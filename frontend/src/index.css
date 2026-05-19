@@ -565,6 +565,14 @@
     background: #f8fafc;
 }
 
+.tabler-admin-shell tr.bg-parrot-green-lt > * {
+    background: #effddd;
+}
+
+.tabler-admin-shell tr.bg-parrot-green-lt:hover > * {
+    background: #e7facd;
+}
+
 .tabler-admin-shell .list-group {
     display: grid;
     gap: 0;

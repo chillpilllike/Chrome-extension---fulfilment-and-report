@@ -5830,7 +5830,17 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                            WHERE inventory_items.store_id = order_lines.store_id
                              AND inventory_items.asin = order_lines.asin
                              AND inventory_items.status = 'available'
-                       ), 0) AS inventory_quantity
+                       ), 0) AS inventory_quantity,
+                       COALESCE((
+                           SELECT COUNT(DISTINCT same_order_lines.asin)
+                           FROM order_lines AS same_order_lines
+                           WHERE same_order_lines.store_id = order_lines.store_id
+                             AND same_order_lines.odoo_order_id = order_lines.odoo_order_id
+                             AND COALESCE(same_order_lines.asin, '') != ''
+                             AND COALESCE(same_order_lines.amazon_order_id, '') = ''
+                             AND same_order_lines.state != 'missing'
+                             AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                       ), 0) AS odoo_order_distinct_asin_count
                 FROM order_lines
                 WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
                 ORDER BY duplicate_asin_count DESC, asin, updated_at DESC

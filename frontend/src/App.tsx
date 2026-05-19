@@ -134,6 +134,7 @@ type OrderLine = {
   created_at: string
   updated_at: string
   duplicate_asin_count: number
+  odoo_order_distinct_asin_count: number
   inventory_quantity: number
 }
 
@@ -2306,7 +2307,16 @@ function App() {
                   </TableHeader>
                   <TableBody>
                     {sortedRows.map((row) => (
-                      <TableRow key={row.id} className={["cancelled", "refunded"].includes(row.odoo_status_label) ? "bg-destructive/5" : ""}>
+                      <TableRow
+                        key={row.id}
+                        className={
+                          ["cancelled", "refunded"].includes(row.odoo_status_label)
+                            ? "bg-destructive/5"
+                            : Number(row.odoo_order_distinct_asin_count || 0) > 1
+                              ? "bg-parrot-green-lt"
+                              : ""
+                        }
+                      >
                         <TableCell>
                           <Checkbox
                             checked={selected.includes(row.id)}
