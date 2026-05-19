@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Nutricity ePost Global Tracking",
+  "description": "Tracks ePost Global EPG parcels from Odoo fulfilled orders and reports status to the local app.",
+  "version": "0.1.0",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": ["storage", "tabs", "alarms"],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*",
+    "https://portal.epgshipping.com/*",
+    "https://epgtrack.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Nutricity ePost Tracking",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://portal.epgshipping.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

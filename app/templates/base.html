@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Amazon Business Fulfilment</title>
+    <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+    <link rel="stylesheet" href="/static/styles.css?v=6">
+  </head>
+  <body class="layout-fluid">
+    {% set path = request.url.path %}
+    <div class="page app-shell">
+      <header class="navbar navbar-expand-md d-print-none">
+        <div class="container-xl">
+          <a class="navbar-brand" href="/legacy">
+            <span class="brand-mark">AB</span>
+            <span>
+              <span class="brand-title">Amazon Business Fulfilment</span>
+              <small>Odoo orders, ASINs, Amazon ordering, delivery tracking</small>
+            </span>
+          </a>
+          <div class="navbar-nav flex-row order-md-last">
+            <a class="nav-link {% if path == '/' %}active{% endif %}" href="/">React app</a>
+          </div>
+          <nav class="navbar-nav">
+            <a class="nav-link {% if path == '/legacy' %}active{% endif %}" href="/legacy">Orders</a>
+            <a class="nav-link {% if path == '/stores' %}active{% endif %}" href="/stores">Stores</a>
+            <a class="nav-link {% if path == '/addresses' %}active{% endif %}" href="/addresses">Addresses</a>
+            <a class="nav-link {% if path == '/amazon-accounts' %}active{% endif %}" href="/amazon-accounts">Amazon Accounts</a>
+            <a class="nav-link {% if path == '/inventory' %}active{% endif %}" href="/inventory">Inventory</a>
+          </nav>
+        </div>
+      </header>
+      <main class="page-wrapper">
+        <div class="container-xl py-4">
+          {% block content %}{% endblock %}
+        </div>
+      </main>
+    </div>
+    <script>
+      function openModal(id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.removeAttribute("hidden");
+        el.style.display = "grid";
+        document.body.classList.add("modal-open");
+      }
+      function closeModal(id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.setAttribute("hidden", "");
+        el.style.display = "";
+        if (!document.querySelector(".modal-backdrop:not([hidden])")) {
+          document.body.classList.remove("modal-open");
+        }
+      }
+      function filterTable(inputId, tableId) {
+        const input = document.getElementById(inputId);
+        const table = document.getElementById(tableId);
+        if (!input || !table) return;
+        const query = input.value.trim().toLowerCase();
+        table.querySelectorAll("tbody tr").forEach((row) => {
+          row.hidden = query && !row.innerText.toLowerCase().includes(query);
+        });
+      }
+      function selectAsin(asin) {
+        document.querySelectorAll(".line-check").forEach((cb) => {
+          cb.checked = cb.dataset.asin === asin;
+        });
+        const search = document.getElementById("orders-search");
+        if (search) {
+          search.value = asin;
+          filterTable("orders-search", "orders-table");
+        }
+      }
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          document.querySelectorAll(".modal-backdrop").forEach((el) => {
+            el.setAttribute("hidden", "");
+            el.style.display = "";
+          });
+          document.body.classList.remove("modal-open");
+        }
+      });
+    </script>
+    <script src="/static/vendor/tabler/js/tabler.min.js"></script>
+  </body>
+</html>

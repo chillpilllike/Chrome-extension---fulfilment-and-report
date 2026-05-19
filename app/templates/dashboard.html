@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="orders-shell">
+  <div class="orders-toolbar">
+    <form method="get" action="/legacy" class="toolbar-form">
+      <label>Store</label>
+      <select name="store_id" onchange="this.form.submit()">
+        {% for store in stores %}
+        <option value="{{ store.id }}" {% if store.id == current_store_id %}selected{% endif %}>{{ store.name }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    <form method="post" action="/pull" class="toolbar-form">
+      <input type="hidden" name="store_id" value="{{ current_store_id }}">
+      <label>Days</label>
+      <input name="days" type="number" value="7" min="0">
+      <label>Limit</label>
+      <input name="limit" type="number" value="50" min="1">
+      <button>Pull Orders</button>
+    </form>
+    <form method="post" action="/place" class="toolbar-form" onsubmit="return confirm('Place all eligible open lines as Amazon orders?')">
+      <input type="hidden" name="store_id" value="{{ current_store_id }}">
+      <label>Ship to</label>
+      <select name="address_id">
+        {% for address in addresses %}
+        <option value="{{ address.id }}" {% if address.is_default %}selected{% endif %}>{{ address.label }}</option>
+        {% endfor %}
+      </select>
+      <label>Amazon account</label>
+      <select name="amazon_account_id">
+        {% for account in amazon_accounts %}
+        <option value="{{ account.id }}" {% if account.is_default %}selected{% endif %}>{{ account.name }}</option>
+        {% endfor %}
+      </select>
+      <button class="danger">Place All</button>
+    </form>
+    <form method="post" action="/delivery-check" class="toolbar-form">
+      <input type="hidden" name="store_id" value="{{ current_store_id }}">
+      <button>Check Delivered & Dispatch</button>
+    </form>
+    <a class="button" href="/reports/latest?store_id={{ current_store_id }}">Download CSV</a>
+  </div>
+
+  <section class="stats">
+    {% for item in counts %}
+    <div><strong>{{ item.count }}</strong><span>{{ item.state }}</span></div>
+    {% endfor %}
+  </section>
+
+  {% if duplicate_asins %}
+  <section class="duplicate-panel">
+    <h2>Duplicate ASINs Ready For Bulk Ordering</h2>
+    <div class="duplicate-grid">
+      {% for group in duplicate_asins %}
+      <button type="button" class="duplicate-chip" onclick="selectAsin('{{ group.asin }}')">
+        <strong>{{ group.asin }}</strong>
+        <span>{{ group.order_count }} orders · qty {{ group.total_quantity }}</span>
+        <small>{{ group.orders }}</small>
+      </button>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="table-wrap">
+    <form method="post" action="/lines/place-selected">
+      <input type="hidden" name="store_id" value="{{ current_store_id }}">
+      <div class="table-actions">
+        <div class="table-search">
+          <label>Search</label>
+          <input id="orders-search" type="search" placeholder="Order, product, ASIN, status..." oninput="filterTable('orders-search', 'orders-table')">
+        </div>
+        <div class="selected-actions">
+          <label>Ship to</label>
+          <select name="address_id">
+            {% for address in addresses %}
+            <option value="{{ address.id }}" {% if address.is_default %}selected{% endif %}>{{ address.label }}</option>
+            {% endfor %}
+          </select>
+          <label>Amazon account</label>
+          <select name="amazon_account_id">
+            {% for account in amazon_accounts %}
+            <option value="{{ account.id }}" {% if account.is_default %}selected{% endif %}>{{ account.name }}</option>
+            {% endfor %}
+          </select>
+          <button formaction="/lines/place-selected" name="action" value="place" class="danger" onclick="return confirm('Place selected lines as separate Amazon orders?')">Place Selected</button>
+          <button formaction="/lines/place-selected" name="action" value="club_place" class="danger" onclick="return confirm('Club selected lines into one Amazon order?')">Club Place</button>
+          <button formaction="/lines/delete" class="danger" onclick="return confirm('Delete selected pulled lines from this local app? This will not delete anything in Odoo or Amazon.')">Delete Selected</button>
+        </div>
+      </div>
+      <table id="orders-table">
+        <thead>
+          <tr>
+            <th><input type="checkbox" onclick="document.querySelectorAll('.line-check').forEach(cb => cb.checked = this.checked)"></th>
+            <th>Odoo Order</th>
+            <th>Product</th>
+            <th>Reference</th>
+            <th>ASIN</th>
+            <th>Qty</th>
+            <th>Odoo Status</th>
+            <th>Inventory</th>
+            <th>State</th>
+            <th>Amazon Account</th>
+            <th>Tracking</th>
+            <th>Amazon Order</th>
+            <th>Comments</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr class="{% if row.odoo_status_label in ['cancelled', 'refunded'] %}row-alert{% elif row.inventory_quantity %}row-inventory{% endif %}" data-asin="{{ row.asin }}">
+            <td><input class="line-check" type="checkbox" name="line_ids" value="{{ row.id }}" data-asin="{{ row.asin }}"></td>
+            <td>
+              {% if row.odoo_order_url %}
+              <a href="{{ row.odoo_order_url }}" target="_blank">{{ row.odoo_order_name }}</a>
+              {% else %}
+              {{ row.odoo_order_name }}
+              {% endif %}
+            </td>
+            <td>{{ row.product_name }}</td>
+            <td><code>{{ row.default_code or "" }}</code></td>
+            <td>
+              {% if row.asin %}
+              <a href="https://www.amazon.com/dp/{{ row.asin }}" target="_blank"><code>{{ row.asin }}</code></a>
+              {% endif %}
+              {% if row.duplicate_asin_count and row.duplicate_asin_count > 1 %}
+              <small>{{ row.duplicate_asin_count }} open lines</small>
+              {% endif %}
+              {% if row.source_line_count and row.source_line_count > 1 %}
+              <small>combined {{ row.source_line_count }} Odoo lines</small>
+              {% endif %}
+              {% if row.asin_from_reference and row.asin_from_note and row.asin_from_reference != row.asin_from_note %}
+              <small class="bad">note mismatch: {{ row.asin_from_note }}</small>
+              {% endif %}
+            </td>
+            <td>{{ row.quantity }}</td>
+            <td>{{ row.odoo_status_label or "" }}</td>
+            <td>
+              {% if row.inventory_quantity %}
+              <a href="/inventory?store_id={{ row.store_id }}">Use inventory: {{ row.inventory_quantity }}</a>
+              {% endif %}
+            </td>
+            <td><span class="pill">{{ row.state }}</span></td>
+            <td>{{ row.amazon_account_name or "" }}</td>
+            <td>
+              {{ row.tracking_status or "" }}
+              {% if row.tracking_checked_at %}
+              <small>{{ row.tracking_checked_at }}</small>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.amazon_order_url %}
+              <a href="{{ row.amazon_order_url }}" target="_blank">{{ row.amazon_order_id }}</a>
+              {% else %}
+              {{ row.amazon_order_id or "" }}
+              {% endif %}
+            </td>
+            <td>{{ row.fulfilment_note or "" }}</td>
+            <td class="error">{{ row.last_error or "" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </form>
+  </section>
+</section>
+{% endblock %}

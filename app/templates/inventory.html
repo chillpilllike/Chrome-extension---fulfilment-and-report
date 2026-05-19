@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="toolbar">
+  <form method="get" action="/inventory">
+    <label>Store</label>
+    <select name="store_id" onchange="this.form.submit()">
+      <option value="">All stores</option>
+      {% for store in stores %}
+      <option value="{{ store.id }}" {% if store.id == current_store_id %}selected{% endif %}>{{ store.name }}</option>
+      {% endfor %}
+    </select>
+  </form>
+</section>
+
+<section class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>ASIN</th>
+        <th>Qty</th>
+        <th>Product</th>
+        <th>Cancelled/Refunded Odoo Order</th>
+        <th>Amazon Order</th>
+        <th>Amazon Account</th>
+        <th>Status</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td><code>{{ item.asin }}</code></td>
+        <td>{{ item.quantity }}</td>
+        <td>{{ item.product_name or "" }}</td>
+        <td>{{ item.source_odoo_order_name }}</td>
+        <td>
+          {% if item.amazon_order_url %}
+          <a href="{{ item.amazon_order_url }}" target="_blank">{{ item.amazon_order_id }}</a>
+          {% else %}
+          {{ item.amazon_order_id or "" }}
+          {% endif %}
+        </td>
+        <td>{{ item.amazon_account_name or "" }}</td>
+        <td><span class="pill">{{ item.status }}</span></td>
+        <td>{{ item.notes or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

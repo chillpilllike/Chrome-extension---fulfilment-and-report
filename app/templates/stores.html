@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block content %}
+{% if test_result %}
+<div class="modal-backdrop" id="test-result-modal" onclick="if (event.target === this) closeModal('test-result-modal')">
+  <div class="modal result-modal">
+    <div class="modal-head">
+      <h2>Store Test Result</h2>
+      <button type="button" class="modal-close" onclick="closeModal('test-result-modal')" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body notice {{ test_status }}">{{ test_result }}</div>
+  </div>
+</div>
+{% endif %}
+<section class="grid">
+  <div>
+    <h2>Configured Stores</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Name</th><th>URL</th><th>Database</th><th>User</th><th>Website</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+          {% for store in stores %}
+          <tr>
+            <td>{{ store.name }}</td>
+            <td>{{ store.odoo_url }}</td>
+            <td>{{ store.odoo_db }}</td>
+            <td>{{ store.odoo_user }}</td>
+            <td>{{ store.website_id or "" }}</td>
+            <td>
+              <div class="row-actions">
+                <button type="button" onclick="openModal('store-{{ store.id }}')">Edit</button>
+                <form method="post" action="/stores/{{ store.id }}/test">
+                  <button>Test</button>
+                </form>
+                <form method="post" action="/stores/{{ store.id }}/delete" onsubmit="return confirm('Remove this store and locally pulled order lines?')">
+                  <button class="danger">Remove</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <form method="post" action="/stores" class="panel">
+    <h2>Add Odoo Store</h2>
+    <label>Name</label>
+    <input name="name" required>
+    <label>Odoo URL</label>
+    <input name="odoo_url" placeholder="https://backend.example.com" required>
+    <label>Database</label>
+    <input name="odoo_db" required>
+    <label>User</label>
+    <input name="odoo_user" required>
+    <label>Password/API key</label>
+    <input name="odoo_password" type="password" required>
+    <label>Website ID</label>
+    <input name="website_id" placeholder="optional">
+    <button>Add Store</button>
+  </form>
+</section>
+
+{% for store in stores %}
+<div class="modal-backdrop" id="store-{{ store.id }}" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Edit Store</h2>
+      <button type="button" class="modal-close" onclick="closeModal('store-{{ store.id }}')" aria-label="Close">×</button>
+    </div>
+    <form method="post" action="/stores/{{ store.id }}/update" class="panel modal-form">
+      <label>Name</label>
+      <input name="name" value="{{ store.name }}" required>
+      <label>Odoo URL</label>
+      <input name="odoo_url" value="{{ store.odoo_url }}" required>
+      <label>Database</label>
+      <input name="odoo_db" value="{{ store.odoo_db }}" required>
+      <label>User</label>
+      <input name="odoo_user" value="{{ store.odoo_user }}" required>
+      <label>Password/API key</label>
+      <input name="odoo_password" type="password" value="{{ store.odoo_password }}" required>
+      <label>Website ID</label>
+      <input name="website_id" value="{{ store.website_id or '' }}">
+      <button>Save Store</button>
+    </form>
+  </div>
+</div>
+{% endfor %}
+{% endblock %}

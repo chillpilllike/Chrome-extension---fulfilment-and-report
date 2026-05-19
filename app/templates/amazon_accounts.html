@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block content %}
+{% if test_result %}
+<div class="modal-backdrop" id="test-result-modal" onclick="if (event.target === this) closeModal('test-result-modal')">
+  <div class="modal result-modal">
+    <div class="modal-head">
+      <h2>Amazon Test Result</h2>
+      <button type="button" class="modal-close" onclick="closeModal('test-result-modal')" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body notice {{ test_status }}">{{ test_result }}</div>
+  </div>
+</div>
+{% endif %}
+<section class="grid">
+  <div>
+    <h2>Amazon Business Accounts</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Name</th><th>API Base</th><th>Tracking Base</th><th>Default</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+          {% for account in accounts %}
+          <tr>
+            <td>{{ account.name }}</td>
+            <td>{{ account.api_base_url }}</td>
+            <td>{{ account.tracking_api_base_url }}</td>
+            <td>{% if account.is_default %}<span class="pill ok">Default</span>{% endif %}</td>
+            <td>
+              <div class="row-actions">
+                <button type="button" onclick="openModal('amazon-{{ account.id }}')">Edit</button>
+                <form method="post" action="/amazon-accounts/{{ account.id }}/test">
+                  <button>Test</button>
+                </form>
+                {% if not account.is_default %}
+                <form method="post" action="/amazon-accounts/{{ account.id }}/default">
+                  <button>Set Default</button>
+                </form>
+                {% endif %}
+                <form method="post" action="/amazon-accounts/{{ account.id }}/delete" onsubmit="return confirm('Remove this Amazon account profile? Existing order history will keep the account name.')">
+                  <button class="danger">Remove</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <form method="post" action="/amazon-accounts" class="panel">
+    <h2>Add Amazon Account</h2>
+    <label>Name</label>
+    <input name="name" required>
+    <label>Ordering API base URL</label>
+    <input name="api_base_url" value="https://api.business.amazon.com" required>
+    <label>Tracking API base URL</label>
+    <input name="tracking_api_base_url" value="https://api.business.amazon.com" required>
+    <label>LWA token URL</label>
+    <input name="lwa_token_url" value="https://api.amazon.com/auth/o2/token" required>
+    <label>LWA client ID</label>
+    <input name="lwa_client_id">
+    <label>LWA client secret</label>
+    <input name="lwa_client_secret" type="password">
+    <label>LWA refresh token</label>
+    <input name="lwa_refresh_token" type="password">
+    <label>Temporary access token</label>
+    <input name="api_access_token" type="password">
+    <label>cXML auth mode</label>
+    <select name="cxml_auth_mode">
+      <option value="header">cXML Header Only</option>
+      <option value="basic">HTTP Basic Only</option>
+      <option value="both">cXML Header + HTTP Basic</option>
+    </select>
+    <label>Punchout cart/session ID</label>
+    <input name="cxml_cart_session_id">
+    <label>cXML credential domain</label>
+    <input name="cxml_credential_domain" value="NetworkId">
+    <label>cXML To identity</label>
+    <input name="cxml_to_identity" value="Amazon">
+    <label class="check-row"><input type="checkbox" name="is_default" value="true"> Make default</label>
+    <button>Add Amazon Account</button>
+  </form>
+</section>
+
+{% for account in accounts %}
+<div class="modal-backdrop" id="amazon-{{ account.id }}" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Edit Amazon Account</h2>
+      <button type="button" class="modal-close" onclick="closeModal('amazon-{{ account.id }}')" aria-label="Close">×</button>
+    </div>
+    <form method="post" action="/amazon-accounts/{{ account.id }}/update" class="panel modal-form">
+      <label>Name</label><input name="name" value="{{ account.name }}" required>
+      <label>Ordering API base URL</label><input name="api_base_url" value="{{ account.api_base_url }}" required>
+      <label>Tracking API base URL</label><input name="tracking_api_base_url" value="{{ account.tracking_api_base_url }}" required>
+      <label>LWA token URL</label><input name="lwa_token_url" value="{{ account.lwa_token_url }}" required>
+      <label>LWA client ID</label><input name="lwa_client_id" value="{{ account.lwa_client_id or '' }}">
+      <label>LWA client secret</label><input name="lwa_client_secret" type="password" value="{{ account.lwa_client_secret or '' }}">
+      <label>LWA refresh token</label><input name="lwa_refresh_token" type="password" value="{{ account.lwa_refresh_token or '' }}">
+      <label>Temporary access token</label><input name="api_access_token" type="password" value="{{ account.api_access_token or '' }}">
+      <label>cXML auth mode</label>
+      <select name="cxml_auth_mode">
+        <option value="header" {% if (account.cxml_auth_mode or 'header') == 'header' %}selected{% endif %}>cXML Header Only</option>
+        <option value="basic" {% if account.cxml_auth_mode == 'basic' %}selected{% endif %}>HTTP Basic Only</option>
+        <option value="both" {% if account.cxml_auth_mode == 'both' %}selected{% endif %}>cXML Header + HTTP Basic</option>
+      </select>
+      <label>Punchout cart/session ID</label><input name="cxml_cart_session_id" value="{{ account.cxml_cart_session_id or '' }}">
+      <label>cXML credential domain</label><input name="cxml_credential_domain" value="{{ account.cxml_credential_domain or 'NetworkId' }}">
+      <label>cXML To identity</label><input name="cxml_to_identity" value="{{ account.cxml_to_identity or 'Amazon' }}">
+      <label class="check-row"><input type="checkbox" name="is_default" value="true" {% if account.is_default %}checked{% endif %}> Default</label>
+      <button>Save Amazon Account</button>
+    </form>
+  </div>
+</div>
+{% endfor %}
+{% endblock %}

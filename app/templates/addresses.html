@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="grid">
+  <div>
+    <h2>Fulfilment Addresses</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Label</th><th>Company</th><th>Address</th><th>Phone</th><th>Default</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+          {% for address in addresses %}
+          <tr>
+            <td>{{ address.label }}</td>
+            <td>{{ address.company_name or "" }}</td>
+            <td>
+              {{ address.address_line1 }}
+              {% if address.address_line2 %}<br>{{ address.address_line2 }}{% endif %}
+              {% if address.address_line3 %}<br>{{ address.address_line3 }}{% endif %}
+              <br>{{ address.city }}{% if address.state_or_region %}, {{ address.state_or_region }}{% endif %} {{ address.postal_code }}
+              <br>{{ address.country_code }}
+            </td>
+            <td>{{ address.phone_number or "" }}</td>
+            <td>{% if address.is_default %}<span class="pill ok">Default</span>{% endif %}</td>
+            <td>
+              <div class="row-actions">
+                <button type="button" onclick="openModal('address-{{ address.id }}')">Edit</button>
+                {% if not address.is_default %}
+                <form method="post" action="/addresses/{{ address.id }}/default">
+                  <button>Set Default</button>
+                </form>
+                {% endif %}
+                <form method="post" action="/addresses/{{ address.id }}/delete" onsubmit="return confirm('Remove this fulfilment address?')">
+                  <button class="danger">Remove</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <form method="post" action="/addresses" class="panel">
+    <h2>Add Address</h2>
+    <label>Label</label>
+    <input name="label" required>
+    <label>Company</label>
+    <input name="company_name" value="Nutricity">
+    <label>Phone</label>
+    <input name="phone_number">
+    <label>Address line 1</label>
+    <input name="address_line1" required>
+    <label>City</label>
+    <input name="city" required>
+    <label>State / Region</label>
+    <input name="state_or_region">
+    <label>Postal code</label>
+    <input name="postal_code" required>
+    <label>Country code</label>
+    <input name="country_code" value="US" required>
+    <label class="check-row"><input type="checkbox" name="is_default" value="true"> Make default</label>
+    <button>Add Address</button>
+  </form>
+</section>
+
+{% for address in addresses %}
+<div class="modal-backdrop" id="address-{{ address.id }}" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Edit Address</h2>
+      <button type="button" class="modal-close" onclick="closeModal('address-{{ address.id }}')" aria-label="Close">×</button>
+    </div>
+    <form method="post" action="/addresses/{{ address.id }}/update" class="panel modal-form">
+      <label>Label</label><input name="label" value="{{ address.label }}" required>
+      <label>Company</label><input name="company_name" value="{{ address.company_name or '' }}">
+      <label>Phone</label><input name="phone_number" value="{{ address.phone_number or '' }}">
+      <label>Address line 1</label><input name="address_line1" value="{{ address.address_line1 }}" required>
+      <label>Address line 2</label><input name="address_line2" value="{{ address.address_line2 or '' }}">
+      <label>Address line 3</label><input name="address_line3" value="{{ address.address_line3 or '' }}">
+      <label>City</label><input name="city" value="{{ address.city }}" required>
+      <label>State / Region</label><input name="state_or_region" value="{{ address.state_or_region or '' }}">
+      <label>Postal code</label><input name="postal_code" value="{{ address.postal_code }}" required>
+      <label>Country code</label><input name="country_code" value="{{ address.country_code }}" required>
+      <label class="check-row"><input type="checkbox" name="is_default" value="true" {% if address.is_default %}checked{% endif %}> Default</label>
+      <button>Save Address</button>
+    </form>
+  </div>
+</div>
+{% endfor %}
+{% endblock %}

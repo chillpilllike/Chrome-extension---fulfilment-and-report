@@ -1,0 +1,220 @@
+const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const TRACKER_URL = "https://portal.epgshipping.com/ParcelTracker/HomePageTracker";
+
+async function getState() {
+  return chrome.storage.local.get({
+    apiBase: DEFAULT_API_BASE,
+    adminToken: "",
+    intervalDays: 1,
+    epostRun: { running: false, batches: [], batchIndex: 0 },
+    epostRunByWindow: {},
+    logs: [],
+    logsByWindow: {},
+  });
+}
+
+function messageWindowId(message = {}, sender = {}) {
+  return Number(message.targetWindowId || sender.tab?.windowId || 0) || null;
+}
+
+async function getWindowState(windowId) {
+  const state = await getState();
+  const key = String(windowId || "");
+  return {
+    ...state,
+    targetWindowId: windowId || null,
+    epostRun: windowId ? state.epostRunByWindow?.[key] || { running: false, batches: [], batchIndex: 0 } : state.epostRun,
+    logs: windowId ? state.logsByWindow?.[key] || [] : state.logs,
+  };
+}
+
+async function saveEpostRun(epostRun, windowId) {
+  if (!windowId) {
+    await chrome.storage.local.set({ epostRun });
+    return;
+  }
+  const { epostRunByWindow } = await getState();
+  await chrome.storage.local.set({ epostRunByWindow: { ...(epostRunByWindow || {}), [String(windowId)]: epostRun }, epostRun });
+}
+
+async function log(message, windowId = null) {
+  const { logs, logsByWindow } = await getState();
+  const entry = `${new Date().toLocaleTimeString()} ${message}`;
+  if (!windowId) {
+    await chrome.storage.local.set({ logs: [entry, ...logs].slice(0, 80) });
+    return;
+  }
+  const key = String(windowId);
+  const next = { ...(logsByWindow || {}) };
+  next[key] = [entry, ...(next[key] || [])].slice(0, 80);
+  await chrome.storage.local.set({ logsByWindow: next, logs: next[key] });
+}
+
+async function api(path, options = {}) {
+  const { apiBase, adminToken } = await getState();
+  const response = await fetch(`${apiBase}${path}`, {
+    headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...(options.headers || {}) },
+    ...options,
+  });
+  if (!response.ok) {
+    throw new Error((await response.text()) || response.statusText);
+  }
+  return response.json();
+}
+
+async function testConnection() {
+  const { apiBase, adminToken } = await getState();
+  const base = String(apiBase || DEFAULT_API_BASE).replace(/\/+$/, "");
+  const health = await fetch(`${base}/health`);
+  if (!health.ok) throw new Error(`Server health check failed: HTTP ${health.status}`);
+  const auth = await fetch(`${base}/api/settings/admin-access`, {
+    headers: adminToken ? { "X-Admin-Token": adminToken } : {},
+  });
+  if (!auth.ok) throw new Error((await auth.text()) || `Admin token check failed: HTTP ${auth.status}`);
+  return { ok: true, message: `Connected to ${base}. Admin token accepted.` };
+}
+
+function chunk(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  return chunks;
+}
+
+async function openTracker(windowId) {
+  const url = `${TRACKER_URL}?nutricityBatch=${Date.now()}`;
+  const query = windowId ? { active: true, windowId } : { active: true, currentWindow: true };
+  const tabs = await chrome.tabs.query(query);
+  if (tabs[0]?.id) {
+    await chrome.tabs.update(tabs[0].id, { url, active: true });
+  } else {
+    await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
+  }
+}
+
+async function scheduleAlarm(days) {
+  await chrome.alarms.clear("epostTracking");
+  const periodInMinutes = Math.max(60, Math.max(1, Number(days || 1)) * 24 * 60 || 60);
+  chrome.alarms.create("epostTracking", { periodInMinutes });
+}
+
+async function startEpost(windowId = null) {
+  const state = await getState();
+  await scheduleAlarm(state.intervalDays);
+  const payload = await api(`/api/epost/due?days=${encodeURIComponent(state.intervalDays || 1)}`);
+  const rows = payload.rows || [];
+  const batches = chunk(rows.map((row) => row.tracking_code).filter(Boolean), 25);
+  const epostRun = { running: true, batches, batchIndex: 0, submittedBatchIndex: null };
+  if (!batches.length) {
+    epostRun.running = false;
+    await saveEpostRun(epostRun, windowId);
+    await log("No ePost tracking codes are due.", windowId);
+    return { ok: false, message: "No ePost tracking codes are due." };
+  }
+  await saveEpostRun(epostRun, windowId);
+  await log(`Loaded ${rows.length} due ePost code(s) in ${batches.length} batch(es).`, windowId);
+  await openTracker(windowId);
+  return { ok: true, message: `Tracking ${rows.length} ePost code(s).` };
+}
+
+async function stopEpost(windowId) {
+  const { epostRun } = await getWindowState(windowId);
+  epostRun.running = false;
+  await saveEpostRun(epostRun, windowId);
+  await log("ePost tracking stopped.", windowId);
+  return { ok: true, message: "Stopped." };
+}
+
+async function handlePortalReady(windowId) {
+  const { epostRun } = await getWindowState(windowId);
+  if (!epostRun.running) return { ok: false };
+  const submittedBatchIndex = Number.isInteger(epostRun.submittedBatchIndex) ? epostRun.submittedBatchIndex : null;
+  const batchIndex = submittedBatchIndex ?? epostRun.batchIndex;
+  const codes = epostRun.batches[batchIndex] || [];
+  return { ok: true, codes, batchIndex, submitted: submittedBatchIndex !== null };
+}
+
+async function handleBatchSubmitted(message, windowId) {
+  const { epostRun } = await getWindowState(windowId);
+  if (!epostRun.running) return { ok: false };
+  if (message.batchIndex !== epostRun.batchIndex) {
+    await log(`Ignored stale ePost submit batch ${Number(message.batchIndex) + 1}.`, windowId);
+    return { ok: false, stale: true };
+  }
+  epostRun.submittedBatchIndex = message.batchIndex;
+  await saveEpostRun(epostRun, windowId);
+  await log(`Submitted ePost batch ${message.batchIndex + 1}/${epostRun.batches.length}.`, windowId);
+  return { ok: true };
+}
+
+async function handleResults(message, windowId) {
+  const { epostRun } = await getWindowState(windowId);
+  if (!epostRun.running) return { ok: false };
+  const expectedBatchIndex = Number.isInteger(epostRun.submittedBatchIndex) ? epostRun.submittedBatchIndex : epostRun.batchIndex;
+  if (Number.isInteger(message.batchIndex) && message.batchIndex !== expectedBatchIndex) {
+    await log(`Ignored stale ePost result batch ${message.batchIndex + 1}.`, windowId);
+    return { ok: false, stale: true };
+  }
+  const resultCount = message.results?.length || 0;
+  epostRun.submittedBatchIndex = null;
+  epostRun.batchIndex = expectedBatchIndex + 1;
+  if (epostRun.batchIndex >= epostRun.batches.length) {
+    epostRun.running = false;
+    await saveEpostRun(epostRun, windowId);
+    try {
+      await api("/api/epost/update", {
+        method: "POST",
+        body: JSON.stringify({ results: message.results || [] }),
+      });
+      await log(`Posted ${resultCount} ePost result(s).`, windowId);
+    } catch (error) {
+      await log(`ePost result upload failed after final batch: ${error.message}`, windowId);
+    }
+    await log("ePost tracking run complete.", windowId);
+    return { ok: true, done: true };
+  }
+  await saveEpostRun(epostRun, windowId);
+  try {
+    await api("/api/epost/update", {
+      method: "POST",
+      body: JSON.stringify({ results: message.results || [] }),
+    });
+    await log(`Posted ${resultCount} ePost result(s).`, windowId);
+  } catch (error) {
+      await log(`ePost result upload failed after batch ${expectedBatchIndex + 1}: ${error.message}`, windowId);
+  }
+  await log(`Moving to ePost batch ${epostRun.batchIndex + 1}/${epostRun.batches.length}.`, windowId);
+  await openTracker(windowId);
+  return { ok: true };
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "epostTracking") {
+    startEpost().catch((error) => log(`Scheduled ePost tracking failed: ${error.message}`));
+  }
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  (async () => {
+    const windowId = messageWindowId(message, sender);
+    if (message.type === "GET_STATE") return getWindowState(windowId);
+    if (message.type === "TEST_CONNECTION") return testConnection();
+    if (message.type === "SET_SETTINGS") {
+      await chrome.storage.local.set({
+        apiBase: message.apiBase || DEFAULT_API_BASE,
+        adminToken: message.adminToken || "",
+        intervalDays: Math.max(1, Math.min(30, Number(message.intervalDays || 1))),
+      });
+      await scheduleAlarm(message.intervalDays);
+      return { ok: true };
+    }
+    if (message.type === "START_EPOST") return startEpost(windowId);
+    if (message.type === "STOP_EPOST") return stopEpost(windowId);
+    if (message.type === "PORTAL_READY") return handlePortalReady(windowId);
+    if (message.type === "BATCH_SUBMITTED") return handleBatchSubmitted(message, windowId);
+    if (message.type === "EPOST_RESULTS") return handleResults(message, windowId);
+    return { ok: false, message: "Unknown message." };
+  })()
+    .then((result) => sendResponse(result))
+    .catch((error) => sendResponse({ ok: false, message: error.message }));
+  return true;
+});

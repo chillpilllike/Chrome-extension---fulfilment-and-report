@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <h1>Amazon invoices</h1>
+    <label>App URL</label>
+    <input id="apiBase" />
+    <label>Admin token</label>
+    <input id="adminToken" type="password" autocomplete="off" />
+    <div class="actions">
+      <button id="save">Save</button>
+      <button id="testConnection">Check connection</button>
+      <button id="start">Start</button>
+      <button id="stop">Stop</button>
+    </div>
+    <p id="status">Stopped</p>
+    <ul id="logs"></ul>
+    <script src="popup.js"></script>
+  </body>
+</html>

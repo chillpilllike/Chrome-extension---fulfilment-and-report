@@ -1,0 +1,61 @@
+#nutricity-panel {
+  position: fixed;
+  z-index: 2147483647;
+  right: 16px;
+  top: 16px;
+  width: 310px;
+  border: 1px solid #1d4ed8;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.18);
+  color: #172033;
+  font: 13px/1.45 Arial, sans-serif;
+  padding: 12px;
+}
+
+#nutricity-panel strong {
+  display: block;
+}
+
+#nutricity-panel button {
+  border: 0;
+  border-radius: 6px;
+  background: #175cd3;
+  color: #fff;
+  cursor: pointer;
+  font-weight: 700;
+  padding: 7px 10px;
+}
+
+#nutricity-panel button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.nutricity-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.nutricity-pause-toggle {
+  flex: 0 0 auto;
+  min-width: 70px;
+  padding: 5px 9px !important;
+}
+
+.nutricity-pause-toggle.is-paused {
+  background: #047857 !important;
+}
+
+.nutricity-panel-action {
+  margin-top: 8px;
+}
+
+.nutricity-highlight {
+  outline: 3px solid #f59e0b !important;
+  outline-offset: 3px !important;
+  background-color: rgba(245, 158, 11, 0.12) !important;
+}

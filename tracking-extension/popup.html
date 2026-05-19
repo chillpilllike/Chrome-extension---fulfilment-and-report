@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Nutricity Tracking</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>Nutricity Tracking</h1>
+      <label>
+        App URL
+        <input id="apiBase" spellcheck="false">
+      </label>
+      <label>
+        Admin token
+        <input id="adminToken" type="password" spellcheck="false" autocomplete="off">
+      </label>
+      <div class="actions">
+        <button id="save">Save</button>
+        <button id="testConnection" class="secondary">Check connection</button>
+        <button id="start">Start tracking</button>
+        <button id="stop" class="secondary">Stop</button>
+      </div>
+      <section id="status"></section>
+      <ol id="logs"></ol>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
