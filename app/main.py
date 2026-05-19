@@ -1382,9 +1382,27 @@ def bulk_opportunity_groups(store_id: Optional[int] = None, days: int = 2) -> li
     return sorted(opportunities, key=lambda item: (-float(item["quantity"]), item["asin"]))
 
 
-def duplicate_asin_groups(store_id: Optional[int] = None) -> list[dict[str, Any]]:
+def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
     with db() as conn:
-        return conn.execute(
+        total_row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM (
+                SELECT asin
+                FROM order_lines
+                WHERE (? IS NULL OR store_id=?)
+                  AND COALESCE(asin, '') != ''
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND state != 'missing'
+                  AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                GROUP BY asin
+                HAVING COUNT(DISTINCT odoo_order_name) > 1
+            ) AS duplicate_groups
+            """,
+            (store_id, store_id),
+        ).fetchone()
+        rows = conn.execute(
             """
             SELECT asin,
                    COUNT(*) AS line_count,
@@ -1400,9 +1418,11 @@ def duplicate_asin_groups(store_id: Optional[int] = None) -> list[dict[str, Any]
             GROUP BY asin
             HAVING COUNT(DISTINCT odoo_order_name) > 1
             ORDER BY order_count DESC, total_quantity DESC, asin
+            LIMIT ? OFFSET ?
             """,
-            (store_id, store_id),
+            (store_id, store_id, per_page, offset),
         ).fetchall()
+    return rows_to_dicts(rows), int(total_row["count"] or 0), page, per_page
 
 
 def consolidate_existing_asin_lines(store_id: Optional[int] = None) -> None:
@@ -5775,7 +5795,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 ORDER BY duplicate_asin_count DESC, asin, updated_at DESC
                 LIMIT ? OFFSET ?
             ),
-            duplicate_rows AS (
+            duplicate_all AS (
                 SELECT asin,
                        COUNT(*) AS line_count,
                        COUNT(DISTINCT odoo_order_name) AS order_count,
@@ -5790,6 +5810,11 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 GROUP BY asin
                 HAVING COUNT(DISTINCT odoo_order_name) > 1
                 ORDER BY order_count DESC, total_quantity DESC, asin
+            ),
+            duplicate_rows AS (
+                SELECT *
+                FROM duplicate_all
+                LIMIT 12
             )
             SELECT
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(stores_cte)), '[]'::json) FROM stores_cte) AS stores,
@@ -5805,6 +5830,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                     GROUP BY state
                 ) c) AS counts,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(duplicate_rows)), '[]'::json) FROM duplicate_rows) AS duplicate_asins,
+                (SELECT COUNT(*) FROM duplicate_all) AS duplicate_asins_total,
                 (SELECT store_id FROM chosen) AS current_store_id,
                 (SELECT value FROM app_settings WHERE key='default_ordering_engine') AS default_ordering_engine
             """
@@ -5835,6 +5861,9 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
         "amazon_accounts": amazon_accounts,
         "punchout_return_urls": punchout_return_urls,
         "duplicate_asins": payload.get("duplicate_asins") or [],
+        "duplicate_asins_page": 1,
+        "duplicate_asins_per_page": 12,
+        "duplicate_asins_total": int(payload.get("duplicate_asins_total") or 0),
         "default_ordering_engine": normalize_ordering_engine(str(payload.get("default_ordering_engine") or "rest")),
         "pull_orders_days": int(get_setting("pull_orders_days", "7") or 7),
         "pull_orders_limit": int(get_setting("pull_orders_limit", "50") or 50),
@@ -6117,6 +6146,19 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
         row["asin_url"] = asin_product_url(row.get("asin") or "")
         row["replacement_asin_url"] = asin_product_url(row.get("replacement_asin") or "")
     return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total}
+
+
+@app.get("/api/duplicate-asins")
+def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page: int = 12) -> dict[str, Any]:
+    rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page)
+    return {
+        "stores": rows_to_dicts(list_stores()),
+        "current_store_id": store_id,
+        "groups": rows,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+    }
 
 
 @app.post("/api/missing/lines/{line_id}/replacement")

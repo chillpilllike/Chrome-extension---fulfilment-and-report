@@ -32,7 +32,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
@@ -288,6 +288,9 @@ type DashboardData = {
   amazon_accounts: AmazonAccount[]
   punchout_return_urls: PunchoutReturnUrl[]
   duplicate_asins: DuplicateAsin[]
+  duplicate_asins_page?: number
+  duplicate_asins_per_page?: number
+  duplicate_asins_total?: number
   tracking_orders?: TrackingOrder[]
   default_ordering_engine: string
   pull_orders_days?: number
@@ -336,6 +339,7 @@ function notifyAdminAuthRequired() {
 }
 
 const PAGE_SIZE = 100
+const DUPLICATE_ASIN_PAGE_SIZE = 12
 
 type ExportColumn = { key: string; label: string }
 
@@ -1002,13 +1006,15 @@ function PaginationControls({
   total,
   onPage,
   disabled = false,
+  perPage = PAGE_SIZE,
 }: {
   page: number
   total: number
   onPage: (page: number) => void
   disabled?: boolean
+  perPage?: number
 }) {
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const totalPages = Math.max(1, Math.ceil(total / perPage))
   const candidatePages = Array.from(new Set([
     1,
     page - 1,
@@ -1150,6 +1156,9 @@ function App() {
   const [bulkGroups, setBulkGroups] = useState<BulkGroup[]>([])
   const [bulkPage, setBulkPage] = useState(1)
   const [bulkTotal, setBulkTotal] = useState(0)
+  const [duplicateAsins, setDuplicateAsins] = useState<DuplicateAsin[]>([])
+  const [duplicateAsinPage, setDuplicateAsinPage] = useState(1)
+  const [duplicateAsinTotal, setDuplicateAsinTotal] = useState(0)
   const [costlyRows, setCostlyRows] = useState<OrderLine[]>([])
   const [costlyPage, setCostlyPage] = useState(1)
   const [costlyTotal, setCostlyTotal] = useState(0)
@@ -1222,6 +1231,7 @@ function App() {
       setBulkPage(1)
       setBulkSelectAll(false)
       setBulkSelected([])
+      setDuplicateAsinPage(1)
       setCostlyPage(1)
       setCostlySelectAll(false)
       setCostlySelected([])
@@ -1238,6 +1248,10 @@ function App() {
     setOrderingEngine(next.default_ordering_engine || "rest")
     if (next.pull_orders_days) setDays(String(next.pull_orders_days))
     if (next.pull_orders_limit) setLimit(String(next.pull_orders_limit))
+    if (duplicateAsinPage === 1) {
+      setDuplicateAsins(next.duplicate_asins || [])
+      setDuplicateAsinTotal(next.duplicate_asins_total || next.duplicate_asins?.length || 0)
+    }
     setPullStoreIds((current) => {
       const valid = new Set(next.stores.map((store) => String(store.id)))
       const filtered = current.filter((id) => valid.has(id))
@@ -1385,6 +1399,20 @@ function App() {
       })
       .catch((error) => setModal({ ok: false, title: "Bulk opportunities load failed", message: String(error) }))
   }, [page, storeId, bulkPage])
+
+  useEffect(() => {
+    if (page !== "home") return
+    const query = new URLSearchParams()
+    if (storeId) query.set("store_id", storeId)
+    query.set("page", String(duplicateAsinPage))
+    query.set("per_page", String(DUPLICATE_ASIN_PAGE_SIZE))
+    api<{ groups: DuplicateAsin[]; total: number }>(`/api/duplicate-asins?${query.toString()}`)
+      .then((result) => {
+        setDuplicateAsins(result.groups)
+        setDuplicateAsinTotal(result.total || 0)
+      })
+      .catch((error) => setModal({ ok: false, title: "Duplicate ASINs load failed", message: String(error) }))
+  }, [page, storeId, duplicateAsinPage])
 
   useEffect(() => {
     if (page !== "costly") return
@@ -2033,9 +2061,9 @@ function App() {
                   <CardTitle>Duplicate ASINs Across Recent Orders</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  {data?.duplicate_asins.length ? (
+                  {duplicateAsins.length ? (
                     <div className="list-group">
-                      {data.duplicate_asins.map((group) => (
+                      {duplicateAsins.map((group) => (
                         <button
                           key={group.asin}
                           onClick={() => {
@@ -2055,6 +2083,15 @@ function App() {
                     <p className="text-sm text-muted-foreground">No duplicate ASIN groups waiting to order.</p>
                   )}
                 </CardContent>
+                <CardFooter>
+                  <PaginationControls
+                    page={duplicateAsinPage}
+                    total={duplicateAsinTotal}
+                    perPage={DUPLICATE_ASIN_PAGE_SIZE}
+                    onPage={setDuplicateAsinPage}
+                    disabled={Boolean(busy)}
+                  />
+                </CardFooter>
               </Card>
             </section>
 
