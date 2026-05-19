@@ -5317,6 +5317,11 @@ def upload_shipping_records(filename: str, data: bytes, month: str, default_fulf
 
 
 def accounting_summary(q: str = "", document_type: str = "all", tax_region: str = "all") -> dict[str, Any]:
+    return accounting_summary_page(q, document_type, tax_region, 1, 500)
+
+
+def accounting_summary_page(q: str = "", document_type: str = "all", tax_region: str = "all", page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    page, per_page, offset = pagination_bounds(page, per_page)
     clauses: list[str] = []
     params: list[Any] = []
     if q.strip():
@@ -5330,9 +5335,10 @@ def accounting_summary(q: str = "", document_type: str = "all", tax_region: str 
         params.append(tax_region)
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     with db() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS count FROM accounting_documents {where}", params).fetchone()["count"] or 0)
         docs = conn.execute(
-            f"SELECT * FROM accounting_documents {where} ORDER BY created_at DESC, id DESC LIMIT 500",
-            params,
+            f"SELECT * FROM accounting_documents {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, per_page, offset],
         ).fetchall()
         region_rows = conn.execute(
             """
@@ -5342,7 +5348,7 @@ def accounting_summary(q: str = "", document_type: str = "all", tax_region: str 
             ORDER BY tax_region, document_type
             """
         ).fetchall()
-    return {"documents": rows_to_dicts(docs), "summary": rows_to_dicts(region_rows)}
+    return {"documents": rows_to_dicts(docs), "summary": rows_to_dicts(region_rows), "page": page, "per_page": per_page, "total": total}
 
 
 def render_odoo_invoice_pdf(odoo: OdooClient, invoice_id: int) -> bytes:
@@ -6506,8 +6512,8 @@ async def api_profit_loss_shipping_upload(
 
 
 @app.get("/api/accounting")
-def api_accounting(q: str = "", document_type: str = "all", tax_region: str = "all") -> dict[str, Any]:
-    return accounting_summary(q, document_type, tax_region)
+def api_accounting(q: str = "", document_type: str = "all", tax_region: str = "all", page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    return accounting_summary_page(q, document_type, tax_region, page, per_page)
 
 
 @app.post("/api/accounting/odoo-sync")
@@ -7312,9 +7318,10 @@ def api_public_tracking(store_id: Optional[int] = None) -> dict[str, Any]:
 
 
 @app.get("/api/amazon-otp")
-def api_amazon_otp(q: str = "") -> dict[str, Any]:
+def api_amazon_otp(q: str = "", page: int = 1, per_page: int = 100) -> dict[str, Any]:
     rows = amazon_otp_rows(q)
-    return {"ok": True, "rows": rows, "total": len(rows)}
+    paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
+    return {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total}
 
 
 @app.get("/api/public/amazon-otp")
@@ -7473,9 +7480,10 @@ def public_amazon_otp_page(q: str = "") -> HTMLResponse:
 
 
 @app.get("/api/duplicate-tracking")
-def api_duplicate_tracking(store_id: Optional[int] = None, q: str = "") -> dict[str, Any]:
+def api_duplicate_tracking(store_id: Optional[int] = None, q: str = "", page: int = 1, per_page: int = 100) -> dict[str, Any]:
     rows = duplicate_tracking_rows(store_id, q)
-    return {"ok": True, "rows": rows, "total": len(rows)}
+    paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
+    return {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total}
 
 
 @app.post("/api/epost/sync")

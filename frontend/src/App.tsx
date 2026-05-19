@@ -531,6 +531,9 @@ type AccountingDocument = {
 type AccountingData = {
   documents: AccountingDocument[]
   summary: Array<{ tax_region: string; document_type: string; document_count: number; total_bytes: number }>
+  page?: number
+  per_page?: number
+  total?: number
 }
 
 type OrderColumnKey =
@@ -3091,15 +3094,21 @@ function TrackingPage({
 function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) {
   const [rows, setRows] = useState<AmazonOtpRow[]>([])
   const [query, setQuery] = useState("")
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
 
-  async function refreshOtp(nextQuery = query) {
+  async function refreshOtp(nextQuery = query, nextPage = page) {
     setLoading(true)
     try {
       const params = new URLSearchParams()
       if (nextQuery.trim()) params.set("q", nextQuery.trim())
+      params.set("page", String(nextPage))
+      params.set("per_page", String(PAGE_SIZE))
       const result = await api<{ ok: boolean; rows: AmazonOtpRow[]; total: number }>(`/api/amazon-otp${params.toString() ? `?${params.toString()}` : ""}`)
       setRows(result.rows || [])
+      setTotal(result.total || 0)
+      setPage(nextPage)
     } catch (error) {
       onResult({ ok: false, title: "Amazon OTP Load Failed", message: String(error) })
     } finally {
@@ -3121,8 +3130,8 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
   }
 
   useEffect(() => {
-    refreshOtp("")
-  }, [])
+    refreshOtp(query, page)
+  }, [page])
 
   return (
     <Card>
@@ -3143,7 +3152,7 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
         </div>
       </CardHeader>
       <div className="border-t px-6 py-3">
-        <form className="flex flex-col gap-2 md:flex-row" onSubmit={(event) => { event.preventDefault(); refreshOtp(query) }}>
+        <form className="flex flex-col gap-2 md:flex-row" onSubmit={(event) => { event.preventDefault(); setPage(1); void refreshOtp(query, 1) }}>
           <SearchBox className="w-full md:w-[520px]" value={query} onChange={setQuery} placeholder="Search OTP, tracking number, Amazon order, Odoo order, product" />
           <Button type="submit" variant="outline" disabled={loading}>
             <Search className="size-4" />
@@ -3151,6 +3160,9 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
           </Button>
           <a className="btn btn-outline-secondary" href="/public/amazon-otp" target="_blank">Open Public Page</a>
         </form>
+      </div>
+      <div className="border-t px-6 py-3">
+        <PaginationControls page={page} total={total} onPage={setPage} disabled={loading} />
       </div>
       <CardContent className="p-0">
         <Table>
@@ -3210,8 +3222,11 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
               </TableRow>
             ) : null}
           </TableBody>
-        </Table>
+          </Table>
       </CardContent>
+      <CardFooter>
+        <PaginationControls page={page} total={total} onPage={setPage} disabled={loading} />
+      </CardFooter>
     </Card>
   )
 }
@@ -3598,17 +3613,23 @@ function DuplicateTrackingPage({
 }) {
   const [rows, setRows] = useState<DuplicateTrackingRow[]>([])
   const [query, setQuery] = useState("")
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState<string[]>([])
   const [selectAll, setSelectAll] = useState(false)
 
-  async function load() {
+  async function load(nextPage = page) {
     setLoading(true)
     try {
       const params = new URLSearchParams({ q: query })
       if (storeId) params.set("store_id", storeId)
+      params.set("page", String(nextPage))
+      params.set("per_page", String(PAGE_SIZE))
       const result = await api<{ rows: DuplicateTrackingRow[]; total: number }>(`/api/duplicate-tracking?${params.toString()}`)
       setRows(result.rows || [])
+      setTotal(result.total || 0)
+      setPage(nextPage)
       setSelected([])
       setSelectAll(false)
     } catch (error) {
@@ -3620,7 +3641,15 @@ function DuplicateTrackingPage({
 
   useEffect(() => {
     load().catch((error) => onResult({ ok: false, title: "Duplicate Tracking Load Failed", message: String(error) }))
-  }, [storeId])
+  }, [storeId, page])
+
+  function applyDuplicateTrackingFilter() {
+    if (page === 1) {
+      void load(1)
+      return
+    }
+    setPage(1)
+  }
 
   const totals = rows.reduce(
     (acc, row) => {
@@ -3662,11 +3691,11 @@ function DuplicateTrackingPage({
               <Label>Search</Label>
               <SearchBox value={query} onChange={setQuery} placeholder="Tracking, Odoo order, invoice file" />
             </div>
-            <Button variant="outline" onClick={load} disabled={loading}>
+            <Button variant="outline" onClick={applyDuplicateTrackingFilter} disabled={loading}>
               <Search className="size-4" />
               Filter
             </Button>
-            <Button variant="outline" onClick={load} disabled={loading}>
+            <Button variant="outline" onClick={() => load(page)} disabled={loading}>
               <RefreshCw className="size-4" />
               Refresh
             </Button>
@@ -3679,7 +3708,7 @@ function DuplicateTrackingPage({
             columns={duplicateTrackingExportColumns}
             selectedIds={selected}
             selectAll={selectAll}
-            total={rows.length}
+            total={total}
             filters={{ q: query }}
             onSelectAll={() => setSelectAll(true)}
             onClear={() => {
@@ -3689,6 +3718,9 @@ function DuplicateTrackingPage({
             onResult={onResult}
             onDownloads={() => onNavigate("downloads")}
           />
+        </div>
+        <div className="border-t px-6 py-3">
+          <PaginationControls page={page} total={total} onPage={setPage} disabled={loading} />
         </div>
         <CardContent className="p-0">
           <Table>
@@ -3799,6 +3831,9 @@ function DuplicateTrackingPage({
             </TableBody>
           </Table>
         </CardContent>
+        <CardFooter>
+          <PaginationControls page={page} total={total} onPage={setPage} disabled={loading} />
+        </CardFooter>
       </Card>
     </div>
   )
@@ -4484,6 +4519,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
 function AccountingPage({ storeId, onResult }: { storeId: string; onResult: (modal: ModalState) => void }) {
   const [data, setData] = useState<AccountingData>({ documents: [], summary: [] })
   const [query, setQuery] = useState("")
+  const [page, setPage] = useState(1)
   const [documentType, setDocumentType] = useState("odoo")
   const [orderName, setOrderName] = useState("")
   const [countryCode, setCountryCode] = useState("")
@@ -4491,15 +4527,26 @@ function AccountingPage({ storeId, onResult }: { storeId: string; onResult: (mod
   const [file, setFile] = useState<File | null>(null)
   const [syncingOdoo, setSyncingOdoo] = useState(false)
 
-  async function load() {
+  async function load(nextPage = page) {
     const params = new URLSearchParams({ q: query })
+    params.set("page", String(nextPage))
+    params.set("per_page", String(PAGE_SIZE))
     const next = await api<AccountingData>(`/api/accounting?${params.toString()}`)
     setData(next)
+    setPage(next.page || nextPage)
   }
 
   useEffect(() => {
     load().catch((error) => onResult({ ok: false, title: "Accounting load failed", message: String(error) }))
-  }, [])
+  }, [page])
+
+  function applyAccountingFilter() {
+    if (page === 1) {
+      void load(1).catch((error) => onResult({ ok: false, title: "Accounting load failed", message: String(error) }))
+      return
+    }
+    setPage(1)
+  }
 
   async function uploadDocument() {
     if (!file || !orderName) return
@@ -4513,7 +4560,7 @@ function AccountingPage({ storeId, onResult }: { storeId: string; onResult: (mod
       const result = await uploadWithAdminToken("/api/accounting/documents", form)
       onResult({ ok: true, title: "Invoice Stored", message: result.message || "Stored." })
       setFile(null)
-      await load()
+      await load(page)
     } catch (error) {
       onResult({ ok: false, title: "Invoice Upload Failed", message: String(error) })
     }
@@ -4526,7 +4573,7 @@ function AccountingPage({ storeId, onResult }: { storeId: string; onResult: (mod
       if (storeId) params.set("store_id", storeId)
       const result = await api<{ ok: boolean; message: string }>(`/api/accounting/odoo-sync?${params.toString()}`, { method: "POST" })
       onResult({ ok: true, title: "Odoo Invoice Sync", message: result.message })
-      await load()
+      await load(page)
     } catch (error) {
       onResult({ ok: false, title: "Odoo Invoice Sync Failed", message: String(error) })
     } finally {
@@ -4575,9 +4622,12 @@ function AccountingPage({ storeId, onResult }: { storeId: string; onResult: (mod
           <CardTitle>Accounting Documents</CardTitle>
           <div className="flex gap-2">
             <SearchBox value={query} onChange={setQuery} placeholder="Filter order or file" />
-            <Button variant="outline" onClick={load}>Filter</Button>
+            <Button variant="outline" onClick={applyAccountingFilter}>Filter</Button>
           </div>
         </CardHeader>
+        <div className="border-t px-6 py-3">
+          <PaginationControls page={data.page || page} total={data.total || 0} perPage={data.per_page || PAGE_SIZE} onPage={setPage} />
+        </div>
         <CardContent className="p-0">
           <Table>
             <TableHeader>
@@ -4597,6 +4647,9 @@ function AccountingPage({ storeId, onResult }: { storeId: string; onResult: (mod
             </TableBody>
           </Table>
         </CardContent>
+        <CardFooter>
+          <PaginationControls page={data.page || page} total={data.total || 0} perPage={data.per_page || PAGE_SIZE} onPage={setPage} />
+        </CardFooter>
       </Card>
     </div>
   )
@@ -5462,6 +5515,16 @@ function PunchoutReturnUrlsTable({
   onChanged: () => Promise<void>
   onResult: (modal: ModalState) => void
 }) {
+  const [page, setPage] = useState(1)
+  const pagedUrls = useMemo(() => {
+    const offset = (page - 1) * PAGE_SIZE
+    return urls.slice(offset, offset + PAGE_SIZE)
+  }, [page, urls])
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(urls.length / PAGE_SIZE))
+    if (page > totalPages) setPage(totalPages)
+  }, [page, urls.length])
+
   return (
     <div className="grid gap-3">
       <div className="flex justify-end">
@@ -5480,7 +5543,7 @@ function PunchoutReturnUrlsTable({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {urls.map((url) => (
+            {pagedUrls.map((url) => (
               <TableRow key={url.id}>
                 <TableCell>{url.label}</TableCell>
                 <TableCell><span className="font-mono text-xs">{url.url}</span></TableCell>
@@ -5510,8 +5573,14 @@ function PunchoutReturnUrlsTable({
                 </TableCell>
               </TableRow>
             ))}
+            {!pagedUrls.length ? (
+              <TableRow>
+                <TableCell colSpan={4} className="py-8 text-center text-muted-foreground">No punchout return URLs found.</TableCell>
+              </TableRow>
+            ) : null}
           </TableBody>
       </Table>
+      <PaginationControls page={page} total={urls.length} onPage={setPage} />
     </div>
   )
 }
@@ -5666,6 +5735,16 @@ function SettingsTable<T extends { id: number }>({
   onTest: (row: T) => void | Promise<void>
   children: ReactNode
 }) {
+  const [page, setPage] = useState(1)
+  const pagedRows = useMemo(() => {
+    const offset = (page - 1) * PAGE_SIZE
+    return rows.slice(offset, offset + PAGE_SIZE)
+  }, [page, rows])
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE))
+    if (page > totalPages) setPage(totalPages)
+  }, [page, rows.length])
+
   return (
     <Card>
       {children}
@@ -5690,7 +5769,7 @@ function SettingsTable<T extends { id: number }>({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.map((row) => (
+            {pagedRows.map((row) => (
               <TableRow key={row.id}>
                 {renderRow(row).map((cell, index) => (
                   <TableCell key={index}>{cell}</TableCell>
@@ -5708,9 +5787,17 @@ function SettingsTable<T extends { id: number }>({
                 </TableCell>
               </TableRow>
             ))}
+            {!pagedRows.length ? (
+              <TableRow>
+                <TableCell colSpan={columns.length + 1} className="py-8 text-center text-muted-foreground">No rows found.</TableCell>
+              </TableRow>
+            ) : null}
           </TableBody>
         </Table>
       </CardContent>
+      <CardFooter>
+        <PaginationControls page={page} total={rows.length} onPage={setPage} />
+      </CardFooter>
     </Card>
   )
 }
