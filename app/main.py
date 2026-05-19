@@ -2506,17 +2506,20 @@ def backfill_missing_order_financials_for_profit_loss(
                 SELECT *
                 FROM (
                     SELECT order_lines.*,
-                           MIN(COALESCE(NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at))
+                           MIN(COALESCE(NULLIF(odoo_order_date, ''), NULLIF(raw_json::jsonb -> 'order' ->> 'date_order', ''), NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at))
                            OVER (PARTITION BY store_id, odoo_order_id) AS profit_order_date
                     FROM order_lines
                     WHERE (? IS NULL OR store_id=?)
                 ) AS candidate_lines
                 WHERE profit_order_date BETWEEN ? AND ?
+                  AND amazon_total_price IS NOT NULL
                   AND (
                     COALESCE(store_currency, '') = ''
                     OR COALESCE(store_currency_rate_to_usd, 0) <= 0
                     OR store_total_native IS NULL
                   )
+                ORDER BY id DESC
+                LIMIT 25
                 """,
                 (store_id, store_id, start_text, end_text),
             ).fetchall()
@@ -2655,12 +2658,39 @@ def normalize_converted_profit_columns(store_id: Optional[int], start_text: str,
                 END,
                 updated_at=?
             WHERE (? IS NULL OR store_id=?)
-              AND COALESCE(NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at) BETWEEN ? AND ?
+              AND COALESCE(NULLIF(odoo_order_date, ''), NULLIF(raw_json::jsonb -> 'order' ->> 'date_order', ''), NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at) BETWEEN ? AND ?
               AND store_total_native IS NOT NULL
               AND COALESCE(store_currency_rate_to_usd, 0) > 0
             """,
             (utc_now(), store_id, store_id, start_text, end_text),
         )
+
+
+def backfill_missing_profit_loss_order_dates(store_id: Optional[int]) -> None:
+    updates: list[tuple[str, str, int]] = []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, raw_json
+            FROM order_lines
+            WHERE (? IS NULL OR store_id=?)
+              AND COALESCE(odoo_order_date, '') = ''
+              AND COALESCE(raw_json, '') != ''
+            ORDER BY id DESC
+            LIMIT 5000
+            """,
+            (store_id, store_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_json"] or "{}")
+                order_date = clean_text((payload.get("order") or {}).get("date_order"))
+            except Exception:
+                order_date = ""
+            if order_date:
+                updates.append((order_date, utc_now(), row["id"]))
+        for update in updates:
+            conn.execute("UPDATE order_lines SET odoo_order_date=?, updated_at=? WHERE id=?", update)
 
 
 def group_lines_for_amazon_order(lines: list[dict[str, Any]], club: bool = False) -> list[list[dict[str, Any]]]:
@@ -5130,7 +5160,6 @@ def profit_loss_data(
     start_text = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_text = end_dt.strftime("%Y-%m-%d %H:%M:%S")
     search = f"%{q.strip()}%" if q.strip() else None
-    backfill_missing_order_financials_for_profit_loss(store_id, start_text, end_text)
     normalize_converted_profit_columns(store_id, start_text, end_text)
     with db() as conn:
         rows = conn.execute(
@@ -5140,7 +5169,7 @@ def profit_loss_data(
                     store_id,
                     odoo_order_id,
                     odoo_order_name,
-                    MIN(COALESCE(NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at)) AS order_date,
+                    MIN(COALESCE(NULLIF(odoo_order_date, ''), NULLIF(raw_json::jsonb -> 'order' ->> 'date_order', ''), NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at)) AS order_date,
                     SUM(
                         CASE
                             WHEN store_total_native IS NOT NULL AND COALESCE(store_currency_rate_to_usd, 0) > 0
@@ -5721,6 +5750,29 @@ def backfill_missing_order_dates(rows: list[dict[str, Any]]) -> list[dict[str, A
     if not candidates:
         return rows
     updated_rows = [dict(row) for row in rows]
+    parsed_dates: dict[int, str] = {}
+    for row in candidates:
+        try:
+            payload = json.loads(row.get("raw_json") or "{}")
+            order_date = clean_text((payload.get("order") or {}).get("date_order"))
+            if order_date:
+                parsed_dates[int(row["id"])] = order_date
+        except Exception:
+            continue
+    if parsed_dates:
+        with db() as conn:
+            for row in updated_rows:
+                order_date = parsed_dates.get(int(row.get("id") or 0))
+                if not order_date:
+                    continue
+                row["odoo_order_date"] = order_date
+                conn.execute(
+                    "UPDATE order_lines SET odoo_order_date=?, updated_at=? WHERE id=?",
+                    (order_date, utc_now(), row["id"]),
+                )
+        candidates = [row for row in updated_rows if not clean_text(row.get("odoo_order_date")) and int(row.get("store_id") or 0) and int(row.get("odoo_order_id") or 0)]
+        if not candidates:
+            return updated_rows
     by_store: dict[int, set[int]] = {}
     for row in candidates:
         by_store.setdefault(int(row["store_id"]), set()).add(int(row["odoo_order_id"]))
