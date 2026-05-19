@@ -3122,6 +3122,42 @@ def ensure_chrome_job_owner(conn: Any, group_key: str, worker_id: str) -> None:
         raise HTTPException(409, "Chrome job is locked by another extension instance.")
 
 
+def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Optional[list[int]]) -> Optional[list[int]]:
+    if not line_ids:
+        return line_ids
+    selected_ids = sorted({int(line_id) for line_id in line_ids if int(line_id or 0) > 0})
+    if not selected_ids:
+        return []
+    selected_orders = conn.execute(
+        f"""
+        SELECT DISTINCT odoo_order_id
+        FROM order_lines
+        WHERE store_id=?
+          AND id IN ({','.join('?' for _ in selected_ids)})
+        """,
+        [store_id, *selected_ids],
+    ).fetchall()
+    order_ids = sorted({int(row["odoo_order_id"]) for row in selected_orders})
+    if not order_ids:
+        return selected_ids
+    sibling_rows = conn.execute(
+        f"""
+        SELECT id
+        FROM order_lines
+        WHERE store_id=?
+          AND odoo_order_id IN ({','.join('?' for _ in order_ids)})
+          AND asin IS NOT NULL AND asin != ''
+          AND COALESCE(amazon_order_id, '') = ''
+          AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory')
+          AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+        ORDER BY odoo_order_id DESC, id ASC
+        """,
+        [store_id, *order_ids],
+    ).fetchall()
+    expanded_ids = sorted({int(row["id"]) for row in sibling_rows})
+    return expanded_ids or selected_ids
+
+
 def queue_chrome_order_groups(
     lines: list[dict[str, Any]],
     amazon_account: dict[str, Any],
@@ -3229,6 +3265,7 @@ def queue_chrome_order_groups_fast(
         if not address:
             raise HTTPException(400, "Add a fulfilment address before placing Amazon orders.")
 
+        line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
         where_line_ids = ""
         params: list[Any] = [store_id]
         if line_ids:
@@ -3747,6 +3784,8 @@ def place_orders(
     placed = 0
     failed = 0
     with db() as conn:
+        if ordering_engine == "chrome":
+            line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
         where_line_ids = ""
         params: list[Any] = [store_id]
         if line_ids:
