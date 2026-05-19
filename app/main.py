@@ -5882,7 +5882,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                        ), 0) AS odoo_order_distinct_asin_count
                 FROM order_lines
                 WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
-                ORDER BY duplicate_asin_count DESC, asin, updated_at DESC
+                ORDER BY odoo_order_id DESC, asin, id
                 LIMIT ? OFFSET ?
             ),
             duplicate_all AS (

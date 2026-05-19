@@ -100,6 +100,7 @@ type AmazonAccount = {
 
 type OrderLine = {
   id: number
+  odoo_order_id?: number
   odoo_order_name: string
   odoo_order_date: string
   odoo_order_url: string
@@ -1248,6 +1249,14 @@ function App() {
       setCostlySelected([])
   }
 
+  function updateOrdersSearch(value: string) {
+    setSearch(value)
+    setSearchRows(null)
+    setOrdersPage(1)
+    setOrdersSelectAll(false)
+    setSelected([])
+  }
+
   function applyDashboardData(next: DashboardData, nextPage = ordersPage) {
     setData(next)
     setOrdersPage(next.page || nextPage)
@@ -1442,15 +1451,22 @@ function App() {
       setOrdersTotal(data?.total || ordersTotal)
       return
     }
+    let active = true
     const timer = window.setTimeout(() => {
       api<DashboardData>(`/api/search${pagedQuery(storeId, ordersPage)}&q=${encodeURIComponent(term)}`)
         .then((result) => {
+          if (!active) return
           setSearchRows(result.rows)
           setOrdersTotal(result.total || 0)
         })
-        .catch(() => setSearchRows(null))
+        .catch(() => {
+          if (active) setSearchRows(null)
+        })
     }, 250)
-    return () => window.clearTimeout(timer)
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+    }
   }, [search, storeId, ordersPage])
 
   useEffect(() => {
@@ -1474,14 +1490,33 @@ function App() {
   }, [rows, search, searchRows])
   const sortedRows = useMemo(() => {
     const multiplier = sortDirection === "asc" ? 1 : -1
-    return [...filteredRows].sort((a, b) => {
-      if (sortKey === "odoo_order_name") {
-        return a.odoo_order_name.localeCompare(b.odoo_order_name, undefined, { numeric: true, sensitivity: "base" }) * multiplier
-      }
-      const aValue = dateTimeValue(a[sortKey] || "")
-      const bValue = dateTimeValue(b[sortKey] || "")
-      return (aValue - bValue) * multiplier
+    const grouped = new Map<string, OrderLine[]>()
+    filteredRows.forEach((row) => {
+      const groupKey = Number(row.odoo_order_distinct_asin_count || 0) > 1
+        ? `order-${row.odoo_order_id || row.odoo_order_name}`
+        : `line-${row.id}`
+      grouped.set(groupKey, [...(grouped.get(groupKey) || []), row])
     })
+    const groupValue = (group: OrderLine[]) => {
+      if (sortKey === "odoo_order_name") {
+        return group[0]?.odoo_order_name || ""
+      }
+      const values = group.map((row) => dateTimeValue(row[sortKey] || "")).filter((value) => value > 0)
+      if (!values.length) return 0
+      return sortDirection === "asc" ? Math.min(...values) : Math.max(...values)
+    }
+    return Array.from(grouped.values()).sort((a, b) => {
+      if (sortKey === "odoo_order_name") {
+        return String(groupValue(a)).localeCompare(String(groupValue(b)), undefined, { numeric: true, sensitivity: "base" }) * multiplier
+      }
+      return (Number(groupValue(a)) - Number(groupValue(b))) * multiplier
+    }).flatMap((group) =>
+      [...group].sort((a, b) =>
+        a.odoo_order_name.localeCompare(b.odoo_order_name, undefined, { numeric: true, sensitivity: "base" })
+          || a.asin.localeCompare(b.asin)
+          || a.id - b.id,
+      ),
+    )
   }, [filteredRows, sortDirection, sortKey])
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
   const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
@@ -2080,13 +2115,13 @@ function App() {
                           role="button"
                           tabIndex={0}
                           onClick={() => {
-                            setSearch(group.asin)
+                            updateOrdersSearch(group.asin)
                             setSelected(rows.filter((row) => row.asin === group.asin && !row.amazon_order_id).map((row) => row.id))
                           }}
                           onKeyDown={(event) => {
                             if (event.key === "Enter" || event.key === " ") {
                               event.preventDefault()
-                              setSearch(group.asin)
+                              updateOrdersSearch(group.asin)
                               setSelected(rows.filter((row) => row.asin === group.asin && !row.amazon_order_id).map((row) => row.id))
                             }
                           }}
@@ -2140,7 +2175,7 @@ function App() {
                         {sortDirection === "asc" ? "Ascending" : "Descending"}
                       </Button>
                     </div>
-                    <SearchBox className="w-full sm:w-[360px]" value={search} onChange={setSearch} placeholder="Search order, product, ASIN, status..." />
+                    <SearchBox className="w-full sm:w-[360px]" value={search} onChange={updateOrdersSearch} placeholder="Search order, product, ASIN, status..." />
                     <Button variant="outline" onClick={() => setShowColumnSettings((current) => !current)}>
                       <Columns3 className="size-4" />
                       Columns
