@@ -5155,7 +5155,10 @@ def profit_loss_data(
     start: str = "",
     end: str = "",
     q: str = "",
+    page: int = 1,
+    per_page: int = 100,
 ) -> dict[str, Any]:
+    page, per_page, offset = pagination_bounds(page, per_page)
     start_dt, end_dt, resolved_month = date_range_from_params(period, month, start, end)
     start_text = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_text = end_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -5243,10 +5246,15 @@ def profit_loss_data(
         entry["orders"] += 1
         for metric in ("odoo_order_value", "amazon_order_value", "shipping_fee", "fulfilment_fee", "net_profit"):
             entry[metric] = round(float(entry[metric] or 0) + float(row.get(metric) or 0), 2)
+    total = len(order_rows)
+    paged_order_rows = order_rows[offset:offset + per_page]
     return {
         "summary": summary,
         "period_rows": sorted(grouped.values(), key=lambda item: item["period"], reverse=True),
-        "orders": order_rows,
+        "orders": paged_order_rows,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
         "imports": rows_to_dicts(imports),
         "start": start_dt.date().isoformat(),
         "end": end_dt.date().isoformat(),
@@ -6479,8 +6487,10 @@ def api_profit_loss(
     start: str = "",
     end: str = "",
     q: str = "",
+    page: int = 1,
+    per_page: int = 100,
 ) -> dict[str, Any]:
-    return profit_loss_data(store_id, period, month, start, end, q)
+    return profit_loss_data(store_id, period, month, start, end, q, page, per_page)
 
 
 @app.post("/api/profit-loss/shipping-upload")

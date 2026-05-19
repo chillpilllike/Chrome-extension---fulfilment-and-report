@@ -504,6 +504,9 @@ type ProfitLossData = {
   summary: Record<string, number>
   period_rows: Array<Record<string, number | string>>
   orders: ProfitLossOrder[]
+  page: number
+  per_page: number
+  total: number
   imports: Array<Record<string, string | number>>
   start: string
   end: string
@@ -4290,19 +4293,23 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
   const [period, setPeriod] = useState("monthly")
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7))
   const [query, setQuery] = useState("")
+  const [page, setPage] = useState(1)
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
 
-  async function load() {
+  async function load(nextPage = page) {
     const params = new URLSearchParams({ period, month, q: query })
     if (storeId) params.set("store_id", storeId)
+    params.set("page", String(nextPage))
+    params.set("per_page", String(PAGE_SIZE))
     const next = await api<ProfitLossData>(`/api/profit-loss?${params.toString()}`)
     setData(next)
+    setPage(next.page || nextPage)
   }
 
   useEffect(() => {
     load().catch((error) => onResult({ ok: false, title: "Profit/Loss load failed", message: String(error) }))
-  }, [storeId, period, month])
+  }, [storeId, period, month, page])
 
   async function uploadShipping() {
     if (!file) return
@@ -4315,12 +4322,20 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
       const result = await uploadWithAdminToken("/api/profit-loss/shipping-upload", form)
       onResult({ ok: true, title: "Shipping Imported", message: result.message || "Imported." })
       setFile(null)
-      await load()
+      await load(page)
     } catch (error) {
       onResult({ ok: false, title: "Shipping Import Failed", message: String(error) })
     } finally {
       setBusy(false)
     }
+  }
+
+  function applyFilters() {
+    if (page === 1) {
+      void load(1).catch((error) => onResult({ ok: false, title: "Profit/Loss load failed", message: String(error) }))
+      return
+    }
+    setPage(1)
   }
 
   const summary = data?.summary || {}
@@ -4349,20 +4364,20 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
           <CardTitle>Profit / Loss Controls</CardTitle>
         </CardHeader>
         <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_1fr_auto] lg:items-end">
-          <SelectField label="View" value={period} onChange={setPeriod}>
+          <SelectField label="View" value={period} onChange={(value) => { setPeriod(value); setPage(1) }}>
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
             <option value="monthly">Monthly</option>
           </SelectField>
           <div>
             <Label>Month</Label>
-            <Input type="month" value={month} onChange={(event) => setMonth(event.target.value)} />
+            <Input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setPage(1) }} />
           </div>
           <div>
             <Label>Search</Label>
             <SearchBox value={query} onChange={setQuery} placeholder="Odoo order or Amazon order" />
           </div>
-          <Button variant="outline" onClick={load}>Apply</Button>
+          <Button variant="outline" onClick={applyFilters}>Apply</Button>
         </CardContent>
         <CardContent className="grid gap-3 lg:grid-cols-[1fr_auto] lg:items-end">
           <div>
@@ -4452,6 +4467,15 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
             </TableBody>
           </Table>
         </CardContent>
+        <CardFooter>
+          <PaginationControls
+            page={data?.page || page}
+            total={data?.total || 0}
+            perPage={data?.per_page || PAGE_SIZE}
+            onPage={setPage}
+            disabled={busy}
+          />
+        </CardFooter>
       </Card>
     </div>
   )
