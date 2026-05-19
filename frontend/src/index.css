@@ -422,6 +422,10 @@
     align-items: start;
 }
 
+.tabler-admin-shell [class~="items-end"] {
+    align-items: end;
+}
+
 @media (min-width: 640px) {
     .tabler-admin-shell [class~="sm:grid-cols-2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .tabler-admin-shell [class~="sm:grid-cols-3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -443,6 +447,7 @@
     .tabler-admin-shell [class~="lg:grid-cols-[140px_160px_120px_160px_1fr_auto]"] { grid-template-columns: 140px 160px 120px 160px 1fr auto; }
     .tabler-admin-shell [class~="lg:grid-cols-[160px_180px_1fr_auto]"] { grid-template-columns: 160px 180px 1fr auto; }
     .tabler-admin-shell [class~="lg:grid-cols-[1fr_auto]"] { grid-template-columns: 1fr auto; }
+    .tabler-admin-shell [class~="lg:items-end"] { align-items: end; }
 }
 
 @media (min-width: 1280px) {
