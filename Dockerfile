@@ -13,7 +13,38 @@ FROM python:3.12-slim AS app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8000 \
+    APP_SECRET_KEY=change-this-in-coolify \
+    ADMIN_ACCESS_TOKEN=change-this-in-coolify \
+    MASTER_ADMIN_ACCESS_TOKEN=change-this-in-coolify \
+    POSTGRES_URL= \
+    DATABASE_URL= \
+    POSTGRES_POOL_MAX=10 \
+    TYPESENSE_URL= \
+    TYPESENSE_API_KEY= \
+    TYPESENSE_ENABLED=false \
+    OPENEXCHANGE_API_KEY= \
+    OPENEXCHANGE_SYNC_INTERVAL_MINUTES=2880 \
+    STORAGE_S3_ENDPOINT= \
+    STORAGE_S3_BUCKET= \
+    STORAGE_S3_REGION=auto \
+    STORAGE_S3_ACCESS_KEY_ID= \
+    STORAGE_S3_SECRET_ACCESS_KEY= \
+    BACKUP_S3_ENDPOINT= \
+    BACKUP_S3_BUCKET= \
+    AMAZON_API_BASE_URL=https://na.business-api.amazon.com \
+    AMAZON_TRACKING_API_BASE_URL=https://na.business-api.amazon.com \
+    AMAZON_LWA_TOKEN_URL=https://api.amazon.com/auth/o2/token \
+    AMAZON_LWA_CLIENT_ID= \
+    AMAZON_LWA_CLIENT_SECRET= \
+    AMAZON_LWA_REFRESH_TOKEN= \
+    AMAZON_API_ACCESS_TOKEN= \
+    AMAZON_PRODUCT_SEARCH_PATH=/products/2020-08-26/products \
+    AMAZON_ORDER_CREATE_PATH=/ordering/2022-10-30/orders \
+    AMAZON_ORDER_DETAILS_PATH=/ordering/2022-10-30/orders/{amazon_order_id} \
+    AMAZON_PACKAGE_TRACKING_PATH=/ab-tracking/2025-07-02/orders/{orderId}/shipments/{shipmentId}/packages/{packageId} \
+    AMAZON_ORDER_URL_TEMPLATE=https://www.amazon.com/gp/css/order-details?orderID={amazon_order_id} \
+    ODOO_VALIDATE_PICKINGS=true
 
 WORKDIR /app
 
