@@ -101,6 +101,7 @@ type AmazonAccount = {
 type OrderLine = {
   id: number
   odoo_order_name: string
+  odoo_order_date: string
   odoo_order_url: string
   product_name: string
   default_code: string
@@ -528,6 +529,7 @@ type AccountingData = {
 
 type OrderColumnKey =
   | "odoo_order"
+  | "odoo_order_date"
   | "product"
   | "reference"
   | "pulled_at"
@@ -545,7 +547,7 @@ type OrderColumnKey =
   | "comments"
   | "error"
 
-type SortKey = "pulled_at" | "ordered_at" | "odoo_order_name"
+type SortKey = "odoo_order_date" | "pulled_at" | "ordered_at" | "odoo_order_name"
 type SortDirection = "asc" | "desc"
 
 type OrderColumn = {
@@ -560,6 +562,7 @@ const ORDER_TABLE_STORAGE_KEY = "fulfilment.orderTable.columns.v1"
 
 const defaultOrderColumns: OrderColumn[] = [
   { key: "odoo_order", label: "Odoo Order", width: "w-32", sortable: "odoo_order_name" },
+  { key: "odoo_order_date", label: "Order Date", width: "w-44", sortable: "odoo_order_date" },
   { key: "product", label: "Product", width: "w-[520px]" },
   { key: "reference", label: "Reference", width: "w-48" },
   { key: "pulled_at", label: "Pulled At", width: "w-44", sortable: "pulled_at" },
@@ -597,7 +600,7 @@ function loadOrderColumns() {
 
 function formatDateTime(value?: string) {
   if (!value) return ""
-  const date = new Date(value)
+  const date = new Date(value.includes("T") ? value : value.replace(" ", "T"))
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString(undefined, {
     year: "numeric",
@@ -606,6 +609,12 @@ function formatDateTime(value?: string) {
     hour: "2-digit",
     minute: "2-digit",
   })
+}
+
+function dateTimeValue(value?: string) {
+  if (!value) return 0
+  const parsed = Date.parse(value.includes("T") ? value : value.replace(" ", "T"))
+  return Number.isNaN(parsed) ? 0 : parsed
 }
 
 function formatMoney(value?: number) {
@@ -1467,10 +1476,8 @@ function App() {
       if (sortKey === "odoo_order_name") {
         return a.odoo_order_name.localeCompare(b.odoo_order_name, undefined, { numeric: true, sensitivity: "base" }) * multiplier
       }
-      const aTime = Date.parse(a[sortKey] || "")
-      const bTime = Date.parse(b[sortKey] || "")
-      const aValue = Number.isNaN(aTime) ? 0 : aTime
-      const bValue = Number.isNaN(bTime) ? 0 : bTime
+      const aValue = dateTimeValue(a[sortKey] || "")
+      const bValue = dateTimeValue(b[sortKey] || "")
       return (aValue - bValue) * multiplier
     })
   }, [filteredRows, sortDirection, sortKey])
@@ -1628,6 +1635,8 @@ function App() {
             {row.default_code}
           </button>
         )
+      case "odoo_order_date":
+        return <span className="text-xs text-muted-foreground">{formatDateTime(row.odoo_order_date)}</span>
       case "pulled_at":
         return <span className="text-xs text-muted-foreground">{formatDateTime(row.pulled_at || row.created_at)}</span>
       case "ordered_at":
@@ -2101,6 +2110,7 @@ function App() {
                   <CardTitle>Odoo Order Lines</CardTitle>
                   <div className="btn-list">
                     <SelectField className="w-[190px]" label="Sort by" value={sortKey} onChange={(value) => setSortKey(value as SortKey)}>
+                      <option value="odoo_order_date">Order date</option>
                       <option value="pulled_at">Pulled date</option>
                       <option value="ordered_at">Placed date</option>
                       <option value="odoo_order_name">Order number</option>

@@ -151,6 +151,7 @@ def init_db() -> None:
                 store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
                 odoo_order_id INTEGER NOT NULL,
                 odoo_order_name TEXT NOT NULL,
+                odoo_order_date TEXT,
                 odoo_line_id INTEGER NOT NULL,
                 product_id INTEGER,
                 product_tmpl_id INTEGER,
@@ -485,6 +486,7 @@ def init_db() -> None:
             conn.execute(index_sql)
         for column, ddl in {
             "odoo_order_state": "ALTER TABLE order_lines ADD COLUMN odoo_order_state TEXT",
+            "odoo_order_date": "ALTER TABLE order_lines ADD COLUMN odoo_order_date TEXT",
             "odoo_invoice_status": "ALTER TABLE order_lines ADD COLUMN odoo_invoice_status TEXT",
             "odoo_status_label": "ALTER TABLE order_lines ADD COLUMN odoo_status_label TEXT",
             "tracking_status": "ALTER TABLE order_lines ADD COLUMN tracking_status TEXT",
@@ -1908,7 +1910,7 @@ def save_combined_order_line(
         conn.execute(
             """
             INSERT INTO order_lines
-            (store_id, odoo_order_id, odoo_order_name, odoo_line_id, product_id, product_tmpl_id,
+            (store_id, odoo_order_id, odoo_order_name, odoo_order_date, odoo_line_id, product_id, product_tmpl_id,
              product_name, default_code, internal_note, asin_from_reference, asin_from_note, asin,
              supplier_part_auxiliary_id,
              quantity, store_unit_price, store_total_price, store_currency, store_currency_rate_to_usd,
@@ -1917,9 +1919,10 @@ def save_combined_order_line(
              amazon_order_url, amazon_account_id, amazon_account_name, amazon_group_key, amazon_status,
              tracking_status, tracking_payload, tracking_checked_at, state, last_error, source_odoo_line_ids,
              source_line_count, raw_json, pulled_at, ordered_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(store_id, odoo_line_id) DO UPDATE SET
                 odoo_order_name=excluded.odoo_order_name,
+                odoo_order_date=excluded.odoo_order_date,
                 product_id=excluded.product_id,
                 product_tmpl_id=excluded.product_tmpl_id,
                 product_name=excluded.product_name,
@@ -1970,6 +1973,7 @@ def save_combined_order_line(
                 store.id,
                 order["id"],
                 order["name"],
+                order.get("date_order") or "",
                 canonical_line_id,
                 combined.get("product_id"),
                 combined.get("product_tmpl_id"),
@@ -5673,6 +5677,43 @@ def amazon_otp_loop() -> None:
         time.sleep(60)
 
 
+def backfill_missing_order_dates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates = [row for row in rows if not clean_text(row.get("odoo_order_date")) and int(row.get("store_id") or 0) and int(row.get("odoo_order_id") or 0)]
+    if not candidates:
+        return rows
+    updated_rows = [dict(row) for row in rows]
+    by_store: dict[int, set[int]] = {}
+    for row in candidates:
+        by_store.setdefault(int(row["store_id"]), set()).add(int(row["odoo_order_id"]))
+    dates: dict[tuple[int, int], str] = {}
+    for store_id, order_ids in by_store.items():
+        try:
+            store = get_store(store_id)
+            odoo = OdooClient(store)
+            fields = odoo.existing_fields("sale.order", ["id", "date_order"])
+            if "date_order" not in fields:
+                continue
+            for order in odoo.read("sale.order", sorted(order_ids), fields):
+                order_date = clean_text(order.get("date_order"))
+                if order_date:
+                    dates[(store_id, int(order["id"]))] = order_date
+        except Exception:
+            continue
+    if not dates:
+        return rows
+    with db() as conn:
+        for row in updated_rows:
+            order_date = dates.get((int(row.get("store_id") or 0), int(row.get("odoo_order_id") or 0)))
+            if not order_date:
+                continue
+            row["odoo_order_date"] = order_date
+            conn.execute(
+                "UPDATE order_lines SET odoo_order_date=?, updated_at=? WHERE id=?",
+                (order_date, utc_now(), row["id"]),
+            )
+    return updated_rows
+
+
 def amazon_otp_rows(q: str = "") -> list[dict[str, Any]]:
     term = clean_text(q).lower()
     term_digits = re.sub(r"\D+", "", term)
@@ -5844,6 +5885,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     current_store_id = payload.get("current_store_id")
     row_dicts = payload.get("rows") or []
     stores_by_id = {store["id"]: store for store in stores}
+    row_dicts = backfill_missing_order_dates(row_dicts)
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
