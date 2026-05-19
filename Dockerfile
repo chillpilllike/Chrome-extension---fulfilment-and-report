@@ -1,11 +1,23 @@
-FROM node:22-bookworm-slim AS frontend-build
+FROM node:22-bookworm-slim AS source
 
-WORKDIR /build/frontend
+ARG REPO_URL=https://github.com/chillpilllike/Chrome-extension---fulfilment-and-report.git
+ARG GIT_BRANCH=main
 
-COPY frontend/package*.json ./
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bust Docker cache whenever the public GitHub main branch changes.
+ADD https://api.github.com/repos/chillpilllike/Chrome-extension---fulfilment-and-report/commits/main /tmp/github-version.json
+
+WORKDIR /src
+RUN git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" .
+
+
+FROM source AS frontend-build
+
+WORKDIR /src/frontend
 RUN npm ci
-
-COPY frontend/ ./
 RUN npm run build
 
 
@@ -52,11 +64,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
+COPY --from=source /src/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
-COPY --from=frontend-build /build/frontend/dist ./frontend/dist
+COPY --from=source /src/app ./app
+COPY --from=frontend-build /src/frontend/dist ./frontend/dist
 
 EXPOSE 8000
 
