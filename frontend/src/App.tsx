@@ -140,6 +140,7 @@ type OrderLine = {
 
 type DuplicateAsin = {
   asin: string
+  asin_url?: string
   line_count: number
   order_count: number
   total_quantity: number
@@ -2074,19 +2075,36 @@ function App() {
                   {duplicateAsins.length ? (
                     <div className="list-group">
                       {duplicateAsins.map((group) => (
-                        <button
+                        <div
                           key={group.asin}
+                          role="button"
+                          tabIndex={0}
                           onClick={() => {
                             setSearch(group.asin)
                             setSelected(rows.filter((row) => row.asin === group.asin && !row.amazon_order_id).map((row) => row.id))
                           }}
-                          className="list-group-item"
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault()
+                              setSearch(group.asin)
+                              setSelected(rows.filter((row) => row.asin === group.asin && !row.amazon_order_id).map((row) => row.id))
+                            }
+                          }}
+                          className="list-group-item cursor-pointer"
                         >
-                          <span className="font-mono font-medium">{group.asin}</span>
+                          <a
+                            className="font-mono font-medium text-primary underline-offset-4 hover:underline"
+                            href={group.asin_url || `https://www.amazon.com/dp/${encodeURIComponent(group.asin)}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            {group.asin}
+                          </a>
                           <span className="text-muted-foreground">
                             {group.order_count} orders, qty {group.total_quantity}
                           </span>
-                        </button>
+                        </div>
                       ))}
                     </div>
                   ) : (
