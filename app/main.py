@@ -1396,7 +1396,7 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
                 WHERE (? IS NULL OR store_id=?)
                   AND COALESCE(asin, '') != ''
                   AND COALESCE(amazon_order_id, '') = ''
-                  AND state != 'missing'
+                  AND state = 'pulled'
                   AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
                 GROUP BY asin
                 HAVING COUNT(DISTINCT odoo_order_name) > 1
@@ -1415,7 +1415,7 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
             WHERE (? IS NULL OR store_id=?)
               AND COALESCE(asin, '') != ''
               AND COALESCE(amazon_order_id, '') = ''
-              AND state != 'missing'
+              AND state = 'pulled'
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
             GROUP BY asin
             HAVING COUNT(DISTINCT odoo_order_name) > 1
@@ -5947,7 +5947,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
                   AND COALESCE(asin, '') != ''
                   AND COALESCE(amazon_order_id, '') = ''
-                  AND state != 'missing'
+                  AND state = 'pulled'
                   AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
                 GROUP BY asin
                 HAVING COUNT(DISTINCT odoo_order_name) > 1
@@ -6378,9 +6378,20 @@ def api_bulk_place(payload: BulkPlacePayload) -> dict[str, Any]:
     with db() as conn:
         placeholders = ",".join("?" for _ in payload.line_ids)
         rows = conn.execute(
-            f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
+            f"""
+            SELECT *
+            FROM order_lines
+            WHERE store_id=?
+              AND id IN ({placeholders})
+              AND COALESCE(asin, '') != ''
+              AND COALESCE(amazon_order_id, '') = ''
+              AND state = 'pulled'
+              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            """,
             [payload.store_id, *payload.line_ids],
         ).fetchall()
+        if not rows:
+            return {"ok": False, "message": "Those bulk rows are no longer available to order. Refreshing opportunities."}
         missing_orders = conn.execute(
             f"""
             SELECT DISTINCT odoo_order_id
@@ -6406,11 +6417,12 @@ def api_bulk_place(payload: BulkPlacePayload) -> dict[str, Any]:
                         (utc_now(), row["id"]),
                     )
             return {"ok": False, "message": "Moved affected bulk rows to Missing because one of their Odoo orders also has a missing item."}
+    eligible_line_ids = [int(row["id"]) for row in rows]
     ordered, skipped = place_orders(
         payload.store_id,
         address_id=payload.address_id,
         amazon_account_id=payload.amazon_account_id,
-        line_ids=payload.line_ids,
+        line_ids=eligible_line_ids,
         club=True,
         ordering_engine=payload.ordering_engine,
     )
