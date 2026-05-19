@@ -2452,6 +2452,193 @@ def backfill_missing_currency_for_chrome_rows(rows: list[dict[str, Any]]) -> lis
         return rows
 
 
+def line_ids_from_row(row: dict[str, Any]) -> list[int]:
+    raw_ids = clean_text(row.get("source_odoo_line_ids") if "source_odoo_line_ids" in row.keys() else "")
+    ids: list[int] = []
+    for part in raw_ids.split(","):
+        try:
+            line_id = int(part.strip())
+        except Exception:
+            continue
+        if line_id not in ids:
+            ids.append(line_id)
+    if not ids:
+        try:
+            ids.append(int(row["odoo_line_id"]))
+        except Exception:
+            pass
+    return ids
+
+
+def backfill_missing_order_financials_for_profit_loss(
+    store_id: Optional[int],
+    start_text: str,
+    end_text: str,
+) -> None:
+    with db() as conn:
+        candidates = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT *
+                FROM (
+                    SELECT order_lines.*,
+                           MIN(COALESCE(NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at))
+                           OVER (PARTITION BY store_id, odoo_order_id) AS profit_order_date
+                    FROM order_lines
+                    WHERE (? IS NULL OR store_id=?)
+                ) AS candidate_lines
+                WHERE profit_order_date BETWEEN ? AND ?
+                  AND (
+                    COALESCE(store_currency, '') = ''
+                    OR COALESCE(store_currency_rate_to_usd, 0) <= 0
+                    OR store_total_native IS NULL
+                  )
+                """,
+                (store_id, store_id, start_text, end_text),
+            ).fetchall()
+        )
+    if not candidates:
+        return
+    settings = get_service_settings()
+    by_store: dict[int, list[dict[str, Any]]] = {}
+    for row in candidates:
+        by_store.setdefault(int(row["store_id"]), []).append(row)
+    for candidate_store_id, rows in by_store.items():
+        try:
+            store = get_store(candidate_store_id)
+            odoo = OdooClient(store)
+            order_ids = sorted({int(row["odoo_order_id"]) for row in rows})
+            order_fields = odoo.existing_fields("sale.order", ["id", "currency_id", "order_line"])
+            order_rows = odoo.read("sale.order", order_ids, order_fields)
+            orders_by_id = {int(order["id"]): order for order in order_rows}
+            all_line_ids = sorted({int(line_id) for order in order_rows for line_id in (order.get("order_line") or [])})
+            if not all_line_ids:
+                continue
+            line_fields = odoo.existing_fields(
+                "sale.order.line",
+                ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"],
+            )
+            line_rows = odoo.read("sale.order.line", all_line_ids, line_fields)
+            lines_by_id = {int(line["id"]): line for line in line_rows}
+            product_ids = sorted({int(line["product_id"][0]) for line in line_rows if line.get("product_id")})
+            product_fields = odoo.existing_fields("product.product", ["id", "default_code"])
+            products = {int(product["id"]): product for product in odoo.read("product.product", product_ids, product_fields)}
+            rows_by_order: dict[int, list[dict[str, Any]]] = {}
+            for row in rows:
+                rows_by_order.setdefault(int(row["odoo_order_id"]), []).append(row)
+            updates: list[tuple[Any, ...]] = []
+            for order_id, order_rows_for_order in rows_by_order.items():
+                order = orders_by_id.get(order_id)
+                if not order:
+                    continue
+                currency = order_currency_code(order)
+                rate = conversion_rate_to_usd(currency, settings)
+                order_line_ids = [int(line_id) for line_id in (order.get("order_line") or []) if int(line_id) in lines_by_id]
+                source_line_ids = {line_id for row in order_rows_for_order for line_id in line_ids_from_row(row)}
+                line_totals_by_row: dict[int, float] = {}
+                subtotal_native = 0.0
+                for row in order_rows_for_order:
+                    row_total = 0.0
+                    for line_id in line_ids_from_row(row):
+                        line = lines_by_id.get(line_id)
+                        if line:
+                            row_total += line_native_total(line)
+                    if not row_total:
+                        row_total = float(row.get("store_total_native") or row.get("store_total_price") or 0)
+                    line_totals_by_row[int(row["id"])] = row_total
+                    subtotal_native += row_total
+                delivery_native = 0.0
+                discount_native = 0.0
+                other_adjustment_native = 0.0
+                for line_id in order_line_ids:
+                    if line_id in source_line_ids:
+                        continue
+                    line = lines_by_id[line_id]
+                    product_id = int(line["product_id"][0]) if line.get("product_id") else 0
+                    default_code = str((products.get(product_id) or {}).get("default_code") or "")
+                    if line.get("display_type"):
+                        continue
+                    if is_delivery_line(line, default_code):
+                        delivery_native += line_native_total(line)
+                    elif is_discount_line(line, default_code) or line_native_total(line) < 0:
+                        discount_native += line_native_total(line)
+                    elif is_order_adjustment_line(line, products.get(product_id) or {}, {}):
+                        other_adjustment_native += line_native_total(line)
+                adjustment_native = delivery_native + discount_native + other_adjustment_native
+                for row in order_rows_for_order:
+                    row_native = line_totals_by_row.get(int(row["id"]), 0.0)
+                    allocation_ratio = (row_native / subtotal_native) if subtotal_native else 0.0
+                    allocated_delivery = delivery_native * allocation_ratio
+                    allocated_discount = discount_native * allocation_ratio
+                    allocated_adjustment = adjustment_native * allocation_ratio
+                    total_native = row_native + allocated_adjustment
+                    usd_total = total_native * rate
+                    quantity = float(row.get("quantity") or 1)
+                    updates.append(
+                        (
+                            currency,
+                            rate,
+                            row_native,
+                            allocated_delivery,
+                            allocated_discount,
+                            allocated_adjustment,
+                            total_native,
+                            (usd_total / quantity) if quantity else 0,
+                            usd_total,
+                            (usd_total - float(row.get("amazon_total_price") or 0)) if row.get("amazon_total_price") is not None else None,
+                            utc_now(),
+                            row["id"],
+                        )
+                    )
+            if updates:
+                with db() as conn:
+                    for update in updates:
+                        conn.execute(
+                            """
+                            UPDATE order_lines
+                            SET store_currency=?,
+                                store_currency_rate_to_usd=?,
+                                store_subtotal_native=?,
+                                store_delivery_native=?,
+                                store_discount_native=?,
+                                store_adjustment_native=?,
+                                store_total_native=?,
+                                store_unit_price=?,
+                                store_total_price=?,
+                                chrome_profit_total=COALESCE(?, chrome_profit_total),
+                                updated_at=?
+                            WHERE id=?
+                            """,
+                            update,
+                        )
+        except Exception:
+            continue
+
+
+def normalize_converted_profit_columns(store_id: Optional[int], start_text: str, end_text: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET store_total_price=store_total_native * store_currency_rate_to_usd,
+                store_unit_price=CASE
+                    WHEN COALESCE(quantity, 0) != 0 THEN (store_total_native * store_currency_rate_to_usd) / quantity
+                    ELSE store_total_price
+                END,
+                chrome_profit_total=CASE
+                    WHEN amazon_total_price IS NOT NULL THEN (store_total_native * store_currency_rate_to_usd) - amazon_total_price
+                    ELSE chrome_profit_total
+                END,
+                updated_at=?
+            WHERE (? IS NULL OR store_id=?)
+              AND COALESCE(NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at) BETWEEN ? AND ?
+              AND store_total_native IS NOT NULL
+              AND COALESCE(store_currency_rate_to_usd, 0) > 0
+            """,
+            (utc_now(), store_id, store_id, start_text, end_text),
+        )
+
+
 def group_lines_for_amazon_order(lines: list[dict[str, Any]], club: bool = False) -> list[list[dict[str, Any]]]:
     if not lines:
         return []
@@ -4880,6 +5067,8 @@ def profit_loss_data(
     start_text = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_text = end_dt.strftime("%Y-%m-%d %H:%M:%S")
     search = f"%{q.strip()}%" if q.strip() else None
+    backfill_missing_order_financials_for_profit_loss(store_id, start_text, end_text)
+    normalize_converted_profit_columns(store_id, start_text, end_text)
     with db() as conn:
         rows = conn.execute(
             """
@@ -4889,7 +5078,13 @@ def profit_loss_data(
                     odoo_order_id,
                     odoo_order_name,
                     MIN(COALESCE(NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at)) AS order_date,
-                    SUM(COALESCE(store_total_price, store_unit_price * quantity, 0)) AS odoo_order_value,
+                    SUM(
+                        CASE
+                            WHEN store_total_native IS NOT NULL AND COALESCE(store_currency_rate_to_usd, 0) > 0
+                                THEN COALESCE(store_total_native, 0) * COALESCE(store_currency_rate_to_usd, 1)
+                            ELSE COALESCE(store_total_price, store_unit_price * quantity, 0)
+                        END
+                    ) AS odoo_order_value,
                     SUM(COALESCE(store_delivery_native, 0) * COALESCE(store_currency_rate_to_usd, 1)) AS collected_delivery,
                     SUM(COALESCE(store_discount_native, 0) * COALESCE(store_currency_rate_to_usd, 1)) AS order_discounts,
                     SUM(COALESCE(amazon_total_price, amazon_unit_price * quantity, 0)) AS amazon_order_value,
