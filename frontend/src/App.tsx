@@ -5846,31 +5846,104 @@ function formatScriptConfigValue(value: any): string {
   if (value === true) return "Yes"
   if (value === false) return "No"
   if (value === null || value === undefined || value === "") return "Not set"
-  if (Array.isArray(value) || typeof value === "object") return JSON.stringify(value, null, 2)
+  if (Array.isArray(value)) return value.map(formatScriptConfigValue).join(", ")
+  if (typeof value === "object") return Object.entries(value).map(([key, item]) => `${key.replace(/_/g, " ")}: ${formatScriptConfigValue(item)}`).join(", ")
   return String(value)
 }
 
-function ScriptConfigCard({ title, config }: { title: string; config: Record<string, any> }) {
+function scriptConfigTitle(script: string) {
+  if (script === "dtb") return "DTB Export Script"
+  if (script === "tracking") return "Tracking Sync Script"
+  return "DTC Export Script"
+}
+
+function ScriptConfigField({ label, value }: { label: string; value: any }) {
+  return (
+    <div className="grid min-w-0 gap-1.5">
+      <Label className="capitalize">{label.replace(/_/g, " ")}</Label>
+      <Input readOnly value={formatScriptConfigValue(value)} className="bg-muted/30" />
+    </div>
+  )
+}
+
+function ScriptConfigObjectFields({ value }: { value: Record<string, any> }) {
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      {Object.entries(value).map(([key, item]) => (
+        <ScriptConfigField key={key} label={key} value={item} />
+      ))}
+    </div>
+  )
+}
+
+function ScriptConfigArrayFields({ label, value }: { label: string; value: any[] }) {
+  return (
+    <div className="grid gap-2">
+      <div className="font-semibold capitalize">{label.replace(/_/g, " ")}</div>
+      <div className="grid gap-3">
+        {value.map((item, index) => (
+          <div key={`${label}-${index}`} className="rounded border bg-muted/10 p-3">
+            <div className="mb-3 text-xs font-semibold uppercase text-muted-foreground">{label.replace(/_/g, " ")} {index + 1}</div>
+            {item && typeof item === "object" && !Array.isArray(item) ? (
+              <ScriptConfigObjectFields value={item} />
+            ) : (
+              <ScriptConfigField label={label} value={item} />
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ScriptConfigSection({ label, value }: { label: string; value: any }) {
+  if (Array.isArray(value)) return <ScriptConfigArrayFields label={label} value={value} />
+  if (value && typeof value === "object") {
+    return (
+      <div className="grid gap-2">
+        <div className="font-semibold capitalize">{label.replace(/_/g, " ")}</div>
+        <div className="rounded border bg-muted/10 p-3">
+          <ScriptConfigObjectFields value={value} />
+        </div>
+      </div>
+    )
+  }
+  return <ScriptConfigField label={label} value={value} />
+}
+
+function ScriptConfigPanel({
+  activeScript,
+  onActiveScript,
+  config,
+}: {
+  activeScript: string
+  onActiveScript: (value: string) => void
+  config: ShopifyScriptConfig
+}) {
+  const selectedConfig = (config[activeScript as keyof ShopifyScriptConfig] || {}) as Record<string, any>
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">{title}</CardTitle>
-        <CardDescription>Read from the bundled script currently used by the app.</CardDescription>
+        <CardTitle className="text-base">Bundled Script Settings</CardTitle>
+        <CardDescription>Select a script to view its current settings as regular fields.</CardDescription>
       </CardHeader>
-      <CardContent className="grid gap-3 text-sm">
-        {Object.entries(config).map(([key, value]) => {
-          const complex = Array.isArray(value) || (value && typeof value === "object")
-          return (
-            <div key={key} className="grid gap-1">
-              <div className="font-semibold capitalize">{key.replace(/_/g, " ")}</div>
-              {complex ? (
-                <pre className="max-h-64 overflow-auto rounded border bg-muted/40 p-3 text-xs leading-relaxed">{formatScriptConfigValue(value)}</pre>
-              ) : (
-                <div className="text-muted-foreground">{formatScriptConfigValue(value)}</div>
-              )}
-            </div>
-          )
-        })}
+      <CardContent className="grid gap-4 text-sm">
+        <div className="grid gap-3 md:grid-cols-[minmax(220px,320px)_1fr] md:items-end">
+          <SelectField label="Script" value={activeScript} onChange={onActiveScript}>
+            <option value="dtc">DTC Export Script</option>
+            <option value="dtb">DTB Export Script</option>
+            <option value="tracking">Tracking Sync Script</option>
+          </SelectField>
+          <div className="rounded border bg-muted/10 px-3 py-2">
+            <div className="text-xs font-semibold uppercase text-muted-foreground">Current Selection</div>
+            <div className="font-semibold">{scriptConfigTitle(activeScript)}</div>
+          </div>
+        </div>
+        <div className="grid gap-4">
+          {Object.entries(selectedConfig).map(([key, value]) => (
+            <ScriptConfigSection key={key} label={key} value={value} />
+          ))}
+        </div>
       </CardContent>
     </Card>
   )
@@ -5895,6 +5968,7 @@ function SettingsPage({
   const [creating, setCreating] = useState(false)
   const [settings, setSettings] = useState<ServiceSettings>({})
   const [shopifyScriptConfig, setShopifyScriptConfig] = useState<ShopifyScriptConfig | null>(null)
+  const [activeShopifyScript, setActiveShopifyScript] = useState("dtc")
   const [savingServices, setSavingServices] = useState("")
   const [reindexProgress, setReindexProgress] = useState<ReindexProgress | null>(null)
   const [adminCode, setAdminCode] = useState("")
@@ -6083,11 +6157,7 @@ function SettingsPage({
             </Button>
           </div>
           {shopifyScriptConfig && (
-            <div className="grid gap-3 lg:grid-cols-3">
-              <ScriptConfigCard title="DTC Export Script Settings" config={shopifyScriptConfig.dtc || {}} />
-              <ScriptConfigCard title="DTB Export Script Settings" config={shopifyScriptConfig.dtb || {}} />
-              <ScriptConfigCard title="Tracking Sync Script Settings" config={shopifyScriptConfig.tracking || {}} />
-            </div>
+            <ScriptConfigPanel activeScript={activeShopifyScript} onActiveScript={setActiveShopifyScript} config={shopifyScriptConfig} />
           )}
         </CardContent>
       </Card>
