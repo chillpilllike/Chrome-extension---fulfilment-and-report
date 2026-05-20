@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Nutricity Fulfilment</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>Nutricity Fulfilment</h1>
+      <label>
+        App URL
+        <input id="apiBase" spellcheck="false">
+      </label>
+      <label>
+        Admin token
+        <input id="adminToken" type="password" spellcheck="false" autocomplete="off">
+      </label>
+      <div class="actions">
+        <button id="save">Save</button>
+        <button id="testConnection" class="secondary">Check connection</button>
+        <button id="start">Start next queued order</button>
+        <button id="pauseResume" class="secondary">Pause</button>
+        <button id="stop" class="secondary">Stop</button>
+        <button id="clearFailed" class="danger">Clear failed jobs</button>
+      </div>
+      <section id="status"></section>
+      <section class="queue">
+        <div class="section-title">
+          <h2>Queued orders</h2>
+          <span id="queueCount">0 waiting</span>
+        </div>
+        <div id="queuedJobs" class="queued-jobs"></div>
+      </section>
+      <section class="pricing">
+        <h2>Profit check</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>ASIN</th>
+              <th>Qty</th>
+              <th>Store</th>
+              <th>Amazon</th>
+              <th>P/L</th>
+            </tr>
+          </thead>
+          <tbody id="pricingRows"></tbody>
+          <tfoot>
+            <tr>
+              <td colspan="4">Total</td>
+              <td id="pricingTotal">$0.00</td>
+            </tr>
+          </tfoot>
+        </table>
+      </section>
+      <ol id="logs"></ol>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

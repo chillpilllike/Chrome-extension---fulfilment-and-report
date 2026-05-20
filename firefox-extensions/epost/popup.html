@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Nutricity ePost Tracking</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>Nutricity ePost Tracking</h1>
+      <label>
+        App URL
+        <input id="apiBase" spellcheck="false">
+      </label>
+      <label>
+        Admin token
+        <input id="adminToken" type="password" spellcheck="false" autocomplete="off">
+      </label>
+      <label>
+        Track again after days
+        <input id="intervalDays" type="number" min="1" max="30" step="1">
+      </label>
+      <div class="actions">
+        <button id="save">Save</button>
+        <button id="testConnection" class="secondary">Check connection</button>
+        <button id="start">Track due codes</button>
+        <button id="stop" class="secondary">Stop</button>
+      </div>
+      <section id="status"></section>
+      <ol id="logs"></ol>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

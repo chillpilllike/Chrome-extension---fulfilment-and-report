@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Nutricity Manual Matcher</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>Manual Amazon Matcher</h1>
+      <label>
+        App URL
+        <input id="apiBase" spellcheck="false">
+      </label>
+      <label>
+        Admin token
+        <input id="adminToken" type="password" spellcheck="false" autocomplete="off">
+      </label>
+      <label>
+        Max order-history pages
+        <input id="maxPages" type="number" min="1" max="100">
+      </label>
+      <div class="actions">
+        <button id="save">Save</button>
+        <button id="testConnection" class="secondary">Check connection</button>
+        <button id="scanCurrent">Scan current page</button>
+        <button id="start">Start history scan</button>
+        <button id="stop" class="secondary">Stop</button>
+      </div>
+      <section id="status"></section>
+      <ol id="logs"></ol>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
