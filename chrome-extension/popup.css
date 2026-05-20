@@ -69,6 +69,10 @@ button.secondary {
   background: #475569;
 }
 
+button.warning {
+  background: #7c3aed;
+}
+
 button.danger {
   background: #b42318;
 }

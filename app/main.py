@@ -133,6 +133,7 @@ FRONTEND_SHELL_PATHS = {
     "/duplicate-tracking",
     "/fulfilment-pending",
     "/missing",
+    "/partial-fulfilments",
     "/bulk",
     "/costly",
     "/profit-loss",
@@ -189,6 +190,7 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_accounting_documents_type_region_created ON accounting_documents(document_type, tax_region, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_payment_failures_status_detected ON amazon_payment_failures(status, detected_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_payment_failures_store_status ON amazon_payment_failures(store_id, status, detected_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_partial_fulfilments_store_status ON partial_fulfilments(store_id, status, updated_at DESC)",
     )
     for index_sql in index_statements:
         conn.execute(index_sql)
@@ -725,6 +727,22 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 resolved_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS partial_fulfilments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL,
+                odoo_order_id INTEGER NOT NULL,
+                odoo_order_name TEXT NOT NULL,
+                amazon_group_key TEXT,
+                missing_line_ids TEXT NOT NULL DEFAULT '[]',
+                missing_asins TEXT NOT NULL DEFAULT '[]',
+                remaining_line_ids TEXT NOT NULL DEFAULT '[]',
+                message TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                processed_at TEXT
+            );
             """
         )
         for column, ddl in {
@@ -758,6 +776,7 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_shopify_export_sku_dest ON shopify_export_sku_map(dest_name, sku)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_export_customer_dest ON shopify_export_customer_map(dest_name, map_key)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_sync_order ON shopify_tracking_sync_log(odoo_db, odoo_order)",
+            "CREATE INDEX IF NOT EXISTS idx_partial_fulfilments_store_status ON partial_fulfilments(store_id, status, updated_at DESC)",
         ):
             conn.execute(index_sql)
         for column, ddl in {
@@ -2004,6 +2023,164 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
     return len(rows)
 
 
+def _json_int_list(values: list[Any]) -> str:
+    normalized: list[int] = []
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed not in normalized:
+            normalized.append(parsed)
+    return json.dumps(normalized)
+
+
+def _json_text_list(values: list[Any]) -> str:
+    normalized: list[str] = []
+    for value in values:
+        text = clean_text(value).upper()
+        if text and text not in normalized:
+            normalized.append(text)
+    return json.dumps(normalized)
+
+
+def _json_load_list(value: Any) -> list[Any]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def partial_fulfilment_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+    item = row_to_dict(row) or {}
+    item["missing_line_ids"] = _json_load_list(item.get("missing_line_ids"))
+    item["missing_asins"] = _json_load_list(item.get("missing_asins"))
+    item["remaining_line_ids"] = _json_load_list(item.get("remaining_line_ids"))
+    return item
+
+
+def list_partial_fulfilments(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    where = ["status='open'"]
+    params: list[Any] = []
+    if store_id:
+        where.append("store_id=?")
+        params.append(store_id)
+    where_sql = " AND ".join(where)
+    with db() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS total FROM partial_fulfilments WHERE {where_sql}", params).fetchone()["total"])
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM partial_fulfilments
+            WHERE {where_sql}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+    return rows, total
+
+
+def record_partial_fulfilment(
+    conn: Any,
+    group_key: str,
+    message: str,
+    missing_rows: list[dict[str, Any]],
+    remaining_rows: list[dict[str, Any]],
+) -> None:
+    by_order: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    for row in missing_rows:
+        order_id = int(row["odoo_order_id"] or 0)
+        if order_id:
+            by_order.setdefault(order_id, {"missing": [], "remaining": []})["missing"].append(row)
+    for row in remaining_rows:
+        order_id = int(row["odoo_order_id"] or 0)
+        if order_id:
+            by_order.setdefault(order_id, {"missing": [], "remaining": []})["remaining"].append(row)
+
+    now = utc_now()
+    for order_id, grouped in by_order.items():
+        if not grouped["missing"] or not grouped["remaining"]:
+            continue
+        first = grouped["missing"][0]
+        store_id = int(first["store_id"] or 0)
+        if not store_id:
+            continue
+        existing = conn.execute(
+            """
+            SELECT *
+            FROM partial_fulfilments
+            WHERE store_id=?
+              AND odoo_order_id=?
+              AND COALESCE(amazon_group_key, '')=?
+              AND status='open'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (store_id, order_id, group_key),
+        ).fetchone()
+        missing_ids = [int(row["id"]) for row in grouped["missing"]]
+        missing_asins = [row["missing_asin"] or row["asin"] for row in grouped["missing"]]
+        remaining_ids = [int(row["id"]) for row in grouped["remaining"]]
+        if existing:
+            missing_ids.extend(_json_load_list(existing["missing_line_ids"]))
+            missing_asins.extend(_json_load_list(existing["missing_asins"]))
+            remaining_ids.extend(_json_load_list(existing["remaining_line_ids"]))
+            conn.execute(
+                """
+                UPDATE partial_fulfilments
+                SET missing_line_ids=?,
+                    missing_asins=?,
+                    remaining_line_ids=?,
+                    message=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    _json_int_list(missing_ids),
+                    _json_text_list(missing_asins),
+                    _json_int_list(remaining_ids),
+                    message,
+                    now,
+                    existing["id"],
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO partial_fulfilments (
+                    store_id,
+                    odoo_order_id,
+                    odoo_order_name,
+                    amazon_group_key,
+                    missing_line_ids,
+                    missing_asins,
+                    remaining_line_ids,
+                    message,
+                    status,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+                """,
+                (
+                    store_id,
+                    order_id,
+                    first["odoo_order_name"],
+                    group_key,
+                    _json_int_list(missing_ids),
+                    _json_text_list(missing_asins),
+                    _json_int_list(remaining_ids),
+                    message,
+                    now,
+                    now,
+                ),
+            )
+
+
 def mark_chrome_line_missing(group_key: str, message: str, missing_asin: str = "", missing_line_id: Optional[int] = None) -> dict[str, Any]:
     missing_asin = normalize_asin(missing_asin)
     updated_rows: list[dict[str, Any]] = []
@@ -2053,7 +2230,7 @@ def mark_chrome_line_missing(group_key: str, message: str, missing_asin: str = "
             updated_rows.append(row)
         remaining = conn.execute(
             """
-            SELECT id
+            SELECT *
             FROM order_lines
             WHERE amazon_group_key=?
               AND order_engine='chrome'
@@ -2064,6 +2241,8 @@ def mark_chrome_line_missing(group_key: str, message: str, missing_asin: str = "
             (group_key,),
         ).fetchall()
         remaining_line_ids = [int(row["id"]) for row in remaining]
+        if remaining_line_ids and updated_rows:
+            record_partial_fulfilment(conn, group_key, message, updated_rows, remaining)
         if not remaining_line_ids:
             conn.execute(
                 """
@@ -8834,6 +9013,43 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
     return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
 
 
+@app.get("/api/partial-fulfilments")
+def api_partial_fulfilments(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    page, per_page, _ = pagination_bounds(page, per_page)
+    raw_rows, total = list_partial_fulfilments(store_id, page, per_page)
+    rows = [partial_fulfilment_to_dict(row) for row in raw_rows]
+    stores = rows_to_dicts(list_stores())
+    stores_by_id = {store["id"]: store for store in stores}
+    for row in rows:
+        store = stores_by_id.get(row.get("store_id"))
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        row["missing_asin_urls"] = {
+            asin: asin_product_url(asin)
+            for asin in row.get("missing_asins") or []
+            if asin
+        }
+    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total}
+
+
+@app.post("/api/partial-fulfilments/{partial_id}/processed")
+def api_partial_fulfilment_processed(partial_id: int) -> dict[str, Any]:
+    now = utc_now()
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE partial_fulfilments
+            SET status='processed',
+                processed_at=?,
+                updated_at=?
+            WHERE id=? AND status='open'
+            """,
+            (now, now, partial_id),
+        )
+    if cursor.rowcount == 0:
+        raise HTTPException(404, "Partial fulfilment was not found or is already processed.")
+    return {"ok": True, "message": "Partial fulfilment marked processed."}
+
+
 @app.get("/api/duplicate-asins")
 def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page: int = 12, days: int = 2) -> dict[str, Any]:
     days = normalize_days_window(days)
@@ -9838,8 +10054,14 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
 def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[str, Any]:
     message = clean_error_message(payload.message)
     missing_asin = normalize_asin(payload.missing_asin)
+    failure_code = clean_text(payload.failure_code).lower().replace("-", "_").replace(" ", "_")
     with db() as conn:
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
+    if failure_code in {"manual_missing", "mark_missing", "missing"}:
+        linked_message = message or "Marked missing from Chrome progress popup."
+        count = mark_chrome_group_missing(group_key, linked_message, missing_asin, payload.missing_line_id)
+        if count:
+            return {"ok": True, "message": f"Moved {count} Chrome line(s) to Missing ASINs."}
     if chrome_fail_is_partial_quantity(payload, message):
         linked_message = partial_quantity_message(payload, message)
         count = mark_chrome_group_missing(group_key, linked_message, missing_asin, payload.missing_line_id)
@@ -9850,7 +10072,7 @@ def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[s
             )
             return {"ok": True, "message": f"Moved {count} Chrome line(s) to Missing because less quantity was available."}
     if missing_asin:
-        linked_message = f"ASIN {missing_asin} is missing or unavailable on Amazon. Skipped fulfilment for this Odoo order."
+        linked_message = message if failure_code == "limit_purchase" else f"ASIN {missing_asin} is missing or unavailable on Amazon. Skipped fulfilment for this Odoo order."
         count = mark_chrome_group_missing(group_key, linked_message, missing_asin, payload.missing_line_id)
         if count:
             return {"ok": True, "message": f"Moved {count} Chrome line(s) to Missing because {missing_asin} is unavailable."}
@@ -11458,6 +11680,11 @@ def dashboard(request: Request, store_id: Optional[int] = None) -> HTMLResponse:
 
 @app.get("/chrome-queue")
 def chrome_queue_page() -> Response:
+    return app_home()
+
+
+@app.get("/partial-fulfilments")
+def partial_fulfilments_page() -> Response:
     return app_home()
 
 

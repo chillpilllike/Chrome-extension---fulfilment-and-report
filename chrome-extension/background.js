@@ -279,6 +279,34 @@ async function stopJob(windowId) {
   return { ok: true, message: "Stopped active job." };
 }
 
+async function skipJob(windowId) {
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job) return { ok: false, message: "No active job to skip." };
+  const groupKey = activeJob.job.group_key;
+  const released = await releaseStoredJob(activeJob, windowId, "after manual skip");
+  if (!released) return { ok: false, message: `Could not release ${groupKey} to skip it.` };
+  const nextJob = await claimNextJobInWindow(windowId);
+  return {
+    ok: true,
+    message: nextJob ? `Skipped ${groupKey}. Started ${nextJob.job.group_key}.` : `Skipped ${groupKey}. No more queued Chrome jobs found.`,
+    next_job_started: Boolean(nextJob),
+    next_group_key: nextJob?.job?.group_key || "",
+  };
+}
+
+async function markCurrentJobMissing(windowId) {
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job) return { ok: false, message: "No active job to mark missing." };
+  const groupKey = activeJob.job.group_key;
+  const result = await failJob("Marked missing from Chrome progress popup.", { failureCode: "manual_missing" }, windowId);
+  return {
+    ...result,
+    message: result.next_job_started
+      ? `Marked ${groupKey} as Missing ASINs. Started ${result.next_group_key}.`
+      : `Marked ${groupKey} as Missing ASINs. No more queued Chrome jobs found.`,
+  };
+}
+
 async function releaseStoredJob(activeJob, windowId = null, label = "Chrome job") {
   if (!activeJob?.job?.group_key || !activeJob?.workerId) return false;
   try {
@@ -516,6 +544,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true };
     }
     if (message.type === "STOP_JOB") return stopJob(windowId);
+    if (message.type === "SKIP_JOB") return skipJob(windowId);
+    if (message.type === "MARK_CURRENT_MISSING") return markCurrentJobMissing(windowId);
     if (message.type === "TOGGLE_PAUSE") return togglePause(windowId);
     if (message.type === "GET_STATE") {
       await releaseMissingWindowJobs();

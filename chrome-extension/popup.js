@@ -8,6 +8,8 @@ const logsBox = document.querySelector("#logs");
 const pricingRows = document.querySelector("#pricingRows");
 const pricingTotal = document.querySelector("#pricingTotal");
 const pauseResume = document.querySelector("#pauseResume");
+const skipJob = document.querySelector("#skipJob");
+const markMissing = document.querySelector("#markMissing");
 const queuedJobs = document.querySelector("#queuedJobs");
 const queueCount = document.querySelector("#queueCount");
 
@@ -170,6 +172,8 @@ async function refresh() {
   const job = state.activeJob?.job;
   pauseResume.textContent = state.activeJob?.paused ? "Resume" : "Pause";
   pauseResume.disabled = !job;
+  skipJob.disabled = !job;
+  markMissing.disabled = !job;
   setStatus(job ? `${state.activeJob.paused ? "Paused" : "Active"}: ${job.group_key} (${state.activeJob.stage})` : "No active job.");
   renderPricing(state.activeJob);
   logsBox.innerHTML = "";
@@ -229,6 +233,26 @@ document.querySelector("#stop").addEventListener("click", async () => {
 pauseResume.addEventListener("click", async () => {
   const result = await send({ type: "TOGGLE_PAUSE" });
   setStatus(result.message || (result.ok ? "Updated." : "Could not pause/resume."));
+});
+
+skipJob.addEventListener("click", async () => {
+  const confirmed = confirm("Skip this Chrome job without marking it missing or changing the order line?");
+  if (!confirmed) return;
+  skipJob.disabled = true;
+  setStatus("Skipping current order and starting the next one...");
+  const result = await send({ type: "SKIP_JOB" });
+  setStatus(result.message || (result.ok ? "Skipped current job." : "Could not skip job."));
+  await refresh();
+});
+
+markMissing.addEventListener("click", async () => {
+  const confirmed = confirm("Mark this active Chrome job as Missing ASINs and start the next queued order?");
+  if (!confirmed) return;
+  markMissing.disabled = true;
+  setStatus("Marking current order missing and starting the next one...");
+  const result = await send({ type: "MARK_CURRENT_MISSING" });
+  setStatus(result.message || (result.ok ? "Marked missing." : "Could not mark missing."));
+  await refresh();
 });
 
 document.querySelector("#clearFailed").addEventListener("click", async () => {

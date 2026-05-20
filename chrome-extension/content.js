@@ -572,6 +572,52 @@ function itemPrimaryLineId(item) {
   return item.line_id || item.line_ids?.[0] || null;
 }
 
+function comparableText(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function matchCheckoutIssueItem(activeJob, title) {
+  const items = activeJob.job?.items || [];
+  if (!items.length) return null;
+  if (items.length === 1) return items[0];
+  const wanted = comparableText(title);
+  if (!wanted) return null;
+  return items.find((item) => {
+    const names = [item.product_name, ...(item.product_names || [])].map(comparableText).filter(Boolean);
+    return names.some((name) => name.includes(wanted) || wanted.includes(name));
+  }) || null;
+}
+
+function checkoutLimitPurchaseIssue(activeJob) {
+  const panel = document.querySelector("#checkout-javaItemSelectPanel");
+  if (!panel || !visible(panel)) return null;
+  const panelText = normalizedText(panel.innerText || panel.textContent);
+  if (
+    !panelText.includes("limited purchase quantity") ||
+    !panelText.includes("business has reached it")
+  ) {
+    return null;
+  }
+
+  const messageNode = [...panel.querySelectorAll("[data-messageid], .line-item-destination-message-groups, .a-alert-content, span")]
+    .find((element) => normalizedText(element.innerText || element.textContent).includes("limited purchase quantity"));
+  const parentView = messageNode?.closest?.("[id^='line-item-parent-view-']");
+  const parentId = parentView?.id || "";
+  const suffix = parentId.startsWith("line-item-parent-view-") ? parentId.slice("line-item-parent-view-".length) : "";
+  const groupView = suffix ? document.getElementById(`line-item-group-display-${suffix}`) : messageNode?.closest?.("[id^='line-item-group-display-']");
+  const titleNode = suffix ? document.getElementById(`item-block-product-title-${suffix}`) : groupView?.querySelector?.(".lineitem-title-text, [id^='item-block-product-title-']");
+  const title = String(titleNode?.innerText || titleNode?.textContent || "").replace(/\s+/g, " ").trim();
+  const item = matchCheckoutIssueItem(activeJob, title);
+  const removeButton = [...(groupView || parentView || panel).querySelectorAll?.("a.js-delete-button, a[aria-label='Remove item'], a, button") || []]
+    .find((element) => visible(element) && normalizedText(element.getAttribute?.("aria-label") || element.innerText || element.textContent).includes("remove item"));
+  return {
+    item,
+    title,
+    removeButton,
+    message: "Limit purchase: Amazon says this item has limited purchase quantity and the business has already reached it.",
+  };
+}
+
 function cartDeleteButtons() {
   const activeCart = document.querySelector("#sc-active-cart");
   if (!activeCart || !visible(activeCart)) return [];
@@ -2114,6 +2160,35 @@ function cardDigitsForPaymentRadio(radio) {
   return (dataNumber || endingMatch?.[1] || "").replace(/\D/g, "").slice(-4);
 }
 
+function findCheckoutPaymentPanel() {
+  return [...document.querySelectorAll(
+    "#checkout-paymentOptionPanel, #selected-payment-methods-list-container",
+  )].find((element) => visible(element));
+}
+
+function checkoutSelectedPaymentText() {
+  const panel = findCheckoutPaymentPanel();
+  if (!panel) return "";
+  const root = panel.closest?.("#checkout-paymentOptionPanel") || panel;
+  const heading = root.querySelector?.(
+    [
+      "#selected-payment-methods-list-container h2",
+      "#payment-option-text-default",
+      "[id^='payment-option-text'][data-testid]",
+      ".selected-payment-method-no-art-description-heading",
+    ].join(", "),
+  );
+  return String(heading?.innerText || heading?.textContent || root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function checkoutSelectedCardDigits() {
+  const text = checkoutSelectedPaymentText();
+  const preferredPattern = text.match(/(?:ending\s+in|visa|mastercard|american\s+express|amex|discover|card|paying\s+with)[^\d]{0,80}(\d{4})\b/i);
+  if (preferredPattern) return preferredPattern[1];
+  const fallback = text.match(/\b(\d{4})\b/);
+  return fallback?.[1] || "";
+}
+
 function findPaymentRadioForPreferences(preferences = []) {
   const radios = [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
     .filter((element) => visible(element) && !element.disabled);
@@ -2291,6 +2366,40 @@ async function openPaymentSelectionIfAvailable() {
   await clickElement(changePayment, "Change payment method button");
   await sleep(2000);
   return true;
+}
+
+async function ensurePreferredCheckoutPayment(activeJob) {
+  const state = await getExtensionState();
+  const cardPreferences = cardPreferenceList(state.cardLast4Preference);
+  if (!cardPreferences.length) return true;
+  const paymentPanel = findCheckoutPaymentPanel();
+  if (!paymentPanel) return true;
+
+  const selectedDigits = checkoutSelectedCardDigits();
+  if (selectedDigits && cardPreferences.includes(selectedDigits)) {
+    showPanel("Nutricity checkout", `Verified checkout card ending in ${selectedDigits}.`, null, null);
+    return true;
+  }
+
+  const expected = cardPreferences.join(" or ");
+  if (selectedDigits) {
+    showPanel("Nutricity checkout", `Checkout shows card ending in ${selectedDigits}; switching to ${expected}.`, null, null);
+  } else {
+    showPanel("Nutricity checkout", `Could not verify checkout card; opening payment selection for ${expected}.`, null, null);
+  }
+
+  if (!await openPaymentSelectionIfAvailable()) {
+    await pauseForManualCheckout(activeJob, selectedDigits
+      ? `Checkout shows card ending in ${selectedDigits}, but I could not find the Change payment method link to switch to ${expected}.`
+      : `Could not verify the checkout card, and I could not find the Change payment method link to select ${expected}.`);
+    return false;
+  }
+  if (await waitUntil(findPaymentRadio, 10000, 400)) {
+    await handlePaymentSelection(activeJob);
+    return !activeJob.paused;
+  }
+  await pauseForManualCheckout(activeJob, `Opened payment selection, but Amazon did not show card choices for ${expected}.`);
+  return false;
 }
 
 async function openAddressEditorIfAvailable(activeJob) {
@@ -2539,10 +2648,68 @@ async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
   return false;
 }
 
+async function handleCheckoutLimitPurchase(activeJob) {
+  const issue = checkoutLimitPurchaseIssue(activeJob);
+  if (!issue) return false;
+  const item = issue.item;
+  const asin = item?.asin || "";
+  const message = asin
+    ? `${issue.message} ASIN ${asin}${issue.title ? ` (${issue.title})` : ""}.`
+    : `${issue.message}${issue.title ? ` ${issue.title}.` : ""}`;
+
+  if (item && (activeJob.job?.items || []).length > 1) {
+    showPanel("Limit purchase", message, null, null);
+    const result = await send({
+      type: "MARK_LINE_MISSING",
+      message,
+      missingAsin: asin,
+      missingLineId: itemPrimaryLineId(item),
+      failureCode: "limit_purchase",
+      requestedQuantity: item.quantity ?? null,
+      fulfilledQuantity: 0,
+      availableQuantity: 0,
+    });
+    if (!result?.ok) {
+      await pauseForManualCheckout(activeJob, `${message} I could not report this line to the app.`);
+      return true;
+    }
+    removeMissingItemFromActiveJob(activeJob, item, item);
+    activeJob.stage = "checkout";
+    await setActiveJob(activeJob);
+    if (issue.removeButton) {
+      await clickElement(issue.removeButton, "Remove limited purchase item");
+      await sleep(1800);
+    }
+    const continueButton = await waitUntil(findUseAddressButton, 3000, 300)
+      || findButtonByText(["continue"]);
+    if (continueButton) {
+      await clickElement(continueButton, "Continue after removing limited purchase item");
+      await sleep(2500);
+    }
+    showPanel("Split fulfilment", `${message} Remaining item(s) will continue.`, null, null);
+    return true;
+  }
+
+  showPanel("Limit purchase", message, null, null);
+  await send({
+    type: "FAIL_JOB",
+    message,
+    missingAsin: asin,
+    missingLineId: item ? itemPrimaryLineId(item) : null,
+    failureCode: "limit_purchase",
+    requestedQuantity: item?.quantity ?? null,
+    fulfilledQuantity: 0,
+    availableQuantity: 0,
+  });
+  showPanel("Missing ASINs", `${message} Order moved to Missing ASINs.`, null, null);
+  return true;
+}
+
 async function handleCheckout(activeJob) {
   await waitForElement([
     "#placeOrder",
     "input.place-your-order-button",
+    "#checkout-javaItemSelectPanel",
     "[data-checkout-view-modal]",
     "#checkout-primary-continue-button-id",
     "input[aria-label='Full name']",
@@ -2553,6 +2720,7 @@ async function handleCheckout(activeJob) {
     "a[href*='proceedToCheckout=1']",
   ], 18000);
   if (await handleBusinessCheckoutInterstitial()) return;
+  if (await handleCheckoutLimitPurchase(activeJob)) return;
   const checkoutRecipient = recipientName(activeJob);
   const extensionState = await getExtensionState();
   const shouldEditExistingAddress = extensionState.editExistingAddress !== false;
@@ -2643,6 +2811,7 @@ async function handleCheckout(activeJob) {
   if (activeJob.paused) return;
 
   if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
+  if (!await ensurePreferredCheckoutPayment(activeJob)) return;
 
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([

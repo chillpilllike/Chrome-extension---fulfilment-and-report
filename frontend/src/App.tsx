@@ -60,6 +60,7 @@ const KNOWN_APP_PAGES = new Set([
   "duplicate-tracking",
   "fulfilment-pending",
   "missing",
+  "partial-fulfilments",
   "bulk",
   "costly",
   "profit-loss",
@@ -243,6 +244,24 @@ type FulfilmentPendingRow = OrderLine & {
   odoo_sale_state: string
   odoo_invoice_status: string
   tracking_checked_at: string
+}
+
+type PartialFulfilment = {
+  id: number
+  store_id: number
+  odoo_order_id: number
+  odoo_order_name: string
+  odoo_order_url?: string
+  amazon_group_key?: string
+  missing_line_ids: number[]
+  missing_asins: string[]
+  missing_asin_urls?: Record<string, string>
+  remaining_line_ids: number[]
+  message?: string
+  status: string
+  created_at?: string
+  updated_at?: string
+  processed_at?: string
 }
 
 type EpostTrackingRow = {
@@ -432,6 +451,7 @@ const defaultUiCopy: UiCopy = {
   "duplicate-tracking": { title: "Duplicate Tracking", description: "Review repeated tracking numbers before dispatch updates." },
   "fulfilment-pending": { title: "Pending Dispatch", description: "Find Amazon-delivered orders still pending in Odoo." },
   missing: { title: "Missing ASINs", description: "Resolve unavailable Amazon products and replacements." },
+  "partial-fulfilments": { title: "Partial Fulfilments", description: "Review orders split between Amazon fulfilment and Missing ASINs." },
   bulk: { title: "Bulk Ordering", description: "Group compatible items before ordering." },
   costly: { title: "Cost Review", description: "Approve or replace items with unfavorable cost." },
   "profit-loss": { title: "Profit / Loss", description: "Review fulfilment profitability and shipping costs." },
@@ -1068,6 +1088,10 @@ function StatusBadge({ value }: { value?: string }) {
   return <Badge variant="outline">{status}</Badge>
 }
 
+function isLimitPurchaseLine(row: OrderLine) {
+  return /limit purchase|limited purchase quantity|business has reached/i.test(`${row.last_error || ""} ${row.fulfilment_note || ""}`)
+}
+
 function ErrorTooltip({ value, className = "" }: { value?: string; className?: string }) {
   const text = String(value || "").trim()
   if (!text) return null
@@ -1510,6 +1534,9 @@ function App() {
   const [missingRows, setMissingRows] = useState<OrderLine[]>([])
   const [missingPage, setMissingPage] = useState(1)
   const [missingTotal, setMissingTotal] = useState(0)
+  const [partialFulfilments, setPartialFulfilments] = useState<PartialFulfilment[]>([])
+  const [partialFulfilmentsPage, setPartialFulfilmentsPage] = useState(1)
+  const [partialFulfilmentsTotal, setPartialFulfilmentsTotal] = useState(0)
   const [fulfilmentPendingRows, setFulfilmentPendingRows] = useState<FulfilmentPendingRow[]>([])
   const [fulfilmentPendingPage, setFulfilmentPendingPage] = useState(1)
   const [fulfilmentPendingTotal, setFulfilmentPendingTotal] = useState(0)
@@ -1601,6 +1628,7 @@ function App() {
       setMissingPage(1)
       setMissingSelectAll(false)
       setMissingSelected([])
+      setPartialFulfilmentsPage(1)
       setFulfilmentPendingPage(1)
       setPendingSelectAll(false)
       setPendingSelected([])
@@ -1809,6 +1837,16 @@ function App() {
       })
       .catch((error) => setModal({ ok: false, title: "Missing orders load failed", message: String(error) }))
   }, [page, storeId, missingPage])
+
+  useEffect(() => {
+    if (page !== "partial-fulfilments" && page !== "home") return
+    api<{ rows: PartialFulfilment[]; total: number }>(`/api/partial-fulfilments${pagedQuery(storeId, partialFulfilmentsPage)}`)
+      .then((result) => {
+        setPartialFulfilments(result.rows || [])
+        setPartialFulfilmentsTotal(result.total || 0)
+      })
+      .catch((error) => setModal({ ok: false, title: "Partial fulfilments load failed", message: String(error) }))
+  }, [page, storeId, partialFulfilmentsPage])
 
   useEffect(() => {
     if (page !== "fulfilment-pending") return
@@ -2230,6 +2268,7 @@ function App() {
         ["bulk", "Bulk Ordering", PackageCheck],
         ["shopify-fulfilment", "Shopify Fulfilment", StoreIcon],
         ["missing", "Missing ASINs", AlertCircle],
+        ["partial-fulfilments", "Partial Fulfilments", AlertCircle],
         ["costly", "Cost Review", AlertCircle],
         ["fulfilment-pending", "Pending Dispatch", AlertCircle],
         ["inventory", "Inventory", PackageCheck],
@@ -2315,7 +2354,7 @@ function App() {
             <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Dark mode"><Moon className="size-5" /></button>
             <button className="btn btn-icon relative" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Notifications">
               <Bell className="size-5" />
-              {(missingRows.length + costlyRows.length + fulfilmentPendingRows.length) > 0 && <span className="absolute right-1 top-1 size-2 rounded-full bg-red" />}
+              {(missingRows.length + partialFulfilments.length + costlyRows.length + fulfilmentPendingRows.length) > 0 && <span className="absolute right-1 top-1 size-2 rounded-full bg-red" />}
             </button>
             <button className={`btn btn-icon ${adminTokenSaved ? "text-green" : "text-yellow"}`} data-bs-toggle="tooltip" data-bs-placement="bottom" title={adminTokenSaved ? "Admin code saved on this PC" : "Enter admin code"} onClick={() => { setAdminAuthError(""); setAdminAccessOpen(true) }}>
               <Lock className="size-5" />
@@ -2421,6 +2460,7 @@ function App() {
           <HomeDashboard
             data={data}
             missingRows={missingRows}
+            partialFulfilments={partialFulfilments}
             costlyRows={costlyRows}
             bulkGroups={bulkGroups}
             fulfilmentPendingRows={fulfilmentPendingRows}
@@ -2880,7 +2920,9 @@ function App() {
                       <TableRow
                         key={row.id}
                         className={
-                          row.amazon_cancelled_at
+                          isLimitPurchaseLine(row)
+                            ? "bg-[#f5f0ff]"
+                            : row.amazon_cancelled_at
                             ? "bg-red-50"
                             : row.state === "missing"
                             ? "bg-orange-50"
@@ -3066,6 +3108,21 @@ function App() {
             }}
           />
         )}
+        {page === "partial-fulfilments" && (
+          <PartialFulfilmentsPage
+            rows={partialFulfilments}
+            page={partialFulfilmentsPage}
+            total={partialFulfilmentsTotal}
+            onPage={setPartialFulfilmentsPage}
+            onResult={setModal}
+            onRefresh={async () => {
+              const result = await api<{ rows: PartialFulfilment[]; total: number }>(`/api/partial-fulfilments${pagedQuery(storeId, partialFulfilmentsPage)}`)
+              setPartialFulfilments(result.rows || [])
+              setPartialFulfilmentsTotal(result.total || 0)
+              await refresh()
+            }}
+          />
+        )}
         {page === "bulk" && (
           <BulkPage
             groups={bulkGroups}
@@ -3155,6 +3212,7 @@ function App() {
 function HomeDashboard({
   data,
   missingRows,
+  partialFulfilments,
   costlyRows,
   bulkGroups,
   fulfilmentPendingRows,
@@ -3170,6 +3228,7 @@ function HomeDashboard({
 }: {
   data: DashboardData
   missingRows: OrderLine[]
+  partialFulfilments: PartialFulfilment[]
   costlyRows: OrderLine[]
   bulkGroups: BulkGroup[]
   fulfilmentPendingRows: FulfilmentPendingRow[]
@@ -3195,9 +3254,10 @@ function HomeDashboard({
   const defaultAddress = addresses.find((address) => address.is_default) || addresses[0]
   const duplicateCount = data.duplicate_asins.length
   const missingCount = stateCount("missing") || missingRows.length
+  const partialCount = partialFulfilments.length
   const costlyCount = stateCount("costly") || costlyRows.length
   const bulkCount = bulkGroups.length || duplicateCount
-  const reviewCount = missingCount + costlyCount + fulfilmentPendingRows.length
+  const reviewCount = missingCount + partialCount + costlyCount + fulfilmentPendingRows.length
   const completionRate = data.total ? Math.round((deliveredCount / data.total) * 100) : 0
   const epostDelivered = epostRows.filter((row) => row.epost_status === "delivered").length
   const epostRate = epostRows.length ? Math.round((epostDelivered / epostRows.length) * 100) : 0
@@ -3229,6 +3289,14 @@ function HomeDashboard({
       primaryLabel: "need replacement",
       details: missingRows.slice(0, 2).map((row) => `${row.odoo_order_name} ${row.missing_asin || row.asin}`),
       tone: missingCount ? "bg-destructive/10" : "",
+    },
+    {
+      title: "Partial",
+      page: "partial-fulfilments",
+      primary: partialCount,
+      primaryLabel: "split orders",
+      details: partialFulfilments.slice(0, 2).map((row) => `${row.odoo_order_name} ${row.missing_asins.join(", ")}`),
+      tone: partialCount ? "bg-destructive/10" : "",
     },
     {
       title: "Costly",
@@ -3328,6 +3396,7 @@ function HomeDashboard({
             <div className="mt-2 text-3xl font-semibold">{reviewCount}</div>
             <div className="list-group mt-5 text-sm">
               <button className="list-group-item" onClick={() => onNavigate("missing")}><span>Missing ASINs</span><b>{missingCount}</b></button>
+              <button className="list-group-item" onClick={() => onNavigate("partial-fulfilments")}><span>Partial Fulfilments</span><b>{partialCount}</b></button>
               <button className="list-group-item" onClick={() => onNavigate("costly")}><span>Cost Review</span><b>{costlyCount}</b></button>
               <button className="list-group-item" onClick={() => onNavigate("fulfilment-pending")}><span>Odoo Pending</span><b>{fulfilmentPendingRows.length}</b></button>
             </div>
@@ -3411,11 +3480,12 @@ function HomeDashboard({
           <CardContent className="text-sm">
             <div className="list-group">
             {missingRows.length ? <button className="list-group-item" onClick={() => onNavigate("missing")}>Resolve {missingRows.length} missing ASIN order(s).</button> : null}
+            {partialFulfilments.length ? <button className="list-group-item text-destructive" onClick={() => onNavigate("partial-fulfilments")}>Review {partialFulfilments.length} partial fulfilment order(s).</button> : null}
             {costlyRows.length ? <button className="list-group-item" onClick={() => onNavigate("costly")}>Approve or reject {costlyRows.length} costly order(s).</button> : null}
             {epostLost ? <button className="list-group-item text-destructive" onClick={() => onNavigate("epost")}>Review {epostLost} lost ePost shipment(s).</button> : null}
             {fulfilmentPendingRows.length ? <button className="list-group-item text-destructive" onClick={() => onNavigate("fulfilment-pending")}>Fix {fulfilmentPendingRows.length} Amazon delivered/Odoo pending order(s).</button> : null}
             </div>
-            {!missingRows.length && !costlyRows.length && !epostLost && !fulfilmentPendingRows.length ? <p className="text-muted-foreground">No urgent review queues right now.</p> : null}
+            {!missingRows.length && !partialFulfilments.length && !costlyRows.length && !epostLost && !fulfilmentPendingRows.length ? <p className="text-muted-foreground">No urgent review queues right now.</p> : null}
           </CardContent>
         </Card>
 
@@ -4638,6 +4708,108 @@ function InventoryPage({
           </Table>
         </CardContent>
       </Card>
+    </div>
+  )
+}
+
+function PartialFulfilmentsPage({
+  rows,
+  page,
+  total,
+  onPage,
+  onResult,
+  onRefresh,
+}: {
+  rows: PartialFulfilment[]
+  page: number
+  total: number
+  onPage: (page: number) => void
+  onResult: (modal: ModalState) => void
+  onRefresh: () => Promise<void>
+}) {
+  async function markProcessed(row: PartialFulfilment) {
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/partial-fulfilments/${row.id}/processed`, { method: "POST" })
+      onResult({ ok: true, title: "Processed", message: result.message || "Partial fulfilment removed from the queue." })
+      await onRefresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Could Not Mark Processed", message: String(error) })
+    }
+  }
+
+  return (
+    <div className="grid gap-5">
+      <section className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">Partial Fulfilments</h2>
+          <p className="text-sm text-muted-foreground">Orders where one line moved to Missing ASINs while the remaining line(s) continue through Amazon fulfilment.</p>
+        </div>
+        <div className="btn-list">
+          <Button variant="outline" onClick={onRefresh}>
+            <RefreshCw className="size-4" />
+            Refresh
+          </Button>
+        </div>
+      </section>
+      <div className="flex justify-end">
+        <PaginationControls page={page} total={total} onPage={onPage} />
+      </div>
+      {rows.length ? (
+        <Card>
+          <CardContent className="p-0">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Order</TableHead>
+                  <TableHead>Missing ASINs</TableHead>
+                  <TableHead>Remaining Lines</TableHead>
+                  <TableHead>Reason</TableHead>
+                  <TableHead>Updated</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((row) => (
+                  <TableRow key={row.id}>
+                    <TableCell>
+                      <div className="font-medium">{row.odoo_order_name}</div>
+                      <div className="text-xs text-muted-foreground">{row.amazon_group_key || "No Chrome group key"}</div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-2">
+                        {row.missing_asins.length ? row.missing_asins.map((asin) => (
+                          <a key={asin} className="font-mono text-destructive underline-offset-4 hover:underline" href={row.missing_asin_urls?.[asin] || `https://www.amazon.com/dp/${asin}`} target="_blank">
+                            {asin}
+                          </a>
+                        )) : <span className="text-muted-foreground">Unknown</span>}
+                      </div>
+                    </TableCell>
+                    <TableCell>{row.remaining_line_ids.length}</TableCell>
+                    <TableCell className="max-w-[420px]"><ErrorTooltip value={row.message || ""} /></TableCell>
+                    <TableCell>{formatDateTime(row.updated_at)}</TableCell>
+                    <TableCell className="text-right">
+                      <div className="flex justify-end gap-2">
+                        {row.odoo_order_url ? (
+                          <Button size="sm" variant="outline" onClick={() => window.open(row.odoo_order_url, "_blank")}>
+                            Open Odoo
+                          </Button>
+                        ) : null}
+                        <Button size="sm" onClick={() => markProcessed(row)}>
+                          Processed
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardContent className="py-8 text-sm text-muted-foreground">No partial fulfilments are waiting for review.</CardContent>
+        </Card>
+      )}
     </div>
   )
 }
