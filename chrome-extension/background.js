@@ -402,7 +402,11 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId) {
 async function failJob(message, details = {}, windowId) {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
-  await heartbeatJob(activeJob, windowId);
+  try {
+    await heartbeatJob(activeJob, windowId);
+  } catch (error) {
+    await log(`Continuing fail report after heartbeat failed for ${activeJob.job.group_key}: ${error.message}`, windowId);
+  }
   const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/fail`, {
     method: "POST",
     body: JSON.stringify({

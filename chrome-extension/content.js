@@ -1093,6 +1093,46 @@ function quantityAvailabilityIssue(context = "regular", requestedQuantity = 1) {
   };
 }
 
+function partialQuantityMessage(asin, requestedQuantity, availableQuantity, issueMessage = "", context = "regular") {
+  const prefix = context === "sns" ? "Less Subscribe & Save quantity available" : "Less quantity available";
+  const availableText = availableQuantity
+    ? `Amazon only allows ${availableQuantity}`
+    : "Amazon showed limited availability";
+  return `${prefix} for ASIN ${asin}. Customer ordered ${requestedQuantity}, ${availableText}.${issueMessage ? ` ${issueMessage}` : ""}`.trim();
+}
+
+async function pauseAfterMissingAsinReportFailure(activeJob, message) {
+  activeJob.pausedStage = activeJob.stage || "product";
+  activeJob.paused = true;
+  await setActiveJob(activeJob);
+  showPanel(
+    "Missing ASIN report failed",
+    `${message} The order is paused so it does not stay locked silently.`,
+    "I did it manually, continue",
+    () => continueAfterManualStep(activeJob),
+  );
+}
+
+async function reportMissingQuantityIssue(activeJob, item, purchaseItem, quantityIssue = {}) {
+  const requestedQuantity = Math.max(1, Math.round(Number(purchaseItem?.quantity || item?.quantity || quantityIssue.requestedQuantity || 1)));
+  const availableQuantity = quantityIssue.availableQuantity || quantityIssue.fulfilledQuantity || maxPredefinedQuantity(quantityIssue.context || "regular") || maxSelectableQuantity(quantityIssue.context || "regular") || null;
+  const result = await send({
+    type: "FAIL_JOB",
+    message: partialQuantityMessage(purchaseItem?.asin || item?.asin || "", requestedQuantity, availableQuantity, quantityIssue.message || "", quantityIssue.context || "regular"),
+    missingAsin: item?.asin || purchaseItem?.asin || "",
+    missingLineId: item ? itemPrimaryLineId(item) : null,
+    failureCode: "partial_quantity",
+    requestedQuantity,
+    fulfilledQuantity: availableQuantity,
+    availableQuantity,
+  });
+  if (result?.ok) {
+    showPanel("Missing ASINs", result.message || "Quantity issue moved to Missing ASINs.", null, null);
+    return true;
+  }
+  throw new Error(result?.message || "Could not move quantity issue to Missing ASINs.");
+}
+
 async function chooseAmazonDropdownOption(select, qty) {
   const container = select.closest(".a-dropdown-container") || select.parentElement;
   const dropdownButton = container?.querySelector(".a-button-dropdown, [data-action='a-dropdown-button']");
@@ -1159,13 +1199,17 @@ async function setQuantity(quantity, context = "regular") {
     await sleep(900);
     const issue = quantityAvailabilityIssue(context, qty);
     if (issue) {
+      issue.context = context;
       window.__nutricityLastQuantityIssue = issue;
       return false;
     }
     if (qty <= 9 || freeFormSet) return true;
   }
   const issue = quantityAvailabilityIssue(context, qty);
-  if (issue) window.__nutricityLastQuantityIssue = issue;
+  if (issue) {
+    issue.context = context;
+    window.__nutricityLastQuantityIssue = issue;
+  }
   return false;
 }
 
@@ -2584,16 +2628,30 @@ async function run() {
       );
       return;
     }
-    await send({
-      type: "FAIL_JOB",
-      message: error.message,
-      missingAsin: shouldMarkItemMissing ? (error.missingAsin || item?.asin || purchaseItem?.asin || "") : "",
-      missingLineId: shouldMarkItemMissing && item ? itemPrimaryLineId(item) : null,
-      failureCode: error.failureCode || "",
-      requestedQuantity: error.requestedQuantity ?? null,
-      fulfilledQuantity: error.fulfilledQuantity ?? null,
-      availableQuantity: error.availableQuantity ?? null,
-    });
+    let failResult = null;
+    try {
+      failResult = await send({
+        type: "FAIL_JOB",
+        message: error.message,
+        missingAsin: error.missingAsin || item?.asin || purchaseItem?.asin || "",
+        missingLineId: item ? itemPrimaryLineId(item) : null,
+        failureCode: error.failureCode || "",
+        requestedQuantity: error.requestedQuantity ?? null,
+        fulfilledQuantity: error.fulfilledQuantity ?? null,
+        availableQuantity: error.availableQuantity ?? null,
+      });
+    } catch (reportError) {
+      await pauseAfterMissingAsinReportFailure(activeJob, reportError.message || "Could not send the Missing ASIN report to the app.");
+      return;
+    }
+    if (!failResult?.ok) {
+      await pauseAfterMissingAsinReportFailure(activeJob, failResult?.message || "The app did not confirm the Missing ASIN report.");
+      return;
+    }
+    const nextMessage = failResult.next_job_started && failResult.next_group_key
+      ? `Order moved to Missing ASINs. Starting next order ${failResult.next_group_key}.`
+      : "Order moved to Missing ASINs.";
+    showPanel("Missing ASINs", nextMessage, null, null);
   }
 }
 
