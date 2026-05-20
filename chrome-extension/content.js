@@ -858,9 +858,6 @@ async function clipVisibleCoupons(context = "regular") {
 }
 
 function unavailableMessage() {
-  const directPurchase = [...document.querySelectorAll("#add-to-cart-button, input[name='submit.add-to-cart'], #buybox-add-to-cart-button input, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input")]
-    .some(visible);
-  if (directPurchase) return "";
   const allBuyingOptions = [...document.querySelectorAll(
     "a[href*='/gp/offer-listing/'], a[href*='/offer-listing/'], a[title='See All Buying Options'], a.a-button-text",
   )].find((element) => {
@@ -959,9 +956,6 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     const requestedQuantity = Math.max(1, Math.round(Number(quantity || 1)));
     const quantityIssue = window.__nutricityLastQuantityIssue || {};
     const availableQuantity = quantityIssue.availableQuantity || maxPredefinedQuantity("sns") || maxSelectableQuantity("sns");
-    if (!quantityIssue.message && !(availableQuantity > 0 && availableQuantity < requestedQuantity)) {
-      return false;
-    }
     const error = new Error(
       availableQuantity > 0 && availableQuantity < requestedQuantity
         ? `Less Subscribe & Save quantity available. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}. ${quantityIssue.message || ""}`.trim()
@@ -1041,10 +1035,7 @@ function quantitySelects(context = "regular") {
     if (context === "sns") {
       return (
         /^sns/i.test(id) && id.includes("predefinedQuantitiesDropdown") ||
-        Boolean(select.closest("#snsQuantity_feature_div")) && (
-          id.includes("predefinedQuantitiesDropdown") ||
-          select.name === "quantity"
-        )
+        Boolean(select.closest("#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent"))
       );
     }
     return (
@@ -1156,7 +1147,7 @@ function quantityAvailabilityIssue(context = "regular", requestedQuantity = 1) {
     lowered.includes("maximum quantity") ||
     lowered.includes("seller does not have") ||
     lowered.includes("seller doesn't have") ||
-    /\bonly\s+\d+\s+(?:left|available|in stock)\b/.test(lowered)
+    lowered.includes("only") && lowered.includes("available")
   );
   const splitOffer = context !== "sns" && document.querySelector("#splitoffer_detailpage_buybox_link[href*='quantity=']");
   if (!hasIssue && !splitOffer) return null;
