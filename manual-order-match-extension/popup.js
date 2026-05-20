@@ -4,6 +4,7 @@ function qs(id) {
 
 const settingsInputs = ["apiBase", "adminToken", "maxPages"].map(qs);
 let settingsDirty = false;
+let settingsHydrated = false;
 
 settingsInputs.forEach((input) => {
   input.addEventListener("input", () => {
@@ -16,10 +17,11 @@ async function send(message) {
 }
 
 function syncSettingsInputs(state) {
-  if (settingsDirty || settingsInputs.includes(document.activeElement)) return;
+  if (settingsHydrated || settingsDirty || settingsInputs.includes(document.activeElement)) return;
   qs("apiBase").value = state.apiBase || "http://127.0.0.1:8000";
   qs("adminToken").value = state.adminToken || "";
   qs("maxPages").value = state.maxPages || state.run?.maxPages || 10;
+  settingsHydrated = true;
 }
 
 function render(state) {

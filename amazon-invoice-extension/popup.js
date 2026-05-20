@@ -3,6 +3,7 @@ const adminToken = document.querySelector("#adminToken");
 const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
 let settingsDirty = false;
+let settingsHydrated = false;
 
 [apiBase, adminToken].forEach((input) => {
   input.addEventListener("input", () => {
@@ -11,9 +12,10 @@ let settingsDirty = false;
 });
 
 function syncSettingsInputs(state) {
-  if (settingsDirty || [apiBase, adminToken].includes(document.activeElement)) return;
+  if (settingsHydrated || settingsDirty || [apiBase, adminToken].includes(document.activeElement)) return;
   apiBase.value = state.apiBase || "http://127.0.0.1:8000";
   adminToken.value = state.adminToken || "";
+  settingsHydrated = true;
 }
 
 function send(message) {

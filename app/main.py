@@ -9318,6 +9318,46 @@ def api_chrome_clear_failed_jobs(store_id: Optional[int] = None) -> dict[str, An
     return {"ok": True, "cleared": cursor.rowcount, "message": f"Cleared {cursor.rowcount} failed Chrome job line(s)."}
 
 
+def chrome_complete_followups(
+    rows: list[dict[str, Any]],
+    updated_for_shopify: list[dict[str, Any]],
+    pricing_by_asin: dict[str, dict[str, Any]],
+    amazon_order_id: str,
+    amazon_order_url: str,
+    chrome_account_name: str,
+) -> None:
+    try:
+        enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+    except Exception as exc:
+        print(f"Chrome complete Shopify enqueue failed: {exc}", flush=True)
+    try:
+        variant_notes_by_order: dict[int, list[str]] = {}
+        for row in rows:
+            pricing = pricing_by_asin.get(str(row["asin"] or "").upper(), {})
+            fulfilment_note = clean_text(str(pricing.get("fulfilment_note") or ""))
+            if fulfilment_note:
+                variant_notes_by_order.setdefault(int(row["odoo_order_id"]), []).append(fulfilment_note)
+        note = (
+            f"Amazon Chrome order placed: {amazon_order_id}\n"
+            f"Amazon order link: {amazon_order_url or order_line_amazon_url(amazon_order_id)}\n"
+            f"Amazon account: {chrome_account_name}"
+        )
+        store = get_store(int(rows[0]["store_id"]))
+        odoo = OdooClient(store)
+        for order_id in sorted({int(row["odoo_order_id"]) for row in rows}):
+            order_note = note
+            for fulfilment_note in variant_notes_by_order.get(order_id, []):
+                order_note += f"\n{fulfilment_note}"
+            odoo.post_order_note(order_id, order_note)
+    except Exception as exc:
+        print(f"Chrome complete Odoo note failed: {exc}", flush=True)
+    try:
+        for store_id in sorted({int(row["store_id"]) for row in rows}):
+            write_report(store_id)
+    except Exception as exc:
+        print(f"Chrome complete report refresh failed: {exc}", flush=True)
+
+
 @app.post("/api/chrome/jobs/{group_key}/complete")
 def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -> dict[str, Any]:
     amazon_order_id = clean_text(payload.amazon_order_id) or f"CHROME-{uuid.uuid4().hex[:10]}"
@@ -9418,30 +9458,18 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                 updated_for_shopify.append(dict(updated))
                 ensure_inventory_for_line(updated)
                 index_order_line(updated)
-    enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
-    try:
-        variant_notes_by_order: dict[int, list[str]] = {}
-        for row in rows:
-            pricing = pricing_by_asin.get(str(row["asin"] or "").upper(), {})
-            fulfilment_note = clean_text(str(pricing.get("fulfilment_note") or ""))
-            if fulfilment_note:
-                variant_notes_by_order.setdefault(int(row["odoo_order_id"]), []).append(fulfilment_note)
-        note = (
-            f"Amazon Chrome order placed: {amazon_order_id}\n"
-            f"Amazon order link: {amazon_order_url or order_line_amazon_url(amazon_order_id)}\n"
-            f"Amazon account: {chrome_account_name}"
-        )
-        store = get_store(int(rows[0]["store_id"]))
-        odoo = OdooClient(store)
-        for order_id in sorted({int(row["odoo_order_id"]) for row in rows}):
-            order_note = note
-            for fulfilment_note in variant_notes_by_order.get(order_id, []):
-                order_note += f"\n{fulfilment_note}"
-            odoo.post_order_note(order_id, order_note)
-    except Exception:
-        pass
-    for store_id in sorted({int(row["store_id"]) for row in rows}):
-        write_report(store_id)
+    threading.Thread(
+        target=chrome_complete_followups,
+        args=(
+            [dict(row) for row in rows],
+            updated_for_shopify,
+            pricing_by_asin,
+            amazon_order_id,
+            amazon_order_url,
+            chrome_account_name,
+        ),
+        daemon=True,
+    ).start()
     return {"ok": True, "message": f"Chrome job {group_key} marked ordered.", "amazon_order_id": amazon_order_id}
 
 

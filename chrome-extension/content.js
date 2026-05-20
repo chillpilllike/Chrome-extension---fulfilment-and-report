@@ -87,11 +87,13 @@ function showPanel(title, message, actionText, action) {
   if (!panel) {
     panel = document.createElement("div");
     panel.id = "nutricity-panel";
+    panel.innerHTML = `<div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div>`;
+    panel.querySelector(".nutricity-pause-toggle").addEventListener("click", togglePanelPause);
     document.documentElement.append(panel);
   }
-  panel.innerHTML = `<div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div>`;
   panel.querySelector("strong").textContent = title;
   panel.querySelector(".nutricity-panel-message").textContent = message;
+  panel.querySelector(".nutricity-panel-action")?.remove();
   updatePanelPauseButton(panel);
   if (actionText && action) {
     const button = document.createElement("button");
@@ -99,6 +101,22 @@ function showPanel(title, message, actionText, action) {
     button.textContent = actionText;
     button.addEventListener("click", action);
     panel.append(button);
+  }
+}
+
+async function togglePanelPause(event) {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const result = await send({ type: "TOGGLE_PAUSE" });
+    const paused = Boolean(result?.paused);
+    button.textContent = paused ? "Resume" : "Pause";
+    button.classList.toggle("is-paused", paused);
+    if (paused) {
+      showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
+    }
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -114,21 +132,6 @@ async function updatePanelPauseButton(panel = document.querySelector("#nutricity
   button.hidden = false;
   button.textContent = activeJob.paused ? "Resume" : "Pause";
   button.classList.toggle("is-paused", Boolean(activeJob.paused));
-  button.onclick = async () => {
-    button.disabled = true;
-    try {
-      const result = await send({ type: "TOGGLE_PAUSE" });
-      const paused = Boolean(result?.paused);
-      button.textContent = paused ? "Resume" : "Pause";
-      button.classList.toggle("is-paused", paused);
-      const latest = await getActiveJob();
-      if (latest?.paused) {
-        showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
-      }
-    } finally {
-      button.disabled = false;
-    }
-  };
 }
 
 function visible(element) {
@@ -1554,6 +1557,9 @@ async function handleCompletion(activeJob) {
   const orderId = extractOrderId();
   if (orderId) {
     showPanel("Nutricity fulfilment", "Amazon order placed. Reporting back to the app.", null, null);
+    activeJob.stage = "reporting_complete";
+    activeJob.reportedOrderId = orderId;
+    await setActiveJob(activeJob);
     await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
     return;
   }
@@ -1575,6 +1581,9 @@ async function handleOrderHistory(activeJob) {
     return;
   }
   showPanel("Nutricity fulfilment", `Found Amazon order ${orderId}. Reporting back to the app.`, null, null);
+  activeJob.stage = "reporting_complete";
+  activeJob.reportedOrderId = orderId;
+  await setActiveJob(activeJob);
   await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
 }
 
@@ -1587,13 +1596,15 @@ async function run() {
     return;
   }
   try {
-    if (activeJob.stage === "complete_pending") {
+    if (activeJob.stage === "reporting_complete") {
+      showPanel("Nutricity fulfilment", `Reporting Amazon order ${activeJob.reportedOrderId || ""} back to the app.`, null, null);
+    } else if (activeJob.stage === "complete_pending") {
       await handleCompletion(activeJob);
     } else if (activeJob.stage === "subscribe_checkout") {
       await handleSubscribeCheckout(activeJob);
     } else if (activeJob.stage === "add_clicked") {
       await handleAddClicked(activeJob);
-    } else if (activeJob.stage === "find_order_id" || /order-history|your-account\/order-history|your-orders/i.test(location.href)) {
+    } else if (activeJob.stage === "find_order_id") {
       activeJob.stage = "find_order_id";
       await setActiveJob(activeJob);
       await handleOrderHistory(activeJob);

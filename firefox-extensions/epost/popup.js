@@ -9,6 +9,7 @@ const logsBox = document.querySelector("#logs");
 
 let targetWindowId = null;
 let settingsDirty = false;
+let settingsHydrated = false;
 
 [apiBase, adminToken, intervalDays].forEach((input) => {
   input.addEventListener("input", () => {
@@ -17,10 +18,11 @@ let settingsDirty = false;
 });
 
 function syncSettingsInputs(state) {
-  if (settingsDirty || [apiBase, adminToken, intervalDays].includes(document.activeElement)) return;
+  if (settingsHydrated || settingsDirty || [apiBase, adminToken, intervalDays].includes(document.activeElement)) return;
   apiBase.value = state.apiBase || "http://127.0.0.1:8000";
   adminToken.value = state.adminToken || "";
   intervalDays.value = state.intervalDays ?? 1;
+  settingsHydrated = true;
 }
 
 async function resolveTargetWindowId() {

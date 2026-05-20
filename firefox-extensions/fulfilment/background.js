@@ -137,17 +137,8 @@ async function openControlWindow(tab) {
   });
 }
 
-async function startNextJob() {
-  const workerId = await getWorkerId();
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true`);
-  const job = payload.jobs?.[0];
-  if (!job) {
-    await log("No queued Firefox jobs found.");
-    return { ok: false, message: "No queued Firefox jobs found." };
-  }
-  const createdWindow = await chrome.windows.create({ url: "https://www.amazon.com/cart?ref_=sw_gtc", type: "normal", focused: true });
-  const targetWindowId = createdWindow.id;
-  const activeJob = {
+function activeJobFor(job, workerId, targetWindowId) {
+  return {
     job,
     itemIndex: 0,
     stage: "clear_cart",
@@ -159,9 +150,48 @@ async function startNextJob() {
     startedAt: Date.now(),
     targetWindowId,
   };
+}
+
+async function navigateWindowToCart(windowId) {
+  if (!windowId) return;
+  const tabs = await chrome.tabs.query({ windowId });
+  const tab = tabs.find((item) => item.active) || tabs[0];
+  if (tab?.id) {
+    await chrome.tabs.update(tab.id, { url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
+  }
+  await chrome.windows.update(windowId, { focused: true });
+}
+
+async function startNextJob() {
+  const workerId = await getWorkerId();
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true`);
+  const job = payload.jobs?.[0];
+  if (!job) {
+    await log("No queued Firefox jobs found.");
+    return { ok: false, message: "No queued Firefox jobs found." };
+  }
+  const createdWindow = await chrome.windows.create({ url: "https://www.amazon.com/cart?ref_=sw_gtc", type: "normal", focused: true });
+  const targetWindowId = createdWindow.id;
+  const activeJob = activeJobFor(job, workerId, targetWindowId);
   await setWindowJob(targetWindowId, activeJob);
   await log(`Started ${job.group_key} with ${job.items.length} item(s).`, targetWindowId);
   return { ok: true, message: `Started ${job.group_key}.`, targetWindowId };
+}
+
+async function claimNextJobInWindow(windowId) {
+  const workerId = await getWorkerId();
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true`);
+  const job = payload.jobs?.[0];
+  if (!job) {
+    await setWindowJob(windowId, null);
+    await log("No more queued Firefox jobs found.", windowId);
+    return null;
+  }
+  const activeJob = activeJobFor(job, workerId, windowId);
+  await setWindowJob(windowId, activeJob);
+  await log(`Started next ${job.group_key} with ${job.items.length} item(s).`, windowId);
+  await navigateWindowToCart(windowId);
+  return activeJob;
 }
 
 async function stopJob(windowId) {
@@ -216,9 +246,9 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId) {
     method: "POST",
     body: JSON.stringify(body),
   });
-  await setWindowJob(windowId, null);
   await log(`Completed ${activeJob.job.group_key} as ${result.amazon_order_id}.`, windowId);
-  return result;
+  const nextJob = await claimNextJobInWindow(windowId);
+  return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
 }
 
 async function failJob(message, details = {}, windowId) {
