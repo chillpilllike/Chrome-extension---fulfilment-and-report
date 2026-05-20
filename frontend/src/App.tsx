@@ -2231,7 +2231,7 @@ function App() {
         }}
       />
       <AdminAccessDialog open={adminAccessOpen} onSubmit={handleAdminTokenSave} onClose={() => setAdminAccessOpen(false)} error={adminAuthError} busy={adminAuthBusy} />
-      <header className="navbar navbar-expand-md d-print-none sticky top-0 z-20">
+      <header className="navbar navbar-expand-md d-print-none">
         <div className="container-xl flex items-center justify-between gap-4 py-3">
           <button className="navbar-brand" onClick={() => setPage("home")}>
             <div className="avatar avatar-sm bg-primary text-primary-fg">

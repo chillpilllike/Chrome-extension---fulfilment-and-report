@@ -1594,8 +1594,15 @@ def order_date_window_sql() -> str:
     """
 
 
-def bulk_opportunity_groups(store_id: Optional[int] = None, days: int = 2) -> list[dict[str, Any]]:
+def bulk_opportunity_groups(store_id: Optional[int] = None, days: int = 2, candidate_ids: Optional[list[int]] = None) -> list[dict[str, Any]]:
     days = normalize_days_window(days)
+    id_clause = ""
+    id_params: list[Any] = []
+    if candidate_ids is not None:
+        if not candidate_ids:
+            return []
+        id_clause = " AND id = ANY(?::int[])"
+        id_params.append(candidate_ids)
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -1607,9 +1614,10 @@ def bulk_opportunity_groups(store_id: Optional[int] = None, days: int = 2) -> li
               AND state='pulled'
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {order_date_window_sql()}
+              {id_clause}
             ORDER BY asin, odoo_order_name
             """,
-            (store_id, store_id, days),
+            (store_id, store_id, days, *id_params),
         ).fetchall()
         missing_order_ids = {
             int(row["odoo_order_id"])
@@ -1645,9 +1653,16 @@ def bulk_opportunity_groups(store_id: Optional[int] = None, days: int = 2) -> li
     return sorted(opportunities, key=lambda item: (-float(item["quantity"]), item["asin"]))
 
 
-def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, days: int = 2) -> tuple[list[dict[str, Any]], int, int, int]:
+def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, days: int = 2, candidate_ids: Optional[list[int]] = None) -> tuple[list[dict[str, Any]], int, int, int]:
     days = normalize_days_window(days)
     page, per_page, offset = pagination_bounds(page, per_page)
+    id_clause = ""
+    id_params: list[Any] = []
+    if candidate_ids is not None:
+        if not candidate_ids:
+            return [], 0, page, per_page
+        id_clause = " AND id = ANY(?::int[])"
+        id_params.append(candidate_ids)
     with db() as conn:
         total_row = conn.execute(
             f"""
@@ -1661,11 +1676,12 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
                   AND state = 'pulled'
                   AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
                   {order_date_window_sql()}
+                  {id_clause}
                 GROUP BY asin
                 HAVING COUNT(DISTINCT odoo_order_name) > 1
             ) AS duplicate_groups
             """,
-            (store_id, store_id, days),
+            (store_id, store_id, days, *id_params),
         ).fetchone()
         rows = conn.execute(
             f"""
@@ -1681,12 +1697,13 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
               AND state = 'pulled'
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {order_date_window_sql()}
+              {id_clause}
             GROUP BY asin
             HAVING COUNT(DISTINCT odoo_order_name) > 1
             ORDER BY order_count DESC, total_quantity DESC, asin
             LIMIT ? OFFSET ?
             """,
-            (store_id, store_id, days, per_page, offset),
+            (store_id, store_id, days, *id_params, per_page, offset),
         ).fetchall()
     return rows_to_dicts(rows), int(total_row["count"] or 0), page, per_page
 
@@ -3145,16 +3162,36 @@ def typesense_enabled(settings: Optional[dict[str, str]] = None) -> bool:
     return str(settings.get("typesense_enabled", "")).lower() in {"1", "true", "yes", "on"}
 
 
+def typesense_ts(value: Any) -> int:
+    text = clean_text(str(value or ""))
+    if not text:
+        return 0
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
+    except Exception:
+        return 0
+
+
 def order_line_search_document(row: Union[dict[str, Any], dict[str, Any]]) -> dict[str, Any]:
+    order_date = row["odoo_order_date"] if "odoo_order_date" in row.keys() else ""
+    pulled_at = row["pulled_at"] if "pulled_at" in row.keys() else ""
+    ordered_at = row["ordered_at"] if "ordered_at" in row.keys() else ""
+    updated_at = row["updated_at"] if "updated_at" in row.keys() else ""
     return {
         "id": str(row["id"]),
         "row_id": int(row["id"]),
         "store_id": int(row["store_id"]),
+        "odoo_order_id": int(row["odoo_order_id"] or 0),
         "odoo_order_name": str(row["odoo_order_name"] or ""),
+        "odoo_order_date": str(order_date or ""),
         "product_name": str(row["product_name"] or ""),
         "default_code": str(row["default_code"] or ""),
         "asin": str(row["asin"] or ""),
         "supplier_part_auxiliary_id": str(row["supplier_part_auxiliary_id"] or "") if "supplier_part_auxiliary_id" in row.keys() else "",
+        "quantity": float(row["quantity"] or 0) if "quantity" in row.keys() else 0.0,
         "state": str(row["state"] or ""),
         "odoo_status_label": str(row["odoo_status_label"] or ""),
         "amazon_order_id": str(row["amazon_order_id"] or ""),
@@ -3164,7 +3201,13 @@ def order_line_search_document(row: Union[dict[str, Any], dict[str, Any]]) -> di
         "last_error": str(row["last_error"] or "") if "last_error" in row.keys() else "",
         "missing_asin": str(row["missing_asin"] or "") if "missing_asin" in row.keys() else "",
         "replacement_asin": str(row["replacement_asin"] or "") if "replacement_asin" in row.keys() else "",
-        "updated_at": str(row["updated_at"] or ""),
+        "pulled_at": str(pulled_at or ""),
+        "ordered_at": str(ordered_at or ""),
+        "updated_at": str(updated_at or ""),
+        "order_date_ts": typesense_ts(order_date or pulled_at or updated_at),
+        "pulled_ts": typesense_ts(pulled_at),
+        "ordered_ts": typesense_ts(ordered_at),
+        "updated_ts": typesense_ts(updated_at),
     }
 
 
@@ -3178,11 +3221,14 @@ def ensure_typesense_collection(settings: Optional[dict[str, str]] = None) -> No
         "fields": [
             {"name": "row_id", "type": "int32"},
             {"name": "store_id", "type": "int32", "facet": True},
+            {"name": "odoo_order_id", "type": "int32"},
             {"name": "odoo_order_name", "type": "string"},
+            {"name": "odoo_order_date", "type": "string", "optional": True},
             {"name": "product_name", "type": "string"},
             {"name": "default_code", "type": "string", "optional": True},
             {"name": "asin", "type": "string"},
             {"name": "supplier_part_auxiliary_id", "type": "string", "optional": True},
+            {"name": "quantity", "type": "float"},
             {"name": "state", "type": "string", "facet": True},
             {"name": "odoo_status_label", "type": "string", "facet": True},
             {"name": "amazon_order_id", "type": "string", "optional": True},
@@ -3192,7 +3238,13 @@ def ensure_typesense_collection(settings: Optional[dict[str, str]] = None) -> No
             {"name": "last_error", "type": "string", "optional": True},
             {"name": "missing_asin", "type": "string", "optional": True},
             {"name": "replacement_asin", "type": "string", "optional": True},
+            {"name": "pulled_at", "type": "string", "optional": True},
+            {"name": "ordered_at", "type": "string", "optional": True},
             {"name": "updated_at", "type": "string", "optional": True},
+            {"name": "order_date_ts", "type": "int64"},
+            {"name": "pulled_ts", "type": "int64"},
+            {"name": "ordered_ts", "type": "int64"},
+            {"name": "updated_ts", "type": "int64"},
         ],
     }
     response = requests.get(f"{base}/collections/order_lines", headers=typesense_headers(settings), timeout=8)
@@ -3265,6 +3317,307 @@ def delete_order_line_index(line_id: int) -> None:
         pass
 
 
+TYPESENSE_COLLECTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "inventory_items": {
+        "name": "inventory_items",
+        "fields": [
+            {"name": "row_id", "type": "int32"},
+            {"name": "store_id", "type": "int32", "facet": True},
+            {"name": "asin", "type": "string"},
+            {"name": "quantity", "type": "float"},
+            {"name": "product_name", "type": "string", "optional": True},
+            {"name": "source_odoo_order_name", "type": "string", "optional": True},
+            {"name": "amazon_order_id", "type": "string", "optional": True},
+            {"name": "amazon_account_name", "type": "string", "optional": True},
+            {"name": "status", "type": "string", "facet": True},
+            {"name": "source_type", "type": "string", "facet": True, "optional": True},
+            {"name": "notes", "type": "string", "optional": True},
+            {"name": "manual_reference", "type": "string", "optional": True},
+            {"name": "updated_ts", "type": "int64"},
+        ],
+    },
+    "epost_global_tracking": {
+        "name": "epost_global_tracking",
+        "fields": [
+            {"name": "row_id", "type": "int32"},
+            {"name": "store_id", "type": "int32", "facet": True},
+            {"name": "odoo_order_name", "type": "string", "optional": True},
+            {"name": "amazon_order_id", "type": "string", "optional": True},
+            {"name": "picking_name", "type": "string", "optional": True},
+            {"name": "tracking_code", "type": "string"},
+            {"name": "status", "type": "string", "optional": True},
+            {"name": "epost_status", "type": "string", "facet": True},
+            {"name": "destination", "type": "string", "optional": True},
+            {"name": "awb", "type": "string", "optional": True},
+            {"name": "location", "type": "string", "optional": True},
+            {"name": "updated_ts", "type": "int64"},
+        ],
+    },
+    "shipping_charges": {
+        "name": "shipping_charges",
+        "fields": [
+            {"name": "row_id", "type": "int32"},
+            {"name": "odoo_order_name", "type": "string"},
+            {"name": "tracking_number", "type": "string", "optional": True},
+            {"name": "carrier", "type": "string", "optional": True},
+            {"name": "service", "type": "string", "optional": True},
+            {"name": "import_id", "type": "string", "optional": True},
+            {"name": "created_ts", "type": "int64"},
+        ],
+    },
+    "accounting_documents": {
+        "name": "accounting_documents",
+        "fields": [
+            {"name": "row_id", "type": "int32"},
+            {"name": "document_type", "type": "string", "facet": True},
+            {"name": "odoo_order_name", "type": "string"},
+            {"name": "country_code", "type": "string", "facet": True},
+            {"name": "tax_region", "type": "string", "facet": True},
+            {"name": "original_filename", "type": "string"},
+            {"name": "stored_filename", "type": "string"},
+            {"name": "notes", "type": "string", "optional": True},
+            {"name": "created_ts", "type": "int64"},
+        ],
+    },
+    "amazon_otp_records": {
+        "name": "amazon_otp_records",
+        "fields": [
+            {"name": "row_id", "type": "int32"},
+            {"name": "amazon_order_id", "type": "string"},
+            {"name": "otp", "type": "string", "optional": True},
+            {"name": "tracking_url", "type": "string", "optional": True},
+            {"name": "shipment_id", "type": "string", "optional": True},
+            {"name": "recipient", "type": "string", "optional": True},
+            {"name": "product_summary", "type": "string", "optional": True},
+            {"name": "status", "type": "string", "facet": True, "optional": True},
+            {"name": "updated_ts", "type": "int64"},
+        ],
+    },
+    "amazon_payment_failures": {
+        "name": "amazon_payment_failures",
+        "fields": [
+            {"name": "row_id", "type": "string"},
+            {"name": "store_id", "type": "int32", "facet": True, "optional": True},
+            {"name": "amazon_order_id", "type": "string"},
+            {"name": "odoo_order_names", "type": "string", "optional": True},
+            {"name": "message", "type": "string", "optional": True},
+            {"name": "status", "type": "string", "facet": True},
+            {"name": "updated_ts", "type": "int64"},
+        ],
+    },
+}
+
+
+def ensure_named_typesense_collection(name: str, schema: Optional[dict[str, Any]] = None, settings: Optional[dict[str, str]] = None) -> None:
+    settings = settings or get_service_settings()
+    schema = schema or TYPESENSE_COLLECTION_SCHEMAS[name]
+    base = typesense_base(settings)
+    if not base:
+        raise RuntimeError("Typesense URL is missing.")
+    response = requests.get(f"{base}/collections/{name}", headers=typesense_headers(settings), timeout=8)
+    if response.status_code == 404:
+        create = requests.post(f"{base}/collections", headers=typesense_headers(settings), json=schema, timeout=15)
+        if create.status_code >= 400:
+            raise RuntimeError(f"Typesense collection create failed for {name}: HTTP {create.status_code}: {create.text[:500]}")
+        return
+    if response.status_code >= 400:
+        raise RuntimeError(f"Typesense collection check failed for {name}: HTTP {response.status_code}: {response.text[:500]}")
+    collection = response.json()
+    existing_fields = {field.get("name") for field in collection.get("fields", [])}
+    missing_fields = [field for field in schema["fields"] if field["name"] not in existing_fields]
+    if missing_fields:
+        alter = requests.patch(
+            f"{base}/collections/{name}",
+            headers=typesense_headers(settings),
+            json={"fields": missing_fields},
+            timeout=15,
+        )
+        if alter.status_code >= 400:
+            raise RuntimeError(f"Typesense collection update failed for {name}: HTTP {alter.status_code}: {alter.text[:500]}")
+
+
+def typesense_search_documents(
+    collection: str,
+    query: str,
+    query_by: str,
+    *,
+    filter_by: str = "",
+    page: int = 1,
+    per_page: int = 100,
+    sort_by: str = "",
+    schema: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    settings = get_service_settings()
+    if not typesense_enabled(settings):
+        return {"ids": [], "total": 0, "enabled": False}
+    page, per_page, _ = pagination_bounds(page, per_page)
+    ensure_named_typesense_collection(collection, schema, settings)
+    params = {
+        "q": query.strip() or "*",
+        "query_by": query_by,
+        "per_page": str(per_page),
+        "page": str(page),
+        "prefix": "true",
+        "infix": "always",
+        "num_typos": "1",
+        "drop_tokens_threshold": "0",
+    }
+    if filter_by:
+        params["filter_by"] = filter_by
+    if sort_by:
+        params["sort_by"] = sort_by
+    response = requests.get(
+        f"{typesense_base(settings)}/collections/{collection}/documents/search",
+        headers=typesense_headers(settings),
+        params=params,
+        timeout=8,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Typesense search failed for {collection}: HTTP {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    ids = []
+    for hit in payload.get("hits") or []:
+        doc = hit.get("document") or {}
+        row_id = doc.get("row_id")
+        if row_id is not None:
+            ids.append(row_id)
+    return {"ids": ids, "total": int(payload.get("found") or 0), "enabled": True}
+
+
+def typesense_all_document_ids(collection: str, query_by: str, filter_by: str = "", query: str = "*", limit: int = 50000) -> list[Any]:
+    ids: list[Any] = []
+    page = 1
+    per_page = 250
+    while len(ids) < limit:
+        result = typesense_search_documents(collection, query, query_by, filter_by=filter_by, page=page, per_page=per_page)
+        batch = list(result.get("ids") or [])
+        if not batch:
+            break
+        ids.extend(batch)
+        if len(ids) >= int(result.get("total") or 0):
+            break
+        page += 1
+    return ids[:limit]
+
+
+def inventory_search_document(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "row_id": int(row["id"]),
+        "store_id": int(row["store_id"]),
+        "asin": str(row.get("asin") or ""),
+        "quantity": float(row.get("quantity") or 0),
+        "product_name": str(row.get("product_name") or ""),
+        "source_odoo_order_name": str(row.get("source_odoo_order_name") or ""),
+        "amazon_order_id": str(row.get("amazon_order_id") or ""),
+        "amazon_account_name": str(row.get("amazon_account_name") or ""),
+        "status": str(row.get("status") or ""),
+        "source_type": str(row.get("source_type") or ""),
+        "notes": str(row.get("notes") or ""),
+        "manual_reference": str(row.get("manual_reference") or ""),
+        "updated_ts": typesense_ts(row.get("updated_at") or row.get("created_at")),
+    }
+
+
+def epost_search_document(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "row_id": int(row["id"]),
+        "store_id": int(row["store_id"]),
+        "odoo_order_name": str(row.get("odoo_order_name") or ""),
+        "amazon_order_id": str(row.get("amazon_order_id") or ""),
+        "picking_name": str(row.get("picking_name") or ""),
+        "tracking_code": str(row.get("tracking_code") or ""),
+        "status": str(row.get("status") or ""),
+        "epost_status": str(row.get("epost_status") or ""),
+        "destination": str(row.get("destination") or ""),
+        "awb": str(row.get("awb") or ""),
+        "location": str(row.get("location") or ""),
+        "updated_ts": typesense_ts(row.get("updated_at") or row.get("last_checked_at") or row.get("created_at")),
+    }
+
+
+def shipping_charge_search_document(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "row_id": int(row["id"]),
+        "odoo_order_name": str(row.get("odoo_order_name") or ""),
+        "tracking_number": str(row.get("tracking_number") or ""),
+        "carrier": str(row.get("carrier") or ""),
+        "service": str(row.get("service") or ""),
+        "import_id": str(row.get("import_id") or ""),
+        "created_ts": typesense_ts(row.get("created_at")),
+    }
+
+
+def accounting_search_document(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "row_id": int(row["id"]),
+        "document_type": str(row.get("document_type") or ""),
+        "odoo_order_name": str(row.get("odoo_order_name") or ""),
+        "country_code": str(row.get("country_code") or ""),
+        "tax_region": str(row.get("tax_region") or ""),
+        "original_filename": str(row.get("original_filename") or ""),
+        "stored_filename": str(row.get("stored_filename") or ""),
+        "notes": str(row.get("notes") or ""),
+        "created_ts": typesense_ts(row.get("created_at")),
+    }
+
+
+def amazon_otp_search_document(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "row_id": int(row["id"]),
+        "amazon_order_id": str(row.get("amazon_order_id") or ""),
+        "otp": str(row.get("otp") or ""),
+        "tracking_url": str(row.get("tracking_url") or ""),
+        "shipment_id": str(row.get("shipment_id") or ""),
+        "recipient": str(row.get("recipient") or ""),
+        "product_summary": str(row.get("product_summary") or ""),
+        "status": str(row.get("status") or ""),
+        "updated_ts": typesense_ts(row.get("updated_at") or row.get("last_synced_at") or row.get("created_at")),
+    }
+
+
+def payment_failure_search_document(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["amazon_order_id"]),
+        "row_id": str(row["amazon_order_id"]),
+        "store_id": int(row.get("store_id") or 0),
+        "amazon_order_id": str(row.get("amazon_order_id") or ""),
+        "odoo_order_names": str(row.get("odoo_order_names") or ""),
+        "message": str(row.get("message") or ""),
+        "status": str(row.get("status") or ""),
+        "updated_ts": typesense_ts(row.get("updated_at") or row.get("detected_at")),
+    }
+
+
+TYPESENSE_TABLE_BUILDERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "inventory_items": inventory_search_document,
+    "epost_global_tracking": epost_search_document,
+    "shipping_charges": shipping_charge_search_document,
+    "accounting_documents": accounting_search_document,
+    "amazon_otp_records": amazon_otp_search_document,
+    "amazon_payment_failures": payment_failure_search_document,
+}
+
+
+def _index_named_document_sync(collection: str, document: dict[str, Any]) -> None:
+    settings = get_service_settings()
+    if not typesense_enabled(settings):
+        return
+    ensure_named_typesense_collection(collection, settings=settings)
+    response = requests.post(
+        f"{typesense_base(settings)}/collections/{collection}/documents?action=upsert",
+        headers=typesense_headers(settings),
+        json=document,
+        timeout=8,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Typesense upsert failed for {collection}: HTTP {response.status_code}: {response.text[:500]}")
+
+
 _TYPESENSE_REINDEX_LOCK = threading.Lock()
 _TYPESENSE_REINDEX_PENDING = False
 
@@ -3307,15 +3660,24 @@ def reindex_order_lines(chunk_size: int = 250) -> int:
     base = typesense_base(settings)
     if not base:
         raise RuntimeError("Typesense URL is missing.")
-    delete_response = requests.delete(f"{base}/collections/order_lines", headers=typesense_headers(settings), timeout=15)
-    if delete_response.status_code not in {200, 201, 202, 204, 404}:
-        raise RuntimeError(f"Typesense collection reset failed: HTTP {delete_response.status_code}: {delete_response.text[:500]}")
+    all_collections = ["order_lines", *TYPESENSE_COLLECTION_SCHEMAS.keys()]
+    for collection in all_collections:
+        delete_response = requests.delete(f"{base}/collections/{collection}", headers=typesense_headers(settings), timeout=15)
+        if delete_response.status_code not in {200, 201, 202, 204, 404}:
+            raise RuntimeError(f"Typesense collection reset failed for {collection}: HTTP {delete_response.status_code}: {delete_response.text[:500]}")
     ensure_typesense_collection(settings)
+    for collection in TYPESENSE_COLLECTION_SCHEMAS:
+        ensure_named_typesense_collection(collection, settings=settings)
     with db() as conn:
         total = int(conn.execute("SELECT COUNT(*) AS count FROM order_lines").fetchone()["count"] or 0)
+        for table in TYPESENSE_COLLECTION_SCHEMAS:
+            total += int(conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"] or 0)
     processed = 0
     headers = typesense_headers(settings)
-    while processed < total:
+    order_processed = 0
+    with db() as conn:
+        order_total = int(conn.execute("SELECT COUNT(*) AS count FROM order_lines").fetchone()["count"] or 0)
+    while order_processed < order_total:
         with db() as conn:
             rows = conn.execute(
                 """
@@ -3324,7 +3686,7 @@ def reindex_order_lines(chunk_size: int = 250) -> int:
                 ORDER BY id
                 LIMIT ? OFFSET ?
                 """,
-                (chunk_size, processed),
+                (chunk_size, order_processed),
             ).fetchall()
         if not rows:
             break
@@ -3337,13 +3699,49 @@ def reindex_order_lines(chunk_size: int = 250) -> int:
         )
         if response.status_code >= 400:
             raise RuntimeError(f"Typesense index failed: HTTP {response.status_code}: {response.text[:500]}")
+        order_processed += len(rows)
         processed += len(rows)
         set_typesense_reindex_progress(
             status="running",
             processed=processed,
             total=total,
-            message=f"Indexed {processed} of {total} order line(s).",
+            message=f"Indexed {processed} of {total} searchable record(s).",
         )
+    for table, builder in TYPESENSE_TABLE_BUILDERS.items():
+        table_processed = 0
+        with db() as conn:
+            table_total = int(conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"] or 0)
+        order_column = "amazon_order_id" if table == "amazon_payment_failures" else "id"
+        while table_processed < table_total:
+            with db() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM {table}
+                    ORDER BY {order_column}
+                    LIMIT ? OFFSET ?
+                    """,
+                    (chunk_size, table_processed),
+                ).fetchall()
+            if not rows:
+                break
+            documents = [json.dumps(builder(row_to_dict(row) or {}), default=str) for row in rows]
+            response = requests.post(
+                f"{base}/collections/{table}/documents/import?action=upsert",
+                headers={**headers, "Content-Type": "text/plain"},
+                data="\n".join(documents),
+                timeout=30,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"Typesense index failed for {table}: HTTP {response.status_code}: {response.text[:500]}")
+            table_processed += len(rows)
+            processed += len(rows)
+            set_typesense_reindex_progress(
+                status="running",
+                processed=processed,
+                total=total,
+                message=f"Indexed {processed} of {total} searchable record(s).",
+            )
     return processed
 
 
@@ -4791,6 +5189,7 @@ def epost_status_from_update(status: str, last_update_at: Any, fallback_at: Any 
 
 
 def refresh_epost_lost_statuses(store_id: Optional[int] = None) -> None:
+    changed = 0
     with db() as conn:
         rows = conn.execute(
             """
@@ -4808,6 +5207,9 @@ def refresh_epost_lost_statuses(store_id: Optional[int] = None) -> None:
                     "UPDATE epost_global_tracking SET epost_status=?, updated_at=? WHERE id=?",
                     (next_status, utc_now(), row["id"]),
                 )
+                changed += 1
+    if changed:
+        start_typesense_reindex_job()
 
 
 def epost_tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
@@ -4939,6 +5341,57 @@ def paged_epost_tracking_rows(
     return data, total, page, per_page
 
 
+def epost_tracking_rows_by_ids(ids: list[int]) -> list[dict[str, Any]]:
+    if not ids:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            WITH matched(id, sort_order) AS (
+                SELECT * FROM UNNEST(?::int[]) WITH ORDINALITY
+            )
+            SELECT epost_global_tracking.*, stores.name AS store_name,
+                   COALESCE(
+                       (SELECT SUM(shipping_fee) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
+                       (SELECT SUM(shipping_fee) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
+                       0
+                   ) AS shipping_fee,
+                   COALESCE(
+                       (SELECT SUM(fulfilment_fee) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
+                       (SELECT SUM(fulfilment_fee) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
+                       0
+                   ) AS fulfilment_fee,
+                   COALESCE(
+                       (SELECT SUM(total_cost) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
+                       (SELECT SUM(total_cost) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
+                       0
+                   ) AS shipping_total,
+                   COALESCE(
+                       (SELECT COUNT(*) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
+                       0
+                   ) AS shipping_tracking_matches,
+                   COALESCE(
+                       (SELECT COUNT(*) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
+                       0
+                   ) AS shipping_order_matches
+            FROM epost_global_tracking
+            JOIN stores ON stores.id = epost_global_tracking.store_id
+            JOIN matched ON matched.id = epost_global_tracking.id
+            ORDER BY matched.sort_order
+            """,
+            (ids,),
+        ).fetchall()
+    data = rows_to_dicts(rows)
+    stores = {int(store["id"]): store for store in list_stores()}
+    for row in data:
+        store = stores.get(int(row["store_id"]))
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
+        row["tracking_url"] = row.get("tracking_url") or f"https://epgtrack.com/{row.get('tracking_code')}"
+        row["shipping_match_type"] = "tracking" if int(row.get("shipping_tracking_matches") or 0) else "order" if int(row.get("shipping_order_matches") or 0) else ""
+    return data
+
+
 def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None) -> list[dict[str, Any]]:
     days = max(0, min(30, int(days or 1)))
     cutoff = time.time() - days * 86400
@@ -4960,9 +5413,10 @@ def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None) -> li
     return due
 
 
-def duplicate_tracking_rows(store_id: Optional[int] = None, q: str = "") -> list[dict[str, Any]]:
+def duplicate_tracking_rows(store_id: Optional[int] = None, q: str = "", candidate_codes: Optional[set[str]] = None) -> list[dict[str, Any]]:
     refresh_epost_lost_statuses(store_id)
     term = clean_text(q).lower()
+    allowed_codes = {clean_text(code).upper() for code in candidate_codes or set() if clean_text(code)}
     with db() as conn:
         epost_candidates = conn.execute(
             """
@@ -4984,14 +5438,16 @@ def duplicate_tracking_rows(store_id: Optional[int] = None, q: str = "") -> list
             HAVING COUNT(*) > 1 OR COUNT(DISTINCT COALESCE(odoo_order_name, '')) > 1
             """
         ).fetchall()
-        candidate_codes = sorted({
+        duplicate_codes = sorted({
             clean_text(row["tracking_code"]).upper()
             for row in [*epost_candidates, *shipping_candidates]
             if clean_text(row["tracking_code"])
         })
+        if candidate_codes is not None:
+            duplicate_codes = [code for code in duplicate_codes if code in allowed_codes]
         stores = {int(store["id"]): store for store in list_stores()}
         results: list[dict[str, Any]] = []
-        for code in candidate_codes:
+        for code in duplicate_codes:
             epost_rows = rows_to_dicts(
                 conn.execute(
                     """
@@ -5711,12 +6167,21 @@ def profit_loss_data(
     q: str = "",
     page: int = 1,
     per_page: int = 100,
+    candidate_order_names: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
     start_dt, end_dt, resolved_month = date_range_from_params(period, month, start, end)
     start_text = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_text = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-    search = f"%{q.strip()}%" if q.strip() else None
+    search = None if candidate_order_names is not None else (f"%{q.strip()}%" if q.strip() else None)
+    candidate_clause = ""
+    candidate_params: list[Any] = []
+    if candidate_order_names is not None:
+        if not candidate_order_names:
+            candidate_clause = " AND FALSE"
+        else:
+            candidate_clause = " AND line_orders.odoo_order_name = ANY(?::text[])"
+            candidate_params.append(candidate_order_names)
     normalize_converted_profit_columns(store_id, start_text, end_text)
     with db() as conn:
         rows = conn.execute(
@@ -5764,9 +6229,10 @@ def profit_loss_data(
             LEFT JOIN shipping ON shipping.odoo_order_name = line_orders.odoo_order_name
             WHERE line_orders.order_date BETWEEN ? AND ?
               AND (? IS NULL OR line_orders.odoo_order_name LIKE ? OR line_orders.amazon_order_ids LIKE ?)
+              {candidate_clause}
             ORDER BY line_orders.order_date DESC, line_orders.odoo_order_id DESC
             """,
-            (store_id, store_id, start_text, end_text, search, search, search),
+            (store_id, store_id, start_text, end_text, search, search, search, *candidate_params),
         ).fetchall()
         imports = conn.execute("SELECT * FROM shipping_imports ORDER BY created_at DESC LIMIT 12").fetchall()
     order_rows = rows_to_dicts(rows)
@@ -5813,6 +6279,7 @@ def profit_loss_data(
         "start": start_dt.date().isoformat(),
         "end": end_dt.date().isoformat(),
         "month": resolved_month,
+        "search_engine": "typesense" if candidate_order_names is not None else "postgres",
     }
 
 
@@ -5867,6 +6334,8 @@ def upload_shipping_records(filename: str, data: bytes, month: str, default_fulf
             "UPDATE shipping_imports SET row_count=?, matched_count=?, unmatched_count=? WHERE id=?",
             (inserted, matched, max(0, inserted - matched), import_id),
         )
+    if inserted:
+        start_typesense_reindex_job()
     return {"ok": True, "message": f"Imported {inserted} shipping rows. Matched {matched}, unmatched {max(0, inserted - matched)}.", "import_id": import_id}
 
 
@@ -6016,6 +6485,8 @@ def sync_odoo_accounting_documents(store_id: int, days: int = 30, limit: int = 2
                 synced += 1
             except Exception as exc:
                 errors.append(f"{order_name}: {exc}")
+    if synced or deleted:
+        start_typesense_reindex_job()
     return {"ok": True, "synced": synced, "deleted": deleted, "errors": errors[:20], "message": f"Synced {synced} Odoo invoice(s), deleted {deleted} stale file(s)."}
 
 
@@ -7107,6 +7578,9 @@ def upsert_amazon_otp_record(parsed: Any, folder: str = "", uid: str = "") -> bo
                 """,
                 (folder, uid, parsed.message_id, order_id, parsed.email_type, parsed.subject, parsed.email_date, now),
             )
+        updated = conn.execute("SELECT * FROM amazon_otp_records WHERE amazon_order_id=?", (order_id,)).fetchone()
+    if updated:
+        _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(updated) or {}: _index_named_document_sync("amazon_otp_records", amazon_otp_search_document(snapshot)))
     return True
 
 
@@ -7240,7 +7714,7 @@ def backfill_missing_order_dates(rows: list[dict[str, Any]]) -> list[dict[str, A
     return updated_rows
 
 
-def amazon_otp_rows(q: str = "") -> list[dict[str, Any]]:
+def amazon_otp_rows(q: str = "", record_ids: Optional[set[int]] = None) -> list[dict[str, Any]]:
     term = clean_text(q).lower()
     term_digits = re.sub(r"\D+", "", term)
     with db() as conn:
@@ -7266,6 +7740,8 @@ def amazon_otp_rows(q: str = "") -> list[dict[str, Any]]:
     stores = {int(store["id"]): store for store in list_stores()}
     results: list[dict[str, Any]] = []
     for record in rows_to_dicts(records):
+        if record_ids is not None and int(record.get("id") or 0) not in record_ids:
+            continue
         order_id = clean_text(record.get("amazon_order_id"))
         order_lines = lines_by_order.get(order_id, [])
         packages: list[dict[str, Any]] = []
@@ -7561,6 +8037,110 @@ def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, p
     }
 
 
+def sql_rows_by_ids(table: str, ids: list[Any], id_column: str = "id", order_by: str = "") -> list[dict[str, Any]]:
+    if not ids:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            WITH matched(id, sort_order) AS (
+                SELECT * FROM UNNEST(?::text[]) WITH ORDINALITY
+            )
+            SELECT {table}.*
+            FROM {table}
+            JOIN matched ON matched.id = {table}.{id_column}::text
+            ORDER BY {order_by or "matched.sort_order"}
+            """,
+            ([str(value) for value in ids],),
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def line_filter_for_typesense(store_id: Optional[int] = None, state: str = "", since_ts: int = 0) -> str:
+    filters = []
+    if store_id:
+        filters.append(f"store_id:={int(store_id)}")
+    if state:
+        filters.append(f"state:={state}")
+    if since_ts:
+        filters.append(f"order_date_ts:>={int(since_ts)}")
+    return " && ".join(filters)
+
+
+def typesense_order_line_ids_for_filter(filter_by: str, limit: int = 50000, query: str = "*") -> list[int]:
+    settings = get_service_settings()
+    if not typesense_enabled(settings):
+        return []
+    ensure_typesense_collection(settings)
+    ids: list[int] = []
+    page = 1
+    per_page = 250
+    while len(ids) < limit:
+        params = {
+            "q": query.strip() or "*",
+            "query_by": "odoo_order_name,product_name,asin,amazon_order_id,amazon_account_name,tracking_status,fulfilment_note,last_error",
+            "filter_by": filter_by,
+            "page": str(page),
+            "per_page": str(per_page),
+            "sort_by": "order_date_ts:desc,updated_ts:desc",
+            "prefix": "true",
+            "infix": "always",
+        }
+        response = requests.get(
+            f"{typesense_base(settings)}/collections/order_lines/documents/search",
+            headers=typesense_headers(settings),
+            params=params,
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Typesense search failed for order_lines: HTTP {response.status_code}: {response.text[:500]}")
+        payload = response.json()
+        batch = [int((hit.get("document") or {}).get("row_id")) for hit in payload.get("hits") or [] if (hit.get("document") or {}).get("row_id")]
+        if not batch:
+            break
+        ids.extend(batch)
+        if len(ids) >= int(payload.get("found") or 0):
+            break
+        page += 1
+    return ids[:limit]
+
+
+def order_window_since_ts(days: int) -> int:
+    days = normalize_days_window(days)
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days - 1)
+    return int(datetime(cutoff.year, cutoff.month, cutoff.day, tzinfo=timezone.utc).timestamp())
+
+
+def order_line_ids_for_state(store_id: Optional[int], state: str, page: int, per_page: int) -> dict[str, Any]:
+    settings = get_service_settings()
+    if not typesense_enabled(settings):
+        return {"ids": [], "total": 0, "enabled": False}
+    page, per_page, _ = pagination_bounds(page, per_page)
+    ensure_typesense_collection(settings)
+    params = {
+        "q": "*",
+        "query_by": "odoo_order_name,product_name,asin,amazon_order_id,last_error",
+        "filter_by": line_filter_for_typesense(store_id, state),
+        "page": str(page),
+        "per_page": str(per_page),
+        "sort_by": "updated_ts:desc,odoo_order_id:desc",
+    }
+    response = requests.get(
+        f"{typesense_base(settings)}/collections/order_lines/documents/search",
+        headers=typesense_headers(settings),
+        params=params,
+        timeout=8,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Typesense search failed for order_lines: HTTP {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    return {
+        "ids": [int((hit.get("document") or {}).get("row_id")) for hit in payload.get("hits") or [] if (hit.get("document") or {}).get("row_id")],
+        "total": int(payload.get("found") or 0),
+        "enabled": True,
+    }
+
+
 @app.on_event("startup")
 def startup() -> None:
     global _sync_thread_started
@@ -7570,6 +8150,8 @@ def startup() -> None:
         threading.Thread(target=autosync_loop, daemon=True).start()
         threading.Thread(target=backup_loop, daemon=True).start()
         threading.Thread(target=amazon_otp_loop, daemon=True).start()
+        if typesense_enabled():
+            threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
         _sync_thread_started = True
 
 
@@ -7826,15 +8408,36 @@ def backup_loop() -> None:
 
 
 @app.get("/api/inventory")
-def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    items, total = list_inventory_items(store_id, page, per_page)
+def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> dict[str, Any]:
+    page, per_page, _ = pagination_bounds(page, per_page)
+    search_engine = "postgres"
+    try:
+        filter_by = f"store_id:={int(store_id)}" if store_id else ""
+        result = typesense_search_documents(
+            "inventory_items",
+            q or "*",
+            "asin,product_name,source_odoo_order_name,amazon_order_id,amazon_account_name,status,source_type,notes,manual_reference",
+            filter_by=filter_by,
+            page=page,
+            per_page=per_page,
+            sort_by="updated_ts:desc",
+        )
+        if result.get("enabled"):
+            items = sql_rows_by_ids("inventory_items", list(result.get("ids") or []))
+            total = int(result.get("total") or 0)
+            search_engine = "typesense"
+        else:
+            items, total = list_inventory_items(store_id, page, per_page)
+    except Exception:
+        items, total = list_inventory_items(store_id, page, per_page)
     return {
         "stores": rows_to_dicts(list_stores()),
         "current_store_id": store_id,
-        "items": rows_to_dicts(items),
-        "page": max(1, int(page or 1)),
-        "per_page": max(1, min(100, int(per_page or 100))),
+        "items": rows_to_dicts(items) if items and not isinstance(items[0], dict) else items,
+        "page": page,
+        "per_page": per_page,
         "total": total,
+        "search_engine": search_engine,
     }
 
 
@@ -7846,13 +8449,15 @@ def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
     quantity = float(payload.quantity or 0)
     if quantity <= 0:
         raise HTTPException(400, "Quantity must be greater than zero.")
+    manual_reference = f"manual-{uuid.uuid4().hex[:10]}"
     with db() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO inventory_items
             (store_id, order_line_id, asin, quantity, product_name, source_odoo_order_id, source_odoo_order_name,
              amazon_order_id, amazon_order_url, amazon_account_name, status, source_type, notes, manual_reference, created_at, updated_at)
             VALUES (?, NULL, ?, ?, ?, NULL, '', '', '', '', 'available', 'manual', ?, ?, ?, ?)
+            RETURNING id
             """,
             (
                 payload.store_id,
@@ -7860,11 +8465,21 @@ def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
                 quantity,
                 clean_text(payload.product_name),
                 clean_text(payload.notes),
-                f"manual-{uuid.uuid4().hex[:10]}",
+                manual_reference,
                 utc_now(),
                 utc_now(),
             ),
         )
+        inserted = cursor.fetchone()
+        if not inserted:
+            row = conn.execute(
+                "SELECT * FROM inventory_items WHERE store_id=? AND manual_reference=? ORDER BY id DESC LIMIT 1",
+                (payload.store_id, manual_reference),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inserted["id"],)).fetchone()
+    if row:
+        _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(row) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
     items, total = list_inventory_items(payload.store_id, 1, 100)
     return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {asin}.", "items": rows_to_dicts(items), "page": 1, "per_page": 100, "total": total}
 
@@ -7872,8 +8487,19 @@ def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
 @app.get("/api/missing")
 def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
-    raw_rows, total = list_missing_order_lines(store_id, page, per_page)
-    rows = rows_to_dicts(raw_rows)
+    search_engine = "postgres"
+    try:
+        result = order_line_ids_for_state(store_id, "missing", page, per_page)
+        if result.get("enabled"):
+            rows = order_lines_by_ids([int(value) for value in result.get("ids") or []])
+            total = int(result.get("total") or 0)
+            search_engine = "typesense"
+        else:
+            raw_rows, total = list_missing_order_lines(store_id, page, per_page)
+            rows = rows_to_dicts(raw_rows)
+    except Exception:
+        raw_rows, total = list_missing_order_lines(store_id, page, per_page)
+        rows = rows_to_dicts(raw_rows)
     stores = rows_to_dicts(list_stores())
     stores_by_id = {store["id"]: store for store in stores}
     for row in rows:
@@ -7882,13 +8508,22 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
         row["missing_asin_url"] = asin_product_url(row.get("missing_asin") or row.get("asin") or "")
         row["asin_url"] = asin_product_url(row.get("asin") or "")
         row["replacement_asin_url"] = asin_product_url(row.get("replacement_asin") or "")
-    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total}
+    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
 
 
 @app.get("/api/duplicate-asins")
 def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page: int = 12, days: int = 2) -> dict[str, Any]:
     days = normalize_days_window(days)
-    rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
+    search_engine = "postgres"
+    try:
+        candidate_ids = typesense_order_line_ids_for_filter(line_filter_for_typesense(store_id, "pulled", order_window_since_ts(days)))
+        if candidate_ids:
+            rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days, candidate_ids)
+            search_engine = "typesense"
+        else:
+            rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
+    except Exception:
+        rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
     return {
         "ok": True,
         "stores": rows_to_dicts(list_stores()),
@@ -7898,7 +8533,7 @@ def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page:
         "per_page": per_page,
         "total": total,
         "days": days,
-        "search_engine": "postgres_indexed",
+        "search_engine": search_engine,
     }
 
 
@@ -7966,8 +8601,17 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
 @app.get("/api/bulk")
 def api_bulk(store_id: Optional[int] = None, days: int = 2, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     days = normalize_days_window(days)
-    groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
-    return {"ok": True, "stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days, "search_engine": "postgres_indexed"}
+    search_engine = "postgres"
+    try:
+        candidate_ids = typesense_order_line_ids_for_filter(line_filter_for_typesense(store_id, "pulled", order_window_since_ts(days)))
+        if candidate_ids:
+            groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days, candidate_ids), page, per_page)
+            search_engine = "typesense"
+        else:
+            groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
+    except Exception:
+        groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
+    return {"ok": True, "stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days, "search_engine": search_engine}
 
 
 @app.post("/api/bulk/place")
@@ -8032,15 +8676,26 @@ def api_bulk_place(payload: BulkPlacePayload) -> dict[str, Any]:
 @app.get("/api/costly")
 def api_costly(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
-    raw_rows, total = list_costly_order_lines(store_id, page, per_page)
-    rows = rows_to_dicts(raw_rows)
+    search_engine = "postgres"
+    try:
+        result = order_line_ids_for_state(store_id, "costly", page, per_page)
+        if result.get("enabled"):
+            rows = order_lines_by_ids([int(value) for value in result.get("ids") or []])
+            total = int(result.get("total") or 0)
+            search_engine = "typesense"
+        else:
+            raw_rows, total = list_costly_order_lines(store_id, page, per_page)
+            rows = rows_to_dicts(raw_rows)
+    except Exception:
+        raw_rows, total = list_costly_order_lines(store_id, page, per_page)
+        rows = rows_to_dicts(raw_rows)
     stores = rows_to_dicts(list_stores())
     stores_by_id = {store["id"]: store for store in stores}
     for row in rows:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         row["asin_url"] = asin_product_url(row.get("asin") or "")
-    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total}
+    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
 
 
 @app.post("/api/costly/approve")
@@ -8081,7 +8736,23 @@ def api_profit_loss(
     page: int = 1,
     per_page: int = 100,
 ) -> dict[str, Any]:
-    return profit_loss_data(store_id, period, month, start, end, q, page, per_page)
+    candidate_order_names: Optional[list[str]] = None
+    if q.strip():
+        try:
+            filters = f"store_id:={int(store_id)}" if store_id else ""
+            ids = typesense_order_line_ids_for_filter(filters, limit=50000, query=q)
+            if ids:
+                with db() as conn:
+                    rows = conn.execute(
+                        "SELECT DISTINCT odoo_order_name FROM order_lines WHERE id = ANY(?::int[])",
+                        (ids,),
+                    ).fetchall()
+                candidate_order_names = [str(row["odoo_order_name"]) for row in rows]
+            else:
+                candidate_order_names = []
+        except Exception:
+            candidate_order_names = None
+    return profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names)
 
 
 @app.post("/api/profit-loss/shipping-upload")
@@ -8098,7 +8769,32 @@ async def api_profit_loss_shipping_upload(
 
 @app.get("/api/accounting")
 def api_accounting(q: str = "", document_type: str = "all", tax_region: str = "all", page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    return accounting_summary_page(q, document_type, tax_region, page, per_page)
+    page, per_page, _ = pagination_bounds(page, per_page)
+    try:
+        filters = []
+        if document_type != "all":
+            filters.append(f"document_type:={document_type}")
+        if tax_region != "all":
+            filters.append(f"tax_region:={tax_region}")
+        result = typesense_search_documents(
+            "accounting_documents",
+            q or "*",
+            "odoo_order_name,original_filename,stored_filename,document_type,tax_region,country_code,notes",
+            filter_by=" && ".join(filters),
+            page=page,
+            per_page=per_page,
+            sort_by="created_ts:desc",
+        )
+        if result.get("enabled"):
+            base = accounting_summary_page("", "all", "all", 1, 1)
+            docs = sql_rows_by_ids("accounting_documents", list(result.get("ids") or []))
+            base.update({"documents": docs, "page": page, "per_page": per_page, "total": int(result.get("total") or 0), "search_engine": "typesense"})
+            return base
+    except Exception:
+        pass
+    data = accounting_summary_page(q, document_type, tax_region, page, per_page)
+    data["search_engine"] = "postgres"
+    return data
 
 
 @app.post("/api/accounting/odoo-sync")
@@ -8185,6 +8881,10 @@ async def api_upload_accounting_document(
             ),
         )
         inserted = cursor.fetchone()
+        if inserted:
+            indexed = conn.execute("SELECT * FROM accounting_documents WHERE id=?", (inserted["id"],)).fetchone()
+    if inserted and indexed:
+        _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(indexed) or {}: _index_named_document_sync("accounting_documents", accounting_search_document(snapshot)))
     return {"ok": True, "message": f"Stored {document_type} invoice for {order_name} in {region}.", "id": inserted["id"] if inserted else None, "storage_key": storage_key, "storage_url": storage_url}
 
 
@@ -8936,12 +9636,19 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                         row["id"],
                     ),
                 )
+                updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+                if updated_row:
+                    index_order_line(updated_row)
+            failure_row = conn.execute("SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?", (amazon_order_id,)).fetchone()
+            if failure_row:
+                _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync("amazon_payment_failures", payment_failure_search_document(snapshot)))
             send_email_alert_async(
                 f"Amazon payment revision needed: {amazon_order_id}",
                 f"Amazon order requires manual payment revision.\nAmazon order: {amazon_order_id}\nRevise payment: {revise_url or order_line_amazon_url(amazon_order_id)}\nOdoo orders: {', '.join(order_names)}",
             )
             return {"ok": True, "updated": len(rows), "tracking_status": "Payment revision needed", "payment_revision_needed": True}
         updated = 0
+        updated_rows_for_index = []
         for row in rows:
             line_packages = [package for package in packages if package_matches_line(package, row)]
             if not line_packages:
@@ -8972,10 +9679,14 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                 ),
             )
             updated += 1
+            updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+            if updated_row:
+                updated_rows_for_index.append(updated_row)
             if line_delivered:
-                updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
                 if updated_row:
                     ensure_inventory_for_line(updated_row)
+    for updated_row in updated_rows_for_index:
+        index_order_line(updated_row)
     if delivered_flag:
         try:
             store = get_store(int(rows[0]["store_id"]))
@@ -8989,8 +9700,32 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
 
 @app.get("/api/tracking/payment-failures")
 def api_tracking_payment_failures(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "open") -> dict[str, Any]:
-    rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
-    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total}
+    page, per_page, _ = pagination_bounds(page, per_page)
+    search_engine = "postgres"
+    try:
+        filters = []
+        if store_id:
+            filters.append(f"store_id:={int(store_id)}")
+        if status:
+            filters.append(f"status:={clean_text(status)}")
+        result = typesense_search_documents(
+            "amazon_payment_failures",
+            "*",
+            "amazon_order_id,odoo_order_names,message,status",
+            filter_by=" && ".join(filters),
+            page=page,
+            per_page=per_page,
+            sort_by="updated_ts:desc",
+        )
+        if result.get("enabled"):
+            rows = sql_rows_by_ids("amazon_payment_failures", list(result.get("ids") or []), "amazon_order_id")
+            total = int(result.get("total") or 0)
+            search_engine = "typesense"
+        else:
+            rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
+    except Exception:
+        rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
+    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
 
 
 @app.post("/api/tracking/payment-failures/{amazon_order_id}/resolve")
@@ -9017,8 +9752,11 @@ def api_tracking_payment_failure_resolve(amazon_order_id: str) -> dict[str, Any]
             """,
             (now, amazon_order_id),
         )
+        failure_row = conn.execute("SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?", (amazon_order_id,)).fetchone()
     if cursor.rowcount == 0:
         raise HTTPException(404, "Payment failure record not found")
+    if failure_row:
+        _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync("amazon_payment_failures", payment_failure_search_document(snapshot)))
     return {"ok": True, "message": f"Marked payment issue resolved for {amazon_order_id}."}
 
 
@@ -9214,8 +9952,35 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
 
 @app.get("/api/epost/tracking")
 def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all") -> dict[str, Any]:
-    rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status)
-    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total}
+    page, per_page, _ = pagination_bounds(page, per_page)
+    status = clean_text(status or "all").lower()
+    search_engine = "postgres"
+    try:
+        filters = []
+        if store_id:
+            filters.append(f"store_id:={int(store_id)}")
+        if status == "pending":
+            filters.append("epost_status:!=delivered && epost_status:!=lost")
+        elif status in {"delivered", "lost"}:
+            filters.append(f"epost_status:={status}")
+        result = typesense_search_documents(
+            "epost_global_tracking",
+            "*",
+            "tracking_code,odoo_order_name,amazon_order_id,picking_name,status,epost_status,destination,awb,location",
+            filter_by=" && ".join(filters),
+            page=page,
+            per_page=per_page,
+            sort_by="updated_ts:desc",
+        )
+        if result.get("enabled"):
+            rows = epost_tracking_rows_by_ids([int(value) for value in result.get("ids") or []])
+            total = int(result.get("total") or 0)
+            search_engine = "typesense"
+        else:
+            rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status)
+    except Exception:
+        rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status)
+    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
 
 
 @app.get("/api/public/epost")
@@ -9313,9 +10078,28 @@ def api_public_tracking(store_id: Optional[int] = None) -> dict[str, Any]:
 
 @app.get("/api/amazon-otp")
 def api_amazon_otp(q: str = "", page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    rows = amazon_otp_rows(q)
+    search_engine = "postgres"
+    try:
+        if q.strip():
+            result = typesense_search_documents(
+                "amazon_otp_records",
+                q,
+                "amazon_order_id,otp,tracking_url,shipment_id,recipient,product_summary,status",
+                page=1,
+                per_page=250,
+                sort_by="updated_ts:desc",
+            )
+            if result.get("enabled"):
+                rows = amazon_otp_rows("", {int(value) for value in result.get("ids") or []})
+                search_engine = "typesense"
+            else:
+                rows = amazon_otp_rows(q)
+        else:
+            rows = amazon_otp_rows(q)
+    except Exception:
+        rows = amazon_otp_rows(q)
     paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
-    return {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total}
+    return {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
 
 
 @app.get("/api/public/amazon-otp")
@@ -9475,15 +10259,53 @@ def public_amazon_otp_page(q: str = "") -> HTMLResponse:
 
 @app.get("/api/duplicate-tracking")
 def api_duplicate_tracking(store_id: Optional[int] = None, q: str = "", page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    rows = duplicate_tracking_rows(store_id, q)
+    search_engine = "postgres"
+    candidate_codes = None
+    if q.strip():
+        try:
+            filters = f"store_id:={int(store_id)}" if store_id else ""
+            epost = typesense_search_documents(
+                "epost_global_tracking",
+                q,
+                "tracking_code,odoo_order_name,amazon_order_id,picking_name,status,epost_status,destination,awb",
+                filter_by=filters,
+                page=1,
+                per_page=250,
+            )
+            shipping = typesense_search_documents(
+                "shipping_charges",
+                q,
+                "tracking_number,odoo_order_name,carrier,service",
+                page=1,
+                per_page=250,
+            )
+            if epost.get("enabled") or shipping.get("enabled"):
+                codes: set[str] = set()
+                if epost.get("ids"):
+                    with db() as conn:
+                        for row in conn.execute("SELECT tracking_code FROM epost_global_tracking WHERE id = ANY(?::int[])", ([int(value) for value in epost.get("ids") or []],)).fetchall():
+                            if clean_text(row["tracking_code"]):
+                                codes.add(clean_text(row["tracking_code"]).upper())
+                if shipping.get("ids"):
+                    with db() as conn:
+                        for row in conn.execute("SELECT tracking_number FROM shipping_charges WHERE id = ANY(?::int[])", ([int(value) for value in shipping.get("ids") or []],)).fetchall():
+                            if clean_text(row["tracking_number"]):
+                                codes.add(clean_text(row["tracking_number"]).upper())
+                candidate_codes = codes
+                search_engine = "typesense"
+        except Exception:
+            candidate_codes = None
+    rows = duplicate_tracking_rows(store_id, q, candidate_codes)
     paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
-    return {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total}
+    return {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
 
 
 @app.post("/api/epost/sync")
 def api_epost_sync(payload: EpostSyncPayload) -> dict[str, Any]:
     days = max(1, min(30, int(payload.days or 2)))
     synced = sync_epost_tracking_from_odoo(payload.store_id, days)
+    if synced:
+        start_typesense_reindex_job()
     rows, total, page, per_page = paged_epost_tracking_rows(payload.store_id, 1, 100, "all")
     return {
         "ok": True,
