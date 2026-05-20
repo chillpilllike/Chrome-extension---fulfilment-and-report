@@ -4292,7 +4292,7 @@ def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Op
           AND odoo_order_id IN ({','.join('?' for _ in order_ids)})
           AND asin IS NOT NULL AND asin != ''
           AND COALESCE(amazon_order_id, '') = ''
-          AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory')
+          AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory')
           AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
         ORDER BY odoo_order_id DESC, id ASC
         """,
@@ -4318,6 +4318,7 @@ def persist_chrome_order_groups(
     updates: list[tuple[Any, ...]] = []
     attempts: list[tuple[Any, ...]] = []
     details: list[str] = []
+    queued_line_ids: list[int] = []
     for group_key_seed, group_lines in grouped.items():
         group_key = f"chrome-{group_lines[0]['store_id']}-{group_key_seed}-{uuid.uuid4().hex[:10]}"
         order_names = list(dict.fromkeys(str(line["odoo_order_name"]) for line in group_lines))
@@ -4340,6 +4341,7 @@ def persist_chrome_order_groups(
         payload_json = json.dumps(attempt_payload)
         for line in group_lines:
             updates.append((line["id"], group_key))
+            queued_line_ids.append(int(line["id"]))
             attempts.append((line["id"], group_key, payload_json, now))
             if len(details) < 8:
                 details.append(f"{line['odoo_order_name']} {line['asin']}: queued for Chrome extension ordering")
@@ -4378,6 +4380,10 @@ def persist_chrome_order_groups(
         template="(?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)",
         page_size=1000,
     )
+    if queued_line_ids:
+        placeholders = ",".join("?" for _ in queued_line_ids)
+        for row in conn.execute(f"SELECT * FROM order_lines WHERE id IN ({placeholders})", queued_line_ids).fetchall():
+            index_order_line(row)
     return len(grouped), details
 
 
@@ -4446,6 +4452,32 @@ def queue_chrome_order_groups_fast(
         line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
         if line_ids is not None and not line_ids:
             return 0, int(cleared_cursor.rowcount or 0), account, []
+        if line_ids:
+            placeholders = ",".join("?" for _ in line_ids)
+            conn.execute(
+                f"""
+                UPDATE order_lines
+                SET state='pulled',
+                    amazon_status=NULL,
+                    amazon_group_key=NULL,
+                    chrome_claimed_by=NULL,
+                    chrome_claimed_at=NULL,
+                    chrome_claim_expires_at=NULL,
+                    last_error=NULL,
+                    missing_asin=NULL,
+                    amazon_unit_price=NULL,
+                    amazon_total_price=NULL,
+                    chrome_profit_total=NULL,
+                    fulfilment_note=NULL,
+                    ordered_at=NULL,
+                    updated_at=?
+                WHERE store_id=?
+                  AND id IN ({placeholders})
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND state IN ('missing', 'error')
+                """,
+                [utc_now(), store_id, *line_ids],
+            )
         where_line_ids = ""
         params: list[Any] = [store_id]
         if line_ids:
