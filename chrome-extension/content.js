@@ -885,6 +885,46 @@ function unavailableMessage() {
   return "";
 }
 
+function amazonProductPageErrorMessage() {
+  const title = String(document.title || "").replace(/\s+/g, " ").trim();
+  const bodyText = String(document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ").trim();
+  const loweredTitle = title.toLowerCase();
+  const loweredBody = bodyText.toLowerCase();
+  if (
+    loweredTitle.includes("page not found") ||
+    loweredTitle.includes("404") ||
+    loweredBody.includes("sorry! we couldn't find that page") ||
+    loweredBody.includes("sorry we couldn't find that page") ||
+    loweredBody.includes("looking for something?") ||
+    loweredBody.includes("the web address you entered is not a functioning page")
+  ) {
+    return "Amazon opened a 404 / product page not found page.";
+  }
+  if (
+    loweredBody.includes("no results for") ||
+    loweredBody.includes("did not match any products") ||
+    loweredBody.includes("couldn't find a match")
+  ) {
+    return "Amazon could not find a product page for this ASIN.";
+  }
+  return "";
+}
+
+async function failCurrentItemAsMissing(item, purchaseItem, message, failureCode = "unavailable") {
+  const result = await send({
+    type: "FAIL_JOB",
+    message,
+    missingAsin: item?.asin || purchaseItem?.asin || currentAsinFromUrl(),
+    missingLineId: item ? itemPrimaryLineId(item) : null,
+    failureCode,
+  });
+  if (result?.ok) {
+    showPanel("Missing ASINs", result.message || "Order moved to Missing ASINs.", null, null);
+    return true;
+  }
+  throw new Error(result?.message || "The app did not confirm the Missing ASIN report.");
+}
+
 async function applyAdditionalSavings(context = "regular") {
   const redeemed = await clickVisibleRedeemPromotions(context);
   const clipped = await clipVisibleCoupons(context);
@@ -1288,7 +1328,15 @@ async function handleClearCart(activeJob) {
 }
 
 async function handleProduct(activeJob) {
-  await waitForElement([
+  const item = activeJob.job.items[activeJob.itemIndex];
+  if (!item) return;
+  const expectedItem = selectedVariantItem(activeJob, item);
+  const pageError = amazonProductPageErrorMessage();
+  if (pageError) {
+    await failCurrentItemAsMissing(item, expectedItem, `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${pageError}`);
+    return;
+  }
+  const productReady = await waitForElement([
     "#productTitle",
     "#add-to-cart-button",
     "input[name='submit.add-to-cart']",
@@ -1296,10 +1344,16 @@ async function handleProduct(activeJob) {
     "#corePrice_feature_div .a-price",
     "#apex_desktop .a-price",
   ], 18000);
-  const item = activeJob.job.items[activeJob.itemIndex];
-  if (!item) return;
+  const delayedPageError = amazonProductPageErrorMessage();
+  if (!productReady || delayedPageError) {
+    await failCurrentItemAsMissing(
+      item,
+      expectedItem,
+      `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${delayedPageError || "Amazon did not load product controls for this ASIN."}`,
+    );
+    return;
+  }
   const asin = currentAsinFromUrl();
-  const expectedItem = selectedVariantItem(activeJob, item);
   showPanel("Nutricity fulfilment", `Adding ${expectedItem.asin} for ${recipientName(activeJob)}.`, null, null);
   if (asin && asin !== expectedItem.asin) {
     location.href = `https://www.amazon.com/dp/${expectedItem.asin}`;
@@ -1310,14 +1364,7 @@ async function handleProduct(activeJob) {
 
   const unavailable = unavailableMessage();
   if (unavailable) {
-    await send({
-      type: "FAIL_JOB",
-      message: `ASIN ${expectedItem.asin} is unavailable on Amazon. ${unavailable}`,
-      missingAsin: item.asin,
-      missingLineId: itemPrimaryLineId(item),
-      failureCode: "unavailable",
-    });
-    showPanel("Nutricity fulfilment", "Amazon says this item is unavailable. Order moved to Missing ASINs.", null, null);
+    await failCurrentItemAsMissing(item, expectedItem, `ASIN ${expectedItem.asin} is unavailable on Amazon. ${unavailable}`);
     return;
   }
 
