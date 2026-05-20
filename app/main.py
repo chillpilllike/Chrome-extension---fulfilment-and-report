@@ -81,6 +81,22 @@ DELIVERY_REFERENCE_RE = re.compile(r"^delivery_", re.IGNORECASE)
 DISCOUNT_LINE_RE = re.compile(r"\bdiscount\b", re.IGNORECASE)
 ORDERING_ENGINES = {"rest", "cxml", "chrome"}
 CXML_AUTH_MODES = {"header", "basic", "both"}
+COUNTRY_NAME_BY_CODE = {
+    "AU": "Australia",
+    "CA": "Canada",
+    "IN": "India",
+    "NZ": "New Zealand",
+    "UK": "United Kingdom",
+    "GB": "United Kingdom",
+    "US": "United States",
+}
+COUNTRY_CODE_BY_HOST_SUFFIX = {
+    ".com.au": "AU",
+    ".co.nz": "NZ",
+    ".co.uk": "GB",
+    ".ca": "CA",
+    ".in": "IN",
+}
 
 app = FastAPI(title="Amazon Business Fulfilment Control Panel")
 app.add_middleware(
@@ -2250,6 +2266,102 @@ def derive_odoo_status(order: dict[str, Any], invoice_rows: list[dict[str, Any]]
     return state or "unknown"
 
 
+def many2one_id(value: Any) -> Optional[int]:
+    if isinstance(value, (list, tuple)) and value:
+        try:
+            return int(value[0])
+        except Exception:
+            return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def enrich_orders_with_destination_countries(odoo: OdooClient, orders: list[dict[str, Any]]) -> None:
+    partner_ids = sorted({
+        partner_id
+        for order in orders
+        for partner_id in (
+            many2one_id(order.get("partner_shipping_id")),
+            many2one_id(order.get("partner_invoice_id")),
+            many2one_id(order.get("partner_id")),
+        )
+        if partner_id
+    })
+    if not partner_ids:
+        return
+    try:
+        partner_fields = odoo.existing_fields("res.partner", ["id", "country_id"])
+        partners = {
+            int(row["id"]): row
+            for row in odoo.read("res.partner", partner_ids, partner_fields)
+        }
+        country_ids = sorted({
+            country_id
+            for partner in partners.values()
+            for country_id in (many2one_id(partner.get("country_id")),)
+            if country_id
+        })
+        country_fields = odoo.existing_fields("res.country", ["id", "code", "name"])
+        countries = {
+            int(row["id"]): row
+            for row in odoo.read("res.country", country_ids, country_fields)
+        } if country_ids else {}
+    except Exception:
+        return
+    for order in orders:
+        partner_id = (
+            many2one_id(order.get("partner_shipping_id"))
+            or many2one_id(order.get("partner_invoice_id"))
+            or many2one_id(order.get("partner_id"))
+        )
+        partner = partners.get(partner_id or 0)
+        country_ref = partner.get("country_id") if partner else None
+        country_id = many2one_id(country_ref)
+        country = countries.get(country_id or 0, {})
+        country_code = clean_text(country.get("code")).upper()
+        country_name = clean_text(country.get("name"))
+        if not country_name and isinstance(country_ref, (list, tuple)) and len(country_ref) > 1:
+            country_name = clean_text(country_ref[1])
+        if country_code or country_name:
+            order["destination_country_code"] = country_code
+            order["destination_country_name"] = country_name or COUNTRY_NAME_BY_CODE.get(country_code, "")
+
+
+def country_label(code: str, name: str = "") -> str:
+    clean_code = clean_text(code).upper()
+    clean_name = clean_text(name)
+    if clean_code and clean_name:
+        return f"{clean_name} ({clean_code})"
+    if clean_name:
+        return clean_name
+    if clean_code:
+        return f"{COUNTRY_NAME_BY_CODE.get(clean_code, clean_code)} ({clean_code})"
+    return ""
+
+
+def destination_country_from_row(row: dict[str, Any]) -> tuple[str, str, str]:
+    payload = safe_json(row.get("raw_json"))
+    order = payload.get("order") or {}
+    code = clean_text(order.get("destination_country_code")).upper()
+    name = clean_text(order.get("destination_country_name"))
+    if not code:
+        note_text = f"{order.get('note') or ''} {row.get('fulfilment_note') or ''} {row.get('last_error') or ''}"
+        note_lower = note_text.lower()
+        for suffix, suffix_code in COUNTRY_CODE_BY_HOST_SUFFIX.items():
+            if suffix in note_lower:
+                code = suffix_code
+                break
+    if not code:
+        match = re.search(r"\(([A-Z]{2})\)", clean_text(row.get("fulfilment_note")))
+        if match:
+            code = match.group(1).upper()
+    if not name and code:
+        name = COUNTRY_NAME_BY_CODE.get(code, "")
+    return code, name, country_label(code, name)
+
+
 def save_combined_order_line(
     store: Store,
     order: dict[str, Any],
@@ -2660,7 +2772,7 @@ def fetch_odoo_lines(
         cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
         domain.append(("date_order", ">=", cutoff.strftime("%Y-%m-%d %H:%M:%S")))
 
-    order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "currency_id", "date_order"])
+    order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "currency_id", "date_order", "partner_shipping_id", "partner_invoice_id", "partner_id"])
     line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
     product_fields = odoo.existing_fields("product.product", ["id", "product_tmpl_id", "default_code", "detailed_type", "type"])
     tmpl_fields = odoo.existing_fields("product.template", ["id", "description", "default_code", "detailed_type", "type"])
@@ -2687,6 +2799,7 @@ def fetch_odoo_lines(
         )
         if not orders:
             break
+        enrich_orders_with_destination_countries(odoo, orders)
         inserted_records += process_odoo_order_batch(
             store,
             odoo,
@@ -7988,6 +8101,10 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        country_code, country_name, country_display = destination_country_from_row(row)
+        row["destination_country_code"] = country_code
+        row["destination_country_name"] = country_name
+        row["destination_country"] = country_display
         if row.get("amazon_order_id") and not row.get("amazon_order_url"):
             row["amazon_order_url"] = order_line_amazon_url(row["amazon_order_id"])
     return {
@@ -8038,6 +8155,10 @@ def hydrate_order_line_rows(rows: list[dict[str, Any]], stores: Optional[list[di
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        country_code, country_name, country_display = destination_country_from_row(row)
+        row["destination_country_code"] = country_code
+        row["destination_country_name"] = country_name
+        row["destination_country"] = country_display
         if row.get("amazon_order_id") and not row.get("amazon_order_url"):
             row["amazon_order_url"] = order_line_amazon_url(row["amazon_order_id"])
     return row_dicts

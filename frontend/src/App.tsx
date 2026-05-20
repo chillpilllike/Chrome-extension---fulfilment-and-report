@@ -159,6 +159,9 @@ type OrderLine = {
   odoo_order_name: string
   odoo_order_date: string
   odoo_order_url: string
+  destination_country?: string
+  destination_country_code?: string
+  destination_country_name?: string
   product_name: string
   default_code: string
   asin: string
@@ -729,6 +732,7 @@ type AccountingData = {
 type OrderColumnKey =
   | "odoo_order"
   | "odoo_order_date"
+  | "destination_country"
   | "product"
   | "reference"
   | "pulled_at"
@@ -763,6 +767,7 @@ const ORDER_TABLE_STORAGE_KEY = "fulfilment.orderTable.columns.v1"
 const defaultOrderColumns: OrderColumn[] = [
   { key: "odoo_order", label: "Odoo Order", width: "w-32", sortable: "odoo_order_name" },
   { key: "odoo_order_date", label: "Order Date", width: "w-44", sortable: "odoo_order_date" },
+  { key: "destination_country", label: "Country", width: "w-36" },
   { key: "product", label: "Product", width: "w-[520px]" },
   { key: "reference", label: "Reference", width: "w-48" },
   { key: "pulled_at", label: "Pulled At", width: "w-44", sortable: "pulled_at" },
@@ -2118,6 +2123,12 @@ function App() {
         )
       case "odoo_order_date":
         return <span className="text-xs text-muted-foreground">{formatDateTime(row.odoo_order_date)}</span>
+      case "destination_country":
+        return row.destination_country ? (
+          <Badge variant="outline">{row.destination_country}</Badge>
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        )
       case "pulled_at":
         return <span className="text-xs text-muted-foreground">{formatDateTime(row.pulled_at || row.created_at)}</span>
       case "ordered_at":
