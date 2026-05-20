@@ -2,23 +2,27 @@ from __future__ import annotations
 
 import csv
 import html
+import importlib.util
 import io
 import json
 import os
 import re
+import smtplib
 import threading
 import time
 import tempfile
+import sys
 import uuid
 import zipfile
 import xmlrpc.client
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from urllib.parse import urlencode
 from urllib.parse import quote_plus
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from calendar import monthrange
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -53,6 +57,7 @@ from app.schemas import (
     InventoryCreatePayload,
     LineSpaidPayload,
     ManualAmazonOrderMatchPayload,
+    ManualFulfilmentPayload,
     PlacePayload,
     PullPayload,
     PunchoutReturnUrlPayload,
@@ -60,6 +65,7 @@ from app.schemas import (
     ServiceSettingsPayload,
     StoreActionPayload,
     StorePayload,
+    UiCopyPayload,
 )
 from app.services.amazon import amz_date, normalize_amazon_endpoint
 from app.services.amazon_otp import imap_connect, imap_search_since, parse_amazon_email
@@ -89,12 +95,83 @@ if (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="frontend-assets")
 
 _sync_thread_started = False
-PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/assets", "/static", "/health", "/favicon")
+PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/assets", "/static", "/health", "/favicon")
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
 _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
 _STORE_CACHE: dict[int, tuple[Store, float]] = {}
 _STORE_CACHE_LOCK = threading.Lock()
+_SHOPIFY_QUEUE_LOCK = threading.Lock()
+_SHOPIFY_OAUTH_LOCK = threading.Lock()
+_SHOPIFY_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
+FRONTEND_SHELL_PATHS = {
+    "/",
+    "/home",
+    "/orders",
+    "/pull-jobs",
+    "/tracking",
+    "/payment-failed",
+    "/amazon-otp",
+    "/epost",
+    "/duplicate-tracking",
+    "/fulfilment-pending",
+    "/missing",
+    "/bulk",
+    "/costly",
+    "/profit-loss",
+    "/accounting",
+    "/downloads",
+    "/shopify-fulfilment",
+    "/shopify-tracking",
+    "/inventory",
+    "/settings",
+}
+
+
+def ensure_performance_indexes(conn: Any) -> None:
+    index_statements = (
+        # Main dashboard and order table pagination.
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_page ON order_lines(store_id, odoo_order_id DESC, asin, id)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_updated_page ON order_lines(store_id, updated_at DESC, odoo_order_id DESC, id)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_updated_page ON order_lines(updated_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_state_updated ON order_lines(store_id, state, updated_at DESC, odoo_order_id DESC, id)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_state_updated ON order_lines(state, updated_at DESC, odoo_order_id DESC, id)",
+        # Duplicate ASIN, bulk, inventory matching, and selected-order expansion.
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_asin_open ON order_lines(store_id, asin, odoo_order_name) WHERE COALESCE(asin, '') != '' AND COALESCE(amazon_order_id, '') = ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_open ON order_lines(store_id, odoo_order_id, id) WHERE COALESCE(amazon_order_id, '') = ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_state_order ON order_lines(store_id, state, odoo_order_id, id)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_line_unique_lookup ON order_lines(store_id, odoo_line_id)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_order_name ON order_lines(odoo_order_name)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_upper_order_name_open ON order_lines(UPPER(odoo_order_name)) WHERE COALESCE(amazon_order_id, '') = ''",
+        # Amazon, Chrome, tracking, and delivery queues.
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_amazon_order ON order_lines(amazon_order_id) WHERE COALESCE(amazon_order_id, '') != ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_amazon_order ON order_lines(store_id, amazon_order_id) WHERE COALESCE(amazon_order_id, '') != ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_ordered_tracking ON order_lines(store_id, tracking_checked_at ASC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_queue ON order_lines(store_id, updated_at ASC, odoo_order_id DESC, id) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(amazon_group_key, '') != ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_worker ON order_lines(chrome_claimed_by, store_id, updated_at ASC) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_group ON order_lines(amazon_group_key, id) WHERE order_engine='chrome'",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_expiry ON order_lines(chrome_claim_expires_at) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(chrome_claim_expires_at, '') != ''",
+        # Reporting, accounting, and date windows.
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_date ON order_lines(store_id, odoo_order_date DESC, odoo_order_id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_ordered_at ON order_lines(ordered_at DESC) WHERE COALESCE(amazon_order_id, '') != ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_missing_order_date ON order_lines(store_id, id DESC) WHERE COALESCE(odoo_order_date, '') = '' AND COALESCE(raw_json, '') != ''",
+        "CREATE INDEX IF NOT EXISTS idx_amazon_attempts_line_external_mode ON amazon_attempts(order_line_id, external_id, mode)",
+        "CREATE INDEX IF NOT EXISTS idx_amazon_attempts_mode_status ON amazon_attempts(mode, status)",
+        # ePost and shipping lookups use case-insensitive tracking numbers.
+        "CREATE INDEX IF NOT EXISTS idx_epost_store_status_checked ON epost_global_tracking(store_id, epost_status, last_checked_at ASC, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_epost_upper_tracking ON epost_global_tracking(UPPER(tracking_code))",
+        "CREATE INDEX IF NOT EXISTS idx_epost_order_name ON epost_global_tracking(odoo_order_name)",
+        "CREATE INDEX IF NOT EXISTS idx_shipping_charges_upper_tracking ON shipping_charges(UPPER(tracking_number))",
+        "CREATE INDEX IF NOT EXISTS idx_shipping_charges_import ON shipping_charges(import_id)",
+        # Accounting lists and Amazon invoice gap checks.
+        "CREATE INDEX IF NOT EXISTS idx_accounting_documents_order_type ON accounting_documents(odoo_order_name, document_type)",
+        "CREATE INDEX IF NOT EXISTS idx_accounting_documents_created ON accounting_documents(created_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_accounting_documents_type_region_created ON accounting_documents(document_type, tax_region, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_payment_failures_status_detected ON amazon_payment_failures(status, detected_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_payment_failures_store_status ON amazon_payment_failures(store_id, status, detected_at DESC)",
+    )
+    for index_sql in index_statements:
+        conn.execute(index_sql)
 
 
 def effective_admin_access_token() -> str:
@@ -121,7 +198,7 @@ def effective_admin_access_token() -> str:
 async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     token = effective_admin_access_token()
     path = request.url.path
-    allow_frontend_shell = request.method == "GET" and path == "/"
+    allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
     if token and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
         supplied = request.headers.get("X-Admin-Token") or request.query_params.get("admin_token") or ""
         if supplied != token and supplied != MASTER_ADMIN_ACCESS_TOKEN:
@@ -293,6 +370,14 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ui_copy (
+                key TEXT PRIMARY KEY,
+                title TEXT,
+                description TEXT,
+                icon TEXT,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS epost_global_tracking (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
@@ -456,6 +541,116 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(folder, uid)
             );
+
+            CREATE TABLE IF NOT EXISTS shopify_fulfilment_jobs (
+                id TEXT PRIMARY KEY,
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                odoo_order_id INTEGER NOT NULL,
+                odoo_order_name TEXT NOT NULL,
+                route TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 5,
+                last_error TEXT,
+                next_run_at TEXT,
+                locked_at TEXT,
+                completed_at TEXT,
+                source_line_ids_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(store_id, odoo_order_name, route)
+            );
+
+            CREATE TABLE IF NOT EXISTS shopify_tracking_jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                from_date TEXT NOT NULL,
+                to_date TEXT NOT NULL,
+                dry_run INTEGER NOT NULL DEFAULT 0,
+                skip_done_pickings INTEGER NOT NULL DEFAULT 0,
+                validate_deliveries INTEGER NOT NULL DEFAULT 1,
+                report_csv TEXT,
+                counters_json TEXT,
+                last_error TEXT,
+                locked_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS shopify_export_order_map (
+                state_scope TEXT NOT NULL,
+                dest_name TEXT NOT NULL,
+                src_order_key TEXT NOT NULL,
+                dest_order_id TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (state_scope, dest_name, src_order_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS shopify_export_sku_map (
+                state_scope TEXT NOT NULL,
+                dest_name TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                variant_id BIGINT,
+                product_id BIGINT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (state_scope, dest_name, sku)
+            );
+
+            CREATE TABLE IF NOT EXISTS shopify_export_customer_map (
+                state_scope TEXT NOT NULL,
+                dest_name TEXT NOT NULL,
+                map_key TEXT NOT NULL,
+                customer_id BIGINT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (state_scope, dest_name, map_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS shopify_export_oauth_tokens (
+                state_scope TEXT NOT NULL,
+                dest_name TEXT NOT NULL,
+                shop TEXT NOT NULL,
+                access_token TEXT,
+                expires_at TEXT,
+                refresh_token TEXT,
+                refresh_expires_at TEXT,
+                scope TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (state_scope, dest_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS shopify_tracking_token_cache (
+                shop TEXT PRIMARY KEY,
+                access_token TEXT,
+                expires_at BIGINT,
+                updated_at BIGINT
+            );
+
+            CREATE TABLE IF NOT EXISTS shopify_tracking_sync_log (
+                src_shop TEXT NOT NULL,
+                src_order_id TEXT NOT NULL,
+                src_fulfillment_id TEXT NOT NULL,
+                odoo_db TEXT,
+                odoo_order TEXT,
+                synced_at BIGINT,
+                PRIMARY KEY (src_shop, src_order_id, src_fulfillment_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS amazon_payment_failures (
+                amazon_order_id TEXT PRIMARY KEY,
+                amazon_order_url TEXT,
+                revise_payment_url TEXT,
+                store_id INTEGER,
+                odoo_order_names TEXT,
+                message TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                raw_json TEXT,
+                detected_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT
+            );
             """
         )
         for column, ddl in {
@@ -482,6 +677,13 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_amazon_otp_order ON amazon_otp_records(amazon_order_id)",
             "CREATE INDEX IF NOT EXISTS idx_amazon_otp_updated ON amazon_otp_records(updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_amazon_otp_email_type ON amazon_otp_email_uids(email_type, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_fulfilment_jobs_status ON shopify_fulfilment_jobs(status, next_run_at, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_fulfilment_jobs_order ON shopify_fulfilment_jobs(store_id, odoo_order_name)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_jobs_status ON shopify_tracking_jobs(status, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_export_order_dest ON shopify_export_order_map(dest_name, src_order_key)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_export_sku_dest ON shopify_export_sku_map(dest_name, sku)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_export_customer_dest ON shopify_export_customer_map(dest_name, map_key)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_sync_order ON shopify_tracking_sync_log(odoo_db, odoo_order)",
         ):
             conn.execute(index_sql)
         for column, ddl in {
@@ -529,6 +731,7 @@ def init_db() -> None:
             existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(order_lines)").fetchall()}
             if column not in existing_cols:
                 conn.execute(ddl)
+        ensure_performance_indexes(conn)
         conn.execute("UPDATE order_lines SET pulled_at = COALESCE(NULLIF(pulled_at, ''), created_at)")
         conn.execute(
             """
@@ -615,7 +818,7 @@ def init_db() -> None:
                     os.getenv("ODOO_URL", "https://backend.nutricityusa.com").rstrip("/"),
                     os.getenv("ODOO_DB", "supplee"),
                     os.getenv("ODOO_USER", "admin@nutricityusa.com"),
-                    os.getenv("ODOO_PASSWORD", "Amit@123"),
+                    os.getenv("ODOO_PASSWORD", ""),
                     None,
                     utc_now(),
                     utc_now(),
@@ -1618,7 +1821,11 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
         if not rows:
             return 0
         for row in rows:
-            is_missing_line = (missing_line_id and int(row["id"]) == int(missing_line_id)) or (missing_asin and str(row["asin"]).upper() == missing_asin)
+            is_missing_line = (
+                (not missing_line_id and not missing_asin)
+                or (missing_line_id and int(row["id"]) == int(missing_line_id))
+                or (missing_asin and str(row["asin"]).upper() == missing_asin)
+            )
             line_message = message if is_missing_line else f"Skipped because ASIN {missing_asin or 'in this order'} is missing from the Amazon fulfilment group."
             conn.execute(
                 """
@@ -1641,6 +1848,55 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
             (message, group_key),
         )
     return len(rows)
+
+
+def _quantity_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return clean_text(str(value))
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:g}"
+
+
+def chrome_fail_is_partial_quantity(payload: ChromeJobFailPayload, message: str) -> bool:
+    code = clean_text(payload.failure_code).lower().replace("-", "_").replace(" ", "_")
+    if code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}:
+        return True
+    if payload.requested_quantity is not None and (payload.fulfilled_quantity is not None or payload.available_quantity is not None):
+        available = payload.fulfilled_quantity if payload.fulfilled_quantity is not None else payload.available_quantity
+        try:
+            return float(available) < float(payload.requested_quantity)
+        except (TypeError, ValueError):
+            return True
+    lowered = message.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "less quantity",
+            "only able to add",
+            "only added",
+            "only available",
+            "only in stock",
+            "required quantity",
+            "insufficient quantity",
+            "not enough quantity",
+            "quantity unavailable",
+        )
+    )
+
+
+def partial_quantity_message(payload: ChromeJobFailPayload, fallback: str) -> str:
+    requested = _quantity_text(payload.requested_quantity)
+    added = _quantity_text(payload.fulfilled_quantity if payload.fulfilled_quantity is not None else payload.available_quantity)
+    if requested and added:
+        return f"Less quantity available on Amazon. Customer ordered {requested}, but Chrome could add only {added}. Moved to Missing ASINs for review."
+    if requested:
+        return f"Less quantity available on Amazon. Customer ordered {requested}, but Amazon did not allow the full quantity. Moved to Missing ASINs for review."
+    return fallback or "Less quantity available on Amazon. Moved to Missing ASINs for review."
 
 
 def mark_chrome_group_costly(
@@ -4057,6 +4313,76 @@ def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
     return bool(asin and asin in asins)
 
 
+PAYMENT_REVISION_PATTERNS = ("payment revision needed", "please update your payment method")
+
+
+def iter_nested_strings(value: Any) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, str):
+        found.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            found.extend(iter_nested_strings(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.extend(iter_nested_strings(item))
+    return found
+
+
+def payment_revision_text(payload: ChromeTrackingUpdatePayload) -> str:
+    chunks = [payload.page_text, payload.alert_html]
+    chunks.extend(iter_nested_strings(payload.packages or []))
+    return "\n".join(clean_text(str(chunk)) for chunk in chunks if chunk)
+
+
+def payment_revision_url(payload: ChromeTrackingUpdatePayload) -> str:
+    explicit = clean_text(payload.payment_revision_url)
+    if explicit:
+        return explicit
+    text = "\n".join([payload.page_text or "", payload.alert_html or "", json.dumps(payload.packages or [], default=str)])
+    match = re.search(r"https?://[^\s\"'<>]+/cpe/revisepayments[^\s\"'<>]*", text)
+    return html.unescape(match.group(0)) if match else ""
+
+
+def payload_has_payment_revision(payload: ChromeTrackingUpdatePayload) -> bool:
+    if payload.payment_revision_needed:
+        return True
+    lowered = payment_revision_text(payload).lower()
+    return any(pattern in lowered for pattern in PAYMENT_REVISION_PATTERNS)
+
+
+def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "open") -> tuple[list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    where = ["(? IS NULL OR store_id=?)"]
+    params: list[Any] = [store_id, store_id]
+    if status and status != "all":
+        where.append("status=?")
+        params.append(status)
+    where_sql = " AND ".join(where)
+    with db() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS total FROM amazon_payment_failures WHERE {where_sql}", params).fetchone()["total"])
+        rows = rows_to_dicts(
+            conn.execute(
+                f"""
+                SELECT *
+                FROM amazon_payment_failures
+                WHERE {where_sql}
+                ORDER BY status='open' DESC, detected_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                params + [per_page, offset],
+            ).fetchall()
+        )
+    for row in rows:
+        try:
+            row["odoo_order_names"] = json.loads(row.get("odoo_order_names") or "[]")
+        except Exception:
+            row["odoo_order_names"] = []
+        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
+        row["action_url"] = row.get("revise_payment_url") or row.get("amazon_order_url")
+    return rows, total, page, per_page
+
+
 def tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
     with db() as conn:
         rows = conn.execute(
@@ -4065,6 +4391,7 @@ def tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
             FROM order_lines
             WHERE COALESCE(amazon_order_id, '') != ''
               AND state IN ('ordered', 'dispatched')
+              AND COALESCE(order_engine, '') != 'third_party'
               AND (? IS NULL OR store_id=?)
             ORDER BY tracking_checked_at IS NULL DESC, tracking_checked_at ASC, ordered_at DESC, updated_at DESC
             """,
@@ -5596,6 +5923,42 @@ def set_setting(key: str, value: str) -> None:
             _ADMIN_ACCESS_TOKEN_CACHE = ("", 0.0)
 
 
+def get_ui_copy() -> dict[str, dict[str, str]]:
+    with db() as conn:
+        rows = conn.execute("SELECT key, title, description, icon FROM ui_copy").fetchall()
+    return {
+        str(row["key"]): {
+            "title": str(row.get("title") or ""),
+            "description": str(row.get("description") or ""),
+            "icon": str(row.get("icon") or ""),
+        }
+        for row in rows
+    }
+
+
+def set_ui_copy(payload: UiCopyPayload) -> dict[str, str]:
+    key = clean_text(payload.key)
+    if not key:
+        raise HTTPException(400, "Missing UI copy key.")
+    title = clean_text(payload.title)
+    description = clean_text(payload.description)
+    icon = clean_text(payload.icon)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO ui_copy(key, title, description, icon, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+              title=excluded.title,
+              description=excluded.description,
+              icon=excluded.icon,
+              updated_at=excluded.updated_at
+            """,
+            (key, title, description, icon, utc_now()),
+        )
+    return {"title": title, "description": description, "icon": icon}
+
+
 def get_service_settings() -> dict[str, str]:
     settings = dict(DEFAULT_SERVICE_SETTINGS)
     with db() as conn:
@@ -5603,7 +5966,752 @@ def get_service_settings() -> dict[str, str]:
     for row in rows:
         if row["key"] in settings:
             settings[row["key"]] = str(row["value"] or "")
+    for key in ("shopify_dtc_script_path", "shopify_dtb_script_path", "shopify_tracking_script_path"):
+        settings[key] = DEFAULT_SERVICE_SETTINGS[key]
     return settings
+
+
+def _safe_script_dict(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_safe_script_dict(item) for item in value]
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if any(secret in str(key).lower() for secret in ("password", "secret", "token", "api_key")):
+                cleaned[key] = "********" if item else ""
+            else:
+                cleaned[key] = _safe_script_dict(item)
+        return cleaned
+    return value
+
+
+def shopify_script_config_summary() -> dict[str, Any]:
+    dtc = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_dtc_script_path"], f"shopify_cfg_dtc_{uuid.uuid4().hex}")
+    dtb = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_dtb_script_path"], f"shopify_cfg_dtb_{uuid.uuid4().hex}")
+    tracking = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_tracking_script_path"], f"shopify_cfg_tracking_{uuid.uuid4().hex}")
+    return {
+        "dtc": {
+            "route": "Non-India orders",
+            "destinations": _safe_script_dict(getattr(dtc, "DESTS", [])),
+            "assign_to_generic_customer": bool(getattr(dtc, "ASSIGN_TO_GENERIC_CUSTOMER", False)),
+            "generic_customer": {
+                "email": getattr(dtc, "GENERIC_CUSTOMER_EMAIL", ""),
+                "first_name": getattr(dtc, "GENERIC_CUSTOMER_FIRST_NAME", ""),
+                "last_name": getattr(dtc, "GENERIC_CUSTOMER_LAST_NAME", ""),
+                "phone": getattr(dtc, "GENERIC_CUSTOMER_PHONE", ""),
+            },
+            "generic_default_address": _safe_script_dict(getattr(dtc, "GENERIC_DEFAULT_ADDRESS", {})),
+            "order_behavior": {
+                "set_shopify_order_currency": bool(getattr(dtc, "SET_SHOPIFY_ORDER_CURRENCY", False)),
+                "disable_shopify_notifications": bool(getattr(dtc, "DISABLE_SHOPIFY_NOTIFICATIONS", True)),
+                "update_existing_sku_products": bool(getattr(dtc, "UPDATE_EXISTING_SKU_PRODUCTS", True)),
+                "override_prices": bool(getattr(dtc, "OVERRIDE_PRICES", True)),
+                "override_price_mode": getattr(dtc, "OVERRIDE_PRICE_MODE", ""),
+                "ignore_odoo_discounts": bool(getattr(dtc, "IGNORE_ODOO_DISCOUNTS", True)),
+                "mark_as_paid": bool(getattr(dtc, "MARK_AS_PAID", True)),
+                "decode_asin": bool(getattr(dtc, "DECODE_ASIN", True)),
+            },
+        },
+        "dtb": {
+            "route": "India orders",
+            "destinations": _safe_script_dict(getattr(dtb, "DESTS", [])),
+            "assign_to_generic_customer": bool(getattr(dtb, "ASSIGN_TO_GENERIC_CUSTOMER", True)),
+            "generic_customer": {
+                "email": getattr(dtb, "GENERIC_CUSTOMER_EMAIL", ""),
+                "first_name": getattr(dtb, "GENERIC_CUSTOMER_FIRST_NAME", ""),
+                "last_name": getattr(dtb, "GENERIC_CUSTOMER_LAST_NAME", ""),
+                "phone": getattr(dtb, "GENERIC_CUSTOMER_PHONE", ""),
+            },
+            "generic_default_address": _safe_script_dict(getattr(dtb, "GENERIC_DEFAULT_ADDRESS", {})),
+            "order_behavior": {
+                "set_shopify_order_currency": bool(getattr(dtb, "SET_SHOPIFY_ORDER_CURRENCY", False)),
+                "disable_shopify_notifications": bool(getattr(dtb, "DISABLE_SHOPIFY_NOTIFICATIONS", True)),
+                "update_existing_sku_products": bool(getattr(dtb, "UPDATE_EXISTING_SKU_PRODUCTS", True)),
+                "override_prices": bool(getattr(dtb, "OVERRIDE_PRICES", True)),
+                "override_price_mode": getattr(dtb, "OVERRIDE_PRICE_MODE", ""),
+                "ignore_odoo_discounts": bool(getattr(dtb, "IGNORE_ODOO_DISCOUNTS", True)),
+                "mark_as_paid": bool(getattr(dtb, "MARK_AS_PAID", True)),
+                "decode_asin": bool(getattr(dtb, "DECODE_ASIN", True)),
+            },
+        },
+        "tracking": {
+            "sources": _safe_script_dict(getattr(tracking, "SHOPIFY_SOURCES", [])),
+            "odoo_destinations": _safe_script_dict(getattr(tracking, "ODOO_DESTS", [])),
+            "matching": "STRICT TAG_DIRECT using SRC_ODOO_DB and SRC_ODOO_ORDER tags only",
+            "state_storage": "Postgres adapter in app runtime",
+        },
+    }
+
+
+def load_external_script(path: str, module_name: str) -> Any:
+    script_path = Path(path).expanduser()
+    if not script_path.exists():
+        raise RuntimeError(f"Script not found: {script_path}")
+    spec = importlib.util.spec_from_file_location(module_name, str(script_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load script: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class PostgresShopifyExportStateDB:
+    def __init__(self, scope: str = "default", *_args: Any, **_kwargs: Any) -> None:
+        self.scope = clean_text(scope) or "default"
+
+    def is_order_synced(self, dest_name: str, src_order_key: str) -> bool:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM shopify_export_order_map
+                WHERE state_scope=? AND dest_name=? AND src_order_key=?
+                LIMIT 1
+                """,
+                (self.scope, dest_name, src_order_key),
+            ).fetchone()
+        return row is not None
+
+    def mark_order_synced(self, dest_name: str, src_order_key: str, dest_order_id: str | None) -> None:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO shopify_export_order_map(state_scope, dest_name, src_order_key, dest_order_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(state_scope, dest_name, src_order_key) DO UPDATE SET
+                  dest_order_id=excluded.dest_order_id,
+                  created_at=excluded.created_at
+                """,
+                (self.scope, dest_name, src_order_key, dest_order_id, utc_now()),
+            )
+
+    def get_variant_for_sku(self, dest_name: str, sku: str) -> tuple[int | None, int | None]:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT variant_id, product_id
+                FROM shopify_export_sku_map
+                WHERE state_scope=? AND dest_name=? AND sku=?
+                LIMIT 1
+                """,
+                (self.scope, dest_name, sku),
+            ).fetchone()
+        if not row:
+            return None, None
+        return (int(row["variant_id"]) if row.get("variant_id") is not None else None, int(row["product_id"]) if row.get("product_id") is not None else None)
+
+    def set_variant_for_sku(self, dest_name: str, sku: str, variant_id: int | None, product_id: int | None) -> None:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO shopify_export_sku_map(state_scope, dest_name, sku, variant_id, product_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(state_scope, dest_name, sku) DO UPDATE SET
+                  variant_id=excluded.variant_id,
+                  product_id=excluded.product_id,
+                  updated_at=excluded.updated_at
+                """,
+                (self.scope, dest_name, sku, variant_id, product_id, utc_now()),
+            )
+
+    def get_customer_id(self, dest_name: str, key: str) -> int | None:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT customer_id
+                FROM shopify_export_customer_map
+                WHERE state_scope=? AND dest_name=? AND map_key=?
+                LIMIT 1
+                """,
+                (self.scope, dest_name, key),
+            ).fetchone()
+        return int(row["customer_id"]) if row and row.get("customer_id") is not None else None
+
+    def set_customer_id(self, dest_name: str, key: str, customer_id: int | None) -> None:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO shopify_export_customer_map(state_scope, dest_name, map_key, customer_id, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(state_scope, dest_name, map_key) DO UPDATE SET
+                  customer_id=excluded.customer_id,
+                  updated_at=excluded.updated_at
+                """,
+                (self.scope, dest_name, key, customer_id, utc_now()),
+            )
+
+    def get_oauth_tokens(self, dest_name: str) -> dict[str, Any] | None:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT shop, access_token, expires_at, refresh_token, refresh_expires_at, scope, updated_at
+                FROM shopify_export_oauth_tokens
+                WHERE state_scope=? AND dest_name=?
+                LIMIT 1
+                """,
+                (self.scope, dest_name),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_oauth_tokens(
+        self,
+        dest_name: str,
+        shop: str,
+        access_token: str | None,
+        expires_at: str | None,
+        refresh_token: str | None,
+        refresh_expires_at: str | None,
+        scope: str | None,
+    ) -> None:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO shopify_export_oauth_tokens
+                  (state_scope, dest_name, shop, access_token, expires_at, refresh_token, refresh_expires_at, scope, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(state_scope, dest_name) DO UPDATE SET
+                  shop=excluded.shop,
+                  access_token=excluded.access_token,
+                  expires_at=excluded.expires_at,
+                  refresh_token=excluded.refresh_token,
+                  refresh_expires_at=excluded.refresh_expires_at,
+                  scope=excluded.scope,
+                  updated_at=excluded.updated_at
+                """,
+                (self.scope, dest_name, shop, access_token, expires_at, refresh_token, refresh_expires_at, scope, utc_now()),
+            )
+
+
+class PostgresShopifyTrackingStateDB:
+    def __init__(self, _path: str = "", read_only: bool = False, *_args: Any, **_kwargs: Any) -> None:
+        self.read_only = bool(read_only)
+
+    def get_token(self, shop: str) -> dict[str, Any] | None:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT access_token, expires_at FROM shopify_tracking_token_cache WHERE shop=? LIMIT 1",
+                (shop,),
+            ).fetchone()
+        return {"access_token": row["access_token"], "expires_at": row["expires_at"]} if row else None
+
+    def set_token(self, shop: str, token: str, expires_at: int) -> None:
+        if self.read_only:
+            return
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO shopify_tracking_token_cache(shop, access_token, expires_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(shop) DO UPDATE SET
+                  access_token=excluded.access_token,
+                  expires_at=excluded.expires_at,
+                  updated_at=excluded.updated_at
+                """,
+                (shop, token, int(expires_at), int(time.time())),
+            )
+
+    def already_synced(self, src_shop: str, src_order_id: str, src_fulfillment_id: str) -> bool:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM shopify_tracking_sync_log
+                WHERE src_shop=? AND src_order_id=? AND src_fulfillment_id=?
+                LIMIT 1
+                """,
+                (src_shop, src_order_id, src_fulfillment_id),
+            ).fetchone()
+        return row is not None
+
+    def log_sync(self, src_shop: str, src_order_id: str, src_fulfillment_id: str, odoo_db: str, odoo_order: str) -> None:
+        if self.read_only:
+            return
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO shopify_tracking_sync_log(src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(src_shop, src_order_id, src_fulfillment_id) DO UPDATE SET
+                  odoo_db=excluded.odoo_db,
+                  odoo_order=excluded.odoo_order,
+                  synced_at=excluded.synced_at
+                """,
+                (src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, int(time.time())),
+            )
+
+
+def shopify_route_script_config(route: str) -> tuple[Any, str, str]:
+    settings = get_service_settings()
+    route = clean_text(route).lower()
+    if route not in {"dtc", "dtb"}:
+        raise HTTPException(status_code=400, detail="route must be dtc or dtb")
+    script_path = settings["shopify_dtb_script_path"] if route == "dtb" else settings["shopify_dtc_script_path"]
+    module = load_external_script(script_path, f"shopify_oauth_{route}_{uuid.uuid4().hex}")
+    module.StateDB = lambda _path="", *_args, **_kwargs: PostgresShopifyExportStateDB(route)
+    module.STATE_DB = f"postgres:{route}"
+    return module, script_path, route
+
+
+def shopify_dest_has_access(module: Any, state: Any, dest: dict[str, Any]) -> bool:
+    if bool(dest.get("force_reauth")):
+        return False
+    token = state.get_oauth_tokens(dest["name"])
+    if not token or not token.get("access_token"):
+        return False
+    now = module.utc_now()
+    expires_at = module.parse_iso_utc(token.get("expires_at"))
+    if not expires_at or expires_at > (now + module.dt.timedelta(minutes=2)):
+        return True
+    refresh_token = token.get("refresh_token")
+    refresh_expires_at = module.parse_iso_utc(token.get("refresh_expires_at"))
+    return bool(refresh_token and (not refresh_expires_at or refresh_expires_at > now))
+
+
+def shopify_missing_oauth_routes() -> list[dict[str, Any]]:
+    return [row for row in shopify_oauth_route_status() if not row.get("authorized")]
+
+
+def shopify_oauth_route_status() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT route
+            FROM shopify_fulfilment_jobs
+            WHERE status != 'completed'
+            ORDER BY route
+            """
+        ).fetchall()
+    routes = [clean_text(row["route"]).lower() for row in rows if clean_text(row["route"]).lower() in {"dtc", "dtb"}]
+    statuses: list[dict[str, Any]] = []
+    for route in routes:
+        try:
+            module, _script_path, state_scope = shopify_route_script_config(route)
+            state = module.StateDB(state_scope)
+            for dest in module.DESTS:
+                statuses.append({
+                    "route": route,
+                    "dest_name": dest.get("name") or route.upper(),
+                    "shop": dest.get("shop") or "",
+                    "authorized": shopify_dest_has_access(module, state, dest),
+                })
+        except Exception as exc:
+            statuses.append({"route": route, "dest_name": route.upper(), "shop": "", "authorized": False, "error": str(exc)})
+    return statuses
+
+
+def shopify_oauth_base_url(request: Request) -> str:
+    settings = get_service_settings()
+    configured = clean_text(settings.get("shopify_oauth_public_base_url"))
+    if configured:
+        return configured.rstrip("/")
+    forwarded_proto = clean_text(request.headers.get("x-forwarded-proto")).split(",")[0].strip()
+    forwarded_host = clean_text(request.headers.get("x-forwarded-host")).split(",")[0].strip()
+    if forwarded_host:
+        return f"{forwarded_proto or request.url.scheme}://{forwarded_host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def complete_shopify_oauth_session(state_key: str, code: str) -> str:
+    with _SHOPIFY_OAUTH_LOCK:
+        session = _SHOPIFY_OAUTH_SESSIONS.pop(state_key, None)
+    if not session:
+        raise RuntimeError("OAuth session was not found or has expired. Please start authorization again from Queue Controls.")
+    route = session["route"]
+    module, _script_path, state_scope = shopify_route_script_config(route)
+    dest = session["dest"]
+    shop = dest["shop"]
+    data = module.shopify_exchange_code_for_tokens(shop, dest["client_id"], dest["client_secret"], code, expiring=1)
+    access_token = data.get("access_token")
+    if not access_token:
+        raise RuntimeError("Shopify did not return an access token.")
+    now = module.utc_now()
+    expires_in = int(data.get("expires_in") or 0) or 3600
+    refresh_token = data.get("refresh_token")
+    refresh_expires_in = int(data.get("refresh_token_expires_in") or 0) or 7776000
+    state_write = module.StateDB(state_scope)
+    state_write.upsert_oauth_tokens(
+        dest["name"],
+        shop,
+        access_token,
+        module.iso_utc(now + module.dt.timedelta(seconds=expires_in)),
+        refresh_token,
+        module.iso_utc(now + module.dt.timedelta(seconds=refresh_expires_in)),
+        data.get("scope"),
+    )
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE shopify_fulfilment_jobs
+            SET status='queued', last_error='', next_run_at=?, updated_at=?
+            WHERE route=?
+              AND status IN ('failed', 'dead')
+              AND COALESCE(last_error, '') LIKE 'Shopify OAuth token%'
+            """,
+            (utc_now(), utc_now(), route),
+        )
+    start_shopify_fulfilment_worker()
+    return route
+
+
+def start_shopify_oauth(route: str, request: Request) -> dict[str, Any]:
+    module, _script_path, state_scope = shopify_route_script_config(route)
+    state_db_obj = module.StateDB(state_scope)
+    missing_dest = None
+    for dest in module.DESTS:
+        if not shopify_dest_has_access(module, state_db_obj, dest):
+            missing_dest = dest
+            break
+    if not missing_dest:
+        return {"ok": True, "authorized": True, "message": f"{route.upper()} Shopify access is already authorized."}
+
+    dest_name = missing_dest["name"]
+    shop = missing_dest["shop"]
+    client_id = missing_dest["client_id"]
+    scopes = missing_dest["scopes"]
+    redirect_uri = f"{shopify_oauth_base_url(request)}/api/shopify/fulfilment/oauth/callback"
+    thread_key = f"{route}:{dest_name}"
+
+    with _SHOPIFY_OAUTH_LOCK:
+        for existing_session in _SHOPIFY_OAUTH_SESSIONS.values():
+            if (
+                existing_session.get("thread_key") == thread_key
+                and time.time() - float(existing_session.get("created_at") or 0) < 600
+                and existing_session.get("auth_url")
+            ):
+                return {
+                    "ok": True,
+                    "authorized": False,
+                    "route": route,
+                    "dest_name": dest_name,
+                    "shop": shop,
+                    "auth_url": existing_session["auth_url"],
+                    "redirect_uri": existing_session["redirect_uri"],
+                    "message": f"Open Shopify OAuth for {dest_name}. Callback URL: {existing_session['redirect_uri']}",
+                }
+
+    oauth_state = module.secrets.token_urlsafe(16)
+    auth_url = module.shopify_authorize_url(shop, client_id, scopes, redirect_uri, oauth_state)
+
+    with _SHOPIFY_OAUTH_LOCK:
+        _SHOPIFY_OAUTH_SESSIONS[oauth_state] = {
+            "thread_key": thread_key,
+            "route": route,
+            "dest": dict(missing_dest),
+            "auth_url": auth_url,
+            "redirect_uri": redirect_uri,
+            "created_at": time.time(),
+        }
+
+    return {
+        "ok": True,
+        "authorized": False,
+        "route": route,
+        "dest_name": dest_name,
+        "shop": shop,
+        "auth_url": auth_url,
+        "redirect_uri": redirect_uri,
+        "message": f"Open Shopify OAuth for {dest_name}. Callback URL: {redirect_uri}",
+    }
+
+
+def shopify_route_for_order(store_id: int, odoo_order_id: int) -> tuple[str, str]:
+    store = get_store(store_id)
+    odoo = OdooClient(store)
+    rows = odoo.read("sale.order", [odoo_order_id], odoo.existing_fields("sale.order", ["partner_shipping_id", "partner_invoice_id", "partner_id"]))
+    order = rows[0] if rows else {}
+    partner_ref = order.get("partner_shipping_id") or order.get("partner_invoice_id") or order.get("partner_id")
+    country_code = ""
+    country_name = ""
+    if isinstance(partner_ref, (list, tuple)) and partner_ref:
+        partner_rows = odoo.read("res.partner", [int(partner_ref[0])], odoo.existing_fields("res.partner", ["country_id"]))
+        partner = partner_rows[0] if partner_rows else {}
+        country_ref = partner.get("country_id")
+        if isinstance(country_ref, (list, tuple)) and country_ref:
+            country_rows = odoo.read("res.country", [int(country_ref[0])], odoo.existing_fields("res.country", ["code", "name"]))
+            country = country_rows[0] if country_rows else {}
+            country_code = clean_text(country.get("code")).upper()
+            country_name = clean_text(country.get("name"))
+    route = "dtb" if country_code == "IN" or country_name.lower() == "india" else "dtc"
+    return route, country_code or country_name
+
+
+def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
+    settings = get_service_settings()
+    if str(settings.get("shopify_auto_enqueue_enabled", "true")).lower() not in {"1", "true", "yes", "on"}:
+        return 0
+    grouped: dict[tuple[int, int, str], list[int]] = {}
+    for row in rows:
+        if not row.get("amazon_order_id"):
+            continue
+        grouped.setdefault((int(row["store_id"]), int(row["odoo_order_id"]), str(row["odoo_order_name"])), []).append(int(row["id"]))
+    inserted = 0
+    max_attempts = max(1, min(20, int(float(settings.get("shopify_job_max_attempts") or 5))))
+    with db() as conn:
+        for (store_id, odoo_order_id, order_name), line_ids in grouped.items():
+            route, country = shopify_route_for_order(store_id, odoo_order_id)
+            cursor = conn.execute(
+                """
+                INSERT INTO shopify_fulfilment_jobs
+                (id, store_id, odoo_order_id, odoo_order_name, route, status, attempts, max_attempts,
+                 last_error, next_run_at, source_line_ids_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, '', ?, ?, ?, ?)
+                ON CONFLICT(store_id, odoo_order_name, route) DO UPDATE SET
+                  status=CASE
+                    WHEN shopify_fulfilment_jobs.status='completed' THEN shopify_fulfilment_jobs.status
+                    ELSE 'queued'
+                  END,
+                  next_run_at=CASE
+                    WHEN shopify_fulfilment_jobs.status='completed' THEN shopify_fulfilment_jobs.next_run_at
+                    ELSE excluded.next_run_at
+                  END,
+                  source_line_ids_json=excluded.source_line_ids_json,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    uuid.uuid4().hex,
+                    store_id,
+                    odoo_order_id,
+                    order_name,
+                    route,
+                    max_attempts,
+                    utc_now(),
+                    json.dumps(sorted(set(line_ids))),
+                    utc_now(),
+                    utc_now(),
+                ),
+            )
+            inserted += max(0, cursor.rowcount)
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET fulfilment_note=CASE
+                      WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                      ELSE fulfilment_note || ' | ' || ?
+                    END,
+                    updated_at=?
+                WHERE id IN ({})
+                """.format(",".join("?" for _ in line_ids)),
+                [f"Shopify {route.upper()} queued ({country or 'unknown country'})", f"Shopify {route.upper()} queued ({country or 'unknown country'})", utc_now(), *line_ids],
+            )
+    start_shopify_fulfilment_worker()
+    return inserted
+
+
+def claim_shopify_fulfilment_job() -> Optional[dict[str, Any]]:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM shopify_fulfilment_jobs
+            WHERE status IN ('queued', 'failed')
+              AND attempts < max_attempts
+              AND (next_run_at IS NULL OR next_run_at='' OR next_run_at <= ?)
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (utc_now(),),
+        ).fetchone()
+        if not row:
+            return None
+        cursor = conn.execute(
+            """
+            UPDATE shopify_fulfilment_jobs
+            SET status='running', attempts=attempts+1, locked_at=?, updated_at=?
+            WHERE id=? AND status IN ('queued', 'failed')
+            """,
+            (utc_now(), utc_now(), row["id"]),
+        )
+        if not cursor.rowcount:
+            return None
+        return conn.execute("SELECT * FROM shopify_fulfilment_jobs WHERE id=?", (row["id"],)).fetchone()
+
+
+def run_shopify_script_export(job: dict[str, Any]) -> None:
+    settings = get_service_settings()
+    store = get_store(int(job["store_id"]))
+    route = clean_text(job["route"]).lower()
+    script_path = settings["shopify_dtb_script_path"] if route == "dtb" else settings["shopify_dtc_script_path"]
+    module = load_external_script(script_path, f"shopify_export_{route}_{uuid.uuid4().hex}")
+    module.ODOO_URL = store.odoo_url
+    module.ODOO_DB = store.odoo_db
+    module.ODOO_USERNAME = store.odoo_user
+    module.ODOO_PASSWORD = store.odoo_password
+    module.StateDB = lambda _path="", *_args, **_kwargs: PostgresShopifyExportStateDB(route)
+    module.STATE_DB = f"postgres:{route}"
+    module._NON_INTERACTIVE_AUTH_URL = ""
+    original_authorize_url = module.shopify_authorize_url
+    def capture_authorize_url(shop: str, client_id: str, scopes: str, redirect_uri: str, state: str) -> str:
+        url = original_authorize_url(shop, client_id, scopes, redirect_uri, state)
+        module._NON_INTERACTIVE_AUTH_URL = url
+        return url
+    def fail_interactive_oauth(redirect_uri: str, timeout_s: int = 600) -> dict[str, Any]:
+        auth_url = getattr(module, "_NON_INTERACTIVE_AUTH_URL", "")
+        suffix = f" Authorization URL: {auth_url}" if auth_url else ""
+        raise RuntimeError(
+            "Shopify OAuth token is missing or expired. Open the matching export script once manually to authorize the Shopify store, "
+            "then retry this queued job. The backend will not wait for an interactive OAuth callback."
+            f"{suffix}"
+        )
+    module.shopify_authorize_url = capture_authorize_url
+    module.run_local_oauth_server = fail_interactive_oauth
+    rename_manager = module.ProductRenameManager(enabled=False, mode="none")
+    state = module.StateDB(route)
+    odoo = module.OdooClient(store.odoo_url, store.odoo_db, store.odoo_user, store.odoo_password)
+    odoo.connect()
+    shops = []
+    for dest in module.DESTS:
+        token = module.get_shopify_access_token(dest, state)
+        shops.append(module.ShopifyClient(dest["name"], dest["shop"], token, dest.get("api_version") or "2025-10"))
+    if not shops:
+        raise RuntimeError(f"No Shopify destination configured in {script_path}")
+    for shop in shops:
+        module.sync_one_order_to_dest(odoo, shop, state, str(job["odoo_order_name"]), rename_manager)
+
+
+def process_one_shopify_fulfilment_job() -> bool:
+    if not _SHOPIFY_QUEUE_LOCK.acquire(blocking=False):
+        return False
+    try:
+        job = claim_shopify_fulfilment_job()
+        if not job:
+            return False
+        try:
+            run_shopify_script_export(job)
+            with db() as conn:
+                conn.execute(
+                    "UPDATE shopify_fulfilment_jobs SET status='completed', last_error='', completed_at=?, updated_at=? WHERE id=?",
+                    (utc_now(), utc_now(), job["id"]),
+                )
+        except Exception as exc:
+            retry_delay = min(3600, 60 * max(1, int(job["attempts"] or 1)))
+            next_run = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
+            next_status = "failed" if int(job["attempts"] or 0) < int(job["max_attempts"] or 5) else "dead"
+            error_text = str(exc)[:2000]
+            with db() as conn:
+                conn.execute(
+                    """
+                    UPDATE shopify_fulfilment_jobs
+                    SET status=?, last_error=?, next_run_at=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (next_status, error_text, next_run, utc_now(), job["id"]),
+                )
+            if not error_text.startswith("Shopify OAuth token"):
+                send_email_alert_async(
+                    f"Shopify fulfilment {next_status}: {job['odoo_order_name']}",
+                    f"Order: {job['odoo_order_name']}\nRoute: {job['route']}\nStatus: {next_status}\nError: {error_text}",
+                )
+        return True
+    finally:
+        _SHOPIFY_QUEUE_LOCK.release()
+
+
+def shopify_fulfilment_worker() -> None:
+    while process_one_shopify_fulfilment_job():
+        time.sleep(1)
+
+
+def start_shopify_fulfilment_worker() -> None:
+    threading.Thread(target=shopify_fulfilment_worker, daemon=True).start()
+
+
+def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    with db() as conn:
+        total = int(conn.execute("SELECT COUNT(*) AS count FROM shopify_fulfilment_jobs").fetchone()["count"] or 0)
+        rows = conn.execute(
+            """
+            SELECT shopify_fulfilment_jobs.*, stores.name AS store_name
+            FROM shopify_fulfilment_jobs
+            LEFT JOIN stores ON stores.id=shopify_fulfilment_jobs.store_id
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (per_page, offset),
+        ).fetchall()
+    return rows_to_dicts(rows), total, page, per_page
+
+
+def list_shopify_tracking_jobs(page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    with db() as conn:
+        total = int(conn.execute("SELECT COUNT(*) AS count FROM shopify_tracking_jobs").fetchone()["count"] or 0)
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM shopify_tracking_jobs
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (per_page, offset),
+        ).fetchall()
+    return rows_to_dicts(rows), total, page, per_page
+
+
+def run_shopify_tracking_job(job_id: str) -> None:
+    with db() as conn:
+        job = conn.execute("SELECT * FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            return
+        conn.execute("UPDATE shopify_tracking_jobs SET status='running', attempts=attempts+1, locked_at=?, updated_at=? WHERE id=?", (utc_now(), utc_now(), job_id))
+    settings = get_service_settings()
+    report_dir = BASE_DIR / "reports"
+    report_dir.mkdir(exist_ok=True)
+    report_csv = str(report_dir / f"shopify_tracking_{job_id}.csv")
+    argv = [
+        str(settings["shopify_tracking_script_path"]),
+        "--from-date",
+        str(job["from_date"]),
+        "--to-date",
+        str(job["to_date"]),
+        "--report-csv",
+        report_csv,
+    ]
+    if int(job["dry_run"] or 0):
+        argv.append("--dry-run")
+    if int(job["skip_done_pickings"] or 0):
+        argv.append("--skip-done-pickings")
+    if not int(job["validate_deliveries"] or 1):
+        argv.append("--no-validate-deliveries")
+    try:
+        module = load_external_script(settings["shopify_tracking_script_path"], f"shopify_tracking_{uuid.uuid4().hex}")
+        module.StateDB = PostgresShopifyTrackingStateDB
+        module.STATE_DB = "postgres:tracking"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        old_argv = sys.argv[:]
+        sys.argv = argv
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                module.main()
+        finally:
+            sys.argv = old_argv
+        counters = {"stdout": stdout.getvalue()[-8000:], "stderr": stderr.getvalue()[-8000:], "returncode": 0}
+        with db() as conn:
+            conn.execute(
+                "UPDATE shopify_tracking_jobs SET status='completed', report_csv=?, counters_json=?, last_error='', completed_at=?, updated_at=? WHERE id=?",
+                (report_csv, json.dumps(counters), utc_now(), utc_now(), job_id),
+            )
+    except SystemExit as exc:
+        error_text = f"Tracking script exited {exc.code}"
+        with db() as conn:
+            conn.execute(
+                "UPDATE shopify_tracking_jobs SET status='failed', last_error=?, updated_at=? WHERE id=?",
+                (error_text, utc_now(), job_id),
+            )
+        send_email_alert_async("Shopify tracking sync failed", f"Job: {job_id}\nError: {error_text}")
+    except Exception as exc:
+        error_text = str(exc)[:2000]
+        with db() as conn:
+            conn.execute(
+                "UPDATE shopify_tracking_jobs SET status='failed', last_error=?, updated_at=? WHERE id=?",
+                (error_text, utc_now(), job_id),
+            )
+        send_email_alert_async("Shopify tracking sync failed", f"Job: {job_id}\nError: {error_text}")
+
+
+def start_shopify_tracking_job(job_id: str) -> None:
+    threading.Thread(target=run_shopify_tracking_job, args=(job_id,), daemon=True).start()
 
 
 def set_service_settings(values: dict[str, str]) -> None:
@@ -5622,6 +6730,50 @@ def set_service_settings(values: dict[str, str]) -> None:
                 """,
                 (key, value, now),
             )
+
+
+def send_email_alert(subject: str, message: str) -> None:
+    settings = get_service_settings()
+    if str(settings.get("email_alerts_enabled", "false")).lower() not in {"1", "true", "yes", "on"}:
+        return
+    to_address = clean_text(settings.get("email_alert_to") or settings.get("email_system_address"))
+    if not to_address or clean_text(settings.get("email_driver")).lower() != "smtp":
+        return
+    smtp_host = clean_text(settings.get("email_smtp_host"))
+    if not smtp_host:
+        return
+    smtp_port = int(float(settings.get("email_smtp_port") or 465))
+    smtp_user = clean_text(settings.get("email_smtp_user"))
+    smtp_password = str(settings.get("email_smtp_password") or "")
+    from_address = clean_text(settings.get("email_from_address")) or clean_text(settings.get("email_system_address")) or smtp_user
+    from_name = clean_text(settings.get("email_from_name")) or "GofinchCRM"
+    msg = EmailMessage()
+    msg["Subject"] = subject[:180]
+    msg["From"] = f"{from_name} <{from_address}>"
+    msg["To"] = to_address
+    msg.set_content(message)
+    secure = str(settings.get("email_smtp_secure", "true")).lower() in {"1", "true", "yes", "on", "ssl"}
+    try:
+        if secure:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as smtp:
+                if smtp_user or smtp_password:
+                    smtp.login(smtp_user, smtp_password)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as smtp:
+                smtp.ehlo()
+                if smtp_port == 587:
+                    smtp.starttls()
+                    smtp.ehlo()
+                if smtp_user or smtp_password:
+                    smtp.login(smtp_user, smtp_password)
+                smtp.send_message(msg)
+    except Exception as exc:
+        print(f"Email alert failed: {exc}", flush=True)
+
+
+def send_email_alert_async(subject: str, message: str) -> None:
+    threading.Thread(target=send_email_alert, args=(subject, message), daemon=True).start()
 
 
 def upsert_amazon_otp_record(parsed: Any, folder: str = "", uid: str = "") -> bool:
@@ -6055,7 +7207,7 @@ def api_save_ordering_engine(payload: EnginePayload) -> dict[str, Any]:
 def api_service_settings() -> dict[str, Any]:
     settings = get_service_settings()
     masked = dict(settings)
-    for key in ("typesense_api_key", "storage_s3_secret_access_key", "amazon_otp_imap_password", "openexchange_api_key"):
+    for key in ("typesense_api_key", "storage_s3_secret_access_key", "amazon_otp_imap_password", "openexchange_api_key", "email_smtp_password"):
         if masked.get(key):
             masked[key] = "********"
     masked["amazon_otp_last_sync_at"] = get_setting("amazon_otp_last_sync_at", "")
@@ -6063,6 +7215,11 @@ def api_service_settings() -> dict[str, Any]:
     masked["openexchange_last_sync_at"] = get_setting("openexchange_last_sync_at", "")
     masked["openexchange_last_sync_message"] = get_setting("openexchange_last_sync_message", "")
     return {"ok": True, "settings": masked}
+
+
+@app.get("/api/settings/shopify-script-config")
+def api_shopify_script_config() -> dict[str, Any]:
+    return {"ok": True, "config": shopify_script_config_summary()}
 
 
 @app.post("/api/settings/services")
@@ -6075,7 +7232,21 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
         else:
             values[key] = value
     set_service_settings(values)
-    return {"ok": True, "message": "Service settings saved.", "settings": get_service_settings()}
+    response = get_service_settings()
+    for key in ("typesense_api_key", "storage_s3_secret_access_key", "amazon_otp_imap_password", "openexchange_api_key", "email_smtp_password"):
+        if response.get(key):
+            response[key] = "********"
+    return {"ok": True, "message": "Service settings saved.", "settings": response}
+
+
+@app.get("/api/settings/ui-copy")
+def api_ui_copy() -> dict[str, Any]:
+    return {"ok": True, "copy": get_ui_copy()}
+
+
+@app.post("/api/settings/ui-copy")
+def api_save_ui_copy(payload: UiCopyPayload) -> dict[str, Any]:
+    return {"ok": True, "copy": {payload.key: set_ui_copy(payload)}, "message": "Page text saved."}
 
 
 @app.get("/api/settings/admin-access")
@@ -6736,6 +7907,25 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
         ordering_engine=ordering_engine,
         allow_missing_spaid=payload.allow_missing_spaid,
     )
+    if ordered:
+        with db() as conn:
+            line_filter = ""
+            params: list[Any] = [payload.store_id]
+            if payload.line_ids:
+                line_filter = f" AND id IN ({','.join('?' for _ in payload.line_ids)})"
+                params.extend(payload.line_ids)
+            queued_rows = rows_to_dicts(conn.execute(
+                f"""
+                SELECT *
+                FROM order_lines
+                WHERE store_id=?
+                  AND COALESCE(amazon_order_id, '') != ''
+                  AND state IN ('ordered', 'dispatched', 'delivered')
+                  {line_filter}
+                """,
+                params,
+            ).fetchall())
+        enqueue_shopify_fulfilment_for_rows(queued_rows)
     details = selected_line_reasons(payload.store_id, payload.line_ids or None)
     account_type = "sandbox" if "sandbox." in str(account["api_base_url"]) else "production"
     data = dashboard_data(payload.store_id)
@@ -6762,6 +7952,134 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
             data["punchout_launch_url"] = f"/punchout/launch?{query}"
             data["message"] += " Opening Amazon Punchout to create the required cart/session."
     return data
+
+
+@app.get("/api/shopify/fulfilment/jobs")
+def api_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    rows, total, page, per_page = list_shopify_fulfilment_jobs(page, per_page)
+    oauth_status = shopify_oauth_route_status()
+    return {
+        "ok": True,
+        "jobs": rows,
+        "oauth_status": oauth_status,
+        "oauth_missing": [row for row in oauth_status if not row.get("authorized")],
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+    }
+
+
+@app.post("/api/shopify/fulfilment/oauth/start")
+def api_shopify_fulfilment_oauth_start(request: Request, route: str) -> dict[str, Any]:
+    return start_shopify_oauth(route, request)
+
+
+@app.get("/api/shopify/fulfilment/oauth/callback")
+def api_shopify_fulfilment_oauth_callback(code: str = "", state: str = "", error: str = "") -> HTMLResponse:
+    if error:
+        return HTMLResponse(
+            f"<html><body><h2>Shopify OAuth failed</h2><p>{html.escape(error)}</p><p>You can close this tab and return to the app.</p></body></html>",
+            status_code=400,
+        )
+    if not code or not state:
+        return HTMLResponse(
+            "<html><body><h2>Shopify OAuth failed</h2><p>Missing code or state. Start authorization again from Queue Controls.</p></body></html>",
+            status_code=400,
+        )
+    try:
+        route = complete_shopify_oauth_session(state, code)
+    except Exception as exc:
+        return HTMLResponse(
+            f"<html><body><h2>Shopify OAuth failed</h2><p>{html.escape(str(exc))}</p><p>Return to the app and try Authorize again.</p></body></html>",
+            status_code=400,
+        )
+    return HTMLResponse(
+        f"<html><body><h2>Shopify OAuth received</h2><p>Connected {html.escape(route.upper())}. You can close this tab and return to the app.</p></body></html>"
+    )
+
+
+@app.post("/api/shopify/fulfilment/enqueue")
+def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None) -> dict[str, Any]:
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE (? IS NULL OR store_id=?)
+              AND COALESCE(amazon_order_id, '') != ''
+              AND COALESCE(order_engine, '') != 'third_party'
+              AND state IN ('ordered', 'dispatched', 'delivered')
+            ORDER BY ordered_at DESC, updated_at DESC
+            LIMIT 1000
+            """,
+            (store_id, store_id),
+        ).fetchall())
+    count = enqueue_shopify_fulfilment_for_rows(rows)
+    return {"ok": True, "message": f"Queued or refreshed {count} Shopify fulfilment job(s).", "count": count}
+
+
+@app.post("/api/shopify/fulfilment/run")
+def api_shopify_fulfilment_run() -> dict[str, Any]:
+    start_shopify_fulfilment_worker()
+    return {"ok": True, "message": "Shopify fulfilment worker started. Jobs are claimed one at a time."}
+
+
+@app.post("/api/shopify/fulfilment/jobs/{job_id}/retry")
+def api_shopify_fulfilment_retry(job_id: str) -> dict[str, Any]:
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE shopify_fulfilment_jobs
+            SET status='queued', next_run_at=?, last_error='', updated_at=?
+            WHERE id=? AND status IN ('failed', 'dead')
+            """,
+            (utc_now(), utc_now(), job_id),
+        )
+    start_shopify_fulfilment_worker()
+    return {"ok": True, "message": f"Requeued {cursor.rowcount} Shopify fulfilment job(s)."}
+
+
+@app.get("/api/shopify/tracking/jobs")
+def api_shopify_tracking_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    rows, total, page, per_page = list_shopify_tracking_jobs(page, per_page)
+    return {"ok": True, "jobs": rows, "page": page, "per_page": per_page, "total": total}
+
+
+@app.post("/api/shopify/tracking/jobs")
+def api_shopify_tracking_create(payload: dict[str, Any]) -> dict[str, Any]:
+    settings = get_service_settings()
+    today = datetime.now(timezone.utc).date()
+    from_days = max(1, min(365, int(float(settings.get("shopify_tracking_from_days") or 7))))
+    from_date = clean_text(payload.get("from_date")) or (today - timedelta(days=from_days)).isoformat()
+    to_date = clean_text(payload.get("to_date")) or today.isoformat()
+    dry_run = bool(payload.get("dry_run", False))
+    skip_done = bool(payload.get("skip_done_pickings", str(settings.get("shopify_tracking_skip_done_pickings", "false")).lower() in {"1", "true", "yes", "on"}))
+    validate = bool(payload.get("validate_deliveries", str(settings.get("shopify_tracking_validate_deliveries", "true")).lower() in {"1", "true", "yes", "on"}))
+    job_id = uuid.uuid4().hex
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO shopify_tracking_jobs
+            (id, status, attempts, max_attempts, from_date, to_date, dry_run, skip_done_pickings,
+             validate_deliveries, report_csv, counters_json, last_error, created_at, updated_at)
+            VALUES (?, 'queued', 0, 3, ?, ?, ?, ?, ?, '', '{}', '', ?, ?)
+            """,
+            (job_id, from_date, to_date, 1 if dry_run else 0, 1 if skip_done else 0, 1 if validate else 0, utc_now(), utc_now()),
+        )
+    start_shopify_tracking_job(job_id)
+    return {"ok": True, "message": "Shopify tracking sync queued.", "job_id": job_id}
+
+
+@app.post("/api/shopify/tracking/jobs/{job_id}/retry")
+def api_shopify_tracking_retry(job_id: str) -> dict[str, Any]:
+    with db() as conn:
+        cursor = conn.execute(
+            "UPDATE shopify_tracking_jobs SET status='queued', last_error='', updated_at=? WHERE id=? AND status='failed'",
+            (utc_now(), job_id),
+        )
+    if cursor.rowcount:
+        start_shopify_tracking_job(job_id)
+    return {"ok": True, "message": f"Requeued {cursor.rowcount} tracking sync job(s)."}
 
 
 @app.get("/api/chrome/jobs")
@@ -6902,6 +8220,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
         ).fetchall()
         if not rows:
             raise HTTPException(404, "Chrome job not found")
+        updated_for_shopify: list[dict[str, Any]] = []
         for row in rows:
             pricing = pricing_by_asin.get(str(row["asin"] or "").upper(), {})
             quantity = float(row["quantity"] or 1)
@@ -6969,8 +8288,10 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
             )
             updated = conn.execute("SELECT * FROM order_lines WHERE id = ?", (row["id"],)).fetchone()
             if updated:
+                updated_for_shopify.append(dict(updated))
                 ensure_inventory_for_line(updated)
                 index_order_line(updated)
+    enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
     try:
         variant_notes_by_order: dict[int, list[str]] = {}
         for row in rows:
@@ -7003,6 +8324,15 @@ def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[s
     missing_asin = normalize_asin(payload.missing_asin)
     with db() as conn:
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
+    if chrome_fail_is_partial_quantity(payload, message):
+        linked_message = partial_quantity_message(payload, message)
+        count = mark_chrome_group_missing(group_key, linked_message, missing_asin, payload.missing_line_id)
+        if count:
+            send_email_alert_async(
+                f"Chrome fulfilment quantity issue: {group_key}",
+                f"Chrome could not assign the required quantity.\nGroup: {group_key}\nWorker: {payload.worker_id}\nError: {linked_message}",
+            )
+            return {"ok": True, "message": f"Moved {count} Chrome line(s) to Missing because less quantity was available."}
     if missing_asin:
         linked_message = f"ASIN {missing_asin} is missing or unavailable on Amazon. Skipped fulfilment for this Odoo order."
         count = mark_chrome_group_missing(group_key, linked_message, missing_asin, payload.missing_line_id)
@@ -7032,6 +8362,10 @@ def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[s
             """,
             (message, group_key),
         )
+    send_email_alert_async(
+        f"Chrome fulfilment error: {group_key}",
+        f"Chrome fulfilment job failed or paused.\nGroup: {group_key}\nWorker: {payload.worker_id}\nError: {message}",
+    )
     return {"ok": True, "message": f"Marked {cursor.rowcount} Chrome line(s) as error."}
 
 
@@ -7107,6 +8441,68 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
         ).fetchall()
         if not rows:
             raise HTTPException(404, "Tracked Amazon order not found")
+        if payload_has_payment_revision(payload):
+            now = utc_now()
+            message = "Payment revision needed. Please update your payment method."
+            revise_url = payment_revision_url(payload)
+            store_id = int(rows[0]["store_id"]) if rows else None
+            order_names = sorted({str(row["odoo_order_name"]) for row in rows if row["odoo_order_name"]})
+            payload_data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+            conn.execute(
+                """
+                INSERT INTO amazon_payment_failures (
+                    amazon_order_id, amazon_order_url, revise_payment_url, store_id,
+                    odoo_order_names, message, status, raw_json, detected_at, updated_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL)
+                ON CONFLICT(amazon_order_id) DO UPDATE SET
+                    amazon_order_url=excluded.amazon_order_url,
+                    revise_payment_url=excluded.revise_payment_url,
+                    store_id=excluded.store_id,
+                    odoo_order_names=excluded.odoo_order_names,
+                    message=excluded.message,
+                    status='open',
+                    raw_json=excluded.raw_json,
+                    updated_at=excluded.updated_at,
+                    resolved_at=NULL
+                """,
+                (
+                    amazon_order_id,
+                    clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                    revise_url,
+                    store_id,
+                    json.dumps(order_names),
+                    message,
+                    json.dumps(payload_data, default=str)[:4000],
+                    now,
+                    now,
+                ),
+            )
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+                        tracking_status='Payment revision needed',
+                        tracking_payload=?,
+                        tracking_checked_at=?,
+                        last_error=?,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        clean_text(payload.amazon_order_url),
+                        json.dumps(payload.packages or [], default=str)[:4000],
+                        now,
+                        message,
+                        now,
+                        row["id"],
+                    ),
+                )
+            send_email_alert_async(
+                f"Amazon payment revision needed: {amazon_order_id}",
+                f"Amazon order requires manual payment revision.\nAmazon order: {amazon_order_id}\nRevise payment: {revise_url or order_line_amazon_url(amazon_order_id)}\nOdoo orders: {', '.join(order_names)}",
+            )
+            return {"ok": True, "updated": len(rows), "tracking_status": "Payment revision needed", "payment_revision_needed": True}
         updated = 0
         for row in rows:
             line_packages = [package for package in packages if package_matches_line(package, row)]
@@ -7153,6 +8549,41 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
     return {"ok": True, "updated": updated, "tracking_status": status}
 
 
+@app.get("/api/tracking/payment-failures")
+def api_tracking_payment_failures(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "open") -> dict[str, Any]:
+    rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
+    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total}
+
+
+@app.post("/api/tracking/payment-failures/{amazon_order_id}/resolve")
+def api_tracking_payment_failure_resolve(amazon_order_id: str) -> dict[str, Any]:
+    amazon_order_id = clean_text(amazon_order_id)
+    if not amazon_order_id:
+        raise HTTPException(400, "amazon_order_id is required")
+    now = utc_now()
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE amazon_payment_failures
+            SET status='resolved', resolved_at=?, updated_at=?
+            WHERE amazon_order_id=?
+            """,
+            (now, now, amazon_order_id),
+        )
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET last_error=NULL, updated_at=?
+            WHERE amazon_order_id=?
+              AND last_error='Payment revision needed. Please update your payment method.'
+            """,
+            (now, amazon_order_id),
+        )
+    if cursor.rowcount == 0:
+        raise HTTPException(404, "Payment failure record not found")
+    return {"ok": True, "message": f"Marked payment issue resolved for {amazon_order_id}."}
+
+
 @app.post("/api/manual-amazon/match")
 def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str, Any]:
     amazon_order_id = clean_text(payload.amazon_order_id)
@@ -7185,6 +8616,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         if not rows:
             return {"ok": True, "matched": 0, "skipped": len(refs), "order_names": refs, "message": f"No unmatched pulled rows found for {', '.join(refs)}."}
         now = utc_now()
+        updated_for_shopify: list[dict[str, Any]] = []
         for row in rows:
             conn.execute(
                 """
@@ -7204,8 +8636,10 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
             )
             updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
             if updated:
+                updated_for_shopify.append(dict(updated))
                 ensure_inventory_for_line(updated)
                 index_order_line(updated)
+    enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
     note_manual_amazon_match(rows, amazon_order_id, amazon_order_url, amazon_account_name)
     write_report(rows[0]["store_id"])
     matched_refs = sorted({str(row["odoo_order_name"]).upper() for row in rows})
@@ -7216,6 +8650,128 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         "amazon_order_id": amazon_order_id,
         "message": f"Matched Amazon order {amazon_order_id} to {len(rows)} line(s): {', '.join(matched_refs)}.",
     }
+
+
+@app.post("/api/lines/manual-fulfilment")
+def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, Any]:
+    if not payload.line_ids:
+        raise HTTPException(400, "Select at least one order line.")
+    reference = clean_text(payload.reference)
+    url = clean_text(payload.url)
+    if not reference and not url:
+        raise HTTPException(400, "Enter an Amazon order ID, third-party order number, or URL.")
+    selected_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
+    placeholders = ",".join("?" for _ in selected_ids)
+    now = utc_now()
+    updated_for_shopify: list[dict[str, Any]] = []
+    with db() as conn:
+        selected_rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT *
+            FROM order_lines
+            WHERE store_id=?
+              AND id IN ({placeholders})
+              AND COALESCE(amazon_order_id, '') = ''
+              AND state NOT IN ('cancelled', 'refunded', 'delivered', 'dispatched')
+              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            """,
+            [payload.store_id, *selected_ids],
+        ).fetchall())
+        if not selected_rows:
+            raise HTTPException(400, "No selected unfulfilled order lines can be manually fulfilled.")
+        order_ids = sorted({int(row["odoo_order_id"]) for row in selected_rows})
+        order_placeholders = ",".join("?" for _ in order_ids)
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT *
+            FROM order_lines
+            WHERE store_id=?
+              AND odoo_order_id IN ({order_placeholders})
+              AND COALESCE(amazon_order_id, '') = ''
+              AND state NOT IN ('cancelled', 'refunded', 'delivered', 'dispatched')
+              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            ORDER BY odoo_order_id, id
+            """,
+            [payload.store_id, *order_ids],
+        ).fetchall())
+        if not rows:
+            raise HTTPException(400, "No open lines found for the selected Odoo order.")
+        if payload.third_party:
+            manual_ref = reference or url
+            note = f"Third-party fulfilled: {manual_ref}"
+            if url and url != manual_ref:
+                note += f" ({url})"
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_id=?,
+                        amazon_order_url=?,
+                        amazon_account_id=NULL,
+                        amazon_account_name='Third Party',
+                        order_engine='third_party',
+                        amazon_group_key=NULL,
+                        amazon_status='third_party_fulfilled',
+                        state='ordered',
+                        fulfilment_note=CASE
+                          WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                          ELSE fulfilment_note || ' | ' || ?
+                        END,
+                        last_error=NULL,
+                        ordered_at=COALESCE(ordered_at, ?),
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (manual_ref, url, note, note, now, now, row["id"]),
+                )
+        else:
+            amazon_order_id = reference
+            if not amazon_order_id:
+                raise HTTPException(400, "Amazon order ID is required when third-party fulfilment is unchecked.")
+            amazon_order_url = url or order_line_amazon_url(amazon_order_id)
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_id=?,
+                        amazon_order_url=?,
+                        amazon_account_id=NULL,
+                        amazon_account_name='Manual Amazon',
+                        order_engine='manual_amazon',
+                        amazon_group_key=NULL,
+                        amazon_status='ordered',
+                        state='ordered',
+                        last_error=NULL,
+                        ordered_at=COALESCE(ordered_at, ?),
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (amazon_order_id, amazon_order_url, now, now, row["id"]),
+                )
+        for row in rows:
+            updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+            if updated:
+                ensure_inventory_for_line(updated)
+                index_order_line(updated)
+                updated_for_shopify.append(dict(updated))
+    if updated_for_shopify:
+        enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+    if payload.third_party:
+        for store_id, store_rows in {payload.store_id: rows}.items():
+            try:
+                odoo = OdooClient(get_store(store_id))
+                note = f"Third-party fulfilment recorded and queued to Shopify: {reference or url}"
+                for order_id in sorted({int(row["odoo_order_id"]) for row in store_rows}):
+                    odoo.post_order_note(order_id, note)
+            except Exception:
+                pass
+    else:
+        note_manual_amazon_match(rows, reference, url, "Manual Amazon")
+    write_report(payload.store_id)
+    data = dashboard_data(payload.store_id)
+    mode = "third-party" if payload.third_party else "manual Amazon"
+    data["message"] = f"Marked {len(rows)} line(s) across {len({row['odoo_order_name'] for row in rows})} Odoo order(s) as {mode} fulfilled."
+    return data
 
 
 @app.get("/api/epost/tracking")
@@ -8623,3 +10179,16 @@ def health() -> dict[str, Any]:
     with db() as conn:
         conn.execute("SELECT 1")
     return {"ok": True, "db": "postgres", "storage": "cloudflare-r2"}
+
+
+@app.get("/{frontend_path:path}")
+def app_frontend_page(frontend_path: str):
+    if f"/{frontend_path.strip('/')}" not in FRONTEND_SHELL_PATHS:
+        raise HTTPException(404, "Not found")
+    index_path = FRONTEND_DIST / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return HTMLResponse(
+        "<h1>Frontend not built</h1><p>Run <code>cd frontend && npm run build</code>, then restart FastAPI.</p>",
+        status_code=503,
+    )

@@ -1,28 +1,27 @@
 "use client"
 
-import { Checkbox as CheckboxPrimitive } from "@base-ui/react/checkbox"
+import type { InputHTMLAttributes } from "react"
 
 import { cn } from "@/lib/utils"
-import { IconCheck } from "@tabler/icons-react"
 
-function Checkbox({ className, ...props }: CheckboxPrimitive.Root.Props) {
+type CheckboxProps = Omit<InputHTMLAttributes<HTMLInputElement>, "onChange" | "type"> & {
+  onCheckedChange?: (checked: boolean, event: { shiftKey: boolean }) => void
+}
+
+function Checkbox({ className, onCheckedChange, checked, ...props }: CheckboxProps) {
   return (
-    <CheckboxPrimitive.Root
+    <input
+      type="checkbox"
       data-slot="checkbox"
       className={cn(
-        "form-check-input",
+        "form-check-input nutricity-checkbox",
         className
       )}
+      checked={checked}
+      data-checked={checked ? "true" : undefined}
+      onChange={(event) => onCheckedChange?.(event.currentTarget.checked, { shiftKey: Boolean((event.nativeEvent as MouseEvent).shiftKey) })}
       {...props}
-    >
-      <CheckboxPrimitive.Indicator
-        data-slot="checkbox-indicator"
-        className="checkbox-indicator"
-      >
-        <IconCheck
-        />
-      </CheckboxPrimitive.Indicator>
-    </CheckboxPrimitive.Root>
+    />
   )
 }
 

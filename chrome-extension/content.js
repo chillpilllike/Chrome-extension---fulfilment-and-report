@@ -643,10 +643,17 @@ function verifyCartQuantities(activeJob) {
   }
   const mismatches = Object.entries(expected).filter(([asin, quantity]) => Number(actual[asin] || 0) !== Number(quantity));
   if (!mismatches.length) return { ok: true };
+  const details = mismatches.map(([asin, quantity]) => ({ asin, expected: Number(quantity), actual: Number(actual[asin] || 0) }));
   const message = mismatches
     .map(([asin, quantity]) => `${asin} expected ${quantity}, cart has ${actual[asin] || 0}`)
     .join("; ");
-  return { ok: false, message };
+  return { ok: false, message, mismatches: details };
+}
+
+function lineIdForAsin(activeJob, asin) {
+  const wanted = String(asin || "").toUpperCase();
+  const item = (activeJob.job?.items || []).find((entry) => String(entry.asin || "").toUpperCase() === wanted);
+  return item ? itemPrimaryLineId(item) : null;
 }
 
 function cartAlreadyHasExpectedItems(activeJob) {
@@ -826,6 +833,22 @@ function quantitySelects(context = "regular") {
     );
   });
   return selects;
+}
+
+function maxSelectableQuantity(context = "regular") {
+  const quantities = [];
+  for (const select of quantitySelects(context)) {
+    for (const option of [...select.options || []]) {
+      const text = clean(option.textContent || option.value);
+      if (/10\+/.test(text)) {
+        quantities.push(10);
+        continue;
+      }
+      const numeric = Number((option.value || text).match(/\d+/)?.[0] || 0);
+      if (numeric > 0) quantities.push(numeric);
+    }
+  }
+  return quantities.length ? Math.max(...quantities) : 0;
 }
 
 function quantityFreeFormInput(select, context = "regular") {
@@ -1021,8 +1044,22 @@ async function handleProduct(activeJob) {
   if (!subscribed) {
     const quantitySet = await setQuantity(purchaseItem.quantity, "regular");
     if (!quantitySet) {
-      await send({ type: "FAIL_JOB", message: `ASIN ${purchaseItem.asin} is missing or unavailable. Could not set quantity ${purchaseItem.quantity || 1}.`, missingAsin: item.asin, missingLineId: itemPrimaryLineId(item) });
-      showPanel("Nutricity fulfilment", "Could not set item quantity. Job marked as error.", null, null);
+      const requestedQuantity = Math.max(1, Math.round(Number(purchaseItem.quantity || 1)));
+      const availableQuantity = maxSelectableQuantity("regular");
+      const lessQuantity = availableQuantity > 0 && availableQuantity < requestedQuantity;
+      await send({
+        type: "FAIL_JOB",
+        message: lessQuantity
+          ? `Less quantity available for ASIN ${purchaseItem.asin}. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.`
+          : `ASIN ${purchaseItem.asin} is missing or unavailable. Could not set quantity ${purchaseItem.quantity || 1}.`,
+        missingAsin: item.asin,
+        missingLineId: itemPrimaryLineId(item),
+        failureCode: lessQuantity ? "partial_quantity" : "",
+        requestedQuantity,
+        fulfilledQuantity: lessQuantity ? availableQuantity : null,
+        availableQuantity: lessQuantity ? availableQuantity : null,
+      });
+      showPanel("Nutricity fulfilment", lessQuantity ? "Less quantity available. Order moved to Missing ASINs." : "Could not set item quantity. Job marked as error.", null, null);
       return;
     }
     const addButton = await waitForElement(["#add-to-cart-button", "input[name='submit.add-to-cart']", "#buybox-add-to-cart-button input"], 18000);
@@ -1089,6 +1126,21 @@ async function handleCart(activeJob) {
   }
   const cartCheck = verifyCartQuantities(activeJob);
   if (!cartCheck.ok) {
+    const shortQuantity = (cartCheck.mismatches || []).find((item) => item.actual > 0 && item.actual < item.expected);
+    if (shortQuantity) {
+      await send({
+        type: "FAIL_JOB",
+        message: `Less quantity available for ASIN ${shortQuantity.asin}. Customer ordered ${shortQuantity.expected}, Amazon cart has ${shortQuantity.actual}.`,
+        missingAsin: shortQuantity.asin,
+        missingLineId: lineIdForAsin(activeJob, shortQuantity.asin),
+        failureCode: "partial_quantity",
+        requestedQuantity: shortQuantity.expected,
+        fulfilledQuantity: shortQuantity.actual,
+        availableQuantity: shortQuantity.actual,
+      });
+      showPanel("Cart quantity needs review", "Less quantity available. Order moved to Missing ASINs.", null, null);
+      return;
+    }
     activeJob.paused = true;
     activeJob.stage = "cart";
     await setActiveJob(activeJob);

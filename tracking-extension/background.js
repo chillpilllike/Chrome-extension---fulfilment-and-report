@@ -127,6 +127,26 @@ async function handleOrderPackages(message, windowId) {
   if (!tracking.running) return { ok: false };
   const order = tracking.orders[tracking.index];
   if (!order || order.amazon_order_id !== message.amazonOrderId) return { ok: false };
+  if (message.paymentRevisionNeeded) {
+    await api("/api/tracking/update", {
+      method: "POST",
+      body: JSON.stringify({
+        amazon_order_id: order.amazon_order_id,
+        amazon_order_url: orderUrl(order),
+        packages: message.packages || [],
+        payment_revision_needed: true,
+        payment_revision_url: message.paymentRevisionUrl || "",
+        page_text: message.pageText || "",
+      }),
+    });
+    await log(`Payment revision needed for ${order.amazon_order_id}; posted to Payment Failed page.`, windowId);
+    tracking.index += 1;
+    tracking.packages = [];
+    tracking.packageIndex = 0;
+    await saveTracking(tracking, windowId);
+    await openCurrentOrder(windowId);
+    return { ok: true };
+  }
   tracking.packages = message.packages || [];
   tracking.packageIndex = 0;
   await saveTracking(tracking, windowId);
@@ -161,6 +181,11 @@ async function handlePackageTracking(message, windowId) {
   const order = tracking.orders[tracking.index];
   if (!order || order.amazon_order_id !== message.amazonOrderId) return { ok: false };
   const packageData = { ...(tracking.packages[tracking.packageIndex] || {}), ...(message.package || {}) };
+  if (message.paymentRevisionNeeded) {
+    packageData.payment_revision_needed = true;
+    packageData.payment_revision_url = message.paymentRevisionUrl || "";
+    packageData.page_text = message.pageText || "";
+  }
   tracking.packages[tracking.packageIndex] = packageData;
   tracking.packageIndex += 1;
   await saveTracking(tracking, windowId);
@@ -175,6 +200,9 @@ async function handlePackageTracking(message, windowId) {
       amazon_order_id: order.amazon_order_id,
       amazon_order_url: orderUrl(order),
       packages: tracking.packages,
+      payment_revision_needed: tracking.packages.some((pkg) => pkg.payment_revision_needed),
+      payment_revision_url: tracking.packages.find((pkg) => pkg.payment_revision_url)?.payment_revision_url || "",
+      page_text: tracking.packages.find((pkg) => pkg.page_text)?.page_text || "",
     }),
   });
   await log(`Posted tracking update for ${order.amazon_order_id}.`, windowId);

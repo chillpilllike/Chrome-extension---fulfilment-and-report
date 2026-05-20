@@ -229,6 +229,10 @@ async function failJob(message, details = {}, windowId) {
       line_ids: activeJob.job.line_ids || [],
       missing_asin: details.missingAsin || "",
       missing_line_id: details.missingLineId || null,
+      failure_code: details.failureCode || "",
+      requested_quantity: details.requestedQuantity ?? null,
+      fulfilled_quantity: details.fulfilledQuantity ?? null,
+      available_quantity: details.availableQuantity ?? null,
       worker_id: activeJob.workerId || "",
     }),
   });

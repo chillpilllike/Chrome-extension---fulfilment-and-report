@@ -31,6 +31,7 @@ function TooltipTrigger({ ...props }: TooltipPrimitive.Trigger.Props) {
 
 function TooltipContent({
   className,
+  innerClassName,
   side = "top",
   sideOffset = 4,
   align = "center",
@@ -41,16 +42,9 @@ function TooltipContent({
   Pick<
     TooltipPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset"
-  >) {
-  const sideClass =
-    side === "bottom"
-      ? "bs-tooltip-bottom"
-      : side === "left" || side === "inline-start"
-        ? "bs-tooltip-start"
-        : side === "right" || side === "inline-end"
-          ? "bs-tooltip-end"
-          : "bs-tooltip-top"
-
+  > & {
+    innerClassName?: string
+  }) {
   return (
     <TooltipPrimitive.Portal>
       <TooltipPrimitive.Positioner
@@ -62,16 +56,13 @@ function TooltipContent({
       >
         <TooltipPrimitive.Popup
           data-slot="tooltip-content"
-          data-bs-placement={side}
           className={cn(
-            "tooltip show",
-            sideClass,
+            "z-50 w-max max-w-xs rounded-md bg-slate-900 px-3 py-2 text-sm text-white shadow-lg outline-none",
             className
           )}
           {...props}
         >
-          <TooltipPrimitive.Arrow className="tooltip-arrow" />
-          <div className="tooltip-inner">{children}</div>
+          <div className={cn("min-w-0", innerClassName)}>{children}</div>
         </TooltipPrimitive.Popup>
       </TooltipPrimitive.Positioner>
     </TooltipPrimitive.Portal>

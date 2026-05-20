@@ -85,6 +85,10 @@ class ChromeJobFailPayload(BaseModel):
     line_ids: list[int] = []
     missing_asin: str = ""
     missing_line_id: Optional[int] = None
+    failure_code: str = ""
+    requested_quantity: Optional[float] = None
+    fulfilled_quantity: Optional[float] = None
+    available_quantity: Optional[float] = None
     worker_id: str = ""
 
 
@@ -102,6 +106,10 @@ class ChromeTrackingUpdatePayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
     packages: list[dict[str, Any]] = []
+    payment_revision_needed: bool = False
+    payment_revision_url: str = ""
+    page_text: str = ""
+    alert_html: str = ""
 
 
 class ManualAmazonOrderMatchPayload(BaseModel):
@@ -111,6 +119,14 @@ class ManualAmazonOrderMatchPayload(BaseModel):
     order_names: list[str] = []
     source_text: str = ""
     store_id: Optional[int] = None
+
+
+class ManualFulfilmentPayload(BaseModel):
+    store_id: int
+    line_ids: list[int] = []
+    reference: str = ""
+    url: str = ""
+    third_party: bool = False
 
 
 class ChromeJobHeartbeatPayload(BaseModel):
@@ -192,3 +208,10 @@ class ServiceSettingsPayload(BaseModel):
 
 class AdminSettingsPayload(BaseModel):
     admin_access_token: str
+
+
+class UiCopyPayload(BaseModel):
+    key: str
+    title: str = ""
+    description: str = ""
+    icon: str = ""

@@ -48,6 +48,17 @@ function absoluteUrl(href) {
   return new URL(href, location.origin).href;
 }
 
+function parsePaymentRevision() {
+  const text = clean(document.querySelector("[data-component='alerts']")?.textContent || document.body.textContent || "");
+  const needed = /payment revision needed/i.test(text) || /please update your payment method/i.test(text);
+  const reviseLink = document.querySelector("a[href*='/cpe/revisepayments'], a[href*='revisepayments']");
+  return {
+    paymentRevisionNeeded: needed,
+    paymentRevisionUrl: reviseLink ? absoluteUrl(reviseLink.getAttribute("href") || "") : "",
+    pageText: needed ? text.slice(0, 2000) : "",
+  };
+}
+
 function asinsFrom(root) {
   return [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]
     .map((link) => {
@@ -60,6 +71,7 @@ function asinsFrom(root) {
 
 function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
+  const paymentRevision = parsePaymentRevision();
   const links = [...document.querySelectorAll("a[href*='ship-track'][href*='orderId=']")];
   const packages = [];
   const seen = new Set();
@@ -78,7 +90,7 @@ function parseOrderDetails() {
     });
   }
   const orderStatus = clean(document.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
-  return { amazonOrderId, packages, orderStatus, promise: orderStatus };
+  return { amazonOrderId, packages, orderStatus, promise: orderStatus, ...paymentRevision };
 }
 
 function parseCarrierAndTrackingId() {
@@ -143,6 +155,7 @@ async function openTrackingEvents() {
 async function parseTrackingPage() {
   await openTrackingEvents();
   const amazonOrderId = currentOrderId();
+  const paymentRevision = parsePaymentRevision();
   const events = parseEvents();
   const carrierInfo = parseCarrierAndTrackingId();
   const status = parseStatus();
@@ -155,7 +168,7 @@ async function parseTrackingPage() {
     tracking_url: location.href,
     asins: asinsFrom(document.body),
   };
-  return { amazonOrderId, package: pkg };
+  return { amazonOrderId, package: pkg, ...paymentRevision };
 }
 
 async function run() {

@@ -17,6 +17,7 @@ from app.schemas.payloads import (
     InventoryCreatePayload,
     LineSpaidPayload,
     ManualAmazonOrderMatchPayload,
+    ManualFulfilmentPayload,
     PlacePayload,
     PullPayload,
     PunchoutReturnUrlPayload,
@@ -24,6 +25,7 @@ from app.schemas.payloads import (
     ServiceSettingsPayload,
     StoreActionPayload,
     StorePayload,
+    UiCopyPayload,
 )
 
 __all__ = [
@@ -45,6 +47,7 @@ __all__ = [
     "InventoryCreatePayload",
     "LineSpaidPayload",
     "ManualAmazonOrderMatchPayload",
+    "ManualFulfilmentPayload",
     "PlacePayload",
     "PullPayload",
     "PunchoutReturnUrlPayload",
@@ -52,4 +55,5 @@ __all__ = [
     "ServiceSettingsPayload",
     "StoreActionPayload",
     "StorePayload",
+    "UiCopyPayload",
 ]

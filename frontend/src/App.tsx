@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import type { ReactNode } from "react"
 import {
   IconAlertCircle as AlertCircle,
@@ -46,6 +46,60 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+
+type SelectId = number | string
+const KNOWN_APP_PAGES = new Set([
+  "home",
+  "orders",
+  "pull-jobs",
+  "tracking",
+  "payment-failed",
+  "amazon-otp",
+  "epost",
+  "duplicate-tracking",
+  "fulfilment-pending",
+  "missing",
+  "bulk",
+  "costly",
+  "profit-loss",
+  "accounting",
+  "downloads",
+  "shopify-fulfilment",
+  "shopify-tracking",
+  "inventory",
+  "settings",
+])
+
+function appPageFromLocation() {
+  if (typeof window === "undefined") return "home"
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, "")
+  const page = path || "home"
+  return KNOWN_APP_PAGES.has(page) ? page : "home"
+}
+
+function pagePath(page: string) {
+  return page === "home" ? "/" : `/${page}`
+}
+
+function rangeSelection<T extends SelectId>(
+  visibleIds: T[],
+  selected: T[],
+  id: T,
+  checked: boolean,
+  shiftKey: boolean,
+  anchor: T | null,
+) {
+  let ids = [id]
+  if (shiftKey && anchor !== null) {
+    const start = visibleIds.indexOf(anchor)
+    const end = visibleIds.indexOf(id)
+    if (start >= 0 && end >= 0) {
+      const [from, to] = start < end ? [start, end] : [end, start]
+      ids = visibleIds.slice(from, to + 1)
+    }
+  }
+  return checked ? Array.from(new Set([...selected, ...ids])) : selected.filter((current) => !ids.includes(current))
+}
 
 type Store = {
   id: number
@@ -155,6 +209,20 @@ type TrackingOrder = {
   tracking_status: string
   tracking_checked_at: string
   lines: OrderLine[]
+}
+
+type PaymentFailure = {
+  amazon_order_id: string
+  amazon_order_url: string
+  revise_payment_url: string
+  action_url: string
+  store_id?: number
+  odoo_order_names: string[]
+  message: string
+  status: string
+  detected_at: string
+  updated_at: string
+  resolved_at?: string
 }
 
 type FulfilmentPendingRow = OrderLine & {
@@ -311,6 +379,45 @@ const PULL_DAYS_STORAGE_KEY = "pull_orders_days"
 const PULL_LIMIT_STORAGE_KEY = "pull_orders_limit"
 const PULL_STORE_IDS_STORAGE_KEY = "pull_orders_store_ids"
 
+const defaultUiCopy: UiCopy = {
+  app_header: {
+    title: "Amazon Business Fulfilment",
+    description: "Odoo ASIN orders, Amazon ordering, delivery tracking.",
+    icon: "package",
+  },
+  home: { title: "Dashboard", description: "Control panel overview for fulfilment, tracking, and exceptions." },
+  orders: { title: "Orders", description: "Review Odoo order lines and queue Amazon fulfilment." },
+  "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
+  tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
+  "payment-failed": { title: "Payment Failed", description: "Review Amazon orders that need payment revision." },
+  "amazon-otp": { title: "Amazon OTP", description: "Match OTP emails to Amazon and Odoo orders." },
+  epost: { title: "ePost Tracking", description: "Monitor ePost Global shipment events." },
+  "duplicate-tracking": { title: "Duplicate Tracking", description: "Review repeated tracking numbers before dispatch updates." },
+  "fulfilment-pending": { title: "Pending Dispatch", description: "Find Amazon-delivered orders still pending in Odoo." },
+  missing: { title: "Missing ASINs", description: "Resolve unavailable Amazon products and replacements." },
+  bulk: { title: "Bulk Ordering", description: "Group compatible items before ordering." },
+  costly: { title: "Cost Review", description: "Approve or replace items with unfavorable cost." },
+  "profit-loss": { title: "Profit / Loss", description: "Review fulfilment profitability and shipping costs." },
+  accounting: { title: "Accounting", description: "Manage invoices, credit notes, and supporting documents." },
+  downloads: { title: "Downloads", description: "Export filtered data and download generated files." },
+  "shopify-fulfilment": { title: "Shopify Fulfilment", description: "Queue Amazon-ordered Odoo sales into DTC or DTB Shopify fulfilment." },
+  "shopify-tracking": { title: "Shopify Tracking to Odoo", description: "Sync Shopify tracking codes back to matching Odoo deliveries." },
+  inventory: { title: "Inventory", description: "Use available stock before placing Amazon orders." },
+  settings: { title: "Settings", description: "Configure stores, accounts, automation, alerts, and integrations." },
+}
+
+const uiIconComponents = {
+  alert: AlertCircle,
+  bell: Bell,
+  database: Database,
+  home: Home,
+  package: PackageCheck,
+  search: Search,
+  settings: Settings,
+  shop: StoreIcon,
+  user: UserCircle,
+}
+
 class AdminAuthError extends Error {
   constructor(message = "Admin access code required.") {
     super(message)
@@ -380,6 +487,44 @@ type PullJob = {
   limit_value: number
   inserted_records: number
   error: string
+  created_at: string
+  updated_at: string
+  completed_at: string
+}
+
+type ShopifyFulfilmentJob = {
+  id: string
+  store_name: string
+  odoo_order_name: string
+  route: string
+  status: string
+  attempts: number
+  max_attempts: number
+  last_error: string
+  created_at: string
+  updated_at: string
+  completed_at: string
+}
+
+type ShopifyOAuthMissing = {
+  route: string
+  dest_name: string
+  shop: string
+  authorized?: boolean
+  error?: string
+}
+
+type ShopifyTrackingJob = {
+  id: string
+  status: string
+  attempts: number
+  from_date: string
+  to_date: string
+  dry_run: number
+  skip_done_pickings: number
+  validate_deliveries: number
+  report_csv: string
+  last_error: string
   created_at: string
   updated_at: string
   completed_at: string
@@ -469,6 +614,14 @@ type PunchoutReturnUrl = {
 }
 
 type ServiceSettings = Record<string, string>
+
+type UiCopy = Record<string, { title?: string; description?: string; icon?: string }>
+
+type ShopifyScriptConfig = {
+  dtc?: Record<string, any>
+  dtb?: Record<string, any>
+  tracking?: Record<string, any>
+}
 
 type ReindexProgress = {
   status: string
@@ -871,6 +1024,29 @@ function StatusBadge({ value }: { value?: string }) {
   return <Badge variant="outline">{status}</Badge>
 }
 
+function ErrorTooltip({ value, className = "" }: { value?: string; className?: string }) {
+  const text = String(value || "").trim()
+  if (!text) return null
+  if (text.startsWith("Shopify OAuth token")) return null
+  return (
+    <Tooltip>
+      <TooltipTrigger className={`block w-full cursor-help truncate text-left text-destructive ${className}`}>
+        {text}
+      </TooltipTrigger>
+      <TooltipContent
+        side="top"
+        align="end"
+        className="max-w-[calc(100vw-32px)]"
+        innerClassName="max-h-[min(45vh,360px)] w-[min(680px,calc(100vw-56px))] overflow-auto whitespace-normal break-words text-left leading-relaxed [overflow-wrap:anywhere]"
+      >
+        <div className="grid min-w-0 gap-2">
+          <span>{text}</span>
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 function ResultDialog({ modal, onClose }: { modal: ModalState; onClose: () => void }) {
   useEffect(() => {
     if (!modal) return
@@ -893,6 +1069,135 @@ function ResultDialog({ modal, onClose }: { modal: ModalState; onClose: () => vo
         <button type="button" className="btn-close" onClick={onClose} aria-label="Close notification" />
       </div>
     </div>
+  )
+}
+
+function UiCopyDialog({
+  copyKey,
+  value,
+  onClose,
+  onSave,
+}: {
+  copyKey: string | null
+  value: { title?: string; description?: string; icon?: string }
+  onClose: () => void
+  onSave: (value: { title: string; description: string; icon?: string }) => Promise<void>
+}) {
+  const [title, setTitle] = useState("")
+  const [description, setDescription] = useState("")
+  const [icon, setIcon] = useState("")
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    if (!copyKey) return
+    setTitle(value.title || "")
+    setDescription(value.description || "")
+    setIcon(value.icon || "")
+    setBusy(false)
+  }, [copyKey, value.title, value.description, value.icon])
+  return (
+    <Dialog open={Boolean(copyKey)} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Edit Text</DialogTitle>
+          <DialogDescription>Change the title and short description shown in the app.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <TextField label="Title" value={title} onChange={setTitle} />
+          <TextField label="Short Description" value={description} onChange={setDescription} />
+          {copyKey === "app_header" && <TextField label="Icon Name" value={icon} onChange={setIcon} />}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true)
+              try {
+                await onSave({ title, description, icon })
+              } finally {
+                setBusy(false)
+              }
+            }}
+          >
+            {busy ? "Saving..." : "Save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ManualFulfilmentDialog({
+  open,
+  selectedCount,
+  onClose,
+  onSubmit,
+}: {
+  open: boolean
+  selectedCount: number
+  onClose: () => void
+  onSubmit: (payload: { reference: string; url: string; third_party: boolean }) => Promise<void>
+}) {
+  const [thirdParty, setThirdParty] = useState(false)
+  const [reference, setReference] = useState("")
+  const [url, setUrl] = useState("")
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    if (!open) return
+    setThirdParty(false)
+    setReference("")
+    setUrl("")
+    setBusy(false)
+  }, [open])
+  const canSave = thirdParty ? Boolean(reference.trim() || url.trim()) : Boolean(reference.trim())
+  return (
+    <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Manual Fulfilment</DialogTitle>
+          <DialogDescription>
+            Mark the selected Odoo order line(s) as fulfilled without placing a new app order.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <Alert>
+            <CheckCircle2 className="size-4" />
+            <AlertTitle>{selectedCount.toLocaleString()} selected line(s)</AlertTitle>
+            <AlertDescription>The app will apply this to the open lines in the selected Odoo order(s).</AlertDescription>
+          </Alert>
+          <label className="form-check w-fit cursor-pointer">
+            <Checkbox checked={thirdParty} onCheckedChange={(checked) => setThirdParty(Boolean(checked))} />
+            <span className="form-check-label">Fulfilled at third party</span>
+          </label>
+          <TextField
+            label={thirdParty ? "Third-party order number or reference" : "Amazon order ID"}
+            value={reference}
+            onChange={setReference}
+          />
+          <TextField
+            label={thirdParty ? "Third-party order URL or notes" : "Amazon order URL (optional)"}
+            value={url}
+            onChange={setUrl}
+          />
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button
+            disabled={!canSave || busy}
+            onClick={async () => {
+              setBusy(true)
+              try {
+                await onSubmit({ reference, url, third_party: thirdParty })
+              } finally {
+                setBusy(false)
+              }
+            }}
+          >
+            {busy ? "Saving..." : "Save Manual Fulfilment"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -1171,6 +1476,9 @@ function App() {
   const [trackingOrders] = useState<TrackingOrder[]>([])
   const [trackingPage, setTrackingPage] = useState(1)
   const trackingTotal = 0
+  const [paymentFailures, setPaymentFailures] = useState<PaymentFailure[]>([])
+  const [paymentFailuresPage, setPaymentFailuresPage] = useState(1)
+  const [paymentFailuresTotal, setPaymentFailuresTotal] = useState(0)
   const [bulkGroups, setBulkGroups] = useState<BulkGroup[]>([])
   const [bulkPage, setBulkPage] = useState(1)
   const [bulkTotal, setBulkTotal] = useState(0)
@@ -1180,8 +1488,10 @@ function App() {
   const [costlyRows, setCostlyRows] = useState<OrderLine[]>([])
   const [costlyPage, setCostlyPage] = useState(1)
   const [costlyTotal, setCostlyTotal] = useState(0)
-  const [page, setPage] = useState("home")
+  const [page, setPage] = useState(appPageFromLocation)
   const [openNavGroup, setOpenNavGroup] = useState<string | null>(null)
+  const navTabsRef = useRef<HTMLDivElement | null>(null)
+  const ordersSelectionAnchor = useRef<number | null>(null)
   const [storeId, setStoreId] = useState("")
   const [addressId, setAddressId] = useState("")
   const [amazonAccountId, setAmazonAccountId] = useState("")
@@ -1207,6 +1517,7 @@ function App() {
   const [costlySelectAll, setCostlySelectAll] = useState(false)
   const [editingSpaid, setEditingSpaid] = useState<OrderLine | null>(null)
   const [editingReplacement, setEditingReplacement] = useState<OrderLine | null>(null)
+  const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
   const [allowMissingSpaid, setAllowMissingSpaid] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>("pulled_at")
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc")
@@ -1219,6 +1530,8 @@ function App() {
   const [adminAccessOpen, setAdminAccessOpen] = useState(!savedAdminToken())
   const [adminAuthError, setAdminAuthError] = useState("")
   const [adminAuthBusy, setAdminAuthBusy] = useState(false)
+  const [uiCopy, setUiCopy] = useState<UiCopy>({})
+  const [editingCopyKey, setEditingCopyKey] = useState<string | null>(null)
 
   function pagedQuery(nextStoreId: string, nextPage = 1, extra?: Record<string, string | number>) {
     const query = new URLSearchParams()
@@ -1246,6 +1559,7 @@ function App() {
       setTrackingPage(1)
       setTrackingSelectAll(false)
       setTrackingSelected([])
+      setPaymentFailuresPage(1)
       setBulkPage(1)
       setBulkSelectAll(false)
       setBulkSelected([])
@@ -1292,6 +1606,25 @@ function App() {
     applyDashboardData(next, nextPage)
   }
 
+  async function loadUiCopy() {
+    const result = await api<{ copy: UiCopy }>("/api/settings/ui-copy")
+    setUiCopy(result.copy || {})
+  }
+
+  function copyFor(key: string) {
+    return { ...(defaultUiCopy[key] || {}), ...(uiCopy[key] || {}) }
+  }
+
+  async function saveUiCopy(key: string, value: { title: string; description: string; icon?: string }) {
+    const result = await api<{ copy: UiCopy; message: string }>("/api/settings/ui-copy", {
+      method: "POST",
+      body: JSON.stringify({ key, title: value.title, description: value.description, icon: value.icon || "" }),
+    })
+    setUiCopy((current) => ({ ...current, ...(result.copy || {}) }))
+    setEditingCopyKey(null)
+    setModal({ ok: true, title: "Page Text", message: result.message || "Page text saved." })
+  }
+
   async function handleAdminTokenSave(token: string, remember = true) {
     const nextToken = token.trim()
     if (!nextToken) return
@@ -1308,6 +1641,7 @@ function App() {
         window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, nextToken)
       }
       applyDashboardData(next, ordersPage)
+      loadUiCopy().catch(() => undefined)
       setAdminTokenSaved(true)
       setAdminAccessOpen(false)
       setAdminAuthError("")
@@ -1350,6 +1684,19 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const onPopState = () => setPage(appPageFromLocation())
+    window.addEventListener("popstate", onPopState)
+    return () => window.removeEventListener("popstate", onPopState)
+  }, [])
+
+  useEffect(() => {
+    const nextPath = pagePath(page)
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({ page }, "", nextPath)
+    }
+  }, [page])
+
+  useEffect(() => {
     if (!savedAdminToken()) {
       setAdminTokenSaved(false)
       return
@@ -1358,6 +1705,7 @@ function App() {
       if (error instanceof AdminAuthError) return
       setModal({ ok: false, title: "Unable to load app", message: String(error) })
     })
+    loadUiCopy().catch(() => undefined)
   }, [ordersPage])
 
   useEffect(() => {
@@ -1371,6 +1719,25 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(PULL_STORE_IDS_STORAGE_KEY, JSON.stringify(pullStoreIds))
   }, [pullStoreIds])
+
+  useEffect(() => {
+    if (!openNavGroup) return
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      const navTabs = navTabsRef.current
+      if (navTabs && event.target instanceof Node && !navTabs.contains(event.target)) {
+        setOpenNavGroup(null)
+      }
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenNavGroup(null)
+    }
+    document.addEventListener("pointerdown", closeOnOutsideClick)
+    document.addEventListener("keydown", closeOnEscape)
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick)
+      document.removeEventListener("keydown", closeOnEscape)
+    }
+  }, [openNavGroup])
 
   useEffect(() => {
     if (page !== "inventory") return
@@ -1405,6 +1772,16 @@ function App() {
       })
       .catch((error) => setModal({ ok: false, title: "Fulfilment pending load failed", message: String(error) }))
   }, [page, storeId, fulfilmentPendingPage])
+
+  useEffect(() => {
+    if (page !== "payment-failed") return
+    api<{ rows: PaymentFailure[]; total: number }>(`/api/tracking/payment-failures${pagedQuery(storeId, paymentFailuresPage)}`)
+      .then((result) => {
+        setPaymentFailures(result.rows || [])
+        setPaymentFailuresTotal(result.total || 0)
+      })
+      .catch((error) => setModal({ ok: false, title: "Payment failed load failed", message: String(error) }))
+  }, [page, storeId, paymentFailuresPage])
 
   useEffect(() => {
     if (page !== "epost") return
@@ -1763,25 +2140,10 @@ function App() {
   const punchoutReturnUrls = data?.punchout_return_urls || []
   const selectedAmazonAccount = accounts.find((account) => String(account.id) === amazonAccountId)
   const engineLabel = orderingEngine === "rest" ? "REST Ordering API" : orderingEngine === "cxml" ? "cXML Punchout" : "Chrome Extension"
-  const pageTitles: Record<string, string> = {
-    home: "Dashboard",
-    orders: "Orders",
-    "pull-jobs": "Pull Jobs",
-    tracking: "Tracking",
-    "amazon-otp": "Amazon OTP",
-    epost: "ePost Tracking",
-    "duplicate-tracking": "Duplicate Tracking",
-    "fulfilment-pending": "Pending Dispatch",
-    missing: "Missing ASINs",
-    bulk: "Bulk Ordering",
-    costly: "Cost Review",
-    "profit-loss": "Profit / Loss",
-    accounting: "Accounting",
-    downloads: "Downloads",
-    inventory: "Inventory",
-    settings: "Settings",
-  }
-  const pageTitle = pageTitles[page] || "Dashboard"
+  const currentPageCopy = copyFor(page)
+  const headerCopy = copyFor("app_header")
+  const pageTitle = currentPageCopy.title || "Dashboard"
+  const HeaderIcon = uiIconComponents[(headerCopy.icon || "package") as keyof typeof uiIconComponents] || PackageCheck
   const navGroups = [
     {
       key: "operations",
@@ -1791,6 +2153,7 @@ function App() {
         ["orders", "Orders", ShoppingCart],
         ["pull-jobs", "Pull Jobs", RefreshCw],
         ["bulk", "Bulk Ordering", PackageCheck],
+        ["shopify-fulfilment", "Shopify Fulfilment", StoreIcon],
         ["missing", "Missing ASINs", AlertCircle],
         ["costly", "Cost Review", AlertCircle],
         ["fulfilment-pending", "Pending Dispatch", AlertCircle],
@@ -1803,9 +2166,11 @@ function App() {
       icon: PackageCheck,
       items: [
         ["tracking", "Amazon Tracking", PackageCheck],
+        ["payment-failed", "Payment Failed", AlertCircle],
         ["amazon-otp", "Amazon OTP", Bell],
         ["epost", "ePost Global", PackageCheck],
         ["duplicate-tracking", "Duplicate Tracking", AlertCircle],
+        ["shopify-tracking", "Shopify Tracking", StoreIcon],
       ],
     },
     {
@@ -1834,18 +2199,42 @@ function App() {
     <TooltipProvider>
     <div className="page tabler-admin-shell min-h-screen bg-muted/30 text-foreground">
       <ResultDialog modal={adminAccessOpen ? null : modal} onClose={() => setModal(null)} />
+      <UiCopyDialog
+        copyKey={editingCopyKey}
+        value={editingCopyKey ? copyFor(editingCopyKey) : {}}
+        onClose={() => setEditingCopyKey(null)}
+        onSave={(value) => editingCopyKey ? saveUiCopy(editingCopyKey, value) : Promise.resolve()}
+      />
+      <ManualFulfilmentDialog
+        open={manualFulfilmentOpen}
+        selectedCount={selected.length}
+        onClose={() => setManualFulfilmentOpen(false)}
+        onSubmit={async (payload) => {
+          await runAction("Manual Fulfilment", () =>
+            api<DashboardData>("/api/lines/manual-fulfilment", {
+              method: "POST",
+              body: JSON.stringify({ store_id: Number(storeId), line_ids: selected, ...payload }),
+            }),
+          )
+          setManualFulfilmentOpen(false)
+          setSelected([])
+        }}
+      />
       <AdminAccessDialog open={adminAccessOpen} onSubmit={handleAdminTokenSave} onClose={() => setAdminAccessOpen(false)} error={adminAuthError} busy={adminAuthBusy} />
       <header className="navbar navbar-expand-md d-print-none sticky top-0 z-20">
         <div className="container-xl flex items-center justify-between gap-4 py-3">
           <button className="navbar-brand" onClick={() => setPage("home")}>
             <div className="avatar avatar-sm bg-primary text-primary-fg">
-              <PackageCheck className="size-4" />
+              <HeaderIcon className="size-4" />
             </div>
             <div>
-              <h1 className="navbar-brand-title">Amazon Business Fulfilment</h1>
-              <p className="navbar-brand-subtitle">Odoo ASIN orders, Amazon ordering, delivery tracking.</p>
+              <h1 className="navbar-brand-title">{headerCopy.title}</h1>
+              <p className="navbar-brand-subtitle">{headerCopy.description}</p>
             </div>
           </button>
+          <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey("app_header")} title="Edit header text">
+            <Edit className="size-4" />
+          </Button>
           <div className="flex items-center gap-2">
             <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Day mode"><Sun className="size-5" /></button>
             <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Dark mode"><Moon className="size-5" /></button>
@@ -1870,7 +2259,7 @@ function App() {
             )}
           </div>
         </div>
-        <div className="navbar-tabs">
+        <div className="navbar-tabs" ref={navTabsRef}>
           <div className="container-xl flex items-center justify-between gap-4">
           <ul className="navbar-nav nav-tabs">
             <li className={`nav-item ${page === "home" ? "active" : ""}`}>
@@ -1928,7 +2317,13 @@ function App() {
           <div className="page-header-row">
             <div>
               <div className="page-pretitle">Control panel</div>
-              <h2 className="page-title">{pageTitle}</h2>
+              <div className="flex items-center gap-2">
+                <h2 className="page-title">{pageTitle}</h2>
+                <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey(page)} title="Edit page text">
+                  <Edit className="size-4" />
+                </Button>
+              </div>
+              {currentPageCopy.description && <p className="mt-1 text-sm text-muted-foreground">{currentPageCopy.description}</p>}
             </div>
             <div className="page-actions">
               {storeId && <span className="badge bg-blue-lt text-blue">{stores.find((store) => String(store.id) === storeId)?.name || "Store selected"}</span>}
@@ -2208,6 +2603,14 @@ function App() {
                       Place Selected
                     </Button>
                     <Button
+                      variant="outline"
+                      disabled={!selected.length || Boolean(busy)}
+                      onClick={() => setManualFulfilmentOpen(true)}
+                    >
+                      <CheckCircle2 className="size-4" />
+                      Manually Fulfilled
+                    </Button>
+                    <Button
                       disabled={!selected.length || Boolean(busy)}
                       onClick={() =>
                         runAction("Club Place Selected", () =>
@@ -2379,9 +2782,11 @@ function App() {
                         <TableCell>
                           <Checkbox
                             checked={selected.includes(row.id)}
-                            onCheckedChange={(checked) => {
+                            onCheckedChange={(checked, event) => {
                               setOrdersSelectAll(false)
-                              setSelected((current) => (checked ? [...current, row.id] : current.filter((id) => id !== row.id)))
+                              const visibleIds = sortedRows.map((item) => item.id)
+                              setSelected((current) => rangeSelection(visibleIds, current, row.id, Boolean(checked), event.shiftKey, ordersSelectionAnchor.current))
+                              ordersSelectionAnchor.current = row.id
                             }}
                           />
                         </TableCell>
@@ -2438,6 +2843,27 @@ function App() {
         )}
         {page === "amazon-otp" && (
           <AmazonOtpPage onResult={setModal} />
+        )}
+        {page === "payment-failed" && (
+          <PaymentFailedPage
+            rows={paymentFailures}
+            storeId={storeId}
+            page={paymentFailuresPage}
+            total={paymentFailuresTotal}
+            onPage={setPaymentFailuresPage}
+            onResult={setModal}
+            onRefresh={async () => {
+              const result = await api<{ rows: PaymentFailure[]; total: number }>(`/api/tracking/payment-failures${pagedQuery(storeId, paymentFailuresPage)}`)
+              setPaymentFailures(result.rows || [])
+              setPaymentFailuresTotal(result.total || 0)
+            }}
+          />
+        )}
+        {page === "shopify-fulfilment" && (
+          <ShopifyFulfilmentPage storeId={storeId} onResult={setModal} />
+        )}
+        {page === "shopify-tracking" && (
+          <ShopifyTrackingSyncPage onResult={setModal} />
         )}
         {page === "fulfilment-pending" && (
           <FulfilmentPendingPage
@@ -2965,6 +3391,7 @@ function TrackingPage({
   const [orders, setOrders] = useState<TrackingOrder[]>([])
   const [localTotal, setLocalTotal] = useState(total)
   const [loading, setLoading] = useState(false)
+  const selectionAnchor = useRef<string | null>(null)
 
   async function refreshTracking() {
     setLoading(true)
@@ -3045,9 +3472,11 @@ function TrackingPage({
                   <TableCell>
                     <Checkbox
                       checked={selected.includes(order.amazon_order_id)}
-                      onCheckedChange={(checked) => {
+                      onCheckedChange={(checked, event) => {
                         onSelectAll(false)
-                        onSelected(checked ? Array.from(new Set([...selected, order.amazon_order_id])) : selected.filter((id) => id !== order.amazon_order_id))
+                        const visibleIds = orders.map((item) => item.amazon_order_id)
+                        onSelected(rangeSelection(visibleIds, selected, order.amazon_order_id, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                        selectionAnchor.current = order.amazon_order_id
                       }}
                     />
                   </TableCell>
@@ -3084,6 +3513,114 @@ function TrackingPage({
                 </TableRow>
               )
             })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  )
+}
+
+function PaymentFailedPage({
+  rows,
+  storeId,
+  page,
+  total,
+  onPage,
+  onResult,
+  onRefresh,
+}: {
+  rows: PaymentFailure[]
+  storeId: string
+  page: number
+  total: number
+  onPage: (page: number) => void
+  onResult: (modal: ModalState) => void
+  onRefresh: () => Promise<void>
+}) {
+  const [loading, setLoading] = useState(false)
+
+  async function markResolved(orderId: string) {
+    setLoading(true)
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/tracking/payment-failures/${encodeURIComponent(orderId)}/resolve`, { method: "POST" })
+      onResult({ ok: result.ok, title: "Payment Issue Updated", message: result.message })
+      await onRefresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Payment Issue Update Failed", message: String(error) })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <CardTitle>Payment Failed Orders</CardTitle>
+          <CardDescription>Amazon orders where the tracking extension saw payment revision needed.</CardDescription>
+        </div>
+        <div className="btn-list">
+          <Button variant="outline" onClick={onRefresh} disabled={loading}>
+            <RefreshCw className="size-4" />
+            Refresh
+          </Button>
+        </div>
+      </CardHeader>
+      <div className="border-t px-6 py-3">
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+          <div className="text-sm text-muted-foreground">{total.toLocaleString()} open payment issue{total === 1 ? "" : "s"}{storeId ? " for this store" : ""}.</div>
+          <PaginationControls page={page} total={total} onPage={onPage} disabled={loading} />
+        </div>
+      </div>
+      <CardContent className="p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Amazon Order</TableHead>
+              <TableHead>Odoo Orders</TableHead>
+              <TableHead>Message</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Detected</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow key={row.amazon_order_id}>
+                <TableCell>
+                  <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.action_url || row.amazon_order_url} target="_blank">
+                    {row.amazon_order_id}
+                  </a>
+                </TableCell>
+                <TableCell className="max-w-[260px]">
+                  <div className="flex flex-wrap gap-1">
+                    {(row.odoo_order_names || []).map((name) => (
+                      <Badge key={name} variant="secondary">{name}</Badge>
+                    ))}
+                  </div>
+                </TableCell>
+                <TableCell className="max-w-[420px]"><ErrorTooltip value={row.message || "Payment revision needed. Please update your payment method."} /></TableCell>
+                <TableCell><StatusBadge value={row.status || "open"} /></TableCell>
+                <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.detected_at)}</TableCell>
+                <TableCell className="text-right">
+                  <div className="btn-list justify-end">
+                    <Button variant="outline" size="sm" onClick={() => window.open(row.action_url || row.amazon_order_url, "_blank")}>
+                      <Link className="size-4" />
+                      Revise
+                    </Button>
+                    <Button size="sm" onClick={() => markResolved(row.amazon_order_id)} disabled={loading}>
+                      <CheckCircle2 className="size-4" />
+                      Mark Resolved
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+            {!rows.length && (
+              <TableRow>
+                <TableCell colSpan={6} className="py-8 text-sm text-muted-foreground">No Amazon payment failures are open.</TableCell>
+              </TableRow>
+            )}
           </TableBody>
         </Table>
       </CardContent>
@@ -3259,6 +3796,7 @@ function FulfilmentPendingPage({
   onRefresh: () => Promise<void>
 }) {
   const [loading, setLoading] = useState(false)
+  const selectionAnchor = useRef<number | null>(null)
   function rowPackages(row: FulfilmentPendingRow) {
     try {
       const parsed = JSON.parse(row.tracking_payload || "[]")
@@ -3325,9 +3863,11 @@ function FulfilmentPendingPage({
                     <TableCell>
                       <Checkbox
                         checked={selected.includes(row.id)}
-                        onCheckedChange={(checked) => {
+                        onCheckedChange={(checked, event) => {
                           onSelectAll(false)
-                          onSelected(checked ? Array.from(new Set([...selected, row.id])) : selected.filter((id) => id !== row.id))
+                          const visibleIds = rows.map((item) => item.id)
+                          onSelected(rangeSelection(visibleIds, selected, row.id, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                          selectionAnchor.current = row.id
                         }}
                       />
                     </TableCell>
@@ -3430,6 +3970,7 @@ function EpostTrackingPage({
 }) {
   const [loading, setLoading] = useState(false)
   const [syncDays, setSyncDays] = useState("2")
+  const selectionAnchor = useRef<number | null>(null)
   async function refresh() {
     setLoading(true)
     try {
@@ -3541,9 +4082,11 @@ function EpostTrackingPage({
                 <TableCell>
                   <Checkbox
                     checked={selected.includes(row.id)}
-                    onCheckedChange={(checked) => {
+                    onCheckedChange={(checked, event) => {
                       onSelectAll(false)
-                      onSelected(checked ? Array.from(new Set([...selected, row.id])) : selected.filter((id) => id !== row.id))
+                      const visibleIds = rows.map((item) => item.id)
+                      onSelected(rangeSelection(visibleIds, selected, row.id, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                      selectionAnchor.current = row.id
                     }}
                   />
                 </TableCell>
@@ -3618,6 +4161,7 @@ function DuplicateTrackingPage({
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState<string[]>([])
   const [selectAll, setSelectAll] = useState(false)
+  const selectionAnchor = useRef<string | null>(null)
 
   async function load(nextPage = page) {
     setLoading(true)
@@ -3751,9 +4295,11 @@ function DuplicateTrackingPage({
                   <TableCell>
                     <Checkbox
                       checked={selected.includes(row.tracking_code)}
-                      onCheckedChange={(checked) => {
+                      onCheckedChange={(checked, event) => {
                         setSelectAll(false)
-                        setSelected(checked ? Array.from(new Set([...selected, row.tracking_code])) : selected.filter((id) => id !== row.tracking_code))
+                        const visibleIds = rows.map((item) => item.tracking_code)
+                        setSelected(rangeSelection(visibleIds, selected, row.tracking_code, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                        selectionAnchor.current = row.tracking_code
                       }}
                     />
                   </TableCell>
@@ -3989,6 +4535,7 @@ function MissingPage({
   onAssign: (line: OrderLine) => void
   onRefresh: () => Promise<void>
 }) {
+  const selectionAnchor = useRef<number | null>(null)
   const groups = useMemo(() => {
     const grouped = new Map<string, OrderLine[]>()
     rows.forEach((row) => {
@@ -4054,9 +4601,11 @@ function MissingPage({
                     <TableCell>
                       <Checkbox
                         checked={selected.includes(row.id)}
-                        onCheckedChange={(checked) => {
+                        onCheckedChange={(checked, event) => {
                           onSelectAll(false)
-                          onSelected(checked ? Array.from(new Set([...selected, row.id])) : selected.filter((id) => id !== row.id))
+                          const visibleIds = rows.map((item) => item.id)
+                          onSelected(rangeSelection(visibleIds, selected, row.id, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                          selectionAnchor.current = row.id
                         }}
                       />
                     </TableCell>
@@ -4067,12 +4616,7 @@ function MissingPage({
                     </TableCell>
                     <TableCell className="max-w-[460px] truncate">{row.product_name}</TableCell>
                     <TableCell>{row.quantity}</TableCell>
-                    <TableCell className="max-w-[360px]">
-                      <Tooltip>
-                        <TooltipTrigger className="block w-full truncate text-left text-destructive">{row.last_error}</TooltipTrigger>
-                        <TooltipContent className="max-w-xl whitespace-normal break-words">{row.last_error}</TooltipContent>
-                      </Tooltip>
-                    </TableCell>
+                    <TableCell className="max-w-[360px]"><ErrorTooltip value={row.last_error} /></TableCell>
                     <TableCell>
                       {row.replacement_asin ? (
                         <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.replacement_asin_url || `https://www.amazon.com/dp/${row.replacement_asin}`} target="_blank">
@@ -4135,6 +4679,8 @@ function BulkPage({
   onResult: (modal: ModalState) => void
   onNavigate: (page: string) => void
 }) {
+  const selectionAnchor = useRef<string | null>(null)
+
   async function placeBulk(group: BulkGroup) {
     try {
       const result = await api<{ ok: boolean; message: string }>("/api/bulk/place", {
@@ -4192,9 +4738,11 @@ function BulkPage({
                   <TableCell>
                     <Checkbox
                       checked={selected.includes(group.asin)}
-                      onCheckedChange={(checked) => {
+                      onCheckedChange={(checked, event) => {
                         onSelectAll(false)
-                        onSelected(checked ? Array.from(new Set([...selected, group.asin])) : selected.filter((id) => id !== group.asin))
+                        const visibleIds = groups.map((item) => item.asin)
+                        onSelected(rangeSelection(visibleIds, selected, group.asin, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                        selectionAnchor.current = group.asin
                       }}
                     />
                   </TableCell>
@@ -4247,6 +4795,8 @@ function CostlyPage({
   onResult: (modal: ModalState) => void
   onNavigate: (page: string) => void
 }) {
+  const selectionAnchor = useRef<number | null>(null)
+
   async function approve(lineIds: number[]) {
     try {
       const result = await api<{ ok: boolean; message: string }>("/api/costly/approve", {
@@ -4301,9 +4851,11 @@ function CostlyPage({
                   <TableCell>
                     <Checkbox
                       checked={selected.includes(row.id)}
-                      onCheckedChange={(checked) => {
+                      onCheckedChange={(checked, event) => {
                         onSelectAll(false)
-                        onSelected(checked ? Array.from(new Set([...selected, row.id])) : selected.filter((id) => id !== row.id))
+                        const visibleIds = rows.map((item) => item.id)
+                        onSelected(rangeSelection(visibleIds, selected, row.id, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                        selectionAnchor.current = row.id
                       }}
                     />
                   </TableCell>
@@ -4311,7 +4863,7 @@ function CostlyPage({
                   <TableCell className="font-mono"><a className="text-primary underline-offset-4 hover:underline" href={row.asin_url || `https://www.amazon.com/dp/${row.asin}`} target="_blank">{row.asin}</a></TableCell>
                   <TableCell className="max-w-[420px] truncate">{row.product_name}</TableCell>
                   <TableCell className="text-destructive">{Number(row.cost_review_loss || 0).toFixed(2)}</TableCell>
-                  <TableCell className="max-w-[420px] truncate text-destructive">{row.last_error}</TableCell>
+                  <TableCell className="max-w-[420px]"><ErrorTooltip value={row.last_error} /></TableCell>
                   <TableCell className="text-right"><Button size="sm" onClick={() => approve([row.id])}>Approve Fulfilment</Button></TableCell>
                 </TableRow>
               ))}
@@ -4712,7 +5264,7 @@ function DownloadsPage({ onResult }: { onResult: (modal: ModalState) => void }) 
                 <TableCell>
                   <div className="font-medium">{job.view.replace("_", " ")}</div>
                   <div className="font-mono text-xs text-muted-foreground">{job.id}</div>
-                  {job.error ? <div className="max-w-[420px] truncate text-xs text-destructive">{job.error}</div> : null}
+                  {job.error ? <div className="max-w-[420px] text-xs"><ErrorTooltip value={job.error} /></div> : null}
                 </TableCell>
                 <TableCell><StatusBadge value={job.status} /></TableCell>
                 <TableCell>{Number(job.processed_records || 0).toLocaleString()} / {Number(job.total_records || 0).toLocaleString()}</TableCell>
@@ -4799,7 +5351,7 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
                 <TableCell>{Number(job.days || 0).toLocaleString()} day(s), limit {Number(job.limit_value || 0).toLocaleString()}</TableCell>
                 <TableCell>{Number(job.inserted_records || 0).toLocaleString()}</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{formatDateTime(job.updated_at || job.created_at)}</TableCell>
-                <TableCell className="max-w-[420px] truncate text-xs text-destructive">{job.error || ""}</TableCell>
+                <TableCell className="max-w-[420px] text-xs"><ErrorTooltip value={job.error} /></TableCell>
               </TableRow>
             ))}
             {!jobs.length && (
@@ -5076,6 +5628,254 @@ function AmazonPage({ accounts, onChanged, onResult }: { accounts: AmazonAccount
   )
 }
 
+function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResult: (modal: ModalState) => void }) {
+  const [jobs, setJobs] = useState<ShopifyFulfilmentJob[]>([])
+  const [oauthMissing, setOauthMissing] = useState<ShopifyOAuthMissing[]>([])
+  const [oauthStatus, setOauthStatus] = useState<ShopifyOAuthMissing[]>([])
+  const [total, setTotal] = useState(0)
+  const [busy, setBusy] = useState("")
+
+  async function load() {
+    const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; total: number }>("/api/shopify/fulfilment/jobs?page=1&per_page=100")
+    setJobs(result.jobs || [])
+    setOauthMissing(result.oauth_missing || [])
+    setOauthStatus(result.oauth_status || [])
+    setTotal(result.total || 0)
+  }
+  useEffect(() => {
+    load().catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
+    const timer = window.setInterval(() => load().catch(() => undefined), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
+  async function enqueuePending() {
+    setBusy("Queue")
+    try {
+      const path = `/api/shopify/fulfilment/enqueue${storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""}`
+      const result = await api<{ ok: boolean; message: string }>(path, { method: "POST" })
+      await load()
+      onResult({ ok: result.ok, title: "Shopify Fulfilment", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  async function runWorker() {
+    setBusy("Run")
+    try {
+      const result = await api<{ ok: boolean; message: string }>("/api/shopify/fulfilment/run", { method: "POST" })
+      await load()
+      onResult({ ok: result.ok, title: "Shopify Fulfilment", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  async function retryJob(jobId: string) {
+    const result = await api<{ ok: boolean; message: string }>(`/api/shopify/fulfilment/jobs/${jobId}/retry`, { method: "POST" })
+    await load()
+    onResult({ ok: result.ok, title: "Retry Shopify Job", message: result.message })
+  }
+  async function startOAuth(route: string) {
+    setBusy(`OAuth-${route}`)
+    try {
+      const result = await api<{ ok: boolean; authorized?: boolean; auth_url?: string; message: string }>(`/api/shopify/fulfilment/oauth/start?route=${encodeURIComponent(route)}`, { method: "POST" })
+      if (result.auth_url) {
+        window.open(result.auth_url, "_blank", "noopener,noreferrer")
+      }
+      await load()
+      onResult({ ok: result.ok, title: "Shopify OAuth", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  return (
+    <div className="grid gap-5">
+      <section className="page-section">
+        <div className="page-pretitle">Fulfilment queue</div>
+        <h2 className="page-title">Shopify Fulfilment</h2>
+        <p className="text-sm text-muted-foreground">Amazon-ordered Odoo orders are routed to DTC for non-India countries and DTB for India, then processed one job at a time.</p>
+      </section>
+      <Card>
+        <CardHeader>
+          <CardTitle>Queue Controls</CardTitle>
+          <CardDescription>Failed jobs stay visible and can be requeued. The worker claims one job at a time to avoid double exports.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <div className="btn-list">
+            <Button onClick={enqueuePending} disabled={Boolean(busy)}>{busy === "Queue" ? "Queueing..." : "Queue Pending Amazon Orders"}</Button>
+            <Button variant="outline" onClick={runWorker} disabled={Boolean(busy)}>{busy === "Run" ? "Starting..." : "Run Worker"}</Button>
+            {oauthMissing.map((item) => (
+              <Button
+                key={`${item.route}-${item.dest_name}`}
+                variant="warning"
+                onClick={() => startOAuth(item.route)}
+                disabled={Boolean(busy)}
+              >
+                <Link className="size-4" />
+                {busy === `OAuth-${item.route}` ? "Opening..." : `Authorize ${item.dest_name || item.route.toUpperCase()}`}
+              </Button>
+            ))}
+            {oauthStatus.filter((item) => item.authorized).map((item) => (
+              <Badge key={`${item.route}-${item.dest_name}-connected`} className="bg-emerald-600 px-3 py-2 text-white hover:bg-emerald-600">
+                Connected {item.route.toUpperCase()}
+              </Badge>
+            ))}
+            <Button variant="outline" onClick={load}>Refresh</Button>
+          </div>
+          {oauthMissing.length ? (
+            <Alert variant="destructive">
+              <AlertCircle className="size-4" />
+              <AlertTitle>Shopify OAuth required</AlertTitle>
+              <AlertDescription>{oauthMissing.map((item) => `${item.dest_name || item.route.toUpperCase()} is not connected`).join(", ")}</AlertDescription>
+            </Alert>
+          ) : null}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Jobs</CardTitle>
+          <CardDescription>{total.toLocaleString()} Shopify fulfilment job(s).</CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader><TableRow><TableHead>Order</TableHead><TableHead>Store</TableHead><TableHead>Route</TableHead><TableHead>Status</TableHead><TableHead>Attempts</TableHead><TableHead>Updated</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
+            <TableBody>
+              {jobs.map((job) => (
+                <TableRow key={job.id}>
+                  <TableCell className="font-medium">{job.odoo_order_name}</TableCell>
+                  <TableCell>{job.store_name}</TableCell>
+                  <TableCell><Badge variant="outline">{job.route?.toUpperCase()}</Badge></TableCell>
+                  <TableCell><StatusBadge value={job.status} /></TableCell>
+                  <TableCell>{job.attempts}/{job.max_attempts}</TableCell>
+                  <TableCell>{formatDateTime(job.updated_at || job.created_at)}</TableCell>
+                  <TableCell className="max-w-md"><ErrorTooltip value={job.last_error} /></TableCell>
+                  <TableCell>{["failed", "dead"].includes(job.status) && <Button size="sm" variant="outline" onClick={() => retryJob(job.id)}>Retry</Button>}</TableCell>
+                </TableRow>
+              ))}
+              {!jobs.length && <TableRow><TableCell colSpan={8} className="py-8 text-center text-muted-foreground">No Shopify fulfilment jobs yet.</TableCell></TableRow>}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) => void }) {
+  const [jobs, setJobs] = useState<ShopifyTrackingJob[]>([])
+  const [fromDate, setFromDate] = useState("")
+  const [toDate, setToDate] = useState("")
+  const [dryRun, setDryRun] = useState(false)
+  const [busy, setBusy] = useState(false)
+  async function load() {
+    const result = await api<{ jobs: ShopifyTrackingJob[] }>("/api/shopify/tracking/jobs?page=1&per_page=100")
+    setJobs(result.jobs || [])
+  }
+  useEffect(() => {
+    load().catch((error) => onResult({ ok: false, title: "Shopify Tracking", message: String(error) }))
+    const timer = window.setInterval(() => load().catch(() => undefined), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
+  async function startSync() {
+    setBusy(true)
+    try {
+      const result = await api<{ ok: boolean; message: string }>("/api/shopify/tracking/jobs", {
+        method: "POST",
+        body: JSON.stringify({ from_date: fromDate, to_date: toDate, dry_run: dryRun }),
+      })
+      await load()
+      onResult({ ok: result.ok, title: "Shopify Tracking", message: result.message })
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function retry(jobId: string) {
+    const result = await api<{ ok: boolean; message: string }>(`/api/shopify/tracking/jobs/${jobId}/retry`, { method: "POST" })
+    await load()
+    onResult({ ok: result.ok, title: "Retry Tracking Sync", message: result.message })
+  }
+  return (
+    <div className="grid gap-5">
+      <section className="page-section">
+        <div className="page-pretitle">Tracking sync</div>
+        <h2 className="page-title">Shopify Tracking to Odoo</h2>
+        <p className="text-sm text-muted-foreground">Runs the strict tag-based Shopify tracking script and writes tracking back to matching Odoo pickings.</p>
+      </section>
+      <Card>
+        <CardHeader>
+          <CardTitle>Start Tracking Sync</CardTitle>
+          <CardDescription>Uses SRC_ODOO_DB and SRC_ODOO_ORDER tags only. Empty dates use the configured default window.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-4">
+          <TextField label="From Date" value={fromDate} onChange={setFromDate} />
+          <TextField label="To Date" value={toDate} onChange={setToDate} />
+          <label className="form-check mt-6">
+            <input className="form-check-input" type="checkbox" checked={dryRun} onChange={(event) => setDryRun(event.target.checked)} />
+            <span className="form-check-label">Dry run</span>
+          </label>
+          <div className="mt-6 btn-list">
+            <Button onClick={startSync} disabled={busy}>{busy ? "Queueing..." : "Run Sync"}</Button>
+            <Button variant="outline" onClick={load}>Refresh</Button>
+          </div>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader><CardTitle>Tracking Jobs</CardTitle></CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader><TableRow><TableHead>Date Range</TableHead><TableHead>Status</TableHead><TableHead>Attempts</TableHead><TableHead>Report</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
+            <TableBody>
+              {jobs.map((job) => (
+                <TableRow key={job.id}>
+                  <TableCell>{job.from_date} to {job.to_date}{job.dry_run ? " (dry run)" : ""}</TableCell>
+                  <TableCell><StatusBadge value={job.status} /></TableCell>
+                  <TableCell>{job.attempts}</TableCell>
+                  <TableCell className="max-w-sm truncate">{job.report_csv}</TableCell>
+                  <TableCell className="max-w-md"><ErrorTooltip value={job.last_error} /></TableCell>
+                  <TableCell>{job.status === "failed" && <Button size="sm" variant="outline" onClick={() => retry(job.id)}>Retry</Button>}</TableCell>
+                </TableRow>
+              ))}
+              {!jobs.length && <TableRow><TableCell colSpan={6} className="py-8 text-center text-muted-foreground">No tracking sync jobs yet.</TableCell></TableRow>}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function formatScriptConfigValue(value: any): string {
+  if (value === true) return "Yes"
+  if (value === false) return "No"
+  if (value === null || value === undefined || value === "") return "Not set"
+  if (Array.isArray(value) || typeof value === "object") return JSON.stringify(value, null, 2)
+  return String(value)
+}
+
+function ScriptConfigCard({ title, config }: { title: string; config: Record<string, any> }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">{title}</CardTitle>
+        <CardDescription>Read from the bundled script currently used by the app.</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3 text-sm">
+        {Object.entries(config).map(([key, value]) => {
+          const complex = Array.isArray(value) || (value && typeof value === "object")
+          return (
+            <div key={key} className="grid gap-1">
+              <div className="font-semibold capitalize">{key.replace(/_/g, " ")}</div>
+              {complex ? (
+                <pre className="max-h-64 overflow-auto rounded border bg-muted/40 p-3 text-xs leading-relaxed">{formatScriptConfigValue(value)}</pre>
+              ) : (
+                <div className="text-muted-foreground">{formatScriptConfigValue(value)}</div>
+              )}
+            </div>
+          )
+        })}
+      </CardContent>
+    </Card>
+  )
+}
+
 function SettingsPage({
   stores,
   addresses,
@@ -5094,6 +5894,7 @@ function SettingsPage({
   const [editing, setEditing] = useState<PunchoutReturnUrl | null>(null)
   const [creating, setCreating] = useState(false)
   const [settings, setSettings] = useState<ServiceSettings>({})
+  const [shopifyScriptConfig, setShopifyScriptConfig] = useState<ShopifyScriptConfig | null>(null)
   const [savingServices, setSavingServices] = useState("")
   const [reindexProgress, setReindexProgress] = useState<ReindexProgress | null>(null)
   const [adminCode, setAdminCode] = useState("")
@@ -5102,6 +5903,9 @@ function SettingsPage({
     api<{ settings: ServiceSettings }>("/api/settings/services")
       .then((result) => setSettings(result.settings))
       .catch((error) => onResult({ ok: false, title: "Settings Load Failed", message: String(error) }))
+    api<{ config: ShopifyScriptConfig }>("/api/settings/shopify-script-config")
+      .then((result) => setShopifyScriptConfig(result.config))
+      .catch(() => setShopifyScriptConfig(null))
     loadReindexProgress()
   }, [])
 
@@ -5223,6 +6027,112 @@ function SettingsPage({
         onChanged={onChanged}
         onResult={onResult}
       />
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <StoreIcon className="size-4 text-muted-foreground" />
+            <CardTitle>Shopify Fulfilment & Tracking</CardTitle>
+          </div>
+          <CardDescription>Integrated DTC, DTB, and tracking sync. Runtime state, OAuth tokens, and sync maps are stored in Postgres.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <Alert>
+            <CheckCircle2 className="size-4" />
+            <AlertTitle>Scripts are bundled inside the app</AlertTitle>
+            <AlertDescription>No Downloads folder path is required for Shopify fulfilment or tracking.</AlertDescription>
+          </Alert>
+          <div className="grid gap-3 md:grid-cols-2">
+            <TextField label="OAuth Public Base URL" value={settings.shopify_oauth_public_base_url || ""} onChange={(value) => setSetting("shopify_oauth_public_base_url", value)} />
+            <SelectField label="Auto Queue After Amazon Order" value={settings.shopify_auto_enqueue_enabled || "true"} onChange={(value) => setSetting("shopify_auto_enqueue_enabled", value)}>
+              <option value="true">Enabled</option>
+              <option value="false">Disabled</option>
+            </SelectField>
+            <TextField label="Fulfilment Max Attempts" value={settings.shopify_job_max_attempts || "5"} onChange={(value) => setSetting("shopify_job_max_attempts", value)} />
+            <TextField label="Tracking Default Days" value={settings.shopify_tracking_from_days || "7"} onChange={(value) => setSetting("shopify_tracking_from_days", value)} />
+            <SelectField label="Tracking Validates Deliveries" value={settings.shopify_tracking_validate_deliveries || "true"} onChange={(value) => setSetting("shopify_tracking_validate_deliveries", value)}>
+              <option value="true">Validate pickings</option>
+              <option value="false">Only write tracking</option>
+            </SelectField>
+            <SelectField label="Skip Done Pickings" value={settings.shopify_tracking_skip_done_pickings || "false"} onChange={(value) => setSetting("shopify_tracking_skip_done_pickings", value)}>
+              <option value="false">Smart update done pickings</option>
+              <option value="true">Always skip done pickings</option>
+            </SelectField>
+          </div>
+          <div className="btn-list">
+            <Button
+              onClick={() => saveSettingsGroup("Shopify Scripts", [
+                "shopify_oauth_public_base_url",
+                "shopify_auto_enqueue_enabled",
+                "shopify_job_max_attempts",
+                "shopify_tracking_from_days",
+                "shopify_tracking_validate_deliveries",
+                "shopify_tracking_skip_done_pickings",
+              ])}
+              disabled={savingServices === "Shopify Scripts"}
+            >
+              {savingServices === "Shopify Scripts" ? "Saving..." : "Save Shopify Scripts"}
+            </Button>
+          </div>
+          {shopifyScriptConfig && (
+            <div className="grid gap-3 lg:grid-cols-3">
+              <ScriptConfigCard title="DTC Export Script Settings" config={shopifyScriptConfig.dtc || {}} />
+              <ScriptConfigCard title="DTB Export Script Settings" config={shopifyScriptConfig.dtb || {}} />
+              <ScriptConfigCard title="Tracking Sync Script Settings" config={shopifyScriptConfig.tracking || {}} />
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Bell className="size-4 text-muted-foreground" />
+            <CardTitle>Email Alerts</CardTitle>
+          </div>
+          <CardDescription>Send SMTP alerts when Chrome fulfilment or Shopify jobs fail.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <SelectField label="Email Alerts" value={settings.email_alerts_enabled || "false"} onChange={(value) => setSetting("email_alerts_enabled", value)}>
+              <option value="true">Enabled</option>
+              <option value="false">Disabled</option>
+            </SelectField>
+            <TextField label="Alert Recipient Email" value={settings.email_alert_to || ""} onChange={(value) => setSetting("email_alert_to", value)} />
+            <TextField label="From Address" value={settings.email_from_address || ""} onChange={(value) => setSetting("email_from_address", value)} />
+            <TextField label="From Name" value={settings.email_from_name || ""} onChange={(value) => setSetting("email_from_name", value)} />
+            <TextField label="SMTP Host" value={settings.email_smtp_host || ""} onChange={(value) => setSetting("email_smtp_host", value)} />
+            <TextField label="SMTP Port" value={settings.email_smtp_port || "465"} onChange={(value) => setSetting("email_smtp_port", value)} />
+            <SelectField label="SMTP Secure" value={settings.email_smtp_secure || "true"} onChange={(value) => setSetting("email_smtp_secure", value)}>
+              <option value="true">SSL</option>
+              <option value="false">Plain / STARTTLS on 587</option>
+            </SelectField>
+            <TextField label="SMTP User" value={settings.email_smtp_user || ""} onChange={(value) => setSetting("email_smtp_user", value)} />
+            <TextField label="SMTP Password" type="password" value={settings.email_smtp_password || ""} onChange={(value) => setSetting("email_smtp_password", value)} />
+            <TextField label="System Address" value={settings.email_system_address || ""} onChange={(value) => setSetting("email_system_address", value)} />
+          </div>
+          <div className="btn-list">
+            <Button
+              onClick={() => saveSettingsGroup("Email Alerts", [
+                "email_alerts_enabled",
+                "email_alert_to",
+                "email_driver",
+                "email_from_address",
+                "email_from_name",
+                "email_smtp_host",
+                "email_smtp_password",
+                "email_smtp_port",
+                "email_smtp_secure",
+                "email_smtp_user",
+                "email_system_address",
+              ])}
+              disabled={savingServices === "Email Alerts"}
+            >
+              {savingServices === "Email Alerts" ? "Saving..." : "Save Email Alerts"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       <section className="grid gap-5 xl:grid-cols-2">
         <Card>
