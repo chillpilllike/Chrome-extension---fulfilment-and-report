@@ -153,6 +153,8 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_expiry ON order_lines(chrome_claim_expires_at) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(chrome_claim_expires_at, '') != ''",
         # Reporting, accounting, and date windows.
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_date ON order_lines(store_id, odoo_order_date DESC, odoo_order_id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_bulk_duplicate_window ON order_lines(store_id, state, odoo_order_date DESC, asin, odoo_order_name) WHERE COALESCE(asin, '') != '' AND COALESCE(amazon_order_id, '') = ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_bulk_duplicate_window_all_stores ON order_lines(state, odoo_order_date DESC, asin, odoo_order_name) WHERE COALESCE(asin, '') != '' AND COALESCE(amazon_order_id, '') = ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_ordered_at ON order_lines(ordered_at DESC) WHERE COALESCE(amazon_order_id, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_missing_order_date ON order_lines(store_id, id DESC) WHERE COALESCE(odoo_order_date, '') = '' AND COALESCE(raw_json, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_amazon_attempts_line_external_mode ON amazon_attempts(order_line_id, external_id, mode)",
@@ -7662,6 +7664,7 @@ def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page:
     days = normalize_days_window(days)
     rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
     return {
+        "ok": True,
         "stores": rows_to_dicts(list_stores()),
         "current_store_id": store_id,
         "groups": rows,
@@ -7669,6 +7672,7 @@ def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page:
         "per_page": per_page,
         "total": total,
         "days": days,
+        "search_engine": "postgres_indexed",
     }
 
 
@@ -7737,7 +7741,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
 def api_bulk(store_id: Optional[int] = None, days: int = 2, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     days = normalize_days_window(days)
     groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
-    return {"stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days}
+    return {"ok": True, "stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days, "search_engine": "postgres_indexed"}
 
 
 @app.post("/api/bulk/place")

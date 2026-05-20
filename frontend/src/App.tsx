@@ -1487,10 +1487,12 @@ function App() {
   const [bulkPage, setBulkPage] = useState(1)
   const [bulkTotal, setBulkTotal] = useState(0)
   const [bulkDays, setBulkDays] = useState("2")
+  const [activeBulkDays, setActiveBulkDays] = useState(2)
   const [duplicateAsins, setDuplicateAsins] = useState<DuplicateAsin[]>([])
   const [duplicateAsinPage, setDuplicateAsinPage] = useState(1)
   const [duplicateAsinTotal, setDuplicateAsinTotal] = useState(0)
   const [duplicateAsinDays, setDuplicateAsinDays] = useState("2")
+  const [activeDuplicateAsinDays, setActiveDuplicateAsinDays] = useState(2)
   const [costlyRows, setCostlyRows] = useState<OrderLine[]>([])
   const [costlyPage, setCostlyPage] = useState(1)
   const [costlyTotal, setCostlyTotal] = useState(0)
@@ -1594,10 +1596,6 @@ function App() {
     setOrderingEngine(next.default_ordering_engine || "rest")
     if (next.pull_orders_days) setDays(String(next.pull_orders_days))
     if (next.pull_orders_limit !== undefined && next.pull_orders_limit !== null) setLimit(String(next.pull_orders_limit))
-    if (duplicateAsinPage === 1) {
-      setDuplicateAsins(next.duplicate_asins || [])
-      setDuplicateAsinTotal(next.duplicate_asins_total || next.duplicate_asins?.length || 0)
-    }
     setPullStoreIds((current) => {
       const valid = new Set(next.stores.map((store) => String(store.id)))
       const filtered = current.filter((id) => valid.has(id))
@@ -1801,25 +1799,29 @@ function App() {
 
   useEffect(() => {
     if (page !== "bulk") return
-    api<{ groups: BulkGroup[]; total: number }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: bulkDays || "2" })}`)
+    const requestedDays = bulkDays || "2"
+    api<{ groups: BulkGroup[]; total: number; days: number; search_engine?: string }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: requestedDays })}`)
       .then((result) => {
         setBulkGroups(result.groups)
         setBulkTotal(result.total || 0)
+        setActiveBulkDays(result.days || Number(requestedDays) || 2)
       })
       .catch((error) => setModal({ ok: false, title: "Bulk opportunities load failed", message: String(error) }))
   }, [page, storeId, bulkPage, bulkDays])
 
   useEffect(() => {
-    if (page !== "home") return
+    if (page !== "orders") return
     const query = new URLSearchParams()
     if (storeId) query.set("store_id", storeId)
     query.set("page", String(duplicateAsinPage))
     query.set("per_page", String(DUPLICATE_ASIN_PAGE_SIZE))
-    query.set("days", duplicateAsinDays || "2")
-    api<{ groups: DuplicateAsin[]; total: number }>(`/api/duplicate-asins?${query.toString()}`)
+    const requestedDays = duplicateAsinDays || "2"
+    query.set("days", requestedDays)
+    api<{ groups: DuplicateAsin[]; total: number; days: number; search_engine?: string }>(`/api/duplicate-asins?${query.toString()}`)
       .then((result) => {
         setDuplicateAsins(result.groups)
         setDuplicateAsinTotal(result.total || 0)
+        setActiveDuplicateAsinDays(result.days || Number(requestedDays) || 2)
       })
       .catch((error) => setModal({ ok: false, title: "Duplicate ASINs load failed", message: String(error) }))
   }, [page, storeId, duplicateAsinPage, duplicateAsinDays])
@@ -2516,7 +2518,7 @@ function App() {
                   <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
                     <div>
                       <CardTitle>Duplicate ASINs Across Recent Orders</CardTitle>
-                      <CardDescription>Filtered by Odoo order date. 2 days means today plus yesterday.</CardDescription>
+                      <CardDescription>Filtered by Odoo order date. Showing the last {activeDuplicateAsinDays.toLocaleString()} day{activeDuplicateAsinDays === 1 ? "" : "s"}.</CardDescription>
                     </div>
                     <div className="w-full md:w-40">
                       <TextField
@@ -2981,6 +2983,7 @@ function App() {
             page={bulkPage}
             total={bulkTotal}
             days={bulkDays}
+            activeDays={activeBulkDays}
             onDays={setBulkDays}
             onPage={setBulkPage}
             selected={bulkSelected}
@@ -2990,9 +2993,11 @@ function App() {
             onResult={setModal}
             onNavigate={setPage}
             onRefresh={async () => {
-              const result = await api<{ groups: BulkGroup[]; total: number }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: bulkDays || "2" })}`)
+              const requestedDays = bulkDays || "2"
+              const result = await api<{ groups: BulkGroup[]; total: number; days: number }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: requestedDays })}`)
               setBulkGroups(result.groups)
               setBulkTotal(result.total || 0)
+              setActiveBulkDays(result.days || Number(requestedDays) || 2)
               await refresh()
             }}
           />
@@ -4683,6 +4688,7 @@ function BulkPage({
   page,
   total,
   days,
+  activeDays,
   onDays,
   onPage,
   selected,
@@ -4701,6 +4707,7 @@ function BulkPage({
   page: number
   total: number
   days: string
+  activeDays: number
   onDays: (days: string) => void
   onPage: (page: number) => void
   selected: string[]
@@ -4735,7 +4742,7 @@ function BulkPage({
     <div className="grid gap-5">
       <section>
         <h2 className="text-lg font-semibold tracking-tight">Bulk Buying Opportunities</h2>
-        <p className="text-sm text-muted-foreground">Same ASIN demand combined across pulled orders by Odoo order date. 2 days means today plus yesterday.</p>
+        <p className="text-sm text-muted-foreground">Same ASIN demand combined across pulled orders by Odoo order date. Showing the last {activeDays.toLocaleString()} day{activeDays === 1 ? "" : "s"}.</p>
       </section>
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div className="w-full md:w-40">
