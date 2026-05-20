@@ -1258,9 +1258,9 @@ function AdminAccessDialog({
               autoFocus
             />
           </div>
-          <label className="flex items-center gap-2 text-sm">
+          <label className="form-check w-fit cursor-pointer">
             <Checkbox checked={remember} onCheckedChange={(checked) => setRemember(Boolean(checked))} />
-            Save token on this PC
+            <span className="form-check-label">Save token on this PC</span>
           </label>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>Cancel</Button>
@@ -1312,9 +1312,9 @@ function AdminAccessScreen({ onSubmit, error, busy }: { onSubmit: (token: string
                 autoFocus
               />
             </div>
-            <label className="flex items-center gap-2 text-sm">
+            <label className="form-check w-fit cursor-pointer">
               <Checkbox checked={remember} onCheckedChange={(checked) => setRemember(Boolean(checked))} />
-              Save token on this PC
+              <span className="form-check-label">Save token on this PC</span>
             </label>
             <Button type="submit" disabled={!token.trim() || busy}>{busy ? "Checking..." : "Open Admin Panel"}</Button>
           </form>
@@ -1650,7 +1650,7 @@ function App() {
       window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY)
       setAdminTokenSaved(false)
       if (error instanceof AdminAuthError) {
-        setAdminAuthError("That code did not work. Please check it and try again, or use master code 1284.")
+        setAdminAuthError("That code did not work. Please check it and try again.")
         setAdminAccessOpen(Boolean(data))
         return
       }
@@ -1671,7 +1671,7 @@ function App() {
 
   useEffect(() => {
     const listener = () => {
-      setAdminAuthError("Admin code required. Please enter a valid code or master code 1284.")
+      setAdminAuthError("Admin code required. Please enter a valid code.")
       setAdminAccessOpen(true)
     }
     const savedListener = () => setAdminTokenSaved(Boolean(savedAdminToken()))
@@ -6070,7 +6070,7 @@ function SettingsPage({
             <Lock className="size-4 text-muted-foreground" />
             <CardTitle>Admin Access Code</CardTitle>
           </div>
-          <CardDescription>Change the code used for the internal admin panel. The master recovery code is 1284.</CardDescription>
+          <CardDescription>Change the code used for the internal admin panel.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
           <div className="grid gap-3 md:grid-cols-2">
@@ -6078,7 +6078,7 @@ function SettingsPage({
             <TextField label="Confirm Admin Code" type="password" value={adminCodeConfirm} onChange={setAdminCodeConfirm} />
           </div>
           <div className="card-actions btn-list justify-between">
-            <p className="text-sm text-muted-foreground">Use 1284 in the login dialog if the saved admin code is forgotten.</p>
+            <p className="text-sm text-muted-foreground">Use a private recovery code only if the saved admin code is forgotten.</p>
             <Button onClick={saveAdminCode} disabled={!adminCode.trim() || !adminCodeConfirm.trim()}>Save Admin Code</Button>
           </div>
         </CardContent>
