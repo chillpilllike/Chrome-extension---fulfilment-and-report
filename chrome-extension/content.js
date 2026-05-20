@@ -881,11 +881,12 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
   const quantitySet = await setQuantity(quantity, "sns");
   if (!quantitySet) {
     const requestedQuantity = Math.max(1, Math.round(Number(quantity || 1)));
-    const availableQuantity = maxSelectableQuantity("sns");
+    const quantityIssue = window.__nutricityLastQuantityIssue || {};
+    const availableQuantity = quantityIssue.availableQuantity || maxPredefinedQuantity("sns") || maxSelectableQuantity("sns");
     const error = new Error(
       availableQuantity > 0 && availableQuantity < requestedQuantity
-        ? `Less Subscribe & Save quantity available. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.`
-        : `Could not set Subscribe & Save quantity ${requestedQuantity}.`,
+        ? `Less Subscribe & Save quantity available. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}. ${quantityIssue.message || ""}`.trim()
+        : `Could not set Subscribe & Save quantity ${requestedQuantity}. ${quantityIssue.message || ""}`.trim(),
     );
     error.failureCode = "partial_quantity";
     error.requestedQuantity = requestedQuantity;
@@ -989,6 +990,22 @@ function maxSelectableQuantity(context = "regular") {
   return quantities.length ? Math.max(...quantities) : 0;
 }
 
+function maxPredefinedQuantity(context = "regular") {
+  const quantities = [];
+  const selectors = context === "sns"
+    ? ["select[id^='sns'][id*='predefinedQuantitiesDropdown']"]
+    : ["select[id*='new_buyingOption'][id*='predefinedQuantitiesDropdown']", "select[id*='DesktopFfqp'][id*='predefinedQuantitiesDropdown']:not([id^='sns'])"];
+  for (const selector of selectors) {
+    for (const select of document.querySelectorAll(selector)) {
+      for (const option of [...select.options || []]) {
+        const numeric = Number((option.value || option.textContent || "").match(/\d+/)?.[0] || 0);
+        if (numeric > 0) quantities.push(numeric);
+      }
+    }
+  }
+  return quantities.length ? Math.max(...quantities) : 0;
+}
+
 function quantityFreeFormInput(select, context = "regular") {
   const id = select?.id || "";
   const candidates = [];
@@ -1005,6 +1022,75 @@ function quantityFreeFormInput(select, context = "regular") {
     if (input) return input;
   }
   return null;
+}
+
+function quantityUpdateButton(select, context = "regular") {
+  const id = select?.id || "";
+  const candidates = [];
+  if (id.includes("predefinedQuantitiesDropdown")) {
+    candidates.push(`#${CSS.escape(id.replace("predefinedQuantitiesDropdown", "updateButton"))}`);
+  }
+  if (context === "sns") {
+    candidates.push("#snsQuantity_feature_div [id$='-updateButton']", "#snsAccordionRowMiddle [id$='-updateButton']", "#snsAccordionRow [id$='-updateButton']");
+  } else {
+    candidates.push("[id*='new_buyingOption'][id$='-updateButton']", "#qualifiedBuybox [id$='-updateButton']", "#desktop_qualifiedBuyBox [id$='-updateButton']");
+  }
+  for (const selector of candidates) {
+    const button = document.querySelector(`${selector} button, ${selector} input, ${selector}`);
+    if (button && visible(button)) return button;
+  }
+  return null;
+}
+
+async function clickQuantityUpdateButton(select, context = "regular") {
+  const button = await waitUntil(() => quantityUpdateButton(select, context), 2500, 250);
+  if (!button) return false;
+  await clickElement(button, `${context === "sns" ? "Subscribe & Save " : ""}quantity update`);
+  await waitForStableDom(500, 4000);
+  return true;
+}
+
+function quantityAvailabilityIssue(context = "regular", requestedQuantity = 1) {
+  const roots = context === "sns"
+    ? [
+        ...document.querySelectorAll("#snsQuantity_feature_div, #snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, [id^='snsABDesktopFfqp_'][id$='-limitedAvailabilityMessage']"),
+      ]
+    : [
+        ...document.querySelectorAll("#qualifiedBuybox, #desktop_qualifiedBuyBox, #buybox, #centerCol, #splitoffer_detailpage_buybox_section, [id*='DesktopFfqp_'][id$='-limitedAvailabilityMessage']:not([id^='sns'])"),
+      ];
+  const text = roots
+    .map((root) => (root.innerText || root.textContent || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const lowered = text.toLowerCase();
+  const hasIssue = (
+    lowered.includes("limited availability at this quantity") ||
+    lowered.includes("quantity unavailable from a single seller") ||
+    lowered.includes("limited availability") ||
+    lowered.includes("not enough inventory") ||
+    lowered.includes("not enough available") ||
+    lowered.includes("maximum quantity") ||
+    lowered.includes("seller does not have") ||
+    lowered.includes("seller doesn't have") ||
+    lowered.includes("only") && lowered.includes("available")
+  );
+  const splitOffer = context !== "sns" && document.querySelector("#splitoffer_detailpage_buybox_link[href*='quantity=']");
+  if (!hasIssue && !splitOffer) return null;
+
+  const requested = Math.max(1, Math.round(Number(requestedQuantity || 1)));
+  const textQuantity =
+    Number(lowered.match(/only\s+(\d+)\s+(?:left|available|in stock)/)?.[1] || 0) ||
+    Number(lowered.match(/maximum(?: order)? quantity(?: is)?\s+(\d+)/)?.[1] || 0);
+  const predefinedQuantity = maxPredefinedQuantity(context);
+  const availableQuantity = textQuantity || (predefinedQuantity > 0 && predefinedQuantity < requested ? predefinedQuantity : 0);
+  return {
+    message: text || (context === "sns" ? "Limited availability at this Subscribe & Save quantity." : "Quantity unavailable from a single seller."),
+    requestedQuantity: requested,
+    availableQuantity: availableQuantity || null,
+    fulfilledQuantity: availableQuantity || null,
+  };
 }
 
 async function chooseAmazonDropdownOption(select, qty) {
@@ -1059,6 +1145,7 @@ async function setFreeFormQuantity(select, qty, context = "regular") {
 async function setQuantity(quantity, context = "regular") {
   await waitForElement(["select#quantity", "select[name='quantity']", "select[id*='predefinedQuantitiesDropdown']", "#add-to-cart-button", "#rcx-subscribe-submit-button"], 12000);
   const qty = Math.max(1, Math.round(Number(quantity) || 1));
+  window.__nutricityLastQuantityIssue = null;
   if (qty === 1) return true;
 
   const selects = quantitySelects(context);
@@ -1068,8 +1155,17 @@ async function setQuantity(quantity, context = "regular") {
     const selected = clicked || await setNativeSelectQuantity(select, qty);
     if (!selected) continue;
     const freeFormSet = await setFreeFormQuantity(select, qty, context);
+    if (freeFormSet) await clickQuantityUpdateButton(select, context);
+    await sleep(900);
+    const issue = quantityAvailabilityIssue(context, qty);
+    if (issue) {
+      window.__nutricityLastQuantityIssue = issue;
+      return false;
+    }
     if (qty <= 9 || freeFormSet) return true;
   }
+  const issue = quantityAvailabilityIssue(context, qty);
+  if (issue) window.__nutricityLastQuantityIssue = issue;
   return false;
 }
 
@@ -1196,19 +1292,21 @@ async function handleProduct(activeJob) {
     const quantitySet = await setQuantity(purchaseItem.quantity, "regular");
     if (!quantitySet) {
       const requestedQuantity = Math.max(1, Math.round(Number(purchaseItem.quantity || 1)));
-      const availableQuantity = maxSelectableQuantity("regular");
+      const quantityIssue = window.__nutricityLastQuantityIssue || {};
+      const availableQuantity = quantityIssue.availableQuantity || maxPredefinedQuantity("regular") || maxSelectableQuantity("regular");
       const lessQuantity = availableQuantity > 0 && availableQuantity < requestedQuantity;
+      const issueMessage = quantityIssue.message ? ` ${quantityIssue.message}` : "";
       await send({
         type: "FAIL_JOB",
         message: lessQuantity
-          ? `Less quantity available for ASIN ${purchaseItem.asin}. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.`
-          : `ASIN ${purchaseItem.asin} is missing or unavailable. Could not set quantity ${purchaseItem.quantity || 1}.`,
+          ? `Less quantity available for ASIN ${purchaseItem.asin}. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.${issueMessage}`
+          : `ASIN ${purchaseItem.asin} is missing or unavailable. Could not set quantity ${purchaseItem.quantity || 1}.${issueMessage}`,
         missingAsin: item.asin,
         missingLineId: itemPrimaryLineId(item),
-        failureCode: lessQuantity ? "partial_quantity" : "",
+        failureCode: "partial_quantity",
         requestedQuantity,
-        fulfilledQuantity: lessQuantity ? availableQuantity : null,
-        availableQuantity: lessQuantity ? availableQuantity : null,
+        fulfilledQuantity: availableQuantity || null,
+        availableQuantity: availableQuantity || null,
       });
       showPanel("Nutricity fulfilment", lessQuantity ? "Less quantity available. Order moved to Missing ASINs." : "Could not set item quantity. Order moved to Missing ASINs.", null, null);
       return;
