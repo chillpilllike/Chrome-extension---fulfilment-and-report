@@ -14,31 +14,26 @@ FIREFOX_BUILDS = [
     {
         "source": "chrome-extension",
         "target": "fulfilment",
-        "name_suffix": "Firefox",
         "gecko_id": "fulfilment@nutricity.local",
     },
     {
         "source": "tracking-extension",
         "target": "tracking",
-        "name_suffix": "Firefox",
         "gecko_id": "tracking@nutricity.local",
     },
     {
         "source": "manual-order-match-extension",
         "target": "manual-order-match",
-        "name_suffix": "Firefox",
         "gecko_id": "manual-order-match@nutricity.local",
     },
     {
         "source": "amazon-invoice-extension",
         "target": "amazon-invoice",
-        "name_suffix": "Firefox",
         "gecko_id": "amazon-invoice@nutricity.local",
     },
     {
         "source": "epost-extension",
         "target": "epost",
-        "name_suffix": "Firefox",
         "gecko_id": "epost@nutricity.local",
     },
 ]
@@ -61,10 +56,7 @@ def copy_source(source: Path, target: Path) -> None:
 
 def patch_manifest(manifest_path: Path, build: dict[str, str]) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    name_suffix = build["name_suffix"]
-    if name_suffix not in manifest["name"]:
-        manifest["name"] = f"{manifest['name']} ({name_suffix})"
-    manifest["description"] = manifest.get("description", "").replace("Chrome-based", "Firefox-compatible browser-based")
+    manifest["description"] = manifest.get("description", "").replace("Chrome-based", "browser-based")
     manifest["background"] = {"scripts": ["background.js"]}
     manifest["browser_specific_settings"] = {
         "gecko": {

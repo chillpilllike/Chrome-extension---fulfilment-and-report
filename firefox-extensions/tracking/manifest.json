@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Nutricity Amazon Tracking (Firefox)",
+  "name": "Nutricity Amazon Tracking",
   "description": "Tracks Amazon package progress for Nutricity orders and reports carrier/tracking updates to the local app.",
   "version": "0.1.0",
   "icons": {

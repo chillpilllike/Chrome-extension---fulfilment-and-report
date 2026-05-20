@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Nutricity Amazon Fulfilment Engine (Firefox)",
-  "description": "Queues Firefox-compatible browser-based Amazon fulfilment jobs from the local Nutricity control panel.",
+  "name": "Nutricity Amazon Fulfilment Engine",
+  "description": "Queues browser-based Amazon fulfilment jobs from the local Nutricity control panel.",
   "version": "0.1.0",
   "icons": {
     "16": "icons/icon-16.png",

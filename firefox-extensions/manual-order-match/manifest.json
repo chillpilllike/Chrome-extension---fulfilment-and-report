@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Nutricity Manual Amazon Matcher (Firefox)",
+  "name": "Nutricity Manual Amazon Matcher",
   "description": "Scans old Amazon manual orders and links Nutricity NC order references back to the local app.",
   "version": "0.1.0",
   "icons": {

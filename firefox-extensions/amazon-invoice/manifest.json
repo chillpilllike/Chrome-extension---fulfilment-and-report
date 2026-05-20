@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Nutricity Amazon Invoice Uploader (Firefox)",
+  "name": "Nutricity Amazon Invoice Uploader",
   "description": "Downloads Amazon printable invoice PDFs, renames them by Odoo order, and uploads them to the fulfilment app.",
   "version": "0.1.0",
   "icons": {
