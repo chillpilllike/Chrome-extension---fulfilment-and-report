@@ -4339,10 +4339,10 @@ def persist_chrome_order_groups(
             ],
         }
         payload_json = json.dumps(attempt_payload)
+        attempts.append((group_lines[0]["id"], group_key, payload_json, now))
         for line in group_lines:
             updates.append((line["id"], group_key))
             queued_line_ids.append(int(line["id"]))
-            attempts.append((line["id"], group_key, payload_json, now))
             if len(details) < 8:
                 details.append(f"{line['odoo_order_name']} {line['asin']}: queued for Chrome extension ordering")
     for batch in chunked(updates, 2000):
@@ -9722,7 +9722,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                 """
                 UPDATE amazon_attempts
                 SET response_json=?, status='ok', error=NULL
-                WHERE order_line_id=? AND external_id=? AND mode='chrome'
+                WHERE external_id=? AND mode='chrome'
                 """,
                 (
                     json.dumps(
@@ -9737,7 +9737,6 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                             "amazon_account_name": chrome_account_name,
                         }
                     ),
-                    row["id"],
                     group_key,
                 ),
             )
