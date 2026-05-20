@@ -12,6 +12,7 @@ const DEFAULT_NEW_DELIVERY_ADDRESS = {
 };
 
 let extensionContextAlive = true;
+let panelOrderStatusVersion = 0;
 
 async function send(message) {
   if (!extensionContextAlive) return null;
@@ -102,12 +103,43 @@ async function waitForElement(selectors, timeoutMs = 18000) {
   return null;
 }
 
+function activeJobOrderLabel(activeJob) {
+  const names = Array.isArray(activeJob?.job?.order_names)
+    ? activeJob.job.order_names.map((name) => String(name || "").trim()).filter(Boolean)
+    : [];
+  if (names.length) return names.join(", ");
+  const recipient = String(activeJob?.job?.recipient_name || "").replace(/\s+/g, " ").trim();
+  if (recipient) return recipient;
+  return String(activeJob?.job?.group_key || "").replace(/\s+/g, " ").trim();
+}
+
+async function updatePanelOrderStatus(panel = document.querySelector("#nutricity-panel")) {
+  if (!panel) return;
+  const version = ++panelOrderStatusVersion;
+  const orderNode = panel.querySelector(".nutricity-panel-order");
+  const orderText = panel.querySelector(".nutricity-panel-order-text");
+  const statusText = panel.querySelector(".nutricity-panel-order-status");
+  if (!orderNode || !orderText || !statusText) return;
+  const activeJob = await getActiveJob();
+  if (version !== panelOrderStatusVersion) return;
+  const label = activeJobOrderLabel(activeJob);
+  if (!activeJob?.job || !label) {
+    orderNode.hidden = true;
+    orderText.textContent = "";
+    statusText.textContent = "";
+    return;
+  }
+  orderNode.hidden = false;
+  orderText.textContent = label;
+  statusText.textContent = activeJob.paused ? "Paused" : "In progress";
+}
+
 function showPanel(title, message, actionText, action) {
   let panel = document.querySelector("#nutricity-panel");
   if (!panel) {
     panel = document.createElement("div");
     panel.id = "nutricity-panel";
-    panel.innerHTML = `<div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div>`;
+    panel.innerHTML = `<div class="nutricity-panel-order" hidden><span class="nutricity-panel-order-label">Order being processed</span><span class="nutricity-panel-order-status"></span><div class="nutricity-panel-order-text"></div></div><div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div>`;
     panel.querySelector(".nutricity-pause-toggle").addEventListener("click", togglePanelPause);
     document.documentElement.append(panel);
   }
@@ -115,6 +147,7 @@ function showPanel(title, message, actionText, action) {
   panel.querySelector(".nutricity-panel-message").textContent = message;
   panel.querySelector(".nutricity-panel-action")?.remove();
   updatePanelPauseButton(panel);
+  updatePanelOrderStatus(panel);
   if (actionText && action) {
     const button = document.createElement("button");
     button.className = "nutricity-panel-action";
