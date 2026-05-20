@@ -5832,7 +5832,8 @@ function ChromeQueuePage({
   onRefresh: () => Promise<void>
 }) {
   const [loading, setLoading] = useState(false)
-  const lockedCount = rows.filter((row) => row.claimed_by).length
+  const lockedRows = rows.filter((row) => row.claimed_by)
+  const lockedCount = lockedRows.length
   const submittedCount = counts.find((item) => item.state === "submitted")?.count || rows.length
 
   async function releaseLock(groupKey: string) {
@@ -5860,7 +5861,7 @@ function ChromeQueuePage({
       <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
           <CardTitle>Chrome Jobs Queue</CardTitle>
-          <CardDescription>Submitted Chrome extension jobs waiting to be fulfilled, including stale locks you can release.</CardDescription>
+          <CardDescription>Locked Chrome extension jobs that may need a manual release.</CardDescription>
         </div>
         <div className="btn-list">
           <Badge variant={lockedCount ? "destructive" : "outline"}>{lockedCount.toLocaleString()} locked</Badge>
@@ -5885,7 +5886,7 @@ function ChromeQueuePage({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.map((job) => (
+            {lockedRows.map((job) => (
               <TableRow key={job.group_key}>
                 <TableCell className="font-mono text-xs">{job.group_key}</TableCell>
                 <TableCell className="max-w-[220px]">
@@ -5925,10 +5926,10 @@ function ChromeQueuePage({
                 </TableCell>
               </TableRow>
             ))}
-            {!rows.length && (
+            {!lockedRows.length && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">
-                  No Chrome jobs waiting.
+                  No locked Chrome jobs.
                 </TableCell>
               </TableRow>
             )}
