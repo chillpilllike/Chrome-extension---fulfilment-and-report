@@ -4555,6 +4555,93 @@ def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Op
     return expanded_ids or selected_ids
 
 
+def block_selected_orders_with_existing_amazon_orders(conn: Any, store_id: int, line_ids: Optional[list[int]]) -> tuple[Optional[list[int]], int]:
+    if not line_ids:
+        return line_ids, 0
+    selected_ids = sorted({int(line_id) for line_id in line_ids if int(line_id or 0) > 0})
+    if not selected_ids:
+        return [], 0
+    placeholders = ",".join("?" for _ in selected_ids)
+    selected_orders = conn.execute(
+        f"""
+        SELECT DISTINCT odoo_order_id
+        FROM order_lines
+        WHERE store_id=?
+          AND id IN ({placeholders})
+        """,
+        [store_id, *selected_ids],
+    ).fetchall()
+    order_ids = sorted({int(row["odoo_order_id"]) for row in selected_orders})
+    if not order_ids:
+        return selected_ids, 0
+    order_placeholders = ",".join("?" for _ in order_ids)
+    blocked_rows = conn.execute(
+        f"""
+        SELECT odoo_order_id, odoo_order_name, amazon_order_id
+        FROM order_lines
+        WHERE store_id=?
+          AND odoo_order_id IN ({order_placeholders})
+          AND COALESCE(amazon_order_id, '') != ''
+        ORDER BY odoo_order_name, amazon_order_id
+        """,
+        [store_id, *order_ids],
+    ).fetchall()
+    blocked: dict[int, dict[str, Any]] = {}
+    for row in blocked_rows:
+        order_id = int(row["odoo_order_id"])
+        entry = blocked.setdefault(order_id, {"name": row["odoo_order_name"], "orders": []})
+        amazon_order_id = clean_text(row["amazon_order_id"])
+        if amazon_order_id and amazon_order_id not in entry["orders"]:
+            entry["orders"].append(amazon_order_id)
+    if not blocked:
+        return selected_ids, 0
+
+    now = utc_now()
+    blocked_ids = sorted(blocked)
+    blocked_placeholders = ",".join("?" for _ in blocked_ids)
+    for order_id, entry in blocked.items():
+        amazon_orders = ", ".join(entry["orders"]) or "an existing Amazon order"
+        message = (
+            f"{entry['name']} already has Amazon order {amazon_orders}. "
+            "Reset fulfilment before sending again to avoid a duplicate Amazon order."
+        )
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET state=CASE WHEN COALESCE(amazon_order_id, '') = '' THEN 'error' ELSE state END,
+                last_error=?,
+                updated_at=?
+            WHERE store_id=?
+              AND odoo_order_id=?
+            """,
+            (message, now, store_id, order_id),
+        )
+    updated_rows = conn.execute(
+        f"""
+        SELECT *
+        FROM order_lines
+        WHERE store_id=?
+          AND odoo_order_id IN ({blocked_placeholders})
+        """,
+        [store_id, *blocked_ids],
+    ).fetchall()
+    for row in updated_rows:
+        index_order_line(row)
+
+    allowed_ids = conn.execute(
+        f"""
+        SELECT id
+        FROM order_lines
+        WHERE store_id=?
+          AND id IN ({placeholders})
+          AND odoo_order_id NOT IN ({blocked_placeholders})
+        ORDER BY id
+        """,
+        [store_id, *selected_ids, *blocked_ids],
+    ).fetchall()
+    return [int(row["id"]) for row in allowed_ids], len(blocked)
+
+
 def chunked(items: list[Any], size: int) -> list[list[Any]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
 
@@ -4665,7 +4752,7 @@ def queue_chrome_order_groups_fast(
     address_id: Optional[int] = None,
     line_ids: Optional[list[int]] = None,
     club: bool = False,
-) -> tuple[int, int, dict[str, Any], list[str]]:
+) -> tuple[int, int, int, dict[str, Any], list[str]]:
     with db() as conn:
         cleared_cursor = conn.execute(
             """
@@ -4703,8 +4790,9 @@ def queue_chrome_order_groups_fast(
             raise HTTPException(400, "Add a fulfilment address before placing Amazon orders.")
 
         line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
+        line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
         if line_ids is not None and not line_ids:
-            return 0, int(cleared_cursor.rowcount or 0), account, []
+            return 0, int(cleared_cursor.rowcount or 0), blocked, account, []
         if line_ids:
             placeholders = ",".join("?" for _ in line_ids)
             conn.execute(
@@ -4750,8 +4838,14 @@ def queue_chrome_order_groups_fast(
             """,
             params,
         ).fetchall()
+        if lines:
+            allowed_ids, candidate_blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, [int(line["id"]) for line in lines])
+            blocked += candidate_blocked
+            if candidate_blocked:
+                allowed_set = set(allowed_ids or [])
+                lines = [line for line in lines if int(line["id"]) in allowed_set]
         if not lines:
-            return 0, int(cleared_cursor.rowcount or 0), account, []
+            return 0, int(cleared_cursor.rowcount or 0), blocked, account, []
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         if club:
@@ -4761,7 +4855,7 @@ def queue_chrome_order_groups_fast(
                 grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
 
         queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
-        return queued, int(cleared_cursor.rowcount or 0), account, details
+        return queued, int(cleared_cursor.rowcount or 0), blocked, account, details
 
 
 def queue_chrome_order_groups_fast_task(
@@ -5204,6 +5298,10 @@ def place_orders(
     with db() as conn:
         if ordering_engine == "chrome":
             line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
+        line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
+        failed += blocked
+        if line_ids is not None and not line_ids:
+            return placed, failed
         where_line_ids = ""
         params: list[Any] = [store_id]
         if line_ids:
@@ -5223,6 +5321,12 @@ def place_orders(
             """,
             params,
         ).fetchall()
+        if lines:
+            allowed_ids, candidate_blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, [int(line["id"]) for line in lines])
+            failed += candidate_blocked
+            if candidate_blocked:
+                allowed_set = set(allowed_ids or [])
+                lines = [line for line in lines if int(line["id"]) in allowed_set]
     inventory_lines: list[dict[str, Any]] = []
     purchase_lines: list[dict[str, Any]] = []
     for line in lines:
@@ -9558,7 +9662,7 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
     ordering_engine = normalize_ordering_engine(payload.ordering_engine or get_default_ordering_engine())
     if ordering_engine == "chrome":
         selected_count = len(payload.line_ids or [])
-        queued, cleared, account, details = queue_chrome_order_groups_fast(
+        queued, cleared, skipped, account, details = queue_chrome_order_groups_fast(
             payload.store_id,
             payload.amazon_account_id,
             payload.address_id,
@@ -9572,8 +9676,13 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
         )
         if cleared:
             message += f" Cleared {cleared} dry-run marker{'s' if cleared != 1 else ''}."
+        if skipped:
+            message += f" Skipped {skipped} order{'s' if skipped != 1 else ''} that already had an Amazon order assigned; reset fulfilment before resending."
+        skip_details = selected_line_reasons(payload.store_id, payload.line_ids) if payload.line_ids else []
+        if skip_details:
+            message += " Reason: " + " | ".join(skip_details)
         return {
-            "ok": True,
+            "ok": queued > 0,
             "message": message,
             "defer_refresh": False,
             "queued": queued,

@@ -795,19 +795,6 @@ function lineIdForAsin(activeJob, asin) {
   return originalItem ? itemPrimaryLineId(originalItem) : null;
 }
 
-function cartAlreadyHasExpectedItems(activeJob) {
-  const expected = expectedCartQuantities(activeJob);
-  if (!Object.keys(expected).length) return false;
-  const actual = {};
-  for (const item of cartActiveItems()) {
-    const asin = cartItemAsin(item);
-    if (asin && expected[asin]) {
-      actual[asin] = (actual[asin] || 0) + cartItemQuantity(item);
-    }
-  }
-  return Object.entries(expected).some(([asin, quantity]) => Number(actual[asin] || 0) >= Number(quantity));
-}
-
 function promotionNodes() {
   const roots = [
     ...document.querySelectorAll(
@@ -1446,11 +1433,11 @@ async function navigateToNext(activeJob) {
 }
 
 async function handleClearCart(activeJob) {
-  if (!canClearCart(activeJob) || cartAlreadyHasExpectedItems(activeJob)) {
+  if (!canClearCart(activeJob)) {
     activeJob.stage = "cart";
     activeJob.cartCleared = true;
     await setActiveJob(activeJob);
-    showPanel("Nutricity fulfilment", "Cart already prepared for this order. Skipping cart clear.", null, null);
+    showPanel("Nutricity fulfilment", "Cart clear is no longer safe at this stage. Continuing with cart check.", null, null);
     return;
   }
   await waitForElement(["#sc-active-cart", "input[name='proceedToRetailCheckout']", "#sc-buy-box-ptc-button input"], 15000);
