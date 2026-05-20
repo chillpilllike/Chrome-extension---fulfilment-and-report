@@ -978,7 +978,7 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     throw error;
   }
   await configureSubscribeAndSaveDelivery();
-  const subscribeButton = document.querySelector("#rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input") || findButtonByText(["subscribe"]);
+  const subscribeButton = document.querySelector("#rcx-subscribe-submit-button-announce, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input, button[value='snsText']") || findButtonByText(["subscribe"]);
   if (subscribeButton) {
     if (activeJob) {
       activeJob.stage = "subscribe_checkout";
@@ -1023,15 +1023,22 @@ async function chooseSubscribeSoonerDelivery() {
 }
 
 async function chooseSubscribeFrequencySixMonths() {
-  const frequencyButton = findVisibleTextTarget(["delivery every", "month", "weeks"], "#snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRow [data-action='a-dropdown-button'], #snsAccordionRowContent [data-action='a-dropdown-button'], #reinvent_price_desktop_snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRowMiddle .a-button-dropdown, #snsAccordionRow .a-button-dropdown, #snsAccordionRowContent .a-button-dropdown");
-  const fallbackButton = document.querySelector("#snsAccordionRowMiddle [id$='-announce'], #snsAccordionRow [id$='-announce'], #snsAccordionRowContent [id$='-announce']");
-  const dropdownButton = frequencyButton || fallbackButton?.closest?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button");
+  const nativeFrequency = [...document.querySelectorAll("#snsAccordionRowMiddle select, #snsAccordionRow select, #snsAccordionRowContent select, #reinvent_price_desktop_snsAccordionRowMiddle select")]
+    .find((select) => [...select.options || []].some((option) => /6\s*months/i.test(option.textContent || "") || String(option.value || "").includes("6M|sns")));
+  const nativeContainerButton = nativeFrequency?.closest?.(".a-dropdown-container")?.querySelector?.(".a-button-dropdown, [data-action='a-dropdown-button']");
+  const explicitButton = document.querySelector("#rcxOrdFreqSns, #rcxOrdFreqSns-announce")?.closest?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button");
+  const frequencyButton = findVisibleTextTarget(["deliver every", "delivery every"], "#snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRow [data-action='a-dropdown-button'], #snsAccordionRowContent [data-action='a-dropdown-button'], #reinvent_price_desktop_snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRowMiddle .a-button-dropdown, #snsAccordionRow .a-button-dropdown, #snsAccordionRowContent .a-button-dropdown");
+  const dropdownButton = explicitButton || nativeContainerButton || frequencyButton;
   if (!dropdownButton || !visible(dropdownButton)) return false;
   await clickElement(dropdownButton, "Subscribe & Save delivery schedule dropdown");
   const sixMonths = await waitUntil(() => (
-    [...document.querySelectorAll(".a-popover-wrapper a.a-dropdown-link, .a-popover-inner a.a-dropdown-link, a[role='option']")]
+    [...document.querySelectorAll("#rcxOrdFreqSns_10, .a-popover-wrapper a.a-dropdown-link, .a-popover-inner a.a-dropdown-link, a[role='option']")]
       .filter(visible)
-      .find((link) => (link.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() === "6 months")
+      .find((link) => {
+        const text = (link.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+        const value = link.getAttribute("data-value") || "";
+        return text === "6 months" || value.includes("6M|sns");
+      })
   ), 5000);
   if (!sixMonths) return false;
   await clickElement(sixMonths, "Subscribe & Save 6 months schedule");
