@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from calendar import monthrange
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 from xml.sax.saxutils import escape as xml_escape
 
 import requests
@@ -437,6 +437,9 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 days INTEGER NOT NULL DEFAULT 7,
                 limit_value INTEGER NOT NULL DEFAULT 50,
+                batch_size INTEGER NOT NULL DEFAULT 50,
+                total_orders INTEGER NOT NULL DEFAULT 0,
+                processed_orders INTEGER NOT NULL DEFAULT 0,
                 inserted_records INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 created_at TEXT NOT NULL,
@@ -731,8 +734,26 @@ def init_db() -> None:
             existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(order_lines)").fetchall()}
             if column not in existing_cols:
                 conn.execute(ddl)
+        for column, ddl in {
+            "batch_size": "ALTER TABLE pull_jobs ADD COLUMN batch_size INTEGER NOT NULL DEFAULT 50",
+            "total_orders": "ALTER TABLE pull_jobs ADD COLUMN total_orders INTEGER NOT NULL DEFAULT 0",
+            "processed_orders": "ALTER TABLE pull_jobs ADD COLUMN processed_orders INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(pull_jobs)").fetchall()}
+            if column not in existing_cols:
+                conn.execute(ddl)
         ensure_performance_indexes(conn)
         conn.execute("UPDATE order_lines SET pulled_at = COALESCE(NULLIF(pulled_at, ''), created_at)")
+        conn.execute(
+            r"""
+            UPDATE order_lines
+            SET odoo_order_date = raw_json::jsonb -> 'order' ->> 'date_order'
+            WHERE COALESCE(odoo_order_date, '') = ''
+              AND COALESCE(raw_json, '') != ''
+              AND raw_json ~ '^\s*\{'
+              AND COALESCE(raw_json::jsonb -> 'order' ->> 'date_order', '') != ''
+            """
+        )
         conn.execute(
             """
             UPDATE order_lines
@@ -917,10 +938,12 @@ class OdooClient:
             kwargs or {},
         )
 
-    def search_read(self, model: str, domain: list[Any], fields: list[str], limit: int = 0, order: str = "") -> list[dict[str, Any]]:
+    def search_read(self, model: str, domain: list[Any], fields: list[str], limit: int = 0, order: str = "", offset: int = 0) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {"fields": fields}
         if limit:
             kwargs["limit"] = limit
+        if offset:
+            kwargs["offset"] = offset
         if order:
             kwargs["order"] = order
         return self.execute(model, "search_read", [domain], kwargs)
@@ -1537,21 +1560,53 @@ def list_costly_order_lines(store_id: Optional[int] = None, page: int = 1, per_p
     return rows, total
 
 
+def normalize_days_window(days: int, default: int = 2) -> int:
+    try:
+        value = int(days)
+    except Exception:
+        value = default
+    return max(1, min(value, 365))
+
+
+def normalize_pull_limit(limit: Any, default: int = 0) -> int:
+    try:
+        value = int(limit)
+    except Exception:
+        value = default
+    return max(0, min(value, 50000))
+
+
+def stored_pull_limit() -> int:
+    return normalize_pull_limit(get_setting("pull_orders_limit", "0"), 0)
+
+
+def stored_pull_batch_size() -> int:
+    return normalize_pull_batch_size(get_service_settings().get("pull_orders_batch_size", "50"))
+
+
+def order_date_window_sql() -> str:
+    return """
+      AND COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at)::timestamp::date
+          >= (CURRENT_DATE - ((?::int - 1) * INTERVAL '1 day'))::date
+    """
+
+
 def bulk_opportunity_groups(store_id: Optional[int] = None, days: int = 2) -> list[dict[str, Any]]:
+    days = normalize_days_window(days)
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM order_lines
             WHERE (? IS NULL OR store_id=?)
               AND COALESCE(asin, '') != ''
               AND COALESCE(amazon_order_id, '') = ''
               AND state='pulled'
-              AND datetime(COALESCE(pulled_at, created_at)) >= datetime('now', ?)
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+              {order_date_window_sql()}
             ORDER BY asin, odoo_order_name
             """,
-            (store_id, store_id, f"-{int(days)} days"),
+            (store_id, store_id, days),
         ).fetchall()
         missing_order_ids = {
             int(row["odoo_order_id"])
@@ -1587,11 +1642,12 @@ def bulk_opportunity_groups(store_id: Optional[int] = None, days: int = 2) -> li
     return sorted(opportunities, key=lambda item: (-float(item["quantity"]), item["asin"]))
 
 
-def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
+def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, days: int = 2) -> tuple[list[dict[str, Any]], int, int, int]:
+    days = normalize_days_window(days)
     page, per_page, offset = pagination_bounds(page, per_page)
     with db() as conn:
         total_row = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count
             FROM (
                 SELECT asin
@@ -1601,14 +1657,15 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
                   AND COALESCE(amazon_order_id, '') = ''
                   AND state = 'pulled'
                   AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                  {order_date_window_sql()}
                 GROUP BY asin
                 HAVING COUNT(DISTINCT odoo_order_name) > 1
             ) AS duplicate_groups
             """,
-            (store_id, store_id),
+            (store_id, store_id, days),
         ).fetchone()
         rows = conn.execute(
-            """
+            f"""
             SELECT asin,
                    COUNT(*) AS line_count,
                    COUNT(DISTINCT odoo_order_name) AS order_count,
@@ -1620,12 +1677,13 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
               AND COALESCE(amazon_order_id, '') = ''
               AND state = 'pulled'
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+              {order_date_window_sql()}
             GROUP BY asin
             HAVING COUNT(DISTINCT odoo_order_name) > 1
             ORDER BY order_count DESC, total_quantity DESC, asin
             LIMIT ? OFFSET ?
             """,
-            (store_id, store_id, per_page, offset),
+            (store_id, store_id, days, per_page, offset),
         ).fetchall()
     return rows_to_dicts(rows), int(total_row["count"] or 0), page, per_page
 
@@ -2334,27 +2392,18 @@ def ensure_inventory_for_line(row: Union[dict[str, Any], dict[str, Any]]) -> Non
         )
 
 
-def fetch_odoo_lines(store: Store, days: int, limit: int) -> int:
-    odoo = OdooClient(store)
-    domain: list[Any] = [("state", "in", ["sale", "done", "cancel"])]
-    if store.website_id:
-        domain.append(("website_id", "=", store.website_id))
-    if days > 0:
-        from datetime import timedelta
-
-        cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
-        domain.append(("date_order", ">=", cutoff.strftime("%Y-%m-%d %H:%M:%S")))
-    orders = odoo.search_read(
-        "sale.order",
-        domain,
-        odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "currency_id", "date_order"]),
-        limit=limit,
-        order="date_order desc",
-    )
-    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
-    product_fields = odoo.existing_fields("product.product", ["id", "product_tmpl_id", "default_code", "detailed_type", "type"])
-    tmpl_fields = odoo.existing_fields("product.template", ["id", "description", "default_code", "detailed_type", "type"])
-    invoice_fields = odoo.existing_fields("account.move", ["id", "move_type", "state", "payment_state", "amount_total_signed"])
+def process_odoo_order_batch(
+    store: Store,
+    odoo: OdooClient,
+    orders: list[dict[str, Any]],
+    line_fields: list[str],
+    product_fields: list[str],
+    tmpl_fields: list[str],
+    invoice_fields: list[str],
+    service_settings: dict[str, str],
+) -> int:
+    if not orders:
+        return 0
     all_line_ids = sorted({int(line_id) for order in orders for line_id in (order.get("order_line") or [])})
     all_invoice_ids = sorted({int(invoice_id) for order in orders for invoice_id in (order.get("invoice_ids") or [])})
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -2372,7 +2421,6 @@ def fetch_odoo_lines(store: Store, days: int, limit: int) -> int:
     count = 0
     pending_saves: list[tuple[dict[str, Any], dict[str, Any], str]] = []
     all_invalid_line_ids: set[int] = set()
-    service_settings = get_service_settings()
     with db() as conn:
         for order in orders:
             currency = order_currency_code(order)
@@ -2511,6 +2559,75 @@ def fetch_odoo_lines(store: Store, days: int, limit: int) -> int:
                 count += 1
     return count
 
+
+
+def normalize_pull_batch_size(value: Any) -> int:
+    try:
+        batch_size = int(value)
+    except Exception:
+        batch_size = 50
+    return max(1, min(batch_size, 500))
+
+
+def fetch_odoo_lines(
+    store: Store,
+    days: int,
+    limit: int,
+    batch_size: int = 50,
+    progress: Optional[Callable[[int, int, int], None]] = None,
+) -> int:
+    odoo = OdooClient(store)
+    domain: list[Any] = [("state", "in", ["sale", "done", "cancel"])]
+    if store.website_id:
+        domain.append(("website_id", "=", store.website_id))
+    if days > 0:
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+        domain.append(("date_order", ">=", cutoff.strftime("%Y-%m-%d %H:%M:%S")))
+
+    order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "currency_id", "date_order"])
+    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
+    product_fields = odoo.existing_fields("product.product", ["id", "product_tmpl_id", "default_code", "detailed_type", "type"])
+    tmpl_fields = odoo.existing_fields("product.template", ["id", "description", "default_code", "detailed_type", "type"])
+    invoice_fields = odoo.existing_fields("account.move", ["id", "move_type", "state", "payment_state", "amount_total_signed"])
+    service_settings = get_service_settings()
+    batch_size = normalize_pull_batch_size(batch_size)
+    limit = normalize_pull_limit(limit, 0)
+    total_available = int(odoo.execute("sale.order", "search_count", [domain]) or 0)
+    target_total = min(total_available, limit) if limit else total_available
+    processed_orders = 0
+    inserted_records = 0
+    offset = 0
+    if progress:
+        progress(processed_orders, target_total, inserted_records)
+    while processed_orders < target_total:
+        current_limit = min(batch_size, target_total - processed_orders)
+        orders = odoo.search_read(
+            "sale.order",
+            domain,
+            order_fields,
+            limit=current_limit,
+            offset=offset,
+            order="date_order desc, id desc",
+        )
+        if not orders:
+            break
+        inserted_records += process_odoo_order_batch(
+            store,
+            odoo,
+            orders,
+            line_fields,
+            product_fields,
+            tmpl_fields,
+            invoice_fields,
+            service_settings,
+        )
+        processed_orders += len(orders)
+        offset += len(orders)
+        if progress:
+            progress(processed_orders, target_total, inserted_records)
+    return inserted_records
 
 def existing_amazon_order_in_odoo(store: Store, order_id: int) -> str:
     try:
@@ -7217,7 +7334,8 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
         "duplicate_asins_total": int(payload.get("duplicate_asins_total") or 0),
         "default_ordering_engine": normalize_ordering_engine(str(payload.get("default_ordering_engine") or "rest")),
         "pull_orders_days": int(get_setting("pull_orders_days", "7") or 7),
-        "pull_orders_limit": int(get_setting("pull_orders_limit", "50") or 50),
+        "pull_orders_limit": stored_pull_limit(),
+        "pull_orders_batch_size": stored_pull_batch_size(),
     }
 
 
@@ -7540,8 +7658,9 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
 
 
 @app.get("/api/duplicate-asins")
-def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page: int = 12) -> dict[str, Any]:
-    rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page)
+def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page: int = 12, days: int = 2) -> dict[str, Any]:
+    days = normalize_days_window(days)
+    rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
     return {
         "stores": rows_to_dicts(list_stores()),
         "current_store_id": store_id,
@@ -7549,6 +7668,7 @@ def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page:
         "page": page,
         "per_page": per_page,
         "total": total,
+        "days": days,
     }
 
 
@@ -7615,8 +7735,9 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
 
 @app.get("/api/bulk")
 def api_bulk(store_id: Optional[int] = None, days: int = 2, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    days = normalize_days_window(days)
     groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
-    return {"stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total}
+    return {"stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days}
 
 
 @app.post("/api/bulk/place")
@@ -7853,8 +7974,27 @@ def run_pull_job(job_id: str) -> None:
             job = conn.execute("SELECT * FROM pull_jobs WHERE id=?", (job_id,)).fetchone()
             if not job:
                 return
-            conn.execute("UPDATE pull_jobs SET status='running', updated_at=? WHERE id=?", (utc_now(), job_id))
-        inserted = fetch_odoo_lines(get_store(int(job["store_id"])), int(job["days"] or 7), int(job["limit_value"] or 50))
+            batch_size = normalize_pull_batch_size(job["batch_size"] if "batch_size" in job.keys() else stored_pull_batch_size())
+            conn.execute("UPDATE pull_jobs SET status='running', batch_size=?, updated_at=? WHERE id=?", (batch_size, utc_now(), job_id))
+
+        def progress(processed_orders: int, total_orders: int, inserted_records: int) -> None:
+            with db() as progress_conn:
+                progress_conn.execute(
+                    """
+                    UPDATE pull_jobs
+                    SET processed_orders=?, total_orders=?, inserted_records=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (processed_orders, total_orders, inserted_records, utc_now(), job_id),
+                )
+
+        inserted = fetch_odoo_lines(
+            get_store(int(job["store_id"])),
+            int(job["days"] or 7),
+            normalize_pull_limit(job["limit_value"], 0),
+            batch_size,
+            progress,
+        )
         with db() as conn:
             conn.execute(
                 """
@@ -7872,20 +8012,20 @@ def run_pull_job(job_id: str) -> None:
             )
 
 
-def start_pull_job(store_id: int, days: int, limit: int) -> dict[str, Any]:
+def start_pull_job(store_id: int, days: int, limit: int, batch_size: int) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     now = utc_now()
     with db() as conn:
         conn.execute(
             """
             INSERT INTO pull_jobs
-            (id, store_id, status, days, limit_value, inserted_records, error, created_at, updated_at)
-            VALUES (?, ?, 'queued', ?, ?, 0, '', ?, ?)
+            (id, store_id, status, days, limit_value, batch_size, total_orders, processed_orders, inserted_records, error, created_at, updated_at)
+            VALUES (?, ?, 'queued', ?, ?, ?, 0, 0, 0, '', ?, ?)
             """,
-            (job_id, store_id, days, limit, now, now),
+            (job_id, store_id, days, limit, batch_size, now, now),
         )
     threading.Thread(target=run_pull_job, args=(job_id,), daemon=True).start()
-    return {"id": job_id, "store_id": store_id, "status": "queued", "days": days, "limit_value": limit, "inserted_records": 0, "error": "", "created_at": now, "updated_at": now, "completed_at": ""}
+    return {"id": job_id, "store_id": store_id, "status": "queued", "days": days, "limit_value": limit, "batch_size": batch_size, "total_orders": 0, "processed_orders": 0, "inserted_records": 0, "error": "", "created_at": now, "updated_at": now, "completed_at": ""}
 
 
 @app.post("/api/pull")
@@ -7895,10 +8035,12 @@ def api_pull_orders(payload: PullPayload) -> dict[str, Any]:
     if not store_ids:
         raise HTTPException(400, "Select at least one store to pull orders.")
     days = max(1, min(365, int(payload.days or 7)))
-    limit = max(1, min(50000, int(payload.limit or 50)))
+    limit = normalize_pull_limit(payload.limit, 0)
+    batch_size = normalize_pull_batch_size(payload.batch_size or stored_pull_batch_size())
     set_setting("pull_orders_days", str(days))
     set_setting("pull_orders_limit", str(limit))
-    jobs = [start_pull_job(store_id, days, limit) for store_id in store_ids]
+    set_service_settings({"pull_orders_batch_size": str(batch_size)})
+    jobs = [start_pull_job(store_id, days, limit, batch_size) for store_id in store_ids]
     message = f"Started {len(jobs)} background pull job{'s' if len(jobs) != 1 else ''}."
     return {"ok": True, "message": message, "jobs": jobs, "defer_refresh": True}
 
@@ -7924,10 +8066,11 @@ def api_pull_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
 @app.post("/api/settings/pull-defaults")
 def api_save_pull_defaults(payload: PullPayload) -> dict[str, Any]:
     days = max(1, min(365, int(payload.days or 7)))
-    limit = max(1, min(50000, int(payload.limit or 50)))
+    limit = normalize_pull_limit(payload.limit, 0)
     set_setting("pull_orders_days", str(days))
     set_setting("pull_orders_limit", str(limit))
-    return {"ok": True, "message": f"Pull defaults saved: {days} day(s), limit {limit}.", "days": days, "limit": limit}
+    limit_label = "all matching orders" if limit == 0 else str(limit)
+    return {"ok": True, "message": f"Pull defaults saved: {days} day(s), limit {limit_label}.", "days": days, "limit": limit}
 
 
 @app.get("/api/settings/pull-defaults")
@@ -7935,7 +8078,8 @@ def api_pull_defaults() -> dict[str, Any]:
     return {
         "ok": True,
         "days": int(get_setting("pull_orders_days", "7") or 7),
-        "limit": int(get_setting("pull_orders_limit", "50") or 50),
+        "limit": stored_pull_limit(),
+        "batch_size": stored_pull_batch_size(),
     }
 
 

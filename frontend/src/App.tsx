@@ -367,6 +367,7 @@ type DashboardData = {
   default_ordering_engine: string
   pull_orders_days?: number
   pull_orders_limit?: number
+  pull_orders_batch_size?: number
   message?: string
   ok?: boolean
   punchout_launch_url?: string
@@ -485,6 +486,9 @@ type PullJob = {
   status: string
   days: number
   limit_value: number
+  batch_size: number
+  total_orders: number
+  processed_orders: number
   inserted_records: number
   error: string
   created_at: string
@@ -1482,9 +1486,11 @@ function App() {
   const [bulkGroups, setBulkGroups] = useState<BulkGroup[]>([])
   const [bulkPage, setBulkPage] = useState(1)
   const [bulkTotal, setBulkTotal] = useState(0)
+  const [bulkDays, setBulkDays] = useState("2")
   const [duplicateAsins, setDuplicateAsins] = useState<DuplicateAsin[]>([])
   const [duplicateAsinPage, setDuplicateAsinPage] = useState(1)
   const [duplicateAsinTotal, setDuplicateAsinTotal] = useState(0)
+  const [duplicateAsinDays, setDuplicateAsinDays] = useState("2")
   const [costlyRows, setCostlyRows] = useState<OrderLine[]>([])
   const [costlyPage, setCostlyPage] = useState(1)
   const [costlyTotal, setCostlyTotal] = useState(0)
@@ -1497,7 +1503,7 @@ function App() {
   const [amazonAccountId, setAmazonAccountId] = useState("")
   const [orderingEngine, setOrderingEngine] = useState("rest")
   const [days, setDays] = useState(() => savedPullSetting(PULL_DAYS_STORAGE_KEY, "7"))
-  const [limit, setLimit] = useState(() => savedPullSetting(PULL_LIMIT_STORAGE_KEY, "50"))
+  const [limit, setLimit] = useState(() => savedPullSetting(PULL_LIMIT_STORAGE_KEY, "0"))
   const [pullStoreIds, setPullStoreIds] = useState<string[]>(savedPullStoreIds)
   const [search, setSearch] = useState("")
   const [searchRows, setSearchRows] = useState<OrderLine[] | null>(null)
@@ -1587,7 +1593,7 @@ function App() {
     setAmazonAccountId((current) => current || String(next.amazon_accounts.find((account) => account.is_default)?.id || next.amazon_accounts[0]?.id || ""))
     setOrderingEngine(next.default_ordering_engine || "rest")
     if (next.pull_orders_days) setDays(String(next.pull_orders_days))
-    if (next.pull_orders_limit) setLimit(String(next.pull_orders_limit))
+    if (next.pull_orders_limit !== undefined && next.pull_orders_limit !== null) setLimit(String(next.pull_orders_limit))
     if (duplicateAsinPage === 1) {
       setDuplicateAsins(next.duplicate_asins || [])
       setDuplicateAsinTotal(next.duplicate_asins_total || next.duplicate_asins?.length || 0)
@@ -1795,13 +1801,13 @@ function App() {
 
   useEffect(() => {
     if (page !== "bulk") return
-    api<{ groups: BulkGroup[]; total: number }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: 2 })}`)
+    api<{ groups: BulkGroup[]; total: number }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: bulkDays || "2" })}`)
       .then((result) => {
         setBulkGroups(result.groups)
         setBulkTotal(result.total || 0)
       })
       .catch((error) => setModal({ ok: false, title: "Bulk opportunities load failed", message: String(error) }))
-  }, [page, storeId, bulkPage])
+  }, [page, storeId, bulkPage, bulkDays])
 
   useEffect(() => {
     if (page !== "home") return
@@ -1809,13 +1815,14 @@ function App() {
     if (storeId) query.set("store_id", storeId)
     query.set("page", String(duplicateAsinPage))
     query.set("per_page", String(DUPLICATE_ASIN_PAGE_SIZE))
+    query.set("days", duplicateAsinDays || "2")
     api<{ groups: DuplicateAsin[]; total: number }>(`/api/duplicate-asins?${query.toString()}`)
       .then((result) => {
         setDuplicateAsins(result.groups)
         setDuplicateAsinTotal(result.total || 0)
       })
       .catch((error) => setModal({ ok: false, title: "Duplicate ASINs load failed", message: String(error) }))
-  }, [page, storeId, duplicateAsinPage])
+  }, [page, storeId, duplicateAsinPage, duplicateAsinDays])
 
   useEffect(() => {
     if (page !== "costly") return
@@ -2408,7 +2415,8 @@ function App() {
                     </div>
                     <div className="grid gap-1.5">
                       <Label>Limit</Label>
-                      <Input type="number" min="1" max="50000" value={limit} onChange={(event) => setLimit(event.target.value)} />
+                      <Input type="number" min="0" max="50000" value={limit} onChange={(event) => setLimit(event.target.value)} />
+                      <p className="text-xs text-muted-foreground">0 pulls every matching order in the selected day window.</p>
                     </div>
                     <Button variant="outline" onClick={savePullDefaults} disabled={Boolean(busy)}>
                       Save Pull Defaults
@@ -2505,7 +2513,25 @@ function App() {
 
               <Card>
                 <CardHeader>
-                  <CardTitle>Duplicate ASINs Across Recent Orders</CardTitle>
+                  <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+                    <div>
+                      <CardTitle>Duplicate ASINs Across Recent Orders</CardTitle>
+                      <CardDescription>Filtered by Odoo order date. 2 days means today plus yesterday.</CardDescription>
+                    </div>
+                    <div className="w-full md:w-40">
+                      <TextField
+                        label="Days"
+                        type="number"
+                        value={duplicateAsinDays}
+                        onChange={(value) => {
+                          setDuplicateAsinDays(value)
+                          setDuplicateAsinPage(1)
+                          setSelected([])
+                          setOrdersSelectAll(false)
+                        }}
+                      />
+                    </div>
+                  </div>
                 </CardHeader>
                 <CardContent>
                   {duplicateAsins.length ? (
@@ -2954,6 +2980,8 @@ function App() {
             orderingEngine={orderingEngine}
             page={bulkPage}
             total={bulkTotal}
+            days={bulkDays}
+            onDays={setBulkDays}
             onPage={setBulkPage}
             selected={bulkSelected}
             selectAll={bulkSelectAll}
@@ -2962,7 +2990,7 @@ function App() {
             onResult={setModal}
             onNavigate={setPage}
             onRefresh={async () => {
-              const result = await api<{ groups: BulkGroup[]; total: number }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: 2 })}`)
+              const result = await api<{ groups: BulkGroup[]; total: number }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: bulkDays || "2" })}`)
               setBulkGroups(result.groups)
               setBulkTotal(result.total || 0)
               await refresh()
@@ -4654,6 +4682,8 @@ function BulkPage({
   orderingEngine,
   page,
   total,
+  days,
+  onDays,
   onPage,
   selected,
   selectAll,
@@ -4670,6 +4700,8 @@ function BulkPage({
   orderingEngine: string
   page: number
   total: number
+  days: string
+  onDays: (days: string) => void
   onPage: (page: number) => void
   selected: string[]
   selectAll: boolean
@@ -4703,11 +4735,27 @@ function BulkPage({
     <div className="grid gap-5">
       <section>
         <h2 className="text-lg font-semibold tracking-tight">Bulk Buying Opportunities</h2>
-        <p className="text-sm text-muted-foreground">Same ASIN demand combined across pulled orders from the last 2 days.</p>
+        <p className="text-sm text-muted-foreground">Same ASIN demand combined across pulled orders by Odoo order date. 2 days means today plus yesterday.</p>
       </section>
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-        <ExportControls view="bulk" storeId={String(storeId || "")} columns={bulkExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ days: 2 }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
-        <PaginationControls page={page} total={total} onPage={onPage} />
+        <div className="w-full md:w-40">
+          <TextField
+            label="Days"
+            type="number"
+            value={days}
+            onChange={(value) => {
+              onDays(value)
+              onPage(1)
+              onSelectAll(false)
+              onSelected([])
+              selectionAnchor.current = null
+            }}
+          />
+        </div>
+        <div className="flex flex-col gap-2 md:flex-row md:items-center">
+          <ExportControls view="bulk" storeId={String(storeId || "")} columns={bulkExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ days: days || "2" }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+          <PaginationControls page={page} total={total} onPage={onPage} />
+        </div>
       </div>
       <Card>
         <CardContent className="p-0">
@@ -5335,6 +5383,7 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
               <TableHead>Store</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Window</TableHead>
+              <TableHead>Progress</TableHead>
               <TableHead>Inserted</TableHead>
               <TableHead>Updated</TableHead>
               <TableHead>Error</TableHead>
@@ -5348,7 +5397,16 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
                   <div className="font-mono text-xs text-muted-foreground">{job.id}</div>
                 </TableCell>
                 <TableCell><StatusBadge value={job.status} /></TableCell>
-                <TableCell>{Number(job.days || 0).toLocaleString()} day(s), limit {Number(job.limit_value || 0).toLocaleString()}</TableCell>
+                <TableCell>
+                  <div>{Number(job.days || 0).toLocaleString()} day(s), limit {Number(job.limit_value || 0) ? Number(job.limit_value || 0).toLocaleString() : "all"}</div>
+                  <div className="text-xs text-muted-foreground">Batch {Number(job.batch_size || 50).toLocaleString()}</div>
+                </TableCell>
+                <TableCell>
+                  <div className="font-medium">
+                    {Number(job.processed_orders || 0).toLocaleString()} / {Number(job.total_orders || 0).toLocaleString()}
+                  </div>
+                  <div className="text-xs text-muted-foreground">Odoo orders</div>
+                </TableCell>
                 <TableCell>{Number(job.inserted_records || 0).toLocaleString()}</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{formatDateTime(job.updated_at || job.created_at)}</TableCell>
                 <TableCell className="max-w-[420px] text-xs"><ErrorTooltip value={job.error} /></TableCell>
@@ -5356,7 +5414,7 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
             ))}
             {!jobs.length && (
               <TableRow>
-                <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">No pull jobs yet.</TableCell>
+                <TableCell colSpan={7} className="py-8 text-center text-muted-foreground">No pull jobs yet.</TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -6291,7 +6349,9 @@ function SettingsPage({
                 {["1", "2", "3", "7", "14", "30"].map((value) => <option key={value} value={value}>Last {value} day{value === "1" ? "" : "s"}</option>)}
               </SelectField>
               <TextField label="Auto Fulfil Pull Limit" value={settings.auto_chrome_fulfil_limit || "100"} onChange={(value) => setSetting("auto_chrome_fulfil_limit", value)} />
+              <TextField label="Odoo Pull Batch Size" value={settings.pull_orders_batch_size || "50"} onChange={(value) => setSetting("pull_orders_batch_size", value)} />
             </div>
+            <p className="text-xs text-muted-foreground">Order pulls read Odoo in batches and save each batch before moving to the next one. Use 50 unless Odoo starts throttling, then reduce it.</p>
             <div className="btn-list">
               <Button
                 onClick={() => saveSettingsGroup("Database & Automation", [
@@ -6300,6 +6360,7 @@ function SettingsPage({
                   "auto_chrome_fulfil_interval_minutes",
                   "auto_chrome_fulfil_days",
                   "auto_chrome_fulfil_limit",
+                  "pull_orders_batch_size",
                 ])}
                 disabled={savingServices === "Database & Automation"}
               >

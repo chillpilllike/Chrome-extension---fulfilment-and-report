@@ -57,7 +57,8 @@ class PullPayload(BaseModel):
     store_id: Optional[int] = None
     store_ids: list[int] = []
     days: int = 7
-    limit: int = 50
+    limit: int = 0
+    batch_size: int = 0
     refresh: bool = True
 
 

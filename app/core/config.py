@@ -64,6 +64,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "shopify_tracking_from_days": os.getenv("SHOPIFY_TRACKING_FROM_DAYS", "7"),
     "shopify_tracking_validate_deliveries": os.getenv("SHOPIFY_TRACKING_VALIDATE_DELIVERIES", "true"),
     "shopify_tracking_skip_done_pickings": os.getenv("SHOPIFY_TRACKING_SKIP_DONE_PICKINGS", "false"),
+    "pull_orders_batch_size": os.getenv("PULL_ORDERS_BATCH_SIZE", "50"),
     "email_alerts_enabled": os.getenv("EMAIL_ALERTS_ENABLED", "false"),
     "email_alert_to": os.getenv("EMAIL_ALERT_TO", ""),
     "email_driver": os.getenv("EMAIL_DRIVER", "smtp"),
