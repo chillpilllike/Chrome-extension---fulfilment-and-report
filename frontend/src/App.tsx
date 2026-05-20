@@ -5364,6 +5364,12 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
     const timer = window.setInterval(refresh, 3000)
     return () => window.clearInterval(timer)
   }, [page])
+  function progressPercent(job: PullJob) {
+    const totalOrders = Number(job.total_orders || 0)
+    const processedOrders = Number(job.processed_orders || 0)
+    if (!totalOrders) return job.status === "completed" ? 100 : 0
+    return Math.max(0, Math.min(100, (processedOrders / totalOrders) * 100))
+  }
   return (
     <Card>
       <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -5401,11 +5407,27 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
                   <div>{Number(job.days || 0).toLocaleString()} day(s), limit {Number(job.limit_value || 0) ? Number(job.limit_value || 0).toLocaleString() : "all"}</div>
                   <div className="text-xs text-muted-foreground">Batch {Number(job.batch_size || 50).toLocaleString()}</div>
                 </TableCell>
-                <TableCell>
-                  <div className="font-medium">
-                    {Number(job.processed_orders || 0).toLocaleString()} / {Number(job.total_orders || 0).toLocaleString()}
+                <TableCell className="min-w-[260px]">
+                  <div className="mb-1 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="font-medium text-foreground">
+                      Pulled {Number(job.processed_orders || 0).toLocaleString()} of {Number(job.total_orders || 0).toLocaleString()}
+                    </span>
+                    <span className="text-muted-foreground">{progressPercent(job).toFixed(0)}%</span>
                   </div>
-                  <div className="text-xs text-muted-foreground">Odoo orders</div>
+                  <div className="progress">
+                    <div
+                      className={`progress-bar bg-primary transition-all ${job.status === "running" ? "progress-bar-striped progress-bar-animated" : ""}`}
+                      role="progressbar"
+                      aria-label={`Pulled ${Number(job.processed_orders || 0).toLocaleString()} of ${Number(job.total_orders || 0).toLocaleString()} Odoo orders`}
+                      aria-valuenow={progressPercent(job)}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      style={{ width: `${progressPercent(job)}%` }}
+                    />
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    Total found: {Number(job.total_orders || 0).toLocaleString()} Odoo order{Number(job.total_orders || 0) === 1 ? "" : "s"}
+                  </div>
                 </TableCell>
                 <TableCell>{Number(job.inserted_records || 0).toLocaleString()}</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{formatDateTime(job.updated_at || job.created_at)}</TableCell>
