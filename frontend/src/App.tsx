@@ -52,6 +52,7 @@ const KNOWN_APP_PAGES = new Set([
   "home",
   "orders",
   "pull-jobs",
+  "chrome-queue",
   "tracking",
   "payment-failed",
   "amazon-otp",
@@ -352,6 +353,33 @@ type BulkGroup = {
   has_missing_order: boolean
 }
 
+type ChromeQueueItem = {
+  asin: string
+  quantity: number
+  product_name?: string
+  line_id?: number
+}
+
+type ChromeQueueJob = {
+  group_key: string
+  store_id?: number
+  store_name?: string
+  order_names?: string[]
+  recipient_name?: string
+  items?: ChromeQueueItem[]
+  claimed_by?: string
+  claimed_at?: string
+  claim_expires_at?: string
+  last_error?: string
+  updated_at?: string
+}
+
+type ChromeQueueCount = {
+  state: string
+  count: number
+  locked?: number
+}
+
 type DashboardData = {
   stores: Store[]
   current_store_id: number | null
@@ -393,6 +421,7 @@ const defaultUiCopy: UiCopy = {
   home: { title: "Dashboard", description: "Control panel overview for fulfilment, tracking, and exceptions." },
   orders: { title: "Orders", description: "Review Odoo order lines and queue Amazon fulfilment." },
   "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
+  "chrome-queue": { title: "Chrome Queue", description: "Review Chrome extension jobs and release stale locks." },
   tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
   "payment-failed": { title: "Payment Failed", description: "Review Amazon orders that need payment revision." },
   "amazon-otp": { title: "Amazon OTP", description: "Match OTP emails to Amazon and Odoo orders." },
@@ -1494,6 +1523,8 @@ function App() {
   const [bulkTotal, setBulkTotal] = useState(0)
   const [bulkDays, setBulkDays] = useState("2")
   const [activeBulkDays, setActiveBulkDays] = useState(2)
+  const [chromeQueueJobs, setChromeQueueJobs] = useState<ChromeQueueJob[]>([])
+  const [chromeQueueCounts, setChromeQueueCounts] = useState<ChromeQueueCount[]>([])
   const [duplicateAsins, setDuplicateAsins] = useState<DuplicateAsin[]>([])
   const [duplicateAsinPage, setDuplicateAsinPage] = useState(1)
   const [duplicateAsinTotal, setDuplicateAsinTotal] = useState(0)
@@ -1805,7 +1836,7 @@ function App() {
   }, [page, storeId, epostPage, epostStatusFilter])
 
   useEffect(() => {
-    if (page !== "bulk") return
+    if (page !== "bulk" || !storeId) return
     const requestedDays = bulkDays || "2"
     api<{ groups: BulkGroup[]; total: number; days: number; search_engine?: string }>(`/api/bulk${pagedQuery(storeId, bulkPage, { days: requestedDays })}`)
       .then((result) => {
@@ -1816,10 +1847,24 @@ function App() {
       .catch((error) => setModal({ ok: false, title: "Bulk opportunities load failed", message: String(error) }))
   }, [page, storeId, bulkPage, bulkDays])
 
-  useEffect(() => {
-    if (page !== "orders") return
+  async function refreshChromeQueue(nextStoreId = storeId) {
     const query = new URLSearchParams()
-    if (storeId) query.set("store_id", storeId)
+    if (nextStoreId) query.set("store_id", nextStoreId)
+    query.set("claim", "false")
+    const result = await api<{ jobs: ChromeQueueJob[]; counts: ChromeQueueCount[] }>(`/api/chrome/jobs?${query.toString()}`)
+    setChromeQueueJobs(result.jobs || [])
+    setChromeQueueCounts(result.counts || [])
+  }
+
+  useEffect(() => {
+    if (page !== "chrome-queue") return
+    refreshChromeQueue().catch((error) => setModal({ ok: false, title: "Chrome queue load failed", message: String(error) }))
+  }, [page, storeId])
+
+  useEffect(() => {
+    if (page !== "orders" || !storeId) return
+    const query = new URLSearchParams()
+    query.set("store_id", storeId)
     query.set("page", String(duplicateAsinPage))
     query.set("per_page", String(DUPLICATE_ASIN_PAGE_SIZE))
     const requestedDays = duplicateAsinDays || "2"
@@ -2170,6 +2215,7 @@ function App() {
       items: [
         ["orders", "Orders", ShoppingCart],
         ["pull-jobs", "Pull Jobs", RefreshCw],
+        ["chrome-queue", "Chrome Queue", Lock],
         ["bulk", "Bulk Ordering", PackageCheck],
         ["shopify-fulfilment", "Shopify Fulfilment", StoreIcon],
         ["missing", "Missing ASINs", AlertCircle],
@@ -2825,6 +2871,8 @@ function App() {
                         className={
                           row.amazon_cancelled_at
                             ? "bg-red-50"
+                            : row.state === "missing"
+                            ? "bg-orange-50"
                             : ["cancelled", "refunded"].includes(row.odoo_status_label)
                             ? "bg-destructive/5"
                             : Number(row.odoo_order_distinct_asin_count || 0) > 1
@@ -2914,6 +2962,15 @@ function App() {
         )}
         {page === "shopify-fulfilment" && (
           <ShopifyFulfilmentPage storeId={storeId} onResult={setModal} />
+        )}
+        {page === "chrome-queue" && (
+          <ChromeQueuePage
+            rows={chromeQueueJobs}
+            counts={chromeQueueCounts}
+            storeId={storeId}
+            onResult={setModal}
+            onRefresh={() => refreshChromeQueue()}
+          />
         )}
         {page === "shopify-tracking" && (
           <ShopifyTrackingSyncPage onResult={setModal} />
@@ -5747,6 +5804,127 @@ function AmazonPage({ accounts, onChanged, onResult }: { accounts: AmazonAccount
       <AmazonDialog open={creating} value={emptyAccount} onClose={() => setCreating(false)} onSaved={onChanged} onResult={onResult} />
       {editing && <AmazonDialog open value={editing} id={editing.id} onClose={() => setEditing(null)} onSaved={onChanged} onResult={onResult} />}
     </SettingsTable>
+  )
+}
+
+function ChromeQueuePage({
+  rows,
+  counts,
+  storeId,
+  onResult,
+  onRefresh,
+}: {
+  rows: ChromeQueueJob[]
+  counts: ChromeQueueCount[]
+  storeId: string
+  onResult: (modal: ModalState) => void
+  onRefresh: () => Promise<void>
+}) {
+  const [loading, setLoading] = useState(false)
+  const lockedCount = rows.filter((row) => row.claimed_by).length
+  const submittedCount = counts.find((item) => item.state === "submitted")?.count || rows.length
+
+  async function releaseLock(groupKey: string) {
+    const confirmed = window.confirm("Break this Chrome job lock only if no extension is currently working on it. Continue?")
+    if (!confirmed) return
+    setLoading(true)
+    try {
+      const query = new URLSearchParams()
+      if (storeId) query.set("store_id", storeId)
+      const result = await api<{ ok: boolean; message: string; released: number }>(
+        `/api/chrome/jobs/${encodeURIComponent(groupKey)}/force-release${query.toString() ? `?${query.toString()}` : ""}`,
+        { method: "POST" },
+      )
+      onResult({ ok: result.ok, title: "Chrome Lock Released", message: result.message })
+      await onRefresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Chrome Lock Release Failed", message: String(error) })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <CardTitle>Chrome Jobs Queue</CardTitle>
+          <CardDescription>Submitted Chrome extension jobs waiting to be fulfilled, including stale locks you can release.</CardDescription>
+        </div>
+        <div className="btn-list">
+          <Badge variant={lockedCount ? "destructive" : "outline"}>{lockedCount.toLocaleString()} locked</Badge>
+          <Badge variant="secondary">{Number(submittedCount || 0).toLocaleString()} submitted</Badge>
+          <Button variant="outline" onClick={onRefresh} disabled={loading}>
+            <RefreshCw className="size-4" />
+            Refresh
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Group</TableHead>
+              <TableHead>Odoo Orders</TableHead>
+              <TableHead>Recipient</TableHead>
+              <TableHead>Items</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Expires</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((job) => (
+              <TableRow key={job.group_key}>
+                <TableCell className="font-mono text-xs">{job.group_key}</TableCell>
+                <TableCell className="max-w-[220px]">
+                  <div className="truncate">{(job.order_names || []).join(", ") || "-"}</div>
+                </TableCell>
+                <TableCell>{job.recipient_name || "-"}</TableCell>
+                <TableCell className="max-w-[320px]">
+                  <div className="space-y-1">
+                    {(job.items || []).map((item, index) => (
+                      <div key={`${job.group_key}-${item.asin}-${index}`} className="text-sm">
+                        <span className="font-mono">{item.asin}</span>
+                        <span className="text-muted-foreground"> x {item.quantity}</span>
+                        {item.product_name ? <div className="truncate text-xs text-muted-foreground">{item.product_name}</div> : null}
+                      </div>
+                    ))}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  {job.claimed_by ? (
+                    <div className="space-y-1">
+                      <Badge variant="destructive">Locked</Badge>
+                      <div className="max-w-[220px] truncate text-xs text-muted-foreground">{job.claimed_by}</div>
+                    </div>
+                  ) : (
+                    <Badge variant="outline">Ready</Badge>
+                  )}
+                </TableCell>
+                <TableCell>{job.claim_expires_at ? formatDateTime(job.claim_expires_at) : "-"}</TableCell>
+                <TableCell className="text-right">
+                  {job.claimed_by ? (
+                    <Button variant="destructive" size="sm" disabled={loading} onClick={() => releaseLock(job.group_key)}>
+                      Break lock
+                    </Button>
+                  ) : (
+                    <span className="text-sm text-muted-foreground">No lock</span>
+                  )}
+                </TableCell>
+              </TableRow>
+            ))}
+            {!rows.length && (
+              <TableRow>
+                <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">
+                  No Chrome jobs waiting.
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
   )
 }
 

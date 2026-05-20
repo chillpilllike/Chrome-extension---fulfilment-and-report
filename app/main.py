@@ -9374,6 +9374,47 @@ def api_chrome_job_release(group_key: str, payload: ChromeJobHeartbeatPayload) -
     return {"ok": True, "released": cursor.rowcount}
 
 
+@app.post("/api/chrome/jobs/{group_key}/force-release")
+def api_chrome_job_force_release(group_key: str, store_id: Optional[int] = None) -> dict[str, Any]:
+    cleaned_group_key = clean_text(group_key)
+    if not cleaned_group_key:
+        raise HTTPException(400, "Chrome group key is required")
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT chrome_claimed_by
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND (? IS NULL OR store_id=?)
+            """,
+            (cleaned_group_key, store_id, store_id),
+        ).fetchall()
+        worker_ids = sorted({clean_text(row["chrome_claimed_by"]) for row in rows if clean_text(row["chrome_claimed_by"])})
+        cursor = conn.execute(
+            """
+            UPDATE order_lines
+            SET chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                updated_at=?
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(chrome_claimed_by, '') != ''
+              AND (? IS NULL OR store_id=?)
+            """,
+            (utc_now(), cleaned_group_key, store_id, store_id),
+        )
+    message = f"Released {cursor.rowcount} locked Chrome line(s) for {cleaned_group_key}."
+    if worker_ids:
+        message += f" Previous worker: {', '.join(worker_ids)}."
+    return {"ok": True, "released": cursor.rowcount, "message": message}
+
+
 @app.post("/api/chrome/failed-jobs/clear")
 def api_chrome_clear_failed_jobs(store_id: Optional[int] = None) -> dict[str, Any]:
     with db() as conn:
@@ -11164,23 +11205,9 @@ def dashboard(request: Request, store_id: Optional[int] = None) -> HTMLResponse:
     )
 
 
-@app.get("/chrome-queue", response_class=HTMLResponse)
-def chrome_queue_page(request: Request, store_id: Optional[int] = None, message: str = "", status: str = "") -> HTMLResponse:
-    if not request_has_admin_access(request):
-        return admin_access_bridge_response(request)
-    snapshot = chrome_queue_snapshot(store_id)
-    return templates.TemplateResponse(
-        "chrome_queue.html",
-        {
-            "request": request,
-            "stores": list_stores(),
-            "current_store_id": store_id,
-            "jobs": snapshot["jobs"],
-            "counts": snapshot["counts"],
-            "message": message,
-            "status": status,
-        },
-    )
+@app.get("/chrome-queue")
+def chrome_queue_page() -> Response:
+    return app_home()
 
 
 @app.post("/chrome-queue/release")
