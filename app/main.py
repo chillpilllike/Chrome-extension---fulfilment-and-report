@@ -5985,10 +5985,41 @@ def _safe_script_dict(value: Any) -> Any:
     return value
 
 
+def apply_shopify_runtime_settings(module: Any, route: str, settings: Optional[dict[str, str]] = None) -> None:
+    settings = settings or get_service_settings()
+    route = clean_text(route).lower()
+    odoo_password = settings.get("odoo_script_password", "")
+    if odoo_password:
+        for attr in ("ODOO_SOURCES", "ODOO_DESTS"):
+            for odoo_cfg in getattr(module, attr, []) or []:
+                odoo_cfg["password"] = odoo_password
+        if hasattr(module, "ODOO_PASSWORD"):
+            module.ODOO_PASSWORD = odoo_password
+    secret_key = {
+        "dtc": "shopify_dtc_client_secret",
+        "dtb": "shopify_dtb_client_secret",
+        "tracking": "shopify_tracking_client_secret",
+    }.get(route, "")
+    client_secret = settings.get(secret_key, "") if secret_key else ""
+    if route in {"dtc", "dtb"}:
+        for dest in getattr(module, "DESTS", []) or []:
+            if client_secret:
+                dest["client_secret"] = client_secret
+        return
+    if route == "tracking":
+        for source in getattr(module, "SHOPIFY_SOURCES", []) or []:
+            if client_secret:
+                source["client_secret"] = client_secret
+
+
 def shopify_script_config_summary() -> dict[str, Any]:
+    settings = get_service_settings()
     dtc = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_dtc_script_path"], f"shopify_cfg_dtc_{uuid.uuid4().hex}")
     dtb = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_dtb_script_path"], f"shopify_cfg_dtb_{uuid.uuid4().hex}")
     tracking = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_tracking_script_path"], f"shopify_cfg_tracking_{uuid.uuid4().hex}")
+    apply_shopify_runtime_settings(dtc, "dtc", settings)
+    apply_shopify_runtime_settings(dtb, "dtb", settings)
+    apply_shopify_runtime_settings(tracking, "tracking", settings)
     return {
         "dtc": {
             "route": "Non-India orders",
@@ -6247,6 +6278,7 @@ def shopify_route_script_config(route: str) -> tuple[Any, str, str]:
         raise HTTPException(status_code=400, detail="route must be dtc or dtb")
     script_path = settings["shopify_dtb_script_path"] if route == "dtb" else settings["shopify_dtc_script_path"]
     module = load_external_script(script_path, f"shopify_oauth_{route}_{uuid.uuid4().hex}")
+    apply_shopify_runtime_settings(module, route, settings)
     module.StateDB = lambda _path="", *_args, **_kwargs: PostgresShopifyExportStateDB(route)
     module.STATE_DB = f"postgres:{route}"
     return module, script_path, route
@@ -6532,6 +6564,7 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
     route = clean_text(job["route"]).lower()
     script_path = settings["shopify_dtb_script_path"] if route == "dtb" else settings["shopify_dtc_script_path"]
     module = load_external_script(script_path, f"shopify_export_{route}_{uuid.uuid4().hex}")
+    apply_shopify_runtime_settings(module, route, settings)
     module.ODOO_URL = store.odoo_url
     module.ODOO_DB = store.odoo_db
     module.ODOO_USERNAME = store.odoo_user
@@ -6675,6 +6708,7 @@ def run_shopify_tracking_job(job_id: str) -> None:
         argv.append("--no-validate-deliveries")
     try:
         module = load_external_script(settings["shopify_tracking_script_path"], f"shopify_tracking_{uuid.uuid4().hex}")
+        apply_shopify_runtime_settings(module, "tracking", settings)
         module.StateDB = PostgresShopifyTrackingStateDB
         module.STATE_DB = "postgres:tracking"
         stdout = io.StringIO()
@@ -6855,8 +6889,10 @@ def sync_amazon_otp_emails() -> dict[str, Any]:
         return {"ok": False, "message": "Amazon OTP IMAP settings are incomplete.", "processed": 0}
     folder = clean_text(settings.get("amazon_otp_imap_folder")) or "INBOX"
     since_days = int(float(settings.get("amazon_otp_imap_since_days") or 14))
+    delete_processed = str(settings.get("amazon_otp_delete_processed_emails", "true")).lower() in {"1", "true", "yes", "on"}
     processed = 0
     matched = 0
+    deleted = 0
     client = imap_connect(settings)
     try:
         status, _ = client.select(folder)
@@ -6883,9 +6919,15 @@ def sync_amazon_otp_emails() -> dict[str, Any]:
             parsed = parse_amazon_email(raw)
             if upsert_amazon_otp_record(parsed, folder, uid):
                 matched += 1
+            if delete_processed:
+                status, _ = client.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
+                if status == "OK":
+                    deleted += 1
+        if delete_processed and deleted:
+            client.expunge()
         set_setting("amazon_otp_last_sync_at", utc_now())
-        set_setting("amazon_otp_last_sync_message", f"Processed {processed}, matched {matched}.")
-        return {"ok": True, "processed": processed, "matched": matched, "message": f"Processed {processed} email(s), matched {matched} Amazon OTP/dispatch email(s)."}
+        set_setting("amazon_otp_last_sync_message", f"Processed {processed}, matched {matched}, deleted {deleted}.")
+        return {"ok": True, "processed": processed, "matched": matched, "deleted": deleted, "message": f"Processed {processed} email(s), matched {matched} Amazon OTP/dispatch email(s), deleted {deleted} processed email(s)."}
     finally:
         try:
             client.logout()
@@ -7207,7 +7249,18 @@ def api_save_ordering_engine(payload: EnginePayload) -> dict[str, Any]:
 def api_service_settings() -> dict[str, Any]:
     settings = get_service_settings()
     masked = dict(settings)
-    for key in ("typesense_api_key", "storage_s3_secret_access_key", "amazon_otp_imap_password", "openexchange_api_key", "email_smtp_password"):
+    secret_keys = (
+        "typesense_api_key",
+        "storage_s3_secret_access_key",
+        "amazon_otp_imap_password",
+        "openexchange_api_key",
+        "email_smtp_password",
+        "shopify_dtc_client_secret",
+        "shopify_dtb_client_secret",
+        "shopify_tracking_client_secret",
+        "odoo_script_password",
+    )
+    for key in secret_keys:
         if masked.get(key):
             masked[key] = "********"
     masked["amazon_otp_last_sync_at"] = get_setting("amazon_otp_last_sync_at", "")
@@ -7233,7 +7286,17 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
             values[key] = value
     set_service_settings(values)
     response = get_service_settings()
-    for key in ("typesense_api_key", "storage_s3_secret_access_key", "amazon_otp_imap_password", "openexchange_api_key", "email_smtp_password"):
+    for key in (
+        "typesense_api_key",
+        "storage_s3_secret_access_key",
+        "amazon_otp_imap_password",
+        "openexchange_api_key",
+        "email_smtp_password",
+        "shopify_dtc_client_secret",
+        "shopify_dtb_client_secret",
+        "shopify_tracking_client_secret",
+        "odoo_script_password",
+    ):
         if response.get(key):
             response[key] = "********"
     return {"ok": True, "message": "Service settings saved.", "settings": response}

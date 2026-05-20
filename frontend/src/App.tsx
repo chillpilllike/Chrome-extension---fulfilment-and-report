@@ -6044,6 +6044,10 @@ function SettingsPage({
           </Alert>
           <div className="grid gap-3 md:grid-cols-2">
             <TextField label="OAuth Public Base URL" value={settings.shopify_oauth_public_base_url || ""} onChange={(value) => setSetting("shopify_oauth_public_base_url", value)} />
+            <TextField label="DTC Client Secret" type="password" value={settings.shopify_dtc_client_secret || ""} onChange={(value) => setSetting("shopify_dtc_client_secret", value)} />
+            <TextField label="DTB Client Secret" type="password" value={settings.shopify_dtb_client_secret || ""} onChange={(value) => setSetting("shopify_dtb_client_secret", value)} />
+            <TextField label="Tracking Client Secret" type="password" value={settings.shopify_tracking_client_secret || ""} onChange={(value) => setSetting("shopify_tracking_client_secret", value)} />
+            <TextField label="Odoo Script Password" type="password" value={settings.odoo_script_password || ""} onChange={(value) => setSetting("odoo_script_password", value)} />
             <SelectField label="Auto Queue After Amazon Order" value={settings.shopify_auto_enqueue_enabled || "true"} onChange={(value) => setSetting("shopify_auto_enqueue_enabled", value)}>
               <option value="true">Enabled</option>
               <option value="false">Disabled</option>
@@ -6063,6 +6067,10 @@ function SettingsPage({
             <Button
               onClick={() => saveSettingsGroup("Shopify Scripts", [
                 "shopify_oauth_public_base_url",
+                "shopify_dtc_client_secret",
+                "shopify_dtb_client_secret",
+                "shopify_tracking_client_secret",
+                "odoo_script_password",
                 "shopify_auto_enqueue_enabled",
                 "shopify_job_max_attempts",
                 "shopify_tracking_from_days",
@@ -6344,6 +6352,10 @@ function SettingsPage({
               <TextField label="IMAP Username" value={settings.amazon_otp_imap_username || ""} onChange={(value) => setSetting("amazon_otp_imap_username", value)} />
               <TextField label="IMAP Password" type="password" value={settings.amazon_otp_imap_password || ""} onChange={(value) => setSetting("amazon_otp_imap_password", value)} />
               <TextField label="IMAP Folder" value={settings.amazon_otp_imap_folder || "INBOX"} onChange={(value) => setSetting("amazon_otp_imap_folder", value)} />
+              <SelectField label="Delete Processed OTP Emails" value={settings.amazon_otp_delete_processed_emails || "true"} onChange={(value) => setSetting("amazon_otp_delete_processed_emails", value)}>
+                <option value="true">Enabled</option>
+                <option value="false">Disabled</option>
+              </SelectField>
               <SelectField label="Use SSL" value={settings.amazon_otp_imap_ssl || "true"} onChange={(value) => setSetting("amazon_otp_imap_ssl", value)}>
                 <option value="true">SSL enabled</option>
                 <option value="false">SSL disabled</option>
@@ -6363,6 +6375,7 @@ function SettingsPage({
                   "amazon_otp_imap_username",
                   "amazon_otp_imap_password",
                   "amazon_otp_imap_folder",
+                  "amazon_otp_delete_processed_emails",
                   "amazon_otp_imap_ssl",
                   "amazon_otp_imap_interval_minutes",
                   "amazon_otp_imap_since_days",
