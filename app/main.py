@@ -1961,6 +1961,7 @@ def fetch_amazon_product_title(asin: str) -> str:
 
 def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = "", missing_line_id: Optional[int] = None) -> int:
     missing_asin = normalize_asin(missing_asin)
+    updated_rows: list[dict[str, Any]] = []
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM order_lines WHERE amazon_group_key=? AND order_engine='chrome'",
@@ -1987,6 +1988,9 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
                 """,
                 (line_message, missing_asin if is_missing_line else "", utc_now(), row["id"]),
             )
+            updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+            if updated:
+                updated_rows.append(updated)
         conn.execute(
             """
             UPDATE amazon_attempts
@@ -1995,6 +1999,8 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
             """,
             (message, group_key),
         )
+    for updated in updated_rows:
+        index_order_line(updated)
     return len(rows)
 
 
@@ -10910,7 +10916,7 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             SET status='reset', error=NULL
             WHERE order_line_id IN ({placeholders})
               AND mode IN ('chrome', 'rest', 'cxml')
-              AND status IN ('queued', 'submitted', 'ok', 'error', 'costly')
+              AND status IN ('queued', 'submitted', 'ok', 'error', 'costly', 'missing')
             """,
             payload.line_ids,
         )

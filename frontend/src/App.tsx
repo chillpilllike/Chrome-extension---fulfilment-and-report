@@ -4680,6 +4680,21 @@ function MissingPage({
     })
     return [...grouped.entries()]
   }, [rows])
+  async function requeueLines(lineIds: number[]) {
+    if (!lineIds.length) return
+    try {
+      const result = await api<DashboardData>("/api/lines/reset-fulfilment", {
+        method: "POST",
+        body: JSON.stringify({ store_id: storeId, line_ids: lineIds }),
+      })
+      onResult({ ok: true, title: "Requeued", message: result.message || "Selected missing line(s) were requeued for normal fulfilment." })
+      onSelected([])
+      onSelectAll(false)
+      await onRefresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Requeue Failed", message: String(error) })
+    }
+  }
   return (
     <div className="grid gap-5">
       <section className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -4687,10 +4702,16 @@ function MissingPage({
           <h2 className="text-lg font-semibold tracking-tight">Missing Orders</h2>
           <p className="text-sm text-muted-foreground">Orders paused because one or more Amazon ASINs were unavailable during fulfilment.</p>
         </div>
-        <Button variant="outline" onClick={onRefresh}>
-          <RefreshCw className="size-4" />
-          Refresh
-        </Button>
+        <div className="btn-list">
+          <Button variant="outline" disabled={!selected.length} onClick={() => requeueLines(selected)}>
+            <RefreshCw className="size-4" />
+            Requeue Selected
+          </Button>
+          <Button variant="outline" onClick={onRefresh}>
+            <RefreshCw className="size-4" />
+            Refresh
+          </Button>
+        </div>
       </section>
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <ExportControls view="missing" storeId={String(storeId || "")} columns={missingExportColumns} selectedIds={selected} selectAll={selectAll} total={total} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
@@ -4763,9 +4784,15 @@ function MissingPage({
                       )}
                     </TableCell>
                     <TableCell className="text-right">
-                      <Button size="sm" onClick={() => onAssign(row)} disabled={!storeId}>
-                        Assign ASIN
-                      </Button>
+                      <div className="flex justify-end gap-2">
+                        <Button size="sm" variant="outline" onClick={() => requeueLines([row.id])} disabled={!storeId}>
+                          <RefreshCw className="size-4" />
+                          Requeue
+                        </Button>
+                        <Button size="sm" onClick={() => onAssign(row)} disabled={!storeId}>
+                          Assign ASIN
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
