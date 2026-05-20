@@ -1219,6 +1219,10 @@ async function reportMissingQuantityIssue(activeJob, item, purchaseItem, quantit
 }
 
 async function chooseAmazonDropdownOption(select, qty) {
+  return chooseAmazonDropdownText(select, qty > 9 ? "10+" : String(qty));
+}
+
+async function chooseAmazonDropdownText(select, optionText) {
   const container = select.closest(".a-dropdown-container") || select.parentElement;
   const dropdownButton = container?.querySelector(".a-button-dropdown, [data-action='a-dropdown-button']");
   if (!dropdownButton || !visible(dropdownButton)) return false;
@@ -1226,13 +1230,30 @@ async function chooseAmazonDropdownOption(select, qty) {
   await sleep(350);
   dropdownButton.click();
   await sleep(700);
-  const optionText = qty > 9 ? "10+" : String(qty);
+  const wanted = String(optionText || "").replace(/\s+/g, " ").trim();
   const links = [...document.querySelectorAll(".a-popover-wrapper a.a-dropdown-link, .a-popover-inner a.a-dropdown-link, a[role='option']")].filter(visible);
-  const option = links.find((link) => (link.textContent || "").replace(/\s+/g, " ").trim() === optionText);
+  const option = links.find((link) => (link.textContent || "").replace(/\s+/g, " ").trim() === wanted);
   if (!option) return false;
   option.scrollIntoView({ block: "nearest" });
   await sleep(250);
   option.click();
+  await sleep(900);
+  return true;
+}
+
+async function selectFreeFormQuantityOption(select, qty) {
+  const thresholds = qty > 9 ? ["10+", "4+"] : ["4+", "10+"];
+  const option = [...select.options || []].find((item) => {
+    const text = (item.textContent || item.value || "").replace(/\s+/g, " ").trim();
+    return thresholds.includes(text) || item.value === "";
+  });
+  if (!option) return false;
+  const text = (option.textContent || option.value || "").replace(/\s+/g, " ").trim();
+  const clicked = await chooseAmazonDropdownText(select, text || thresholds[0]);
+  if (clicked) return true;
+  select.value = option.value;
+  select.dispatchEvent(new Event("input", { bubbles: true }));
+  select.dispatchEvent(new Event("change", { bubbles: true }));
   await sleep(900);
   return true;
 }
@@ -1250,9 +1271,10 @@ async function setNativeSelectQuantity(select, qty) {
 }
 
 async function setFreeFormQuantity(select, qty, context = "regular") {
-  if (qty <= 9) return true;
   const input = quantityFreeFormInput(select, context);
   if (!input) return false;
+  await selectFreeFormQuantityOption(select, qty);
+  await sleep(500);
   input.classList.remove("aok-hidden");
   input.removeAttribute("aria-hidden");
   input.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -1264,7 +1286,10 @@ async function setFreeFormQuantity(select, qty, context = "regular") {
   input.dispatchEvent(new Event("change", { bubbles: true }));
   input.blur();
   await sleep(1000);
-  return true;
+  const updated = await clickQuantityUpdateButton(select, context);
+  await sleep(updated ? 1300 : 700);
+  const value = Number(String(input.value || "").replace(/[^\d.]/g, ""));
+  return Number.isFinite(value) && value === qty;
 }
 
 async function setQuantity(quantity, context = "regular") {
@@ -1276,11 +1301,10 @@ async function setQuantity(quantity, context = "regular") {
   const selects = quantitySelects(context);
   for (const select of selects) {
     showPanel("Nutricity fulfilment", `Setting ${context === "sns" ? "Subscribe & Save " : ""}quantity to ${qty}.`, null, null);
-    const clicked = await chooseAmazonDropdownOption(select, qty);
-    const selected = clicked || await setNativeSelectQuantity(select, qty);
+    const freeFormInput = quantityFreeFormInput(select, context);
+    const freeFormSet = freeFormInput ? await setFreeFormQuantity(select, qty, context) : false;
+    const selected = freeFormSet || await chooseAmazonDropdownOption(select, qty) || await setNativeSelectQuantity(select, qty);
     if (!selected) continue;
-    const freeFormSet = await setFreeFormQuantity(select, qty, context);
-    if (freeFormSet) await clickQuantityUpdateButton(select, context);
     await sleep(900);
     const issue = quantityAvailabilityIssue(context, qty);
     if (issue) {
@@ -1288,7 +1312,7 @@ async function setQuantity(quantity, context = "regular") {
       window.__nutricityLastQuantityIssue = issue;
       return false;
     }
-    if (qty <= 9 || freeFormSet) return true;
+    return true;
   }
   const issue = quantityAvailabilityIssue(context, qty);
   if (issue) {
