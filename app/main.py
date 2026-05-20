@@ -3908,6 +3908,24 @@ def clear_expired_chrome_claims(conn: Any) -> None:
             chrome_claim_expires_at=NULL,
             updated_at=?
         WHERE order_engine='chrome'
+          AND state != 'submitted'
+          AND COALESCE(amazon_order_id, '') = ''
+          AND (
+            COALESCE(chrome_claimed_by, '') != ''
+            OR COALESCE(chrome_claimed_at, '') != ''
+            OR COALESCE(chrome_claim_expires_at, '') != ''
+          )
+        """,
+        (utc_now(),),
+    )
+    conn.execute(
+        """
+        UPDATE order_lines
+        SET chrome_claimed_by=NULL,
+            chrome_claimed_at=NULL,
+            chrome_claim_expires_at=NULL,
+            updated_at=?
+        WHERE order_engine='chrome'
           AND state='submitted'
           AND COALESCE(amazon_order_id, '') = ''
           AND COALESCE(chrome_claim_expires_at, '') != ''
@@ -3951,6 +3969,44 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]]) -> dict[str, Any]:
             for item in items
         ],
     }
+
+
+def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = True) -> dict[str, Any]:
+    with db() as conn:
+        if clear_expired:
+            clear_expired_chrome_claims(conn)
+        counts = rows_to_dicts(conn.execute(
+            """
+            SELECT state,
+                   COUNT(*) AS count,
+                   SUM(CASE WHEN COALESCE(chrome_claimed_by, '') != '' THEN 1 ELSE 0 END) AS locked
+            FROM order_lines
+            WHERE order_engine='chrome'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND (? IS NULL OR store_id=?)
+            GROUP BY state
+            ORDER BY state
+            """,
+            (store_id, store_id),
+        ).fetchall())
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_group_key, '') != ''
+              AND (? IS NULL OR store_id=?)
+            ORDER BY COALESCE(chrome_claimed_by, '') != '', updated_at ASC, odoo_order_id DESC, id ASC
+            """,
+            (store_id, store_id),
+        ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows_to_dicts(rows):
+        grouped.setdefault(str(row["amazon_group_key"]), []).append(row)
+    jobs = [chrome_job_from_rows(group_rows) for group_rows in grouped.values()]
+    return {"jobs": jobs, "counts": counts}
 
 
 def claim_next_chrome_job(store_id: Optional[int], worker_id: str) -> Optional[dict[str, Any]]:
@@ -7656,7 +7712,7 @@ def amazon_otp_loop() -> None:
         time.sleep(60)
 
 
-def backfill_missing_order_dates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def backfill_missing_order_dates(rows: list[dict[str, Any]], fetch_remote: bool = False) -> list[dict[str, Any]]:
     candidates = [row for row in rows if not clean_text(row.get("odoo_order_date")) and int(row.get("store_id") or 0) and int(row.get("odoo_order_id") or 0)]
     if not candidates:
         return rows
@@ -7682,8 +7738,10 @@ def backfill_missing_order_dates(rows: list[dict[str, Any]]) -> list[dict[str, A
                     (order_date, utc_now(), row["id"]),
                 )
         candidates = [row for row in updated_rows if not clean_text(row.get("odoo_order_date")) and int(row.get("store_id") or 0) and int(row.get("odoo_order_id") or 0)]
-        if not candidates:
+        if not candidates or not fetch_remote:
             return updated_rows
+    if not fetch_remote:
+        return rows
     by_store: dict[int, set[int]] = {}
     for row in candidates:
         by_store.setdefault(int(row["store_id"]), set()).add(int(row["odoo_order_id"]))
@@ -7849,27 +7907,6 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
                 ORDER BY odoo_order_id DESC, asin, id
                 LIMIT ? OFFSET ?
-            ),
-            duplicate_all AS (
-                SELECT asin,
-                       COUNT(*) AS line_count,
-                       COUNT(DISTINCT odoo_order_name) AS order_count,
-                       SUM(quantity) AS total_quantity,
-                       STRING_AGG(DISTINCT odoo_order_name, ',') AS orders
-                FROM order_lines
-                WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
-                  AND COALESCE(asin, '') != ''
-                  AND COALESCE(amazon_order_id, '') = ''
-                  AND state = 'pulled'
-                  AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-                GROUP BY asin
-                HAVING COUNT(DISTINCT odoo_order_name) > 1
-                ORDER BY order_count DESC, total_quantity DESC, asin
-            ),
-            duplicate_rows AS (
-                SELECT *
-                FROM duplicate_all
-                LIMIT 12
             )
             SELECT
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(stores_cte)), '[]'::json) FROM stores_cte) AS stores,
@@ -7884,8 +7921,6 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                     WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
                     GROUP BY state
                 ) c) AS counts,
-                (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(duplicate_rows)), '[]'::json) FROM duplicate_rows) AS duplicate_asins,
-                (SELECT COUNT(*) FROM duplicate_all) AS duplicate_asins_total,
                 (SELECT store_id FROM chosen) AS current_store_id,
                 (SELECT value FROM app_settings WHERE key='default_ordering_engine') AS default_ordering_engine
             """
@@ -7916,10 +7951,10 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
         "addresses": addresses,
         "amazon_accounts": amazon_accounts,
         "punchout_return_urls": punchout_return_urls,
-        "duplicate_asins": payload.get("duplicate_asins") or [],
+        "duplicate_asins": [],
         "duplicate_asins_page": 1,
         "duplicate_asins_per_page": 12,
-        "duplicate_asins_total": int(payload.get("duplicate_asins_total") or 0),
+        "duplicate_asins_total": 0,
         "default_ordering_engine": normalize_ordering_engine(str(payload.get("default_ordering_engine") or "rest")),
         "pull_orders_days": int(get_setting("pull_orders_days", "7") or 7),
         "pull_orders_limit": stored_pull_limit(),
@@ -9234,28 +9269,8 @@ def api_chrome_jobs(store_id: Optional[int] = None, worker_id: str = "", claim: 
     if claim:
         job = claim_next_chrome_job(store_id, worker_id)
         return {"ok": True, "jobs": [job] if job else []}
-    with db() as conn:
-        clear_expired_chrome_claims(conn)
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM order_lines
-            WHERE order_engine='chrome'
-              AND state='submitted'
-              AND COALESCE(amazon_order_id, '') = ''
-              AND COALESCE(amazon_group_key, '') != ''
-              AND (? IS NULL OR store_id=?)
-            ORDER BY COALESCE(chrome_claimed_by, '') != '', updated_at ASC, odoo_order_id DESC, id ASC
-            """,
-            (store_id, store_id),
-        ).fetchall()
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        grouped.setdefault(str(row["amazon_group_key"]), []).append(row)
-    jobs: list[dict[str, Any]] = []
-    for group_key, group_rows in grouped.items():
-        jobs.append(chrome_job_from_rows(rows_to_dicts(group_rows)))
-    return {"ok": True, "jobs": jobs}
+    snapshot = chrome_queue_snapshot(store_id)
+    return {"ok": True, **snapshot}
 
 
 @app.post("/api/chrome/jobs/{group_key}/heartbeat")
@@ -11094,6 +11109,64 @@ def dashboard(request: Request, store_id: Optional[int] = None) -> HTMLResponse:
             **data,
         },
     )
+
+
+@app.get("/chrome-queue", response_class=HTMLResponse)
+def chrome_queue_page(request: Request, store_id: Optional[int] = None, message: str = "", status: str = "") -> HTMLResponse:
+    snapshot = chrome_queue_snapshot(store_id)
+    return templates.TemplateResponse(
+        "chrome_queue.html",
+        {
+            "request": request,
+            "stores": list_stores(),
+            "current_store_id": store_id,
+            "jobs": snapshot["jobs"],
+            "counts": snapshot["counts"],
+            "message": message,
+            "status": status,
+        },
+    )
+
+
+@app.post("/chrome-queue/release")
+def chrome_queue_release_lock(group_key: str = Form(...), store_id: str = Form("")) -> RedirectResponse:
+    cleaned_group_key = clean_text(group_key)
+    if not cleaned_group_key:
+        return RedirectResponse("/chrome-queue?status=bad&message=Missing%20Chrome%20group%20key.", status_code=303)
+    store_id_value = int(store_id) if str(store_id or "").strip().isdigit() else None
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT chrome_claimed_by
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+            """,
+            (cleaned_group_key,),
+        ).fetchall()
+        worker_ids = sorted({clean_text(row["chrome_claimed_by"]) for row in rows if clean_text(row["chrome_claimed_by"])})
+        cursor = conn.execute(
+            """
+            UPDATE order_lines
+            SET chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                updated_at=?
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(chrome_claimed_by, '') != ''
+            """,
+            (utc_now(), cleaned_group_key),
+        )
+    message = f"Released {cursor.rowcount} locked Chrome line(s) for {cleaned_group_key}."
+    if worker_ids:
+        message += f" Previous worker: {', '.join(worker_ids)}."
+    query = urlencode({"store_id": store_id_value or "", "status": "ok" if cursor.rowcount else "bad", "message": message})
+    return RedirectResponse(f"/chrome-queue?{query}", status_code=303)
 
 
 @app.get("/inventory", response_class=HTMLResponse)

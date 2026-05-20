@@ -1,6 +1,15 @@
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const ACTION_DELAY = 1800;
 const PAGE_READY_TIMEOUT = 12000;
+const DEFAULT_NEW_DELIVERY_ADDRESS = {
+  countryCode: "US",
+  phoneNumber: "9176818556",
+  addressLine1: "6614 AVENUE U STE 7",
+  addressLine2: "",
+  city: "BROOKLYN",
+  stateOrRegion: "NY",
+  postalCode: "11234-6021",
+};
 
 let extensionContextAlive = true;
 
@@ -26,6 +35,11 @@ async function setActiveJob(activeJob) {
   await send({ type: "SET_ACTIVE_JOB", activeJob });
 }
 
+async function getExtensionState() {
+  const data = await send({ type: "GET_STATE" });
+  return data || {};
+}
+
 async function isPaused() {
   const activeJob = await getActiveJob();
   return Boolean(activeJob?.paused);
@@ -33,7 +47,13 @@ async function isPaused() {
 
 async function waitIfPaused() {
   while (await isPaused()) {
-    showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
+    const activeJob = await getActiveJob();
+    showPanel(
+      "Nutricity fulfilment paused",
+      "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",
+      "I did it manually, continue",
+      () => continueAfterManualStep(activeJob),
+    );
     await sleep(1000);
   }
 }
@@ -113,7 +133,16 @@ async function togglePanelPause(event) {
     button.textContent = paused ? "Resume" : "Pause";
     button.classList.toggle("is-paused", paused);
     if (paused) {
-      showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
+      const activeJob = await getActiveJob();
+      showPanel(
+        "Nutricity fulfilment paused",
+        "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",
+        "I did it manually, continue",
+        () => continueAfterManualStep(activeJob),
+      );
+    } else {
+      showPanel("Nutricity fulfilment", `Resuming ${result?.stage || "last step"}.`, null, null);
+      setTimeout(runSafely, 250);
     }
   } finally {
     button.disabled = false;
@@ -168,7 +197,9 @@ function findButtonByText(texts) {
   const wanted = texts.map((text) => text.toLowerCase());
   const candidates = [...document.querySelectorAll("button, input[type='submit'], input[type='button'], a, span.a-button")];
   return candidates.find((element) => {
-    const text = (element.value || element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const labelledBy = element.getAttribute?.("aria-labelledby");
+    const labelText = labelledBy ? document.getElementById(labelledBy)?.textContent : "";
+    const text = (element.value || element.title || element.innerText || element.textContent || labelText || "").replace(/\s+/g, " ").trim().toLowerCase();
     return visible(element) && wanted.some((needle) => text.includes(needle));
   });
 }
@@ -665,7 +696,15 @@ function verifyCartQuantities(activeJob) {
 function lineIdForAsin(activeJob, asin) {
   const wanted = String(asin || "").toUpperCase();
   const item = (activeJob.job?.items || []).find((entry) => String(entry.asin || "").toUpperCase() === wanted);
-  return item ? itemPrimaryLineId(item) : null;
+  if (item) return itemPrimaryLineId(item);
+  const pricingItem = Object.values(activeJob.pricing || {}).find((entry) => {
+    const purchasedAsin = String(entry.purchased_asin || "").toUpperCase();
+    const originalAsin = String(entry.asin || "").toUpperCase();
+    return purchasedAsin === wanted || originalAsin === wanted;
+  });
+  if (!pricingItem?.asin) return null;
+  const originalItem = (activeJob.job?.items || []).find((entry) => String(entry.asin || "").toUpperCase() === String(pricingItem.asin || "").toUpperCase());
+  return originalItem ? itemPrimaryLineId(originalItem) : null;
 }
 
 function cartAlreadyHasExpectedItems(activeJob) {
@@ -711,6 +750,7 @@ function savingsRoots(context = "regular") {
         document.querySelector("#snsAccordionRow"),
         document.querySelector("#reinvent_price_desktop_snsAccordionRowMiddle"),
         document.querySelector("#promoPriceBlockMessage_feature_div"),
+        document.body,
       ].filter(Boolean)
     : [
         document.querySelector("#reinvent_price_desktop_newAccordionRow"),
@@ -762,10 +802,11 @@ async function clipVisibleCoupons(context = "regular") {
   for (const root of roots) {
     const candidates = [
       ...root.querySelectorAll("input[type='checkbox']:not(:checked)"),
+      ...root.querySelectorAll("[data-csa-c-action='clipPromotion'] input[type='checkbox']:not(:checked), [data-csa-c-owner='PromotionsDiscovery'] input[type='checkbox']:not(:checked)"),
       ...root.querySelectorAll(".a-checkbox:not(.aok-hidden) label, .a-icon-checkbox"),
     ].filter((element) => visible(element) || visible(element.closest?.("label, .a-checkbox, span, div")));
     for (const candidate of candidates) {
-      const target = candidate.closest?.("label") || candidate;
+      const target = candidate.matches?.("input[type='checkbox']") ? candidate : candidate.closest?.("label") || candidate;
       if (clicked.has(target)) continue;
       const nearbyText = (target.closest?.(".promoPriceBlockMessage, [data-csa-c-owner='PromotionsDiscovery'], #promoPriceBlockMessage_feature_div")?.innerText || target.parentElement?.innerText || "").toLowerCase();
       if (!nearbyText.includes("coupon") && !nearbyText.includes("save")) continue;
@@ -781,6 +822,34 @@ async function clipVisibleCoupons(context = "regular") {
     showPanel("Nutricity fulfilment", `Applied ${count} Amazon coupon${count === 1 ? "" : "s"}.`, null, null);
   }
   return count;
+}
+
+function unavailableMessage() {
+  const allBuyingOptions = [...document.querySelectorAll(
+    "a[href*='/gp/offer-listing/'], a[href*='/offer-listing/'], a[title='See All Buying Options'], a.a-button-text",
+  )].find((element) => {
+    const text = (element.innerText || element.textContent || element.getAttribute("title") || "").replace(/\s+/g, " ").trim().toLowerCase();
+    return visible(element) && text.includes("see all buying options");
+  });
+  if (allBuyingOptions) {
+    return "Amazon only shows See All Buying Options, so this ASIN is not directly available to add to cart.";
+  }
+  const roots = [
+    ...document.querySelectorAll("#availability, #outOfStock, #availabilityInsideBuyBox_feature_div, #desktop_qualifiedBuyBox, #buybox, #centerCol"),
+  ].filter(Boolean);
+  for (const root of roots) {
+    if (!visible(root) && root.id !== "centerCol") continue;
+    const text = (root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
+    const lowered = text.toLowerCase();
+    if (
+      lowered.includes("currently unavailable") ||
+      lowered.includes("we don't know when or if this item will be back in stock") ||
+      lowered.includes("we do not know when or if this item will be back in stock")
+    ) {
+      return text.match(/currently unavailable[^.]*\./i)?.[0] || "Currently unavailable. We do not know when or if this item will be back in stock.";
+    }
+  }
+  return "";
 }
 
 async function applyAdditionalSavings(context = "regular") {
@@ -1066,6 +1135,19 @@ async function handleProduct(activeJob) {
   rememberProductDosage(activeJob, item);
   await setActiveJob(activeJob);
 
+  const unavailable = unavailableMessage();
+  if (unavailable) {
+    await send({
+      type: "FAIL_JOB",
+      message: `ASIN ${expectedItem.asin} is unavailable on Amazon. ${unavailable}`,
+      missingAsin: item.asin,
+      missingLineId: itemPrimaryLineId(item),
+      failureCode: "unavailable",
+    });
+    showPanel("Nutricity fulfilment", "Amazon says this item is unavailable. Order moved to Missing ASINs.", null, null);
+    return;
+  }
+
   await applyAdditionalSavings("regular");
   const promoCount = markPromotions();
   if (promoCount && !activeJob.promoAcknowledged[item.asin]) {
@@ -1128,7 +1210,7 @@ async function handleProduct(activeJob) {
         fulfilledQuantity: lessQuantity ? availableQuantity : null,
         availableQuantity: lessQuantity ? availableQuantity : null,
       });
-      showPanel("Nutricity fulfilment", lessQuantity ? "Less quantity available. Order moved to Missing ASINs." : "Could not set item quantity. Job marked as error.", null, null);
+      showPanel("Nutricity fulfilment", lessQuantity ? "Less quantity available. Order moved to Missing ASINs." : "Could not set item quantity. Order moved to Missing ASINs.", null, null);
       return;
     }
     const addButton = await waitForElement(["#add-to-cart-button", "input[name='submit.add-to-cart']", "#buybox-add-to-cart-button input"], 18000);
@@ -1195,25 +1277,21 @@ async function handleCart(activeJob) {
   }
   const cartCheck = verifyCartQuantities(activeJob);
   if (!cartCheck.ok) {
-    const shortQuantity = (cartCheck.mismatches || []).find((item) => item.actual > 0 && item.actual < item.expected);
-    if (shortQuantity) {
-      await send({
-        type: "FAIL_JOB",
-        message: `Less quantity available for ASIN ${shortQuantity.asin}. Customer ordered ${shortQuantity.expected}, Amazon cart has ${shortQuantity.actual}.`,
-        missingAsin: shortQuantity.asin,
-        missingLineId: lineIdForAsin(activeJob, shortQuantity.asin),
-        failureCode: "partial_quantity",
-        requestedQuantity: shortQuantity.expected,
-        fulfilledQuantity: shortQuantity.actual,
-        availableQuantity: shortQuantity.actual,
-      });
-      showPanel("Cart quantity needs review", "Less quantity available. Order moved to Missing ASINs.", null, null);
-      return;
-    }
-    activeJob.paused = true;
-    activeJob.stage = "cart";
-    await setActiveJob(activeJob);
-    showPanel("Cart quantity needs review", `Paused before checkout. ${cartCheck.message}`, null, null);
+    const mismatch = (cartCheck.mismatches || [])[0];
+    const missingAsin = mismatch?.asin || "";
+    await send({
+      type: "FAIL_JOB",
+      message: mismatch
+        ? `Could not add the desired quantity for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}.`
+        : `Could not verify the desired Amazon cart quantities. ${cartCheck.message}`,
+      missingAsin,
+      missingLineId: lineIdForAsin(activeJob, missingAsin),
+      failureCode: "partial_quantity",
+      requestedQuantity: mismatch?.expected ?? null,
+      fulfilledQuantity: mismatch?.actual ?? 0,
+      availableQuantity: mismatch?.actual ?? 0,
+    });
+    showPanel("Cart quantity issue", "Could not add the desired quantity. Order moved to Missing ASINs.", null, null);
     return;
   }
   if (cartCheck.warning) {
@@ -1250,28 +1328,148 @@ async function handleCart(activeJob) {
 }
 
 async function fillFullName(name) {
-  const selectors = [
-    "#address-ui-widgets-enterAddressFullName",
-    "input[name='address-ui-widgets-enterAddressFullName']",
-    "input[aria-label='Full name']",
-    "input[aria-label='Full Name']",
-    "input[placeholder='Full name']",
-    "input[placeholder='Full Name']",
-    "input[autocomplete='name']",
-    "input[name*='FullName']",
-    "input[id*='FullName']",
-  ];
-  const input = await waitForElement(selectors, 20000);
+  const input = await waitUntil(() => (
+    document.querySelector("input#address-ui-widgets-enterAddressFullName[name='address-ui-widgets-enterAddressFullName']")
+    || findAddressNameInput()
+  ), 20000);
   if (!input) return false;
+  const desired = String(name || "").replace(/\s+/g, " ").trim();
+  if (!desired) return false;
   input.scrollIntoView({ block: "center", behavior: "smooth" });
   await sleep(500);
-  input.focus();
-  input.select?.();
-  input.value = name;
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.dispatchEvent(new Event("change", { bubbles: true }));
+  await setInputValue(input, desired);
+  await sleep(800);
+  const saved = input.value.replace(/\s+/g, " ").trim() === desired;
   input.blur();
-  await sleep(1000);
+  return saved;
+}
+
+async function setInputValue(input, value) {
+  const desired = String(value ?? "");
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  input.focus();
+  input.click?.();
+  await sleep(100);
+  input.select?.();
+  input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "a", code: "KeyA", ctrlKey: true, metaKey: true }));
+  input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "a", code: "KeyA", ctrlKey: true, metaKey: true }));
+  await sleep(50);
+  try {
+    document.execCommand("insertText", false, desired);
+    await sleep(150);
+    if (input.value === desired) {
+      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, composed: true, key: "Tab" }));
+      input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, composed: true, key: "Tab" }));
+      return;
+    }
+  } catch {
+    // Fall back to manual value/input events below.
+  }
+  input.select?.();
+  setter ? setter.call(input, "") : (input.value = "");
+  input.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+  input.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+  await sleep(50);
+  for (const char of desired) {
+    const key = char === " " ? " " : char;
+    input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, composed: true, key }));
+    input.dispatchEvent(new KeyboardEvent("keypress", { bubbles: true, composed: true, key }));
+    const nextValue = `${input.value || ""}${char}`;
+    setter ? setter.call(input, nextValue) : (input.value = nextValue);
+    input.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "insertText", data: char }));
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: char }));
+    input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, composed: true, key }));
+    await sleep(18);
+  }
+  input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, composed: true, key: "Tab" }));
+  input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, composed: true, key: "Tab" }));
+}
+
+function addressDataForRow(row) {
+  const carrier = row?.closest?.("[data-action='select_address_in_list'][data-select_address_in_list]") || row?.querySelector?.("[data-action='select_address_in_list'][data-select_address_in_list]");
+  if (!carrier) return {};
+  try {
+    return JSON.parse(carrier.getAttribute("data-select_address_in_list") || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function rowIsNutricityAddress(row) {
+  if (!row) return false;
+  const data = addressDataForRow(row);
+  const dataName = normalizedText(data.fullName);
+  const visibleName = normalizedText(row.querySelector?.("[data-testid='address-row-radio-name']")?.textContent || "");
+  const rowText = normalizedText(row.innerText || row.textContent || "");
+  return dataName.includes("nutricity") || visibleName.includes("nutricity") || rowText.includes("nutricity");
+}
+
+function nutricityAddressRow() {
+  const rows = [...document.querySelectorAll(
+    [
+      "[data-testid='address-row-radio']",
+      "[data-testid='address-row-section']",
+      "[data-testid^='address-row-'][id^='address-row-']",
+      ".address-row-section",
+      ".address-row",
+    ].join(", "),
+  )].filter(visible);
+  return rows.find(rowIsNutricityAddress) || null;
+}
+
+function addressRowForRecipient(name) {
+  const wanted = normalizedText(name);
+  if (!wanted) return null;
+  const rows = [...document.querySelectorAll(
+    [
+      "[data-testid='address-row-radio']",
+      "[data-testid='address-row-section']",
+      "[data-testid^='address-row-'][id^='address-row-']",
+      ".address-row-section",
+      ".address-row",
+      "[data-action='select_address_in_list']",
+    ].join(", "),
+  )].filter(visible);
+  return rows.find((row) => normalizedText(row.innerText || row.textContent).includes(wanted)) || null;
+}
+
+function addressSelectionControl(row) {
+  if (!row) return null;
+  const label = row.closest?.("label");
+  const radio = row.querySelector("input[type='radio'][name='addressID']")
+    || label?.querySelector?.("input[type='radio'][name='addressID']")
+    || row.closest?.("[data-testid='address-row-radio']")?.querySelector?.("input[type='radio'][name='addressID']");
+  return radio?.closest?.("label") || radio || row;
+}
+
+function nutricityAddressSelectionControl() {
+  return addressSelectionControl(nutricityAddressRow());
+}
+
+function recipientAddressSelectionControl(name) {
+  return addressSelectionControl(addressRowForRecipient(name));
+}
+
+function addressSelectionControlForElement(element) {
+  const row = element?.closest?.(
+    "[data-testid='address-row-radio'], [data-testid='address-row-section'], [data-testid^='address-row-'], .address-row-section, .address-row, [data-action='select_address_in_list']",
+  );
+  if (!row) return null;
+  const label = row.closest?.("label");
+  const radio = row.querySelector("input[type='radio'][name='addressID']")
+    || label?.querySelector?.("input[type='radio'][name='addressID']")
+    || row.closest?.("[data-testid='address-row-radio']")?.querySelector?.("input[type='radio'][name='addressID']");
+  return radio?.checked ? null : radio?.closest?.("label") || radio || null;
+}
+
+async function selectAddressRadioForElement(element) {
+  const control = addressSelectionControlForElement(element);
+  if (!control) return false;
+  showPanel("Nutricity checkout", "Selecting delivery address row.", null, null);
+  await clickElement(control, "Address radio button");
+  await sleep(700);
   return true;
 }
 
@@ -1281,10 +1479,15 @@ function findEditAddressTrigger() {
     const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
     return visible(element) && (modalData.includes("editAddressModal") || text.includes("edit address"));
   });
-  const preferred = triggers.find((element, index) => {
-    if (index === 0) return false;
-    const row = element.closest("[data-testid^='address-row-'], .address-row, [data-action='select_address_in_list']");
-    return /nutricity/i.test(row?.innerText || "");
+  const nutricityRowTrigger = triggers.find((element) => {
+    const row = element.closest("[data-testid='address-row-radio'], [data-testid='address-row-section'], [data-testid^='address-row-'], .address-row-section, .address-row, [data-action='select_address_in_list']");
+    return rowIsNutricityAddress(row);
+  });
+  if (nutricityRowTrigger) return nutricityRowTrigger.querySelector("a, button, span") || nutricityRowTrigger;
+
+  const preferred = triggers.find((element) => {
+    const row = element.closest("[data-testid='address-row-radio'], [data-testid='address-row-section'], [data-testid^='address-row-'], .address-row-section, .address-row, [data-action='select_address_in_list']");
+    return rowIsNutricityAddress(row);
   });
   const selected = preferred || triggers[1] || triggers[0];
   if (selected) return selected.querySelector("a, button, span") || selected;
@@ -1319,17 +1522,146 @@ function checkoutShowsRecipient(name) {
     ),
   ];
   for (const root of roots) {
-    if (!root || root.closest?.("#nutricity-panel")) continue;
+    if (!root || root.closest?.("#nutricity-panel") || root.closest?.(".a-popover, .a-popover-preload")) continue;
     const text = normalizedText(root.innerText || root.textContent);
     if (text.includes(wanted)) return true;
   }
   return false;
 }
 
+function checkoutDeliveryRecipientText() {
+  const direct = document.querySelector("#deliver-to-customer-text");
+  const candidates = [
+    direct,
+    ...document.querySelectorAll("h2, [id*='deliver-to'][id*='customer'], a[aria-label='Change delivery address']"),
+  ].filter(Boolean);
+  for (const element of candidates) {
+    if (!visible(element)) continue;
+    const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+    if (/^delivering\s+to\s+/i.test(text)) return text.replace(/^delivering\s+to\s+/i, "").trim();
+  }
+  return "";
+}
+
+function checkoutDeliveryRecipientMatches(name) {
+  const deliveredTo = normalizedText(checkoutDeliveryRecipientText());
+  const wanted = normalizedText(name);
+  return Boolean(deliveredTo && wanted && deliveredTo === wanted);
+}
+
+function findChangeDeliveryAddressButton() {
+  return [...document.querySelectorAll(
+    [
+      "a[data-csa-c-slot-id='checkout-change-shipaddressselect']",
+      "a[data-topage='shipaddressselect']",
+      "a[aria-label='Change delivery address']",
+      "a#change-delivery-link",
+      "a.expand-panel-button",
+      "a",
+      "button",
+    ].join(", "),
+  )].find((element) => {
+    const href = String(element.getAttribute?.("href") || element.href || "").toLowerCase();
+    const text = normalizedText(element.getAttribute?.("aria-label") || element.innerText || element.textContent);
+    return visible(element) && !element.disabled && (
+      element.getAttribute?.("data-csa-c-slot-id") === "checkout-change-shipaddressselect" ||
+      element.getAttribute?.("data-topage") === "shipaddressselect" ||
+      text === "change delivery address" ||
+      text === "change" && href.includes("/checkout/") && href.includes("/address")
+    );
+  });
+}
+
 function findAddressNameInput() {
   return [...document.querySelectorAll(
-    "#address-ui-widgets-enterAddressFullName, input[name='address-ui-widgets-enterAddressFullName'], input[aria-label='Full name'], input[name*='FullName'], input[id*='FullName']",
+    [
+      "#address-ui-widgets-enterAddressFullName",
+      "input[name='address-ui-widgets-enterAddressFullName']",
+      "input[aria-label='Full name']",
+      "input[aria-label='Full Name']",
+      "input[placeholder='Full name']",
+      "input[placeholder='Full Name']",
+      "input[autocomplete='name']",
+      "input[name*='FullName']",
+      "input[id*='FullName']",
+      "input[name*='fullName']",
+      "input[id*='fullName']",
+      "input[name*='Name']",
+      "input[id*='Name']",
+    ].join(", "),
   )].find((element) => visible(element) && !element.disabled);
+}
+
+function findAddressField(selectors) {
+  return [...document.querySelectorAll(selectors.join(", "))].find((element) => visible(element) && !element.disabled);
+}
+
+async function fillAddressInput(selectors, value, required = true) {
+  const input = await waitUntil(() => findAddressField(selectors), 8000, 300);
+  if (!input) return !required;
+  input.scrollIntoView({ block: "center", behavior: "smooth" });
+  await sleep(200);
+  await setInputValue(input, value);
+  await sleep(150);
+  input.blur();
+  return String(input.value || "").trim() === String(value || "").trim();
+}
+
+async function setAddressSelect(selectors, value, required = true) {
+  const select = await waitUntil(() => findAddressField(selectors), 8000, 300);
+  if (!select) return !required;
+  select.scrollIntoView({ block: "center", behavior: "smooth" });
+  await sleep(200);
+  const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+  setter ? setter.call(select, value) : (select.value = value);
+  select.dispatchEvent(new Event("input", { bubbles: true }));
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  await sleep(250);
+  return select.value === value;
+}
+
+async function fillNewDeliveryAddress(checkoutRecipient) {
+  const address = DEFAULT_NEW_DELIVERY_ADDRESS;
+  const steps = [
+    () => setAddressSelect([
+      "#address-ui-widgets-countryCode-dropdown-nativeId",
+      "select[name='address-ui-widgets-countryCode']",
+    ], address.countryCode),
+    () => fillAddressInput([
+      "#address-ui-widgets-enterAddressFullName",
+      "input[name='address-ui-widgets-enterAddressFullName']",
+      "input[autocomplete='name']",
+    ], checkoutRecipient),
+    () => fillAddressInput([
+      "#address-ui-widgets-enterAddressPhoneNumber",
+      "input[name='address-ui-widgets-enterAddressPhoneNumber']",
+      "input[autocomplete='tel']",
+    ], address.phoneNumber),
+    () => fillAddressInput([
+      "#address-ui-widgets-enterAddressLine1",
+      "input[name='address-ui-widgets-enterAddressLine1']",
+    ], address.addressLine1),
+    () => fillAddressInput([
+      "#address-ui-widgets-enterAddressLine2",
+      "input[name='address-ui-widgets-enterAddressLine2']",
+    ], address.addressLine2, false),
+    () => fillAddressInput([
+      "#address-ui-widgets-enterAddressCity",
+      "input[name='address-ui-widgets-enterAddressCity']",
+    ], address.city),
+    () => setAddressSelect([
+      "#address-ui-widgets-enterAddressStateOrRegion-dropdown-nativeId",
+      "select[name='address-ui-widgets-enterAddressStateOrRegion']",
+    ], address.stateOrRegion),
+    () => fillAddressInput([
+      "#address-ui-widgets-enterAddressPostalCode",
+      "input[name='address-ui-widgets-enterAddressPostalCode']",
+    ], address.postalCode),
+  ];
+  for (const step of steps) {
+    if (!await step()) return false;
+  }
+  return true;
 }
 
 async function waitUntil(check, timeoutMs = 12000, intervalMs = 300) {
@@ -1346,13 +1678,22 @@ async function waitUntil(check, timeoutMs = 12000, intervalMs = 300) {
 function findUseAddressButton() {
   const addressEditorOpen = Boolean(findAddressNameInput());
   const selectors = [
+    "input[data-csa-c-slot-id='address-ui-widgets-continue-edit-address-btn-bottom'][data-testid='bottom-continue-button']",
     "input[data-csa-c-slot-id*='continue-edit-address']",
     "button[data-csa-c-slot-id*='continue-edit-address']",
+    "input[data-testid='bottom-continue-button']",
+    "button[data-testid='bottom-continue-button']",
+    "input[data-testid*='continue-button']",
+    "button[data-testid*='continue-button']",
+    "input[aria-labelledby='checkout-primary-continue-button-id-announce']",
+    "#checkout-primary-continue-button-id input",
   ];
   if (addressEditorOpen) {
     selectors.push(
-      "input[data-testid='bottom-continue-button'][aria-labelledby='checkout-primary-continue-button-id-announce']",
-      "#checkout-primary-continue-button-id input",
+      ".a-popover input[type='submit']",
+      ".a-popover button[type='submit']",
+      ".a-modal-scroller input[type='submit']",
+      ".a-modal-scroller button[type='submit']",
     );
   }
   const direct = [...document.querySelectorAll(selectors.join(", "))].find((element) => visible(element) && !element.disabled);
@@ -1363,11 +1704,27 @@ function findUseAddressButton() {
     return visible(element) && [
       "use this address",
       "save address",
-      "deliver to this address",
       "continue to checkout",
       "continue",
     ].some((needle) => text.includes(needle));
   });
+}
+
+async function clickUseAddressButton(useAddress) {
+  const target = document.querySelector("#checkout-primary-continue-button-id-announce")
+    || useAddress?.closest?.("[data-action='checkout-continue-button-click-action']")?.querySelector?.("#checkout-primary-continue-button-id-announce, .a-button-text")
+    || useAddress?.closest?.("#checkout-primary-continue-button-id")?.querySelector?.("#checkout-primary-continue-button-id-announce, .a-button-text")
+    || useAddress?.closest?.("span.a-button")?.querySelector?.(".a-button-text")
+    || useAddress;
+  return clickElement(target, "Use this address button");
+}
+
+function findDeliverToThisAddressButton() {
+  if (findAddressNameInput()) return null;
+  const direct = [...document.querySelectorAll(
+    "input[data-testid='ab-select-address-continue-button-bottom'], #ab-select-address-continue-button-bottom input, input[aria-labelledby='ab-select-address-continue-button-bottom-announce']",
+  )].find((element) => visible(element) && !element.disabled);
+  return direct || findButtonByText(["deliver to this address", "use this address"]);
 }
 
 function findPaymentRadio() {
@@ -1375,18 +1732,71 @@ function findPaymentRadio() {
     .find((element) => visible(element) && !element.disabled);
 }
 
-function findPaymentSelection() {
-  const radio = findPaymentRadio();
+function cardPreferenceList(value) {
+  return String(value || "")
+    .split(/[\s,;|]+/)
+    .map((item) => item.replace(/\D/g, "").slice(-4))
+    .filter((item) => item.length === 4);
+}
+
+function paymentRowForRadio(radio) {
+  return radio?.closest?.(".a-box-inner, .a-fixed-left-grid, [data-pmts-component-id], .pmts-instrument-selector") || radio?.closest?.("label") || radio?.parentElement || radio;
+}
+
+function paymentRowText(radio) {
+  const label = radio?.closest?.("label");
+  const labelledText = label?.innerText || label?.textContent || "";
+  const root = paymentRowForRadio(radio);
+  return [labelledText, root?.innerText || root?.textContent || "", radio?.value || ""].join(" ");
+}
+
+function cardDigitsForPaymentRadio(radio) {
+  const root = paymentRowForRadio(radio);
+  const dataNumber = root?.querySelector?.("[data-number]")?.getAttribute("data-number");
+  const text = paymentRowText(radio);
+  const endingMatch = text.match(/ending\s+in\s+(\d{4})/i);
+  return (dataNumber || endingMatch?.[1] || "").replace(/\D/g, "").slice(-4);
+}
+
+function findPaymentRadioForPreferences(preferences = []) {
+  const radios = [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
+    .filter((element) => visible(element) && !element.disabled);
+  if (!radios.length) return null;
+  for (const preferred of preferences) {
+    const radio = radios.find((candidate) => cardDigitsForPaymentRadio(candidate) === preferred);
+    if (radio) return radio;
+  }
+  return radios.find((radio) => radio.checked) || radios[0];
+}
+
+function findPaymentSelection(preferences = []) {
+  const radio = findPaymentRadioForPreferences(preferences);
   if (!radio) return null;
 
-  const exactContinue = [...document.querySelectorAll("input[data-csa-c-slot-id*='continue-payselect'], button[data-csa-c-slot-id*='continue-payselect']")]
+  const paymentRoot = paymentRowForRadio(radio)?.closest?.(
+    "form, [data-testid*='pay'], [data-csa-c-slot-id*='payselect'], [data-pmts-component-id], .pmts-portal-component, body",
+  ) || document;
+  const exactContinue = [...document.querySelectorAll(
+    [
+      "input[data-csa-c-slot-id*='continue-payselect']",
+      "button[data-csa-c-slot-id*='continue-payselect']",
+      "input[data-testid='bottom-continue-button'][data-csa-c-slot-id*='payselect']",
+      "input[data-testid='secondary-continue-button'][data-csa-c-slot-id*='payselect']",
+      "button[data-testid='bottom-continue-button'][data-csa-c-slot-id*='payselect']",
+      "button[data-testid='secondary-continue-button'][data-csa-c-slot-id*='payselect']",
+      "input[name='ppw-widgetEvent:SetPaymentPlanSelectContinueEvent']",
+      "input[name='ppw-widgetEvent:SetPaymentPlanContinueEvent']",
+      "input[aria-labelledby*='continue']",
+    ].join(", "),
+  )]
     .find((element) => visible(element) && !element.disabled);
   if (exactContinue) return { radio, continueButton: exactContinue };
 
-  const continueButton = [...document.querySelectorAll("input[type='submit'], button, span.a-button")].find((element) => {
+  const continueButton = [...paymentRoot.querySelectorAll("input[type='submit'], input[type='button'], button, span.a-button")].find((element) => {
     const text = normalizedText(element.value || element.innerText || element.textContent);
     return visible(element) && !element.disabled && (
       text.includes("use this payment method") ||
+      text.includes("use this card") ||
       text === "continue" ||
       text.includes("continue")
     );
@@ -1394,11 +1804,61 @@ function findPaymentSelection() {
   return radio && continueButton ? { radio, continueButton } : null;
 }
 
-function findPlaceOrderButton() {
-  return [...document.querySelectorAll("#placeOrder, input.place-your-order-button, input[type='submit'], button, span.a-button")].find((element) => {
-    const text = normalizedText(element.value || element.innerText || element.textContent);
+function findChangePaymentButton() {
+  return [...document.querySelectorAll(
+    [
+      "a[data-csa-c-slot-id='checkout-change-payselect']",
+      "a[data-topage='payselect']",
+      "a[href*='/checkout/'][href*='/pay']",
+      "a[href*='ref_=chk_spc_chg_payselect']",
+      "button",
+      "a",
+    ].join(", "),
+  )].find((element) => {
+    const href = String(element.getAttribute?.("href") || element.href || "").toLowerCase();
+    const text = normalizedText(element.getAttribute?.("aria-label") || element.innerText || element.textContent);
     return visible(element) && !element.disabled && (
-      element.matches?.("#placeOrder, input.place-your-order-button") ||
+      element.getAttribute?.("data-csa-c-slot-id") === "checkout-change-payselect" ||
+      element.getAttribute?.("data-topage") === "payselect" ||
+      href.includes("/pay") && href.includes("checkout") ||
+      text.includes("change payment method")
+    );
+  });
+}
+
+function findAddNewDeliveryAddressLink() {
+  return [...document.querySelectorAll(
+    [
+      "#add-new-address-popover-link",
+      "a[data-csa-c-slot-id='add-new-address-non-mobile-tango-sasp']",
+      "a",
+      "button",
+      "span.a-button",
+    ].join(", "),
+  )].find((element) => {
+    const text = normalizedText(element.getAttribute?.("aria-label") || element.innerText || element.textContent);
+    return visible(element) && !element.disabled && text.includes("add a new delivery address");
+  });
+}
+
+function findPlaceOrderButton() {
+  const selectors = [
+    "input#placeOrder",
+    "input[name='placeYourOrder1']",
+    "input[data-testid='SPC_selectPlaceOrder']",
+    "input[data-csa-c-slot-id='checkout-place-your-order-button']",
+    "input.place-your-order-button",
+    "input[title='Place your order']",
+    "input[value='Place your order']",
+    "button",
+    "span.a-button",
+  ].join(", ");
+  return [...document.querySelectorAll(selectors)].find((element) => {
+    const labelledBy = element.getAttribute?.("aria-labelledby");
+    const labelText = labelledBy ? document.getElementById(labelledBy)?.textContent : "";
+    const text = normalizedText(element.value || element.title || element.innerText || element.textContent || labelText);
+    return visible(element) && !element.disabled && (
+      element.matches?.("input#placeOrder, input[name='placeYourOrder1'], input[data-testid='SPC_selectPlaceOrder'], input[data-csa-c-slot-id='checkout-place-your-order-button'], input.place-your-order-button") ||
       text.includes("place your order")
     );
   });
@@ -1428,33 +1888,172 @@ async function handleBusinessCheckoutInterstitial() {
 }
 
 async function handlePaymentSelection(activeJob) {
-  let payment = findPaymentSelection();
-  if (!payment) {
-    if (!findPaymentRadio()) return false;
-    payment = await waitUntil(findPaymentSelection, 5000);
+  try {
+    const state = await getExtensionState();
+    const cardPreferences = cardPreferenceList(state.cardLast4Preference);
+    let payment = findPaymentSelection(cardPreferences);
     if (!payment) {
-      await pauseForManualCheckout(activeJob, "Could not find the Use this payment method button.");
+      if (!findPaymentRadio()) return false;
+      payment = await waitUntil(() => findPaymentSelection(cardPreferences), 5000);
+      if (!payment) {
+        await pauseForManualCheckout(activeJob, "Amazon is asking for a payment method, but I could not find the payment Continue button.");
+        return true;
+      }
+    }
+    const selectedDigits = cardDigitsForPaymentRadio(payment.radio);
+    showPanel("Nutricity checkout", selectedDigits ? `Selecting card ending in ${selectedDigits}.` : "Selecting Amazon payment method.", null, null);
+    if (!payment.radio.checked) {
+      const target = payment.radio.closest?.("label") || payment.radio;
+      await clickElement(target, "Payment method radio");
+      if (!payment.radio.checked) {
+        payment.radio.checked = true;
+        payment.radio.dispatchEvent(new Event("input", { bubbles: true }));
+        payment.radio.dispatchEvent(new Event("change", { bubbles: true }));
+        await sleep(800);
+      }
+    }
+    if (cardPreferences.length && selectedDigits && !cardPreferences.includes(selectedDigits)) {
+      await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
+    await clickElement(payment.continueButton, "Use this payment method button");
+    showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
+    await sleep(2500);
+    activeJob.stage = "checkout";
+    await setActiveJob(activeJob);
+    return true;
+  } catch (error) {
+    await pauseForManualCheckout(activeJob, `Payment selection got stuck: ${error.message || error}`);
+    return true;
   }
-  showPanel("Nutricity checkout", "Selecting Amazon payment method.", null, null);
-  if (!payment.radio.checked) {
-    await clickElement(payment.radio, "Payment method radio");
-  }
-  await clickElement(payment.continueButton, "Use this payment method button");
-  showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
+}
+
+async function openPaymentSelectionIfAvailable() {
+  const changePayment = await waitUntil(findChangePaymentButton, 6000, 400);
+  if (!changePayment) return false;
+  showPanel("Nutricity checkout", "Opening payment method selection.", null, null);
+  await clickElement(changePayment, "Change payment method button");
   await sleep(2000);
-  await waitUntil(() => findPlaceOrderButton(), 10000);
-  activeJob.stage = "checkout";
-  await setActiveJob(activeJob);
   return true;
 }
 
-async function pauseForManualCheckout(activeJob, message) {
-  activeJob.stage = "checkout";
+async function openAddressEditorIfAvailable(activeJob) {
+  const directEditor = findAddressNameInput();
+  if (directEditor) return directEditor;
+
+  let editAddress = await waitUntil(findEditAddressTrigger, 6000, 400);
+  if (!editAddress) {
+    const changeAddress = findChangeDeliveryAddressButton();
+    if (changeAddress) {
+      showPanel("Nutricity checkout", "Opening delivery address selection.", null, null);
+      activeJob.stage = "editing_address";
+      activeJob.editAddressClickedAt = Date.now();
+      await setActiveJob(activeJob);
+      await clickElement(changeAddress, "Change delivery address link");
+      await sleep(2000);
+      editAddress = await waitUntil(findEditAddressTrigger, 10000, 400);
+      if (!editAddress && findAddressNameInput()) return findAddressNameInput();
+    }
+  }
+
+  if (!editAddress) return null;
+  await selectAddressRadioForElement(editAddress);
+  showPanel("Nutricity checkout", "Opening Amazon address editor.", null, null);
+  activeJob.stage = "editing_address";
+  activeJob.editAddressClickedAt = Date.now();
+  await setActiveJob(activeJob);
+  await clickElement(editAddress, "Edit address link");
+  await waitForElement([
+    "#address-ui-widgets-enterAddressFullName",
+    "input[name='address-ui-widgets-enterAddressFullName']",
+    "input[aria-label='Full name']",
+    "input[name*='FullName']",
+    "input[id*='FullName']",
+  ], 8000);
+  return findAddressNameInput();
+}
+
+async function openNewDeliveryAddressFormIfAvailable(activeJob) {
+  const directEditor = findAddressNameInput();
+  if (directEditor) return directEditor;
+
+  let addNewAddress = findAddNewDeliveryAddressLink();
+  if (!addNewAddress) {
+    const changeAddress = findChangeDeliveryAddressButton();
+    if (changeAddress) {
+      showPanel("Nutricity checkout", "Opening delivery address selection.", null, null);
+      activeJob.stage = "editing_address";
+      activeJob.editAddressClickedAt = Date.now();
+      await setActiveJob(activeJob);
+      await clickElement(changeAddress, "Change delivery address link");
+      await sleep(2000);
+      addNewAddress = await waitUntil(findAddNewDeliveryAddressLink, 10000, 400);
+    }
+  }
+  if (!addNewAddress) return null;
+
+  showPanel("Nutricity checkout", "Opening new delivery address form.", null, null);
+  activeJob.stage = "editing_address";
+  activeJob.editAddressClickedAt = Date.now();
+  await setActiveJob(activeJob);
+  await clickElement(addNewAddress, "Add a new delivery address link");
+  await waitForElement([
+    "#address-ui-widgets-enterAddressFullName",
+    "input[name='address-ui-widgets-enterAddressFullName']",
+    "#address-ui-widgets-enterAddressPhoneNumber",
+    "#address-ui-widgets-enterAddressLine1",
+  ], 10000);
+  return findAddressNameInput();
+}
+
+function manualNextStage(activeJob, requestedStage = "") {
+  if (requestedStage) return requestedStage;
+  const stage = String(activeJob?.stage || "");
+  if (stage === "clear_cart") return "product";
+  if (stage === "product") return "add_clicked";
+  if (stage === "add_clicked") return "navigate_next";
+  if (stage === "subscribe_checkout") return "checkout";
+  if (stage === "cart") return "checkout";
+  if (stage === "editing_address") return "checkout";
+  if (stage === "complete_pending") return "find_order_id";
+  return stage || "product";
+}
+
+async function continueAfterManualStep(activeJob, nextStage = "") {
+  const latest = await getActiveJob();
+  const next = { ...(latest || activeJob), paused: false, pausedStage: null };
+  const targetStage = manualNextStage(next, nextStage);
+  if (targetStage === "navigate_next") {
+    showPanel("Nutricity fulfilment", "Manual step done. Moving to the next item.", null, null);
+    await navigateToNext(next);
+    setTimeout(runSafely, 250);
+    return;
+  }
+  if (targetStage === "product") {
+    next.itemIndex = Number(next.itemIndex || 0);
+    next.cartCleared = true;
+  }
+  if (targetStage === "add_clicked") {
+    next.addClickedAt = Date.now();
+    markItemAdded(next);
+  }
+  next.stage = targetStage;
+  await setActiveJob(next);
+  showPanel("Nutricity fulfilment", `Manual step done. Continuing ${targetStage}.`, null, null);
+  setTimeout(runSafely, 250);
+}
+
+async function pauseForManualCheckout(activeJob, message, nextStage = "checkout") {
+  activeJob.pausedStage = activeJob.stage || "checkout";
+  activeJob.stage = activeJob.pausedStage;
   activeJob.paused = true;
   await setActiveJob(activeJob);
-  showPanel("Nutricity checkout needs attention", `${message} Make the needed Amazon checkout change, then click Resume.`, null, null);
+  showPanel(
+    "Nutricity checkout needs attention",
+    `${message} Make the needed Amazon checkout change, then click Resume to retry this step.`,
+    "I did it manually, continue",
+    () => continueAfterManualStep(activeJob, nextStage),
+  );
 }
 
 async function saveEditedAddress(activeJob, checkoutRecipient) {
@@ -1463,13 +2062,31 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   if (!filled) return false;
 
   showPanel("Nutricity checkout", "Saving Amazon address.", null, null);
-  const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "deliver to this address", "continue"]);
+  await sleep(1000);
+  const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "continue"]);
   if (!useAddress) {
     await pauseForManualCheckout(activeJob, "Could not find the Use this address button.");
     return false;
   }
-  await clickElement(useAddress, "Use this address button");
-  await sleep(2000);
+  await clickUseAddressButton(useAddress);
+  await sleep(3000);
+
+  const recipientAddressControl = await waitUntil(() => !findAddressNameInput() && recipientAddressSelectionControl(checkoutRecipient), 10000, 300);
+  if (recipientAddressControl) {
+    showPanel("Nutricity checkout", "Selecting the recipient delivery address.", null, null);
+    await clickElement(recipientAddressControl, "Recipient address row");
+  }
+
+  const deliverToThisAddress = await waitUntil(findDeliverToThisAddressButton, 5000, 300);
+  if (deliverToThisAddress) {
+    if (!recipientAddressControl && !checkoutShowsRecipient(checkoutRecipient)) {
+      await pauseForManualCheckout(activeJob, `Could not find the edited address row for "${checkoutRecipient}" after saving.`);
+      return false;
+    }
+    showPanel("Nutricity checkout", "Selecting edited delivery address.", null, null);
+    await clickElement(deliverToThisAddress, "Deliver to this address button");
+    await sleep(2000);
+  }
 
   showPanel("Nutricity checkout", "Waiting for checkout to update.", null, null);
   await waitUntil(
@@ -1478,8 +2095,92 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   );
   activeJob.stage = "checkout";
   activeJob.editAddressClickedAt = null;
+  activeJob.addressEditedRecipient = checkoutRecipient;
+  activeJob.addressEditedAt = Date.now();
   await setActiveJob(activeJob);
   return true;
+}
+
+async function saveNewDeliveryAddress(activeJob, checkoutRecipient) {
+  if (!findAddressNameInput() && !await openNewDeliveryAddressFormIfAvailable(activeJob)) {
+    await pauseForManualCheckout(activeJob, "Could not find the Add a new delivery address link.");
+    return false;
+  }
+
+  showPanel("Nutricity checkout", "Adding Amazon delivery address.", null, null);
+  const filled = await fillNewDeliveryAddress(checkoutRecipient);
+  if (!filled) {
+    await pauseForManualCheckout(activeJob, "Could not fill the new delivery address form.");
+    return false;
+  }
+
+  showPanel("Nutricity checkout", "Saving new Amazon address.", null, null);
+  await sleep(1000);
+  const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "continue"]);
+  if (!useAddress) {
+    await pauseForManualCheckout(activeJob, "Could not find the Use this address button.");
+    return false;
+  }
+  await clickUseAddressButton(useAddress);
+  await sleep(3000);
+
+  const deliverToThisAddress = await waitUntil(findDeliverToThisAddressButton, 5000, 300);
+  if (deliverToThisAddress) {
+    showPanel("Nutricity checkout", "Selecting new delivery address.", null, null);
+    await clickElement(deliverToThisAddress, "Deliver to this address button");
+    await sleep(2000);
+  }
+
+  await waitUntil(
+    () => checkoutShowsRecipient(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton() || !findAddressNameInput(),
+    12000,
+  );
+  activeJob.stage = "checkout";
+  activeJob.editAddressClickedAt = null;
+  activeJob.addressEditedRecipient = checkoutRecipient;
+  activeJob.addressEditedAt = Date.now();
+  activeJob.addressMode = "new";
+  await setActiveJob(activeJob);
+  return true;
+}
+
+async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
+  const deliveredTo = checkoutDeliveryRecipientText();
+  if (!deliveredTo) return true;
+  if (checkoutDeliveryRecipientMatches(checkoutRecipient)) {
+    activeJob.addressVerifiedRecipient = checkoutRecipient;
+    activeJob.addressVerifiedAt = Date.now();
+    activeJob.addressVerifyAttempts = 0;
+    await setActiveJob(activeJob);
+    return true;
+  }
+
+  const attempts = Number(activeJob.addressVerifyAttempts || 0) + 1;
+  activeJob.addressVerifyAttempts = attempts;
+  activeJob.addressVerifiedRecipient = "";
+  await setActiveJob(activeJob);
+  if (attempts > 2) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Delivery name still shows "${deliveredTo}" instead of "${checkoutRecipient}".`,
+    );
+    return false;
+  }
+
+  const changeAddress = findChangeDeliveryAddressButton();
+  if (!changeAddress) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Delivery name shows "${deliveredTo}" instead of "${checkoutRecipient}", and I could not find the Change delivery address link.`,
+    );
+    return false;
+  }
+  showPanel("Nutricity checkout", `Delivery name shows ${deliveredTo}. Reopening address edit.`, null, null);
+  activeJob.stage = "editing_address";
+  activeJob.editAddressClickedAt = Date.now();
+  await setActiveJob(activeJob);
+  await clickElement(changeAddress, "Change delivery address link");
+  return false;
 }
 
 async function handleCheckout(activeJob) {
@@ -1497,13 +2198,16 @@ async function handleCheckout(activeJob) {
   ], 18000);
   if (await handleBusinessCheckoutInterstitial()) return;
   const checkoutRecipient = recipientName(activeJob);
+  const extensionState = await getExtensionState();
+  const shouldEditExistingAddress = extensionState.editExistingAddress !== false;
   showPanel("Nutricity checkout", `Using recipient name: ${checkoutRecipient}`, null, null);
   if (activeJob.stage === "editing_address") {
-    if (checkoutShowsRecipient(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton()) {
-      activeJob.stage = "checkout";
-      activeJob.editAddressClickedAt = null;
-      await setActiveJob(activeJob);
-    } else if (await saveEditedAddress(activeJob, checkoutRecipient)) {
+    if (shouldEditExistingAddress && !findAddressNameInput()) {
+      await openAddressEditorIfAvailable(activeJob);
+    } else if (!shouldEditExistingAddress && !findAddressNameInput()) {
+      await openNewDeliveryAddressFormIfAvailable(activeJob);
+    }
+    if (shouldEditExistingAddress ? await saveEditedAddress(activeJob, checkoutRecipient) : await saveNewDeliveryAddress(activeJob, checkoutRecipient)) {
       // Continue in this same pass so checkout can place the order without waiting for the next interval.
     } else if (Date.now() - Number(activeJob.editAddressClickedAt || 0) > 45000) {
       activeJob.stage = "checkout";
@@ -1520,45 +2224,55 @@ async function handleCheckout(activeJob) {
     return;
   }
 
-  const handledPayment = await handlePaymentSelection(activeJob);
-  if (handledPayment) {
-    // Amazon sometimes asks for payment confirmation before the final place-order step.
+  let handledPayment = false;
+  if (findPaymentRadio()) {
+    handledPayment = await handlePaymentSelection(activeJob);
+    if (handledPayment) {
+      showPanel("Nutricity checkout", "Payment confirmed. Changing address after payment.", null, null);
+    }
+    if (activeJob.paused) return;
   }
-  if (activeJob.paused) return;
 
-  if (handledPayment) {
-    showPanel("Nutricity checkout", "Payment confirmed. Continuing checkout.", null, null);
-  } else if (checkoutShowsRecipient(checkoutRecipient)) {
-    showPanel("Nutricity checkout", "Recipient already set. Continuing checkout.", null, null);
-  } else {
-    const editAddress = findEditAddressTrigger();
-    if (editAddress) {
-      showPanel("Nutricity checkout", "Opening Amazon edit address modal.", null, null);
-      activeJob.stage = "editing_address";
-      activeJob.editAddressClickedAt = Date.now();
-      await setActiveJob(activeJob);
-      await clickElement(editAddress, "Edit address link");
-      await waitForElement([
-        "#address-ui-widgets-enterAddressFullName",
-        "input[name='address-ui-widgets-enterAddressFullName']",
-        "input[aria-label='Full name']",
-        "input[name*='FullName']",
-        "input[id*='FullName']",
-      ], 8000);
-      if (await saveEditedAddress(activeJob, checkoutRecipient)) {
-        // Continue below to place the order immediately when Amazon has returned to checkout.
+  const addressEditIsFresh = activeJob.addressEditedRecipient === checkoutRecipient && Date.now() - Number(activeJob.addressEditedAt || 0) < 30000;
+  if (!addressEditIsFresh) {
+    if (shouldEditExistingAddress) {
+      const addressRow = nutricityAddressRow();
+      if (addressRow) {
+        addressRow.scrollIntoView({ block: "center", behavior: "smooth" });
+        await sleep(250);
+      }
+      const addressEditor = await openAddressEditorIfAvailable(activeJob);
+      if (addressEditor) {
+        if (await saveEditedAddress(activeJob, checkoutRecipient)) {
+          // Continue below to place the order immediately when Amazon has returned to checkout.
+        } else {
+          return;
+        }
       } else {
+        await pauseForManualCheckout(activeJob, "Could not find the Change delivery address or Edit address link for the Nutricity address.");
         return;
       }
+    } else {
+      const addressEditor = await openNewDeliveryAddressFormIfAvailable(activeJob);
+      if (!addressEditor) {
+        await pauseForManualCheckout(activeJob, "Could not find the Add a new delivery address link.");
+        return;
+      }
+      if (!await saveNewDeliveryAddress(activeJob, checkoutRecipient)) return;
     }
+  } else {
+    showPanel("Nutricity checkout", "Recipient address edit saved. Continuing checkout.", null, null);
   }
+
+  if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
 
   if (!handledPayment && !checkoutShowsRecipient(checkoutRecipient) && !findPlaceOrderButton() && await fillFullName(checkoutRecipient)) {
     await sleep(1200);
     const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "deliver to this address", "continue"]);
     if (useAddress) {
-      await clickElement(useAddress, "Use this address button");
-      await sleep(2000);
+      await sleep(1000);
+      await clickUseAddressButton(useAddress);
+      await sleep(3000);
       await waitUntil(() => checkoutShowsRecipient(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton(), 10000);
     } else {
       await pauseForManualCheckout(activeJob, "Could not find the Use this address button.");
@@ -1566,19 +2280,30 @@ async function handleCheckout(activeJob) {
     }
   }
 
-  if (!handledPayment && await handlePaymentSelection(activeJob)) {
+  if (!handledPayment && findPaymentRadio() && await handlePaymentSelection(activeJob)) {
+    handledPayment = true;
     // Continue below to place the order if Amazon exposed the final button.
   }
   if (activeJob.paused) return;
 
-  const placeOrder = await waitUntil(findPlaceOrderButton, 10000) || await waitForElement(["#placeOrder:not([disabled])", "input.place-your-order-button:not([disabled])"], 3000) || findButtonByText(["place your order"]);
+  if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
+
+  const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
+    || await waitForElement([
+      "input#placeOrder:not([disabled])",
+      "input[name='placeYourOrder1']:not([disabled])",
+      "input[data-testid='SPC_selectPlaceOrder']:not([disabled])",
+      "input[data-csa-c-slot-id='checkout-place-your-order-button']:not([disabled])",
+      "input.place-your-order-button:not([disabled])",
+    ], 5000)
+    || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
     showPanel("Final step", "Clicking Place your order now.", null, null);
     activeJob.stage = "complete_pending";
     await setActiveJob(activeJob);
     await clickElement(placeOrder, "Place your order button");
   } else {
-    await pauseForManualCheckout(activeJob, "Could not find the payment or Place your order control.");
+    await pauseForManualCheckout(activeJob, "Could not find the payment or Place your order control.", "complete_pending");
   }
 }
 
@@ -1649,11 +2374,7 @@ async function handleCompletion(activeJob) {
   await waitForElement(["body"], 8000);
   const orderId = extractOrderId();
   if (orderId) {
-    showPanel("Nutricity fulfilment", "Amazon order placed. Reporting back to the app.", null, null);
-    activeJob.stage = "reporting_complete";
-    activeJob.reportedOrderId = orderId;
-    await setActiveJob(activeJob);
-    await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
+    await reportAmazonOrder(activeJob, orderId);
     return;
   }
   if (!confirmationSaysPlaced()) return;
@@ -1673,11 +2394,32 @@ async function handleOrderHistory(activeJob) {
     showPanel("Nutricity fulfilment", `Looking for recent Amazon order for ${activeJob.job.recipient_name}.`, null, null);
     return;
   }
+  await reportAmazonOrder(activeJob, orderId);
+}
+
+async function reportAmazonOrder(activeJob, orderId) {
   showPanel("Nutricity fulfilment", `Found Amazon order ${orderId}. Reporting back to the app.`, null, null);
   activeJob.stage = "reporting_complete";
   activeJob.reportedOrderId = orderId;
+  activeJob.reportAttemptedAt = Date.now();
   await setActiveJob(activeJob);
-  await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
+  const result = await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
+  if (!result?.ok) {
+    const message = result?.message || "Could not report Amazon order back to the app.";
+    activeJob.paused = true;
+    activeJob.pausedStage = "reporting_complete";
+    activeJob.reportError = message;
+    await setActiveJob(activeJob);
+    showPanel(
+      "Nutricity reporting needs attention",
+      `${message} Amazon order ${orderId} was found, but the app did not confirm completion.`,
+      "Retry reporting",
+      () => continueAfterManualStep(activeJob, "reporting_complete"),
+    );
+    return false;
+  }
+  showPanel("Nutricity fulfilment", result.message || `Reported Amazon order ${orderId}.`, null, null);
+  return true;
 }
 
 async function run() {
@@ -1685,12 +2427,21 @@ async function run() {
   const activeJob = await getActiveJob();
   if (!activeJob?.job || !/amazon\.com$/i.test(location.hostname)) return;
   if (activeJob.paused) {
-    showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
+    showPanel(
+      "Nutricity fulfilment paused",
+      "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",
+      "I did it manually, continue",
+      () => continueAfterManualStep(activeJob),
+    );
     return;
   }
   try {
     if (activeJob.stage === "reporting_complete") {
-      showPanel("Nutricity fulfilment", `Reporting Amazon order ${activeJob.reportedOrderId || ""} back to the app.`, null, null);
+      if (activeJob.reportedOrderId) {
+        await reportAmazonOrder(activeJob, activeJob.reportedOrderId);
+      } else {
+        showPanel("Nutricity fulfilment", "Reporting Amazon order back to the app.", null, null);
+      }
     } else if (activeJob.stage === "complete_pending") {
       await handleCompletion(activeJob);
     } else if (activeJob.stage === "subscribe_checkout") {
@@ -1723,6 +2474,18 @@ async function run() {
     const item = activeJob.job.items?.[activeJob.itemIndex];
     const purchaseItem = item ? selectedVariantItem(activeJob, item) : item;
     const shouldMarkItemMissing = Boolean(error.failureCode || error.missingAsin);
+    if (!shouldMarkItemMissing) {
+      activeJob.pausedStage = activeJob.stage || "product";
+      activeJob.paused = true;
+      await setActiveJob(activeJob);
+      showPanel(
+        "Nutricity fulfilment needs attention",
+        `${error.message} Complete the stuck Amazon step manually, then continue.`,
+        "I did it manually, continue",
+        () => continueAfterManualStep(activeJob),
+      );
+      return;
+    }
     await send({
       type: "FAIL_JOB",
       message: error.message,

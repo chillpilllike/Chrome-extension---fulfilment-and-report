@@ -16,6 +16,14 @@
         Admin token
         <input id="adminToken" type="password" spellcheck="false" autocomplete="off">
       </label>
+      <label>
+        Card last 4 preference
+        <input id="cardLast4Preference" spellcheck="false" placeholder="4421, 3454">
+      </label>
+      <label class="checkbox-row">
+        <input id="editExistingAddress" type="checkbox">
+        <span>Edit existing address</span>
+      </label>
       <div class="actions">
         <button id="save">Save</button>
         <button id="testConnection" class="secondary">Check connection</button>
@@ -24,6 +32,7 @@
         <button id="stop" class="secondary">Stop</button>
         <button id="clearFailed" class="danger">Clear stale queue</button>
       </div>
+      <section id="connectionNotice" class="connection-notice" hidden></section>
       <section id="status"></section>
       <section class="queue">
         <div class="section-title">

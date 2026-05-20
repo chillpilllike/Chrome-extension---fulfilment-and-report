@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="orders-shell">
+  <div class="orders-toolbar">
+    <form method="get" action="/chrome-queue" class="toolbar-form">
+      <label>Store</label>
+      <select name="store_id" onchange="this.form.submit()">
+        <option value="" {% if not current_store_id %}selected{% endif %}>All stores</option>
+        {% for store in stores %}
+        <option value="{{ store.id }}" {% if store.id == current_store_id %}selected{% endif %}>{{ store.name }}</option>
+        {% endfor %}
+      </select>
+      <button>Refresh</button>
+    </form>
+    <a class="button" href="/legacy{% if current_store_id %}?store_id={{ current_store_id }}{% endif %}">Orders</a>
+  </div>
+
+  {% if message %}
+  <section class="alert {% if status == 'ok' %}alert-success{% else %}alert-warning{% endif %}">
+    {{ message }}
+  </section>
+  {% endif %}
+
+  <section class="stats">
+    {% for item in counts %}
+    <div><strong>{{ item.count }}</strong><span>{{ item.state }}{% if item.locked %} · {{ item.locked }} locked{% endif %}</span></div>
+    {% endfor %}
+    {% if not counts %}
+    <div><strong>0</strong><span>queued</span></div>
+    {% endif %}
+  </section>
+
+  <section class="table-wrap">
+    <table id="chrome-queue-table">
+      <thead>
+        <tr>
+          <th>Group</th>
+          <th>Orders</th>
+          <th>Recipient</th>
+          <th>Items</th>
+          <th>Lock</th>
+          <th>Expires</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr class="{% if job.claimed_by %}row-alert{% endif %}">
+          <td><code>{{ job.group_key }}</code></td>
+          <td>{{ (job.order_names or [])|join(", ") }}</td>
+          <td>{{ job.recipient_name or "" }}</td>
+          <td>
+            {% for item in job.items or [] %}
+            <div><code>{{ item.asin }}</code> × {{ item.quantity }}</div>
+            {% endfor %}
+          </td>
+          <td>
+            {% if job.claimed_by %}
+            <span class="pill">Locked</span>
+            <small>{{ job.claimed_by }}</small>
+            {% else %}
+            <span class="pill">Ready</span>
+            {% endif %}
+          </td>
+          <td>{{ job.claim_expires_at or "" }}</td>
+          <td>
+            {% if job.claimed_by %}
+            <form method="post" action="/chrome-queue/release" onsubmit="return confirm('Break this Chrome job lock only if no extension is currently working on it. Continue?')">
+              <input type="hidden" name="group_key" value="{{ job.group_key }}">
+              <input type="hidden" name="store_id" value="{{ current_store_id or '' }}">
+              <button class="danger">Break lock</button>
+            </form>
+            {% else %}
+            <span class="muted">No lock</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        {% if not jobs %}
+        <tr>
+          <td colspan="7">No queued Chrome jobs.</td>
+        </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </section>
+</section>
+{% endblock %}
