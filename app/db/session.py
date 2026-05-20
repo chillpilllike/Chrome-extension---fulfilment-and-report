@@ -7,7 +7,7 @@ from typing import Any, Iterable, Optional
 
 import psycopg2
 from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 from app.core.config import DEFAULT_SERVICE_SETTINGS
 
@@ -70,6 +70,25 @@ class PostgresCursor:
         self.lastrowid = None
         return self
 
+    def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> "PostgresCursor":
+        translated = _translate_sql(sql)
+        self._cursor.executemany(translated, [tuple(params or ()) for params in seq_of_params])
+        self.lastrowid = None
+        return self
+
+    def execute_values(
+        self,
+        sql: str,
+        argslist: Iterable[Iterable[Any]],
+        template: str | None = None,
+        page_size: int = 1000,
+    ) -> "PostgresCursor":
+        translated = _translate_sql(sql)
+        translated_template = _translate_placeholders(template) if template else None
+        execute_values(self._cursor, translated, [tuple(params or ()) for params in argslist], template=translated_template, page_size=page_size)
+        self.lastrowid = None
+        return self
+
     def fetchone(self) -> Optional[dict[str, Any]]:
         row = self._cursor.fetchone()
         return dict(row) if row else None
@@ -110,6 +129,20 @@ class PostgresConnection:
             )
         cursor = self.cursor()
         return cursor.execute(sql, params)
+
+    def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> PostgresCursor:
+        cursor = self.cursor()
+        return cursor.executemany(sql, seq_of_params)
+
+    def execute_values(
+        self,
+        sql: str,
+        argslist: Iterable[Iterable[Any]],
+        template: str | None = None,
+        page_size: int = 1000,
+    ) -> PostgresCursor:
+        cursor = self.cursor()
+        return cursor.execute_values(sql, argslist, template=template, page_size=page_size)
 
     def executescript(self, script: str) -> None:
         statements = [statement.strip() for statement in script.split(";") if statement.strip()]

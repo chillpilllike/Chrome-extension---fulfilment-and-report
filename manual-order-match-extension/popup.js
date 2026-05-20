@@ -2,14 +2,28 @@ function qs(id) {
   return document.getElementById(id);
 }
 
+const settingsInputs = ["apiBase", "adminToken", "maxPages"].map(qs);
+let settingsDirty = false;
+
+settingsInputs.forEach((input) => {
+  input.addEventListener("input", () => {
+    settingsDirty = true;
+  });
+});
+
 async function send(message) {
   return chrome.runtime.sendMessage(message);
 }
 
-function render(state) {
+function syncSettingsInputs(state) {
+  if (settingsDirty || settingsInputs.includes(document.activeElement)) return;
   qs("apiBase").value = state.apiBase || "http://127.0.0.1:8000";
   qs("adminToken").value = state.adminToken || "";
   qs("maxPages").value = state.maxPages || state.run?.maxPages || 10;
+}
+
+function render(state) {
+  syncSettingsInputs(state);
   const run = state.run || {};
   qs("status").textContent = run.running
     ? `Running. Pages scanned: ${run.pagesScanned || 0}/${run.maxPages || 10}. Orders seen: ${(run.seenOrderIds || []).length}.`
@@ -28,6 +42,7 @@ async function saveSettings() {
     adminToken: qs("adminToken").value.trim(),
     maxPages: Number(qs("maxPages").value || 10),
   });
+  if (response?.ok) settingsDirty = false;
   qs("status").textContent = response?.ok ? "Saved." : response?.message || "Save failed.";
   await refresh();
 }

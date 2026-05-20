@@ -8,6 +8,20 @@ const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
 
 let targetWindowId = null;
+let settingsDirty = false;
+
+[apiBase, adminToken, intervalDays].forEach((input) => {
+  input.addEventListener("input", () => {
+    settingsDirty = true;
+  });
+});
+
+function syncSettingsInputs(state) {
+  if (settingsDirty || [apiBase, adminToken, intervalDays].includes(document.activeElement)) return;
+  apiBase.value = state.apiBase || "http://127.0.0.1:8000";
+  adminToken.value = state.adminToken || "";
+  intervalDays.value = state.intervalDays ?? 1;
+}
 
 async function resolveTargetWindowId() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -25,9 +39,7 @@ function setStatus(text) {
 async function refresh() {
   if (!targetWindowId) await resolveTargetWindowId();
   const state = await send({ type: "GET_STATE" });
-  apiBase.value = state.apiBase || "http://127.0.0.1:8000";
-  adminToken.value = state.adminToken || "";
-  intervalDays.value = state.intervalDays ?? 1;
+  syncSettingsInputs(state);
   const run = state.epostRun || {};
   setStatus(run.running ? `Running: batch ${run.batchIndex + 1 || 1}/${run.batches?.length || 0}` : "Stopped");
   logsBox.innerHTML = "";
@@ -40,11 +52,13 @@ async function refresh() {
 
 document.querySelector("#save").addEventListener("click", async () => {
   const result = await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1) });
+  if (result.ok) settingsDirty = false;
   setStatus(result.ok ? "Saved." : result.message);
 });
 
 document.querySelector("#testConnection").addEventListener("click", async () => {
   await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1) });
+  settingsDirty = false;
   const result = await send({ type: "TEST_CONNECTION" });
   setStatus(result.message || (result.ok ? "Connection ok." : "Connection failed."));
 });

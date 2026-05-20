@@ -13,6 +13,19 @@ function send(message) {
 }
 
 let targetWindowId = Number(new URLSearchParams(location.search).get("targetWindowId") || 0) || null;
+let settingsDirty = false;
+
+[apiBase, adminToken].forEach((input) => {
+  input.addEventListener("input", () => {
+    settingsDirty = true;
+  });
+});
+
+function syncSettingsInputs(state) {
+  if (settingsDirty || [apiBase, adminToken].includes(document.activeElement)) return;
+  apiBase.value = state.apiBase || "http://127.0.0.1:8000";
+  adminToken.value = state.adminToken || "";
+}
 
 function setStatus(text) {
   statusBox.textContent = text;
@@ -89,8 +102,7 @@ function renderQueuedJobs(jobs, workerId = "") {
 
 async function refresh() {
   const state = await send({ type: "GET_STATE" });
-  apiBase.value = state.apiBase || "http://127.0.0.1:8000";
-  adminToken.value = state.adminToken || "";
+  syncSettingsInputs(state);
   const job = state.activeJob?.job;
   pauseResume.textContent = state.activeJob?.paused ? "Resume" : "Pause";
   pauseResume.disabled = !job;
@@ -114,11 +126,13 @@ async function refresh() {
 
 document.querySelector("#save").addEventListener("click", async () => {
   const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim() });
+  if (result.ok) settingsDirty = false;
   setStatus(result.ok ? "Saved." : result.message);
 });
 
 document.querySelector("#testConnection").addEventListener("click", async () => {
   await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim() });
+  settingsDirty = false;
   const result = await send({ type: "TEST_CONNECTION" });
   setStatus(result.message || (result.ok ? "Connection ok." : "Connection failed."));
 });

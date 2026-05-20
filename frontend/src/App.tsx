@@ -2269,8 +2269,9 @@ function App() {
             )}
           </div>
         </div>
-        <div className="navbar-tabs" ref={navTabsRef}>
-          <div className="container-xl flex items-center justify-between gap-4">
+      </header>
+      <nav className="navbar-tabs d-print-none" ref={navTabsRef}>
+        <div className="container-xl flex items-center justify-between gap-4">
           <ul className="navbar-nav nav-tabs">
             <li className={`nav-item ${page === "home" ? "active" : ""}`}>
               <button className={`nav-link ${page === "home" ? "active" : ""}`} onClick={() => { setPage("home"); setOpenNavGroup(null) }}>
@@ -2317,9 +2318,8 @@ function App() {
               <span className="nav-link-icon"><Settings className="size-4" /></span>
               <span className="nav-link-title">Settings</span>
             </button>
-          </div>
         </div>
-      </header>
+      </nav>
 
       <main className="page-wrapper">
       <div className="page-header d-print-none">

@@ -4069,6 +4069,85 @@ def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Op
     return expanded_ids or selected_ids
 
 
+def chunked(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def persist_chrome_order_groups(
+    conn: Any,
+    grouped: dict[str, list[dict[str, Any]]],
+    amazon_account: dict[str, Any],
+    address_id: int,
+) -> tuple[int, list[str]]:
+    if not grouped:
+        return 0, []
+    now = utc_now()
+    updates: list[tuple[Any, ...]] = []
+    attempts: list[tuple[Any, ...]] = []
+    details: list[str] = []
+    for group_key_seed, group_lines in grouped.items():
+        group_key = f"chrome-{group_lines[0]['store_id']}-{group_key_seed}-{uuid.uuid4().hex[:10]}"
+        order_names = list(dict.fromkeys(str(line["odoo_order_name"]) for line in group_lines))
+        attempt_payload = {
+            "group_key": group_key,
+            "order_names": order_names,
+            "recipient_name": chrome_recipient_name(order_names),
+            "address_id": address_id,
+            "amazon_account_id": amazon_account["id"],
+            "items": [
+                {
+                    "line_id": line["id"],
+                    "asin": line["asin"],
+                    "quantity": line["quantity"],
+                    "product_name": line["product_name"],
+                }
+                for line in group_lines
+            ],
+        }
+        payload_json = json.dumps(attempt_payload)
+        for line in group_lines:
+            updates.append((line["id"], group_key))
+            attempts.append((line["id"], group_key, payload_json, now))
+            if len(details) < 8:
+                details.append(f"{line['odoo_order_name']} {line['asin']}: queued for Chrome extension ordering")
+    for batch in chunked(updates, 2000):
+        values_sql = ",".join(["(?, ?)"] * len(batch))
+        params: list[Any] = []
+        for line_id, group_key in batch:
+            params.extend([line_id, group_key])
+        conn.execute(
+            f"""
+            WITH queued(line_id, group_key) AS (VALUES {values_sql})
+            UPDATE order_lines
+            SET state='submitted',
+                amazon_status='chrome_queued',
+                order_engine='chrome',
+                amazon_group_key=queued.group_key,
+                amazon_account_id=?,
+                amazon_account_name=?,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                last_error=NULL,
+                updated_at=?
+            FROM queued
+            WHERE order_lines.id=queued.line_id
+            """,
+            [*params, amazon_account["id"], amazon_account["name"], now],
+        )
+    conn.execute_values(
+        """
+        INSERT INTO amazon_attempts
+        (order_line_id, external_id, mode, request_json, response_json, status, error, created_at)
+        VALUES ?
+        """,
+        attempts,
+        template="(?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)",
+        page_size=1000,
+    )
+    return len(grouped), details
+
+
 def queue_chrome_order_groups(
     lines: list[dict[str, Any]],
     amazon_account: dict[str, Any],
@@ -4084,53 +4163,8 @@ def queue_chrome_order_groups(
         for line in lines:
             grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
     with db() as conn:
-        for group_key_seed, group_lines in grouped.items():
-            group_key = f"chrome-{group_lines[0]['store_id']}-{group_key_seed}-{uuid.uuid4().hex[:10]}"
-            order_names = list(dict.fromkeys(str(line["odoo_order_name"]) for line in group_lines))
-            attempt_payload = {
-                "group_key": group_key,
-                "order_names": order_names,
-                "recipient_name": chrome_recipient_name(order_names),
-                "address_id": fulfilment_address["id"],
-                "amazon_account_id": amazon_account["id"],
-                "items": [
-                    {
-                        "line_id": line["id"],
-                        "asin": line["asin"],
-                        "quantity": line["quantity"],
-                        "product_name": line["product_name"],
-                    }
-                    for line in group_lines
-                ],
-            }
-            for line in group_lines:
-                conn.execute(
-                    """
-                    UPDATE order_lines
-                    SET state='submitted',
-                        amazon_status='chrome_queued',
-                        order_engine='chrome',
-                        amazon_group_key=?,
-                        amazon_account_id=?,
-                        amazon_account_name=?,
-                        chrome_claimed_by=NULL,
-                        chrome_claimed_at=NULL,
-                        chrome_claim_expires_at=NULL,
-                        last_error=NULL,
-                        updated_at=?
-                    WHERE id=?
-                    """,
-                    (group_key, amazon_account["id"], amazon_account["name"], utc_now(), line["id"]),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO amazon_attempts
-                    (order_line_id, external_id, mode, request_json, response_json, status, error, created_at)
-                    VALUES (?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)
-                    """,
-                    (line["id"], group_key, json.dumps(attempt_payload), utc_now()),
-                )
-    return len(grouped)
+        queued, _ = persist_chrome_order_groups(conn, grouped, amazon_account, int(fulfilment_address["id"]))
+    return queued
 
 
 def queue_chrome_order_groups_fast(
@@ -4177,6 +4211,8 @@ def queue_chrome_order_groups_fast(
             raise HTTPException(400, "Add a fulfilment address before placing Amazon orders.")
 
         line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
+        if line_ids is not None and not line_ids:
+            return 0, int(cleared_cursor.rowcount or 0), account, []
         where_line_ids = ""
         params: list[Any] = [store_id]
         if line_ids:
@@ -4206,55 +4242,8 @@ def queue_chrome_order_groups_fast(
             for line in lines:
                 grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
 
-        details: list[str] = []
-        for group_key_seed, group_lines in grouped.items():
-            group_key = f"chrome-{group_lines[0]['store_id']}-{group_key_seed}-{uuid.uuid4().hex[:10]}"
-            order_names = list(dict.fromkeys(str(line["odoo_order_name"]) for line in group_lines))
-            attempt_payload = {
-                "group_key": group_key,
-                "order_names": order_names,
-                "recipient_name": chrome_recipient_name(order_names),
-                "address_id": address["id"],
-                "amazon_account_id": account["id"],
-                "items": [
-                    {
-                        "line_id": line["id"],
-                        "asin": line["asin"],
-                        "quantity": line["quantity"],
-                        "product_name": line["product_name"],
-                    }
-                    for line in group_lines
-                ],
-            }
-            for line in group_lines:
-                conn.execute(
-                    """
-                    UPDATE order_lines
-                    SET state='submitted',
-                        amazon_status='chrome_queued',
-                        order_engine='chrome',
-                        amazon_group_key=?,
-                        amazon_account_id=?,
-                        amazon_account_name=?,
-                        chrome_claimed_by=NULL,
-                        chrome_claimed_at=NULL,
-                        chrome_claim_expires_at=NULL,
-                        last_error=NULL,
-                        updated_at=?
-                    WHERE id=?
-                    """,
-                    (group_key, account["id"], account["name"], utc_now(), line["id"]),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO amazon_attempts
-                    (order_line_id, external_id, mode, request_json, response_json, status, error, created_at)
-                    VALUES (?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)
-                    """,
-                    (line["id"], group_key, json.dumps(attempt_payload), utc_now()),
-                )
-                details.append(f"{line['odoo_order_name']} {line['asin']}: queued for Chrome extension ordering")
-        return len(grouped), int(cleared_cursor.rowcount or 0), account, details[:8]
+        queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
+        return queued, int(cleared_cursor.rowcount or 0), account, details
 
 
 def queue_chrome_order_groups_fast_task(

@@ -5,6 +5,19 @@ const apiBase = document.querySelector("#apiBase");
 const adminToken = document.querySelector("#adminToken");
 const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
+let settingsDirty = false;
+
+[apiBase, adminToken].forEach((input) => {
+  input.addEventListener("input", () => {
+    settingsDirty = true;
+  });
+});
+
+function syncSettingsInputs(state) {
+  if (settingsDirty || [apiBase, adminToken].includes(document.activeElement)) return;
+  apiBase.value = state.apiBase || "http://127.0.0.1:8000";
+  adminToken.value = state.adminToken || "";
+}
 
 function send(message) {
   return chrome.runtime.sendMessage(message);
@@ -12,8 +25,7 @@ function send(message) {
 
 async function refresh() {
   const state = await send({ type: "GET_STATE" });
-  apiBase.value = state.apiBase || "http://127.0.0.1:8000";
-  adminToken.value = state.adminToken || "";
+  syncSettingsInputs(state);
   const run = state.invoiceRun || {};
   statusBox.textContent = run.running ? `Running: ${run.index + 1 || 1}/${run.orders?.length || 0}` : "Stopped";
   logsBox.innerHTML = "";
@@ -26,10 +38,12 @@ async function refresh() {
 
 document.querySelector("#save").addEventListener("click", async () => {
   await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim() });
+  settingsDirty = false;
 });
 
 document.querySelector("#testConnection").addEventListener("click", async () => {
   await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim() });
+  settingsDirty = false;
   const result = await send({ type: "TEST_CONNECTION" });
   statusBox.textContent = result.message || (result.ok ? "Connection ok." : "Connection failed.");
 });

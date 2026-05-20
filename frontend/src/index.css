@@ -216,7 +216,16 @@
 }
 
 .tabler-admin-shell .navbar-tabs > .container-xl {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
     min-height: 3rem;
+}
+
+.tabler-admin-shell .navbar-tabs .navbar-nav {
+    flex-direction: row;
+    align-items: center;
 }
 
 .tabler-admin-shell .navbar-brand {
