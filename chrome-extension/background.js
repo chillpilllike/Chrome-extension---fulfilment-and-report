@@ -426,6 +426,32 @@ async function failJob(message, details = {}, windowId) {
   return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
 }
 
+async function markLineMissing(message, details = {}, windowId) {
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job) return { ok: false, message: "No active job." };
+  try {
+    await heartbeatJob(activeJob, windowId);
+  } catch (error) {
+    await log(`Continuing partial missing report after heartbeat failed for ${activeJob.job.group_key}: ${error.message}`, windowId);
+  }
+  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/missing-line`, {
+    method: "POST",
+    body: JSON.stringify({
+      message,
+      line_ids: activeJob.job.line_ids || [],
+      missing_asin: details.missingAsin || "",
+      missing_line_id: details.missingLineId || null,
+      failure_code: details.failureCode || "",
+      requested_quantity: details.requestedQuantity ?? null,
+      fulfilled_quantity: details.fulfilledQuantity ?? null,
+      available_quantity: details.availableQuantity ?? null,
+      worker_id: activeJob.workerId || "",
+    }),
+  });
+  await log(`Partially marked missing in ${activeJob.job.group_key}: ${message}`, windowId);
+  return result;
+}
+
 async function costlyJob(message, details = {}, windowId) {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
@@ -532,6 +558,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true };
     }
     if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId);
+    if (message.type === "MARK_LINE_MISSING") return markLineMissing(message.message || "Chrome extension line is missing.", message, windowId);
     if (message.type === "FAIL_JOB") return failJob(message.message || "Chrome extension job failed.", message, windowId);
     if (message.type === "COSTLY_JOB") return costlyJob(message.message || "Chrome extension job needs costly approval.", message, windowId);
     if (message.type === "CLEAR_FAILED_JOBS") return clearFailedJobs();

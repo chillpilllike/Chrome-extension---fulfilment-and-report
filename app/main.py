@@ -2004,6 +2004,80 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
     return len(rows)
 
 
+def mark_chrome_line_missing(group_key: str, message: str, missing_asin: str = "", missing_line_id: Optional[int] = None) -> dict[str, Any]:
+    missing_asin = normalize_asin(missing_asin)
+    updated_rows: list[dict[str, Any]] = []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND COALESCE(amazon_order_id, '') = ''
+            ORDER BY id
+            """,
+            (group_key,),
+        ).fetchall()
+        if not rows:
+            return {"count": 0, "remaining_line_ids": []}
+        target_ids = [
+            int(row["id"])
+            for row in rows
+            if (
+                (missing_line_id and int(row["id"]) == int(missing_line_id))
+                or (missing_asin and str(row["asin"]).upper() == missing_asin)
+            )
+        ]
+        if not target_ids and len(rows) == 1:
+            target_ids = [int(rows[0]["id"])]
+        if not target_ids:
+            return {"count": 0, "remaining_line_ids": [int(row["id"]) for row in rows if str(row["state"]) == "submitted"]}
+        placeholders = ",".join("?" for _ in target_ids)
+        conn.execute(
+            f"""
+            UPDATE order_lines
+            SET state='missing',
+                amazon_status='missing',
+                last_error=?,
+                missing_asin=?,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                updated_at=?
+            WHERE id IN ({placeholders})
+            """,
+            [message, missing_asin, utc_now(), *target_ids],
+        )
+        for row in conn.execute(f"SELECT * FROM order_lines WHERE id IN ({placeholders})", target_ids).fetchall():
+            updated_rows.append(row)
+        remaining = conn.execute(
+            """
+            SELECT id
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+            ORDER BY id
+            """,
+            (group_key,),
+        ).fetchall()
+        remaining_line_ids = [int(row["id"]) for row in remaining]
+        if not remaining_line_ids:
+            conn.execute(
+                """
+                UPDATE amazon_attempts
+                SET status='missing', error=?
+                WHERE external_id=? AND mode='chrome'
+                """,
+                (message, group_key),
+            )
+    for updated in updated_rows:
+        index_order_line(updated)
+    return {"count": len(target_ids), "remaining_line_ids": remaining_line_ids}
+
+
 def _quantity_text(value: Any) -> str:
     if value is None:
         return ""
@@ -9809,6 +9883,25 @@ def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[s
         f"Chrome fulfilment job failed or paused.\nGroup: {group_key}\nWorker: {payload.worker_id}\nError: {message}",
     )
     return {"ok": True, "message": f"Marked {cursor.rowcount} Chrome line(s) as error."}
+
+
+@app.post("/api/chrome/jobs/{group_key}/missing-line")
+def api_chrome_job_missing_line(group_key: str, payload: ChromeJobFailPayload) -> dict[str, Any]:
+    message = clean_error_message(payload.message)
+    missing_asin = normalize_asin(payload.missing_asin)
+    with db() as conn:
+        ensure_chrome_job_owner(conn, group_key, payload.worker_id)
+    result = mark_chrome_line_missing(group_key, message, missing_asin, payload.missing_line_id)
+    count = int(result.get("count") or 0)
+    if not count:
+        raise HTTPException(404, "Could not identify the missing line in this Chrome job.")
+    remaining_line_ids = [int(value) for value in result.get("remaining_line_ids") or []]
+    return {
+        "ok": True,
+        "message": f"Moved {count} Chrome line(s) to Missing ASINs. {len(remaining_line_ids)} line(s) remain in this Amazon order.",
+        "remaining_line_ids": remaining_line_ids,
+        "remaining_count": len(remaining_line_ids),
+    }
 
 
 @app.post("/api/chrome/jobs/{group_key}/costly")

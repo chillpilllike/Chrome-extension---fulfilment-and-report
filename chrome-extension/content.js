@@ -919,7 +919,60 @@ function amazonProductPageErrorMessage() {
   return "";
 }
 
-async function failCurrentItemAsMissing(item, purchaseItem, message, failureCode = "unavailable") {
+function removeMissingItemFromActiveJob(activeJob, item, purchaseItem = item) {
+  if (!item) return activeJob.job?.items || [];
+  const missingLineId = itemPrimaryLineId(item);
+  const missingAsins = new Set([item?.asin, purchaseItem?.asin].filter(Boolean).map((asin) => String(asin).toUpperCase()));
+  const currentIndex = Number(activeJob.itemIndex || 0);
+  const remainingItems = (activeJob.job?.items || []).filter((entry) => {
+    const lineId = itemPrimaryLineId(entry);
+    if (missingLineId && lineId === missingLineId) return false;
+    if (missingLineId) return true;
+    return !missingAsins.has(String(entry.asin || "").toUpperCase());
+  });
+  activeJob.job.items = remainingItems;
+  activeJob.job.line_ids = (activeJob.job.line_ids || []).filter((lineId) => !missingLineId || lineId !== missingLineId);
+  if (activeJob.pricing) {
+    for (const asin of missingAsins) delete activeJob.pricing[asin];
+  }
+  activeJob.itemIndex = currentIndex;
+  return remainingItems;
+}
+
+async function continueAfterPartialMissing(activeJob, item, purchaseItem, message, failureCode = "unavailable", details = {}) {
+  if (!item) return false;
+  const lineId = itemPrimaryLineId(item);
+  if (!lineId || (activeJob.job?.items || []).length <= 1) return false;
+  showPanel("Sending line to Missing ASINs", message, null, null);
+  const result = await send({
+    type: "MARK_LINE_MISSING",
+    message,
+    missingAsin: item?.asin || purchaseItem?.asin || currentAsinFromUrl(),
+    missingLineId: lineId,
+    failureCode,
+    requestedQuantity: details.requestedQuantity ?? null,
+    fulfilledQuantity: details.fulfilledQuantity ?? null,
+    availableQuantity: details.availableQuantity ?? null,
+  });
+  if (!result?.ok) return false;
+  const remainingItems = removeMissingItemFromActiveJob(activeJob, item, purchaseItem);
+  if (!remainingItems.length) return false;
+  if (activeJob.itemIndex < remainingItems.length) {
+    activeJob.stage = "product";
+    await setActiveJob(activeJob);
+    showPanel("Split fulfilment", `${message} ${result.message || ""} Continuing with remaining Amazon item(s).`, null, null);
+    location.href = `https://www.amazon.com/dp/${remainingItems[activeJob.itemIndex].asin}`;
+  } else {
+    activeJob.stage = "cart";
+    await setActiveJob(activeJob);
+    showPanel("Split fulfilment", `${message} ${result.message || ""} Proceeding to checkout for remaining Amazon item(s).`, null, null);
+    location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+  }
+  return true;
+}
+
+async function failCurrentItemAsMissing(activeJob, item, purchaseItem, message, failureCode = "unavailable", details = {}) {
+  if (await continueAfterPartialMissing(activeJob, item, purchaseItem, message, failureCode, details)) return true;
   showPanel("Sending to Missing ASINs", message, null, null);
   const result = await send({
     type: "FAIL_JOB",
@@ -927,6 +980,9 @@ async function failCurrentItemAsMissing(item, purchaseItem, message, failureCode
     missingAsin: item?.asin || purchaseItem?.asin || currentAsinFromUrl(),
     missingLineId: item ? itemPrimaryLineId(item) : null,
     failureCode,
+    requestedQuantity: details.requestedQuantity ?? null,
+    fulfilledQuantity: details.fulfilledQuantity ?? null,
+    availableQuantity: details.availableQuantity ?? null,
   });
   if (result?.ok) {
     showPanel("Missing ASINs", `${message} ${result.message || "Order moved to Missing ASINs."}`, null, null);
@@ -1376,7 +1432,7 @@ async function handleProduct(activeJob) {
   const expectedItem = selectedVariantItem(activeJob, item);
   const pageError = amazonProductPageErrorMessage();
   if (pageError) {
-    await failCurrentItemAsMissing(item, expectedItem, `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${pageError}`);
+    await failCurrentItemAsMissing(activeJob, item, expectedItem, `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${pageError}`);
     return;
   }
   const productReady = await waitForElement([
@@ -1390,6 +1446,7 @@ async function handleProduct(activeJob) {
   const delayedPageError = amazonProductPageErrorMessage();
   if (!productReady || delayedPageError) {
     await failCurrentItemAsMissing(
+      activeJob,
       item,
       expectedItem,
       `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${delayedPageError || "Amazon did not load product controls for this ASIN."}`,
@@ -1407,7 +1464,7 @@ async function handleProduct(activeJob) {
 
   const unavailable = unavailableMessage();
   if (unavailable) {
-    await failCurrentItemAsMissing(item, expectedItem, `ASIN ${expectedItem.asin} is unavailable on Amazon. ${unavailable}`);
+    await failCurrentItemAsMissing(activeJob, item, expectedItem, `ASIN ${expectedItem.asin} is unavailable on Amazon. ${unavailable}`);
     return;
   }
 
@@ -1466,6 +1523,13 @@ async function handleProduct(activeJob) {
       const message = lessQuantity
         ? `Less quantity available for ASIN ${purchaseItem.asin}. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.${issueMessage}`
         : `ASIN ${purchaseItem.asin} is missing or unavailable. Could not set quantity ${purchaseItem.quantity || 1}.${issueMessage}`;
+      if (await continueAfterPartialMissing(activeJob, item, purchaseItem, message, "partial_quantity", {
+        requestedQuantity,
+        fulfilledQuantity: availableQuantity || null,
+        availableQuantity: availableQuantity || null,
+      })) {
+        return;
+      }
       showPanel("Sending to Missing ASINs", message, null, null);
       await send({
         type: "FAIL_JOB",
@@ -1551,6 +1615,27 @@ async function handleCart(activeJob) {
     const message = mismatch
       ? `Could not add the desired quantity for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}.`
       : `Could not verify the desired Amazon cart quantities. ${cartCheck.message}`;
+    const missingItem = (activeJob.job?.items || []).find((entry) => String(entry.asin || "").toUpperCase() === String(missingAsin || "").toUpperCase());
+    if (missingItem && (activeJob.job?.items || []).length > 1) {
+      showPanel("Sending line to Missing ASINs", message, null, null);
+      const partialResult = await send({
+        type: "MARK_LINE_MISSING",
+        message,
+        missingAsin,
+        missingLineId: itemPrimaryLineId(missingItem),
+        failureCode: "partial_quantity",
+        requestedQuantity: mismatch?.expected ?? null,
+        fulfilledQuantity: mismatch?.actual ?? 0,
+        availableQuantity: mismatch?.actual ?? 0,
+      });
+      if (partialResult?.ok) {
+        removeMissingItemFromActiveJob(activeJob, missingItem, selectedVariantItem(activeJob, missingItem));
+        activeJob.stage = "cart";
+        await setActiveJob(activeJob);
+        showPanel("Split fulfilment", `${message} ${partialResult.message || ""} Proceeding to checkout for remaining Amazon item(s).`, null, null);
+        return;
+      }
+    }
     showPanel("Sending to Missing ASINs", message, null, null);
     await send({
       type: "FAIL_JOB",
@@ -2755,6 +2840,13 @@ async function run() {
         "I did it manually, continue",
         () => continueAfterManualStep(activeJob),
       );
+      return;
+    }
+    if (await continueAfterPartialMissing(activeJob, item, purchaseItem, error.message, error.failureCode || "unavailable", {
+      requestedQuantity: error.requestedQuantity ?? null,
+      fulfilledQuantity: error.fulfilledQuantity ?? null,
+      availableQuantity: error.availableQuantity ?? null,
+    })) {
       return;
     }
     let failResult = null;
