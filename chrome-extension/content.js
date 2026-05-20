@@ -173,6 +173,15 @@ function findButtonByText(texts) {
   });
 }
 
+function findVisibleTextTarget(texts, selectors = "a, button, input[type='submit'], input[type='button'], label, span.a-button, span.a-button-text, [role='button'], [role='option']") {
+  const wanted = texts.map((text) => text.toLowerCase());
+  const candidates = [...document.querySelectorAll(selectors)];
+  return candidates.find((element) => {
+    const text = (element.value || element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    return visible(element) && wanted.some((needle) => text.includes(needle));
+  });
+}
+
 function parsePriceFrom(element) {
   if (!element) return null;
   const whole = element.querySelector(".a-price-whole")?.textContent || "";
@@ -802,8 +811,20 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
   await applyAdditionalSavings("sns");
   const quantitySet = await setQuantity(quantity, "sns");
   if (!quantitySet) {
-    throw new Error(`Could not set Subscribe & Save quantity ${quantity || 1}.`);
+    const requestedQuantity = Math.max(1, Math.round(Number(quantity || 1)));
+    const availableQuantity = maxSelectableQuantity("sns");
+    const error = new Error(
+      availableQuantity > 0 && availableQuantity < requestedQuantity
+        ? `Less Subscribe & Save quantity available. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.`
+        : `Could not set Subscribe & Save quantity ${requestedQuantity}.`,
+    );
+    error.failureCode = "partial_quantity";
+    error.requestedQuantity = requestedQuantity;
+    error.fulfilledQuantity = availableQuantity > 0 && availableQuantity < requestedQuantity ? availableQuantity : null;
+    error.availableQuantity = availableQuantity > 0 && availableQuantity < requestedQuantity ? availableQuantity : null;
+    throw error;
   }
+  await configureSubscribeAndSaveDelivery();
   const subscribeButton = document.querySelector("#rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input") || findButtonByText(["subscribe"]);
   if (subscribeButton) {
     if (activeJob) {
@@ -818,6 +839,51 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     return true;
   }
   return false;
+}
+
+async function configureSubscribeAndSaveDelivery() {
+  showPanel("Nutricity fulfilment", "Checking Subscribe & Save delivery preferences.", null, null);
+  await chooseSubscribeSoonerDelivery();
+  await chooseSubscribeFrequencySixMonths();
+}
+
+async function chooseSubscribeSoonerDelivery() {
+  const changeDateLink = findVisibleTextTarget(["change first delivery date"]);
+  if (!changeDateLink) return false;
+  await clickElement(changeDateLink, "Change first delivery date");
+  const soonerOption = await waitUntil(() => (
+    document.querySelector("#onmlDeliveryOpt") ||
+    findVisibleTextTarget(["get it sooner"], "#snsDeliveryDateBottomSheet label, .a-popover-inner label, .a-popover-inner span, .a-popover-inner div")
+  ), 7000);
+  if (!soonerOption) return false;
+  const soonerTarget = soonerOption.closest?.("label") || soonerOption;
+  await clickElement(soonerTarget, "Get it sooner delivery option");
+  const selectDateButton = await waitUntil(() => (
+    findVisibleTextTarget(["select date"], "#snsDeliveryDateBottomSheet input, #snsDeliveryDateBottomSheet button, #snsDeliveryDateBottomSheet span.a-button, #snsDeliveryDateBottomSheet span.a-button-text, .a-popover-inner input, .a-popover-inner button, .a-popover-inner span.a-button, .a-popover-inner span.a-button-text")
+  ), 5000);
+  if (selectDateButton) {
+    const buttonTarget = selectDateButton.closest?.("span.a-button, button") || selectDateButton;
+    await clickElement(buttonTarget, "Select Subscribe & Save delivery date");
+  }
+  await waitForStableDom(700, 5000);
+  return true;
+}
+
+async function chooseSubscribeFrequencySixMonths() {
+  const frequencyButton = findVisibleTextTarget(["delivery every", "month", "weeks"], "#snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRow [data-action='a-dropdown-button'], #snsAccordionRowContent [data-action='a-dropdown-button'], #reinvent_price_desktop_snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRowMiddle .a-button-dropdown, #snsAccordionRow .a-button-dropdown, #snsAccordionRowContent .a-button-dropdown");
+  const fallbackButton = document.querySelector("#snsAccordionRowMiddle [id$='-announce'], #snsAccordionRow [id$='-announce'], #snsAccordionRowContent [id$='-announce']");
+  const dropdownButton = frequencyButton || fallbackButton?.closest?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button");
+  if (!dropdownButton || !visible(dropdownButton)) return false;
+  await clickElement(dropdownButton, "Subscribe & Save delivery schedule dropdown");
+  const sixMonths = await waitUntil(() => (
+    [...document.querySelectorAll(".a-popover-wrapper a.a-dropdown-link, .a-popover-inner a.a-dropdown-link, a[role='option']")]
+      .filter(visible)
+      .find((link) => (link.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() === "6 months")
+  ), 5000);
+  if (!sixMonths) return false;
+  await clickElement(sixMonths, "Subscribe & Save 6 months schedule");
+  await waitForStableDom(700, 5000);
+  return true;
 }
 
 function quantitySelects(context = "regular") {
@@ -1338,6 +1404,29 @@ function findPlaceOrderButton() {
   });
 }
 
+function findBusinessContinueCheckoutButton() {
+  return [...document.querySelectorAll(
+    "a[name='checkout-byg-ptc-button'], a[href*='/checkout/entry/cart/amazon_business'], a[href*='proceedToCheckout=1'], button, input[type='submit'], input[type='button'], span.a-button",
+  )].find((element) => {
+    const href = String(element.getAttribute?.("href") || element.href || "").toLowerCase();
+    const text = normalizedText(element.value || element.innerText || element.textContent);
+    return visible(element) && !element.disabled && (
+      element.getAttribute?.("name") === "checkout-byg-ptc-button" ||
+      href.includes("/checkout/entry/cart/amazon_business") ||
+      (href.includes("proceedtocheckout=1") && text.includes("continue to checkout"))
+    );
+  });
+}
+
+async function handleBusinessCheckoutInterstitial() {
+  const continueCheckout = findBusinessContinueCheckoutButton();
+  if (!continueCheckout) return false;
+  showPanel("Nutricity checkout", "Continuing through Amazon Business checkout.", null, null);
+  await clickElement(continueCheckout, "Amazon Business continue to checkout button");
+  await sleep(1500);
+  return true;
+}
+
 async function handlePaymentSelection(activeJob) {
   let payment = findPaymentSelection();
   if (!payment) {
@@ -1402,7 +1491,11 @@ async function handleCheckout(activeJob) {
     "input[aria-label='Full name']",
     "input[type='radio'][name='ppw-instrumentRowSelection']",
     "input[data-csa-c-slot-id*='continue-payselect']",
+    "a[name='checkout-byg-ptc-button']",
+    "a[href*='/checkout/entry/cart/amazon_business']",
+    "a[href*='proceedToCheckout=1']",
   ], 18000);
+  if (await handleBusinessCheckoutInterstitial()) return;
   const checkoutRecipient = recipientName(activeJob);
   showPanel("Nutricity checkout", `Using recipient name: ${checkoutRecipient}`, null, null);
   if (activeJob.stage === "editing_address") {
@@ -1421,7 +1514,7 @@ async function handleCheckout(activeJob) {
       return;
     }
   }
-  const continueCheckout = findButtonByText(["continue to checkout"]);
+  const continueCheckout = findBusinessContinueCheckoutButton() || findButtonByText(["continue to checkout"]);
   if (continueCheckout) {
     await clickElement(continueCheckout, "Continue to checkout button");
     return;
@@ -1627,7 +1720,19 @@ async function run() {
     }
   } catch (error) {
     showPanel("Nutricity fulfilment error", error.message, null, null);
-    await send({ type: "FAIL_JOB", message: error.message });
+    const item = activeJob.job.items?.[activeJob.itemIndex];
+    const purchaseItem = item ? selectedVariantItem(activeJob, item) : item;
+    const shouldMarkItemMissing = Boolean(error.failureCode || error.missingAsin);
+    await send({
+      type: "FAIL_JOB",
+      message: error.message,
+      missingAsin: shouldMarkItemMissing ? (error.missingAsin || item?.asin || purchaseItem?.asin || "") : "",
+      missingLineId: shouldMarkItemMissing && item ? itemPrimaryLineId(item) : null,
+      failureCode: error.failureCode || "",
+      requestedQuantity: error.requestedQuantity ?? null,
+      fulfilledQuantity: error.fulfilledQuantity ?? null,
+      availableQuantity: error.availableQuantity ?? null,
+    });
   }
 }
 

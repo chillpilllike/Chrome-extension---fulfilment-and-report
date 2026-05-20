@@ -269,9 +269,9 @@ async function failJob(message, details = {}, windowId) {
       worker_id: activeJob.workerId || "",
     }),
   });
-  await setWindowJob(windowId, null);
   await log(`Failed ${activeJob.job.group_key}: ${message}`, windowId);
-  return result;
+  const nextJob = await claimNextJobInWindow(windowId);
+  return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
 }
 
 async function costlyJob(message, details = {}, windowId) {

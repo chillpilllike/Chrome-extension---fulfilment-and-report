@@ -109,6 +109,8 @@ class ChromeTrackingUpdatePayload(BaseModel):
     packages: list[dict[str, Any]] = []
     payment_revision_needed: bool = False
     payment_revision_url: str = ""
+    order_cancelled: bool = False
+    cancellation_message: str = ""
     page_text: str = ""
     alert_html: str = ""
 

@@ -130,6 +130,26 @@ async function handleOrderPackages(message, windowId) {
   if (!tracking.running) return { ok: false };
   const order = tracking.orders[tracking.index];
   if (!order || order.amazon_order_id !== message.amazonOrderId) return { ok: false };
+  if (message.orderCancelled) {
+    await api("/api/tracking/update", {
+      method: "POST",
+      body: JSON.stringify({
+        amazon_order_id: order.amazon_order_id,
+        amazon_order_url: orderUrl(order),
+        packages: message.packages || [],
+        order_cancelled: true,
+        cancellation_message: message.cancellationMessage || "This order has been cancelled.",
+        page_text: message.pageText || "",
+      }),
+    });
+    await log(`Amazon order ${order.amazon_order_id} is cancelled; reset lines for reorder.`, windowId);
+    tracking.index += 1;
+    tracking.packages = [];
+    tracking.packageIndex = 0;
+    await saveTracking(tracking, windowId);
+    await openCurrentOrder(windowId);
+    return { ok: true };
+  }
   if (message.paymentRevisionNeeded) {
     await api("/api/tracking/update", {
       method: "POST",

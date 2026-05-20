@@ -59,6 +59,17 @@ function parsePaymentRevision() {
   };
 }
 
+function parseOrderCancellation() {
+  const alert = [...document.querySelectorAll(".a-alert-heading, .a-alert-content, .a-box-inner")]
+    .find((element) => /order has been cancelled|order was cancelled|this order has been canceled|this order has been cancelled/i.test(clean(element.textContent)));
+  const pageText = clean(document.body.textContent || "");
+  const cancelled = Boolean(alert) || /this order has been cancelled|this order has been canceled/i.test(pageText);
+  return {
+    orderCancelled: cancelled,
+    cancellationMessage: cancelled ? clean(alert?.textContent || "This order has been cancelled.") : "",
+  };
+}
+
 function asinsFrom(root) {
   return [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]
     .map((link) => {
@@ -72,6 +83,7 @@ function asinsFrom(root) {
 function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
   const paymentRevision = parsePaymentRevision();
+  const cancellation = parseOrderCancellation();
   const links = [...document.querySelectorAll("a[href*='ship-track'][href*='orderId=']")];
   const packages = [];
   const seen = new Set();
@@ -90,7 +102,7 @@ function parseOrderDetails() {
     });
   }
   const orderStatus = clean(document.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
-  return { amazonOrderId, packages, orderStatus, promise: orderStatus, ...paymentRevision };
+  return { amazonOrderId, packages, orderStatus, promise: orderStatus, ...paymentRevision, ...cancellation };
 }
 
 function parseCarrierAndTrackingId() {

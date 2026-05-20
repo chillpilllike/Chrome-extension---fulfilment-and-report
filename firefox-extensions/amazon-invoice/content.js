@@ -41,8 +41,14 @@ async function findPrintableSummaryLink() {
   return link ? link.href || absoluteAmazonUrl(link.getAttribute("href")) : "";
 }
 
+async function invoiceRunIsActive() {
+  const state = await send({ type: "GET_STATE" });
+  return Boolean(state?.invoiceRun?.running);
+}
+
 async function run() {
   if (!/amazon\.com$/i.test(location.hostname)) return;
+  if (!await invoiceRunIsActive()) return;
   if (/summary\/print\.html/i.test(location.href)) {
     const download = [...document.querySelectorAll("a")].find((link) => /documents\/download\/.*order-document\.pdf/i.test(link.href || link.getAttribute("href") || ""));
     if (!download) return;

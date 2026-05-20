@@ -156,10 +156,10 @@ pauseResume.addEventListener("click", async () => {
 });
 
 document.querySelector("#clearFailed").addEventListener("click", async () => {
-  const confirmed = confirm("Clear failed Chrome jobs in the app so they can be queued again?");
+  const confirmed = confirm("Clear failed or stale queued Chrome jobs in the app so they can be queued again?");
   if (!confirmed) return;
   const result = await send({ type: "CLEAR_FAILED_JOBS" });
-  setStatus(result.message || (result.ok ? "Failed jobs cleared." : "Could not clear failed jobs."));
+  setStatus(result.message || (result.ok ? "Stale queue cleared." : "Could not clear stale queue."));
 });
 
 refresh();

@@ -182,6 +182,8 @@ type OrderLine = {
   order_engine: string
   tracking_status: string
   tracking_payload: string
+  amazon_cancelled_at?: string
+  amazon_cancelled_order_id?: string
   fulfilment_note: string
   last_error: string
   pulled_at: string
@@ -208,6 +210,8 @@ type TrackingOrder = {
   odoo_order_names: string[]
   tracking_status: string
   tracking_checked_at: string
+  amazon_cancelled_at?: string
+  amazon_cancelled_order_id?: string
   lines: OrderLine[]
 }
 
@@ -709,6 +713,7 @@ type OrderColumnKey =
   | "engine"
   | "amazon_account"
   | "tracking"
+  | "cancelled_earlier"
   | "amazon_order"
   | "comments"
   | "error"
@@ -742,6 +747,7 @@ const defaultOrderColumns: OrderColumn[] = [
   { key: "engine", label: "Engine", width: "w-28" },
   { key: "amazon_account", label: "Amazon Account", width: "w-44" },
   { key: "tracking", label: "Tracking", width: "w-36" },
+  { key: "cancelled_earlier", label: "Cancelled Earlier", width: "w-36" },
   { key: "amazon_order", label: "Amazon Order", width: "w-44" },
   { key: "comments", label: "Comments", width: "w-80" },
   { key: "error", label: "Error", width: "w-64" },
@@ -2101,10 +2107,12 @@ function App() {
         return row.amazon_account_name
       case "tracking":
         return row.tracking_status
+      case "cancelled_earlier":
+        return row.amazon_cancelled_at ? <Badge className="bg-red-100 text-red-700 hover:bg-red-100">Yes</Badge> : <Badge variant="outline">No</Badge>
       case "amazon_order":
-        return row.amazon_order_url ? (
+        return row.amazon_order_url || row.amazon_cancelled_order_id ? (
           <a className="text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
-            {row.amazon_order_id}
+            {row.amazon_order_id || row.amazon_cancelled_order_id}
           </a>
         ) : (
           row.amazon_order_id
@@ -2815,7 +2823,9 @@ function App() {
                       <TableRow
                         key={row.id}
                         className={
-                          ["cancelled", "refunded"].includes(row.odoo_status_label)
+                          row.amazon_cancelled_at
+                            ? "bg-red-50"
+                            : ["cancelled", "refunded"].includes(row.odoo_status_label)
                             ? "bg-destructive/5"
                             : Number(row.odoo_order_distinct_asin_count || 0) > 1
                               ? "bg-parrot-green-lt"
@@ -3439,6 +3449,7 @@ function TrackingPage({
   const [orders, setOrders] = useState<TrackingOrder[]>([])
   const [localTotal, setLocalTotal] = useState(total)
   const [loading, setLoading] = useState(false)
+  const [statusFilter, setStatusFilter] = useState("active")
   const selectionAnchor = useRef<string | null>(null)
 
   async function refreshTracking() {
@@ -3448,6 +3459,7 @@ function TrackingPage({
       if (storeId) query.set("store_id", storeId)
       query.set("page", String(page))
       query.set("per_page", String(PAGE_SIZE))
+      query.set("status", statusFilter)
       const result = await api<{ ok: boolean; orders: TrackingOrder[]; total: number }>(`/api/tracking/orders?${query.toString()}`)
       setOrders(result.orders || [])
       setLocalTotal(result.total || 0)
@@ -3460,7 +3472,7 @@ function TrackingPage({
 
   useEffect(() => {
     refreshTracking()
-  }, [storeId, page])
+  }, [storeId, page, statusFilter])
 
   useEffect(() => setLocalTotal(total), [total])
 
@@ -3471,10 +3483,16 @@ function TrackingPage({
           <CardTitle>Package Tracking</CardTitle>
           <CardDescription>Chrome tracking extension updates package status, carrier, tracking ID, and latest scan until delivered.</CardDescription>
         </div>
-        <Button variant="outline" onClick={refreshTracking} disabled={loading}>
-          <RefreshCw className="size-4" />
-          Refresh
-        </Button>
+        <div className="flex items-end gap-2">
+          <SelectField className="w-44" label="Filter" value={statusFilter} onChange={(value) => { setStatusFilter(value); onPage(1) }}>
+            <option value="active">Active</option>
+            <option value="cancelled">Cancelled</option>
+          </SelectField>
+          <Button variant="outline" onClick={refreshTracking} disabled={loading}>
+            <RefreshCw className="size-4" />
+            Refresh
+          </Button>
+        </div>
       </CardHeader>
       <div className="border-t px-6 py-3">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -3499,6 +3517,7 @@ function TrackingPage({
               <TableHead>Odoo Order</TableHead>
               <TableHead>Amazon Order</TableHead>
               <TableHead>Status</TableHead>
+              <TableHead>Cancelled Earlier</TableHead>
               <TableHead>Carrier / Tracking</TableHead>
               <TableHead>Latest Update</TableHead>
               <TableHead>Checked</TableHead>
@@ -3516,7 +3535,7 @@ function TrackingPage({
               const firstPackage = payloads[0] || {}
               const latest = firstPackage.latest_event || {}
               return (
-                <TableRow key={order.amazon_order_id}>
+                <TableRow key={order.amazon_order_id} className={order.amazon_cancelled_at ? "bg-red-50" : ""}>
                   <TableCell>
                     <Checkbox
                       checked={selected.includes(order.amazon_order_id)}
@@ -3543,6 +3562,7 @@ function TrackingPage({
                     </a>
                   </TableCell>
                   <TableCell><StatusBadge value={order.tracking_status || firstPackage.status || "Unknown"} /></TableCell>
+                  <TableCell>{order.amazon_cancelled_at ? <Badge className="bg-red-100 text-red-700 hover:bg-red-100">Yes</Badge> : <Badge variant="outline">No</Badge>}</TableCell>
                   <TableCell className="max-w-[320px]">
                     {payloads.length ? (
                       <div className="grid gap-1 text-sm">

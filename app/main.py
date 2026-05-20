@@ -270,6 +270,8 @@ def init_db() -> None:
                 tracking_status TEXT,
                 tracking_payload TEXT,
                 tracking_checked_at TEXT,
+                amazon_cancelled_at TEXT,
+                amazon_cancelled_order_id TEXT,
                 chrome_claimed_by TEXT,
                 chrome_claimed_at TEXT,
                 chrome_claim_expires_at TEXT,
@@ -700,6 +702,8 @@ def init_db() -> None:
             "tracking_status": "ALTER TABLE order_lines ADD COLUMN tracking_status TEXT",
             "tracking_payload": "ALTER TABLE order_lines ADD COLUMN tracking_payload TEXT",
             "tracking_checked_at": "ALTER TABLE order_lines ADD COLUMN tracking_checked_at TEXT",
+            "amazon_cancelled_at": "ALTER TABLE order_lines ADD COLUMN amazon_cancelled_at TEXT",
+            "amazon_cancelled_order_id": "ALTER TABLE order_lines ADD COLUMN amazon_cancelled_order_id TEXT",
             "chrome_claimed_by": "ALTER TABLE order_lines ADD COLUMN chrome_claimed_by TEXT",
             "chrome_claimed_at": "ALTER TABLE order_lines ADD COLUMN chrome_claimed_at TEXT",
             "chrome_claim_expires_at": "ALTER TABLE order_lines ADD COLUMN chrome_claim_expires_at TEXT",
@@ -3197,6 +3201,8 @@ def order_line_search_document(row: Union[dict[str, Any], dict[str, Any]]) -> di
         "amazon_order_id": str(row["amazon_order_id"] or ""),
         "amazon_account_name": str(row["amazon_account_name"] or ""),
         "tracking_status": str(row["tracking_status"] or "") if "tracking_status" in row.keys() else "",
+        "amazon_cancelled_at": str(row["amazon_cancelled_at"] or "") if "amazon_cancelled_at" in row.keys() else "",
+        "amazon_cancelled_order_id": str(row["amazon_cancelled_order_id"] or "") if "amazon_cancelled_order_id" in row.keys() else "",
         "fulfilment_note": str(row["fulfilment_note"] or "") if "fulfilment_note" in row.keys() else "",
         "last_error": str(row["last_error"] or "") if "last_error" in row.keys() else "",
         "missing_asin": str(row["missing_asin"] or "") if "missing_asin" in row.keys() else "",
@@ -3234,6 +3240,8 @@ def ensure_typesense_collection(settings: Optional[dict[str, str]] = None) -> No
             {"name": "amazon_order_id", "type": "string", "optional": True},
             {"name": "amazon_account_name", "type": "string", "optional": True},
             {"name": "tracking_status", "type": "string", "optional": True},
+            {"name": "amazon_cancelled_at", "type": "string", "optional": True},
+            {"name": "amazon_cancelled_order_id", "type": "string", "optional": True},
             {"name": "fulfilment_note", "type": "string", "optional": True},
             {"name": "last_error", "type": "string", "optional": True},
             {"name": "missing_asin", "type": "string", "optional": True},
@@ -4997,14 +5005,18 @@ def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page
     return rows, total, page, per_page
 
 
-def tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
+def tracking_rows(store_id: Optional[int] = None, status: str = "active") -> list[dict[str, Any]]:
+    status = clean_text(status).lower() or "active"
+    if status == "cancelled":
+        where_status = "COALESCE(amazon_cancelled_at, '') != ''"
+    else:
+        where_status = "COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')"
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM order_lines
-            WHERE COALESCE(amazon_order_id, '') != ''
-              AND state IN ('ordered', 'dispatched')
+            WHERE {where_status}
               AND COALESCE(order_engine, '') != 'third_party'
               AND (? IS NULL OR store_id=?)
             ORDER BY tracking_checked_at IS NULL DESC, tracking_checked_at ASC, ordered_at DESC, updated_at DESC
@@ -5016,7 +5028,8 @@ def tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
     for row in data:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
-        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
+        amazon_id = row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or ""
+        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(amazon_id)
         row["asin_url"] = asin_product_url(row.get("asin") or "")
     return data
 
@@ -9008,19 +9021,26 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
     ordering_engine = normalize_ordering_engine(payload.ordering_engine or get_default_ordering_engine())
     if ordering_engine == "chrome":
         selected_count = len(payload.line_ids or [])
-        threading.Thread(
-            target=queue_chrome_order_groups_fast_task,
-            args=(payload.store_id, payload.amazon_account_id, payload.address_id, payload.line_ids or None, payload.club),
-            daemon=True,
-        ).start()
-        message = (
-            f"Using engine: chrome. Queueing {selected_count or 'matching'} selected line{'s' if selected_count != 1 else ''} for the Chrome extension. "
-            "You can open the Chrome extension and click Start next queued order in a moment."
+        queued, cleared, account, details = queue_chrome_order_groups_fast(
+            payload.store_id,
+            payload.amazon_account_id,
+            payload.address_id,
+            payload.line_ids or None,
+            payload.club,
         )
+        message = (
+            f"Using engine: chrome. Queued {queued} order group{'s' if queued != 1 else ''} "
+            f"from {selected_count or 'matching'} selected line{'s' if selected_count != 1 else ''} "
+            f"for {account['name']}."
+        )
+        if cleared:
+            message += f" Cleared {cleared} dry-run marker{'s' if cleared != 1 else ''}."
         return {
             "ok": True,
             "message": message,
-            "defer_refresh": True,
+            "defer_refresh": False,
+            "queued": queued,
+            "details": details,
         }
 
     cleared = clear_dry_run_order_markers(payload.store_id)
@@ -9301,7 +9321,7 @@ def api_chrome_clear_failed_jobs(store_id: Optional[int] = None) -> dict[str, An
                 last_error=NULL,
                 updated_at=?
             WHERE order_engine='chrome'
-              AND state='error'
+              AND state IN ('error', 'submitted')
               AND COALESCE(amazon_order_id, '') = ''
               AND (? IS NULL OR store_id=?)
             """,
@@ -9312,10 +9332,10 @@ def api_chrome_clear_failed_jobs(store_id: Optional[int] = None) -> dict[str, An
             UPDATE amazon_attempts
             SET status='cleared'
             WHERE mode='chrome'
-              AND status='error'
+              AND status IN ('error', 'queued')
             """
         )
-    return {"ok": True, "cleared": cursor.rowcount, "message": f"Cleared {cursor.rowcount} failed Chrome job line(s)."}
+    return {"ok": True, "cleared": cursor.rowcount, "message": f"Cleared {cursor.rowcount} failed or stale queued Chrome job line(s)."}
 
 
 def chrome_complete_followups(
@@ -9547,11 +9567,11 @@ def api_chrome_job_costly(group_key: str, payload: ChromeJobCostlyPayload) -> di
 
 
 @app.get("/api/tracking/orders")
-def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    rows = tracking_rows(store_id)
+def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "active") -> dict[str, Any]:
+    rows = tracking_rows(store_id, status)
     grouped: dict[str, dict[str, Any]] = {}
     for row in rows:
-        order_id = str(row.get("amazon_order_id") or "")
+        order_id = str(row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or "")
         if not order_id:
             continue
         entry = grouped.setdefault(
@@ -9563,6 +9583,8 @@ def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page:
                 "lines": [],
                 "tracking_checked_at": row.get("tracking_checked_at") or "",
                 "tracking_status": row.get("tracking_status") or "",
+                "amazon_cancelled_at": row.get("amazon_cancelled_at") or "",
+                "amazon_cancelled_order_id": row.get("amazon_cancelled_order_id") or "",
             },
         )
         if row.get("odoo_order_name") not in entry["odoo_order_names"]:
@@ -9596,6 +9618,57 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
         ).fetchall()
         if not rows:
             raise HTTPException(404, "Tracked Amazon order not found")
+        if payload.order_cancelled:
+            now = utc_now()
+            cancellation_message = clean_text(payload.cancellation_message) or "This order has been cancelled."
+            note = f"Earlier Amazon order {amazon_order_id} was cancelled. Reset to fresh pulled state for reorder. {cancellation_message}"
+            updated_rows = []
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_id=NULL,
+                        amazon_order_url=NULL,
+                        amazon_status='cancelled',
+                        tracking_status='Amazon cancelled',
+                        tracking_payload=?,
+                        tracking_checked_at=?,
+                        state='pulled',
+                        order_engine='chrome',
+                        amazon_group_key=NULL,
+                        chrome_claimed_by=NULL,
+                        chrome_claimed_at=NULL,
+                        chrome_claim_expires_at=NULL,
+                        amazon_cancelled_at=?,
+                        amazon_cancelled_order_id=?,
+                        fulfilment_note=CASE
+                          WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                          WHEN fulfilment_note LIKE ? THEN fulfilment_note
+                          ELSE fulfilment_note || ' | ' || ?
+                        END,
+                        last_error=NULL,
+                        ordered_at=NULL,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        json.dumps({"order_cancelled": True, "amazon_order_id": amazon_order_id, "message": cancellation_message}, default=str)[:4000],
+                        now,
+                        now,
+                        amazon_order_id,
+                        note,
+                        f"%Earlier Amazon order {amazon_order_id} was cancelled%",
+                        note,
+                        now,
+                        row["id"],
+                    ),
+                )
+                updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+                if updated_row:
+                    updated_rows.append(updated_row)
+            for updated_row in updated_rows:
+                index_order_line(updated_row)
+            return {"ok": True, "updated": len(updated_rows), "tracking_status": "Amazon cancelled", "order_cancelled": True}
         if payload_has_payment_revision(payload):
             now = utc_now()
             message = "Payment revision needed. Please update your payment method."
