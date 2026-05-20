@@ -113,24 +113,33 @@ function activeJobOrderLabel(activeJob) {
   return String(activeJob?.job?.group_key || "").replace(/\s+/g, " ").trim();
 }
 
+function activeJobStepLabel(activeJob) {
+  const stage = String(activeJob?.stage || "").replace(/_/g, " ").trim();
+  if (!stage) return "Preparing";
+  return stage.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 async function updatePanelOrderStatus(panel = document.querySelector("#nutricity-panel")) {
   if (!panel) return;
   const version = ++panelOrderStatusVersion;
   const orderNode = panel.querySelector(".nutricity-panel-order");
   const orderText = panel.querySelector(".nutricity-panel-order-text");
   const statusText = panel.querySelector(".nutricity-panel-order-status");
-  if (!orderNode || !orderText || !statusText) return;
+  const stepText = panel.querySelector(".nutricity-panel-step-text");
+  if (!orderNode || !orderText || !statusText || !stepText) return;
   const activeJob = await getActiveJob();
   if (version !== panelOrderStatusVersion) return;
   const label = activeJobOrderLabel(activeJob);
   if (!activeJob?.job || !label) {
     orderNode.hidden = true;
     orderText.textContent = "";
+    stepText.textContent = "";
     statusText.textContent = "";
     return;
   }
   orderNode.hidden = false;
   orderText.textContent = label;
+  stepText.textContent = activeJobStepLabel(activeJob);
   statusText.textContent = activeJob.paused ? "Paused" : "In progress";
 }
 
@@ -139,7 +148,7 @@ function showPanel(title, message, actionText, action) {
   if (!panel) {
     panel = document.createElement("div");
     panel.id = "nutricity-panel";
-    panel.innerHTML = `<div class="nutricity-panel-order" hidden><span class="nutricity-panel-order-label">Order being processed</span><span class="nutricity-panel-order-status"></span><div class="nutricity-panel-order-text"></div></div><div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div>`;
+    panel.innerHTML = `<div class="nutricity-panel-order" hidden><span class="nutricity-panel-order-label">Order being processed</span><span class="nutricity-panel-order-status"></span><div class="nutricity-panel-order-text"></div><div class="nutricity-panel-step">Step: <span class="nutricity-panel-step-text"></span></div></div><div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div>`;
     panel.querySelector(".nutricity-pause-toggle").addEventListener("click", togglePanelPause);
     document.documentElement.append(panel);
   }
@@ -911,6 +920,7 @@ function amazonProductPageErrorMessage() {
 }
 
 async function failCurrentItemAsMissing(item, purchaseItem, message, failureCode = "unavailable") {
+  showPanel("Sending to Missing ASINs", message, null, null);
   const result = await send({
     type: "FAIL_JOB",
     message,
@@ -919,7 +929,7 @@ async function failCurrentItemAsMissing(item, purchaseItem, message, failureCode
     failureCode,
   });
   if (result?.ok) {
-    showPanel("Missing ASINs", result.message || "Order moved to Missing ASINs.", null, null);
+    showPanel("Missing ASINs", `${message} ${result.message || "Order moved to Missing ASINs."}`, null, null);
     return true;
   }
   throw new Error(result?.message || "The app did not confirm the Missing ASIN report.");
@@ -1189,9 +1199,11 @@ async function pauseAfterMissingAsinReportFailure(activeJob, message) {
 async function reportMissingQuantityIssue(activeJob, item, purchaseItem, quantityIssue = {}) {
   const requestedQuantity = Math.max(1, Math.round(Number(purchaseItem?.quantity || item?.quantity || quantityIssue.requestedQuantity || 1)));
   const availableQuantity = quantityIssue.availableQuantity || quantityIssue.fulfilledQuantity || maxPredefinedQuantity(quantityIssue.context || "regular") || maxSelectableQuantity(quantityIssue.context || "regular") || null;
+  const message = partialQuantityMessage(purchaseItem?.asin || item?.asin || "", requestedQuantity, availableQuantity, quantityIssue.message || "", quantityIssue.context || "regular");
+  showPanel("Sending to Missing ASINs", message, null, null);
   const result = await send({
     type: "FAIL_JOB",
-    message: partialQuantityMessage(purchaseItem?.asin || item?.asin || "", requestedQuantity, availableQuantity, quantityIssue.message || "", quantityIssue.context || "regular"),
+    message,
     missingAsin: item?.asin || purchaseItem?.asin || "",
     missingLineId: item ? itemPrimaryLineId(item) : null,
     failureCode: "partial_quantity",
@@ -1200,7 +1212,7 @@ async function reportMissingQuantityIssue(activeJob, item, purchaseItem, quantit
     availableQuantity,
   });
   if (result?.ok) {
-    showPanel("Missing ASINs", result.message || "Quantity issue moved to Missing ASINs.", null, null);
+    showPanel("Missing ASINs", `${message} ${result.message || "Quantity issue moved to Missing ASINs."}`, null, null);
     return true;
   }
   throw new Error(result?.message || "Could not move quantity issue to Missing ASINs.");
@@ -1420,11 +1432,13 @@ async function handleProduct(activeJob) {
       const availableQuantity = quantityIssue.availableQuantity || maxPredefinedQuantity("regular") || maxSelectableQuantity("regular");
       const lessQuantity = availableQuantity > 0 && availableQuantity < requestedQuantity;
       const issueMessage = quantityIssue.message ? ` ${quantityIssue.message}` : "";
+      const message = lessQuantity
+        ? `Less quantity available for ASIN ${purchaseItem.asin}. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.${issueMessage}`
+        : `ASIN ${purchaseItem.asin} is missing or unavailable. Could not set quantity ${purchaseItem.quantity || 1}.${issueMessage}`;
+      showPanel("Sending to Missing ASINs", message, null, null);
       await send({
         type: "FAIL_JOB",
-        message: lessQuantity
-          ? `Less quantity available for ASIN ${purchaseItem.asin}. Customer ordered ${requestedQuantity}, Amazon only allows ${availableQuantity}.${issueMessage}`
-          : `ASIN ${purchaseItem.asin} is missing or unavailable. Could not set quantity ${purchaseItem.quantity || 1}.${issueMessage}`,
+        message,
         missingAsin: item.asin,
         missingLineId: itemPrimaryLineId(item),
         failureCode: "partial_quantity",
@@ -1432,7 +1446,7 @@ async function handleProduct(activeJob) {
         fulfilledQuantity: availableQuantity || null,
         availableQuantity: availableQuantity || null,
       });
-      showPanel("Nutricity fulfilment", lessQuantity ? "Less quantity available. Order moved to Missing ASINs." : "Could not set item quantity. Order moved to Missing ASINs.", null, null);
+      showPanel("Missing ASINs", `${message} Order moved to Missing ASINs.`, null, null);
       return;
     }
     const addButton = await waitForElement(["#add-to-cart-button", "input[name='submit.add-to-cart']", "#buybox-add-to-cart-button input"], 18000);
@@ -1442,8 +1456,10 @@ async function handleProduct(activeJob) {
     await setActiveJob(activeJob);
     const added = await clickElement(addButton, "Add to cart button");
     if (!added) {
-      await send({ type: "FAIL_JOB", message: `ASIN ${purchaseItem.asin} is missing or unavailable. Could not find Add to cart button.`, missingAsin: item.asin, missingLineId: itemPrimaryLineId(item) });
-      showPanel("Nutricity fulfilment", "Could not find Add to cart. Job marked as error.", null, null);
+      const message = `ASIN ${purchaseItem.asin} is missing or unavailable. Could not find Add to cart button.`;
+      showPanel("Sending to Missing ASINs", message, null, null);
+      await send({ type: "FAIL_JOB", message, missingAsin: item.asin, missingLineId: itemPrimaryLineId(item) });
+      showPanel("Missing ASINs", `${message} Job marked as error.`, null, null);
       return;
     }
   }
@@ -1501,11 +1517,13 @@ async function handleCart(activeJob) {
   if (!cartCheck.ok) {
     const mismatch = (cartCheck.mismatches || [])[0];
     const missingAsin = mismatch?.asin || "";
+    const message = mismatch
+      ? `Could not add the desired quantity for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}.`
+      : `Could not verify the desired Amazon cart quantities. ${cartCheck.message}`;
+    showPanel("Sending to Missing ASINs", message, null, null);
     await send({
       type: "FAIL_JOB",
-      message: mismatch
-        ? `Could not add the desired quantity for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}.`
-        : `Could not verify the desired Amazon cart quantities. ${cartCheck.message}`,
+      message,
       missingAsin,
       missingLineId: lineIdForAsin(activeJob, missingAsin),
       failureCode: "partial_quantity",
@@ -1513,7 +1531,7 @@ async function handleCart(activeJob) {
       fulfilledQuantity: mismatch?.actual ?? 0,
       availableQuantity: mismatch?.actual ?? 0,
     });
-    showPanel("Cart quantity issue", "Could not add the desired quantity. Order moved to Missing ASINs.", null, null);
+    showPanel("Missing ASINs", `${message} Order moved to Missing ASINs.`, null, null);
     return;
   }
   if (cartCheck.warning) {
@@ -2728,9 +2746,10 @@ async function run() {
       await pauseAfterMissingAsinReportFailure(activeJob, failResult?.message || "The app did not confirm the Missing ASIN report.");
       return;
     }
+    const reason = error.message || "No reason supplied.";
     const nextMessage = failResult.next_job_started && failResult.next_group_key
-      ? `Order moved to Missing ASINs. Starting next order ${failResult.next_group_key}.`
-      : "Order moved to Missing ASINs.";
+      ? `Reason: ${reason} Order moved to Missing ASINs. Starting next order ${failResult.next_group_key}.`
+      : `Reason: ${reason} Order moved to Missing ASINs.`;
     showPanel("Missing ASINs", nextMessage, null, null);
   }
 }
