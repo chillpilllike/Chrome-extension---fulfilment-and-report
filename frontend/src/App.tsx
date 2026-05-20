@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import type { ReactNode } from "react"
+import type { DragEvent, ReactNode } from "react"
 import {
   IconAlertCircle as AlertCircle,
   IconBell as Bell,
@@ -1532,6 +1532,7 @@ function App() {
   const [showColumnSettings, setShowColumnSettings] = useState(false)
   const [orderColumns, setOrderColumns] = useState<OrderColumn[]>(loadOrderColumns)
   const [draggedColumnKey, setDraggedColumnKey] = useState<OrderColumnKey | null>(null)
+  const [columnDropTarget, setColumnDropTarget] = useState<{ key: OrderColumnKey; after: boolean } | null>(null)
   const [busy, setBusy] = useState("")
   const [modal, setModal] = useState<ModalState>(null)
   const [adminTokenSaved, setAdminTokenSaved] = useState(Boolean(savedAdminToken()))
@@ -1868,18 +1869,10 @@ function App() {
     )
   }, [orderColumns])
 
-  const rows = searchRows || data?.rows || []
+  const rows = search.trim() && searchRows === null ? [] : searchRows || data?.rows || []
   const filteredRows = useMemo(() => {
-    if (searchRows) return rows
-    const term = search.trim().toLowerCase()
-    if (!term) return rows
-    return rows.filter((row) =>
-      [row.odoo_order_name, row.product_name, row.asin, row.state, row.odoo_status_label, row.amazon_order_id, row.amazon_account_name]
-        .join(" ")
-        .toLowerCase()
-        .includes(term),
-    )
-  }, [rows, search, searchRows])
+    return rows
+  }, [rows])
   const sortedRows = useMemo(() => {
     const multiplier = sortDirection === "asc" ? 1 : -1
     const grouped = new Map<string, OrderLine[]>()
@@ -1987,7 +1980,7 @@ function App() {
     setOrderColumns((current) => current.map((column) => (column.key === key ? { ...column, visible } : column)))
   }
 
-  function moveColumn(dragKey: OrderColumnKey, targetKey: OrderColumnKey) {
+  function moveColumn(dragKey: OrderColumnKey, targetKey: OrderColumnKey, after = false) {
     if (dragKey === targetKey) return
     setOrderColumns((current) => {
       const next = [...current]
@@ -1995,9 +1988,17 @@ function App() {
       const to = next.findIndex((column) => column.key === targetKey)
       if (from < 0 || to < 0) return current
       const [moved] = next.splice(from, 1)
-      next.splice(to, 0, moved)
+      const targetIndex = next.findIndex((column) => column.key === targetKey)
+      if (targetIndex < 0) return current
+      next.splice(targetIndex + (after ? 1 : 0), 0, moved)
       return next
     })
+  }
+
+  function updateColumnDropTarget(event: DragEvent<HTMLElement>, key: OrderColumnKey) {
+    event.preventDefault()
+    const rect = event.currentTarget.getBoundingClientRect()
+    setColumnDropTarget({ key, after: event.clientX > rect.left + rect.width / 2 })
   }
 
   function applySort(nextSortKey: SortKey) {
@@ -2747,13 +2748,27 @@ function App() {
                         <div
                           key={column.key}
                           draggable
-                          onDragStart={() => setDraggedColumnKey(column.key)}
-                          onDragOver={(event) => event.preventDefault()}
-                          onDrop={() => {
-                            if (draggedColumnKey) moveColumn(draggedColumnKey, column.key)
-                            setDraggedColumnKey(null)
+                          onDragStart={() => {
+                            setDraggedColumnKey(column.key)
+                            setColumnDropTarget({ key: column.key, after: false })
                           }}
-                          className="badge badge-outline cursor-grab active:cursor-grabbing"
+                          onDragEnd={() => {
+                            setDraggedColumnKey(null)
+                            setColumnDropTarget(null)
+                          }}
+                          onDragOver={(event) => updateColumnDropTarget(event, column.key)}
+                          onDrop={(event) => {
+                            event.preventDefault()
+                            if (draggedColumnKey) moveColumn(draggedColumnKey, column.key, columnDropTarget?.key === column.key ? columnDropTarget.after : false)
+                            setDraggedColumnKey(null)
+                            setColumnDropTarget(null)
+                          }}
+                          className={[
+                            "badge badge-outline cursor-grab border-l-4 border-r-4 border-l-transparent border-r-transparent active:cursor-grabbing",
+                            draggedColumnKey === column.key ? "opacity-60" : "",
+                            columnDropTarget?.key === column.key && !columnDropTarget.after ? "border-l-primary" : "",
+                            columnDropTarget?.key === column.key && columnDropTarget.after ? "border-r-primary" : "",
+                          ].filter(Boolean).join(" ")}
                         >
                           <GripVertical className="size-3.5 text-muted-foreground" />
                           <Checkbox

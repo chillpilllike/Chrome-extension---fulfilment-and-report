@@ -95,6 +95,7 @@ if (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="frontend-assets")
 
 _sync_thread_started = False
+_TYPESENSE_INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="typesense-index")
 PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/assets", "/static", "/health", "/favicon")
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
@@ -3139,6 +3140,11 @@ def typesense_base(settings: Optional[dict[str, str]] = None) -> str:
     return str(settings.get("typesense_url") or "").rstrip("/")
 
 
+def typesense_enabled(settings: Optional[dict[str, str]] = None) -> bool:
+    settings = settings or get_service_settings()
+    return str(settings.get("typesense_enabled", "")).lower() in {"1", "true", "yes", "on"}
+
+
 def order_line_search_document(row: Union[dict[str, Any], dict[str, Any]]) -> dict[str, Any]:
     return {
         "id": str(row["id"]),
@@ -3146,12 +3152,18 @@ def order_line_search_document(row: Union[dict[str, Any], dict[str, Any]]) -> di
         "store_id": int(row["store_id"]),
         "odoo_order_name": str(row["odoo_order_name"] or ""),
         "product_name": str(row["product_name"] or ""),
+        "default_code": str(row["default_code"] or ""),
         "asin": str(row["asin"] or ""),
+        "supplier_part_auxiliary_id": str(row["supplier_part_auxiliary_id"] or "") if "supplier_part_auxiliary_id" in row.keys() else "",
         "state": str(row["state"] or ""),
         "odoo_status_label": str(row["odoo_status_label"] or ""),
         "amazon_order_id": str(row["amazon_order_id"] or ""),
         "amazon_account_name": str(row["amazon_account_name"] or ""),
+        "tracking_status": str(row["tracking_status"] or "") if "tracking_status" in row.keys() else "",
         "fulfilment_note": str(row["fulfilment_note"] or "") if "fulfilment_note" in row.keys() else "",
+        "last_error": str(row["last_error"] or "") if "last_error" in row.keys() else "",
+        "missing_asin": str(row["missing_asin"] or "") if "missing_asin" in row.keys() else "",
+        "replacement_asin": str(row["replacement_asin"] or "") if "replacement_asin" in row.keys() else "",
         "updated_at": str(row["updated_at"] or ""),
     }
 
@@ -3168,12 +3180,18 @@ def ensure_typesense_collection(settings: Optional[dict[str, str]] = None) -> No
             {"name": "store_id", "type": "int32", "facet": True},
             {"name": "odoo_order_name", "type": "string"},
             {"name": "product_name", "type": "string"},
+            {"name": "default_code", "type": "string", "optional": True},
             {"name": "asin", "type": "string"},
+            {"name": "supplier_part_auxiliary_id", "type": "string", "optional": True},
             {"name": "state", "type": "string", "facet": True},
             {"name": "odoo_status_label", "type": "string", "facet": True},
             {"name": "amazon_order_id", "type": "string", "optional": True},
             {"name": "amazon_account_name", "type": "string", "optional": True},
+            {"name": "tracking_status", "type": "string", "optional": True},
             {"name": "fulfilment_note", "type": "string", "optional": True},
+            {"name": "last_error", "type": "string", "optional": True},
+            {"name": "missing_asin", "type": "string", "optional": True},
+            {"name": "replacement_asin", "type": "string", "optional": True},
             {"name": "updated_at", "type": "string", "optional": True},
         ],
     }
@@ -3184,26 +3202,71 @@ def ensure_typesense_collection(settings: Optional[dict[str, str]] = None) -> No
             raise RuntimeError(f"Typesense collection create failed: HTTP {create.status_code}: {create.text[:500]}")
     elif response.status_code >= 400:
         raise RuntimeError(f"Typesense collection check failed: HTTP {response.status_code}: {response.text[:500]}")
+    else:
+        collection = response.json()
+        existing_fields = {field.get("name") for field in collection.get("fields", [])}
+        missing_fields = [field for field in schema["fields"] if field["name"] not in existing_fields]
+        if missing_fields:
+            alter = requests.patch(
+                f"{base}/collections/order_lines",
+                headers=typesense_headers(settings),
+                json={"fields": missing_fields},
+                timeout=15,
+            )
+            if alter.status_code >= 400:
+                raise RuntimeError(f"Typesense collection update failed: HTTP {alter.status_code}: {alter.text[:500]}")
+
+
+def _index_order_line_sync(row: Union[dict[str, Any], dict[str, Any]]) -> None:
+    settings = get_service_settings()
+    if not typesense_enabled(settings):
+        return
+    ensure_typesense_collection(settings)
+    doc = order_line_search_document(row)
+    response = requests.post(
+        f"{typesense_base(settings)}/collections/order_lines/documents?action=upsert",
+        headers=typesense_headers(settings),
+        json=doc,
+        timeout=8,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Typesense upsert failed: HTTP {response.status_code}: {response.text[:500]}")
 
 
 def index_order_line(row: Union[dict[str, Any], dict[str, Any]]) -> None:
-    settings = get_service_settings()
-    if str(settings.get("typesense_enabled", "")).lower() not in {"1", "true", "yes", "on"}:
-        return
     try:
-        ensure_typesense_collection(settings)
-        doc = order_line_search_document(row)
-        requests.post(
-            f"{typesense_base(settings)}/collections/order_lines/documents?action=upsert",
+        snapshot = row_to_dict(row) if hasattr(row, "keys") else dict(row)
+        if not snapshot:
+            return
+        _TYPESENSE_INDEX_EXECUTOR.submit(_index_order_line_sync, snapshot)
+    except Exception:
+        pass
+
+
+def delete_order_line_index(line_id: int) -> None:
+    def task() -> None:
+        settings = get_service_settings()
+        if not typesense_enabled(settings):
+            return
+        base = typesense_base(settings)
+        if not base:
+            return
+        response = requests.delete(
+            f"{base}/collections/order_lines/documents/{int(line_id)}",
             headers=typesense_headers(settings),
-            json=doc,
             timeout=8,
         )
+        if response.status_code not in {200, 201, 202, 204, 404}:
+            raise RuntimeError(f"Typesense delete failed: HTTP {response.status_code}: {response.text[:500]}")
+
+    try:
+        _TYPESENSE_INDEX_EXECUTOR.submit(task)
     except Exception:
         pass
 
 
 _TYPESENSE_REINDEX_LOCK = threading.Lock()
+_TYPESENSE_REINDEX_PENDING = False
 
 
 def typesense_reindex_progress() -> dict[str, Any]:
@@ -3241,11 +3304,16 @@ def set_typesense_reindex_progress(**updates: Any) -> dict[str, Any]:
 
 def reindex_order_lines(chunk_size: int = 250) -> int:
     settings = get_service_settings()
+    base = typesense_base(settings)
+    if not base:
+        raise RuntimeError("Typesense URL is missing.")
+    delete_response = requests.delete(f"{base}/collections/order_lines", headers=typesense_headers(settings), timeout=15)
+    if delete_response.status_code not in {200, 201, 202, 204, 404}:
+        raise RuntimeError(f"Typesense collection reset failed: HTTP {delete_response.status_code}: {delete_response.text[:500]}")
     ensure_typesense_collection(settings)
     with db() as conn:
         total = int(conn.execute("SELECT COUNT(*) AS count FROM order_lines").fetchone()["count"] or 0)
     processed = 0
-    base = typesense_base(settings)
     headers = typesense_headers(settings)
     while processed < total:
         with db() as conn:
@@ -3280,9 +3348,12 @@ def reindex_order_lines(chunk_size: int = 250) -> int:
 
 
 def run_typesense_reindex_job() -> None:
+    global _TYPESENSE_REINDEX_PENDING
     if not _TYPESENSE_REINDEX_LOCK.acquire(blocking=False):
+        _TYPESENSE_REINDEX_PENDING = True
         return
     try:
+        _TYPESENSE_REINDEX_PENDING = False
         with db() as conn:
             total = int(conn.execute("SELECT COUNT(*) AS count FROM order_lines").fetchone()["count"] or 0)
         set_typesense_reindex_progress(
@@ -3312,12 +3383,21 @@ def run_typesense_reindex_job() -> None:
         )
     finally:
         _TYPESENSE_REINDEX_LOCK.release()
+        if _TYPESENSE_REINDEX_PENDING:
+            _TYPESENSE_REINDEX_PENDING = False
+            threading.Thread(target=run_typesense_reindex_job, daemon=True).start()
 
 
 def start_typesense_reindex_job() -> dict[str, Any]:
+    global _TYPESENSE_REINDEX_PENDING
+    settings = get_service_settings()
+    if not typesense_enabled(settings):
+        return {"ok": True, "message": "Typesense is disabled; reindex skipped.", "progress": typesense_reindex_progress()}
     current = typesense_reindex_progress()
     if current.get("status") == "running":
-        return {"ok": True, "message": "Typesense reindex is already running.", "progress": current}
+        _TYPESENSE_REINDEX_PENDING = True
+        current["message"] = "Typesense reindex is already running; another pass is queued."
+        return {"ok": True, "message": "Typesense reindex is already running; another pass is queued.", "progress": current}
     progress = set_typesense_reindex_progress(
         status="queued",
         processed=0,
@@ -3331,20 +3411,43 @@ def start_typesense_reindex_job() -> dict[str, Any]:
     return {"ok": True, "message": "Typesense reindex started.", "progress": progress}
 
 
-def typesense_search_ids(query: str, store_id: Optional[int]) -> list[int]:
+def typesense_search_order_lines(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100) -> dict[str, Any]:
     settings = get_service_settings()
-    if str(settings.get("typesense_enabled", "")).lower() not in {"1", "true", "yes", "on"}:
-        return []
+    if not typesense_enabled(settings):
+        return {"ids": [], "total": 0}
     base = typesense_base(settings)
     if not base or not query.strip():
-        return []
+        return {"ids": [], "total": 0}
+    page, per_page, _ = pagination_bounds(page, per_page)
     params = {
-        "q": query,
-        "query_by": "odoo_order_name,product_name,asin,state,odoo_status_label,amazon_order_id,amazon_account_name",
-        "per_page": "250",
+        "q": query.strip(),
+        "query_by": ",".join([
+            "odoo_order_name",
+            "product_name",
+            "default_code",
+            "asin",
+            "supplier_part_auxiliary_id",
+            "state",
+            "odoo_status_label",
+            "amazon_order_id",
+            "amazon_account_name",
+            "tracking_status",
+            "fulfilment_note",
+            "last_error",
+            "missing_asin",
+            "replacement_asin",
+        ]),
+        "query_by_weights": "8,3,5,7,5,2,2,5,2,2,2,2,4,4",
+        "per_page": str(per_page),
+        "page": str(page),
+        "prefix": "true",
+        "infix": "always",
+        "num_typos": "1",
+        "drop_tokens_threshold": "0",
     }
     if store_id:
         params["filter_by"] = f"store_id:={int(store_id)}"
+    ensure_typesense_collection(settings)
     response = requests.get(f"{base}/collections/order_lines/documents/search", headers=typesense_headers(settings), params=params, timeout=8)
     if response.status_code >= 400:
         raise RuntimeError(f"Typesense search failed: HTTP {response.status_code}: {response.text[:500]}")
@@ -3354,7 +3457,12 @@ def typesense_search_ids(query: str, store_id: Optional[int]) -> list[int]:
         doc = hit.get("document") or {}
         if doc.get("row_id"):
             ids.append(int(doc["row_id"]))
-    return ids
+    return {"ids": ids, "total": int(payload.get("found") or 0)}
+
+
+def typesense_search_ids(query: str, store_id: Optional[int]) -> list[int]:
+    result = typesense_search_order_lines(query, store_id, 1, 250)
+    return list(result.get("ids") or [])
 
 
 def mark_line_error(line_id: int, message: str) -> None:
@@ -7341,6 +7449,118 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     }
 
 
+ORDER_LINE_SEARCH_COLUMNS = (
+    "odoo_order_name",
+    "product_name",
+    "default_code",
+    "asin",
+    "supplier_part_auxiliary_id",
+    "state",
+    "odoo_status_label",
+    "amazon_order_id",
+    "amazon_account_name",
+    "tracking_status",
+    "fulfilment_note",
+    "last_error",
+    "missing_asin",
+    "replacement_asin",
+)
+
+
+def hydrate_order_line_rows(rows: list[dict[str, Any]], stores: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    row_dicts = rows_to_dicts(rows)
+    stores = stores or rows_to_dicts(list_stores())
+    stores_by_id = {store["id"]: store for store in stores}
+    row_dicts = backfill_missing_order_dates(row_dicts)
+    for row in row_dicts:
+        store = stores_by_id.get(row.get("store_id"))
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        if row.get("amazon_order_id") and not row.get("amazon_order_url"):
+            row["amazon_order_url"] = order_line_amazon_url(row["amazon_order_id"])
+    return row_dicts
+
+
+def order_line_search_select_sql(where_sql: str) -> str:
+    return f"""
+        SELECT order_lines.*,
+               COALESCE((
+                   SELECT COUNT(*)
+                   FROM order_lines AS duplicate_lines
+                   WHERE duplicate_lines.store_id = order_lines.store_id
+                     AND duplicate_lines.asin = order_lines.asin
+                     AND COALESCE(duplicate_lines.amazon_order_id, '') = ''
+                     AND COALESCE(duplicate_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+               ), 0) AS duplicate_asin_count,
+               COALESCE((
+                   SELECT SUM(quantity)
+                   FROM inventory_items
+                   WHERE inventory_items.store_id = order_lines.store_id
+                     AND inventory_items.asin = order_lines.asin
+                     AND inventory_items.status = 'available'
+               ), 0) AS inventory_quantity,
+               COALESCE((
+                   SELECT COUNT(DISTINCT same_order_lines.asin)
+                   FROM order_lines AS same_order_lines
+                   WHERE same_order_lines.store_id = order_lines.store_id
+                     AND same_order_lines.odoo_order_id = order_lines.odoo_order_id
+                     AND COALESCE(same_order_lines.asin, '') != ''
+                     AND COALESCE(same_order_lines.amazon_order_id, '') = ''
+                     AND same_order_lines.state != 'missing'
+                     AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+               ), 0) AS odoo_order_distinct_asin_count
+        FROM order_lines
+        {where_sql}
+    """
+
+
+def order_lines_by_ids(ids: list[int], stores: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    if not ids:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            WITH matched(id, sort_order) AS (
+                SELECT * FROM UNNEST(?::int[]) WITH ORDINALITY
+            )
+            {order_line_search_select_sql("JOIN matched ON matched.id = order_lines.id")}
+            ORDER BY matched.sort_order
+            """,
+            (ids,),
+        ).fetchall()
+    return hydrate_order_line_rows(rows, stores)
+
+
+def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    term = f"%{query.strip()}%"
+    search_clause = " OR ".join(f"COALESCE({column}, '') ILIKE ?" for column in ORDER_LINE_SEARCH_COLUMNS)
+    params: list[Any] = [term for _ in ORDER_LINE_SEARCH_COLUMNS]
+    store_clause = ""
+    if store_id:
+        store_clause = " AND store_id=?"
+        params.append(int(store_id))
+    where_sql = f"WHERE ({search_clause}){store_clause}"
+    with db() as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) AS count FROM order_lines {where_sql}",
+            params,
+        ).fetchone()["count"] or 0)
+        rows = conn.execute(
+            f"""
+            {order_line_search_select_sql(where_sql)}
+            ORDER BY odoo_order_id DESC, asin, id
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+    return {
+        "rows": hydrate_order_line_rows(rows),
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+    }
+
+
 @app.on_event("startup")
 def startup() -> None:
     global _sync_thread_started
@@ -7524,25 +7744,26 @@ def api_run_backup() -> dict[str, Any]:
 
 @app.get("/api/search")
 def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    data = dashboard_data(store_id, page, per_page)
+    data = dashboard_data(store_id, 1, 1)
+    page, per_page, _ = pagination_bounds(page, per_page)
     if not q.strip():
-        return data
-    rows = data["rows"]
+        return dashboard_data(store_id, page, per_page)
     try:
-        ids = typesense_search_ids(q, store_id)
+        search_result = typesense_search_order_lines(q, store_id, page, per_page)
+        ids = list(search_result.get("ids") or [])
         if ids:
-            order = {row_id: idx for idx, row_id in enumerate(ids)}
-            data["rows"] = sorted([row for row in rows if int(row["id"]) in order], key=lambda row: order[int(row["id"])])
+            data["rows"] = order_lines_by_ids(ids, data.get("stores") or [])
+            data["page"] = page
+            data["per_page"] = per_page
+            data["total"] = int(search_result.get("total") or len(ids))
             data["search_engine"] = "typesense"
             return data
+        data["search_warning"] = "Typesense returned no hits; falling back to Postgres while the index catches up."
     except Exception as exc:
         data["search_warning"] = str(exc)
-    term = q.strip().lower()
-    data["rows"] = [
-        row for row in rows
-        if term in " ".join(str(row.get(key) or "") for key in ("odoo_order_name", "product_name", "asin", "state", "odoo_status_label", "amazon_order_id", "amazon_account_name", "fulfilment_note")).lower()
-    ]
-    data["search_engine"] = "local"
+    fallback = search_order_lines_sql(q, store_id, page, per_page)
+    data.update(fallback)
+    data["search_engine"] = "postgres"
     return data
 
 
@@ -7554,8 +7775,11 @@ def autosync_loop() -> None:
             settings = get_service_settings()
             interval = int(float(settings.get("autosync_interval_minutes") or 0))
             if interval > 0 and time.time() - last_run >= interval * 60:
+                pulled_count = 0
                 for store in list_stores():
-                    fetch_odoo_lines(get_store(int(store["id"])), days=2, limit=100)
+                    pulled_count += fetch_odoo_lines(get_store(int(store["id"])), days=2, limit=100)
+                if pulled_count:
+                    start_typesense_reindex_job()
                 last_run = time.time()
             chrome_interval = int(float(settings.get("auto_chrome_fulfil_interval_minutes") or 0))
             if chrome_interval > 0 and time.time() - last_chrome_run >= chrome_interval * 60:
@@ -7563,7 +7787,9 @@ def autosync_loop() -> None:
                 limit = max(1, min(500, int(float(settings.get("auto_chrome_fulfil_limit") or 100))))
                 for store in list_stores():
                     store_id = int(store["id"])
-                    fetch_odoo_lines(get_store(store_id), days=days, limit=limit)
+                    pulled_count = fetch_odoo_lines(get_store(store_id), days=days, limit=limit)
+                    if pulled_count:
+                        start_typesense_reindex_job()
                     place_orders(store_id, ordering_engine="chrome")
                 last_chrome_run = time.time()
         except Exception:
@@ -8008,6 +8234,7 @@ def run_pull_job(job_id: str) -> None:
                 """,
                 (inserted, utc_now(), utc_now(), job_id),
             )
+        start_typesense_reindex_job()
     except Exception as exc:
         with db() as conn:
             conn.execute(
@@ -9490,6 +9717,8 @@ def api_delete_lines(payload: DeleteLinesPayload) -> dict[str, Any]:
                 f"DELETE FROM order_lines WHERE store_id = ? AND id IN ({placeholders})",
                 [payload.store_id, *payload.line_ids],
             )
+        for line_id in payload.line_ids:
+            delete_order_line_index(int(line_id))
     data = dashboard_data(payload.store_id)
     data["message"] = f"Deleted {len(payload.line_ids)} selected line{'s' if len(payload.line_ids) != 1 else ''}."
     return data
@@ -9543,6 +9772,12 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             """,
             payload.line_ids,
         )
+        updated_rows = conn.execute(
+            f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
+            [payload.store_id, *payload.line_ids],
+        ).fetchall()
+    for updated in updated_rows:
+        index_order_line(updated)
     data = dashboard_data(payload.store_id)
     data["message"] = f"Reset {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} to fresh pulled status."
     return data
@@ -9563,6 +9798,9 @@ def api_update_line_spaid(line_id: int, payload: LineSpaidPayload) -> dict[str, 
             """,
             (value, utc_now(), line_id, payload.store_id),
         )
+        updated = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, payload.store_id)).fetchone()
+    if updated:
+        index_order_line(updated)
     data = dashboard_data(payload.store_id)
     data["message"] = f"SupplierPartAuxiliaryID {'saved' if value else 'cleared'}."
     data["ok"] = True
@@ -10318,7 +10556,8 @@ def test_store(store_id: int) -> RedirectResponse:
 
 @app.post("/pull")
 def pull_orders(store_id: int = Form(...), days: int = Form(7), limit: int = Form(50)) -> RedirectResponse:
-    fetch_odoo_lines(get_store(store_id), days, limit)
+    if fetch_odoo_lines(get_store(store_id), days, limit):
+        start_typesense_reindex_job()
     return RedirectResponse(f"/?store_id={store_id}", status_code=303)
 
 
