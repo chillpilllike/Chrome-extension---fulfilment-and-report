@@ -18,7 +18,7 @@ import xmlrpc.client
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.parse import quote_plus
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -125,6 +125,7 @@ FRONTEND_SHELL_PATHS = {
     "/shopify-fulfilment",
     "/shopify-tracking",
     "/inventory",
+    "/chrome-queue",
     "/settings",
 }
 
@@ -197,14 +198,63 @@ def effective_admin_access_token() -> str:
     return token
 
 
+def supplied_admin_access_token(request: Request) -> str:
+    return (
+        request.headers.get("X-Admin-Token")
+        or request.query_params.get("admin_token")
+        or request.cookies.get("admin_access_token")
+        or ""
+    )
+
+
+def request_has_admin_access(request: Request) -> bool:
+    token = effective_admin_access_token()
+    if not token:
+        return True
+    supplied = supplied_admin_access_token(request)
+    return supplied == token or supplied == MASTER_ADMIN_ACCESS_TOKEN
+
+
+def admin_access_bridge_response(request: Request) -> HTMLResponse:
+    current_path = request.url.path
+    if request.url.query:
+        current_path += f"?{request.url.query}"
+    safe_path = current_path if urlsplit(current_path).path.startswith("/") else "/"
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Admin Access Required</title>
+    <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+  </head>
+  <body>
+    <main class="container py-5">
+      <div class="alert alert-warning">Admin token required.</div>
+    </main>
+    <script>
+      const token = window.localStorage.getItem("admin_access_token") || window.sessionStorage.getItem("admin_access_token") || "";
+      const attemptedKey = "chrome_queue_admin_bridge_attempted";
+      if (token && !window.sessionStorage.getItem(attemptedKey)) {{
+        window.sessionStorage.setItem(attemptedKey, "1");
+        document.cookie = "admin_access_token=" + encodeURIComponent(token) + "; path=/; SameSite=Lax";
+        window.location.replace({json.dumps(safe_path)});
+      }}
+    </script>
+  </body>
+</html>""",
+        status_code=401,
+    )
+
+
 @app.middleware("http")
 async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     token = effective_admin_access_token()
     path = request.url.path
     allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
     if token and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
-        supplied = request.headers.get("X-Admin-Token") or request.query_params.get("admin_token") or ""
-        if supplied != token and supplied != MASTER_ADMIN_ACCESS_TOKEN:
+        if not request_has_admin_access(request):
             return Response("Admin token required.", status_code=401)
     return await call_next(request)
 
@@ -8181,13 +8231,16 @@ def order_line_ids_for_state(store_id: Optional[int], state: str, page: int, per
 @app.on_event("startup")
 def startup() -> None:
     global _sync_thread_started
-    init_db()
-    backfill_cxml_order_references()
     if not _sync_thread_started:
+        with db() as conn:
+            conn.execute("SELECT 1")
+        should_reindex_typesense = typesense_enabled()
+        threading.Thread(target=init_db, daemon=True).start()
+        threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
         threading.Thread(target=autosync_loop, daemon=True).start()
         threading.Thread(target=backup_loop, daemon=True).start()
         threading.Thread(target=amazon_otp_loop, daemon=True).start()
-        if typesense_enabled():
+        if should_reindex_typesense:
             threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
         _sync_thread_started = True
 
@@ -11113,6 +11166,8 @@ def dashboard(request: Request, store_id: Optional[int] = None) -> HTMLResponse:
 
 @app.get("/chrome-queue", response_class=HTMLResponse)
 def chrome_queue_page(request: Request, store_id: Optional[int] = None, message: str = "", status: str = "") -> HTMLResponse:
+    if not request_has_admin_access(request):
+        return admin_access_bridge_response(request)
     snapshot = chrome_queue_snapshot(store_id)
     return templates.TemplateResponse(
         "chrome_queue.html",

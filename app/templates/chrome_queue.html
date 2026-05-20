@@ -50,7 +50,7 @@
           <td>{{ (job.order_names or [])|join(", ") }}</td>
           <td>{{ job.recipient_name or "" }}</td>
           <td>
-            {% for item in job.items or [] %}
+            {% for item in job["items"] or [] %}
             <div><code>{{ item.asin }}</code> × {{ item.quantity }}</div>
             {% endfor %}
           </td>
