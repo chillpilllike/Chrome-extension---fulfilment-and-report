@@ -364,6 +364,12 @@ function oneTimePurchaseRoots() {
     const root = node.closest("[data-csa-c-buying-option-type], [data-a-accordion-row-name], .a-accordion-row, .a-box, #qualifiedBuybox, #desktop_qualifiedBuyBox, #buybox") || node.closest(".a-section") || node;
     if (root && visible(root) && !isInSubscribeAndSave(root) && !roots.includes(root)) roots.push(root);
   }
+  for (const node of document.querySelectorAll("button, [role='button'], .a-accordion-row, .a-box, #rightCol, #desktop_buybox")) {
+    if (!visible(node) || isInSubscribeAndSave(node) || roots.includes(node)) continue;
+    const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!text.includes("one-time purchase") || !/\$\s*\d/.test(text)) continue;
+    roots.push(node);
+  }
   return roots;
 }
 
@@ -386,7 +392,10 @@ function productPriceSnapshot() {
     .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !isInSubscribeAndSave(element) && !element.closest(".aok-hidden"))
     .map(parsePriceFrom)
     .filter((value) => Number(value) > 0);
-  const regular = regularPrices.length ? Math.min(...regularPrices) : null;
+  const regularFallbackPrices = regularPrices.length ? [] : regularRoots
+    .map((root) => firstPriceIn(root))
+    .filter((value) => Number(value) > 0);
+  const regular = regularPrices.length ? Math.min(...regularPrices) : (regularFallbackPrices.length ? Math.min(...regularFallbackPrices) : null);
   const snsRoots = [...document.querySelectorAll(subscribeAndSaveRootSelector())].filter(visible);
   const snsPriceSelectors = [
     "#sns-tiered-price .a-price[data-a-size='b']",
