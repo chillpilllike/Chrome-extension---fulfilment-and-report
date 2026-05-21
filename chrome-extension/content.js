@@ -1170,7 +1170,7 @@ function removeMissingItemFromActiveJob(activeJob, item, purchaseItem = item) {
 async function continueAfterPartialMissing(activeJob, item, purchaseItem, message, failureCode = "unavailable", details = {}) {
   if (!item) return false;
   const lineId = itemPrimaryLineId(item);
-  if (!lineId || (activeJob.job?.items || []).length <= 1) return false;
+  if (!lineId) return false;
   showPanel("Sending line to Missing ASINs", message, null, null);
   const result = await send({
     type: "MARK_LINE_MISSING",
@@ -1184,7 +1184,10 @@ async function continueAfterPartialMissing(activeJob, item, purchaseItem, messag
   });
   if (!result?.ok) return false;
   const remainingItems = removeMissingItemFromActiveJob(activeJob, item, purchaseItem);
-  if (!remainingItems.length) return false;
+  if (!remainingItems.length) {
+    showPanel("Missing ASINs", `${message} ${result.message || "Order moved to Missing ASINs."}`, null, null);
+    return true;
+  }
   if (activeJob.itemIndex < remainingItems.length) {
     activeJob.stage = "product";
     await setActiveJob(activeJob);
@@ -2467,23 +2470,8 @@ function rowIsNutricityAddress(row) {
   return dataName.includes("nutricity") || visibleName.includes("nutricity") || rowText.includes("nutricity");
 }
 
-function nutricityAddressRow() {
-  const rows = [...document.querySelectorAll(
-    [
-      "[data-testid='address-row-radio']",
-      "[data-testid='address-row-section']",
-      "[data-testid^='address-row-'][id^='address-row-']",
-      ".address-row-section",
-      ".address-row",
-    ].join(", "),
-  )].filter(visible);
-  return rows.find(rowIsNutricityAddress) || null;
-}
-
-function addressRowForRecipient(name) {
-  const wanted = normalizedText(name);
-  if (!wanted) return null;
-  const rows = [...document.querySelectorAll(
+function checkoutAddressRows() {
+  const selectorRows = [...document.querySelectorAll(
     [
       "[data-testid='address-row-radio']",
       "[data-testid='address-row-section']",
@@ -2492,14 +2480,36 @@ function addressRowForRecipient(name) {
       ".address-row",
       "[data-action='select_address_in_list']",
     ].join(", "),
-  )].filter(visible);
-  return rows.find((row) => normalizedText(row.innerText || row.textContent).includes(wanted)) || null;
+  )];
+  const radioRows = [...document.querySelectorAll("input[type='radio']")]
+    .map((radio) => {
+      let row = radio.closest("label, .a-row, .a-section, div");
+      for (let i = 0; row && i < 6; i += 1) {
+        const text = normalizedText(row.innerText || row.textContent || "");
+        if (text.includes("edit address") || text.includes("delivery preferences") || text.includes("united states")) return row;
+        row = row.parentElement;
+      }
+      return radio.closest("label") || radio.parentElement;
+    })
+    .filter(Boolean);
+  return [...new Set([...selectorRows, ...radioRows])].filter(visible);
+}
+
+function nutricityAddressRow() {
+  return checkoutAddressRows().find(rowIsNutricityAddress) || null;
+}
+
+function addressRowForRecipient(name) {
+  const wanted = normalizedText(name);
+  if (!wanted) return null;
+  return checkoutAddressRows().find((row) => normalizedText(row.innerText || row.textContent).includes(wanted)) || null;
 }
 
 function addressSelectionControl(row) {
   if (!row) return null;
   const label = row.closest?.("label");
-  const radio = row.querySelector("input[type='radio'][name='addressID']")
+  const radio = row.matches?.("input[type='radio']") ? row
+    : row.querySelector("input[type='radio'][name='addressID'], input[type='radio']")
     || label?.querySelector?.("input[type='radio'][name='addressID']")
     || row.closest?.("[data-testid='address-row-radio']")?.querySelector?.("input[type='radio'][name='addressID']");
   return radio?.closest?.("label") || radio || row;
@@ -2563,6 +2573,13 @@ function findEditAddressTrigger() {
   const xpath = "//*[starts-with(@id,'declarativeAction-') and .//*[normalize-space()='Edit address']]";
   const xpathNode = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
   if (xpathNode && visible(xpathNode)) return xpathNode.querySelector?.("a, button, span") || xpathNode;
+
+  const nutricityRow = nutricityAddressRow();
+  const rowEditLink = [...(nutricityRow?.querySelectorAll?.("a, button, span") || [])].find((element) => {
+    const text = (element.innerText || element.textContent || "").trim().toLowerCase();
+    return visible(element) && text === "edit address";
+  });
+  if (rowEditLink) return rowEditLink;
 
   return [...document.querySelectorAll("a, button, span")].find((element) => {
     const text = (element.innerText || element.textContent || "").trim().toLowerCase();
@@ -3485,6 +3502,11 @@ async function handleCheckout(activeJob) {
     "[data-checkout-view-modal]",
     "#checkout-primary-continue-button-id",
     "input[aria-label='Full name']",
+    "input[type='radio'][name='addressID']",
+    "input[type='radio'][aria-label*='Nutricity' i]",
+    "input[type='radio'][aria-label*='United States' i]",
+    "#ab-select-address-continue-button-bottom",
+    "input[data-testid='ab-select-address-continue-button-bottom']",
     "input[type='radio'][name='ppw-instrumentRowSelection']",
     "input[data-csa-c-slot-id*='continue-payselect']",
     "a[name='checkout-byg-ptc-button']",

@@ -522,7 +522,11 @@ async function markLineMissing(message, details = {}, windowId) {
     }),
   });
   await log(`Partially marked missing in ${activeJob.job.group_key}: ${message}`, windowId);
-  return result;
+  let nextJob = null;
+  if (result?.ok && Number(result.remaining_count || 0) === 0) {
+    nextJob = await claimNextJobInWindow(windowId);
+  }
+  return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
 }
 
 async function costlyJob(message, details = {}, windowId) {

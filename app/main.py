@@ -1997,6 +1997,9 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
         if not rows:
             return 0
         for row in rows:
+            if str(row["state"] or "") == "missing" and clean_text(row["missing_asin"] or ""):
+                updated_rows.append(row)
+                continue
             is_missing_line = (
                 (not missing_line_id and not missing_asin)
                 or (missing_line_id and int(row["id"]) == int(missing_line_id))
@@ -4434,10 +4437,10 @@ def clear_expired_chrome_claims(conn: Any) -> None:
     )
 
 
-def chrome_job_from_rows(group_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    group_rows = backfill_missing_currency_for_chrome_rows(group_rows)
+def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optional[dict[int, dict[str, Any]]] = None) -> dict[str, Any]:
     order_names = list(dict.fromkeys(str(row["odoo_order_name"]) for row in group_rows))
-    account = get_amazon_account(group_rows[0]["amazon_account_id"])
+    account_id = int(group_rows[0]["amazon_account_id"] or 0)
+    account = (accounts_by_id or {}).get(account_id) or get_amazon_account(account_id)
     items = aggregate_items_by_asin(group_rows)
     return {
         "group_key": str(group_rows[0]["amazon_group_key"]),
@@ -4501,10 +4504,12 @@ def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = 
             """,
             (store_id, store_id),
         ).fetchall()
+        account_rows = rows_to_dicts(conn.execute("SELECT * FROM amazon_accounts").fetchall())
+    accounts_by_id = {int(row["id"]): row for row in account_rows if row.get("id") is not None}
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows_to_dicts(rows):
         grouped.setdefault(str(row["amazon_group_key"]), []).append(row)
-    jobs = [chrome_job_from_rows(group_rows) for group_rows in grouped.values()]
+    jobs = [chrome_job_from_rows(group_rows, accounts_by_id) for group_rows in grouped.values()]
     return {"jobs": jobs, "counts": counts}
 
 
