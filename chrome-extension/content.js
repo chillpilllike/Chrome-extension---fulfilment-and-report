@@ -1885,8 +1885,7 @@ async function handleProduct(activeJob) {
   }
 
   const priceSnapshot = productPriceSnapshot();
-  const multiItemJob = (activeJob.job?.items || []).length > 1;
-  const priceForDecision = multiItemJob ? (priceSnapshot.regular || priceSnapshot.best) : priceSnapshot.best;
+  const priceForDecision = priceSnapshot.best;
   const switchedVariant = await selectCheapestCountVariant(activeJob, item, priceForDecision);
   if (switchedVariant) return;
   const purchaseItem = selectedVariantItem(activeJob, item);
@@ -1895,7 +1894,8 @@ async function handleProduct(activeJob) {
     showPanel("Cheaper variant found", `${selectionNote} Proceeding with this option.`, null, null);
     await sleep(1800);
   }
-  await recordAmazonPrice(activeJob, item, priceForDecision, !multiItemJob && priceSnapshot.sns && priceSnapshot.sns === priceForDecision ? "subscribe-save" : "product", purchaseItem);
+  const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
+  await recordAmazonPrice(activeJob, item, priceForDecision, snsIsCheaper && priceSnapshot.sns === priceForDecision ? "subscribe-save" : "product", purchaseItem);
   const quantity = Number(purchaseItem.quantity || 1);
   const storeTotal = Number(item.store_total_price || Number(item.store_unit_price || 0) * Number(item.quantity || 1) || 0);
   const amazonTotal = Number(priceForDecision || 0) * quantity;
@@ -1912,9 +1912,9 @@ async function handleProduct(activeJob) {
     return;
   }
 
-  const subscribed = !multiItemJob && await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob);
+  const subscribed = await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob);
   if (!subscribed) {
-    if (!multiItemJob && priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular) {
+    if (snsIsCheaper) {
       throw new Error(`Subscribe & Save is cheaper (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}), but the extension did not complete the Subscribe & Save selection. Fulfilment paused before changing regular quantity.`);
     }
     const quantitySet = await setQuantity(purchaseItem.quantity, "regular");
