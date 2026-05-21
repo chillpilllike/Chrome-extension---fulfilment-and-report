@@ -6,6 +6,7 @@ async function getSettings() {
     adminToken: "",
     cardLast4Preference: "",
     editExistingAddress: true,
+    fulfilAvailableMixedAsin: false,
     workerId: "",
     activeJob: null,
     activeJobsByWindow: {},
@@ -634,6 +635,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         adminToken: message.adminToken || "",
         cardLast4Preference: message.cardLast4Preference || "",
         editExistingAddress: message.editExistingAddress !== false,
+        fulfilAvailableMixedAsin: message.fulfilAvailableMixedAsin === true,
       });
       return { ok: true };
     }

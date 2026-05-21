@@ -1171,6 +1171,7 @@ async function continueAfterPartialMissing(activeJob, item, purchaseItem, messag
   if (!item) return false;
   const lineId = itemPrimaryLineId(item);
   if (!lineId) return false;
+  if (!await shouldFulfilAvailableMixedAsin(activeJob)) return false;
   showPanel("Sending line to Missing ASINs", message, null, null);
   const result = await send({
     type: "MARK_LINE_MISSING",
@@ -1200,6 +1201,12 @@ async function continueAfterPartialMissing(activeJob, item, purchaseItem, messag
     location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
   }
   return true;
+}
+
+async function shouldFulfilAvailableMixedAsin(activeJob) {
+  if ((activeJob.job?.items || []).length <= 1) return true;
+  const state = await getExtensionState();
+  return state.fulfilAvailableMixedAsin === true;
 }
 
 async function failCurrentItemAsMissing(activeJob, item, purchaseItem, message, failureCode = "unavailable", details = {}) {
@@ -2324,7 +2331,7 @@ async function handleCart(activeJob) {
       ? `Could not add the desired quantity for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}.`
       : `Could not verify the desired Amazon cart quantities. ${cartCheck.message}`;
     const missingItem = (activeJob.job?.items || []).find((entry) => String(entry.asin || "").toUpperCase() === String(missingAsin || "").toUpperCase());
-    if (missingItem && (activeJob.job?.items || []).length > 1) {
+    if (missingItem && (activeJob.job?.items || []).length > 1 && await shouldFulfilAvailableMixedAsin(activeJob)) {
       showPanel("Sending line to Missing ASINs", message, null, null);
       const partialResult = await send({
         type: "MARK_LINE_MISSING",
@@ -3446,7 +3453,7 @@ async function handleCheckoutLimitPurchase(activeJob) {
     ? `${issue.message} ASIN ${asin}${issue.title ? ` (${issue.title})` : ""}.${requestedQuantity ? ` Customer ordered ${requestedQuantity}, Amazon checkout allows ${availableQuantity}.` : ""}`
     : `${issue.message}${issue.title ? ` ${issue.title}.` : ""}`;
 
-  if (item && (activeJob.job?.items || []).length > 1) {
+  if (item && (activeJob.job?.items || []).length > 1 && await shouldFulfilAvailableMixedAsin(activeJob)) {
     showPanel("Limit purchase", message, null, null);
     const result = await send({
       type: "MARK_LINE_MISSING",

@@ -2,6 +2,7 @@ const apiBase = document.querySelector("#apiBase");
 const adminToken = document.querySelector("#adminToken");
 const cardLast4Preference = document.querySelector("#cardLast4Preference");
 const editExistingAddress = document.querySelector("#editExistingAddress");
+const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAsin");
 const connectionNotice = document.querySelector("#connectionNotice");
 const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
@@ -30,6 +31,7 @@ function hydrateSettingsValues(settings = {}) {
   adminToken.value = settings.adminToken || "";
   cardLast4Preference.value = settings.cardLast4Preference || "";
   editExistingAddress.checked = settings.editExistingAddress !== false;
+  fulfilAvailableMixedAsin.checked = settings.fulfilAvailableMixedAsin === true;
 }
 
 function hasSettingsPayload(state) {
@@ -37,7 +39,8 @@ function hasSettingsPayload(state) {
     Object.hasOwn(state, "apiBase") ||
     Object.hasOwn(state, "adminToken") ||
     Object.hasOwn(state, "cardLast4Preference") ||
-    Object.hasOwn(state, "editExistingAddress")
+    Object.hasOwn(state, "editExistingAddress") ||
+    Object.hasOwn(state, "fulfilAvailableMixedAsin")
   ));
 }
 
@@ -47,8 +50,9 @@ function loadSavedSettings() {
     adminToken: "",
     cardLast4Preference: "",
     editExistingAddress: true,
+    fulfilAvailableMixedAsin: false,
   }, (settings) => {
-    if (chrome.runtime.lastError || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress].includes(document.activeElement)) return;
+    if (chrome.runtime.lastError || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin].includes(document.activeElement)) return;
     hydrateSettingsValues(settings);
     settingsHydrated = true;
   });
@@ -64,7 +68,7 @@ function registerControlWindow() {
   });
 }
 
-[apiBase, adminToken, cardLast4Preference, editExistingAddress].forEach((input) => {
+[apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin].forEach((input) => {
   input.addEventListener("input", () => {
     settingsDirty = true;
   });
@@ -74,7 +78,7 @@ function registerControlWindow() {
 });
 
 function syncSettingsInputs(state) {
-  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress].includes(document.activeElement)) return;
+  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin].includes(document.activeElement)) return;
   hydrateSettingsValues(state);
   settingsHydrated = true;
 }
@@ -237,13 +241,13 @@ async function refresh() {
 }
 
 document.querySelector("#save").addEventListener("click", async () => {
-  const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked });
+  const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked });
   if (result.ok) settingsDirty = false;
   setStatus(result.ok ? "Saved." : result.message);
 });
 
 document.querySelector("#testConnection").addEventListener("click", async () => {
-  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked });
+  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked });
   settingsDirty = false;
   const result = await send({ type: "TEST_CONNECTION" });
   if (result.ok) {
