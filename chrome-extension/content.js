@@ -284,8 +284,37 @@ function firstPriceIn(root) {
   return price || priceFromText(root.innerText || root.textContent || "");
 }
 
+function moneyText(value) {
+  const number = Number(value || 0);
+  return number ? `$${number.toFixed(2)}` : "unknown price";
+}
+
 function isInSubscribeAndSave(element) {
-  return Boolean(element?.closest?.("#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, #reinvent_price_desktop_snsAccordionRowMiddle"));
+  return Boolean(element?.closest?.(subscribeAndSaveRootSelector()));
+}
+
+function subscribeAndSaveRootSelector() {
+  return [
+    "#snsAccordionRowMiddle",
+    "#snsAccordionRow",
+    "#snsAccordionRowContent",
+    "#reinvent_price_desktop_snsAccordionRowMiddle",
+    "#snsQuantity_feature_div",
+    "[id*='rcx-subscribe']",
+    "[id*='rcxOrdFreqSns']",
+    "[id*='snsAccordion']",
+    "[id*='snsBuyingOption']",
+    "[data-a-accordion-row-name*='sns']",
+  ].join(", ");
+}
+
+function subscribeAndSavePriceFromText(text) {
+  const match = String(text || "")
+    .replace(/,/g, "")
+    .match(/subscribe\s*&\s*save\s*\$+\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
 }
 
 function productPriceSnapshot() {
@@ -303,8 +332,8 @@ function productPriceSnapshot() {
     .filter((element) => visible(element) && !isInSubscribeAndSave(element))
     .map(parsePriceFrom)
     .find((value) => value) || null;
-  const snsRoot = document.querySelector("#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, #reinvent_price_desktop_snsAccordionRowMiddle");
-  const sns = firstPriceIn(snsRoot);
+  const snsRoots = [...document.querySelectorAll(subscribeAndSaveRootSelector())].filter(visible);
+  const sns = snsRoots.map(firstPriceIn).find((value) => value) || subscribeAndSavePriceFromText(document.body.innerText);
   const best = sns && regular ? Math.min(sns, regular) : sns || regular || 0;
   return { regular, sns, best };
 }
@@ -1056,9 +1085,11 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
   const { regular: pagePrice, sns: snsPrice } = productPriceSnapshot();
   const snsRoot = document.querySelector("#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, #reinvent_price_desktop_snsAccordionRowMiddle");
   if (!pagePrice || !snsPrice || snsPrice >= pagePrice) return false;
+  showPanel("Subscribe & Save", `Subscribe & Save is cheaper (${moneyText(snsPrice)} vs ${moneyText(pagePrice)}). Switching to subscription checkout.`, null, null);
 
   const radio = document.querySelector(".a-accordion-radio.a-icon-radio-inactive") || snsRoot?.querySelector("[role='radio'], input[type='radio']");
   if (radio) {
+    showPanel("Subscribe & Save", "Selecting the Subscribe & Save buying option.", null, null);
     radio.scrollIntoView({ block: "center", behavior: "smooth" });
     await sleep(500);
     radio.click();
@@ -1202,8 +1233,8 @@ function quantitySelects(context = "regular") {
     const id = select.id || "";
     if (context === "sns") {
       return (
-        /^sns/i.test(id) && id.includes("predefinedQuantitiesDropdown") ||
-        Boolean(select.closest("#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent"))
+        /sns/i.test(id) && id.includes("predefinedQuantitiesDropdown") ||
+        Boolean(select.closest(subscribeAndSaveRootSelector()))
       );
     }
     return (
@@ -1256,6 +1287,8 @@ function quantityFreeFormInput(select, context = "regular") {
   }
   if (context === "sns") {
     candidates.push(
+      "input[id*='sns'][id$='freeQuantityTextInput']",
+      "input[id*='sns'][id$='quantityTextInput']",
       "input[id^='sns'][id$='freeQuantityTextInput']",
       "input[id^='sns'][id$='quantityTextInput']",
       "#snsAccordionRowMiddle input.freeQuantityTextInput",
@@ -1275,6 +1308,12 @@ function quantityFreeFormInput(select, context = "regular") {
   for (const selector of candidates) {
     const input = document.querySelector(selector);
     if (input) return input;
+  }
+  if (context === "sns") {
+    for (const root of document.querySelectorAll(subscribeAndSaveRootSelector())) {
+      const input = root.querySelector("input.freeQuantityTextInput, input.quantity-text-input-with-label, input[id$='quantityTextInput'], input[id$='freeQuantityTextInput']");
+      if (input) return input;
+    }
   }
   return null;
 }
@@ -1306,6 +1345,8 @@ function quantityUpdateButton(select, context = "regular") {
 function quantityTextInputs(context = "regular") {
   const selectors = context === "sns"
     ? [
+        "input[id*='sns'][id$='quantityTextInput']",
+        "input[id*='sns'][id$='freeQuantityTextInput']",
         "input[id^='sns'][id$='quantityTextInput']",
         "input[id^='sns'][id$='freeQuantityTextInput']",
         "#snsAccordionRowMiddle input.quantity-text-input-with-label",
@@ -1317,7 +1358,13 @@ function quantityTextInputs(context = "regular") {
         "input.quantity-text-input-with-label:not([id^='sns'])",
         "input.freeQuantityTextInput:not([id^='sns'])",
       ];
-  return selectors.flatMap((selector) => [...document.querySelectorAll(selector)]).filter((input, index, all) => (
+  const inputs = selectors.flatMap((selector) => [...document.querySelectorAll(selector)]);
+  if (context === "sns") {
+    for (const root of document.querySelectorAll(subscribeAndSaveRootSelector())) {
+      inputs.push(...root.querySelectorAll("input.quantity-text-input-with-label, input.freeQuantityTextInput, input[id$='quantityTextInput'], input[id$='freeQuantityTextInput']"));
+    }
+  }
+  return inputs.filter((input, index, all) => (
     all.indexOf(input) === index && visible(input)
   ));
 }
@@ -1345,9 +1392,9 @@ function quantityAvailabilityIssue(context = "regular", requestedQuantity = 1) {
     .replace(/\s+/g, " ")
     .trim();
   const lowered = text.toLowerCase();
-  const hasIssue = (
+  const hasSingleSellerSplitOffer = lowered.includes("quantity unavailable from a single seller") || lowered.includes("buy from multiple sellers");
+  const hasSpecificInventoryLimit = (
     lowered.includes("limited availability at this quantity") ||
-    lowered.includes("quantity unavailable from a single seller") ||
     lowered.includes("limited availability") ||
     lowered.includes("not enough inventory") ||
     lowered.includes("not enough available") ||
@@ -1355,6 +1402,13 @@ function quantityAvailabilityIssue(context = "regular", requestedQuantity = 1) {
     lowered.includes("seller does not have") ||
     lowered.includes("seller doesn't have") ||
     lowered.includes("only") && lowered.includes("available")
+  );
+  if (context === "sns" && hasSingleSellerSplitOffer && !hasSpecificInventoryLimit) {
+    return null;
+  }
+  const hasIssue = (
+    hasSpecificInventoryLimit ||
+    hasSingleSellerSplitOffer
   );
   const splitOffer = context !== "sns" && document.querySelector("#splitoffer_detailpage_buybox_link[href*='quantity=']");
   if (!hasIssue && !splitOffer) return null;
