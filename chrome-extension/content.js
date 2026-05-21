@@ -1212,21 +1212,29 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
 
 async function activateSubscribeAndSaveOption() {
   if (subscribeAndSaveIsActive()) return true;
-  const target = findSubscribeAndSaveRadio();
+  const target = findSubscribeAndSaveAccordionClickTarget();
   if (!target) return false;
-  showPanel("Subscribe & Save", "Clicking the Subscribe & Save radio button.", null, null);
+  showPanel("Subscribe & Save", "Clicking the Subscribe & Save accordion row.", null, null);
   const clickTargets = [
     target,
-    target.querySelector?.(".a-accordion-radio.a-icon-radio-inactive"),
-    target.closest?.("[role='button'], .a-accordion-row, label"),
+    target.querySelector?.("[data-action='a-accordion'][role='button']"),
+    target.querySelector?.(".a-accordion-row[role='button']"),
+    target.querySelector?.(".accordion-header[role='button']"),
+    target.querySelector?.("h5"),
   ].filter(Boolean);
   for (const clickTarget of [...new Set(clickTargets)]) {
     clickTarget.scrollIntoView({ block: "center", behavior: "smooth" });
     await sleep(250);
+    clickTarget.focus?.();
+    clickTarget.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerType: "mouse" }));
     clickTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
     clickTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+    clickTarget.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, pointerType: "mouse" }));
     clickTarget.click();
     clickTarget.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+    clickTarget.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+    clickTarget.dispatchEvent(new KeyboardEvent("keydown", { key: " ", code: "Space", bubbles: true, cancelable: true }));
+    clickTarget.dispatchEvent(new KeyboardEvent("keyup", { key: " ", code: "Space", bubbles: true, cancelable: true }));
     await waitForStableDom(700, 5000);
     if (subscribeAndSaveIsActive()) return true;
   }
@@ -1236,8 +1244,19 @@ async function activateSubscribeAndSaveOption() {
 function subscribeAndSaveIsActive() {
   return Boolean(
     document.querySelector("#snsAccordionRowMiddle .a-accordion-radio-active, #snsAccordionRow .a-accordion-radio-active, #snsAccordionRowContent .a-accordion-radio-active, [data-csa-c-slot-id='snsAccordionRowMiddle'] .a-accordion-radio-active") ||
+    document.querySelector("#snsAccordionRowMiddle [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRow [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRowContent [data-action='a-accordion'][aria-expanded='true']") ||
+    snsQuantityControlVisible() ||
     [...document.querySelectorAll(subscribeAndSaveRootSelector())].some((root) => root.querySelector?.("[role='radio'][aria-checked='true']")),
   );
+}
+
+function findSubscribeAndSaveAccordionClickTarget() {
+  return document.querySelector("#snsAccordionRowMiddle")
+    || document.querySelector("#snsAccordionRow")
+    || document.querySelector("#snsAccordionRowContent")
+    || document.querySelector("[data-a-accordion-row-name='snsAccordionRowMiddle']")
+    || document.querySelector("[data-csa-c-slot-id='snsAccordionRowMiddle']")?.closest(".a-box, [data-a-accordion-row-name]")
+    || findSubscribeAndSaveRadio();
 }
 
 function findSubscribeAndSaveRadio(root = null) {
