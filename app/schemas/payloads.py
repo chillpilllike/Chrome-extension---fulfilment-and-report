@@ -136,6 +136,11 @@ class ChromeJobHeartbeatPayload(BaseModel):
     worker_id: str = ""
 
 
+class ChromeJobResetPayload(BaseModel):
+    worker_id: str = ""
+    line_ids: list[int] = []
+
+
 class EpostTrackingUpdatePayload(BaseModel):
     results: list[dict[str, Any]] = []
 

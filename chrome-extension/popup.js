@@ -12,6 +12,9 @@ const skipJob = document.querySelector("#skipJob");
 const markMissing = document.querySelector("#markMissing");
 const queuedJobs = document.querySelector("#queuedJobs");
 const queueCount = document.querySelector("#queueCount");
+const duplicateOrderAlert = document.querySelector("#duplicateOrderAlert");
+const duplicateOrderRows = document.querySelector("#duplicateOrderRows");
+const resetDuplicateFulfilment = document.querySelector("#resetDuplicateFulfilment");
 
 function send(message) {
   return chrome.runtime.sendMessage({ ...message, targetWindowId });
@@ -117,6 +120,45 @@ function renderPricing(activeJob) {
   pricingTotal.className = total >= 0 ? "profit" : "loss";
 }
 
+function renderDuplicateOrder(activeJob) {
+  const duplicate = activeJob?.duplicateOrder;
+  const orders = Array.isArray(duplicate?.orders) ? duplicate.orders : [];
+  duplicateOrderRows.innerHTML = "";
+  duplicateOrderAlert.hidden = !orders.length;
+  resetDuplicateFulfilment.disabled = !orders.length;
+  if (!orders.length) return;
+  for (const order of orders) {
+    const orderId = String(order.amazon_order_id || "").trim();
+    const orderUrl = String(order.amazon_order_url || (orderId ? `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(orderId)}` : "")).trim();
+    const row = document.createElement("div");
+    row.className = "duplicate-order-row";
+    const label = document.createElement("span");
+    label.textContent = `${order.order_name || "App order"}: `;
+    const link = document.createElement("a");
+    link.href = orderUrl || "#";
+    link.textContent = orderId || "Open Amazon order";
+    link.title = orderUrl || orderId;
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      if (orderUrl) chrome.tabs.create({ url: orderUrl });
+    });
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "icon-button";
+    copy.title = "Copy Amazon order number";
+    copy.textContent = "Copy";
+    copy.addEventListener("click", async () => {
+      await navigator.clipboard.writeText(orderId);
+      copy.textContent = "OK";
+      setTimeout(() => {
+        copy.textContent = "Copy";
+      }, 1200);
+    });
+    row.append(label, link, copy);
+    duplicateOrderRows.append(row);
+  }
+}
+
 function shortWorkerId(value) {
   const text = String(value || "");
   return text.length > 18 ? `${text.slice(0, 10)}...${text.slice(-5)}` : text;
@@ -175,6 +217,7 @@ async function refresh() {
   skipJob.disabled = !job;
   markMissing.disabled = !job;
   setStatus(job ? `${state.activeJob.paused ? "Paused" : "Active"}: ${job.group_key} (${state.activeJob.stage})` : "No active job.");
+  renderDuplicateOrder(state.activeJob);
   renderPricing(state.activeJob);
   logsBox.innerHTML = "";
   for (const line of state.logs || []) {
@@ -252,6 +295,16 @@ markMissing.addEventListener("click", async () => {
   setStatus("Marking current order missing and starting the next one...");
   const result = await send({ type: "MARK_CURRENT_MISSING" });
   setStatus(result.message || (result.ok ? "Marked missing." : "Could not mark missing."));
+  await refresh();
+});
+
+resetDuplicateFulfilment.addEventListener("click", async () => {
+  const confirmed = confirm("Clear the existing Amazon order number from the app for this active Chrome job and resume fulfilment?");
+  if (!confirmed) return;
+  resetDuplicateFulfilment.disabled = true;
+  setStatus("Clearing existing Amazon order from the app...");
+  const result = await send({ type: "RESET_DUPLICATE_FULFILMENT" });
+  setStatus(result.message || (result.ok ? "Cleared. Continue fulfilment." : "Could not clear existing Amazon order."));
   await refresh();
 });
 

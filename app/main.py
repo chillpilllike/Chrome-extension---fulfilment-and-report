@@ -47,6 +47,7 @@ from app.schemas import (
     ChromeJobCostlyPayload,
     ChromeJobFailPayload,
     ChromeJobHeartbeatPayload,
+    ChromeJobResetPayload,
     ChromeTrackingUpdatePayload,
     CostlyApprovalPayload,
     DeleteLinesPayload,
@@ -10048,6 +10049,138 @@ def api_chrome_job_release(group_key: str, payload: ChromeJobHeartbeatPayload) -
             (utc_now(), group_key, worker_id),
         )
     return {"ok": True, "released": cursor.rowcount}
+
+
+@app.post("/api/chrome/jobs/{group_key}/duplicate-check")
+def api_chrome_job_duplicate_check(group_key: str, payload: ChromeJobResetPayload) -> dict[str, Any]:
+    line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
+    if not line_ids:
+        return {"ok": True, "duplicate": False, "orders": []}
+    placeholders = ",".join("?" for _ in line_ids)
+    with db() as conn:
+        selected_rows = conn.execute(
+            f"""
+            SELECT id, store_id, odoo_order_id
+            FROM order_lines
+            WHERE id IN ({placeholders})
+            """,
+            line_ids,
+        ).fetchall()
+        if not selected_rows:
+            return {"ok": True, "duplicate": False, "orders": []}
+        order_pairs = sorted({(int(row["store_id"]), int(row["odoo_order_id"])) for row in selected_rows})
+        clauses = " OR ".join("(store_id=? AND odoo_order_id=?)" for _ in order_pairs)
+        params = [value for pair in order_pairs for value in pair]
+        duplicate_rows = conn.execute(
+            f"""
+            SELECT id, store_id, odoo_order_id, odoo_order_name, amazon_order_id, amazon_order_url
+            FROM order_lines
+            WHERE ({clauses})
+              AND COALESCE(amazon_order_id, '') != ''
+            ORDER BY odoo_order_name, amazon_order_id, id
+            """,
+            params,
+        ).fetchall()
+    orders: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in duplicate_rows:
+        amazon_order_id = clean_text(row["amazon_order_id"])
+        if not amazon_order_id:
+            continue
+        key = f"{row['store_id']}:{row['odoo_order_id']}:{amazon_order_id}"
+        if key in seen:
+            continue
+        seen.add(key)
+        orders.append(
+            {
+                "line_id": row["id"],
+                "store_id": row["store_id"],
+                "odoo_order_id": row["odoo_order_id"],
+                "order_name": row["odoo_order_name"],
+                "amazon_order_id": amazon_order_id,
+                "amazon_order_url": clean_text(row["amazon_order_url"]) or order_line_amazon_url(amazon_order_id),
+            }
+        )
+    message = ""
+    if orders:
+        message = "Amazon order already exists in the app: " + ", ".join(
+            f"{item['amazon_order_id']} ({item['order_name']})" for item in orders
+        )
+    return {"ok": True, "duplicate": bool(orders), "orders": orders, "message": message}
+
+
+@app.post("/api/chrome/jobs/{group_key}/reset-fulfilment")
+def api_chrome_job_reset_fulfilment(group_key: str, payload: ChromeJobResetPayload) -> dict[str, Any]:
+    worker_id = clean_text(payload.worker_id)
+    line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
+    if not worker_id:
+        raise HTTPException(400, "worker_id is required")
+    if not line_ids:
+        raise HTTPException(400, "line_ids are required")
+    placeholders = ",".join("?" for _ in line_ids)
+    now = utc_now()
+    expiry = chrome_job_lease_expiry()
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM order_lines
+            WHERE id IN ({placeholders})
+              AND amazon_group_key=?
+              AND order_engine='chrome'
+            """,
+            [*line_ids, group_key],
+        ).fetchall()
+        if not rows:
+            raise HTTPException(404, "Chrome job lines not found.")
+        cursor = conn.execute(
+            f"""
+            UPDATE order_lines
+            SET amazon_order_id=NULL,
+                amazon_order_url=NULL,
+                amazon_account_name=NULL,
+                amazon_status=NULL,
+                tracking_status=NULL,
+                tracking_payload=NULL,
+                tracking_checked_at=NULL,
+                state='submitted',
+                chrome_claimed_by=?,
+                chrome_claimed_at=COALESCE(chrome_claimed_at, ?),
+                chrome_claim_expires_at=?,
+                amazon_unit_price=NULL,
+                amazon_total_price=NULL,
+                chrome_profit_total=NULL,
+                fulfilment_note=NULL,
+                last_error=NULL,
+                ordered_at=NULL,
+                updated_at=?
+            WHERE id IN ({placeholders})
+              AND amazon_group_key=?
+              AND order_engine='chrome'
+            """,
+            [worker_id, now, expiry, now, *line_ids, group_key],
+        )
+        conn.execute(
+            f"""
+            UPDATE amazon_attempts
+            SET status='queued', error=NULL
+            WHERE order_line_id IN ({placeholders})
+              AND mode='chrome'
+              AND status IN ('ok', 'error', 'costly', 'missing', 'reset')
+            """,
+            line_ids,
+        )
+        updated_rows = conn.execute(
+            f"SELECT * FROM order_lines WHERE id IN ({placeholders})",
+            line_ids,
+        ).fetchall()
+    for row in updated_rows:
+        index_order_line(row)
+    return {
+        "ok": True,
+        "reset": cursor.rowcount,
+        "message": f"Cleared existing Amazon order from {cursor.rowcount} Chrome line(s). You can continue fulfilment.",
+    }
 
 
 @app.post("/api/chrome/jobs/{group_key}/force-release")

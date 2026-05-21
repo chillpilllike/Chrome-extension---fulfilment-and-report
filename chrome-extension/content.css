@@ -109,6 +109,23 @@
   margin-top: 8px;
 }
 
+.nutricity-panel-activity {
+  display: grid;
+  gap: 3px;
+  max-height: 86px;
+  margin: 8px 0 0;
+  padding-left: 18px;
+  overflow: auto;
+  color: #475569;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.nutricity-panel-activity li:first-child {
+  color: #0f172a;
+  font-weight: 700;
+}
+
 .nutricity-highlight {
   outline: 3px solid #f59e0b !important;
   outline-offset: 3px !important;

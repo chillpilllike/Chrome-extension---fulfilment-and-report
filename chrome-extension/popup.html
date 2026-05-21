@@ -35,6 +35,11 @@
         <button id="clearFailed" class="danger">Clear stale queue</button>
       </div>
       <section id="connectionNotice" class="connection-notice" hidden></section>
+      <section id="duplicateOrderAlert" class="duplicate-order-alert" hidden>
+        <strong>Amazon order already exists</strong>
+        <div id="duplicateOrderRows"></div>
+        <button id="resetDuplicateFulfilment" class="danger">Clear app order and continue</button>
+      </section>
       <section id="status"></section>
       <section class="queue">
         <div class="section-title">

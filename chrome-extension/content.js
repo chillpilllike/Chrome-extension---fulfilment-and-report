@@ -148,12 +148,13 @@ function showPanel(title, message, actionText, action) {
   if (!panel) {
     panel = document.createElement("div");
     panel.id = "nutricity-panel";
-    panel.innerHTML = `<div class="nutricity-panel-order" hidden><span class="nutricity-panel-order-label">Order being processed</span><span class="nutricity-panel-order-status"></span><div class="nutricity-panel-order-text"></div><div class="nutricity-panel-step">Step: <span class="nutricity-panel-step-text"></span></div></div><div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div>`;
+    panel.innerHTML = `<div class="nutricity-panel-order" hidden><span class="nutricity-panel-order-label">Order being processed</span><span class="nutricity-panel-order-status"></span><div class="nutricity-panel-order-text"></div><div class="nutricity-panel-step">Step: <span class="nutricity-panel-step-text"></span></div></div><div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div><ol class="nutricity-panel-activity"></ol>`;
     panel.querySelector(".nutricity-pause-toggle").addEventListener("click", togglePanelPause);
     document.documentElement.append(panel);
   }
   panel.querySelector("strong").textContent = title;
   panel.querySelector(".nutricity-panel-message").textContent = message;
+  rememberPanelActivity(panel, title, message);
   panel.querySelector(".nutricity-panel-action")?.remove();
   updatePanelPauseButton(panel);
   updatePanelOrderStatus(panel);
@@ -163,6 +164,20 @@ function showPanel(title, message, actionText, action) {
     button.textContent = actionText;
     button.addEventListener("click", action);
     panel.append(button);
+  }
+}
+
+function rememberPanelActivity(panel, title, message) {
+  const activity = panel.querySelector(".nutricity-panel-activity");
+  if (!activity || !message) return;
+  const text = `${title}: ${message}`.replace(/\s+/g, " ").trim();
+  if (activity.firstElementChild?.dataset?.text === text) return;
+  const item = document.createElement("li");
+  item.dataset.text = text;
+  item.textContent = text;
+  activity.prepend(item);
+  while (activity.children.length > 5) {
+    activity.lastElementChild.remove();
   }
 }
 
@@ -1112,27 +1127,79 @@ async function chooseSubscribeSoonerDelivery() {
 }
 
 async function chooseSubscribeFrequencySixMonths() {
+  showPanel("Subscribe & Save", "Opening delivery every dropdown.", null, null);
   const nativeFrequency = [...document.querySelectorAll("#snsAccordionRowMiddle select, #snsAccordionRow select, #snsAccordionRowContent select, #reinvent_price_desktop_snsAccordionRowMiddle select")]
     .find((select) => [...select.options || []].some((option) => /6\s*months/i.test(option.textContent || "") || String(option.value || "").includes("6M|sns")));
   const nativeContainerButton = nativeFrequency?.closest?.(".a-dropdown-container")?.querySelector?.(".a-button-dropdown, [data-action='a-dropdown-button']");
   const explicitButton = document.querySelector("#rcxOrdFreqSns, #rcxOrdFreqSns-announce")?.closest?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button");
-  const frequencyButton = findVisibleTextTarget(["deliver every", "delivery every"], "#snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRow [data-action='a-dropdown-button'], #snsAccordionRowContent [data-action='a-dropdown-button'], #reinvent_price_desktop_snsAccordionRowMiddle [data-action='a-dropdown-button'], #snsAccordionRowMiddle .a-button-dropdown, #snsAccordionRow .a-button-dropdown, #snsAccordionRowContent .a-button-dropdown");
+  const frequencyButton = findSubscribeFrequencyDropdownButton();
   const dropdownButton = explicitButton || nativeContainerButton || frequencyButton;
-  if (!dropdownButton || !visible(dropdownButton)) return false;
+  if (!dropdownButton || !visible(dropdownButton)) return selectNativeSubscribeFrequency(nativeFrequency);
   await clickElement(dropdownButton, "Subscribe & Save delivery schedule dropdown");
-  const sixMonths = await waitUntil(() => (
-    [...document.querySelectorAll("#rcxOrdFreqSns_10, .a-popover-wrapper a.a-dropdown-link, .a-popover-inner a.a-dropdown-link, a[role='option']")]
-      .filter(visible)
-      .find((link) => {
-        const text = (link.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-        const value = link.getAttribute("data-value") || "";
-        return text === "6 months" || value.includes("6M|sns");
-      })
-  ), 5000);
-  if (!sixMonths) return false;
-  await clickElement(sixMonths, "Subscribe & Save 6 months schedule");
+  const frequencyOption = await waitUntil(findLastSubscribeFrequencyOption, 5000);
+  if (!frequencyOption) return selectNativeSubscribeFrequency(nativeFrequency);
+  const selectedText = (frequencyOption.textContent || "").replace(/\s+/g, " ").trim();
+  showPanel("Subscribe & Save", `Selecting delivery every ${selectedText}.`, null, null);
+  await clickElement(frequencyOption, `Subscribe & Save ${selectedText} schedule`);
   await waitForStableDom(700, 5000);
   return true;
+}
+
+async function selectNativeSubscribeFrequency(select) {
+  if (!select?.options?.length) return false;
+  const options = [...select.options].filter((option) => /sns/i.test(String(option.value || "")) || /\b(weeks?|months?)\b/i.test(option.textContent || ""));
+  const target = options.find((option) => /6\s*months/i.test(option.textContent || "") || String(option.value || "").includes("6M|sns")) || options.at(-1);
+  if (!target) return false;
+  const selectedText = (target.textContent || "").replace(/\s+/g, " ").trim();
+  showPanel("Subscribe & Save", `Selecting delivery every ${selectedText}.`, null, null);
+  select.value = target.value;
+  select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  await waitForStableDom(700, 5000);
+  return true;
+}
+
+function findSubscribeFrequencyDropdownButton() {
+  const roots = [
+    document.querySelector("#snsAccordionRowMiddle"),
+    document.querySelector("#snsAccordionRow"),
+    document.querySelector("#snsAccordionRowContent"),
+    document.querySelector("#reinvent_price_desktop_snsAccordionRowMiddle"),
+  ].filter(Boolean);
+  const candidates = [
+    ...roots.flatMap((root) => [
+      ...root.querySelectorAll("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button"),
+    ]),
+    ...document.querySelectorAll("[id$='-announce'], span.a-dropdown-prompt"),
+  ];
+  return candidates.find((element) => {
+    const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const inSns = roots.some((root) => root.contains(element));
+    const looksLikeFrequency = /deliver(?:y)?\s*every/.test(text) || /\b\d+\s*(weeks?|months?)\b/.test(text);
+    return visible(element) && (inSns || /rcxordfreqsns/i.test(element.id || "")) && looksLikeFrequency;
+  })?.closest?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button") || null;
+}
+
+function findLastSubscribeFrequencyOption() {
+  const popovers = [...document.querySelectorAll(".a-popover-wrapper, .a-popover-inner")]
+    .filter((popover) => visible(popover) && /\b(weeks?|months?)\b/i.test(popover.innerText || popover.textContent || ""));
+  for (const popover of popovers) {
+    const scroller = popover.querySelector(".a-popover-inner") || popover;
+    scroller.scrollTop = scroller.scrollHeight;
+  }
+  const options = popovers
+    .flatMap((popover) => [...popover.querySelectorAll("a.a-dropdown-link, a[role='option']")])
+    .filter((link, index, all) => {
+      const text = (link.textContent || "").replace(/\s+/g, " ").trim();
+      const value = link.getAttribute("data-value") || "";
+      return all.indexOf(link) === index && visible(link) && (/\b\d+\s*(weeks?|months?)\b/i.test(text) || /\d+[WM]\|sns/i.test(value));
+    });
+  const sixMonths = options.find((link) => {
+    const text = (link.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const value = link.getAttribute("data-value") || "";
+    return text === "6 months" || value.includes("6M|sns");
+  });
+  return sixMonths || options.at(-1) || null;
 }
 
 function quantitySelects(context = "regular") {
@@ -1190,11 +1257,25 @@ function quantityFreeFormInput(select, context = "regular") {
   const candidates = [];
   if (id.includes("predefinedQuantitiesDropdown")) {
     candidates.push(`#${CSS.escape(id.replace("predefinedQuantitiesDropdown", "freeQuantityTextInput"))}`);
+    candidates.push(`#${CSS.escape(id.replace("predefinedQuantitiesDropdown", "quantityTextInput"))}`);
   }
   if (context === "sns") {
-    candidates.push("input[id^='sns'][id$='freeQuantityTextInput']", "#snsAccordionRowMiddle input.freeQuantityTextInput", "#snsAccordionRow input.freeQuantityTextInput");
+    candidates.push(
+      "input[id^='sns'][id$='freeQuantityTextInput']",
+      "input[id^='sns'][id$='quantityTextInput']",
+      "#snsAccordionRowMiddle input.freeQuantityTextInput",
+      "#snsAccordionRowMiddle input.quantity-text-input-with-label",
+      "#snsAccordionRow input.freeQuantityTextInput",
+      "#snsAccordionRow input.quantity-text-input-with-label",
+    );
   } else {
-    candidates.push("input[id*='new_buyingOption'][id$='freeQuantityTextInput']", "input.freeQuantityTextInput:not([id^='sns'])", "input#quantity");
+    candidates.push(
+      "input[id*='new_buyingOption'][id$='freeQuantityTextInput']",
+      "input[id*='new_buyingOption'][id$='quantityTextInput']",
+      "input.freeQuantityTextInput:not([id^='sns'])",
+      "input.quantity-text-input-with-label:not([id^='sns'])",
+      "input#quantity",
+    );
   }
   for (const selector of candidates) {
     const input = document.querySelector(selector);
@@ -1209,6 +1290,12 @@ function quantityUpdateButton(select, context = "regular") {
   if (id.includes("predefinedQuantitiesDropdown")) {
     candidates.push(`#${CSS.escape(id.replace("predefinedQuantitiesDropdown", "updateButton"))}`);
   }
+  if (id.includes("quantityTextInput")) {
+    candidates.push(`#${CSS.escape(id.replace("quantityTextInput", "updateButton"))}`);
+  }
+  if (id.includes("freeQuantityTextInput")) {
+    candidates.push(`#${CSS.escape(id.replace("freeQuantityTextInput", "updateButton"))}`);
+  }
   if (context === "sns") {
     candidates.push("#snsQuantity_feature_div [id$='-updateButton']", "#snsAccordionRowMiddle [id$='-updateButton']", "#snsAccordionRow [id$='-updateButton']");
   } else {
@@ -1219,6 +1306,25 @@ function quantityUpdateButton(select, context = "regular") {
     if (button && visible(button)) return button;
   }
   return null;
+}
+
+function quantityTextInputs(context = "regular") {
+  const selectors = context === "sns"
+    ? [
+        "input[id^='sns'][id$='quantityTextInput']",
+        "input[id^='sns'][id$='freeQuantityTextInput']",
+        "#snsAccordionRowMiddle input.quantity-text-input-with-label",
+        "#snsAccordionRowMiddle input.freeQuantityTextInput",
+      ]
+    : [
+        "input[id*='new_buyingOption'][id$='quantityTextInput']",
+        "input[id*='new_buyingOption'][id$='freeQuantityTextInput']",
+        "input.quantity-text-input-with-label:not([id^='sns'])",
+        "input.freeQuantityTextInput:not([id^='sns'])",
+      ];
+  return selectors.flatMap((selector) => [...document.querySelectorAll(selector)]).filter((input, index, all) => (
+    all.indexOf(input) === index && visible(input)
+  ));
 }
 
 async function clickQuantityUpdateButton(select, context = "regular") {
@@ -1388,8 +1494,26 @@ async function setFreeFormQuantity(select, qty, context = "regular") {
   return Number.isFinite(value) && value === qty;
 }
 
+async function setDirectQuantityInput(input, qty, context = "regular") {
+  if (!input) return false;
+  showPanel("Nutricity fulfilment", `Typing ${context === "sns" ? "Subscribe & Save " : ""}quantity ${qty}.`, null, null);
+  input.classList.remove("aok-hidden");
+  input.removeAttribute("aria-hidden");
+  input.scrollIntoView({ block: "center", behavior: "smooth" });
+  await sleep(350);
+  await setInputValue(input, String(qty));
+  input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  input.blur();
+  await sleep(800);
+  const updated = await clickQuantityUpdateButton(input, context);
+  await sleep(updated ? 1300 : 700);
+  const value = Number(String(input.value || "").replace(/[^\d.]/g, ""));
+  return Number.isFinite(value) && value === qty;
+}
+
 async function setQuantity(quantity, context = "regular") {
-  await waitForElement(["select#quantity", "select[name='quantity']", "select[id*='predefinedQuantitiesDropdown']", "#add-to-cart-button", "#rcx-subscribe-submit-button"], 12000);
+  await waitForElement(["select#quantity", "select[name='quantity']", "select[id*='predefinedQuantitiesDropdown']", "input[id$='quantityTextInput']", ".quantity-text-input-with-label", "#add-to-cart-button", "#rcx-subscribe-submit-button"], 12000);
   const qty = Math.max(1, Math.round(Number(quantity) || 1));
   window.__nutricityLastQuantityIssue = null;
   if (qty === 1) return true;
@@ -1402,6 +1526,17 @@ async function setQuantity(quantity, context = "regular") {
     const selected = freeFormSet || await chooseAmazonDropdownOption(select, qty) || await setNativeSelectQuantity(select, qty);
     if (!selected) continue;
     await sleep(900);
+    const issue = quantityAvailabilityIssue(context, qty);
+    if (issue) {
+      issue.context = context;
+      window.__nutricityLastQuantityIssue = issue;
+      return false;
+    }
+    return true;
+  }
+  for (const input of quantityTextInputs(context)) {
+    const typed = await setDirectQuantityInput(input, qty, context);
+    if (!typed) continue;
     const issue = quantityAvailabilityIssue(context, qty);
     if (issue) {
       issue.context = context;
@@ -1501,25 +1636,22 @@ async function handleProduct(activeJob) {
     return;
   }
 
-  await applyAdditionalSavings("regular");
+  const savingsApplied = await applyAdditionalSavings("regular");
+  if (savingsApplied) {
+    await waitForStableDom(900, 6000);
+  }
   const promoCount = markPromotions();
   if (promoCount && !activeJob.promoAcknowledged[item.asin]) {
-    showPanel(
-      "Coupon or promotion found",
-      "Tick any Amazon coupon/promotion you want to use, then continue.",
-      "I applied it, continue",
-      async () => {
-        const latest = await getActiveJob();
-        latest.promoAcknowledged[item.asin] = true;
-        await setActiveJob(latest);
-        handleProduct(latest);
-      },
-    );
-    return;
+    activeJob.promoAcknowledged[item.asin] = true;
+    await setActiveJob(activeJob);
+    showPanel("Nutricity fulfilment", "Coupon or promotion detected. Continuing price comparison.", null, null);
+    await sleep(900);
   }
 
   const priceSnapshot = productPriceSnapshot();
-  const switchedVariant = await selectCheapestCountVariant(activeJob, item, priceSnapshot.best);
+  const multiItemJob = (activeJob.job?.items || []).length > 1;
+  const priceForDecision = multiItemJob ? (priceSnapshot.regular || priceSnapshot.best) : priceSnapshot.best;
+  const switchedVariant = await selectCheapestCountVariant(activeJob, item, priceForDecision);
   if (switchedVariant) return;
   const purchaseItem = selectedVariantItem(activeJob, item);
   const selectionNote = variantSelectionNote(item, purchaseItem);
@@ -1527,10 +1659,10 @@ async function handleProduct(activeJob) {
     showPanel("Cheaper variant found", `${selectionNote} Proceeding with this option.`, null, null);
     await sleep(1800);
   }
-  await recordAmazonPrice(activeJob, item, priceSnapshot.best, priceSnapshot.sns && priceSnapshot.sns === priceSnapshot.best ? "subscribe-save" : "product", purchaseItem);
+  await recordAmazonPrice(activeJob, item, priceForDecision, !multiItemJob && priceSnapshot.sns && priceSnapshot.sns === priceForDecision ? "subscribe-save" : "product", purchaseItem);
   const quantity = Number(purchaseItem.quantity || 1);
   const storeTotal = Number(item.store_total_price || Number(item.store_unit_price || 0) * Number(item.quantity || 1) || 0);
-  const amazonTotal = Number(priceSnapshot.best || 0) * quantity;
+  const amazonTotal = Number(priceForDecision || 0) * quantity;
   if (!item.cost_approved && storeTotal > 0 && amazonTotal > storeTotal) {
     await send({
       type: "COSTLY_JOB",
@@ -1544,7 +1676,7 @@ async function handleProduct(activeJob) {
     return;
   }
 
-  const subscribed = await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob);
+  const subscribed = !multiItemJob && await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob);
   if (!subscribed) {
     const quantitySet = await setQuantity(purchaseItem.quantity, "regular");
     if (!quantitySet) {
@@ -2810,6 +2942,29 @@ async function handleCheckout(activeJob) {
     ], 5000)
     || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
+    const duplicateCheck = await send({ type: "CHECK_EXISTING_AMAZON_ORDER" });
+    if (!duplicateCheck?.ok) {
+      activeJob.paused = true;
+      activeJob.pausedStage = "checkout";
+      await setActiveJob(activeJob);
+      showPanel(
+        "Duplicate check failed",
+        duplicateCheck?.message || "Could not confirm whether an Amazon order already exists in the app. Fulfilment is paused before placing the order.",
+        "Retry",
+        () => continueAfterManualStep(activeJob, "checkout"),
+      );
+      return;
+    }
+    if (duplicateCheck?.duplicate) {
+      const orders = (duplicateCheck.orders || []).map((item) => item.amazon_order_id).filter(Boolean).join(", ");
+      showPanel(
+        "Amazon order already exists",
+        `${orders || "An Amazon order"} is already saved in the app. Open the extension popup to review it, copy the number, or clear it after confirming the Amazon order was cancelled.`,
+        null,
+        null,
+      );
+      return;
+    }
     showPanel("Final step", "Clicking Place your order now.", null, null);
     activeJob.stage = "complete_pending";
     await setActiveJob(activeJob);
@@ -2954,6 +3109,14 @@ async function run() {
       } else {
         showPanel("Nutricity fulfilment", "Reporting Amazon order back to the app.", null, null);
       }
+    } else if (activeJob.stage === "duplicate_order") {
+      const orders = (activeJob.duplicateOrder?.orders || []).map((item) => item.amazon_order_id).filter(Boolean).join(", ");
+      showPanel(
+        "Amazon order already exists",
+        `${orders || "An Amazon order"} is already saved in the app. Open the extension popup to review or clear it before continuing.`,
+        null,
+        null,
+      );
     } else if (activeJob.stage === "complete_pending") {
       await handleCompletion(activeJob);
     } else if (activeJob.stage === "subscribe_checkout") {

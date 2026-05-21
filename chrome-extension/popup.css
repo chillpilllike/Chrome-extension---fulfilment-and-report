@@ -98,6 +98,46 @@ button.danger {
   display: none;
 }
 
+.duplicate-order-alert {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  background: #fef2f2;
+  color: #991b1b;
+  padding: 8px;
+}
+
+.duplicate-order-alert[hidden] {
+  display: none;
+}
+
+.duplicate-order-alert strong {
+  color: #7f1d1d;
+}
+
+.duplicate-order-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.duplicate-order-row a {
+  color: #b42318;
+  font-weight: 800;
+}
+
+.icon-button {
+  min-width: 30px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #991b1b;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
 .queue,
 .pricing {
   border: 1px solid #e2e8f0;

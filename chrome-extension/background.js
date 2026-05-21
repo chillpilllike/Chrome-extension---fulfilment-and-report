@@ -307,6 +307,51 @@ async function markCurrentJobMissing(windowId) {
   };
 }
 
+async function checkExistingAmazonOrder(windowId) {
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job?.group_key) return { ok: true, duplicate: false, orders: [] };
+  try {
+    await heartbeatJob(activeJob, windowId);
+  } catch (error) {
+    await log(`Continuing duplicate check after heartbeat failed for ${activeJob.job.group_key}: ${error.message}`, windowId);
+  }
+  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/duplicate-check`, {
+    method: "POST",
+    body: JSON.stringify({
+      worker_id: activeJob.workerId || "",
+      line_ids: activeJob.job.line_ids || [],
+    }),
+  });
+  activeJob.duplicateOrder = result.duplicate ? result : null;
+  if (result.duplicate) {
+    activeJob.paused = true;
+    activeJob.pausedStage = activeJob.stage || "checkout";
+    activeJob.stage = "duplicate_order";
+    await log(result.message || `Amazon order already exists for ${activeJob.job.group_key}.`, windowId);
+  }
+  await setWindowJob(windowId, activeJob);
+  return result;
+}
+
+async function resetDuplicateFulfilment(windowId) {
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job?.group_key) return { ok: false, message: "No active job to reset." };
+  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/reset-fulfilment`, {
+    method: "POST",
+    body: JSON.stringify({
+      worker_id: activeJob.workerId || "",
+      line_ids: activeJob.job.line_ids || [],
+    }),
+  });
+  activeJob.duplicateOrder = null;
+  activeJob.paused = false;
+  activeJob.pausedStage = null;
+  activeJob.stage = "checkout";
+  await setWindowJob(windowId, activeJob);
+  await log(result.message || `Cleared existing Amazon order for ${activeJob.job.group_key}.`, windowId);
+  return result;
+}
+
 async function releaseStoredJob(activeJob, windowId = null, label = "Chrome job") {
   if (!activeJob?.job?.group_key || !activeJob?.workerId) return false;
   try {
@@ -526,7 +571,6 @@ chrome.windows.onRemoved.addListener((windowId) => {
     const targetWindowId = controlWindowsById?.[String(windowId)] || null;
     if (targetWindowId) {
       await setControlWindow(windowId, null);
-      await stopJob(Number(targetWindowId));
       return;
     }
     if (activeJobsByWindow?.[String(windowId)]) {
@@ -546,6 +590,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "STOP_JOB") return stopJob(windowId);
     if (message.type === "SKIP_JOB") return skipJob(windowId);
     if (message.type === "MARK_CURRENT_MISSING") return markCurrentJobMissing(windowId);
+    if (message.type === "CHECK_EXISTING_AMAZON_ORDER") return checkExistingAmazonOrder(windowId);
+    if (message.type === "RESET_DUPLICATE_FULFILMENT") return resetDuplicateFulfilment(windowId);
     if (message.type === "TOGGLE_PAUSE") return togglePause(windowId);
     if (message.type === "GET_STATE") {
       await releaseMissingWindowJobs();
