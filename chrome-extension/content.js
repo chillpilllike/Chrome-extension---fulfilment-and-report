@@ -582,6 +582,23 @@ function selectedVariantItem(activeJob, item) {
   };
 }
 
+function purchaseAsinForJobItem(activeJob, item) {
+  return String(selectedVariantItem(activeJob, item)?.asin || item?.asin || "").toUpperCase();
+}
+
+function uniquePurchaseAsins(activeJob) {
+  const asins = new Set();
+  for (const item of activeJob?.job?.items || []) {
+    const asin = purchaseAsinForJobItem(activeJob, item);
+    if (asin) asins.add(asin);
+  }
+  return asins;
+}
+
+function isMixedAsinOrder(activeJob) {
+  return uniquePurchaseAsins(activeJob).size > 1;
+}
+
 function variantSelectionNote(item, purchaseItem) {
   if (!purchaseItem.selected_variant_label || !purchaseItem.original_asin || purchaseItem.original_asin === purchaseItem.asin) return "";
   const originalLabel = itemCountPack(item)?.label || item.product_name || item.asin;
@@ -1572,6 +1589,8 @@ function quantityTextInputs(context = "regular") {
         "#snsAccordionRowMiddle input.freeQuantityTextInput",
       ]
     : [
+        "input#quantity",
+        "input[name='quantity']",
         "input[id*='new_buyingOption'][id$='quantityTextInput']",
         "input[id*='new_buyingOption'][id$='freeQuantityTextInput']",
         "input.quantity-text-input-with-label:not([id^='sns'])",
@@ -1588,14 +1607,79 @@ function quantityTextInputs(context = "regular") {
   ));
 }
 
+function regularBuyboxQuantityControls() {
+  const controls = [
+    ...document.querySelectorAll(
+      [
+        "#addToCart select#quantity",
+        "#addToCart input#quantity",
+        "#addToCart input[name='quantity']",
+        "#buybox select#quantity",
+        "#buybox input#quantity",
+        "#buybox input[name='quantity']",
+        "#desktop_buybox select#quantity",
+        "#desktop_buybox input#quantity",
+        "#desktop_buybox input[name='quantity']",
+        "select#quantity",
+        "input#quantity",
+        "input[name='quantity']",
+      ].join(", "),
+    ),
+  ];
+  return controls.filter((control, index, all) => (
+    all.indexOf(control) === index &&
+    !control.closest(subscribeAndSaveRootSelector()) &&
+    String(control.name || control.id || "").toLowerCase() === "quantity"
+  ));
+}
+
+function setQuantityControlValue(control, qty) {
+  if (!control) return false;
+  const requested = Math.max(1, Math.round(Number(qty) || 1));
+  if (control.tagName === "SELECT") {
+    const option = [...control.options || []].find((item) => String(item.value) === String(requested) || Number(item.value) === requested);
+    if (!option) return false;
+    control.value = option.value;
+  } else {
+    control.value = String(requested);
+    control.setAttribute("value", String(requested));
+  }
+  control.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  control.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  return true;
+}
+
+function syncRegularQuantity(qty = 1) {
+  const requested = Math.max(1, Math.round(Number(qty) || 1));
+  const controls = [
+    ...regularBuyboxQuantityControls(),
+    ...quantitySelects("regular"),
+    ...quantityTextInputs("regular"),
+  ].filter((control, index, all) => all.indexOf(control) === index);
+  let synced = false;
+  for (const control of controls) {
+    synced = setQuantityControlValue(control, requested) || synced;
+  }
+  return synced || requested === 1;
+}
+
 function quantityValueAccepted(context = "regular", qty = 1) {
   const requested = Math.max(1, Math.round(Number(qty) || 1));
+  if (context !== "sns") {
+    const buyboxControls = regularBuyboxQuantityControls();
+    if (buyboxControls.length) {
+      return buyboxControls.some((control) => {
+        const value = Number(String(control.value || "").replace(/[^\d.]/g, ""));
+        return Number.isFinite(value) && value === requested;
+      });
+    }
+  }
   const roots = context === "sns"
     ? [...document.querySelectorAll(subscribeAndSaveRootSelector())]
     : [document];
   const controls = roots.flatMap((root) => [
     ...root.querySelectorAll("select[id*='predefinedQuantitiesDropdown'], select#quantity, select[name='quantity'], input#rcxsubsQuan, input[id$='quantityTextInput'], input[id$='freeQuantityTextInput'], input#quantity"),
-  ]);
+  ]).filter((control) => context === "sns" || !control.closest(subscribeAndSaveRootSelector()));
   const accepted = controls.some((control) => {
     const value = Number(String(control.value || "").replace(/[^\d.]/g, ""));
     return Number.isFinite(value) && value === requested;
@@ -1861,11 +1945,21 @@ async function setQuantity(quantity, context = "regular") {
     const freeFormSet = freeFormInput ? await setFreeFormQuantity(select, qty, context) : false;
     const selected = freeFormSet || await chooseAmazonDropdownOption(select, qty) || await setNativeSelectQuantity(select, qty);
     if (!selected) continue;
+    if (context === "regular") {
+      syncRegularQuantity(qty);
+      await sleep(400);
+      if (!quantityValueAccepted(context, qty)) continue;
+    }
     await sleep(900);
     const issue = quantityAvailabilityIssue(context, qty);
     if (issue) {
-      if (context === "sns" && quantityValueAccepted(context, qty)) {
-        showPanel("Nutricity fulfilment", "Amazon accepted the Subscribe & Save quantity despite a limited availability warning. Continuing.", null, null);
+      if (quantityValueAccepted(context, qty)) {
+        showPanel(
+          "Nutricity fulfilment",
+          `Amazon accepted the ${context === "sns" ? "Subscribe & Save " : ""}quantity despite a limited availability warning. Continuing.`,
+          null,
+          null,
+        );
         return true;
       }
       issue.context = context;
@@ -1877,10 +1971,20 @@ async function setQuantity(quantity, context = "regular") {
   for (const input of quantityTextInputs(context)) {
     const typed = await setDirectQuantityInput(input, qty, context);
     if (!typed) continue;
+    if (context === "regular") {
+      syncRegularQuantity(qty);
+      await sleep(400);
+      if (!quantityValueAccepted(context, qty)) continue;
+    }
     const issue = quantityAvailabilityIssue(context, qty);
     if (issue) {
-      if (context === "sns" && quantityValueAccepted(context, qty)) {
-        showPanel("Nutricity fulfilment", "Amazon accepted the Subscribe & Save quantity despite a limited availability warning. Continuing.", null, null);
+      if (quantityValueAccepted(context, qty)) {
+        showPanel(
+          "Nutricity fulfilment",
+          `Amazon accepted the ${context === "sns" ? "Subscribe & Save " : ""}quantity despite a limited availability warning. Continuing.`,
+          null,
+          null,
+        );
         return true;
       }
       issue.context = context;
@@ -1993,17 +2097,21 @@ async function handleProduct(activeJob) {
   }
 
   const priceSnapshot = productPriceSnapshot();
-  const priceForDecision = priceSnapshot.best;
-  const switchedVariant = await selectCheapestCountVariant(activeJob, item, priceForDecision);
+  const mixedAsinOrder = isMixedAsinOrder(activeJob);
+  const priceForVariantDecision = mixedAsinOrder ? (priceSnapshot.regular || priceSnapshot.best) : priceSnapshot.best;
+  const switchedVariant = await selectCheapestCountVariant(activeJob, item, priceForVariantDecision);
   if (switchedVariant) return;
   const purchaseItem = selectedVariantItem(activeJob, item);
+  const mixedAsinAfterVariant = isMixedAsinOrder(activeJob);
   const selectionNote = variantSelectionNote(item, purchaseItem);
   if (selectionNote) {
     showPanel("Cheaper variant found", `${selectionNote} Proceeding with this option.`, null, null);
     await sleep(1800);
   }
   const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
-  await recordAmazonPrice(activeJob, item, priceForDecision, snsIsCheaper && priceSnapshot.sns === priceForDecision ? "subscribe-save" : "product", purchaseItem);
+  const useSubscribeAndSave = snsIsCheaper && !mixedAsinAfterVariant;
+  const priceForDecision = useSubscribeAndSave ? priceSnapshot.sns : (priceSnapshot.regular || priceSnapshot.best);
+  await recordAmazonPrice(activeJob, item, priceForDecision, useSubscribeAndSave ? "subscribe-save" : "product", purchaseItem);
   const quantity = Number(purchaseItem.quantity || 1);
   const storeTotal = Number(item.store_total_price || Number(item.store_unit_price || 0) * Number(item.quantity || 1) || 0);
   const amazonTotal = Number(priceForDecision || 0) * quantity;
@@ -2020,9 +2128,19 @@ async function handleProduct(activeJob) {
     return;
   }
 
-  const subscribed = await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob);
+  if (mixedAsinAfterVariant && snsIsCheaper) {
+    showPanel(
+      "Subscribe & Save skipped",
+      `This order has multiple different ASINs, so ${purchaseItem.asin} will be added with regular Add to cart even though Subscribe & Save is cheaper (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}).`,
+      null,
+      null,
+    );
+    await sleep(900);
+  }
+
+  const subscribed = useSubscribeAndSave ? await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob) : false;
   if (!subscribed) {
-    if (snsIsCheaper) {
+    if (useSubscribeAndSave) {
       throw new Error(`Subscribe & Save is cheaper (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}), but the extension did not complete the Subscribe & Save selection. Fulfilment paused before changing regular quantity.`);
     }
     const quantitySet = await setQuantity(purchaseItem.quantity, "regular");
@@ -2052,6 +2170,30 @@ async function handleProduct(activeJob) {
         requestedQuantity,
         fulfilledQuantity: availableQuantity || null,
         availableQuantity: availableQuantity || null,
+      });
+      showPanel("Missing ASINs", `${message} Order moved to Missing ASINs.`, null, null);
+      return;
+    }
+    const requestedQuantity = Math.max(1, Math.round(Number(purchaseItem.quantity || 1)));
+    if (requestedQuantity > 1 && !quantityValueAccepted("regular", requestedQuantity)) {
+      const message = `ASIN ${purchaseItem.asin} is missing or unavailable. Amazon did not verify regular Add to cart quantity ${requestedQuantity}.`;
+      if (await continueAfterPartialMissing(activeJob, item, purchaseItem, message, "partial_quantity", {
+        requestedQuantity,
+        fulfilledQuantity: null,
+        availableQuantity: null,
+      })) {
+        return;
+      }
+      showPanel("Sending to Missing ASINs", message, null, null);
+      await send({
+        type: "FAIL_JOB",
+        message,
+        missingAsin: item.asin,
+        missingLineId: itemPrimaryLineId(item),
+        failureCode: "partial_quantity",
+        requestedQuantity,
+        fulfilledQuantity: null,
+        availableQuantity: null,
       });
       showPanel("Missing ASINs", `${message} Order moved to Missing ASINs.`, null, null);
       return;
