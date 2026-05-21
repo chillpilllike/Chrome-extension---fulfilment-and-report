@@ -1541,6 +1541,24 @@ function quantityTextInputs(context = "regular") {
   ));
 }
 
+function quantityValueAccepted(context = "regular", qty = 1) {
+  const requested = Math.max(1, Math.round(Number(qty) || 1));
+  const roots = context === "sns"
+    ? [...document.querySelectorAll(subscribeAndSaveRootSelector())]
+    : [document];
+  const controls = roots.flatMap((root) => [
+    ...root.querySelectorAll("select[id*='predefinedQuantitiesDropdown'], select#quantity, select[name='quantity'], input#rcxsubsQuan, input[id$='quantityTextInput'], input[id$='freeQuantityTextInput'], input#quantity"),
+  ]);
+  const accepted = controls.some((control) => {
+    const value = Number(String(control.value || "").replace(/[^\d.]/g, ""));
+    return Number.isFinite(value) && value === requested;
+  });
+  if (!accepted) return false;
+  if (context !== "sns") return true;
+  const subscribeButton = document.querySelector("#rcx-subscribe-submit-button-announce, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input, button[value='snsText']");
+  return Boolean(subscribeButton && visible(subscribeButton) && !subscribeButton.disabled);
+}
+
 async function clickQuantityUpdateButton(select, context = "regular") {
   const button = await waitUntil(() => quantityUpdateButton(select, context), 2500, 250);
   if (!button) return false;
@@ -1764,6 +1782,10 @@ async function setQuantity(quantity, context = "regular") {
     await sleep(900);
     const issue = quantityAvailabilityIssue(context, qty);
     if (issue) {
+      if (context === "sns" && quantityValueAccepted(context, qty)) {
+        showPanel("Nutricity fulfilment", "Amazon accepted the Subscribe & Save quantity despite a limited availability warning. Continuing.", null, null);
+        return true;
+      }
       issue.context = context;
       window.__nutricityLastQuantityIssue = issue;
       return false;
@@ -1775,6 +1797,10 @@ async function setQuantity(quantity, context = "regular") {
     if (!typed) continue;
     const issue = quantityAvailabilityIssue(context, qty);
     if (issue) {
+      if (context === "sns" && quantityValueAccepted(context, qty)) {
+        showPanel("Nutricity fulfilment", "Amazon accepted the Subscribe & Save quantity despite a limited availability warning. Continuing.", null, null);
+        return true;
+      }
       issue.context = context;
       window.__nutricityLastQuantityIssue = issue;
       return false;
