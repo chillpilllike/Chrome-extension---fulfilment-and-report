@@ -1129,7 +1129,7 @@ async function chooseSubscribeSoonerDelivery() {
 async function chooseSubscribeFrequencySixMonths() {
   showPanel("Subscribe & Save", "Opening delivery every dropdown.", null, null);
   const nativeFrequency = [...document.querySelectorAll("#snsAccordionRowMiddle select, #snsAccordionRow select, #snsAccordionRowContent select, #reinvent_price_desktop_snsAccordionRowMiddle select")]
-    .find((select) => [...select.options || []].some((option) => /6\s*months/i.test(option.textContent || "") || String(option.value || "").includes("6M|sns")));
+    .find((select) => [...select.options || []].some((option) => /\b(weeks?|months?)\b/i.test(option.textContent || "") || /\d+[WM]\|sns/i.test(String(option.value || ""))));
   const nativeContainerButton = nativeFrequency?.closest?.(".a-dropdown-container")?.querySelector?.(".a-button-dropdown, [data-action='a-dropdown-button']");
   const explicitButton = document.querySelector("#rcxOrdFreqSns, #rcxOrdFreqSns-announce")?.closest?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button");
   const frequencyButton = findSubscribeFrequencyDropdownButton();
@@ -1148,7 +1148,7 @@ async function chooseSubscribeFrequencySixMonths() {
 async function selectNativeSubscribeFrequency(select) {
   if (!select?.options?.length) return false;
   const options = [...select.options].filter((option) => /sns/i.test(String(option.value || "")) || /\b(weeks?|months?)\b/i.test(option.textContent || ""));
-  const target = options.find((option) => /6\s*months/i.test(option.textContent || "") || String(option.value || "").includes("6M|sns")) || options.at(-1);
+  const target = options.at(-1);
   if (!target) return false;
   const selectedText = (target.textContent || "").replace(/\s+/g, " ").trim();
   showPanel("Subscribe & Save", `Selecting delivery every ${selectedText}.`, null, null);
@@ -1194,12 +1194,7 @@ function findLastSubscribeFrequencyOption() {
       const value = link.getAttribute("data-value") || "";
       return all.indexOf(link) === index && visible(link) && (/\b\d+\s*(weeks?|months?)\b/i.test(text) || /\d+[WM]\|sns/i.test(value));
     });
-  const sixMonths = options.find((link) => {
-    const text = (link.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-    const value = link.getAttribute("data-value") || "";
-    return text === "6 months" || value.includes("6M|sns");
-  });
-  return sixMonths || options.at(-1) || null;
+  return options.at(-1) || null;
 }
 
 function quantitySelects(context = "regular") {
