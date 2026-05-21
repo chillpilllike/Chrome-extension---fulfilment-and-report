@@ -1197,6 +1197,14 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     throw error;
   }
   await configureSubscribeAndSaveDelivery();
+  const syncedQuantity = syncSubscribeAndSaveQuantity(quantity);
+  if (!syncedQuantity) {
+    const requestedQuantity = Math.max(1, Math.round(Number(quantity || 1)));
+    const error = new Error(`Subscribe & Save quantity ${requestedQuantity} was visible, but Amazon's checkout form still had a different quantity. Fulfilment paused before checkout.`);
+    error.failureCode = "partial_quantity";
+    error.requestedQuantity = requestedQuantity;
+    throw error;
+  }
   const subscribeButton = document.querySelector("#rcx-subscribe-submit-button-announce, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input, button[value='snsText']") || findButtonByText(["subscribe"]);
   if (subscribeButton) {
     if (activeJob) {
@@ -1557,6 +1565,41 @@ function quantityValueAccepted(context = "regular", qty = 1) {
   if (context !== "sns") return true;
   const subscribeButton = document.querySelector("#rcx-subscribe-submit-button-announce, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input, button[value='snsText']");
   return Boolean(subscribeButton && visible(subscribeButton) && !subscribeButton.disabled);
+}
+
+function syncSubscribeAndSaveQuantity(qty = 1) {
+  const requested = Math.max(1, Math.round(Number(qty) || 1));
+  const roots = [
+    ...document.querySelectorAll("#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, #reinvent_price_desktop_snsAccordionRowMiddle, #snsQuantity_feature_div"),
+  ].filter((root, index, all) => root && all.indexOf(root) === index);
+  const scopedRoots = roots.length ? roots : [document];
+  const controls = scopedRoots.flatMap((root) => [
+    ...root.querySelectorAll("input#rcxsubsQuan, form input[name='quantity'], select[id*='sns'][id*='predefinedQuantitiesDropdown'], input[id*='sns'][id$='quantityTextInput'], input[id*='sns'][id$='freeQuantityTextInput']"),
+  ]).filter((control, index, all) => all.indexOf(control) === index);
+
+  for (const control of controls) {
+    if (control.tagName === "SELECT") {
+      const option = [...control.options || []].find((item) => String(item.value) === String(requested) || Number(item.value) === requested);
+      if (!option) continue;
+      control.value = option.value;
+    } else {
+      control.value = String(requested);
+      control.setAttribute("value", String(requested));
+    }
+    control.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    control.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  }
+
+  const hiddenQuantityControls = controls.filter((control) => {
+    const type = String(control.type || "").toLowerCase();
+    return type === "hidden" || control.id === "rcxsubsQuan" || control.name === "quantity";
+  });
+  const requiredControls = hiddenQuantityControls.length ? hiddenQuantityControls : controls;
+  const synced = requiredControls.some((control) => Number(String(control.value || "").replace(/[^\d.]/g, "")) === requested);
+  if (synced && requested > 1) {
+    showPanel("Nutricity fulfilment", `Synced Subscribe & Save checkout quantity to ${requested}.`, null, null);
+  }
+  return synced || requested === 1;
 }
 
 async function clickQuantityUpdateButton(select, context = "regular") {
