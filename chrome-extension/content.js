@@ -2722,6 +2722,55 @@ function findPlaceOrderButton() {
   });
 }
 
+function checkoutQuantityFromPage() {
+  const text = (document.body.innerText || document.body.textContent || "").replace(/\s+/g, " ");
+  const deleteStepperMatch = text.match(/(?:minimum quantity reached,\s*delete item|delete item)\s+(\d+)\s+\1\s+increase item quantity/i);
+  if (deleteStepperMatch) return Number(deleteStepperMatch[1]);
+  const quantityMatch = text.match(/\bquantity\s*:?\s*(\d+)\b/i);
+  return quantityMatch ? Number(quantityMatch[1]) : 0;
+}
+
+function checkoutIncreaseQuantityButton() {
+  return [...document.querySelectorAll("button, input[type='button'], input[type='submit'], a, span.a-button")]
+    .find((element) => {
+      const label = normalizedText(element.getAttribute?.("aria-label") || element.value || element.title || element.innerText || element.textContent);
+      return visible(element) && !element.disabled && label.includes("increase item quantity");
+    });
+}
+
+function expectedSubscribeCheckoutQuantity(activeJob) {
+  if (!activeJob?.subscribeAndSave) return 0;
+  const pricedQuantities = Object.values(activeJob.pricing || {})
+    .map((item) => Number(item.quantity || 0))
+    .filter((quantity) => quantity > 0);
+  if (pricedQuantities.length) return Math.max(...pricedQuantities);
+  const activeItem = activeJob.job?.items?.[Number(activeJob.itemIndex || 0)];
+  return Number(activeItem?.quantity || 0);
+}
+
+async function ensureSubscribeCheckoutQuantity(activeJob) {
+  const expected = expectedSubscribeCheckoutQuantity(activeJob);
+  if (expected <= 1) return true;
+  let current = checkoutQuantityFromPage();
+  if (!current || current >= expected) return true;
+  showPanel("Nutricity checkout", `Checkout shows Subscribe & Save quantity ${current}; increasing to ${expected}.`, null, null);
+  for (let index = current; index < expected; index += 1) {
+    const increase = checkoutIncreaseQuantityButton();
+    if (!increase) break;
+    await clickElement(increase, "Increase checkout item quantity");
+    await sleep(1200);
+    current = checkoutQuantityFromPage() || current + 1;
+    if (current >= expected) break;
+  }
+  current = checkoutQuantityFromPage() || current;
+  if (current >= expected) {
+    showPanel("Nutricity checkout", `Verified Subscribe & Save checkout quantity ${current}.`, null, null);
+    return true;
+  }
+  await pauseForManualCheckout(activeJob, `Checkout still shows Subscribe & Save quantity ${current || "unknown"} instead of ${expected}.`);
+  return false;
+}
+
 function findBusinessContinueCheckoutButton() {
   return [...document.querySelectorAll(
     "a[name='checkout-byg-ptc-button'], a[href*='/checkout/entry/cart/amazon_business'], a[href*='proceedToCheckout=1'], button, input[type='submit'], input[type='button'], span.a-button",
@@ -3239,6 +3288,7 @@ async function handleCheckout(activeJob) {
 
   if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
   if (!await ensurePreferredCheckoutPayment(activeJob)) return;
+  if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
 
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([
