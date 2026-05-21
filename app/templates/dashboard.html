@@ -109,7 +109,7 @@
         </thead>
         <tbody>
           {% for row in rows %}
-          <tr class="{% if row.odoo_status_label in ['cancelled', 'refunded'] %}row-alert{% elif row.inventory_quantity %}row-inventory{% endif %}" data-asin="{{ row.asin }}">
+          <tr class="{% if row.last_error and ('limited purchase quantity' in row.last_error or 'business has reached' in row.last_error or 'Limit purchase' in row.last_error) %}row-alert{% elif row.last_error and ('Less quantity' in row.last_error or 'Customer ordered' in row.last_error or 'maximum allowable' in row.last_error) %}row-quantity-warning{% elif row.state == 'missing' %}row-missing{% elif row.odoo_status_label in ['cancelled', 'refunded'] %}row-alert{% elif row.inventory_quantity %}row-inventory{% endif %}" data-asin="{{ row.asin }}">
             <td><input class="line-check" type="checkbox" name="line_ids" value="{{ row.id }}" data-asin="{{ row.asin }}"></td>
             <td>
               {% if row.odoo_order_url %}

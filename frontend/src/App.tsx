@@ -1092,6 +1092,10 @@ function isLimitPurchaseLine(row: OrderLine) {
   return /limit purchase|limited purchase quantity|business has reached/i.test(`${row.last_error || ""} ${row.fulfilment_note || ""}`)
 }
 
+function isPartialQuantityLine(row: OrderLine) {
+  return /less quantity|partial quantity|customer ordered|maximum allowable|only allows|did not allow the full quantity|could add only/i.test(`${row.last_error || ""} ${row.fulfilment_note || ""}`)
+}
+
 function ErrorTooltip({ value, className = "" }: { value?: string; className?: string }) {
   const text = String(value || "").trim()
   if (!text) return null
@@ -4932,7 +4936,10 @@ function MissingPage({
               </TableHeader>
               <TableBody>
                 {groupRows.map((row) => (
-                  <TableRow key={row.id}>
+                  <TableRow
+                    key={row.id}
+                    className={isLimitPurchaseLine(row) ? "bg-red-50" : isPartialQuantityLine(row) ? "bg-orange-50" : ""}
+                  >
                     <TableCell>
                       <Checkbox
                         checked={selected.includes(row.id)}

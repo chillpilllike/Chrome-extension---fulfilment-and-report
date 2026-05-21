@@ -732,6 +732,50 @@ function matchCheckoutIssueItem(activeJob, title) {
   }) || null;
 }
 
+function checkoutLineItemGroups(panel) {
+  return [...panel.querySelectorAll("[id^='line-item-group-display-']")]
+    .filter((element) => visible(element) && !element.classList.contains("aok-hidden"));
+}
+
+function checkoutLineItemTitle(groupView) {
+  const titleNode = groupView?.querySelector?.(".lineitem-title-text, [id^='item-block-product-title-']");
+  return String(titleNode?.innerText || titleNode?.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function checkoutLineItemQuantity(groupView) {
+  const stepper = groupView?.querySelector?.("[name='stma-checkout-quantity-stepper'], [data-a-component='stepper']");
+  const value = Number(
+    stepper?.getAttribute?.("data-steppervalue") ||
+    stepper?.getAttribute?.("data-displaystring") ||
+    stepper?.querySelector?.("[data-a-selector='inner-value']")?.textContent ||
+    0,
+  );
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function checkoutLineItemLimitCandidate(activeJob, groupView) {
+  if (!groupView) return null;
+  const groupText = normalizedText(groupView.innerText || groupView.textContent);
+  if (
+    !groupText.includes("limited purchase quantity") ||
+    !groupText.includes("business has reached it")
+  ) {
+    return null;
+  }
+  const title = checkoutLineItemTitle(groupView);
+  const item = matchCheckoutIssueItem(activeJob, title);
+  const currentQuantity = checkoutLineItemQuantity(groupView);
+  const removeButton = [...groupView.querySelectorAll("a.js-delete-button, a[aria-label='Remove item'], a, button")]
+    .find((element) => visible(element) && normalizedText(element.getAttribute?.("aria-label") || element.innerText || element.textContent).includes("remove item"));
+  return {
+    item,
+    title,
+    currentQuantity,
+    removeButton,
+    message: "Limit purchase: Amazon says this item has limited purchase quantity and the business has already reached it.",
+  };
+}
+
 function checkoutLimitPurchaseIssue(activeJob) {
   const panel = document.querySelector("#checkout-javaItemSelectPanel");
   if (!panel || !visible(panel)) return null;
@@ -743,7 +787,12 @@ function checkoutLimitPurchaseIssue(activeJob) {
     return null;
   }
 
-  const messageNode = [...panel.querySelectorAll("[data-messageid], .line-item-destination-message-groups, .a-alert-content, span")]
+  const lineIssue = checkoutLineItemGroups(panel)
+    .map((groupView) => checkoutLineItemLimitCandidate(activeJob, groupView))
+    .find(Boolean);
+  if (lineIssue) return lineIssue;
+
+  const messageNode = [...panel.querySelectorAll("[data-messageid='AmazonBusinessCVMessages'], .line-item-destination-message-groups")]
     .find((element) => normalizedText(element.innerText || element.textContent).includes("limited purchase quantity"));
   const parentView = messageNode?.closest?.("[id^='line-item-parent-view-']");
   const parentId = parentView?.id || "";
@@ -754,9 +803,11 @@ function checkoutLimitPurchaseIssue(activeJob) {
   const item = matchCheckoutIssueItem(activeJob, title);
   const removeButton = [...(groupView || parentView || panel).querySelectorAll?.("a.js-delete-button, a[aria-label='Remove item'], a, button") || []]
     .find((element) => visible(element) && normalizedText(element.getAttribute?.("aria-label") || element.innerText || element.textContent).includes("remove item"));
+  const currentQuantity = checkoutLineItemQuantity(groupView);
   return {
     item,
     title,
+    currentQuantity,
     removeButton,
     message: "Limit purchase: Amazon says this item has limited purchase quantity and the business has already reached it.",
   };
@@ -3310,8 +3361,10 @@ async function handleCheckoutLimitPurchase(activeJob) {
   if (!issue) return false;
   const item = issue.item;
   const asin = item?.asin || "";
+  const requestedQuantity = Number(item?.quantity || 0) || null;
+  const availableQuantity = Number(issue.currentQuantity || 0) || 1;
   const message = asin
-    ? `${issue.message} ASIN ${asin}${issue.title ? ` (${issue.title})` : ""}.`
+    ? `${issue.message} ASIN ${asin}${issue.title ? ` (${issue.title})` : ""}.${requestedQuantity ? ` Customer ordered ${requestedQuantity}, Amazon checkout allows ${availableQuantity}.` : ""}`
     : `${issue.message}${issue.title ? ` ${issue.title}.` : ""}`;
 
   if (item && (activeJob.job?.items || []).length > 1) {
@@ -3321,10 +3374,10 @@ async function handleCheckoutLimitPurchase(activeJob) {
       message,
       missingAsin: asin,
       missingLineId: itemPrimaryLineId(item),
-      failureCode: "limit_purchase",
-      requestedQuantity: item.quantity ?? null,
-      fulfilledQuantity: 0,
-      availableQuantity: 0,
+      failureCode: "partial_quantity",
+      requestedQuantity,
+      fulfilledQuantity: availableQuantity,
+      availableQuantity,
     });
     if (!result?.ok) {
       await pauseForManualCheckout(activeJob, `${message} I could not report this line to the app.`);
@@ -3353,10 +3406,10 @@ async function handleCheckoutLimitPurchase(activeJob) {
     message,
     missingAsin: asin,
     missingLineId: item ? itemPrimaryLineId(item) : null,
-    failureCode: "limit_purchase",
-    requestedQuantity: item?.quantity ?? null,
-    fulfilledQuantity: 0,
-    availableQuantity: 0,
+    failureCode: "partial_quantity",
+    requestedQuantity,
+    fulfilledQuantity: availableQuantity,
+    availableQuantity,
   });
   showPanel("Missing ASINs", `${message} Order moved to Missing ASINs.`, null, null);
   return true;

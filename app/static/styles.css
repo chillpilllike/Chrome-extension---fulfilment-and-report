@@ -392,6 +392,14 @@ tbody tr:hover {
   background: #fff1f2;
 }
 
+.row-quantity-warning {
+  background: #fff7ed;
+}
+
+.row-missing {
+  background: #fffbeb;
+}
+
 .row-inventory {
   background: #eff6ff;
 }
