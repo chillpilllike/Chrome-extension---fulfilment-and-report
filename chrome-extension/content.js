@@ -326,6 +326,7 @@ function subscribeAndSaveRootSelector() {
     "#snsAccordionRowContent",
     "#reinvent_price_desktop_snsAccordionRowMiddle",
     "#snsQuantity_feature_div",
+    "[data-csa-c-buying-option-type='SNS']",
     "[data-csa-c-slot-id*='sns']",
     "[id*='rcx-subscribe']",
     "[id*='rcxOrdFreqSns']",
@@ -1227,6 +1228,7 @@ async function activateSubscribeAndSaveOption() {
   if (!target) return false;
   showPanel("Subscribe & Save", "Clicking the Subscribe & Save accordion row.", null, null);
   const clickTargets = [
+    target.querySelector?.(".a-accordion-radio.a-icon-radio-inactive")?.closest?.("[data-action='a-accordion'][role='button'], .a-accordion-row[role='button'], .accordion-header[role='button']"),
     target.querySelector?.("[data-action='a-accordion'][role='button']"),
     target.querySelector?.(".a-accordion-row[role='button']"),
     target.querySelector?.(".accordion-header[role='button']"),
@@ -1243,6 +1245,7 @@ async function activateSubscribeAndSaveOption() {
     clickTarget.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
     clickTarget.dispatchEvent(new KeyboardEvent("keydown", { key: " ", code: "Space", bubbles: true, cancelable: true }));
     clickTarget.dispatchEvent(new KeyboardEvent("keyup", { key: " ", code: "Space", bubbles: true, cancelable: true }));
+    dispatchClickAtElementCenter(clickTarget);
     await waitForStableDom(700, 5000);
     if (subscribeAndSaveIsActive()) return true;
   }
@@ -1258,20 +1261,30 @@ function dispatchAmazonClickSequence(element) {
   element.click();
 }
 
+function dispatchClickAtElementCenter(element) {
+  const rect = element?.getBoundingClientRect?.();
+  if (!rect?.width || !rect?.height) return false;
+  const x = rect.left + Math.min(Math.max(12, rect.width * 0.08), rect.width / 2);
+  const y = rect.top + rect.height / 2;
+  const target = document.elementFromPoint(x, y) || element;
+  dispatchAmazonClickSequence(target);
+  return true;
+}
+
 function subscribeAndSaveIsActive() {
   return subscribeAndSaveAccordionIsActive();
 }
 
 function subscribeAndSaveAccordionIsActive() {
   return Boolean(
-    document.querySelector("#snsAccordionRowMiddle .a-accordion-radio-active, #snsAccordionRow .a-accordion-radio-active, #snsAccordionRowContent .a-accordion-radio-active, [data-csa-c-slot-id='snsAccordionRowMiddle'] .a-accordion-radio-active") ||
-    document.querySelector("#snsAccordionRowMiddle [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRow [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRowContent [data-action='a-accordion'][aria-expanded='true']") ||
-    [...document.querySelectorAll(subscribeAndSaveRootSelector())].some((root) => root.querySelector?.("[role='radio'][aria-checked='true']")),
+    document.querySelector("#snsAccordionRowMiddle .a-accordion-radio-active, #snsAccordionRow .a-accordion-radio-active, #snsAccordionRowContent .a-accordion-radio-active, [data-csa-c-slot-id*='sns'] .a-accordion-radio-active, [data-a-accordion-row-name*='sns'] .a-accordion-radio-active, [data-csa-c-buying-option-type='SNS'] .a-accordion-radio-active") ||
+    document.querySelector("#snsAccordionRowMiddle [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRow [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRowContent [data-action='a-accordion'][aria-expanded='true'], [data-csa-c-slot-id*='sns'][data-action='a-accordion'][aria-expanded='true'], [data-a-accordion-row-name*='sns'] [data-action='a-accordion'][aria-expanded='true']") ||
+    [...document.querySelectorAll(subscribeAndSaveRootSelector())].some((root) => root.querySelector?.("[role='radio'][aria-checked='true']") || visible(root.querySelector?.("#rcx-subscribe-submit-button, #rcx-subscribe-submit-button-announce, input#rcxsubsQuan"))),
   );
 }
 
 function findSubscribeAndSaveAccordionClickTarget() {
-  return document.querySelector("#snsAccordionRowMiddle [data-action='a-accordion'][role='button']")
+  const direct = document.querySelector("#snsAccordionRowMiddle [data-action='a-accordion'][role='button']")
     || document.querySelector("#snsAccordionRowMiddle .a-accordion-row[role='button']")
     || document.querySelector("#snsAccordionRowMiddle")
     || document.querySelector("#snsAccordionRow [data-action='a-accordion'][role='button']")
@@ -1283,6 +1296,23 @@ function findSubscribeAndSaveAccordionClickTarget() {
     || document.querySelector("[data-csa-c-slot-id='snsAccordionRowMiddle'][data-action='a-accordion'][role='button']")
     || document.querySelector("[data-csa-c-slot-id='snsAccordionRowMiddle']")?.closest(".a-accordion-row[role='button'], .a-box, [data-a-accordion-row-name]")
     || findSubscribeAndSaveRadio();
+  if (direct) return direct;
+
+  const rows = [
+    ...document.querySelectorAll("[data-csa-c-buying-option-type='SNS'], [data-a-accordion-row-name*='sns'], [data-csa-c-slot-id*='sns'], .a-accordion-row, .accordion-header"),
+  ].filter((row, index, all) => all.indexOf(row) === index && visible(row));
+  for (const row of rows) {
+    const text = (row.innerText || row.textContent || "").replace(/\s+/g, " ").toLowerCase();
+    const idData = `${row.id || ""} ${row.getAttribute("data-a-accordion-row-name") || ""} ${row.getAttribute("data-csa-c-slot-id") || ""} ${row.getAttribute("data-csa-c-buying-option-type") || ""}`.toLowerCase();
+    if (!text.includes("subscribe") && !idData.includes("sns")) continue;
+    const header = row.closest?.("[data-a-accordion-row-name]")?.querySelector?.("[data-action='a-accordion'][role='button'], .a-accordion-row[role='button'], .accordion-header[role='button']")
+      || row.querySelector?.("[data-action='a-accordion'][role='button'], .a-accordion-row[role='button'], .accordion-header[role='button']")
+      || row.closest?.("[data-action='a-accordion'][role='button'], .a-accordion-row[role='button'], .accordion-header[role='button']")
+      || row.closest?.("[data-a-accordion-row-name], .a-box")
+      || row;
+    if (header && visible(header)) return header;
+  }
+  return null;
 }
 
 function findSubscribeAndSaveRadio(root = null) {
