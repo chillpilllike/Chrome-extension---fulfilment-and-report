@@ -1164,19 +1164,18 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
   }
   showPanel("Subscribe & Save", `Subscribe & Save is cheaper (${moneyText(snsPrice)} vs ${moneyText(pagePrice)}). Switching to subscription checkout.`, null, null);
 
-  const radio = findSubscribeAndSaveRadio();
-  if (radio) {
-    showPanel("Subscribe & Save", "Selecting the Subscribe & Save buying option.", null, null);
-    await clickElement(radio, "Subscribe & Save option");
-    await sleep(1500);
-    await waitForStableDom(800, 6000);
+  const activated = await activateSubscribeAndSaveOption();
+  if (!activated) {
+    const error = new Error("Subscribe & Save is cheaper, but Amazon did not activate the Subscribe & Save radio button. Fulfilment paused before touching regular Add to cart quantity.");
+    error.failureCode = "";
+    throw error;
   }
-  const snsSelected = document.querySelector(`${subscribeAndSaveRootSelector()} .a-accordion-radio-active, ${subscribeAndSaveRootSelector()} [role='radio'][aria-checked='true']`);
-  if (!snsSelected && radio) {
-    showPanel("Subscribe & Save", "Waiting for Subscribe & Save controls to open.", null, null);
-    await sleep(1200);
+  const controlsReady = await waitUntil(snsQuantityControlVisible, 8000, 300);
+  if (!controlsReady) {
+    const error = new Error("Subscribe & Save is cheaper and selected, but Amazon did not show the Subscribe & Save quantity controls. Fulfilment paused before touching regular Add to cart quantity.");
+    error.failureCode = "";
+    throw error;
   }
-  await waitUntil(snsQuantityControlVisible, 6000, 300);
   await applyAdditionalSavings("sns");
   const quantitySet = await setQuantity(quantity, "sns");
   if (!quantitySet) {
@@ -1211,10 +1210,50 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
   return false;
 }
 
+async function activateSubscribeAndSaveOption() {
+  if (subscribeAndSaveIsActive()) return true;
+  const target = findSubscribeAndSaveRadio();
+  if (!target) return false;
+  showPanel("Subscribe & Save", "Clicking the Subscribe & Save radio button.", null, null);
+  const clickTargets = [
+    target,
+    target.querySelector?.(".a-accordion-radio.a-icon-radio-inactive"),
+    target.closest?.("[role='button'], .a-accordion-row, label"),
+  ].filter(Boolean);
+  for (const clickTarget of [...new Set(clickTargets)]) {
+    clickTarget.scrollIntoView({ block: "center", behavior: "smooth" });
+    await sleep(250);
+    clickTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+    clickTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+    clickTarget.click();
+    clickTarget.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+    await waitForStableDom(700, 5000);
+    if (subscribeAndSaveIsActive()) return true;
+  }
+  return await waitUntil(subscribeAndSaveIsActive, 3000, 250);
+}
+
+function subscribeAndSaveIsActive() {
+  return Boolean(
+    document.querySelector("#snsAccordionRowMiddle .a-accordion-radio-active, #snsAccordionRow .a-accordion-radio-active, #snsAccordionRowContent .a-accordion-radio-active, [data-csa-c-slot-id='snsAccordionRowMiddle'] .a-accordion-radio-active") ||
+    [...document.querySelectorAll(subscribeAndSaveRootSelector())].some((root) => root.querySelector?.("[role='radio'][aria-checked='true']")),
+  );
+}
+
 function findSubscribeAndSaveRadio(root = null) {
+  const direct = [
+    "#snsAccordionRowMiddle .a-accordion-row",
+    "#snsAccordionRow .a-accordion-row",
+    "#snsAccordionRowContent .a-accordion-row",
+    "[data-csa-c-slot-id='snsAccordionRowMiddle'][role='button']",
+    "[data-a-accordion-row-name='snsAccordionRowMiddle'] .a-accordion-row",
+  ]
+    .flatMap((selector) => [...document.querySelectorAll(selector)])
+    .find((item) => item.querySelector(".a-accordion-radio.a-icon-radio-inactive") || /subscribe\s*&\s*save/i.test(item.innerText || item.textContent || ""));
+  if (direct) return direct;
   const roots = root ? [root] : [...document.querySelectorAll(subscribeAndSaveRootSelector())];
   for (const item of roots) {
-    if (!item || !visible(item)) continue;
+    if (!item) continue;
     const text = (item.innerText || item.textContent || "").replace(/\s+/g, " ").toLowerCase();
     if (!text.includes("subscribe") && !/sns/i.test(item.id || "") && !/sns/i.test(item.getAttribute("data-csa-c-slot-id") || "")) continue;
     const inactive = item.querySelector(".a-accordion-radio.a-icon-radio-inactive, [role='radio'][aria-checked='false'], input[type='radio']:not(:checked)");
@@ -1823,6 +1862,9 @@ async function handleProduct(activeJob) {
 
   const subscribed = !multiItemJob && await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob);
   if (!subscribed) {
+    if (!multiItemJob && priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular) {
+      throw new Error(`Subscribe & Save is cheaper (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}), but the extension did not complete the Subscribe & Save selection. Fulfilment paused before changing regular quantity.`);
+    }
     const quantitySet = await setQuantity(purchaseItem.quantity, "regular");
     if (!quantitySet) {
       const requestedQuantity = Math.max(1, Math.round(Number(purchaseItem.quantity || 1)));
