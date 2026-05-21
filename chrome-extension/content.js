@@ -272,16 +272,35 @@ function findVisibleTextTarget(texts, selectors = "a, button, input[type='submit
 
 function parsePriceFrom(element) {
   if (!element) return null;
+  const offscreen = element.querySelector(".a-offscreen")?.textContent || "";
+  const offscreenPrice = priceFromText(offscreen);
+  if (offscreenPrice) return offscreenPrice;
   const whole = element.querySelector(".a-price-whole")?.textContent || "";
   const fraction = element.querySelector(".a-price-fraction")?.textContent || "00";
   const value = Number(`${whole.replace(/[^0-9]/g, "")}.${fraction.replace(/[^0-9]/g, "").slice(0, 2)}`);
-  return Number.isFinite(value) ? value : null;
+  if (Number.isFinite(value) && value > 0) return value;
+  return priceFromText(element.textContent || "");
+}
+
+function priceCandidatesIn(root, selectors = [".a-price"]) {
+  if (!root) return null;
+  const prices = selectors
+    .flatMap((selector) => [...root.querySelectorAll(selector)])
+    .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !element.closest(".aok-hidden"))
+    .map(parsePriceFrom)
+    .filter((value) => Number(value) > 0);
+  return prices;
 }
 
 function firstPriceIn(root) {
   if (!root) return null;
-  const price = [...root.querySelectorAll(".a-price")].filter(visible).map(parsePriceFrom).find((value) => value);
-  return price || priceFromText(root.innerText || root.textContent || "");
+  const prices = priceCandidatesIn(root);
+  return prices[0] || priceFromText(root.innerText || root.textContent || "");
+}
+
+function lowestPriceIn(root, selectors = [".a-price"]) {
+  const prices = priceCandidatesIn(root, selectors);
+  return prices.length ? Math.min(...prices) : null;
 }
 
 function moneyText(value) {
@@ -300,6 +319,7 @@ function subscribeAndSaveRootSelector() {
     "#snsAccordionRowContent",
     "#reinvent_price_desktop_snsAccordionRowMiddle",
     "#snsQuantity_feature_div",
+    "[data-csa-c-slot-id*='sns']",
     "[id*='rcx-subscribe']",
     "[id*='rcxOrdFreqSns']",
     "[id*='snsAccordion']",
@@ -318,22 +338,35 @@ function subscribeAndSavePriceFromText(text) {
 }
 
 function productPriceSnapshot() {
-  const regularSelectors = [
-    "#corePrice_feature_div .a-price",
-    "#apex_desktop .a-price",
-    "#reinvent_price_desktop_newAccordionRow .a-price",
-    "#newAccordionRow .a-price",
-    "#buybox .a-price",
-    "#tp_price_block_total_price_ww .a-price",
-    ".a-price",
+  const regularPriceSelectors = [
+    ".a-price[data-a-color='price'][data-a-size='b']",
+    ".a-price[data-a-color='price'].header-price",
+    ".a-price.a-color-price[data-a-size='b']",
+    "#corePrice_feature_div .a-price[data-a-size='b']",
+    "#apex_desktop .a-price[data-a-size='b']",
+    "#reinvent_price_desktop_newAccordionRow .a-price[data-a-size='b']",
+    "#newAccordionRow .a-price[data-a-size='b']",
+    "#buybox .a-price[data-a-size='b']",
+    "#tp_price_block_total_price_ww .a-price[data-a-size='b']",
   ];
-  const regular = regularSelectors
+  const regularPrices = regularPriceSelectors
     .flatMap((selector) => [...document.querySelectorAll(selector)])
-    .filter((element) => visible(element) && !isInSubscribeAndSave(element))
+    .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !isInSubscribeAndSave(element) && !element.closest(".aok-hidden"))
     .map(parsePriceFrom)
-    .find((value) => value) || null;
+    .filter((value) => Number(value) > 0);
+  const regular = regularPrices.length ? Math.min(...regularPrices) : null;
   const snsRoots = [...document.querySelectorAll(subscribeAndSaveRootSelector())].filter(visible);
-  const sns = snsRoots.map(firstPriceIn).find((value) => value) || subscribeAndSavePriceFromText(document.body.innerText);
+  const snsPriceSelectors = [
+    "#sns-tiered-price .a-price[data-a-size='b']",
+    "#subscriptionPrice .a-price[data-a-color='secondary'][data-a-size='b']",
+    ".a-price[data-a-color='secondary'][data-a-size='b']",
+    ".a-price[data-a-color='secondary'].header-price",
+    ".a-price.a-color-price[data-a-size='b']",
+  ];
+  const snsPrices = snsRoots
+    .flatMap((root) => priceCandidatesIn(root, snsPriceSelectors))
+    .filter((value) => Number(value) > 0);
+  const sns = snsPrices.length ? Math.min(...snsPrices) : subscribeAndSavePriceFromText(document.body.innerText);
   const best = sns && regular ? Math.min(sns, regular) : sns || regular || 0;
   return { regular, sns, best };
 }
@@ -1081,13 +1114,12 @@ function markPromotions() {
 }
 
 async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
-  await waitForElement(["#corePrice_feature_div .a-price", "#apex_desktop .a-price", "#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent"], 12000);
+  await waitForElement(["#corePrice_feature_div .a-price", "#apex_desktop .a-price", "#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, [data-csa-c-slot-id*='sns']"], 12000);
   const { regular: pagePrice, sns: snsPrice } = productPriceSnapshot();
-  const snsRoot = document.querySelector("#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, #reinvent_price_desktop_snsAccordionRowMiddle");
   if (!pagePrice || !snsPrice || snsPrice >= pagePrice) return false;
   showPanel("Subscribe & Save", `Subscribe & Save is cheaper (${moneyText(snsPrice)} vs ${moneyText(pagePrice)}). Switching to subscription checkout.`, null, null);
 
-  const radio = document.querySelector(".a-accordion-radio.a-icon-radio-inactive") || snsRoot?.querySelector("[role='radio'], input[type='radio']");
+  const radio = findSubscribeAndSaveRadio();
   if (radio) {
     showPanel("Subscribe & Save", "Selecting the Subscribe & Save buying option.", null, null);
     radio.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -1127,6 +1159,20 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     return true;
   }
   return false;
+}
+
+function findSubscribeAndSaveRadio(root = null) {
+  const roots = root ? [root] : [...document.querySelectorAll(subscribeAndSaveRootSelector())];
+  for (const item of roots) {
+    if (!item || !visible(item)) continue;
+    const text = (item.innerText || item.textContent || "").replace(/\s+/g, " ").toLowerCase();
+    if (!text.includes("subscribe") && !/sns/i.test(item.id || "") && !/sns/i.test(item.getAttribute("data-csa-c-slot-id") || "")) continue;
+    const inactive = item.querySelector(".a-accordion-radio.a-icon-radio-inactive, [role='radio'][aria-checked='false'], input[type='radio']:not(:checked)");
+    if (inactive) return inactive.closest("[role='button'], .a-accordion-row, label") || inactive;
+    const header = item.matches("[role='button'], .a-accordion-row") ? item : item.closest?.("[role='button'], .a-accordion-row");
+    if (header && !header.querySelector(".a-accordion-radio-active")) return header;
+  }
+  return document.querySelector(".a-accordion-row[data-csa-c-slot-id*='sns'] .a-accordion-radio.a-icon-radio-inactive")?.closest("[role='button'], .a-accordion-row") || null;
 }
 
 async function configureSubscribeAndSaveDelivery() {
