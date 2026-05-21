@@ -292,6 +292,13 @@ function priceCandidatesIn(root, selectors = [".a-price"]) {
   return prices;
 }
 
+function priceCandidateElementsIn(root, selectors = [".a-price"]) {
+  if (!root) return [];
+  return selectors
+    .flatMap((selector) => [...root.querySelectorAll(selector)])
+    .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !element.closest(".aok-hidden"));
+}
+
 function firstPriceIn(root) {
   if (!root) return null;
   const prices = priceCandidatesIn(root);
@@ -337,6 +344,28 @@ function subscribeAndSavePriceFromText(text) {
   return Number.isFinite(value) ? value : null;
 }
 
+function oneTimePurchaseRootSelector() {
+  return [
+    "#qualifiedBuybox",
+    "#desktop_qualifiedBuyBox",
+    "#buybox",
+    "#newAccordionRow",
+    "#reinvent_price_desktop_newAccordionRow",
+    "[data-csa-c-buying-option-type='NEW']",
+    "[data-csa-c-buying-option-type='B2B']",
+    "[data-a-accordion-row-name*='new']",
+  ].join(", ");
+}
+
+function oneTimePurchaseRoots() {
+  const roots = [...document.querySelectorAll(oneTimePurchaseRootSelector())].filter((root) => visible(root) && !isInSubscribeAndSave(root));
+  for (const node of document.querySelectorAll("[id*='new_buyingOption'], [id*='DesktopFfqp_'][id*='new_buyingOption']")) {
+    const root = node.closest("[data-csa-c-buying-option-type], [data-a-accordion-row-name], .a-accordion-row, .a-box, #qualifiedBuybox, #desktop_qualifiedBuyBox, #buybox") || node.closest(".a-section") || node;
+    if (root && visible(root) && !isInSubscribeAndSave(root) && !roots.includes(root)) roots.push(root);
+  }
+  return roots;
+}
+
 function productPriceSnapshot() {
   const regularPriceSelectors = [
     ".a-price[data-a-color='price'][data-a-size='b']",
@@ -349,8 +378,10 @@ function productPriceSnapshot() {
     "#buybox .a-price[data-a-size='b']",
     "#tp_price_block_total_price_ww .a-price[data-a-size='b']",
   ];
-  const regularPrices = regularPriceSelectors
-    .flatMap((selector) => [...document.querySelectorAll(selector)])
+  const regularRoots = oneTimePurchaseRoots();
+  const regularPool = regularRoots.length ? regularRoots : [document];
+  const regularPrices = regularPool
+    .flatMap((root) => priceCandidateElementsIn(root, regularPriceSelectors))
     .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !isInSubscribeAndSave(element) && !element.closest(".aok-hidden"))
     .map(parsePriceFrom)
     .filter((value) => Number(value) > 0);
@@ -369,6 +400,12 @@ function productPriceSnapshot() {
   const sns = snsPrices.length ? Math.min(...snsPrices) : subscribeAndSavePriceFromText(document.body.innerText);
   const best = sns && regular ? Math.min(sns, regular) : sns || regular || 0;
   return { regular, sns, best };
+}
+
+function snsQuantityControlVisible() {
+  return Boolean([...document.querySelectorAll(subscribeAndSaveRootSelector())].find((root) => (
+    visible(root) && root.querySelector("select[id*='sns'][id*='predefinedQuantitiesDropdown'], input#rcxsubsQuan, input[id*='sns'][id$='freeQuantityTextInput']")
+  )));
 }
 
 function productTitleText() {
@@ -1116,17 +1153,30 @@ function markPromotions() {
 async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
   await waitForElement(["#corePrice_feature_div .a-price", "#apex_desktop .a-price", "#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, [data-csa-c-slot-id*='sns']"], 12000);
   const { regular: pagePrice, sns: snsPrice } = productPriceSnapshot();
-  if (!pagePrice || !snsPrice || snsPrice >= pagePrice) return false;
+  if (!pagePrice || !snsPrice || snsPrice >= pagePrice) {
+    showPanel(
+      "Subscribe & Save",
+      `Using one-time purchase because Subscribe & Save was not cheaper or could not be read (${moneyText(snsPrice)} vs ${moneyText(pagePrice)}).`,
+      null,
+      null,
+    );
+    return false;
+  }
   showPanel("Subscribe & Save", `Subscribe & Save is cheaper (${moneyText(snsPrice)} vs ${moneyText(pagePrice)}). Switching to subscription checkout.`, null, null);
 
   const radio = findSubscribeAndSaveRadio();
   if (radio) {
     showPanel("Subscribe & Save", "Selecting the Subscribe & Save buying option.", null, null);
-    radio.scrollIntoView({ block: "center", behavior: "smooth" });
-    await sleep(500);
-    radio.click();
+    await clickElement(radio, "Subscribe & Save option");
     await sleep(1500);
+    await waitForStableDom(800, 6000);
   }
+  const snsSelected = document.querySelector(`${subscribeAndSaveRootSelector()} .a-accordion-radio-active, ${subscribeAndSaveRootSelector()} [role='radio'][aria-checked='true']`);
+  if (!snsSelected && radio) {
+    showPanel("Subscribe & Save", "Waiting for Subscribe & Save controls to open.", null, null);
+    await sleep(1200);
+  }
+  await waitUntil(snsQuantityControlVisible, 6000, 300);
   await applyAdditionalSavings("sns");
   const quantitySet = await setQuantity(quantity, "sns");
   if (!quantitySet) {
