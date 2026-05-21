@@ -1610,6 +1610,7 @@ function App() {
   const [adminAuthBusy, setAdminAuthBusy] = useState(false)
   const [uiCopy, setUiCopy] = useState<UiCopy>({})
   const [editingCopyKey, setEditingCopyKey] = useState<string | null>(null)
+  const searchAbortRef = useRef<AbortController | null>(null)
 
   function pagedQuery(nextStoreId: string, nextPage = 1, extra?: Record<string, string | number>) {
     const query = new URLSearchParams()
@@ -1650,7 +1651,6 @@ function App() {
 
   function updateOrdersSearch(value: string) {
     setSearch(value)
-    setSearchRows(null)
     setOrdersPage(1)
     setOrdersSelectAll(false)
     setSelected([])
@@ -1934,25 +1934,31 @@ function App() {
   useEffect(() => {
     const term = search.trim()
     if (!term) {
+      searchAbortRef.current?.abort()
       setSearchRows(null)
       setOrdersTotal(data?.total || ordersTotal)
       return
     }
     let active = true
     const timer = window.setTimeout(() => {
-      api<DashboardData>(`/api/search${pagedQuery(storeId, ordersPage)}&q=${encodeURIComponent(term)}`)
+      searchAbortRef.current?.abort()
+      const controller = new AbortController()
+      searchAbortRef.current = controller
+      api<DashboardData>(`/api/search${pagedQuery(storeId, ordersPage)}&q=${encodeURIComponent(term)}`, { signal: controller.signal })
         .then((result) => {
           if (!active) return
           setSearchRows(result.rows)
           setOrdersTotal(result.total || 0)
         })
-        .catch(() => {
+        .catch((error) => {
+          if (error instanceof DOMException && error.name === "AbortError") return
           if (active) setSearchRows(null)
         })
     }, 250)
     return () => {
       active = false
       window.clearTimeout(timer)
+      searchAbortRef.current?.abort()
     }
   }, [search, storeId, ordersPage])
 
@@ -1963,7 +1969,7 @@ function App() {
     )
   }, [orderColumns])
 
-  const rows = search.trim() && searchRows === null ? [] : searchRows || data?.rows || []
+  const rows = search.trim() ? (searchRows || data?.rows || []) : data?.rows || []
   const filteredRows = useMemo(() => {
     return rows
   }, [rows])
