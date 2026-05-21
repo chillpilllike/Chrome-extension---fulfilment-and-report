@@ -2607,7 +2607,28 @@ function checkoutDeliveryRecipientText() {
 function checkoutDeliveryRecipientMatches(name) {
   const deliveredTo = normalizedText(checkoutDeliveryRecipientText());
   const wanted = normalizedText(name);
-  return Boolean(deliveredTo && wanted && deliveredTo === wanted);
+  return Boolean(deliveredTo && wanted && (
+    deliveredTo === wanted ||
+    deliveredTo.includes(wanted) ||
+    wanted.includes(deliveredTo)
+  ));
+}
+
+function checkoutRecipientConfirmed(name) {
+  return checkoutDeliveryRecipientMatches(name) || checkoutShowsRecipient(name);
+}
+
+async function markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, message = "Verified delivery address. Continuing checkout.") {
+  activeJob.stage = "checkout";
+  activeJob.editAddressClickedAt = null;
+  activeJob.addressEditedRecipient = checkoutRecipient;
+  activeJob.addressEditedAt = Date.now();
+  activeJob.addressVerifiedRecipient = checkoutRecipient;
+  activeJob.addressVerifiedAt = Date.now();
+  activeJob.addressVerifyAttempts = 0;
+  await setActiveJob(activeJob);
+  showPanel("Nutricity checkout", message, null, null);
+  return true;
 }
 
 function findChangeDeliveryAddressButton() {
@@ -2821,20 +2842,33 @@ function cardDigitsForPaymentRadio(radio) {
 
 function findCheckoutPaymentPanel() {
   return [...document.querySelectorAll(
-    "#checkout-paymentOptionPanel, #selected-payment-methods-list-container",
+    [
+      "#checkout-paymentOptionPanel",
+      "#selected-payment-methods-list-container",
+      "#paymentOptionList",
+      "#payment-information",
+      "[id*='paymentOption']",
+      "[id*='selected-payment']",
+      "[data-csa-c-slot-id*='payselect']",
+      "[data-testid*='payment']",
+    ].join(", "),
   )].find((element) => visible(element));
 }
 
 function checkoutSelectedPaymentText() {
   const panel = findCheckoutPaymentPanel();
-  if (!panel) return "";
-  const root = panel.closest?.("#checkout-paymentOptionPanel") || panel;
+  const root = panel?.closest?.("#checkout-paymentOptionPanel, #selected-payment-methods-list-container, #payment-information")
+    || panel
+    || document.querySelector("#checkoutDisplayPage, #spc-orders, body");
+  if (!root) return "";
   const heading = root.querySelector?.(
     [
       "#selected-payment-methods-list-container h2",
       "#payment-option-text-default",
       "[id^='payment-option-text'][data-testid]",
       ".selected-payment-method-no-art-description-heading",
+      "[class*='selected-payment']",
+      "[id*='selected-payment']",
     ].join(", "),
   );
   return String(heading?.innerText || heading?.textContent || root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
@@ -2846,6 +2880,16 @@ function checkoutSelectedCardDigits() {
   if (preferredPattern) return preferredPattern[1];
   const fallback = text.match(/\b(\d{4})\b/);
   return fallback?.[1] || "";
+}
+
+function checkoutPaymentConfirmed(preferences = []) {
+  const placeOrder = findPlaceOrderButton();
+  if (placeOrder && !placeOrder.disabled) return true;
+  const text = checkoutSelectedPaymentText();
+  if (!text) return false;
+  const selectedDigits = checkoutSelectedCardDigits();
+  if (preferences.length) return Boolean(selectedDigits && preferences.includes(selectedDigits));
+  return /(?:payment method|paying with|ending in|visa|mastercard|american express|amex|discover|card)/i.test(text);
 }
 
 function findPaymentRadioForPreferences(preferences = []) {
@@ -3057,9 +3101,13 @@ async function handlePaymentSelection(activeJob) {
     }
     await clickElement(payment.continueButton, "Use this payment method button");
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
-    await sleep(2500);
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences) || findPlaceOrderButton() || !findPaymentRadio(), 12000, 400);
     activeJob.stage = "checkout";
     await setActiveJob(activeJob);
+    const confirmedDigits = checkoutSelectedCardDigits();
+    if (confirmedDigits) {
+      showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
+    }
     return true;
   } catch (error) {
     await pauseForManualCheckout(activeJob, `Payment selection got stuck: ${error.message || error}`);
@@ -3079,9 +3127,14 @@ async function openPaymentSelectionIfAvailable() {
 async function ensurePreferredCheckoutPayment(activeJob) {
   const state = await getExtensionState();
   const cardPreferences = cardPreferenceList(state.cardLast4Preference);
-  if (!cardPreferences.length) return true;
+  if (!cardPreferences.length) {
+    if (checkoutPaymentConfirmed(cardPreferences)) {
+      showPanel("Nutricity checkout", "Verified checkout payment method.", null, null);
+    }
+    return true;
+  }
   const paymentPanel = findCheckoutPaymentPanel();
-  if (!paymentPanel) return true;
+  if (!paymentPanel && !checkoutPaymentConfirmed(cardPreferences)) return true;
 
   const selectedDigits = checkoutSelectedCardDigits();
   if (selectedDigits && cardPreferences.includes(selectedDigits)) {
@@ -3263,9 +3316,12 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
 
   showPanel("Nutricity checkout", "Waiting for checkout to update.", null, null);
   await waitUntil(
-    () => checkoutShowsRecipient(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton() || !findAddressNameInput(),
+    () => checkoutRecipientConfirmed(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton() || !findAddressNameInput(),
     12000,
   );
+  if (checkoutRecipientConfirmed(checkoutRecipient)) {
+    return markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Verified edited delivery address. Continuing checkout.");
+  }
   activeJob.stage = "checkout";
   activeJob.editAddressClickedAt = null;
   activeJob.addressEditedRecipient = checkoutRecipient;
@@ -3305,9 +3361,15 @@ async function saveNewDeliveryAddress(activeJob, checkoutRecipient) {
   }
 
   await waitUntil(
-    () => checkoutShowsRecipient(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton() || !findAddressNameInput(),
+    () => checkoutRecipientConfirmed(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton() || !findAddressNameInput(),
     12000,
   );
+  if (checkoutRecipientConfirmed(checkoutRecipient)) {
+    await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Verified new delivery address. Continuing checkout.");
+    activeJob.addressMode = "new";
+    await setActiveJob(activeJob);
+    return true;
+  }
   activeJob.stage = "checkout";
   activeJob.editAddressClickedAt = null;
   activeJob.addressEditedRecipient = checkoutRecipient;
@@ -3436,12 +3498,17 @@ async function handleCheckout(activeJob) {
   const shouldEditExistingAddress = extensionState.editExistingAddress !== false;
   showPanel("Nutricity checkout", `Using recipient name: ${checkoutRecipient}`, null, null);
   if (activeJob.stage === "editing_address") {
+    if (!findAddressNameInput() && checkoutRecipientConfirmed(checkoutRecipient)) {
+      await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Delivery address already shows ${checkoutRecipient}. Continuing checkout.`);
+    } else
     if (shouldEditExistingAddress && !findAddressNameInput()) {
       await openAddressEditorIfAvailable(activeJob);
     } else if (!shouldEditExistingAddress && !findAddressNameInput()) {
       await openNewDeliveryAddressFormIfAvailable(activeJob);
     }
-    if (shouldEditExistingAddress ? await saveEditedAddress(activeJob, checkoutRecipient) : await saveNewDeliveryAddress(activeJob, checkoutRecipient)) {
+    if (checkoutRecipientConfirmed(checkoutRecipient)) {
+      await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Delivery address shows ${checkoutRecipient}. Continuing checkout.`);
+    } else if (shouldEditExistingAddress ? await saveEditedAddress(activeJob, checkoutRecipient) : await saveNewDeliveryAddress(activeJob, checkoutRecipient)) {
       // Continue in this same pass so checkout can place the order without waiting for the next interval.
     } else if (Date.now() - Number(activeJob.editAddressClickedAt || 0) > 45000) {
       activeJob.stage = "checkout";
@@ -3467,7 +3534,11 @@ async function handleCheckout(activeJob) {
     if (activeJob.paused) return;
   }
 
-  const addressEditIsFresh = activeJob.addressEditedRecipient === checkoutRecipient && Date.now() - Number(activeJob.addressEditedAt || 0) < 30000;
+  const addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
+  if (addressAlreadyConfirmed) {
+    await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Verified delivery address for ${checkoutRecipient}.`);
+  }
+  const addressEditIsFresh = addressAlreadyConfirmed || activeJob.addressEditedRecipient === checkoutRecipient && Date.now() - Number(activeJob.addressEditedAt || 0) < 30000;
   if (!addressEditIsFresh) {
     if (shouldEditExistingAddress) {
       const addressRow = nutricityAddressRow();
@@ -3500,14 +3571,14 @@ async function handleCheckout(activeJob) {
 
   if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
 
-  if (!handledPayment && !checkoutShowsRecipient(checkoutRecipient) && !findPlaceOrderButton() && await fillFullName(checkoutRecipient)) {
+  if (!handledPayment && !checkoutRecipientConfirmed(checkoutRecipient) && !findPlaceOrderButton() && await fillFullName(checkoutRecipient)) {
     await sleep(1200);
     const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "deliver to this address", "continue"]);
     if (useAddress) {
       await sleep(1000);
       await clickUseAddressButton(useAddress);
       await sleep(3000);
-      await waitUntil(() => checkoutShowsRecipient(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton(), 10000);
+      await waitUntil(() => checkoutRecipientConfirmed(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton(), 10000);
     } else {
       await pauseForManualCheckout(activeJob, "Could not find the Use this address button.");
       return;
@@ -3662,7 +3733,16 @@ async function reportAmazonOrder(activeJob, orderId) {
   activeJob.reportedOrderId = orderId;
   activeJob.reportAttemptedAt = Date.now();
   await setActiveJob(activeJob);
-  const result = await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
+  let result = null;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    result = await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
+    if (result?.ok) break;
+    const message = normalizedText(result?.message || "");
+    const transient = /internal server error|pool|timeout|failed to fetch|network|temporarily/.test(message);
+    if (!transient || attempt === 4) break;
+    showPanel("Nutricity fulfilment", `The app was busy reporting ${orderId}. Retrying ${attempt + 1}/4.`, null, null);
+    await sleep(1500 * attempt);
+  }
   if (!result?.ok) {
     const message = result?.message || "Could not report Amazon order back to the app.";
     activeJob.paused = true;
@@ -3800,3 +3880,8 @@ async function runSafely() {
 
 runSafely();
 setInterval(runSafely, 5000);
+window.addEventListener("pageshow", () => setTimeout(runSafely, 250));
+window.addEventListener("focus", () => setTimeout(runSafely, 250));
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) setTimeout(runSafely, 250);
+});

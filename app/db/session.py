@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Iterable, Optional
 
@@ -15,6 +17,7 @@ from app.core.config import DEFAULT_SERVICE_SETTINGS
 POSTGRES_URL = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL") or DEFAULT_SERVICE_SETTINGS["postgres_url"]
 
 _pool: Optional[pool.ThreadedConnectionPool] = None
+_pool_lock = threading.Lock()
 
 
 def _translate_placeholders(sql: str) -> str:
@@ -108,8 +111,18 @@ class PostgresConnection:
             raise RuntimeError("POSTGRES_URL or DATABASE_URL is required. SQLite is intentionally disabled.")
         global _pool
         if _pool is None:
-            _pool = pool.ThreadedConnectionPool(1, int(os.getenv("POSTGRES_POOL_MAX", "10")), POSTGRES_URL)
-        return cls(_pool.getconn())
+            with _pool_lock:
+                if _pool is None:
+                    max_connections = int(os.getenv("POSTGRES_POOL_MAX", "30"))
+                    _pool = pool.ThreadedConnectionPool(1, max_connections, POSTGRES_URL)
+        last_error: Exception | None = None
+        for attempt in range(int(os.getenv("POSTGRES_POOL_RETRIES", "5"))):
+            try:
+                return cls(_pool.getconn())
+            except pool.PoolError as error:
+                last_error = error
+                time.sleep(0.2 * (attempt + 1))
+        raise last_error or RuntimeError("Could not get a PostgreSQL connection from the pool.")
 
     def cursor(self) -> PostgresCursor:
         return PostgresCursor(self._raw.cursor(cursor_factory=RealDictCursor), self)
