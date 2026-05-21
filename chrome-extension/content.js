@@ -403,9 +403,12 @@ function productPriceSnapshot() {
 }
 
 function snsQuantityControlVisible() {
-  return Boolean([...document.querySelectorAll(subscribeAndSaveRootSelector())].find((root) => (
-    visible(root) && root.querySelector("select[id*='sns'][id*='predefinedQuantitiesDropdown'], input#rcxsubsQuan, input[id*='sns'][id$='freeQuantityTextInput']")
-  )));
+  if (!subscribeAndSaveAccordionIsActive()) return false;
+  return Boolean([...document.querySelectorAll(subscribeAndSaveRootSelector())].find((root) => {
+    if (!visible(root)) return false;
+    const control = root.querySelector("select[id*='sns'][id*='predefinedQuantitiesDropdown'], input#rcxsubsQuan, input[id*='sns'][id$='freeQuantityTextInput']");
+    return visible(control) || visible(control?.closest?.("td, table, .a-section, .a-dropdown-container"));
+  }));
 }
 
 function productTitleText() {
@@ -1248,10 +1251,13 @@ function dispatchAmazonClickSequence(element) {
 }
 
 function subscribeAndSaveIsActive() {
+  return subscribeAndSaveAccordionIsActive();
+}
+
+function subscribeAndSaveAccordionIsActive() {
   return Boolean(
     document.querySelector("#snsAccordionRowMiddle .a-accordion-radio-active, #snsAccordionRow .a-accordion-radio-active, #snsAccordionRowContent .a-accordion-radio-active, [data-csa-c-slot-id='snsAccordionRowMiddle'] .a-accordion-radio-active") ||
     document.querySelector("#snsAccordionRowMiddle [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRow [data-action='a-accordion'][aria-expanded='true'], #snsAccordionRowContent [data-action='a-accordion'][aria-expanded='true']") ||
-    snsQuantityControlVisible() ||
     [...document.querySelectorAll(subscribeAndSaveRootSelector())].some((root) => root.querySelector?.("[role='radio'][aria-checked='true']")),
   );
 }
@@ -1728,9 +1734,24 @@ async function setDirectQuantityInput(input, qty, context = "regular") {
 }
 
 async function setQuantity(quantity, context = "regular") {
-  await waitForElement(["select#quantity", "select[name='quantity']", "select[id*='predefinedQuantitiesDropdown']", "input[id$='quantityTextInput']", ".quantity-text-input-with-label", "#add-to-cart-button", "#rcx-subscribe-submit-button"], 12000);
+  const quantitySelectors = context === "sns"
+    ? [
+        "#snsAccordionRowMiddle select[id*='sns'][id*='predefinedQuantitiesDropdown']",
+        "#snsAccordionRow select[id*='sns'][id*='predefinedQuantitiesDropdown']",
+        "#snsQuantity_feature_div select[id*='sns'][id*='predefinedQuantitiesDropdown']",
+        "#snsAccordionRowMiddle input#rcxsubsQuan",
+        "#snsAccordionRow input#rcxsubsQuan",
+        "#rcx-subscribe-submit-button",
+      ]
+    : ["select#quantity", "select[name='quantity']", "select[id*='predefinedQuantitiesDropdown']", "input[id$='quantityTextInput']", ".quantity-text-input-with-label", "#add-to-cart-button"];
+  await waitForElement(quantitySelectors, 12000);
   const qty = Math.max(1, Math.round(Number(quantity) || 1));
   window.__nutricityLastQuantityIssue = null;
+  if (context === "sns" && !subscribeAndSaveAccordionIsActive()) {
+    const error = new Error("Subscribe & Save quantity was requested before the Subscribe & Save row became active.");
+    error.failureCode = "";
+    throw error;
+  }
   if (qty === 1) return true;
 
   const selects = quantitySelects(context);
