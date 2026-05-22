@@ -757,6 +757,18 @@ type DatabaseBackup = {
   last_modified: string
 }
 
+type BackupProgress = {
+  status: string
+  percent: number
+  message: string
+  started_at: string
+  updated_at: string
+  completed_at: string
+  error: string
+  backup_name?: string
+  backup_size?: number
+}
+
 type UiCopy = Record<string, { title?: string; description?: string; icon?: string }>
 
 type ShopifyScriptConfig = {
@@ -7528,6 +7540,7 @@ function SettingsPage({
   const [backups, setBackups] = useState<DatabaseBackup[]>([])
   const [selectedBackupKey, setSelectedBackupKey] = useState("")
   const [backupBusy, setBackupBusy] = useState("")
+  const [backupProgress, setBackupProgress] = useState<BackupProgress | null>(null)
   const [adminCode, setAdminCode] = useState("")
   const [adminCodeConfirm, setAdminCodeConfirm] = useState("")
   useEffect(() => {
@@ -7538,6 +7551,7 @@ function SettingsPage({
       .then((result) => setShopifyScriptConfig(result.config))
       .catch(() => setShopifyScriptConfig(null))
     loadReindexProgress()
+    loadBackupProgress()
     loadBackups()
   }, [])
 
@@ -7550,12 +7564,29 @@ function SettingsPage({
     return () => window.clearInterval(timer)
   }, [reindexProgress?.status])
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (backupBusy === "backup" || backupProgress?.status === "running") {
+        loadBackupProgress()
+      }
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [backupBusy, backupProgress?.status])
+
   async function loadReindexProgress() {
     try {
       const result = await api<{ ok: boolean; progress: ReindexProgress }>("/api/settings/typesense/reindex")
       setReindexProgress(result.progress)
     } catch {
       // Keep settings usable even if progress cannot be loaded.
+    }
+  }
+  async function loadBackupProgress() {
+    try {
+      const result = await api<{ ok: boolean; progress: BackupProgress }>("/api/settings/backup/progress")
+      setBackupProgress(result.progress)
+    } catch {
+      // Keep backup controls usable even if progress cannot be loaded.
     }
   }
   async function loadBackups() {
@@ -7596,11 +7627,24 @@ function SettingsPage({
   }
   async function runBackup() {
     setBackupBusy("backup")
+    setBackupProgress({
+      status: "queued",
+      percent: 1,
+      message: "Backup request sent. Waiting for pg_dump to start.",
+      started_at: "",
+      updated_at: "",
+      completed_at: "",
+      error: "",
+    })
     try {
-      const result = await api<{ ok: boolean; message: string; backups: DatabaseBackup[]; backup?: DatabaseBackup }>("/api/settings/backup/run", { method: "POST" })
+      const result = await api<{ ok: boolean; message: string; backups: DatabaseBackup[]; backup?: DatabaseBackup; progress?: BackupProgress }>("/api/settings/backup/run", { method: "POST" })
       setBackups(result.backups || [])
+      if (result.progress) setBackupProgress(result.progress)
       if (result.backup?.key) setSelectedBackupKey(result.backup.key)
       onResult({ ok: result.ok, title: "Backup", message: result.message })
+    } catch (error) {
+      await loadBackupProgress()
+      onResult({ ok: false, title: "Backup Failed", message: String(error) })
     } finally {
       setBackupBusy("")
     }
@@ -8056,6 +8100,34 @@ function SettingsPage({
                 {backupBusy === "delete" ? "Deleting..." : "Delete Selected"}
               </Button>
             </div>
+            {backupProgress && backupProgress.status !== "idle" ? (
+              <div className="form-fieldset">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                  <span className="font-medium">Backup status: {backupProgress.status}</span>
+                  <span className="text-muted-foreground">{Math.max(0, Math.min(100, Number(backupProgress.percent || 0))).toFixed(0)}%</span>
+                </div>
+                <div className="progress">
+                  <div
+                    className="progress-bar progress-bar-striped progress-bar-animated bg-primary transition-all"
+                    role="progressbar"
+                    aria-valuenow={Math.max(0, Math.min(100, Number(backupProgress.percent || 0)))}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={`${Number(backupProgress.percent || 0).toFixed(0)}% Complete`}
+                    style={{ width: `${Math.max(0, Math.min(100, Number(backupProgress.percent || 0)))}%` }}
+                  >
+                    <span className="visually-hidden">{Number(backupProgress.percent || 0).toFixed(0)}% Complete</span>
+                  </div>
+                </div>
+                <div className="grid gap-1 text-xs text-muted-foreground">
+                  <div>{backupProgress.message}</div>
+                  {backupProgress.backup_name ? <div>Backup: {backupProgress.backup_name}</div> : null}
+                  {Number(backupProgress.backup_size || 0) ? <div>Size: {formatFileSize(Number(backupProgress.backup_size || 0))}</div> : null}
+                  {backupProgress.updated_at ? <div>Last update: {formatDateTime(backupProgress.updated_at)}</div> : null}
+                  {backupProgress.error ? <div className="text-destructive">{backupProgress.error}</div> : null}
+                </div>
+              </div>
+            ) : null}
             <p className="text-xs text-muted-foreground">
               Restore downloads the selected R2 dump and replaces the current Postgres schema/data using pg_restore.
             </p>

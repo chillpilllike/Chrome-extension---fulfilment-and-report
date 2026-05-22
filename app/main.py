@@ -147,6 +147,7 @@ _CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "completed_at": "",
     "error": "",
 }
+BACKUP_PROGRESS_STALE_SECONDS = 30 * 60
 FRONTEND_SHELL_PATHS = {
     "/",
     "/home",
@@ -4991,6 +4992,54 @@ def set_typesense_reindex_progress(**updates: Any) -> dict[str, Any]:
     return data
 
 
+def backup_progress() -> dict[str, Any]:
+    raw = get_setting("database_backup_progress", "")
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                if data.get("status") in {"queued", "running"}:
+                    updated_at = str(data.get("updated_at") or data.get("started_at") or "")
+                    try:
+                        parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - parsed).total_seconds() > BACKUP_PROGRESS_STALE_SECONDS:
+                            data.update({
+                                "status": "failed",
+                                "percent": 0,
+                                "message": "Previous backup stopped before completion.",
+                                "completed_at": utc_now(),
+                                "error": "Backup progress became stale.",
+                            })
+                            set_setting("database_backup_progress", json.dumps(data, default=str))
+                    except Exception:
+                        pass
+                return data
+        except Exception:
+            pass
+    return {
+        "status": "idle",
+        "percent": 0,
+        "message": "No backup has run yet.",
+        "started_at": "",
+        "updated_at": "",
+        "completed_at": "",
+        "error": "",
+        "backup_name": "",
+        "backup_size": 0,
+    }
+
+
+def set_backup_progress(**updates: Any) -> dict[str, Any]:
+    data = backup_progress()
+    data.update(updates)
+    data["percent"] = max(0, min(100, int(float(data.get("percent") or 0))))
+    data["updated_at"] = utc_now()
+    set_setting("database_backup_progress", json.dumps(data, default=str))
+    return data
+
+
 def latest_typesense_record_label(collection: str, row: dict[str, Any]) -> str:
     if collection == "order_lines":
         order_name = clean_text(row.get("odoo_order_name"))
@@ -7851,15 +7900,29 @@ def create_database_backup() -> dict[str, Any]:
         raise RuntimeError("pg_dump is not installed in this app environment.")
     client, bucket = require_backup_client()
     key = backup_key_for_now(postgres_url)
+    set_backup_progress(
+        status="running",
+        percent=5,
+        message="Backup started. Preparing Postgres dump.",
+        started_at=utc_now(),
+        completed_at="",
+        error="",
+        backup_name=key.rsplit("/", 1)[-1],
+        backup_size=0,
+    )
     with tempfile.NamedTemporaryFile(suffix=".dump") as dump_file:
+        set_backup_progress(status="running", percent=20, message="Dumping Postgres database with pg_dump.")
         run_checked([pg_dump, "--format=custom", "--no-owner", "--no-acl", "--file", dump_file.name, postgres_url], timeout=20 * 60)
+        size = Path(dump_file.name).stat().st_size
+        set_backup_progress(status="running", percent=70, message=f"Postgres dump complete. Uploading {size:,} bytes to Cloudflare R2.", backup_size=size)
         client.upload_file(
             dump_file.name,
             bucket,
             key,
             ExtraArgs={"ContentType": "application/octet-stream", "Metadata": {"created-by": "nutricity-app", "kind": "postgres"}},
         )
-        size = Path(dump_file.name).stat().st_size
+        set_backup_progress(status="running", percent=92, message="Upload complete. Refreshing backup list.", backup_size=size)
+    set_backup_progress(status="completed", percent=100, message=f"Backup uploaded to Cloudflare R2: {key.rsplit('/', 1)[-1]}.", completed_at=utc_now(), backup_size=size)
     return {"key": key, "name": key.rsplit("/", 1)[-1], "size": size}
 
 
@@ -10708,13 +10771,22 @@ def api_typesense_reindex_status() -> dict[str, Any]:
 
 @app.post("/api/settings/backup/run")
 def api_run_backup() -> dict[str, Any]:
-    backup = create_database_backup()
-    return {"ok": True, "message": f"Postgres backup uploaded to Cloudflare R2: {backup['name']}.", "backup": backup, "backups": list_database_backups()}
+    try:
+        backup = create_database_backup()
+        return {"ok": True, "message": f"Postgres backup uploaded to Cloudflare R2: {backup['name']}.", "backup": backup, "backups": list_database_backups(), "progress": backup_progress()}
+    except Exception as exc:
+        set_backup_progress(status="failed", percent=0, message=f"Backup failed: {exc}", completed_at=utc_now(), error=str(exc))
+        raise
 
 
 @app.get("/api/settings/backup/list")
 def api_list_backups() -> dict[str, Any]:
     return {"ok": True, "backups": list_database_backups()}
+
+
+@app.get("/api/settings/backup/progress")
+def api_backup_progress() -> dict[str, Any]:
+    return {"ok": True, "progress": backup_progress()}
 
 
 @app.post("/api/settings/backup/restore")
