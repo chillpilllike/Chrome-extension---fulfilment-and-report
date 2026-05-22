@@ -3545,6 +3545,7 @@ function App() {
             page={backInStockPage}
             total={backInStockTotal}
             onPage={setBackInStockPage}
+            onResult={setModal}
             onRefresh={async () => {
               const result = await api<{ rows: BackInStockRow[]; total: number }>(`/api/back-in-stock${pagedQuery(storeId, backInStockPage)}`)
               setBackInStockRows(result.rows || [])
@@ -5565,14 +5566,31 @@ function BackInStockPage({
   page,
   total,
   onPage,
+  onResult,
   onRefresh,
 }: {
   rows: BackInStockRow[]
   page: number
   total: number
   onPage: (page: number) => void
+  onResult: (modal: ModalState) => void
   onRefresh: () => Promise<void>
 }) {
+  const [approving, setApproving] = useState<number | null>(null)
+  async function approve(row: BackInStockRow) {
+    const confirmed = window.confirm(`Approve ${row.asin} for ${row.odoo_order_name || row.odoo_order_id}? The app will check Odoo first and only queue Chrome if the Odoo order is not cancelled.`)
+    if (!confirmed) return
+    setApproving(row.id)
+    try {
+      const result = await api<{ ok: boolean; message: string; queued: number }>(`/api/back-in-stock/${row.id}/approve`, { method: "POST" })
+      onResult({ ok: result.ok, title: result.ok ? "Back In Stock Approved" : "Approval Skipped", message: result.message })
+      await onRefresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Approval Failed", message: String(error) })
+    } finally {
+      setApproving(null)
+    }
+  }
   return (
     <div className="grid gap-5">
       <section className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -5600,13 +5618,14 @@ function BackInStockPage({
                 <TableHead>Price</TableHead>
                 <TableHead>Queue</TableHead>
                 <TableHead>Checked</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {rows.map((row) => (
                 <TableRow
                   key={row.id}
-                  className={row.status === "back_in_stock" || row.queued_at ? "bg-emerald-50" : row.status === "replacement_assigned" ? "bg-amber-50" : ""}
+                  className={row.status === "back_in_stock" ? "bg-emerald-50" : row.queued_at ? "bg-blue-50" : row.status === "replacement_assigned" ? "bg-amber-50" : row.status === "odoo_cancelled" || row.status === "odoo_refunded" ? "bg-red-50" : ""}
                 >
                   <TableCell>
                     {row.odoo_order_url ? (
@@ -5629,6 +5648,12 @@ function BackInStockPage({
                       {row.status === "replacement_assigned" ? (
                         <span className="text-xs text-muted-foreground">Skipped because a replacement ASIN is assigned.</span>
                       ) : null}
+                      {row.status === "back_in_stock" && !row.queued_at ? (
+                        <span className="text-xs text-muted-foreground">Needs manual approval before Chrome queue.</span>
+                      ) : null}
+                      {row.status === "odoo_cancelled" || row.status === "odoo_refunded" ? (
+                        <span className="text-xs text-muted-foreground">Odoo check blocked fulfilment.</span>
+                      ) : null}
                     </div>
                   </TableCell>
                   <TableCell>{row.price ? formatMoney(row.price) : "-"}</TableCell>
@@ -5644,11 +5669,20 @@ function BackInStockPage({
                       {row.availability_message ? <span className="truncate" title={row.availability_message}>{row.availability_message}</span> : null}
                     </div>
                   </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      size="sm"
+                      disabled={approving === row.id || Boolean(row.queued_at) || row.status !== "back_in_stock"}
+                      onClick={() => approve(row)}
+                    >
+                      {approving === row.id ? "Approving..." : "Approve"}
+                    </Button>
+                  </TableCell>
                 </TableRow>
               ))}
               {!rows.length && (
                 <TableRow>
-                  <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={8} className="py-8 text-center text-sm text-muted-foreground">
                     No back-in-stock ASINs reported yet.
                   </TableCell>
                 </TableRow>

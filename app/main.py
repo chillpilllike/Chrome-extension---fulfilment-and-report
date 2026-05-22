@@ -10967,10 +10967,142 @@ def back_in_stock_rows(store_id: Optional[int] = None, page: int = 1, per_page: 
     return rows, total
 
 
+def check_odoo_order_not_cancelled(store_id: int, odoo_order_id: int) -> tuple[bool, str, str]:
+    try:
+        store = get_store(store_id)
+        odoo = OdooClient(store)
+        fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status"])
+        rows = odoo.read("sale.order", [int(odoo_order_id)], fields or ["id", "state"])
+    except Exception as exc:
+        raise HTTPException(502, f"Could not verify Odoo order status before queueing: {exc}") from exc
+    if not rows:
+        raise HTTPException(404, "Odoo order was not found during pre-fulfilment check.")
+    order = rows[0]
+    state = str(order.get("state") or "").strip().lower()
+    invoice_status = str(order.get("invoice_status") or "").strip().lower()
+    if state == "cancel":
+        return False, "cancelled", f"Odoo order {order.get('name') or odoo_order_id} is cancelled."
+    if invoice_status == "refunded":
+        return False, "refunded", f"Odoo order {order.get('name') or odoo_order_id} is refunded."
+    return True, invoice_status or state or "open", ""
+
+
+def mark_back_in_stock_cancelled(line_id: int, asin: str, status: str, message: str) -> None:
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET odoo_status_label=?,
+                last_error=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (status, message, now, line_id),
+        )
+        conn.execute(
+            """
+            UPDATE missing_asin_availability
+            SET status=?,
+                availability_message=CASE
+                  WHEN COALESCE(availability_message, '') = '' THEN ?
+                  ELSE availability_message || ' | ' || ?
+                END,
+                last_checked_at=?
+            WHERE order_line_id=? AND asin=?
+            """,
+            ("odoo_cancelled" if status == "cancelled" else "odoo_refunded", message, message, now, line_id, asin),
+        )
+        updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+        if updated:
+            index_order_line(updated)
+
+
 @app.get("/api/back-in-stock")
 def api_back_in_stock(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     rows, total = back_in_stock_rows(store_id, page, per_page)
     return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total}
+
+
+@app.post("/api/back-in-stock/{availability_id}/approve")
+def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
+    with db() as conn:
+        record = conn.execute(
+            """
+            SELECT missing_asin_availability.*,
+                   order_lines.id AS line_id,
+                   order_lines.state AS line_state,
+                   order_lines.amazon_order_id,
+                   order_lines.odoo_status_label,
+                   order_lines.replacement_asin
+            FROM missing_asin_availability
+            LEFT JOIN order_lines ON order_lines.id=missing_asin_availability.order_line_id
+            WHERE missing_asin_availability.id=?
+            """,
+            (availability_id,),
+        ).fetchone()
+    if not record:
+        raise HTTPException(404, "Back-in-stock record not found.")
+    if not record["line_id"]:
+        raise HTTPException(404, "Linked order line was not found.")
+    if not record["odoo_order_id"]:
+        raise HTTPException(400, "Linked Odoo order ID is missing; cannot verify cancellation status.")
+    line_id = int(record["order_line_id"])
+    asin = normalize_asin(record["asin"] or "")
+    if record["queued_at"]:
+        return {"ok": True, "message": "This ASIN was already queued for Chrome.", "queued": 0}
+    if record["status"] not in {"back_in_stock", "approval_failed"}:
+        raise HTTPException(400, f"Only back-in-stock records can be approved. Current status is {record['status']}.")
+    if clean_text(record["amazon_order_id"]):
+        raise HTTPException(400, "This order line already has an Amazon order ID.")
+    if clean_text(record["replacement_asin"]):
+        raise HTTPException(400, "A replacement ASIN is assigned. It will not be queued from the back-in-stock page.")
+    local_status = clean_text(record["odoo_status_label"]).lower()
+    if local_status in {"cancelled", "refunded"}:
+        with db() as conn:
+            conn.execute(
+                "UPDATE missing_asin_availability SET status=?, availability_message=?, last_checked_at=? WHERE id=?",
+                (f"odoo_{local_status}", f"Odoo order is already marked {local_status} in the app.", utc_now(), availability_id),
+            )
+        return {"ok": False, "message": f"Odoo order is already marked {local_status}; nothing was queued.", "queued": 0}
+    is_open, odoo_status, message = check_odoo_order_not_cancelled(int(record["store_id"]), int(record["odoo_order_id"] or 0))
+    if not is_open:
+        mark_back_in_stock_cancelled(line_id, asin, odoo_status, message)
+        return {"ok": False, "message": f"{message} Nothing was queued.", "queued": 0}
+    queued, _cleared, _blocked, _account, _details = queue_chrome_order_groups_fast(
+        int(record["store_id"]),
+        line_ids=[line_id],
+        include_missing_asins=True,
+    )
+    if not queued:
+        with db() as conn:
+            conn.execute(
+                "UPDATE missing_asin_availability SET status=?, availability_message=?, last_checked_at=? WHERE id=?",
+                ("approval_failed", "Approval did not queue this line; it may already be queued, fulfilled, ignored, or blocked.", utc_now(), availability_id),
+            )
+        return {"ok": False, "message": "Could not queue this line; it may already be queued, fulfilled, ignored, or blocked.", "queued": 0}
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET amazon_status='back_in_stock',
+                fulfilment_note=CASE
+                  WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                  ELSE fulfilment_note || ' | ' || ?
+                END,
+                updated_at=?
+            WHERE id=?
+            """,
+            ("Back in stock approved; queued for Chrome fulfilment.", "Back in stock approved; queued for Chrome fulfilment.", utc_now(), line_id),
+        )
+        conn.execute(
+            "UPDATE missing_asin_availability SET status='approved', queued_at=?, availability_message=?, last_checked_at=? WHERE id=?",
+            (utc_now(), "Approved after Odoo cancellation check; queued for Chrome.", utc_now(), availability_id),
+        )
+        updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+        if updated:
+            index_order_line(updated)
+    return {"ok": True, "message": "Approved and queued for Chrome fulfilment.", "queued": queued}
 
 
 @app.get("/api/chrome/missing-asin-checks")
@@ -10991,7 +11123,6 @@ def api_chrome_missing_asin_report(payload: dict[str, Any]) -> dict[str, Any]:
     if not line_id or not asin:
         raise HTTPException(400, "line_id and asin are required.")
     now = utc_now()
-    queued = 0
     skipped_reason = ""
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
@@ -11036,40 +11167,9 @@ def api_chrome_missing_asin_report(payload: dict[str, Any]) -> dict[str, Any]:
                 now,
             ),
         )
-    if in_stock:
-        if order_has_replacement:
-            skipped_reason = "Replacement ASIN is already assigned on this Odoo order."
-        else:
-            queued, _cleared, _blocked, _account, _details = queue_chrome_order_groups_fast(
-                int(row["store_id"]),
-                line_ids=[line_id],
-                include_missing_asins=True,
-            )
-            if queued:
-                with db() as conn:
-                    conn.execute(
-                        """
-                        UPDATE order_lines
-                        SET amazon_status='back_in_stock',
-                            fulfilment_note=CASE
-                              WHEN COALESCE(fulfilment_note, '') = '' THEN ?
-                              ELSE fulfilment_note || ' | ' || ?
-                            END,
-                            updated_at=?
-                        WHERE id=?
-                        """,
-                        ("Back in stock; queued by Chrome availability check.", "Back in stock; queued by Chrome availability check.", utc_now(), line_id),
-                    )
-                    conn.execute(
-                        "UPDATE missing_asin_availability SET queued_at=? WHERE order_line_id=? AND asin=?",
-                        (utc_now(), line_id, asin),
-                    )
-                    updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
-                    if updated:
-                        index_order_line(updated)
-            else:
-                skipped_reason = "Could not queue this line; it may already be queued, fulfilled, ignored, or blocked."
-    return {"ok": True, "status": record_status if in_stock else status, "queued": queued, "skipped_reason": skipped_reason}
+    if in_stock and order_has_replacement:
+        skipped_reason = "Replacement ASIN is already assigned on this Odoo order."
+    return {"ok": True, "status": record_status if in_stock else status, "queued": 0, "requires_approval": in_stock and not order_has_replacement, "skipped_reason": skipped_reason}
 
 
 @app.get("/api/partial-fulfilments")
