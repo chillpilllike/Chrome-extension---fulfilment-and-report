@@ -5990,6 +5990,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
   const [manualCostId, setManualCostId] = useState<number | null>(null)
   const [manualCostLabel, setManualCostLabel] = useState("Google Ads")
   const [manualCostAmount, setManualCostAmount] = useState("")
+  const [manualCostMonth, setManualCostMonth] = useState(month)
   const [manualCostNote, setManualCostNote] = useState("")
 
   async function load(nextPage = page) {
@@ -6044,6 +6045,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
     setManualCostId(null)
     setManualCostLabel("Google Ads")
     setManualCostAmount("")
+    setManualCostMonth(period === "monthly" ? month : period === "weekly" ? weekStart.slice(0, 7) : day.slice(0, 7))
     setManualCostNote("")
   }
 
@@ -6051,6 +6053,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
     setManualCostId(Number(row.id || 0) || null)
     setManualCostLabel(String(row.label || ""))
     setManualCostAmount(String(row.amount || ""))
+    setManualCostMonth(String(row.month || month))
     setManualCostNote(String(row.note || ""))
   }
 
@@ -6067,7 +6070,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
         body: JSON.stringify({
           id: manualCostId,
           store_id: storeId ? Number(storeId) : null,
-          month: period === "monthly" ? month : period === "weekly" ? weekStart.slice(0, 7) : day.slice(0, 7),
+          month: manualCostMonth,
           label: manualCostLabel,
           amount,
           note: manualCostNote,
@@ -6098,6 +6101,11 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
       setBusy(false)
     }
   }
+
+  useEffect(() => {
+    if (manualCostId) return
+    setManualCostMonth(period === "monthly" ? month : period === "weekly" ? weekStart.slice(0, 7) : day.slice(0, 7))
+  }, [period, month, day, weekStart, manualCostId])
 
   const summary = data?.summary || {}
   return (
@@ -6164,7 +6172,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
           <CardTitle>Manual Monthly Costs</CardTitle>
           <CardDescription>Costs entered here are subtracted from the Profit / Loss total for their month.</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 lg:grid-cols-[1fr_160px_1fr_auto_auto] lg:items-end">
+        <CardContent className="grid gap-3 lg:grid-cols-[1fr_160px_160px_1fr_auto_auto] lg:items-end">
           <div>
             <Label>Cost Name</Label>
             <Input value={manualCostLabel} onChange={(event) => setManualCostLabel(event.target.value)} placeholder="Google Ads" />
@@ -6172,6 +6180,10 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
           <div>
             <Label>Amount</Label>
             <Input type="number" min="0" step="0.01" value={manualCostAmount} onChange={(event) => setManualCostAmount(event.target.value)} placeholder="0.00" />
+          </div>
+          <div>
+            <Label>Cost Month</Label>
+            <Input type="month" value={manualCostMonth} onChange={(event) => setManualCostMonth(event.target.value)} />
           </div>
           <div>
             <Label>Note</Label>

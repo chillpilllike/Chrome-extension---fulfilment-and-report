@@ -8293,6 +8293,7 @@ def profit_loss_data(
     total = len(order_rows)
     paged_order_rows = order_rows[offset:offset + per_page]
     month_keys = sorted({(parse_iso_date(str(row.get("order_date") or "")) or start_dt).strftime("%Y-%m") for row in order_rows} or {resolved_month})
+    selected_month = resolved_month
     with db() as conn:
         if store_id:
             manual_cost_rows = rows_to_dicts(conn.execute(
@@ -8315,7 +8316,7 @@ def profit_loss_data(
                 """,
                 (month_keys,),
             ).fetchall())
-    manual_cost_total = round(sum(float(row.get("amount") or 0) for row in manual_cost_rows), 2) if period == "monthly" else 0
+    manual_cost_total = round(sum(float(row.get("amount") or 0) for row in manual_cost_rows if str(row.get("month") or "") == selected_month), 2)
     manual_costs_by_month: dict[str, float] = {}
     for cost in manual_cost_rows:
         key = str(cost.get("month") or resolved_month)
@@ -8325,7 +8326,10 @@ def profit_loss_data(
     summary["net_profit"] = round(float(summary["net_profit"] or 0) - manual_cost_total, 2)
     summary["margin_percent"] = round((summary["net_profit"] / summary["odoo_order_value"]) * 100, 2) if summary["odoo_order_value"] else 0
     for entry in grouped.values():
-        manual_cost = manual_costs_by_month.get(str(entry.get("period") or ""), 0) if period == "monthly" else 0
+        if period == "monthly":
+            manual_cost = manual_costs_by_month.get(str(entry.get("period") or ""), 0)
+        else:
+            manual_cost = manual_cost_total
         entry["manual_costs_total"] = manual_cost
         if manual_cost:
             entry["net_profit_before_manual_costs"] = entry["net_profit"]
