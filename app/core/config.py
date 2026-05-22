@@ -77,6 +77,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "shopify_oauth_public_base_url": os.getenv("SHOPIFY_OAUTH_PUBLIC_BASE_URL", ""),
     "shopify_auto_enqueue_enabled": os.getenv("SHOPIFY_AUTO_ENQUEUE_ENABLED", "true"),
     "amazon_order_date_guard_enabled": os.getenv("AMAZON_ORDER_DATE_GUARD_ENABLED", "true"),
+    "shopify_fulfilled_order_guard_enabled": os.getenv("SHOPIFY_FULFILLED_ORDER_GUARD_ENABLED", "false"),
     "shopify_product_rename_enabled": os.getenv("SHOPIFY_PRODUCT_RENAME_ENABLED", "true"),
     "shopify_generic_product_name": os.getenv("SHOPIFY_GENERIC_PRODUCT_NAME", "Generic Product"),
     "shopify_job_max_attempts": os.getenv("SHOPIFY_JOB_MAX_ATTEMPTS", "5"),

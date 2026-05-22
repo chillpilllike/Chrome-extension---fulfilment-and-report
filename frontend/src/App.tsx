@@ -1366,6 +1366,9 @@ function StatusBadge({ value }: { value?: string }) {
   if (status === "submitted") {
     return <Badge variant="outline">submitted</Badge>
   }
+  if (status === "amazon_placed") {
+    return <Badge variant="outline" className="border-amber-400 bg-amber-50 text-amber-800">placed on Amazon / not synced</Badge>
+  }
   return <Badge variant="outline">{status}</Badge>
 }
 
@@ -1825,6 +1828,7 @@ function ExportControls({
 function App() {
   const initialDashboard = cachedDashboardData()
   const [data, setData] = useState<DashboardData | null>(() => initialDashboard)
+  const [orderRows, setOrderRows] = useState<OrderLine[]>(() => initialDashboard?.rows || [])
   const [inventory, setInventory] = useState<InventoryItem[]>([])
   const [inventoryPage, setInventoryPage] = useState(1)
   const [inventoryTotal, setInventoryTotal] = useState(0)
@@ -1833,6 +1837,7 @@ function App() {
   const [cancelledOrdersTotal, setCancelledOrdersTotal] = useState(0)
   const [ordersPage, setOrdersPage] = useState(1)
   const [ordersTotal, setOrdersTotal] = useState(() => initialDashboard?.total || 0)
+  const [ordersLoading, setOrdersLoading] = useState(false)
   const [missingRows, setMissingRows] = useState<OrderLine[]>([])
   const [missingPage, setMissingPage] = useState(1)
   const [missingTotal, setMissingTotal] = useState(0)
@@ -1885,7 +1890,6 @@ function App() {
   const [pullStoreIds, setPullStoreIds] = useState<string[]>(savedPullStoreIds)
   const [search, setSearch] = useState("")
   const [orderCondition, setOrderCondition] = useState("all")
-  const [searchRows, setSearchRows] = useState<OrderLine[] | null>(null)
   const [selected, setSelected] = useState<number[]>([])
   const [ordersSelectAll, setOrdersSelectAll] = useState(false)
   const [pendingSelected, setPendingSelected] = useState<number[]>([])
@@ -1908,7 +1912,7 @@ function App() {
   const [placeRecentDays, setPlaceRecentDays] = useState(() => savedPullSetting(PULL_DAYS_STORAGE_KEY, "5"))
   const [allowMissingSpaid, setAllowMissingSpaid] = useState(false)
   const [resendMissingAsins, setResendMissingAsins] = useState(false)
-  const [sortKey, setSortKey] = useState<SortKey>("pulled_at")
+  const [sortKey, setSortKey] = useState<SortKey>("odoo_order_date")
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc")
   const [showColumnSettings, setShowColumnSettings] = useState(false)
   const [orderColumns, setOrderColumns] = useState<OrderColumn[]>(loadOrderColumns)
@@ -1923,7 +1927,6 @@ function App() {
   const [adminAuthBusy, setAdminAuthBusy] = useState(false)
   const [uiCopy, setUiCopy] = useState<UiCopy>({})
   const [editingCopyKey, setEditingCopyKey] = useState<string | null>(null)
-  const searchAbortRef = useRef<AbortController | null>(null)
   const shopifyStatusSyncKeyRef = useRef("")
   const ordersRequestSeqRef = useRef(0)
   const shopifyStatusCompletedRefreshRef = useRef("")
@@ -1966,6 +1969,7 @@ function App() {
   }
 
   function updateOrdersSearch(value: string) {
+    ordersRequestSeqRef.current += 1
     setSearch(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
@@ -1973,14 +1977,15 @@ function App() {
   }
 
   function updateOrderCondition(value: string) {
+    ordersRequestSeqRef.current += 1
     setOrderCondition(value)
-    setSearchRows(null)
     setOrdersPage(1)
     setOrdersSelectAll(false)
     setSelected([])
   }
 
   function updateSortKey(value: SortKey) {
+    ordersRequestSeqRef.current += 1
     setSortKey(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
@@ -1988,6 +1993,7 @@ function App() {
   }
 
   function updateSortDirection(value: SortDirection) {
+    ordersRequestSeqRef.current += 1
     setSortDirection(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
@@ -1996,6 +2002,7 @@ function App() {
 
   function applyDashboardData(next: DashboardData, nextPage = ordersPage) {
     setData(next)
+    setOrderRows(next.rows || [])
     saveDashboardCache(next)
     setOrdersPage(next.page || nextPage)
     setOrdersTotal(next.total || 0)
@@ -2024,17 +2031,39 @@ function App() {
 
   async function refreshOrdersPage(nextStoreId = storeId, nextPage = ordersPage) {
     const requestSeq = ++ordersRequestSeqRef.current
-    const result = await api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(
-      `/api/orders${pagedQuery(nextStoreId, nextPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}`,
-    )
-    if (requestSeq !== ordersRequestSeqRef.current) return
-    setData((current) => {
-      if (!current) return current
-      const next = { ...current, rows: result.rows, page: result.page || nextPage, per_page: result.per_page, total: result.total }
-      saveDashboardCache(next)
-      return next
-    })
-    setOrdersTotal(result.total || 0)
+    setOrdersLoading(true)
+    const term = search.trim()
+    const hasCondition = orderCondition !== "all"
+    try {
+      if (term || hasCondition) {
+        const result = await api<DashboardData>(
+          `/api/search${pagedQuery(nextStoreId, nextPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}&q=${encodeURIComponent(term)}`,
+        )
+        if (requestSeq !== ordersRequestSeqRef.current) return
+        setOrderRows(result.rows || [])
+        setOrdersPage(result.page || nextPage)
+        setOrdersTotal(result.total || 0)
+        return
+      }
+      const result = await api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(
+        `/api/orders${pagedQuery(nextStoreId, nextPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}`,
+      )
+      if (requestSeq !== ordersRequestSeqRef.current) return
+      setOrderRows(result.rows || [])
+      setData((current) => {
+        if (!current) return current
+        const next = { ...current, rows: result.rows, page: result.page || nextPage, per_page: result.per_page, total: result.total }
+        saveDashboardCache(next)
+        return next
+      })
+      setOrdersTotal(result.total || 0)
+    } finally {
+      if (requestSeq === ordersRequestSeqRef.current) setOrdersLoading(false)
+    }
+  }
+
+  async function refreshCurrentOrdersPage() {
+    await refreshOrdersPage(storeId, ordersPage)
   }
 
   async function forceSyncShopifyStatuses() {
@@ -2150,17 +2179,19 @@ function App() {
       setAdminTokenSaved(false)
       return
     }
-    const load = initialDashboardRefreshDone.current && page === "orders" && storeId && data
-      ? refreshOrdersPage(storeId, ordersPage)
-      : refresh(storeId, ordersPage).finally(() => {
+    const load = !initialDashboardRefreshDone.current
+      ? refresh(storeId, ordersPage).finally(() => {
         initialDashboardRefreshDone.current = true
       })
+      : page === "orders" && storeId && data
+        ? refreshOrdersPage(storeId, ordersPage)
+        : Promise.resolve()
     load.catch((error) => {
       if (error instanceof AdminAuthError) return
       setModal({ ok: false, title: "Unable to load app", message: String(error) })
     })
     if (!initialDashboardRefreshDone.current) loadUiCopy().catch(() => undefined)
-  }, [ordersPage, sortKey, sortDirection, storeId])
+  }, [page, ordersPage, sortKey, sortDirection, storeId, search, orderCondition])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2359,48 +2390,13 @@ function App() {
   }, [page, storeId, costlyPage])
 
   useEffect(() => {
-    const term = search.trim()
-    const hasCondition = orderCondition !== "all"
-    if (!term && !hasCondition) {
-      searchAbortRef.current?.abort()
-      setSearchRows(null)
-      setOrdersTotal(data?.total || ordersTotal)
-      return
-    }
-    let active = true
-    const timer = window.setTimeout(() => {
-      searchAbortRef.current?.abort()
-      const controller = new AbortController()
-      searchAbortRef.current = controller
-      api<DashboardData>(
-        `/api/search${pagedQuery(storeId, ordersPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}&q=${encodeURIComponent(term)}`,
-        { signal: controller.signal },
-      )
-        .then((result) => {
-          if (!active) return
-          setSearchRows(result.rows)
-          setOrdersTotal(result.total || 0)
-        })
-        .catch((error) => {
-          if (error instanceof DOMException && error.name === "AbortError") return
-          if (active) setSearchRows(null)
-        })
-    }, 250)
-    return () => {
-      active = false
-      window.clearTimeout(timer)
-      searchAbortRef.current?.abort()
-    }
-  }, [search, orderCondition, storeId, ordersPage, sortKey, sortDirection])
-
-  useEffect(() => {
     window.localStorage.setItem(
       ORDER_TABLE_STORAGE_KEY,
       JSON.stringify(orderColumns.map((column) => ({ key: column.key, visible: column.visible !== false }))),
     )
   }, [orderColumns])
 
-  const rows = search.trim() || orderCondition !== "all" ? (searchRows || data?.rows || []) : data?.rows || []
+  const rows = orderRows
   useEffect(() => {
     if (page !== "orders" || !storeId || !rows.length) return
     const orderNames = Array.from(new Set(rows.map((row) => row.odoo_order_name).filter(Boolean))).slice(0, 100)
@@ -2448,8 +2444,9 @@ function App() {
     }
   }, [page, storeId, ordersPage])
   const filteredRows = useMemo(() => {
+    if (ordersLoading) return []
     return rows
-  }, [rows])
+  }, [ordersLoading, rows])
   const sortedRows = filteredRows
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
   const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
@@ -2606,16 +2603,16 @@ function App() {
       setBusy(title)
       const result = await fn()
       if ("rows" in result) {
-        applyDashboardData(result)
+        await refreshCurrentOrdersPage()
         if (result.punchout_launch_url) {
           window.open(result.punchout_launch_url, "_blank")
         }
       } else if (result.defer_refresh) {
         window.setTimeout(() => {
-          void refresh().catch((error) => setModal({ ok: false, title: "Refresh Failed", message: String(error) }))
+          void refreshCurrentOrdersPage().catch((error) => setModal({ ok: false, title: "Refresh Failed", message: String(error) }))
         }, 2500)
       } else {
-        await refresh()
+        await refreshCurrentOrdersPage()
       }
       setSelected([])
       setModal({ ok: "ok" in result ? result.ok ?? true : true, title, message: result.message || "Done." })
@@ -3510,7 +3507,7 @@ function App() {
                     </div>
                   </div>
                 )}
-                <PaginationControls page={ordersPage} total={ordersTotal} onPage={setOrdersPage} disabled={Boolean(busy)} label="orders" />
+                <PaginationControls page={ordersPage} total={ordersTotal} onPage={setOrdersPage} disabled={Boolean(busy) || ordersLoading} label="orders" />
                 {selectedClubName && <p className="text-sm text-muted-foreground">Clubbed recipient: {selectedClubName}</p>}
                 {orderingEngine === "cxml" && (
                   <label className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -3622,7 +3619,13 @@ function App() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {sortedRows.map((row) => (
+                    {ordersLoading ? (
+                      <TableRow>
+                        <TableCell colSpan={visibleOrderColumns.length + 1} className="h-32 text-center text-muted-foreground">
+                          Loading orders...
+                        </TableCell>
+                      </TableRow>
+                    ) : sortedRows.length ? sortedRows.map((row) => (
                       <TableRow
                         key={row.id}
                         onClick={(event) => {
@@ -3673,7 +3676,13 @@ function App() {
                           </TableCell>
                         ))}
                       </TableRow>
-                    ))}
+                    )) : (
+                      <TableRow>
+                        <TableCell colSpan={visibleOrderColumns.length + 1} className="h-32 text-center text-muted-foreground">
+                          No orders match this view.
+                        </TableCell>
+                      </TableRow>
+                    )}
                   </TableBody>
                 </Table>
               </CardContent>
@@ -7486,6 +7495,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [savingProductTitle, setSavingProductTitle] = useState(false)
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
+  const [jobStatusCounts, setJobStatusCounts] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState("")
   const pageRef = useRef(page)
   const progressTotal = Math.max(0, Number(progress?.total || 0))
@@ -7502,6 +7512,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const productRepairPercent = productRepairTotal ? Math.max(0, Math.min(100, Math.round((productRepairProcessed / productRepairTotal) * 100))) : 0
   const productRepairBusy = productRepairProgress?.status === "running"
   const showProductRepairProgress = Boolean(productRepairProgress && (productRepairBusy || productRepairTotal > 0 || productRepairProgress.message))
+  const completedJobCount = Number(jobStatusCounts.completed || 0)
   const filteredDuplicateGroups = duplicateGroups.filter((group) => {
     if (duplicateFilter === "duplicates") return Number(group.duplicate_count || 0) > 0
     if (duplicateFilter === "errors") return Boolean(group.error || group.orders.some((order) => order.cancel_error))
@@ -7515,10 +7526,11 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
 
   async function load(nextPage = page) {
     const requestedPage = nextPage
-    const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?page=${nextPage}&per_page=${PAGE_SIZE}`)
+    const result = await api<{ jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?page=${nextPage}&per_page=${PAGE_SIZE}`)
     const resultPage = result.page || requestedPage
     if (requestedPage !== pageRef.current && resultPage !== pageRef.current) return
     setJobs(result.jobs || [])
+    setJobStatusCounts(result.status_counts || {})
     setOauthMissing(result.oauth_missing || [])
     setOauthStatus(result.oauth_status || [])
     setProgress(result.progress || null)
@@ -7672,6 +7684,24 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     await load()
     onResult({ ok: result.ok, title: "Retry Shopify Job", message: result.message })
   }
+  async function clearCompletedJobs() {
+    const confirmed = window.confirm("Clear completed Shopify fulfilment jobs from the displayed history? Queued, running, failed, and dead jobs will stay visible.")
+    if (!confirmed) return
+    setBusy("ClearCompleted")
+    try {
+      const result = await api<{ ok: boolean; message: string; jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; page?: number; total: number }>(`/api/shopify/fulfilment/jobs/clear-completed?page=${pageRef.current}&per_page=${PAGE_SIZE}`, { method: "POST" })
+      setJobs(result.jobs || [])
+      setJobStatusCounts(result.status_counts || {})
+      setTotal(result.total || 0)
+      if (result.page) {
+        pageRef.current = result.page
+        setPage(result.page)
+      }
+      onResult({ ok: result.ok, title: "Shopify Jobs Cleared", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
   async function repushJob(job: ShopifyFulfilmentJob) {
     if (!job.shopify_order_id) return
     const confirmed = window.confirm(`Only continue after Shopify order #${job.shopify_order_id} is cancelled. Repush ${job.odoo_order_name} now?`)
@@ -7793,6 +7823,9 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
             <Button variant="outline" onClick={runWorker} disabled={Boolean(busy)}>{busy === "Run" ? "Starting..." : "Run Worker"}</Button>
             <Button variant="outline" onClick={runOneJob} disabled={Boolean(busy)}>{busy === "RunOne" ? "Running..." : "Run One Job"}</Button>
             <Button variant="outline" onClick={repairSyncedProducts} disabled={Boolean(busy) || productRepairBusy}>{busy === "ProductRepair" || productRepairBusy ? "Repairing..." : "Repair Synced Products"}</Button>
+            <Button variant="outline" onClick={clearCompletedJobs} disabled={Boolean(busy) || completedJobCount === 0}>
+              {busy === "ClearCompleted" ? "Clearing..." : `Clear Completed${completedJobCount ? ` (${completedJobCount})` : ""}`}
+            </Button>
             {productRepairBusy ? (
               <Button variant="destructive" onClick={cancelProductRepair} disabled={busy === "ProductRepairCancel" || Boolean(productRepairProgress?.cancel_requested)}>
                 {busy === "ProductRepairCancel" || productRepairProgress?.cancel_requested ? "Cancelling..." : "Cancel Repair"}
@@ -8116,7 +8149,11 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                   <TableCell className="max-w-md"><ErrorTooltip value={job.last_error} /></TableCell>
                   <TableCell>
                     <div className="flex flex-wrap gap-2">
-                      {["failed", "dead"].includes(job.status) ? <Button size="sm" variant="outline" onClick={() => retryJob(job.id)}>Retry</Button> : null}
+                      {["amazon_placed", "queued", "failed", "dead"].includes(job.status) ? (
+                        <Button size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => retryJob(job.id)}>
+                          {["amazon_placed", "queued"].includes(job.status) ? "Sync Now" : "Retry"}
+                        </Button>
+                      ) : null}
                       {job.shopify_order_id ? (
                         <Button size="sm" variant="warning" disabled={Boolean(busy)} onClick={() => repushJob(job)}>
                           {busy === `Repush-${job.id}` ? "Repushing..." : "Repush"}
@@ -8615,6 +8652,10 @@ function SettingsPage({
               <option value="true">Enabled - block before 18 May</option>
               <option value="false">Disabled - allow old orders</option>
             </SelectField>
+            <SelectField label="Check Fulfilled Shopify Before Amazon Queue" value={settings.shopify_fulfilled_order_guard_enabled || "false"} onChange={(value) => setSetting("shopify_fulfilled_order_guard_enabled", value)}>
+              <option value="false">Disabled - faster queue</option>
+              <option value="true">Enabled - block fulfilled Shopify orders</option>
+            </SelectField>
             <SelectField label="Generic Product Names" value={settings.shopify_product_rename_enabled || "true"} onChange={(value) => setSetting("shopify_product_rename_enabled", value)}>
               <option value="true">Use generic product name</option>
               <option value="false">Use original product names</option>
@@ -8658,6 +8699,7 @@ function SettingsPage({
                 "odoo_script_password",
                 "shopify_auto_enqueue_enabled",
                 "amazon_order_date_guard_enabled",
+                "shopify_fulfilled_order_guard_enabled",
                 "shopify_product_rename_enabled",
                 "shopify_generic_product_name",
                 "shopify_job_max_attempts",

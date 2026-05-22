@@ -2443,6 +2443,32 @@ ORDER_LINE_PAGE_SELECT = """
 """
 
 
+ORDER_LINE_PAGE_COLUMNS = (
+    "id", "store_id", "odoo_order_id", "odoo_order_name", "odoo_order_date", "odoo_line_id",
+    "product_id", "product_tmpl_id", "product_name", "default_code", "asin_from_reference",
+    "asin_from_note", "asin", "supplier_part_auxiliary_id", "quantity", "store_unit_price",
+    "store_total_price", "store_currency", "store_currency_rate_to_usd", "store_subtotal_native",
+    "store_delivery_native", "store_discount_native", "store_adjustment_native", "store_total_native",
+    "amazon_unit_price", "amazon_total_price", "chrome_profit_total", "fulfilment_note",
+    "odoo_order_state", "odoo_invoice_status", "odoo_status_label", "state", "amazon_order_id",
+    "amazon_order_url", "amazon_account_id", "amazon_account_name", "order_engine", "amazon_group_key",
+    "amazon_status", "tracking_status", "tracking_checked_at", "amazon_cancelled_at",
+    "amazon_cancelled_order_id", "chrome_claimed_by", "chrome_claimed_at", "chrome_claim_expires_at",
+    "last_error", "missing_asin", "original_asin", "replacement_asin", "replacement_product_name",
+    "replacement_note", "replacement_assigned_at", "cost_approved_at", "cost_review_loss",
+    "source_line_count", "pulled_at", "ordered_at", "created_at", "updated_at",
+)
+
+
+def qualified_order_line_page_select(alias: str = "order_lines") -> str:
+    columns = ", ".join(f"{alias}.{column}" for column in ORDER_LINE_PAGE_COLUMNS)
+    return f"""
+    {columns},
+    CASE WHEN COALESCE({alias}.raw_json, '') ~ '^\\s*\\{{' THEN {alias}.raw_json::jsonb -> 'order' ->> 'destination_country_code' ELSE '' END AS destination_country_code,
+    CASE WHEN COALESCE({alias}.raw_json, '') ~ '^\\s*\\{{' THEN {alias}.raw_json::jsonb -> 'order' ->> 'destination_country_name' ELSE '' END AS destination_country_name
+    """
+
+
 def order_date_window_sql() -> str:
     return """
       AND COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at)::timestamp::date
@@ -5490,6 +5516,68 @@ def order_sort_sql(sort_by: str = "", sort_dir: str = "") -> str:
     return f"{expression} {direction} {nulls}, COALESCE(odoo_order_id, 0) {direction}, asin ASC, id ASC"
 
 
+def order_group_sort_sql(sort_by: str = "", sort_dir: str = "") -> str:
+    direction = "ASC" if clean_text(sort_dir).lower() == "asc" else "DESC"
+    nulls = "NULLS FIRST" if direction == "ASC" else "NULLS LAST"
+    sort_key = clean_text(sort_by).lower() or "odoo_order_date"
+    fields = {
+        "odoo_order_name": "sort_odoo_order_id",
+        "odoo_order_date": "sort_odoo_order_date",
+        "pulled_at": "sort_pulled_at",
+        "ordered_at": "sort_ordered_at",
+        "destination_country": "sort_destination_country",
+        "product_name": "sort_product_name",
+        "default_code": "sort_default_code",
+        "asin": "sort_asin",
+        "supplier_part_auxiliary_id": "sort_supplier_part_auxiliary_id",
+        "quantity": "sort_quantity",
+        "odoo_status_label": "sort_odoo_status_label",
+        "state": "sort_state",
+        "order_engine": "sort_order_engine",
+        "amazon_account_name": "sort_amazon_account_name",
+        "tracking_status": "sort_tracking_status",
+        "amazon_cancelled_order_id": "sort_amazon_cancelled_order_id",
+        "amazon_order_id": "sort_amazon_order_id",
+        "fulfilment_note": "sort_fulfilment_note",
+        "last_error": "sort_last_error",
+    }
+    field = fields.get(sort_key, "sort_odoo_order_date")
+    return f"{field} {direction} {nulls}, sort_odoo_order_id {direction}, min_line_id ASC"
+
+
+def order_group_select_sql(sort_by: str = "") -> str:
+    sort_key = clean_text(sort_by).lower() or "odoo_order_date"
+    optional_fields = {
+        "pulled_at": "MAX(NULLIF(pulled_at, '')::timestamp) AS sort_pulled_at",
+        "ordered_at": "MAX(NULLIF(ordered_at, '')::timestamp) AS sort_ordered_at",
+        "destination_country": "MIN(COALESCE(CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_name' ELSE '' END, '')) AS sort_destination_country",
+        "product_name": "MIN(COALESCE(product_name, '')) AS sort_product_name",
+        "default_code": "MIN(COALESCE(default_code, '')) AS sort_default_code",
+        "asin": "MIN(COALESCE(asin, '')) AS sort_asin",
+        "supplier_part_auxiliary_id": "MIN(COALESCE(supplier_part_auxiliary_id, '')) AS sort_supplier_part_auxiliary_id",
+        "quantity": "SUM(COALESCE(quantity, 0)) AS sort_quantity",
+        "odoo_status_label": "MIN(COALESCE(odoo_status_label, '')) AS sort_odoo_status_label",
+        "state": "MIN(COALESCE(state, '')) AS sort_state",
+        "order_engine": "MIN(COALESCE(order_engine, '')) AS sort_order_engine",
+        "amazon_account_name": "MIN(COALESCE(amazon_account_name, '')) AS sort_amazon_account_name",
+        "tracking_status": "MIN(COALESCE(tracking_status, '')) AS sort_tracking_status",
+        "amazon_cancelled_order_id": "MIN(COALESCE(amazon_cancelled_order_id, '')) AS sort_amazon_cancelled_order_id",
+        "amazon_order_id": "MIN(COALESCE(amazon_order_id, '')) AS sort_amazon_order_id",
+        "fulfilment_note": "MIN(COALESCE(fulfilment_note, '')) AS sort_fulfilment_note",
+        "last_error": "MIN(COALESCE(last_error, '')) AS sort_last_error",
+    }
+    fields = [
+        "store_id",
+        "odoo_order_id",
+        "MIN(id) AS min_line_id",
+        "MAX(COALESCE(odoo_order_id, 0)) AS sort_odoo_order_id",
+        "MAX(NULLIF(odoo_order_date, '')::timestamp) AS sort_odoo_order_date",
+    ]
+    if sort_key in optional_fields:
+        fields.append(optional_fields[sort_key])
+    return ",\n                       ".join(fields)
+
+
 def order_sort_for_typesense(sort_by: str = "", sort_dir: str = "") -> str:
     direction = "asc" if clean_text(sort_dir).lower() == "asc" else "desc"
     sort_key = clean_text(sort_by).lower()
@@ -5512,8 +5600,8 @@ def order_sort_for_typesense(sort_by: str = "", sort_dir: str = "") -> str:
         "fulfilment_note": "fulfilment_note",
         "last_error": "last_error",
     }
-    field = fields.get(sort_key, "odoo_order_id")
-    return f"{field}:{direction},odoo_order_id:{direction}"
+    field = fields.get(sort_key, "order_date_ts")
+    return f"{field}:{direction},odoo_order_id:{direction},id:asc"
 
 
 def typesense_search_order_lines(
@@ -5522,7 +5610,7 @@ def typesense_search_order_lines(
     page: int = 1,
     per_page: int = 100,
     filter_by: str = "",
-    sort_by: str = "odoo_order_name",
+    sort_by: str = "odoo_order_date",
     sort_dir: str = "desc",
 ) -> dict[str, Any]:
     settings = get_service_settings()
@@ -9752,11 +9840,11 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
                 INSERT INTO shopify_fulfilment_jobs
                 (id, store_id, odoo_order_id, odoo_order_name, route, status, attempts, max_attempts,
                  last_error, next_run_at, source_line_ids_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, '', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'amazon_placed', 0, ?, '', ?, ?, ?, ?)
                 ON CONFLICT(store_id, odoo_order_name, route) DO UPDATE SET
                   status=CASE
                     WHEN shopify_fulfilment_jobs.status='completed' THEN shopify_fulfilment_jobs.status
-                    ELSE 'queued'
+                    ELSE 'amazon_placed'
                   END,
                   next_run_at=CASE
                     WHEN shopify_fulfilment_jobs.status='completed' THEN shopify_fulfilment_jobs.next_run_at
@@ -9791,7 +9879,6 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
                 """.format(",".join("?" for _ in line_ids)),
                 [f"Shopify {route.upper()} queued ({country or 'unknown country'})", f"Shopify {route.upper()} queued ({country or 'unknown country'})", utc_now(), *line_ids],
             )
-    start_shopify_fulfilment_worker()
     return inserted
 
 
@@ -9802,7 +9889,7 @@ def claim_shopify_fulfilment_job() -> Optional[dict[str, Any]]:
             WITH next_job AS (
                 SELECT id
                 FROM shopify_fulfilment_jobs
-                WHERE status IN ('queued', 'failed')
+                WHERE status IN ('amazon_placed', 'queued', 'failed')
                   AND attempts < max_attempts
                   AND (next_run_at IS NULL OR next_run_at='' OR next_run_at <= ?)
                 ORDER BY created_at ASC
@@ -10104,6 +10191,10 @@ def amazon_order_date_guard_enabled() -> bool:
     return str(get_service_settings().get("amazon_order_date_guard_enabled", "true")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def shopify_fulfilled_order_guard_enabled() -> bool:
+    return str(get_service_settings().get("shopify_fulfilled_order_guard_enabled", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def block_lines_before_min_odoo_order_date(conn: Any, lines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, list[str]]:
     if not lines:
         return lines, 0, []
@@ -10277,6 +10368,8 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]]) -> list[dict[str, 
 
 def block_lines_with_fulfilled_shopify_orders(conn: Any, store_id: int, lines: list[dict[str, Any]], live_sync: bool = True) -> tuple[list[dict[str, Any]], int, list[str]]:
     if not lines:
+        return lines, 0, []
+    if not shopify_fulfilled_order_guard_enabled():
         return lines, 0, []
     order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in lines if clean_text(row.get("odoo_order_name"))})
     ensure_shopify_order_status_cache_table()
@@ -11279,6 +11372,18 @@ def start_shopify_fulfilment_worker() -> dict[str, Any]:
     return shopify_fulfilment_progress()
 
 
+def shopify_fulfilment_job_status_counts() -> dict[str, int]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM shopify_fulfilment_jobs
+            GROUP BY status
+            """
+        ).fetchall()
+    return {clean_text(row["status"]) or "unknown": int(row["count"] or 0) for row in rows}
+
+
 def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     with db() as conn:
@@ -11316,6 +11421,17 @@ def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> tuple[li
         else:
             row["shopify_order_url"] = ""
     return result, total, page, per_page
+
+
+def clear_completed_shopify_fulfilment_jobs() -> int:
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM shopify_fulfilment_jobs
+            WHERE status='completed'
+            """
+        )
+        return int(cursor.rowcount or 0)
 
 
 def list_shopify_tracking_jobs(page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
@@ -11762,9 +11878,9 @@ def get_default_ordering_engine() -> str:
     return normalize_ordering_engine(get_setting("default_ordering_engine", "rest"))
 
 
-def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
+def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
-    order_by_sql = order_sort_sql(sort_by, sort_dir)
+    order_by_sql = order_group_sort_sql(sort_by, sort_dir)
     with db() as conn:
         payload = conn.execute(
             f"""
@@ -11774,23 +11890,32 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
             chosen AS (
                 SELECT COALESCE(?, (SELECT id FROM stores_cte LIMIT 1)) AS store_id
             ),
-            page_rows AS (
-                SELECT {ORDER_LINE_PAGE_SELECT},
-                       ROW_NUMBER() OVER (ORDER BY {order_by_sql}) AS sort_order
+            order_groups AS (
+                SELECT {order_group_select_sql(sort_by)}
                 FROM order_lines
                 WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
+                  AND odoo_order_id IS NOT NULL
+                GROUP BY store_id, odoo_order_id
+            ),
+            page_orders AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (ORDER BY {order_by_sql}) AS sort_order
+                FROM order_groups
                 ORDER BY {order_by_sql}
                 LIMIT ? OFFSET ?
+            ),
+            page_rows AS (
+                SELECT {qualified_order_line_page_select("order_lines")},
+                       page_orders.sort_order AS sort_order
+                FROM order_lines
+                JOIN page_orders
+                  ON page_orders.store_id=order_lines.store_id
+                 AND page_orders.odoo_order_id=order_lines.odoo_order_id
             ),
             page_asins AS (
                 SELECT DISTINCT store_id, asin
                 FROM page_rows
                 WHERE COALESCE(asin, '') != ''
-            ),
-            page_orders AS (
-                SELECT DISTINCT store_id, odoo_order_id
-                FROM page_rows
-                WHERE odoo_order_id IS NOT NULL
             ),
             duplicate_counts AS (
                 SELECT duplicate_lines.store_id,
@@ -11850,7 +11975,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(a)), '[]'::json) FROM (SELECT * FROM fulfilment_addresses ORDER BY is_default DESC, label) a) AS addresses,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(ac)), '[]'::json) FROM (SELECT * FROM amazon_accounts ORDER BY is_default DESC, name) ac) AS amazon_accounts,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(p)), '[]'::json) FROM (SELECT * FROM punchout_return_urls ORDER BY is_default DESC, label) p) AS punchout_return_urls,
-                (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order), '[]'::json) FROM line_rows) AS rows,
+                (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order, odoo_order_id DESC, id ASC), '[]'::json) FROM line_rows) AS rows,
                 (SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) FROM order_lines WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen)) AND odoo_order_id IS NOT NULL) AS total,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(c)), '[]'::json) FROM (
                     SELECT state, COUNT(*) AS count
@@ -11907,29 +12032,38 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     }
 
 
-def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
+def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
-    order_by_sql = order_sort_sql(sort_by, sort_dir)
+    order_by_sql = order_group_sort_sql(sort_by, sort_dir)
     with db() as conn:
         payload = conn.execute(
             f"""
-            WITH page_rows AS (
-                SELECT {ORDER_LINE_PAGE_SELECT},
-                       ROW_NUMBER() OVER (ORDER BY {order_by_sql}) AS sort_order
+            WITH order_groups AS (
+                SELECT {order_group_select_sql(sort_by)}
                 FROM order_lines
                 WHERE (? IS NULL OR store_id=?)
+                  AND odoo_order_id IS NOT NULL
+                GROUP BY store_id, odoo_order_id
+            ),
+            page_orders AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (ORDER BY {order_by_sql}) AS sort_order
+                FROM order_groups
                 ORDER BY {order_by_sql}
                 LIMIT ? OFFSET ?
+            ),
+            page_rows AS (
+                SELECT {qualified_order_line_page_select("order_lines")},
+                       page_orders.sort_order AS sort_order
+                FROM order_lines
+                JOIN page_orders
+                  ON page_orders.store_id=order_lines.store_id
+                 AND page_orders.odoo_order_id=order_lines.odoo_order_id
             ),
             page_asins AS (
                 SELECT DISTINCT store_id, asin
                 FROM page_rows
                 WHERE COALESCE(asin, '') != ''
-            ),
-            page_orders AS (
-                SELECT DISTINCT store_id, odoo_order_id
-                FROM page_rows
-                WHERE odoo_order_id IS NOT NULL
             ),
             duplicate_counts AS (
                 SELECT duplicate_lines.store_id,
@@ -11985,7 +12119,7 @@ def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_pag
                  AND order_asin_counts.odoo_order_id = page_rows.odoo_order_id
             )
             SELECT
-                (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order), '[]'::json) FROM line_rows) AS rows,
+                (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order, odoo_order_id DESC, id ASC), '[]'::json) FROM line_rows) AS rows,
                 (SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) FROM order_lines WHERE (? IS NULL OR store_id=?) AND odoo_order_id IS NOT NULL) AS total
             """,
             (store_id, store_id, per_page, offset, store_id, store_id),
@@ -12088,7 +12222,7 @@ def order_lines_by_ids(ids: list[int], stores: Optional[list[dict[str, Any]]] = 
     return hydrate_order_line_rows(rows, stores)
 
 
-def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
+def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
     clean_query = query.strip()
     order_by_sql = order_sort_sql(sort_by, sort_dir)
@@ -12290,12 +12424,12 @@ def startup() -> None:
 
 
 @app.get("/api/dashboard")
-def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
+def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     return dashboard_data(store_id, page, per_page, sort_by, sort_dir)
 
 
 @app.get("/api/orders")
-def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
+def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     filter_by, filtered = order_condition_filter(condition, store_id)
     if filtered:
         result = typesense_search_order_lines("*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
@@ -12504,7 +12638,7 @@ def api_delete_backup(payload: BackupKeyPayload) -> dict[str, Any]:
 
 
 @app.get("/api/search")
-def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
+def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
     filter_by, filtered = order_condition_filter(condition, store_id)
     if not q.strip() and not filtered:
@@ -13894,12 +14028,31 @@ def api_place_recent_chrome(payload: dict[str, Any]) -> dict[str, Any]:
 def api_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
     rows, total, page, per_page = list_shopify_fulfilment_jobs(page, per_page)
     oauth_status = shopify_oauth_route_status()
+    status_counts = shopify_fulfilment_job_status_counts()
     return {
         "ok": True,
         "jobs": rows,
+        "status_counts": status_counts,
         "oauth_status": oauth_status,
         "oauth_missing": [row for row in oauth_status if not row.get("authorized")],
         "progress": shopify_fulfilment_progress(),
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+    }
+
+
+@app.post("/api/shopify/fulfilment/jobs/clear-completed")
+def api_clear_completed_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    cleared = clear_completed_shopify_fulfilment_jobs()
+    rows, total, page, per_page = list_shopify_fulfilment_jobs(page, per_page)
+    status_counts = shopify_fulfilment_job_status_counts()
+    return {
+        "ok": True,
+        "cleared": cleared,
+        "message": f"Cleared {cleared} completed Shopify fulfilment job{'s' if cleared != 1 else ''}.",
+        "jobs": rows,
+        "status_counts": status_counts,
         "page": page,
         "per_page": per_page,
         "total": total,
@@ -14097,13 +14250,13 @@ def api_shopify_fulfilment_retry(job_id: str) -> dict[str, Any]:
         cursor = conn.execute(
             """
             UPDATE shopify_fulfilment_jobs
-            SET status='queued', next_run_at=?, last_error='', updated_at=?
-            WHERE id=? AND status IN ('failed', 'dead')
+            SET status='amazon_placed', next_run_at=?, last_error='', updated_at=?
+            WHERE id=? AND status IN ('amazon_placed', 'queued', 'failed', 'dead')
             """,
             (utc_now(), utc_now(), job_id),
         )
     start_shopify_fulfilment_worker()
-    return {"ok": True, "message": f"Requeued {cursor.rowcount} Shopify fulfilment job(s)."}
+    return {"ok": True, "message": f"Started sync for {cursor.rowcount} Shopify fulfilment job(s)."}
 
 
 @app.post("/api/shopify/fulfilment/jobs/{job_id}/repush")
@@ -15030,6 +15183,56 @@ def api_chrome_clear_failed_jobs(store_id: Optional[int] = None) -> dict[str, An
             """
         )
     return {"ok": True, "cleared": cursor.rowcount, "message": f"Cleared {cursor.rowcount} failed or stale queued Chrome job line(s)."}
+
+
+@app.post("/api/chrome/queue/force-clear")
+def api_chrome_force_clear_queue(store_id: Optional[int] = None) -> dict[str, Any]:
+    now = utc_now()
+    with db() as conn:
+        protected = int(conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM order_lines
+            WHERE order_engine='chrome'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_group_key, '') != ''
+              AND COALESCE(amazon_status, '') IN ('order_submitted', 'reporting_complete')
+              AND (? IS NULL OR store_id=?)
+            """,
+            (store_id, store_id),
+        ).fetchone()["count"] or 0)
+        cursor = conn.execute(
+            """
+            UPDATE order_lines
+            SET state='pulled',
+                amazon_status=NULL,
+                amazon_group_key=NULL,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                last_error=NULL,
+                updated_at=?
+            WHERE order_engine='chrome'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_group_key, '') != ''
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+              AND (? IS NULL OR store_id=?)
+            """,
+            (now, store_id, store_id),
+        )
+        conn.execute(
+            """
+            UPDATE amazon_attempts
+            SET status='force_cleared',
+                error='Chrome queue force cleared from extension popup.'
+            WHERE mode='chrome'
+              AND status IN ('queued', 'error')
+            """
+        )
+    message = f"Force cleared {cursor.rowcount} unsubmitted Chrome queue line(s)."
+    if protected:
+        message += f" Preserved {protected} submitted line(s) waiting for Amazon order-number reporting."
+    return {"ok": True, "cleared": cursor.rowcount, "protected": protected, "message": message}
 
 
 def chrome_complete_followups(
