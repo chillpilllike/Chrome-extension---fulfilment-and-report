@@ -8171,7 +8171,7 @@ def start_export_job(job_id: str) -> None:
 
 
 def date_range_from_params(period: str = "monthly", month: str = "", start: str = "", end: str = "") -> tuple[datetime, datetime, str]:
-    if period == "monthly" or month:
+    if period == "monthly":
         return month_bounds(month or datetime.now(timezone.utc).strftime("%Y-%m"))
     parsed_start = parse_iso_date(start) or datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     parsed_end = parse_iso_date(end) or parsed_start
@@ -8315,7 +8315,7 @@ def profit_loss_data(
                 """,
                 (month_keys,),
             ).fetchall())
-    manual_cost_total = round(sum(float(row.get("amount") or 0) for row in manual_cost_rows), 2)
+    manual_cost_total = round(sum(float(row.get("amount") or 0) for row in manual_cost_rows), 2) if period == "monthly" else 0
     manual_costs_by_month: dict[str, float] = {}
     for cost in manual_cost_rows:
         key = str(cost.get("month") or resolved_month)

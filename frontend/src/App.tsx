@@ -5976,6 +5976,13 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
   const [data, setData] = useState<ProfitLossData | null>(null)
   const [period, setPeriod] = useState("monthly")
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7))
+  const [day, setDay] = useState(new Date().toISOString().slice(0, 10))
+  const [weekStart, setWeekStart] = useState(() => {
+    const now = new Date()
+    const dayOfWeek = now.getDay() || 7
+    now.setDate(now.getDate() - dayOfWeek + 1)
+    return now.toISOString().slice(0, 10)
+  })
   const [query, setQuery] = useState("")
   const [page, setPage] = useState(1)
   const [file, setFile] = useState<File | null>(null)
@@ -5986,7 +5993,14 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
   const [manualCostNote, setManualCostNote] = useState("")
 
   async function load(nextPage = page) {
-    const params = new URLSearchParams({ period, month, q: query })
+    const params = new URLSearchParams({ period, q: query })
+    if (period === "monthly") {
+      params.set("month", month)
+    } else if (period === "weekly") {
+      params.set("start", weekStart)
+    } else {
+      params.set("start", day)
+    }
     if (storeId) params.set("store_id", storeId)
     params.set("page", String(nextPage))
     params.set("per_page", String(PAGE_SIZE))
@@ -5997,7 +6011,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
 
   useEffect(() => {
     load().catch((error) => onResult({ ok: false, title: "Profit/Loss load failed", message: String(error) }))
-  }, [storeId, period, month, page])
+  }, [storeId, period, month, day, weekStart, page])
 
   async function uploadShipping() {
     if (!file) return
@@ -6053,7 +6067,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
         body: JSON.stringify({
           id: manualCostId,
           store_id: storeId ? Number(storeId) : null,
-          month,
+          month: period === "monthly" ? month : period === "weekly" ? weekStart.slice(0, 7) : day.slice(0, 7),
           label: manualCostLabel,
           amount,
           note: manualCostNote,
@@ -6118,8 +6132,14 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
             <option value="monthly">Monthly</option>
           </SelectField>
           <div>
-            <Label>Month</Label>
-            <Input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setPage(1) }} />
+            <Label>{period === "daily" ? "Day" : period === "weekly" ? "Week Starting" : "Month"}</Label>
+            {period === "daily" ? (
+              <Input type="date" value={day} onChange={(event) => { setDay(event.target.value); setPage(1) }} />
+            ) : period === "weekly" ? (
+              <Input type="date" value={weekStart} onChange={(event) => { setWeekStart(event.target.value); setPage(1) }} />
+            ) : (
+              <Input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setPage(1) }} />
+            )}
           </div>
           <div>
             <Label>Search</Label>
@@ -6142,7 +6162,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
       <Card>
         <CardHeader>
           <CardTitle>Manual Monthly Costs</CardTitle>
-          <CardDescription>Costs entered here are subtracted from this month’s Profit / Loss total.</CardDescription>
+          <CardDescription>Costs entered here are subtracted from the Profit / Loss total for their month.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 lg:grid-cols-[1fr_160px_1fr_auto_auto] lg:items-end">
           <div>
