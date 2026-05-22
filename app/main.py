@@ -123,7 +123,7 @@ _sync_thread_started = False
 _TYPESENSE_INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="typesense-index")
 _TYPESENSE_COLLECTION_CACHE: dict[str, float] = {}
 _TYPESENSE_COLLECTION_CACHE_LOCK = threading.Lock()
-TYPESENSE_SCHEMA_VERSION = "2"
+TYPESENSE_SCHEMA_VERSION = "3"
 PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/assets", "/static", "/health", "/favicon")
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
@@ -4296,6 +4296,7 @@ def order_line_search_document(row: Union[dict[str, Any], dict[str, Any]]) -> di
         "state": str(row["state"] or ""),
         "odoo_status_label": str(row["odoo_status_label"] or ""),
         "amazon_order_id": str(row["amazon_order_id"] or ""),
+        "amazon_status": str(row["amazon_status"] or "") if "amazon_status" in row.keys() else "",
         "amazon_account_name": str(row["amazon_account_name"] or ""),
         "tracking_status": str(row["tracking_status"] or "") if "tracking_status" in row.keys() else "",
         "amazon_cancelled_at": str(row["amazon_cancelled_at"] or "") if "amazon_cancelled_at" in row.keys() else "",
@@ -4345,6 +4346,7 @@ def ensure_typesense_collection(settings: Optional[dict[str, str]] = None) -> No
             {"name": "state", "type": "string", "facet": True},
             {"name": "odoo_status_label", "type": "string", "facet": True},
             {"name": "amazon_order_id", "type": "string", "optional": True},
+            {"name": "amazon_status", "type": "string", "facet": True, "optional": True},
             {"name": "amazon_account_name", "type": "string", "optional": True},
             {"name": "tracking_status", "type": "string", "optional": True},
             {"name": "amazon_cancelled_at", "type": "string", "optional": True},
@@ -4894,6 +4896,9 @@ def reindex_order_lines(chunk_size: int = 250) -> int:
         delete_response = requests.delete(f"{base}/collections/{collection}", headers=typesense_headers(settings), timeout=15)
         if delete_response.status_code not in {200, 201, 202, 204, 404}:
             raise RuntimeError(f"Typesense collection reset failed for {collection}: HTTP {delete_response.status_code}: {delete_response.text[:500]}")
+    with _TYPESENSE_COLLECTION_CACHE_LOCK:
+        for collection in all_collections:
+            _TYPESENSE_COLLECTION_CACHE.pop(f"{base}/{collection}", None)
     ensure_typesense_collection(settings)
     for collection in TYPESENSE_COLLECTION_SCHEMAS:
         ensure_named_typesense_collection(collection, settings=settings)
@@ -5058,16 +5063,50 @@ def start_typesense_reindex_job() -> dict[str, Any]:
     return {"ok": True, "message": "Typesense reindex started.", "progress": progress}
 
 
-def typesense_search_order_lines(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100) -> dict[str, Any]:
+ORDER_CONDITION_FILTERS: dict[str, str] = {
+    "all": "",
+    "ready": "state:=[pulled,error] && odoo_status_label:!=cancelled && odoo_status_label:!=refunded",
+    "missing": "(state:=missing || amazon_status:=missing)",
+    "ignored": "state:=ignored",
+    "costly": "state:=costly",
+    "queued": "state:=submitted",
+    "ordered": "state:=[ordered,dispatched]",
+    "delivered": "state:=delivered",
+    "inventory": "state:=inventory",
+    "error": "state:=error",
+    "cancelled_refunded": "odoo_status_label:=[cancelled,refunded]",
+}
+
+
+def order_condition_filter(condition: str, store_id: Optional[int] = None) -> tuple[str, bool]:
+    condition_key = clean_text(condition or "all").lower() or "all"
+    if condition_key not in ORDER_CONDITION_FILTERS:
+        raise HTTPException(400, "Unknown order filter.")
+    filters = []
+    if store_id:
+        filters.append(f"store_id:={int(store_id)}")
+    condition_filter = ORDER_CONDITION_FILTERS[condition_key]
+    if condition_filter:
+        filters.append(condition_filter)
+    return " && ".join(filters), condition_key != "all"
+
+
+def typesense_search_order_lines(
+    query: str,
+    store_id: Optional[int],
+    page: int = 1,
+    per_page: int = 100,
+    filter_by: str = "",
+) -> dict[str, Any]:
     settings = get_service_settings()
     if not typesense_enabled(settings):
         return {"ids": [], "total": 0, "enabled": False}
     base = typesense_base(settings)
-    if not base or not query.strip():
+    if not base or (not query.strip() and not filter_by):
         return {"ids": [], "total": 0, "enabled": False}
     page, per_page, _ = pagination_bounds(page, per_page)
     params = {
-        "q": query.strip(),
+        "q": query.strip() or "*",
         "query_by": ",".join([
             "odoo_order_name",
             "product_name",
@@ -5077,6 +5116,7 @@ def typesense_search_order_lines(query: str, store_id: Optional[int], page: int 
             "state",
             "odoo_status_label",
             "amazon_order_id",
+            "amazon_status",
             "amazon_cancelled_order_id",
             "amazon_account_name",
             "tracking_status",
@@ -5089,7 +5129,7 @@ def typesense_search_order_lines(query: str, store_id: Optional[int], page: int 
             "amazon_group_key",
             "search_text",
         ]),
-        "query_by_weights": "10,3,5,8,6,2,2,8,8,3,3,3,3,5,5,3,3,4,1",
+        "query_by_weights": "10,3,5,8,6,2,2,8,3,8,3,3,3,3,5,5,3,3,4,1",
         "per_page": str(per_page),
         "page": str(page),
         "prefix": "true",
@@ -5097,7 +5137,9 @@ def typesense_search_order_lines(query: str, store_id: Optional[int], page: int 
         "num_typos": "1",
         "drop_tokens_threshold": "0",
     }
-    if store_id:
+    if filter_by:
+        params["filter_by"] = filter_by
+    elif store_id:
         params["filter_by"] = f"store_id:={int(store_id)}"
     ensure_typesense_collection(settings)
     response = requests.get(f"{base}/collections/order_lines/documents/search", headers=typesense_headers(settings), params=params, timeout=8)
@@ -7995,7 +8037,7 @@ def profit_loss_data(
     normalize_converted_profit_columns(store_id, start_text, end_text)
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             WITH line_orders AS (
                 SELECT
                     store_id,
@@ -10049,7 +10091,7 @@ def typesense_order_line_ids_for_filter(filter_by: str, limit: int = 50000, quer
     while len(ids) < limit:
         params = {
             "q": query.strip() or "*",
-            "query_by": "odoo_order_name,product_name,asin,amazon_order_id,amazon_account_name,tracking_status,fulfilment_note,last_error",
+            "query_by": "odoo_order_name,product_name,asin,amazon_order_id,amazon_status,amazon_account_name,tracking_status,fulfilment_note,last_error",
             "filter_by": filter_by,
             "page": str(page),
             "per_page": str(per_page),
@@ -10135,8 +10177,22 @@ def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int =
 
 
 @app.get("/api/orders")
-def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    return order_lines_page_data(store_id, page, per_page)
+def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all") -> dict[str, Any]:
+    filter_by, filtered = order_condition_filter(condition, store_id)
+    if filtered:
+        result = typesense_search_order_lines("*", store_id, page, per_page, filter_by=filter_by)
+        if not result.get("enabled"):
+            raise HTTPException(503, "Typesense is required for order condition filters.")
+        return {
+            "rows": order_lines_by_ids([int(value) for value in result.get("ids") or []]),
+            "page": page,
+            "per_page": per_page,
+            "total": int(result.get("total") or 0),
+            "search_engine": "typesense",
+        }
+    data = order_lines_page_data(store_id, page, per_page)
+    data["search_engine"] = "postgres"
+    return data
 
 
 @app.post("/api/settings/ordering-engine")
@@ -10321,12 +10377,13 @@ def api_delete_backup(payload: BackupKeyPayload) -> dict[str, Any]:
 
 
 @app.get("/api/search")
-def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
-    if not q.strip():
+    filter_by, filtered = order_condition_filter(condition, store_id)
+    if not q.strip() and not filtered:
         return dashboard_data(store_id, page, per_page)
     try:
-        search_result = typesense_search_order_lines(q, store_id, page, per_page)
+        search_result = typesense_search_order_lines(q or "*", store_id, page, per_page, filter_by=filter_by)
         ids = list(search_result.get("ids") or [])
         if search_result.get("enabled"):
             return {
@@ -10336,8 +10393,14 @@ def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_p
                 "total": int(search_result.get("total") or 0),
                 "search_engine": "typesense",
             }
+        if filtered:
+            raise HTTPException(503, "Typesense is required for order condition filters.")
         search_warning = "Typesense is disabled or not configured; using Postgres fallback."
     except Exception as exc:
+        if filtered:
+            if isinstance(exc, HTTPException):
+                raise exc
+            raise HTTPException(503, f"Typesense order filter failed: {exc}")
         search_warning = str(exc)
     fallback = search_order_lines_sql(q, store_id, page, per_page)
     fallback["search_engine"] = "postgres"
@@ -10509,6 +10572,23 @@ def api_partial_fulfilments(store_id: Optional[int] = None, page: int = 1, per_p
     for row in rows:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        with db() as conn:
+            amazon_rows = rows_to_dicts(conn.execute(
+                """
+                SELECT DISTINCT amazon_order_id, amazon_order_url, amazon_account_name
+                FROM order_lines
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND COALESCE(amazon_order_id, '') != ''
+                ORDER BY amazon_order_id
+                """,
+                (row.get("store_id"), row.get("odoo_order_id")),
+            ).fetchall())
+        for amazon_row in amazon_rows:
+            if amazon_row.get("amazon_order_id") and not amazon_row.get("amazon_order_url"):
+                amazon_row["amazon_order_url"] = order_line_amazon_url(amazon_row["amazon_order_id"])
+        row["amazon_orders"] = amazon_rows
+        row["amazon_order_ids"] = [item.get("amazon_order_id") for item in amazon_rows if item.get("amazon_order_id")]
         row["missing_asin_urls"] = {
             asin: asin_product_url(asin)
             for asin in row.get("missing_asins") or []
@@ -11077,6 +11157,34 @@ def api_cancel_pull_job(job_id: str) -> dict[str, Any]:
     if cursor.rowcount <= 0:
         return {"ok": True, "message": f"Pull job is already {row['status']}.", "job": row_to_dict(row)}
     return {"ok": True, "message": "Pull job stopped.", "job": row_to_dict(row)}
+
+
+@app.post("/api/pull/jobs/clear")
+def api_clear_pull_jobs() -> dict[str, Any]:
+    now = utc_now()
+    with db() as conn:
+        active = int(conn.execute("SELECT COUNT(*) AS count FROM pull_jobs WHERE status IN ('queued', 'running')").fetchone()["count"] or 0)
+        total = int(conn.execute("SELECT COUNT(*) AS count FROM pull_jobs").fetchone()["count"] or 0)
+        conn.execute(
+            """
+            UPDATE pull_jobs
+            SET status='cancelled',
+                error=?,
+                updated_at=?,
+                completed_at=?
+            WHERE status IN ('queued', 'running')
+            """,
+            ("Cleared by user.", now, now),
+        )
+        conn.execute("DELETE FROM pull_jobs")
+    return {
+        "ok": True,
+        "message": f"Cleared {total} pull job{'s' if total != 1 else ''}. {active} active job{'s' if active != 1 else ''} will stop on the next progress check.",
+        "cleared": total,
+        "active_cancelled": active,
+        "jobs": [],
+        "total": 0,
+    }
 
 
 @app.post("/api/settings/pull-defaults")

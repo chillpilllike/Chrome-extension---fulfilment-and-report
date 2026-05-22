@@ -254,6 +254,8 @@ type PartialFulfilment = {
   odoo_order_id: number
   odoo_order_name: string
   odoo_order_url?: string
+  amazon_orders?: Array<{ amazon_order_id: string; amazon_order_url?: string; amazon_account_name?: string }>
+  amazon_order_ids?: string[]
   amazon_group_key?: string
   missing_line_ids: number[]
   missing_asins: string[]
@@ -532,6 +534,20 @@ function notifyAdminAuthRequired() {
 
 const PAGE_SIZE = 100
 const DUPLICATE_ASIN_PAGE_SIZE = 12
+
+const orderConditionOptions = [
+  { value: "all", label: "All orders" },
+  { value: "ready", label: "Ready for fulfilment" },
+  { value: "missing", label: "Missing marked" },
+  { value: "ignored", label: "Do not process" },
+  { value: "costly", label: "Cost review" },
+  { value: "queued", label: "Queued for Amazon" },
+  { value: "ordered", label: "Ordered / dispatched" },
+  { value: "delivered", label: "Delivered" },
+  { value: "inventory", label: "Using inventory" },
+  { value: "error", label: "Errors" },
+  { value: "cancelled_refunded", label: "Cancelled / refunded" },
+]
 
 type ExportColumn = { key: string; label: string }
 
@@ -1628,6 +1644,7 @@ function App() {
   const [limit, setLimit] = useState(() => savedPullSetting(PULL_LIMIT_STORAGE_KEY, "0"))
   const [pullStoreIds, setPullStoreIds] = useState<string[]>(savedPullStoreIds)
   const [search, setSearch] = useState("")
+  const [orderCondition, setOrderCondition] = useState("all")
   const [searchRows, setSearchRows] = useState<OrderLine[] | null>(null)
   const [selected, setSelected] = useState<number[]>([])
   const [ordersSelectAll, setOrdersSelectAll] = useState(false)
@@ -1708,6 +1725,14 @@ function App() {
     setSelected([])
   }
 
+  function updateOrderCondition(value: string) {
+    setOrderCondition(value)
+    setSearchRows(null)
+    setOrdersPage(1)
+    setOrdersSelectAll(false)
+    setSelected([])
+  }
+
   function applyDashboardData(next: DashboardData, nextPage = ordersPage) {
     setData(next)
     saveDashboardCache(next)
@@ -1735,7 +1760,9 @@ function App() {
   }
 
   async function refreshOrdersPage(nextStoreId = storeId, nextPage = ordersPage) {
-    const result = await api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(`/api/orders${pagedQuery(nextStoreId, nextPage)}`)
+    const result = await api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(
+      `/api/orders${pagedQuery(nextStoreId, nextPage, { condition: orderCondition })}`,
+    )
     setData((current) => {
       if (!current) return current
       const next = { ...current, rows: result.rows, page: result.page || nextPage, per_page: result.per_page, total: result.total }
@@ -2028,7 +2055,8 @@ function App() {
 
   useEffect(() => {
     const term = search.trim()
-    if (!term) {
+    const hasCondition = orderCondition !== "all"
+    if (!term && !hasCondition) {
       searchAbortRef.current?.abort()
       setSearchRows(null)
       setOrdersTotal(data?.total || ordersTotal)
@@ -2039,7 +2067,10 @@ function App() {
       searchAbortRef.current?.abort()
       const controller = new AbortController()
       searchAbortRef.current = controller
-      api<DashboardData>(`/api/search${pagedQuery(storeId, ordersPage)}&q=${encodeURIComponent(term)}`, { signal: controller.signal })
+      api<DashboardData>(
+        `/api/search${pagedQuery(storeId, ordersPage, { condition: orderCondition })}&q=${encodeURIComponent(term)}`,
+        { signal: controller.signal },
+      )
         .then((result) => {
           if (!active) return
           setSearchRows(result.rows)
@@ -2055,7 +2086,7 @@ function App() {
       window.clearTimeout(timer)
       searchAbortRef.current?.abort()
     }
-  }, [search, storeId, ordersPage])
+  }, [search, orderCondition, storeId, ordersPage])
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -2064,7 +2095,7 @@ function App() {
     )
   }, [orderColumns])
 
-  const rows = search.trim() ? (searchRows || data?.rows || []) : data?.rows || []
+  const rows = search.trim() || orderCondition !== "all" ? (searchRows || data?.rows || []) : data?.rows || []
   const filteredRows = useMemo(() => {
     return rows
   }, [rows])
@@ -2936,6 +2967,11 @@ function App() {
                         {sortDirection === "asc" ? "Ascending" : "Descending"}
                       </Button>
                     </div>
+                    <SelectField className="w-[210px]" label="Filter" value={orderCondition} onChange={updateOrderCondition}>
+                      {orderConditionOptions.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </SelectField>
                     <SearchBox className="w-full sm:w-[360px]" value={search} onChange={updateOrdersSearch} placeholder="Search order, product, ASIN, status..." />
                     <Button variant="outline" onClick={() => setShowColumnSettings((current) => !current)}>
                       <Columns3 className="size-4" />
@@ -3003,7 +3039,7 @@ function App() {
                   selectedIds={selected}
                   selectAll={ordersSelectAll}
                   total={ordersTotal}
-                  filters={{ q: search.trim() }}
+                  filters={{ q: search.trim(), condition: orderCondition }}
                   onSelectAll={() => setOrdersSelectAll(true)}
                   onClear={() => { setOrdersSelectAll(false); setSelected([]) }}
                   onResult={setModal}
@@ -4998,6 +5034,7 @@ function PartialFulfilmentsPage({
               <TableHeader>
                 <TableRow>
                   <TableHead>Order</TableHead>
+                  <TableHead>Amazon Order</TableHead>
                   <TableHead>Missing ASINs</TableHead>
                   <TableHead>Remaining Lines</TableHead>
                   <TableHead>Reason</TableHead>
@@ -5011,6 +5048,20 @@ function PartialFulfilmentsPage({
                     <TableCell>
                       <div className="font-medium">{row.odoo_order_name}</div>
                       <div className="text-xs text-muted-foreground">{row.amazon_group_key || "No Chrome group key"}</div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="grid gap-1">
+                        {row.amazon_orders?.length ? row.amazon_orders.map((order) => (
+                          <a
+                            key={order.amazon_order_id}
+                            className="font-mono text-xs text-primary underline-offset-4 hover:underline"
+                            href={order.amazon_order_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(order.amazon_order_id)}`}
+                            target="_blank"
+                          >
+                            {order.amazon_order_id}
+                          </a>
+                        )) : <span className="text-muted-foreground">Pending</span>}
+                      </div>
                     </TableCell>
                     <TableCell>
                       <div className="flex flex-wrap gap-2">
@@ -5900,6 +5951,8 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [stoppingIds, setStoppingIds] = useState<string[]>([])
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
+  const [clearing, setClearing] = useState(false)
   async function refresh() {
     try {
       const result = await api<{ jobs: PullJob[]; total: number }>(`/api/pull/jobs?page=${page}&per_page=${PAGE_SIZE}`)
@@ -5933,19 +5986,41 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
       setStoppingIds((ids) => ids.filter((id) => id !== job.id))
     }
   }
+
+  async function clearAllJobs() {
+    setClearing(true)
+    try {
+      const result = await api<{ ok: boolean; message: string; jobs: PullJob[]; total: number }>("/api/pull/jobs/clear", { method: "POST" })
+      setJobs(result.jobs || [])
+      setTotal(result.total || 0)
+      setPage(1)
+      setClearConfirmOpen(false)
+      onResult({ ok: true, title: "Pull Jobs Cleared", message: result.message || "All pull jobs cleared." })
+    } catch (error) {
+      onResult({ ok: false, title: "Clear Pull Jobs Failed", message: String(error) })
+    } finally {
+      setClearing(false)
+    }
+  }
+
   return (
-    <Card>
-      <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div>
-          <CardTitle>Order Pull Jobs</CardTitle>
-          <CardDescription>Odoo order pulls run in the background per store, so large imports do not lock the app.</CardDescription>
-        </div>
-        <div className="btn-list">
-          <Button variant="outline" onClick={refresh}><RefreshCw className="size-4" />Refresh</Button>
-          <PaginationControls page={page} total={total} onPage={setPage} />
-        </div>
-      </CardHeader>
-      <CardContent className="p-0">
+    <>
+      <Card>
+        <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <CardTitle>Order Pull Jobs</CardTitle>
+            <CardDescription>Odoo order pulls run in the background per store, so large imports do not lock the app.</CardDescription>
+          </div>
+          <div className="btn-list">
+            <Button variant="outline" onClick={refresh}><RefreshCw className="size-4" />Refresh</Button>
+            <Button variant="destructive" disabled={!total || clearing} onClick={() => setClearConfirmOpen(true)}>
+              <Trash2 className="size-4" />
+              Clear All
+            </Button>
+            <PaginationControls page={page} total={total} onPage={setPage} />
+          </div>
+        </CardHeader>
+        <CardContent className="p-0">
         <Table>
           <TableHeader>
             <TableRow>
@@ -6020,8 +6095,31 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
             )}
           </TableBody>
         </Table>
-      </CardContent>
-    </Card>
+        </CardContent>
+      </Card>
+      <Dialog open={clearConfirmOpen} onOpenChange={(open) => !open && setClearConfirmOpen(false)}>
+        <DialogContent className="border-destructive/50 sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertCircle className="size-5" />
+              Clear all pull jobs?
+            </DialogTitle>
+            <DialogDescription>
+              This will clear every pull job record and stop queued or running pull jobs at their next progress check.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+            This clears all pull job history and kills in-progress pulls. Continue only if you are sure.
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={clearing} onClick={() => setClearConfirmOpen(false)}>Cancel</Button>
+            <Button variant="destructive" disabled={clearing} onClick={clearAllJobs}>
+              {clearing ? "Clearing" : "Clear all jobs"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 
