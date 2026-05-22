@@ -13,6 +13,7 @@ import {
   IconDatabase as Database,
   IconDownload as Download,
   IconEdit as Edit,
+  IconExternalLink as ExternalLink,
   IconGripVertical as GripVertical,
   IconHome as Home,
   IconLink as Link,
@@ -7260,6 +7261,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [busy, setBusy] = useState("")
+  const pageRef = useRef(page)
   const progressTotal = Math.max(0, Number(progress?.total || 0))
   const progressProcessed = Math.max(0, Number(progress?.processed || 0))
   const progressPercent = progressTotal ? Math.max(0, Math.min(100, Math.round((progressProcessed / progressTotal) * 100))) : 0
@@ -7276,13 +7278,21 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     return true
   })
 
+  useEffect(() => {
+    pageRef.current = page
+  }, [page])
+
   async function load(nextPage = page) {
+    const requestedPage = nextPage
     const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?page=${nextPage}&per_page=${PAGE_SIZE}`)
+    const resultPage = result.page || requestedPage
+    if (requestedPage !== pageRef.current && resultPage !== pageRef.current) return
     setJobs(result.jobs || [])
     setOauthMissing(result.oauth_missing || [])
     setOauthStatus(result.oauth_status || [])
     setProgress(result.progress || null)
-    setPage(result.page || nextPage)
+    pageRef.current = resultPage
+    setPage(resultPage)
     setTotal(result.total || 0)
   }
   async function loadDuplicates() {
@@ -7493,19 +7503,21 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
             <CardTitle>Duplicate Finder</CardTitle>
             <CardDescription>Scan pushed Shopify orders by Odoo order number and cancel only duplicate Shopify orders that are not fulfilled.</CardDescription>
           </div>
-          <div className="btn-list">
-            <SelectField className="w-[190px]" label="Filter" value={duplicateFilter} onChange={setDuplicateFilter}>
+          <div className="flex flex-wrap items-end gap-2">
+            <SelectField className="w-[220px]" label="Filter" value={duplicateFilter} onChange={setDuplicateFilter}>
               <option value="duplicates">Duplicates only</option>
               <option value="all">All scan results</option>
               <option value="cancelled">Cancelled</option>
               <option value="errors">Errors</option>
             </SelectField>
-            <Button variant="outline" onClick={scanDuplicates} disabled={Boolean(busy) || duplicateBusy}>
-              {busy === "DuplicateScan" || duplicateProgress?.status === "running" ? "Scanning..." : "Scan Duplicates"}
-            </Button>
-            <Button variant="destructive" onClick={cancelDuplicates} disabled={Boolean(busy) || duplicateBusy || !duplicateGroups.some((group) => group.orders.some((order) => order.duplicate && order.cancel_status !== "cancelled"))}>
-              {busy === "DuplicateCancel" || duplicateProgress?.status === "cancelling" ? "Cancelling..." : "Cancel Duplicates"}
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={scanDuplicates} disabled={Boolean(busy) || duplicateBusy}>
+                {busy === "DuplicateScan" || duplicateProgress?.status === "running" ? "Scanning..." : "Scan Duplicates"}
+              </Button>
+              <Button variant="destructive" onClick={cancelDuplicates} disabled={Boolean(busy) || duplicateBusy || !duplicateGroups.some((group) => group.orders.some((order) => order.duplicate && order.cancel_status !== "cancelled"))}>
+                {busy === "DuplicateCancel" || duplicateProgress?.status === "cancelling" ? "Cancelling..." : "Cancel Duplicates"}
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className="grid gap-4">
@@ -7545,8 +7557,9 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                   <TableRow key={group.key}>
                     <TableCell className="font-medium">
                       {group.odoo_order_url ? (
-                        <a className="text-primary underline-offset-4 hover:underline" href={group.odoo_order_url} target="_blank" rel="noreferrer">
+                        <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={group.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order">
                           {group.odoo_order_name}
+                          <ExternalLink className="size-3.5" />
                         </a>
                       ) : group.odoo_order_name}
                     </TableCell>
@@ -7559,8 +7572,9 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                         {(group.orders || []).map((order) => (
                           <div key={`${group.key}-${order.id}`} className="flex flex-wrap items-center gap-2 text-sm">
                             {order.url ? (
-                              <a className="text-primary underline-offset-4 hover:underline" href={order.url} target="_blank" rel="noreferrer">
+                              <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={order.url} target="_blank" rel="noreferrer" title="Open Shopify order">
                                 {order.name || order.id}
+                                <ExternalLink className="size-3.5" />
                               </a>
                             ) : (
                               <span>{order.name || order.id}</span>
@@ -7606,15 +7620,17 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                 <TableRow key={job.id}>
                   <TableCell className="font-medium">
                     {job.odoo_order_url ? (
-                      <a className="text-primary underline-offset-4 hover:underline" href={job.odoo_order_url} target="_blank" rel="noreferrer">
+                      <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={job.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order">
                         {job.odoo_order_name}
+                        <ExternalLink className="size-3.5" />
                       </a>
                     ) : job.odoo_order_name}
                   </TableCell>
                   <TableCell>
                     {job.shopify_order_url ? (
-                      <a className="text-primary underline-offset-4 hover:underline" href={job.shopify_order_url} target="_blank" rel="noreferrer">
+                      <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={job.shopify_order_url} target="_blank" rel="noreferrer" title="Open Shopify order">
                         #{job.shopify_order_id}
+                        <ExternalLink className="size-3.5" />
                       </a>
                     ) : job.shopify_order_id ? (
                       <span className="font-mono text-xs">{job.shopify_order_id}</span>
