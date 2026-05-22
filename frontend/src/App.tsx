@@ -1111,6 +1111,9 @@ function StatusBadge({ value }: { value?: string }) {
   if (status === "missing") {
     return <Badge variant="destructive">missing</Badge>
   }
+  if (status === "ignored") {
+    return <Badge variant="outline" className="border-slate-400 text-slate-600">ignored</Badge>
+  }
   if (["cancelled", "refunded"].includes(status)) {
     return <Badge variant="destructive">{status}</Badge>
   }
@@ -2185,6 +2188,15 @@ function App() {
     )
   }
 
+  function ignoreSelectedOrders() {
+    return runAction("Mark Do Not Process", () =>
+      api<DashboardData>("/api/lines/ignore", {
+        method: "POST",
+        body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
+      }),
+    )
+  }
+
   function deleteSelectedOrders() {
     return runAction("Delete Selected Lines", () =>
       api<DashboardData>("/api/lines/delete", {
@@ -2953,6 +2965,14 @@ function App() {
                     <Button
                       variant="outline"
                       disabled={!selected.length || Boolean(busy)}
+                      onClick={ignoreSelectedOrders}
+                    >
+                      <AlertCircle className="size-4" />
+                      Do Not Process
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={!selected.length || Boolean(busy)}
                       onClick={resetSelectedOrders}
                     >
                       <RefreshCw className="size-4" />
@@ -3087,6 +3107,9 @@ function App() {
                           [
                             "cursor-pointer",
                             selected.includes(row.id) ? "outline outline-1 -outline-offset-1 outline-primary/35" : "",
+                            row.state === "ignored"
+                              ? "bg-slate-50 opacity-75 [&_td:not(:first-child)]:line-through [&_td:not(:first-child)]:text-muted-foreground"
+                              : "",
                             isLimitPurchaseLine(row)
                             ? "bg-[#f5f0ff]"
                             : row.amazon_cancelled_at
@@ -3148,6 +3171,10 @@ function App() {
                       </Button>
                       <Button disabled={Boolean(busy)} onClick={clubPlaceSelectedOrders}>
                         Club Place
+                      </Button>
+                      <Button variant="outline" disabled={Boolean(busy)} onClick={ignoreSelectedOrders}>
+                        <AlertCircle className="size-4" />
+                        Do Not Process
                       </Button>
                       <Button variant="outline" disabled={Boolean(busy)} onClick={resetSelectedOrders}>
                         <RefreshCw className="size-4" />

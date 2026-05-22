@@ -2344,7 +2344,9 @@ def selected_line_reasons(store_id: int, line_ids: Optional[list[int]] = None) -
     reasons = []
     for row in rows:
         prefix = f"{row['odoo_order_name']} {row['asin'] or ''}".strip()
-        if row["last_error"]:
+        if row["state"] == "ignored":
+            reasons.append(f"{prefix}: marked do not process")
+        elif row["last_error"]:
             reasons.append(f"{prefix}: {clean_error_message(row['last_error'])}")
         elif row["state"] == "submitted" and row["amazon_order_id"]:
             reasons.append(f"{prefix}: cXML request submitted to Amazon; confirmation pending ({row['amazon_order_id']})")
@@ -5594,12 +5596,13 @@ def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Op
         FROM order_lines
         WHERE store_id=?
           AND id IN ({','.join('?' for _ in selected_ids)})
+          AND state != 'ignored'
         """,
         [store_id, *selected_ids],
     ).fetchall()
     order_ids = sorted({int(row["odoo_order_id"]) for row in selected_orders})
     if not order_ids:
-        return selected_ids
+        return []
     sibling_rows = conn.execute(
         f"""
         SELECT id
@@ -5608,7 +5611,7 @@ def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Op
           AND odoo_order_id IN ({','.join('?' for _ in order_ids)})
           AND asin IS NOT NULL AND asin != ''
           AND COALESCE(amazon_order_id, '') = ''
-          AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory')
+          AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory', 'ignored')
           AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
         ORDER BY odoo_order_id DESC, id ASC
         """,
@@ -5894,7 +5897,7 @@ def queue_chrome_order_groups_fast(
             WHERE store_id = ?
               AND asin IS NOT NULL AND asin != ''
               AND COALESCE(amazon_order_id, '') = ''
-              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory')
+              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory', 'ignored')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {where_line_ids}
             ORDER BY odoo_order_id DESC, id ASC
@@ -6033,7 +6036,7 @@ def save_punchout_spaids(store_id: int, items: list[dict[str, Any]]) -> list[int
                 WHERE store_id=?
                   AND asin=?
                   AND COALESCE(amazon_order_id, '') = ''
-                  AND state NOT IN ('ordered', 'submitted', 'delivered', 'dispatched')
+                  AND state NOT IN ('ordered', 'submitted', 'delivered', 'dispatched', 'ignored')
                   AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
                 ORDER BY
                   CASE WHEN ABS(COALESCE(quantity, 1) - ?) < 0.0001 THEN 0 ELSE 1 END,
@@ -6073,7 +6076,7 @@ def first_missing_spaid_line(store_id: int, line_ids: Optional[list[int]] = None
               AND COALESCE(asin, '') != ''
               AND COALESCE(supplier_part_auxiliary_id, '') = ''
               AND COALESCE(amazon_order_id, '') = ''
-              AND state NOT IN ('ordered', 'submitted', 'delivered', 'dispatched')
+              AND state NOT IN ('ordered', 'submitted', 'delivered', 'dispatched', 'ignored')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {line_filter}
             ORDER BY updated_at DESC, id DESC
@@ -6377,7 +6380,7 @@ def place_orders(
             WHERE store_id = ?
               AND asin IS NOT NULL AND asin != ''
               AND COALESCE(amazon_order_id, '') = ''
-              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory')
+              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory', 'ignored')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {where_line_ids}
             ORDER BY odoo_order_id DESC, id ASC
@@ -12586,7 +12589,7 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
             WHERE store_id=?
               AND id IN ({placeholders})
               AND COALESCE(amazon_order_id, '') = ''
-              AND state NOT IN ('cancelled', 'refunded', 'delivered', 'dispatched')
+              AND state NOT IN ('cancelled', 'refunded', 'delivered', 'dispatched', 'ignored')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
             """,
             [payload.store_id, *selected_ids],
@@ -12602,7 +12605,7 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
             WHERE store_id=?
               AND odoo_order_id IN ({order_placeholders})
               AND COALESCE(amazon_order_id, '') = ''
-              AND state NOT IN ('cancelled', 'refunded', 'delivered', 'dispatched')
+              AND state NOT IN ('cancelled', 'refunded', 'delivered', 'dispatched', 'ignored')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
             ORDER BY odoo_order_id, id
             """,
@@ -13284,6 +13287,55 @@ def api_delete_lines(payload: DeleteLinesPayload) -> dict[str, Any]:
     return data
 
 
+@app.post("/api/lines/ignore")
+def api_ignore_lines(payload: DeleteLinesPayload) -> dict[str, Any]:
+    if not payload.line_ids:
+        raise HTTPException(400, "Select at least one order line to mark do not process.")
+    selected_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
+    if not selected_ids:
+        raise HTTPException(400, "Select at least one order line to mark do not process.")
+    placeholders = ",".join("?" for _ in selected_ids)
+    now = utc_now()
+    with db() as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE order_lines
+            SET state='ignored',
+                amazon_status='ignored',
+                amazon_group_key=NULL,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                last_error='Marked do not process for Amazon fulfilment.',
+                updated_at=?
+            WHERE store_id=?
+              AND id IN ({placeholders})
+              AND COALESCE(amazon_order_id, '') = ''
+              AND state NOT IN ('ordered', 'delivered', 'dispatched')
+            """,
+            [now, payload.store_id, *selected_ids],
+        )
+        conn.execute(
+            f"""
+            UPDATE amazon_attempts
+            SET status='ignored', error=NULL
+            WHERE order_line_id IN ({placeholders})
+              AND mode IN ('chrome', 'rest', 'cxml')
+              AND status IN ('queued', 'submitted', 'error', 'costly', 'missing')
+            """,
+            selected_ids,
+        )
+        updated_rows = conn.execute(
+            f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
+            [payload.store_id, *selected_ids],
+        ).fetchall()
+    for updated in updated_rows:
+        index_order_line(updated)
+    data = dashboard_data(payload.store_id)
+    data["message"] = f"Marked {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} do not process. Ignored lines stay visible and are skipped when placing orders."
+    return data
+
+
 @app.post("/api/lines/reset-fulfilment")
 def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
     if not payload.line_ids:
@@ -13328,7 +13380,7 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             SET status='reset', error=NULL
             WHERE order_line_id IN ({placeholders})
               AND mode IN ('chrome', 'rest', 'cxml')
-              AND status IN ('queued', 'submitted', 'ok', 'error', 'costly', 'missing')
+              AND status IN ('queued', 'submitted', 'ok', 'error', 'costly', 'missing', 'ignored')
             """,
             payload.line_ids,
         )
