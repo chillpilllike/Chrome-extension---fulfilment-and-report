@@ -134,6 +134,19 @@ _STORE_CACHE_LOCK = threading.Lock()
 _SHOPIFY_QUEUE_LOCK = threading.Lock()
 _SHOPIFY_OAUTH_LOCK = threading.Lock()
 _SHOPIFY_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
+_SHOPIFY_FULFILMENT_PROGRESS_LOCK = threading.Lock()
+_SHOPIFY_FULFILMENT_PROGRESS: dict[str, Any] = {
+    "status": "idle",
+    "total": 0,
+    "processed": 0,
+    "current_order": "",
+    "current_route": "",
+    "message": "Shopify fulfilment worker is idle.",
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "error": "",
+}
 _CHROME_BROWSERLESS_LOCK = threading.Lock()
 _CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "running": False,
@@ -9558,6 +9571,32 @@ def claim_shopify_fulfilment_job() -> Optional[dict[str, Any]]:
         return conn.execute("SELECT * FROM shopify_fulfilment_jobs WHERE id=?", (row["id"],)).fetchone()
 
 
+def due_shopify_fulfilment_job_count() -> int:
+    with db() as conn:
+        return int(conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM shopify_fulfilment_jobs
+            WHERE status IN ('queued', 'failed')
+              AND attempts < max_attempts
+              AND (next_run_at IS NULL OR next_run_at='' OR next_run_at <= ?)
+            """,
+            (utc_now(),),
+        ).fetchone()["count"] or 0)
+
+
+def set_shopify_fulfilment_progress(**updates: Any) -> dict[str, Any]:
+    with _SHOPIFY_FULFILMENT_PROGRESS_LOCK:
+        _SHOPIFY_FULFILMENT_PROGRESS.update(updates)
+        _SHOPIFY_FULFILMENT_PROGRESS["updated_at"] = utc_now()
+        return dict(_SHOPIFY_FULFILMENT_PROGRESS)
+
+
+def shopify_fulfilment_progress() -> dict[str, Any]:
+    with _SHOPIFY_FULFILMENT_PROGRESS_LOCK:
+        return dict(_SHOPIFY_FULFILMENT_PROGRESS)
+
+
 def run_shopify_script_export(job: dict[str, Any]) -> None:
     settings = get_service_settings()
     store = get_store(int(job["store_id"]))
@@ -9608,6 +9647,22 @@ def process_one_shopify_fulfilment_job() -> bool:
         job = claim_shopify_fulfilment_job()
         if not job:
             return False
+        progress = shopify_fulfilment_progress()
+        if str(progress.get("status") or "") not in {"running", "queued"}:
+            set_shopify_fulfilment_progress(
+                status="running",
+                total=max(1, due_shopify_fulfilment_job_count() + 1),
+                processed=0,
+                started_at=utc_now(),
+                completed_at="",
+                error="",
+            )
+        set_shopify_fulfilment_progress(
+            status="running",
+            current_order=str(job["odoo_order_name"] or ""),
+            current_route=str(job["route"] or "").upper(),
+            message=f"Syncing {job['odoo_order_name']} to Shopify {str(job['route'] or '').upper()}.",
+        )
         try:
             run_shopify_script_export(job)
             with db() as conn:
@@ -9615,6 +9670,14 @@ def process_one_shopify_fulfilment_job() -> bool:
                     "UPDATE shopify_fulfilment_jobs SET status='completed', last_error='', completed_at=?, updated_at=? WHERE id=?",
                     (utc_now(), utc_now(), job["id"]),
                 )
+            progress = shopify_fulfilment_progress()
+            processed = int(progress.get("processed") or 0) + 1
+            set_shopify_fulfilment_progress(
+                processed=processed,
+                total=max(int(progress.get("total") or 0), processed),
+                message=f"Synced {job['odoo_order_name']} to Shopify.",
+                error="",
+            )
         except Exception as exc:
             retry_delay = min(3600, 60 * max(1, int(job["attempts"] or 1)))
             next_run = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
@@ -9634,18 +9697,69 @@ def process_one_shopify_fulfilment_job() -> bool:
                     f"Shopify fulfilment {next_status}: {job['odoo_order_name']}",
                     f"Order: {job['odoo_order_name']}\nRoute: {job['route']}\nStatus: {next_status}\nError: {error_text}",
                 )
+            progress = shopify_fulfilment_progress()
+            processed = int(progress.get("processed") or 0) + 1
+            set_shopify_fulfilment_progress(
+                processed=processed,
+                total=max(int(progress.get("total") or 0), processed),
+                message=f"Shopify sync stopped on {job['odoo_order_name']}: {error_text}",
+                error=error_text,
+            )
         return True
     finally:
         _SHOPIFY_QUEUE_LOCK.release()
 
 
 def shopify_fulfilment_worker() -> None:
+    progress = shopify_fulfilment_progress()
+    if str(progress.get("status") or "") != "running":
+        total = due_shopify_fulfilment_job_count()
+        set_shopify_fulfilment_progress(
+            status="running" if total else "idle",
+            total=total,
+            processed=0,
+            current_order="",
+            current_route="",
+            message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''}.",
+            started_at=utc_now() if total else "",
+            completed_at="",
+            error="",
+        )
     while process_one_shopify_fulfilment_job():
         time.sleep(1)
+    progress = shopify_fulfilment_progress()
+    if str(progress.get("status") or "") == "running":
+        processed = int(progress.get("processed") or 0)
+        total = max(int(progress.get("total") or 0), processed)
+        set_shopify_fulfilment_progress(
+            status="completed" if total else "idle",
+            total=total,
+            processed=processed,
+            current_order="",
+            current_route="",
+            completed_at=utc_now(),
+            message=(
+                f"Shopify fulfilment worker finished {processed} of {total} job{'s' if total != 1 else ''}."
+                if total else "No Shopify fulfilment jobs were ready."
+            ),
+        )
 
 
-def start_shopify_fulfilment_worker() -> None:
+def start_shopify_fulfilment_worker() -> dict[str, Any]:
+    total = due_shopify_fulfilment_job_count()
+    set_shopify_fulfilment_progress(
+        status="running" if total else "idle",
+        total=total,
+        processed=0,
+        current_order="",
+        current_route="",
+        message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''}.",
+        started_at=utc_now() if total else "",
+        completed_at="",
+        error="",
+    )
     threading.Thread(target=shopify_fulfilment_worker, daemon=True).start()
+    return shopify_fulfilment_progress()
 
 
 def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
@@ -12240,6 +12354,7 @@ def api_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> dict[str,
         "jobs": rows,
         "oauth_status": oauth_status,
         "oauth_missing": [row for row in oauth_status if not row.get("authorized")],
+        "progress": shopify_fulfilment_progress(),
         "page": page,
         "per_page": per_page,
         "total": total,
@@ -12276,7 +12391,8 @@ def api_shopify_fulfilment_oauth_callback(code: str = "", state: str = "", error
 
 
 @app.post("/api/shopify/fulfilment/enqueue")
-def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None) -> dict[str, Any]:
+def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None, limit: int = 1000) -> dict[str, Any]:
+    limit = max(1, min(1000, int(limit or 1000)))
     with db() as conn:
         rows = rows_to_dicts(conn.execute(
             """
@@ -12287,18 +12403,59 @@ def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None) -> dict[str, 
               AND COALESCE(order_engine, '') != 'third_party'
               AND state IN ('ordered', 'dispatched', 'delivered')
             ORDER BY ordered_at DESC, updated_at DESC
-            LIMIT 1000
+            LIMIT ?
             """,
-            (store_id, store_id),
+            (store_id, store_id, limit),
         ).fetchall())
     count = enqueue_shopify_fulfilment_for_rows(rows)
-    return {"ok": True, "message": f"Queued or refreshed {count} Shopify fulfilment job(s).", "count": count}
+    return {"ok": True, "message": f"Queued or refreshed {count} Shopify fulfilment job(s).", "count": count, "progress": shopify_fulfilment_progress()}
 
 
 @app.post("/api/shopify/fulfilment/run")
 def api_shopify_fulfilment_run() -> dict[str, Any]:
-    start_shopify_fulfilment_worker()
-    return {"ok": True, "message": "Shopify fulfilment worker started. Jobs are claimed one at a time."}
+    progress = start_shopify_fulfilment_worker()
+    return {"ok": True, "message": "Shopify fulfilment worker started. Jobs are claimed one at a time.", "progress": progress}
+
+
+@app.post("/api/shopify/fulfilment/run-one")
+def api_shopify_fulfilment_run_one() -> dict[str, Any]:
+    set_shopify_fulfilment_progress(
+        status="running",
+        total=1,
+        processed=0,
+        current_order="",
+        current_route="",
+        message="Running one Shopify fulfilment job.",
+        started_at=utc_now(),
+        completed_at="",
+        error="",
+    )
+    ran = process_one_shopify_fulfilment_job()
+    progress = shopify_fulfilment_progress()
+    if not ran:
+        progress = set_shopify_fulfilment_progress(
+            status="idle",
+            total=0,
+            processed=0,
+            current_order="",
+            current_route="",
+            completed_at=utc_now(),
+            message="No Shopify fulfilment job was ready to run.",
+        )
+    else:
+        status = "failed" if progress.get("error") else "completed"
+        progress = set_shopify_fulfilment_progress(
+            status=status,
+            current_order="",
+            current_route="",
+            completed_at=utc_now(),
+        )
+    return {"ok": ran, "message": progress.get("message") or ("Ran one Shopify fulfilment job." if ran else "No Shopify fulfilment job was ready."), "progress": progress}
+
+
+@app.get("/api/shopify/fulfilment/progress")
+def api_shopify_fulfilment_progress() -> dict[str, Any]:
+    return {"ok": True, "progress": shopify_fulfilment_progress()}
 
 
 @app.post("/api/shopify/fulfilment/jobs/{job_id}/retry")

@@ -650,6 +650,19 @@ type ShopifyOAuthMissing = {
   error?: string
 }
 
+type ShopifyFulfilmentProgress = {
+  status: string
+  total: number
+  processed: number
+  current_order?: string
+  current_route?: string
+  message?: string
+  started_at?: string
+  updated_at?: string
+  completed_at?: string
+  error?: string
+}
+
 type ShopifyTrackingJob = {
   id: string
   status: string
@@ -7198,14 +7211,21 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [jobs, setJobs] = useState<ShopifyFulfilmentJob[]>([])
   const [oauthMissing, setOauthMissing] = useState<ShopifyOAuthMissing[]>([])
   const [oauthStatus, setOauthStatus] = useState<ShopifyOAuthMissing[]>([])
+  const [progress, setProgress] = useState<ShopifyFulfilmentProgress | null>(null)
   const [total, setTotal] = useState(0)
   const [busy, setBusy] = useState("")
+  const progressTotal = Math.max(0, Number(progress?.total || 0))
+  const progressProcessed = Math.max(0, Number(progress?.processed || 0))
+  const progressPercent = progressTotal ? Math.max(0, Math.min(100, Math.round((progressProcessed / progressTotal) * 100))) : 0
+  const progressRunning = progress?.status === "running" || progress?.status === "queued"
+  const showProgress = Boolean(progress && (progressRunning || progressTotal > 0 || progress.message))
 
   async function load() {
-    const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; total: number }>("/api/shopify/fulfilment/jobs?page=1&per_page=100")
+    const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; total: number }>("/api/shopify/fulfilment/jobs?page=1&per_page=100")
     setJobs(result.jobs || [])
     setOauthMissing(result.oauth_missing || [])
     setOauthStatus(result.oauth_status || [])
+    setProgress(result.progress || null)
     setTotal(result.total || 0)
   }
   useEffect(() => {
@@ -7217,9 +7237,22 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     setBusy("Queue")
     try {
       const path = `/api/shopify/fulfilment/enqueue${storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""}`
-      const result = await api<{ ok: boolean; message: string }>(path, { method: "POST" })
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
+      if (result.progress) setProgress(result.progress)
       await load()
       onResult({ ok: result.ok, title: "Shopify Fulfilment", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  async function enqueueOneTestOrder() {
+    setBusy("QueueOne")
+    try {
+      const path = `/api/shopify/fulfilment/enqueue?limit=1${storeId ? `&store_id=${encodeURIComponent(storeId)}` : ""}`
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
+      if (result.progress) setProgress(result.progress)
+      await load()
+      onResult({ ok: result.ok, title: "Shopify Test Order", message: result.message })
     } finally {
       setBusy("")
     }
@@ -7227,9 +7260,21 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   async function runWorker() {
     setBusy("Run")
     try {
-      const result = await api<{ ok: boolean; message: string }>("/api/shopify/fulfilment/run", { method: "POST" })
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>("/api/shopify/fulfilment/run", { method: "POST" })
+      if (result.progress) setProgress(result.progress)
       await load()
       onResult({ ok: result.ok, title: "Shopify Fulfilment", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  async function runOneJob() {
+    setBusy("RunOne")
+    try {
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>("/api/shopify/fulfilment/run-one", { method: "POST" })
+      if (result.progress) setProgress(result.progress)
+      await load()
+      onResult({ ok: result.ok, title: "Shopify Test Job", message: result.message })
     } finally {
       setBusy("")
     }
@@ -7267,7 +7312,9 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
         <CardContent className="grid gap-3">
           <div className="btn-list">
             <Button onClick={enqueuePending} disabled={Boolean(busy)}>{busy === "Queue" ? "Queueing..." : "Queue Pending Amazon Orders"}</Button>
+            <Button variant="outline" onClick={enqueueOneTestOrder} disabled={Boolean(busy)}>{busy === "QueueOne" ? "Queueing..." : "Queue 1 Test Order"}</Button>
             <Button variant="outline" onClick={runWorker} disabled={Boolean(busy)}>{busy === "Run" ? "Starting..." : "Run Worker"}</Button>
+            <Button variant="outline" onClick={runOneJob} disabled={Boolean(busy)}>{busy === "RunOne" ? "Running..." : "Run One Job"}</Button>
             {oauthMissing.map((item) => (
               <Button
                 key={`${item.route}-${item.dest_name}`}
@@ -7280,12 +7327,43 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
               </Button>
             ))}
             {oauthStatus.filter((item) => item.authorized).map((item) => (
-              <Badge key={`${item.route}-${item.dest_name}-connected`} className="bg-emerald-600 px-3 py-2 text-white hover:bg-emerald-600">
+              <span key={`${item.route}-${item.dest_name}-connected`} className="shopify-connected-pill">
+                <CheckCircle2 className="size-4" />
                 Connected {item.route.toUpperCase()}
-              </Badge>
+              </span>
             ))}
             <Button variant="outline" onClick={load}>Refresh</Button>
           </div>
+          {showProgress ? (
+            <div className="form-fieldset">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="font-medium">
+                  Shopify worker: {progress?.status || "idle"}
+                  {progress?.current_order ? ` - ${progress.current_order}` : ""}
+                  {progress?.current_route ? ` (${progress.current_route})` : ""}
+                </span>
+                <span className="text-muted-foreground">
+                  {progressProcessed.toLocaleString()} / {progressTotal.toLocaleString()} job{progressTotal === 1 ? "" : "s"}
+                </span>
+              </div>
+              <div className="progress">
+                <div
+                  className={`progress-bar bg-primary transition-all ${progressRunning ? "progress-bar-striped progress-bar-animated" : ""}`}
+                  role="progressbar"
+                  aria-valuenow={progressPercent}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Shopify fulfilment ${progressPercent}% complete`}
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>{progress?.message || "Waiting for Shopify fulfilment work."}</span>
+                <span>{progressPercent}%</span>
+              </div>
+              {progress?.error ? <p className="text-xs text-destructive">{progress.error}</p> : null}
+            </div>
+          ) : null}
           {oauthMissing.length ? (
             <Alert variant="destructive">
               <AlertCircle className="size-4" />

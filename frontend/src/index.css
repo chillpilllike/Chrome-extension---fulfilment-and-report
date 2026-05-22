@@ -876,6 +876,29 @@
     gap: .5rem;
 }
 
+.shopify-connected-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: .375rem;
+    min-height: 2.5rem;
+    padding: .5rem 1rem;
+    border: 1px solid #047857;
+    border-radius: 999px;
+    background: #059669;
+    color: #ffffff;
+    font-size: .875rem;
+    font-weight: 650;
+    line-height: 1;
+    white-space: nowrap;
+    box-shadow: 0 .125rem .25rem rgba(4, 120, 87, .18);
+}
+
+.shopify-connected-pill svg {
+    width: 1rem;
+    height: 1rem;
+    color: #ffffff;
+}
+
 .tabler-admin-shell .pagination-wrap {
     display: flex;
     flex-wrap: wrap;
