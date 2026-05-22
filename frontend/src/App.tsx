@@ -723,6 +723,10 @@ type ReindexProgress = {
   updated_at: string
   completed_at: string
   error: string
+  current_collection?: string
+  current_processed?: number
+  current_total?: number
+  latest_record?: string
 }
 
 type ProfitLossOrder = {
@@ -7068,6 +7072,20 @@ function SettingsPage({
                   <span>{reindexProgress.message}</span>
                   <span>{Number(reindexProgress.percent || 0).toFixed(1)}%</span>
                 </div>
+                {reindexProgress.current_collection ? (
+                  <div className="grid gap-1 text-xs text-muted-foreground">
+                    <div>
+                      Current collection: <span className="font-medium text-foreground">{reindexProgress.current_collection}</span>
+                      {Number(reindexProgress.current_total || 0) ? (
+                        <span> · {(reindexProgress.current_processed || 0).toLocaleString()} / {(reindexProgress.current_total || 0).toLocaleString()}</span>
+                      ) : null}
+                    </div>
+                    {reindexProgress.latest_record ? <div>Latest indexed: {reindexProgress.latest_record}</div> : null}
+                    {reindexProgress.updated_at ? <div>Last update: {formatDateTime(reindexProgress.updated_at)}</div> : null}
+                  </div>
+                ) : reindexProgress.updated_at ? (
+                  <div className="text-xs text-muted-foreground">Last update: {formatDateTime(reindexProgress.updated_at)}</div>
+                ) : null}
                 {reindexProgress.error ? <p className="text-xs text-destructive">{reindexProgress.error}</p> : null}
               </div>
             ) : null}

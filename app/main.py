@@ -52,6 +52,7 @@ from app.schemas import (
     BulkPlacePayload,
     ChromeJobCompletePayload,
     ChromeJobCostlyPayload,
+    ChromeBrowserlessRunPayload,
     ChromeJobFailPayload,
     ChromeJobHeartbeatPayload,
     ChromeJobResetPayload,
@@ -133,6 +134,18 @@ _STORE_CACHE_LOCK = threading.Lock()
 _SHOPIFY_QUEUE_LOCK = threading.Lock()
 _SHOPIFY_OAUTH_LOCK = threading.Lock()
 _SHOPIFY_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
+_CHROME_BROWSERLESS_LOCK = threading.Lock()
+_CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
+    "running": False,
+    "processed": 0,
+    "placed": 0,
+    "failed": 0,
+    "message": "Browserless Chrome ordering has not run yet.",
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "error": "",
+}
 FRONTEND_SHELL_PATHS = {
     "/",
     "/home",
@@ -4396,9 +4409,20 @@ def index_order_line(row: Union[dict[str, Any], dict[str, Any]]) -> None:
         snapshot = row_to_dict(row) if hasattr(row, "keys") else dict(row)
         if not snapshot:
             return
-        _TYPESENSE_INDEX_EXECUTOR.submit(_index_order_line_sync, snapshot)
+        future = _TYPESENSE_INDEX_EXECUTOR.submit(_index_order_line_sync, snapshot)
+        future.add_done_callback(log_typesense_index_error)
     except Exception:
         pass
+
+
+def log_typesense_index_error(future: Any) -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        try:
+            set_setting("typesense_last_index_error", f"{utc_now()} {exc}")
+        except Exception:
+            pass
 
 
 def delete_order_line_index(line_id: int) -> None:
@@ -4758,6 +4782,7 @@ def _index_named_document_sync(collection: str, document: dict[str, Any]) -> Non
 
 _TYPESENSE_REINDEX_LOCK = threading.Lock()
 _TYPESENSE_REINDEX_PENDING = False
+TYPESENSE_REINDEX_STALE_SECONDS = 10 * 60
 
 
 def typesense_reindex_progress() -> dict[str, Any]:
@@ -4766,6 +4791,16 @@ def typesense_reindex_progress() -> dict[str, Any]:
         try:
             data = json.loads(raw)
             if isinstance(data, dict):
+                if typesense_progress_is_stale(data):
+                    data.update(
+                        {
+                            "status": "failed",
+                            "message": "Previous Typesense reindex stopped before completion. Start a new reindex to refresh the search index.",
+                            "completed_at": data.get("updated_at") or utc_now(),
+                            "error": "Reindex progress became stale.",
+                        }
+                    )
+                    set_setting("typesense_reindex_progress", json.dumps(data, default=str))
                 return data
         except Exception:
             pass
@@ -4779,7 +4814,26 @@ def typesense_reindex_progress() -> dict[str, Any]:
         "updated_at": "",
         "completed_at": "",
         "error": "",
+        "current_collection": "",
+        "current_processed": 0,
+        "current_total": 0,
+        "latest_record": "",
     }
+
+
+def typesense_progress_is_stale(data: dict[str, Any]) -> bool:
+    if data.get("status") not in {"queued", "running"}:
+        return False
+    updated_at = str(data.get("updated_at") or data.get("started_at") or "")
+    if not updated_at:
+        return False
+    try:
+        parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds() > TYPESENSE_REINDEX_STALE_SECONDS
 
 
 def set_typesense_reindex_progress(**updates: Any) -> dict[str, Any]:
@@ -4791,6 +4845,41 @@ def set_typesense_reindex_progress(**updates: Any) -> dict[str, Any]:
     data["updated_at"] = utc_now()
     set_setting("typesense_reindex_progress", json.dumps(data, default=str))
     return data
+
+
+def latest_typesense_record_label(collection: str, row: dict[str, Any]) -> str:
+    if collection == "order_lines":
+        order_name = clean_text(row.get("odoo_order_name"))
+        asin = clean_text(row.get("asin"))
+        state = clean_text(row.get("state"))
+        parts = [f"#{row.get('id')}"]
+        if order_name:
+            parts.append(order_name)
+        if asin:
+            parts.append(asin)
+        if state:
+            parts.append(state)
+        return " · ".join(parts)
+    if collection == "amazon_payment_failures":
+        return clean_text(row.get("amazon_order_id")) or str(row.get("id") or "")
+    if collection == "accounting_documents":
+        return " · ".join(part for part in (clean_text(row.get("odoo_order_name")), clean_text(row.get("document_type")), clean_text(row.get("tax_region"))) if part)
+    return str(row.get("id") or row.get("row_id") or "")
+
+
+def validate_typesense_import_response(response: requests.Response, collection: str) -> None:
+    failures: list[str] = []
+    for line in response.text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if item.get("success") is False:
+            failures.append(str(item.get("error") or item)[:300])
+    if failures:
+        raise RuntimeError(f"Typesense import failed for {collection}: {' | '.join(failures[:3])}")
 
 
 def reindex_order_lines(chunk_size: int = 250) -> int:
@@ -4837,13 +4926,18 @@ def reindex_order_lines(chunk_size: int = 250) -> int:
         )
         if response.status_code >= 400:
             raise RuntimeError(f"Typesense index failed: HTTP {response.status_code}: {response.text[:500]}")
+        validate_typesense_import_response(response, "order_lines")
         order_processed += len(rows)
         processed += len(rows)
         set_typesense_reindex_progress(
             status="running",
             processed=processed,
             total=total,
-            message=f"Indexed {processed} of {total} searchable record(s).",
+            current_collection="order_lines",
+            current_processed=order_processed,
+            current_total=order_total,
+            latest_record=latest_typesense_record_label("order_lines", row_to_dict(rows[-1]) or {}),
+            message=f"Indexed {processed} of {total} searchable record(s). Latest: {latest_typesense_record_label('order_lines', row_to_dict(rows[-1]) or {})}.",
         )
     for table, builder in TYPESENSE_TABLE_BUILDERS.items():
         table_processed = 0
@@ -4872,13 +4966,19 @@ def reindex_order_lines(chunk_size: int = 250) -> int:
             )
             if response.status_code >= 400:
                 raise RuntimeError(f"Typesense index failed for {table}: HTTP {response.status_code}: {response.text[:500]}")
+            validate_typesense_import_response(response, table)
             table_processed += len(rows)
             processed += len(rows)
+            latest_record = latest_typesense_record_label(table, row_to_dict(rows[-1]) or {})
             set_typesense_reindex_progress(
                 status="running",
                 processed=processed,
                 total=total,
-                message=f"Indexed {processed} of {total} searchable record(s).",
+                current_collection=table,
+                current_processed=table_processed,
+                current_total=table_total,
+                latest_record=latest_record,
+                message=f"Indexed {processed} of {total} searchable record(s). Latest {table}: {latest_record}.",
             )
     return processed
 
@@ -4900,6 +5000,10 @@ def run_typesense_reindex_job() -> None:
             started_at=utc_now(),
             completed_at="",
             error="",
+            current_collection="",
+            current_processed=0,
+            current_total=0,
+            latest_record="",
         )
         count = reindex_order_lines()
         set_typesense_reindex_progress(
@@ -4909,6 +5013,10 @@ def run_typesense_reindex_job() -> None:
             message=f"Reindexed {count} searchable record(s) into Typesense.",
             completed_at=utc_now(),
             error="",
+            current_collection="",
+            current_processed=0,
+            current_total=0,
+            latest_record="",
         )
         set_setting("typesense_schema_version", TYPESENSE_SCHEMA_VERSION)
     except Exception as exc:
@@ -4931,7 +5039,7 @@ def start_typesense_reindex_job() -> dict[str, Any]:
     if not typesense_enabled(settings):
         return {"ok": True, "message": "Typesense is disabled; reindex skipped.", "progress": typesense_reindex_progress()}
     current = typesense_reindex_progress()
-    if current.get("status") == "running":
+    if current.get("status") in {"queued", "running"} and not typesense_progress_is_stale(current):
         _TYPESENSE_REINDEX_PENDING = True
         current["message"] = "Typesense reindex is already running; another pass is queued."
         return {"ok": True, "message": "Typesense reindex is already running; another pass is queued.", "progress": current}
@@ -10375,19 +10483,8 @@ def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
 @app.get("/api/missing")
 def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
-    search_engine = "postgres"
-    try:
-        result = order_line_ids_for_state(store_id, "missing", page, per_page)
-        if result.get("enabled"):
-            rows = order_lines_by_ids([int(value) for value in result.get("ids") or []])
-            total = int(result.get("total") or 0)
-            search_engine = "typesense"
-        else:
-            raw_rows, total = list_missing_order_lines(store_id, page, per_page)
-            rows = rows_to_dicts(raw_rows)
-    except Exception:
-        raw_rows, total = list_missing_order_lines(store_id, page, per_page)
-        rows = rows_to_dicts(raw_rows)
+    raw_rows, total = list_missing_order_lines(store_id, page, per_page)
+    rows = rows_to_dicts(raw_rows)
     stores = rows_to_dicts(list_stores())
     stores_by_id = {store["id"]: store for store in stores}
     for row in rows:
@@ -10396,7 +10493,7 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
         row["missing_asin_url"] = asin_product_url(row.get("missing_asin") or row.get("asin") or "")
         row["asin_url"] = asin_product_url(row.get("asin") or "")
         row["replacement_asin_url"] = asin_product_url(row.get("replacement_asin") or "")
-    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
+    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": "postgres"}
 
 
 @app.get("/api/partial-fulfilments")
@@ -11268,6 +11365,163 @@ def api_chrome_order_history_unmatched(limit: int = 250) -> dict[str, Any]:
         except Exception:
             row["asins"] = []
     return {"ok": True, "rows": rows}
+
+
+def set_chrome_browserless_progress(**updates: Any) -> dict[str, Any]:
+    _CHROME_BROWSERLESS_PROGRESS.update(updates)
+    _CHROME_BROWSERLESS_PROGRESS["updated_at"] = utc_now()
+    return dict(_CHROME_BROWSERLESS_PROGRESS)
+
+
+def chrome_job_attempt_address_id(group_key: str) -> Optional[int]:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT request_json
+            FROM amazon_attempts
+            WHERE external_id=? AND mode='chrome'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (group_key,),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row["request_json"] or "{}")
+        address_id = int(payload.get("address_id") or 0)
+        return address_id or None
+    except Exception:
+        return None
+
+
+def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
+    worker_id = clean_text(payload.worker_id)[:120] or f"browserless-{uuid.uuid4().hex[:12]}"
+    ordering_engine = normalize_ordering_engine(payload.ordering_engine or "rest")
+    if ordering_engine == "chrome":
+        ordering_engine = "rest"
+    max_jobs = max(0, int(payload.max_jobs or 0))
+    processed = 0
+    placed_total = 0
+    failed_total = 0
+    try:
+        set_chrome_browserless_progress(
+            running=True,
+            processed=0,
+            placed=0,
+            failed=0,
+            error="",
+            completed_at="",
+            started_at=utc_now(),
+            message=f"Browserless Chrome ordering started with {ordering_engine.upper()} engine.",
+        )
+        while True:
+            if max_jobs and processed >= max_jobs:
+                break
+            job = claim_next_chrome_job(
+                payload.store_id,
+                worker_id,
+                resume_existing=True,
+                split_mixed_asin=payload.split_mixed_asin,
+            )
+            if not job:
+                break
+            group_key = clean_text(job.get("group_key"))
+            line_ids = [int(line_id) for line_id in job.get("line_ids") or [] if int(line_id or 0) > 0]
+            if not group_key or not line_ids:
+                break
+            processed += 1
+            set_chrome_browserless_progress(
+                processed=processed,
+                placed=placed_total,
+                failed=failed_total,
+                message=f"Placing {group_key} in browserless mode.",
+            )
+            address_id = chrome_job_attempt_address_id(group_key)
+            try:
+                placed, failed = place_orders(
+                    int(job["store_id"]),
+                    address_id=address_id,
+                    amazon_account_id=int(job["amazon_account_id"] or 0) or None,
+                    line_ids=line_ids,
+                    club=False,
+                    ordering_engine=ordering_engine,
+                    allow_missing_spaid=True,
+                )
+                placed_total += int(placed or 0)
+                failed_total += int(failed or 0)
+                set_chrome_browserless_progress(
+                    processed=processed,
+                    placed=placed_total,
+                    failed=failed_total,
+                    message=f"Browserless placed {placed} line(s), failed/skipped {failed} for {group_key}.",
+                )
+            except Exception as exc:
+                failed_total += len(line_ids)
+                with db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE order_lines
+                        SET state='error',
+                            amazon_status='chrome_browserless_error',
+                            last_error=?,
+                            chrome_claimed_by=NULL,
+                            chrome_claimed_at=NULL,
+                            chrome_claim_expires_at=NULL,
+                            updated_at=?
+                        WHERE amazon_group_key=? AND order_engine='chrome'
+                        """,
+                        (clean_error_message(str(exc)), utc_now(), group_key),
+                    )
+                set_chrome_browserless_progress(
+                    processed=processed,
+                    placed=placed_total,
+                    failed=failed_total,
+                    message=f"Browserless failed {group_key}: {exc}",
+                    error=str(exc),
+                )
+        set_chrome_browserless_progress(
+            running=False,
+            processed=processed,
+            placed=placed_total,
+            failed=failed_total,
+            completed_at=utc_now(),
+            message=f"Browserless ordering finished: {processed} job(s), {placed_total} line(s) placed, {failed_total} failed/skipped.",
+        )
+    except Exception as exc:
+        set_chrome_browserless_progress(
+            running=False,
+            completed_at=utc_now(),
+            error=str(exc),
+            message=f"Browserless ordering stopped: {exc}",
+        )
+    finally:
+        _CHROME_BROWSERLESS_LOCK.release()
+
+
+@app.post("/api/chrome/browserless/run")
+def api_chrome_browserless_run(payload: ChromeBrowserlessRunPayload) -> dict[str, Any]:
+    if not _CHROME_BROWSERLESS_LOCK.acquire(blocking=False):
+        return {
+            "ok": True,
+            "running": True,
+            "message": _CHROME_BROWSERLESS_PROGRESS.get("message") or "Browserless ordering is already running.",
+            "progress": dict(_CHROME_BROWSERLESS_PROGRESS),
+        }
+    progress = set_chrome_browserless_progress(
+        running=True,
+        message="Browserless ordering queued.",
+        started_at=utc_now(),
+        completed_at="",
+        error="",
+    )
+    threading.Thread(target=chrome_browserless_worker, args=(payload,), daemon=True).start()
+    return {"ok": True, "running": True, "message": "Browserless ordering started.", "progress": progress}
+
+
+@app.get("/api/chrome/browserless/status")
+def api_chrome_browserless_status() -> dict[str, Any]:
+    return {"ok": True, "progress": dict(_CHROME_BROWSERLESS_PROGRESS)}
 
 
 @app.get("/api/chrome/jobs")
