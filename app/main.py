@@ -137,6 +137,7 @@ _SHOPIFY_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 _CHROME_BROWSERLESS_LOCK = threading.Lock()
 _CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "running": False,
+    "stop_requested": False,
     "total": 0,
     "processed": 0,
     "placed": 0,
@@ -2869,14 +2870,17 @@ def _quantity_text(value: Any) -> str:
 
 def chrome_fail_is_partial_quantity(payload: ChromeJobFailPayload, message: str) -> bool:
     code = clean_text(payload.failure_code).lower().replace("-", "_").replace(" ", "_")
-    if code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}:
-        return True
+    if code in {"cart_verification_failed", "cart_quantity_mismatch"}:
+        return False
     if payload.requested_quantity is not None and (payload.fulfilled_quantity is not None or payload.available_quantity is not None):
         available = payload.fulfilled_quantity if payload.fulfilled_quantity is not None else payload.available_quantity
         try:
             return float(available) < float(payload.requested_quantity)
         except (TypeError, ValueError):
-            return True
+            if code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}:
+                return True
+    if code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}:
+        return True
     lowered = message.lower()
     return any(
         phrase in lowered
@@ -2898,6 +2902,14 @@ def partial_quantity_message(payload: ChromeJobFailPayload, fallback: str) -> st
     requested = _quantity_text(payload.requested_quantity)
     added = _quantity_text(payload.fulfilled_quantity if payload.fulfilled_quantity is not None else payload.available_quantity)
     if requested and added:
+        try:
+            requested_number = float(payload.requested_quantity or 0)
+            added_number = float(payload.fulfilled_quantity if payload.fulfilled_quantity is not None else payload.available_quantity or 0)
+        except (TypeError, ValueError):
+            requested_number = 0
+            added_number = 0
+        if requested_number > 0 and added_number > requested_number:
+            return f"Amazon cart quantity mismatch. Customer ordered {requested}, but Chrome found {added} in the Amazon cart. Moved to Missing ASINs for review."
         return f"Less quantity available on Amazon. Customer ordered {requested}, but Chrome could add only {added}. Moved to Missing ASINs for review."
     if requested:
         return f"Less quantity available on Amazon. Customer ordered {requested}, but Amazon did not allow the full quantity. Moved to Missing ASINs for review."
@@ -5389,6 +5401,7 @@ def chrome_recipient_name(order_names: Union[list[str], str], suffix: str = "") 
 
 CHROME_JOB_LEASE_MINUTES = 20
 CHROME_ORDER_SUBMITTED_STATUS = "order_submitted"
+CHROME_PROTECTED_STATUSES = {CHROME_ORDER_SUBMITTED_STATUS, "reporting_complete"}
 
 
 def chrome_job_lease_expiry() -> str:
@@ -5488,7 +5501,37 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
     }
 
 
-def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = True, limit: int = 50) -> dict[str, Any]:
+def chrome_job_is_protected_after_submit(conn: Any, group_key: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM order_lines
+        WHERE amazon_group_key=?
+          AND order_engine='chrome'
+          AND (
+            COALESCE(amazon_order_id, '') != ''
+            OR COALESCE(amazon_status, '') IN ('order_submitted', 'reporting_complete')
+          )
+        LIMIT 1
+        """,
+        (group_key,),
+    ).fetchone()
+    return bool(row)
+
+
+def ensure_chrome_job_not_protected_after_submit(conn: Any, group_key: str, action: str) -> None:
+    if chrome_job_is_protected_after_submit(conn, group_key):
+        raise HTTPException(
+            409,
+            f"Chrome job {group_key} was already submitted to Amazon; ignored {action}. Open order history and report the Amazon order ID instead.",
+        )
+
+
+def chrome_queue_snapshot(
+    store_id: Optional[int] = None,
+    clear_expired: bool = True,
+    limit: int = 50,
+) -> dict[str, Any]:
     limit = max(1, min(int(limit or 50), 250))
     with db() as conn:
         if clear_expired:
@@ -12431,6 +12474,7 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
     try:
         set_chrome_browserless_progress(
             running=True,
+            stop_requested=False,
             total=initial_total,
             processed=0,
             placed=0,
@@ -12441,6 +12485,8 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
             message=f"Browserless Chrome ordering started with {ordering_engine.upper()} engine.",
         )
         while True:
+            if _CHROME_BROWSERLESS_PROGRESS.get("stop_requested"):
+                break
             if max_jobs and processed >= max_jobs:
                 break
             job = claim_next_chrome_job(
@@ -12483,6 +12529,8 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
                     failed=failed_total,
                     message=f"Browserless placed {placed} line(s), failed/skipped {failed} for {group_key}.",
                 )
+                if _CHROME_BROWSERLESS_PROGRESS.get("stop_requested"):
+                    break
             except Exception as exc:
                 processed += 1
                 failed_total += len(line_ids)
@@ -12509,18 +12557,27 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
                     message=f"Browserless failed {group_key}: {exc}",
                     error=str(exc),
                 )
+                if _CHROME_BROWSERLESS_PROGRESS.get("stop_requested"):
+                    break
+        stopped = bool(_CHROME_BROWSERLESS_PROGRESS.get("stop_requested"))
         set_chrome_browserless_progress(
             running=False,
+            stop_requested=False,
             processed=processed,
             total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed),
             placed=placed_total,
             failed=failed_total,
             completed_at=utc_now(),
-            message=f"Browserless ordering finished: {processed} job(s), {placed_total} line(s) placed, {failed_total} failed/skipped.",
+            message=(
+                f"Browserless ordering stopped after {processed} job(s)."
+                if stopped
+                else f"Browserless ordering finished: {processed} job(s), {placed_total} line(s) placed, {failed_total} failed/skipped."
+            ),
         )
     except Exception as exc:
         set_chrome_browserless_progress(
             running=False,
+            stop_requested=False,
             completed_at=utc_now(),
             error=str(exc),
             message=f"Browserless ordering stopped: {exc}",
@@ -12553,6 +12610,7 @@ def api_chrome_browserless_run(payload: ChromeBrowserlessRunPayload) -> dict[str
         total = min(total, max_jobs)
     progress = set_chrome_browserless_progress(
         running=True,
+        stop_requested=False,
         total=total,
         processed=0,
         message="Browserless ordering queued.",
@@ -12562,6 +12620,22 @@ def api_chrome_browserless_run(payload: ChromeBrowserlessRunPayload) -> dict[str
     )
     threading.Thread(target=chrome_browserless_worker, args=(payload,), daemon=True).start()
     return {"ok": True, "running": True, "message": "Browserless ordering started.", "progress": progress}
+
+
+@app.post("/api/chrome/browserless/stop")
+def api_chrome_browserless_stop() -> dict[str, Any]:
+    if not _CHROME_BROWSERLESS_PROGRESS.get("running"):
+        progress = set_chrome_browserless_progress(
+            running=False,
+            stop_requested=False,
+            message="Browserless ordering is not running.",
+        )
+        return {"ok": True, "running": False, "message": progress["message"], "progress": progress}
+    progress = set_chrome_browserless_progress(
+        stop_requested=True,
+        message="Stopping browserless ordering after the current job is reported.",
+    )
+    return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
 
 
 @app.get("/api/chrome/browserless/status")
@@ -12731,6 +12805,109 @@ def api_chrome_job_release(group_key: str, payload: ChromeJobHeartbeatPayload) -
     return {"ok": True, "released": cursor.rowcount}
 
 
+@app.post("/api/chrome/jobs/{group_key}/post-submit-unplaced")
+def api_chrome_job_post_submit_unplaced(group_key: str, payload: ChromeJobFailPayload) -> dict[str, Any]:
+    group_key = clean_text(group_key)
+    message = clean_error_message(payload.message or "Amazon did not place the order after submit.")
+    missing_asin = normalize_asin(payload.missing_asin)
+    if not group_key:
+        raise HTTPException(400, "group_key is required")
+    with db() as conn:
+        ensure_chrome_job_owner(conn, group_key, payload.worker_id)
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_status, '')=?
+            """,
+            (group_key, CHROME_ORDER_SUBMITTED_STATUS),
+        ).fetchall())
+        if not rows:
+            raise HTTPException(409, "Chrome job is not in a protected submitted state without an Amazon order ID.")
+        eligible_ids = {int(row["id"]) for row in rows}
+        if payload.line_ids:
+            line_ids = {int(value) for value in payload.line_ids if int(value or 0) > 0}
+            eligible_ids = eligible_ids.intersection(line_ids)
+        if payload.missing_line_id:
+            eligible_ids = eligible_ids.intersection({int(payload.missing_line_id)})
+        if not eligible_ids:
+            raise HTTPException(404, "No matching submitted Chrome line could be moved to Missing ASINs.")
+        placeholders = ",".join("?" for _ in eligible_ids)
+        now = utc_now()
+        conn.execute(
+            f"""
+            UPDATE order_lines
+            SET state='missing',
+                amazon_status='missing',
+                amazon_order_id='',
+                amazon_order_url='',
+                last_error=?,
+                missing_asin=?,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                updated_at=?
+            WHERE id IN ({placeholders})
+            """,
+            [message, missing_asin, now, *sorted(eligible_ids)],
+        )
+        conn.execute(
+            """
+            UPDATE amazon_attempts
+            SET status='missing', error=?
+            WHERE external_id=? AND mode='chrome'
+            """,
+            (message, group_key),
+        )
+        updated_rows = rows_to_dicts(conn.execute(
+            f"SELECT * FROM order_lines WHERE id IN ({placeholders})",
+            sorted(eligible_ids),
+        ).fetchall())
+    for updated in updated_rows:
+        index_order_line(updated)
+    return {
+        "ok": True,
+        "message": f"Moved {len(updated_rows)} Chrome line(s) to Missing ASINs because Amazon did not place the order after submit.",
+        "moved": len(updated_rows),
+    }
+
+
+@app.post("/api/chrome/jobs/{group_key}/preflight-missing")
+def api_chrome_job_preflight_missing(group_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+    group_key = clean_text(group_key)
+    message = clean_error_message(payload.get("message") or "Chrome split-order preflight found an unavailable ASIN.")
+    missing_asin = normalize_asin(payload.get("missing_asin") or "")
+    missing_line_id = parse_optional_int(payload.get("missing_line_id"))
+    checked_url = clean_text(payload.get("checked_url") or "")
+    if not group_key:
+        raise HTTPException(400, "group_key is required")
+    with db() as conn:
+        ensure_chrome_job_not_protected_after_submit(conn, group_key, "preflight missing report")
+        claimed = rows_to_dicts(conn.execute(
+            """
+            SELECT DISTINCT chrome_claimed_by
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND COALESCE(chrome_claimed_by, '') != ''
+            """,
+            (group_key,),
+        ).fetchall())
+        if claimed:
+            raise HTTPException(409, "Chrome job is already claimed and cannot be preflight-moved.")
+    full_message = message
+    if checked_url:
+        full_message = f"{message} Checked URL: {checked_url}"
+    count = mark_chrome_group_missing(group_key, full_message, missing_asin, missing_line_id)
+    if not count:
+        raise HTTPException(404, "Chrome job not found")
+    return {"ok": True, "message": f"Preflight moved {count} Chrome line(s) to Missing ASINs before split ordering.", "moved": count}
+
+
 @app.post("/api/chrome/jobs/{group_key}/duplicate-check")
 def api_chrome_job_duplicate_check(group_key: str, payload: ChromeJobResetPayload) -> dict[str, Any]:
     line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
@@ -12748,18 +12925,15 @@ def api_chrome_job_duplicate_check(group_key: str, payload: ChromeJobResetPayloa
         ).fetchall()
         if not selected_rows:
             return {"ok": True, "duplicate": False, "orders": []}
-        order_pairs = sorted({(int(row["store_id"]), int(row["odoo_order_id"])) for row in selected_rows})
-        clauses = " OR ".join("(store_id=? AND odoo_order_id=?)" for _ in order_pairs)
-        params = [value for pair in order_pairs for value in pair]
         duplicate_rows = conn.execute(
             f"""
             SELECT id, store_id, odoo_order_id, odoo_order_name, amazon_order_id, amazon_order_url
             FROM order_lines
-            WHERE ({clauses})
+            WHERE id IN ({placeholders})
               AND COALESCE(amazon_order_id, '') != ''
             ORDER BY odoo_order_name, amazon_order_id, id
             """,
-            params,
+            line_ids,
         ).fetchall()
     orders: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -12995,6 +13169,8 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
             pricing_by_asin[asin] = item
     order_by_line_id: dict[int, dict[str, str]] = {}
     order_by_asin: dict[str, dict[str, str]] = {}
+    mapped_line_ids: set[int] = set()
+    mapped_asins: set[str] = set()
     for mapping in payload.order_mappings or []:
         mapped_order_id = clean_text(str(mapping.get("amazon_order_id") or ""))
         if not mapped_order_id:
@@ -13003,12 +13179,15 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
         normalized_mapping = {"amazon_order_id": mapped_order_id, "amazon_order_url": mapped_url}
         for line_id in mapping.get("line_ids") or []:
             try:
-                order_by_line_id[int(line_id)] = normalized_mapping
+                normalized_line_id = int(line_id)
+                order_by_line_id[normalized_line_id] = normalized_mapping
+                mapped_line_ids.add(normalized_line_id)
             except (TypeError, ValueError):
                 continue
         mapped_asin = normalize_asin(str(mapping.get("asin") or ""))
         if mapped_asin:
             order_by_asin[mapped_asin] = normalized_mapping
+            mapped_asins.add(mapped_asin)
     with db() as conn:
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
         params: list[Any] = [group_key]
@@ -13049,6 +13228,28 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     "already_completed": True,
                 }
             raise HTTPException(404, "Chrome job not found")
+        row_dicts = [dict(row) for row in rows]
+        row_asins = sorted({normalize_asin(str(row["asin"] or "")) for row in row_dicts if normalize_asin(str(row["asin"] or ""))})
+        if len(row_dicts) > 1 and len(row_asins) > 1 and not payload.order_mappings:
+            raise HTTPException(
+                409,
+                f"Refused to report Amazon order {amazon_order_id} to multi-ASIN Chrome job {group_key} because no ASIN-to-order mapping was provided.",
+            )
+        if payload.order_mappings and len(row_dicts) > 1:
+            unmapped_rows = [
+                row
+                for row in row_dicts
+                if int(row["id"]) not in mapped_line_ids and normalize_asin(str(row["asin"] or "")) not in mapped_asins
+            ]
+            if unmapped_rows:
+                expected = ", ".join(
+                    f"{row['odoo_order_name']} line {row['id']} ASIN {normalize_asin(str(row['asin'] or '')) or 'UNKNOWN'}"
+                    for row in unmapped_rows[:5]
+                )
+                raise HTTPException(
+                    409,
+                    f"Refused to report Amazon order {amazon_order_id} because ASIN mapping did not cover every line in multi-line Chrome job {group_key}. Unmapped: {expected}.",
+                )
         updated_for_shopify: list[dict[str, Any]] = []
         for row in rows:
             pricing = pricing_by_asin.get(str(row["asin"] or "").upper(), {})
@@ -13149,6 +13350,7 @@ def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[s
     missing_asin = normalize_asin(payload.missing_asin)
     failure_code = clean_text(payload.failure_code).lower().replace("-", "_").replace(" ", "_")
     with db() as conn:
+        ensure_chrome_job_not_protected_after_submit(conn, group_key, "failure or missing report")
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
     if failure_code in {"manual_missing", "mark_missing", "missing"}:
         linked_message = message or "Marked missing from Chrome progress popup."
@@ -13205,6 +13407,7 @@ def api_chrome_job_missing_line(group_key: str, payload: ChromeJobFailPayload) -
     message = clean_error_message(payload.message)
     missing_asin = normalize_asin(payload.missing_asin)
     with db() as conn:
+        ensure_chrome_job_not_protected_after_submit(conn, group_key, "missing-line report")
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
     result = mark_chrome_line_missing(group_key, message, missing_asin, payload.missing_line_id)
     count = int(result.get("count") or 0)
@@ -13222,6 +13425,7 @@ def api_chrome_job_missing_line(group_key: str, payload: ChromeJobFailPayload) -
 @app.post("/api/chrome/jobs/{group_key}/costly")
 def api_chrome_job_costly(group_key: str, payload: ChromeJobCostlyPayload) -> dict[str, Any]:
     with db() as conn:
+        ensure_chrome_job_not_protected_after_submit(conn, group_key, "costly-review report")
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
     costly_asin = normalize_asin(payload.costly_asin)
     message = clean_error_message(
