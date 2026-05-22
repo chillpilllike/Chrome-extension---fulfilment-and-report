@@ -611,6 +611,17 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS profit_loss_manual_costs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+                month TEXT NOT NULL,
+                label TEXT NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS accounting_documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 document_type TEXT NOT NULL,
@@ -831,6 +842,7 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_pull_jobs_store ON pull_jobs(store_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_shipping_charges_order ON shipping_charges(odoo_order_name)",
             "CREATE INDEX IF NOT EXISTS idx_shipping_imports_month ON shipping_imports(month)",
+            "CREATE INDEX IF NOT EXISTS idx_profit_loss_manual_costs_month_store ON profit_loss_manual_costs(month, store_id)",
             "CREATE INDEX IF NOT EXISTS idx_accounting_documents_order ON accounting_documents(odoo_order_name)",
             "CREATE INDEX IF NOT EXISTS idx_accounting_documents_region ON accounting_documents(tax_region, document_type)",
             "CREATE INDEX IF NOT EXISTS idx_amazon_otp_order ON amazon_otp_records(amazon_order_id)",
@@ -8280,6 +8292,44 @@ def profit_loss_data(
             entry[metric] = round(float(entry[metric] or 0) + float(row.get(metric) or 0), 2)
     total = len(order_rows)
     paged_order_rows = order_rows[offset:offset + per_page]
+    month_keys = sorted({(parse_iso_date(str(row.get("order_date") or "")) or start_dt).strftime("%Y-%m") for row in order_rows} or {resolved_month})
+    with db() as conn:
+        if store_id:
+            manual_cost_rows = rows_to_dicts(conn.execute(
+                """
+                SELECT *
+                FROM profit_loss_manual_costs
+                WHERE month = ANY(?::text[])
+                  AND (store_id IS NULL OR store_id=?)
+                ORDER BY month DESC, updated_at DESC, id DESC
+                """,
+                (month_keys, store_id),
+            ).fetchall())
+        else:
+            manual_cost_rows = rows_to_dicts(conn.execute(
+                """
+                SELECT *
+                FROM profit_loss_manual_costs
+                WHERE month = ANY(?::text[])
+                ORDER BY month DESC, updated_at DESC, id DESC
+                """,
+                (month_keys,),
+            ).fetchall())
+    manual_cost_total = round(sum(float(row.get("amount") or 0) for row in manual_cost_rows), 2)
+    manual_costs_by_month: dict[str, float] = {}
+    for cost in manual_cost_rows:
+        key = str(cost.get("month") or resolved_month)
+        manual_costs_by_month[key] = round(manual_costs_by_month.get(key, 0) + float(cost.get("amount") or 0), 2)
+    summary["net_profit_before_manual_costs"] = summary["net_profit"]
+    summary["manual_costs_total"] = manual_cost_total
+    summary["net_profit"] = round(float(summary["net_profit"] or 0) - manual_cost_total, 2)
+    summary["margin_percent"] = round((summary["net_profit"] / summary["odoo_order_value"]) * 100, 2) if summary["odoo_order_value"] else 0
+    for entry in grouped.values():
+        manual_cost = manual_costs_by_month.get(str(entry.get("period") or ""), 0) if period == "monthly" else 0
+        entry["manual_costs_total"] = manual_cost
+        if manual_cost:
+            entry["net_profit_before_manual_costs"] = entry["net_profit"]
+            entry["net_profit"] = round(float(entry["net_profit"] or 0) - manual_cost, 2)
     return {
         "summary": summary,
         "period_rows": sorted(grouped.values(), key=lambda item: item["period"], reverse=True),
@@ -8288,6 +8338,7 @@ def profit_loss_data(
         "per_page": per_page,
         "total": total,
         "imports": rows_to_dicts(imports),
+        "manual_costs": manual_cost_rows,
         "start": start_dt.date().isoformat(),
         "end": end_dt.date().isoformat(),
         "month": resolved_month,
@@ -11468,6 +11519,54 @@ def api_profit_loss(
         except Exception:
             candidate_order_names = None
     return profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names)
+
+
+@app.post("/api/profit-loss/manual-costs")
+def api_profit_loss_manual_cost_save(payload: dict[str, Any]) -> dict[str, Any]:
+    month = clean_text(payload.get("month"))
+    if not re.match(r"^\d{4}-\d{2}$", month):
+        raise HTTPException(400, "Enter a valid month in YYYY-MM format.")
+    label = clean_text(payload.get("label")) or "Manual monthly cost"
+    amount = round(float(payload.get("amount") or 0), 2)
+    if amount < 0:
+        raise HTTPException(400, "Manual cost amount cannot be negative.")
+    note = clean_text(payload.get("note"))
+    store_id = int(payload.get("store_id") or 0) or None
+    cost_id = int(payload.get("id") or 0)
+    now = utc_now()
+    with db() as conn:
+        if cost_id:
+            row = conn.execute(
+                """
+                UPDATE profit_loss_manual_costs
+                SET store_id=?, month=?, label=?, amount=?, note=?, updated_at=?
+                WHERE id=?
+                RETURNING *
+                """,
+                (store_id, month, label, amount, note, now, cost_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "Manual cost not found.")
+        else:
+            row = conn.execute(
+                """
+                INSERT INTO profit_loss_manual_costs
+                (store_id, month, label, amount, note, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                RETURNING *
+                """,
+                (store_id, month, label, amount, note, now, now),
+            ).fetchone()
+    return {"ok": True, "message": "Manual monthly cost saved.", "cost": dict(row) if row else None}
+
+
+@app.delete("/api/profit-loss/manual-costs/{cost_id}")
+def api_profit_loss_manual_cost_delete(cost_id: int) -> dict[str, Any]:
+    with db() as conn:
+        cursor = conn.execute("DELETE FROM profit_loss_manual_costs WHERE id=?", (cost_id,))
+    if cursor.rowcount <= 0:
+        raise HTTPException(404, "Manual cost not found.")
+    return {"ok": True, "message": "Manual monthly cost removed."}
 
 
 @app.post("/api/profit-loss/shipping-upload")

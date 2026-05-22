@@ -803,6 +803,7 @@ type ProfitLossData = {
   summary: Record<string, number>
   period_rows: Array<Record<string, number | string>>
   orders: ProfitLossOrder[]
+  manual_costs: Array<Record<string, string | number | null>>
   page: number
   per_page: number
   total: number
@@ -5979,6 +5980,10 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
   const [page, setPage] = useState(1)
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
+  const [manualCostId, setManualCostId] = useState<number | null>(null)
+  const [manualCostLabel, setManualCostLabel] = useState("Google Ads")
+  const [manualCostAmount, setManualCostAmount] = useState("")
+  const [manualCostNote, setManualCostNote] = useState("")
 
   async function load(nextPage = page) {
     const params = new URLSearchParams({ period, month, q: query })
@@ -6021,16 +6026,76 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
     setPage(1)
   }
 
+  function resetManualCostForm() {
+    setManualCostId(null)
+    setManualCostLabel("Google Ads")
+    setManualCostAmount("")
+    setManualCostNote("")
+  }
+
+  function editManualCost(row: Record<string, string | number | null>) {
+    setManualCostId(Number(row.id || 0) || null)
+    setManualCostLabel(String(row.label || ""))
+    setManualCostAmount(String(row.amount || ""))
+    setManualCostNote(String(row.note || ""))
+  }
+
+  async function saveManualCost() {
+    const amount = Number(manualCostAmount || 0)
+    if (!Number.isFinite(amount) || amount < 0) {
+      onResult({ ok: false, title: "Manual Cost", message: "Enter a valid monthly cost amount." })
+      return
+    }
+    setBusy(true)
+    try {
+      const result = await api<{ ok: boolean; message: string }>("/api/profit-loss/manual-costs", {
+        method: "POST",
+        body: JSON.stringify({
+          id: manualCostId,
+          store_id: storeId ? Number(storeId) : null,
+          month,
+          label: manualCostLabel,
+          amount,
+          note: manualCostNote,
+        }),
+      })
+      onResult({ ok: result.ok, title: "Manual Cost Saved", message: result.message })
+      resetManualCostForm()
+      await load(page)
+    } catch (error) {
+      onResult({ ok: false, title: "Manual Cost Failed", message: String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function deleteManualCost(row: Record<string, string | number | null>) {
+    const confirmed = window.confirm(`Remove ${row.label || "manual cost"} from ${row.month || month}?`)
+    if (!confirmed) return
+    setBusy(true)
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/profit-loss/manual-costs/${row.id}`, { method: "DELETE" })
+      onResult({ ok: result.ok, title: "Manual Cost Removed", message: result.message })
+      if (manualCostId === Number(row.id || 0)) resetManualCostForm()
+      await load(page)
+    } catch (error) {
+      onResult({ ok: false, title: "Remove Manual Cost Failed", message: String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const summary = data?.summary || {}
   return (
     <div className="grid gap-3">
-      <section className="grid gap-3 xl:grid-cols-6">
+      <section className="grid gap-3 xl:grid-cols-4 2xl:grid-cols-7">
         {[
           ["Sales", formatMoney(Number(summary.odoo_order_value || 0))],
           ["Delivery Collected", formatMoney(Number(summary.collected_delivery || 0))],
           ["Discounts", formatMoney(Number(summary.order_discounts || 0))],
           ["Amazon Cost", formatMoney(Number(summary.amazon_order_value || 0))],
           ["Shipping + Fulfilment", formatMoney(Number(summary.shipping_fee || 0) + Number(summary.fulfilment_fee || 0))],
+          ["Manual Costs", formatMoney(Number(summary.manual_costs_total || 0))],
           ["Net Profit", formatMoney(Number(summary.net_profit || 0))],
         ].map(([label, value]) => (
           <Card key={label}>
@@ -6074,17 +6139,85 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
         </CardContent>
       </Card>
 
+      <Card>
+        <CardHeader>
+          <CardTitle>Manual Monthly Costs</CardTitle>
+          <CardDescription>Costs entered here are subtracted from this month’s Profit / Loss total.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 lg:grid-cols-[1fr_160px_1fr_auto_auto] lg:items-end">
+          <div>
+            <Label>Cost Name</Label>
+            <Input value={manualCostLabel} onChange={(event) => setManualCostLabel(event.target.value)} placeholder="Google Ads" />
+          </div>
+          <div>
+            <Label>Amount</Label>
+            <Input type="number" min="0" step="0.01" value={manualCostAmount} onChange={(event) => setManualCostAmount(event.target.value)} placeholder="0.00" />
+          </div>
+          <div>
+            <Label>Note</Label>
+            <Input value={manualCostNote} onChange={(event) => setManualCostNote(event.target.value)} placeholder="Campaign, invoice, or memo" />
+          </div>
+          <Button disabled={busy || !manualCostLabel.trim()} onClick={saveManualCost}>
+            {manualCostId ? "Update Cost" : "Add Cost"}
+          </Button>
+          <Button variant="outline" disabled={busy} onClick={resetManualCostForm}>Clear</Button>
+        </CardContent>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Month</TableHead>
+                <TableHead>Name</TableHead>
+                <TableHead>Amount</TableHead>
+                <TableHead>Note</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(data?.manual_costs || []).map((row) => (
+                <TableRow key={String(row.id)}>
+                  <TableCell>{row.month}</TableCell>
+                  <TableCell>{row.label}</TableCell>
+                  <TableCell>{formatMoney(Number(row.amount || 0))}</TableCell>
+                  <TableCell className="max-w-[320px] truncate">{row.note || "-"}</TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex justify-end gap-2">
+                      <Button size="sm" variant="outline" disabled={busy} onClick={() => editManualCost(row)}>
+                        <Edit className="size-4" />
+                        Edit
+                      </Button>
+                      <Button size="sm" variant="destructive" disabled={busy} onClick={() => deleteManualCost(row)}>
+                        <Trash2 className="size-4" />
+                        Remove
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+              {!(data?.manual_costs || []).length && (
+                <TableRow>
+                  <TableCell colSpan={5} className="py-6 text-center text-sm text-muted-foreground">
+                    No manual monthly costs added for this period.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+
       <section className="grid gap-3 xl:grid-cols-[0.75fr_1.25fr]">
         <Card>
           <CardHeader><CardTitle>{period[0].toUpperCase() + period.slice(1)} Summary</CardTitle></CardHeader>
           <CardContent className="p-0">
             <Table>
-              <TableHeader><TableRow><TableHead>Period</TableHead><TableHead>Orders</TableHead><TableHead>Net Profit</TableHead></TableRow></TableHeader>
+              <TableHeader><TableRow><TableHead>Period</TableHead><TableHead>Orders</TableHead><TableHead>Manual Costs</TableHead><TableHead>Net Profit</TableHead></TableRow></TableHeader>
               <TableBody>
                 {(data?.period_rows || []).map((row) => (
                   <TableRow key={String(row.period)}>
                     <TableCell>{row.period}</TableCell>
                     <TableCell>{row.orders}</TableCell>
+                    <TableCell>{formatMoney(Number(row.manual_costs_total || 0))}</TableCell>
                     <TableCell>{formatMoney(Number(row.net_profit || 0))}</TableCell>
                   </TableRow>
                 ))}
