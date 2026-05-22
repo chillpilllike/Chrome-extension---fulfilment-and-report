@@ -31,6 +31,7 @@ from calendar import monthrange
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 from xml.sax.saxutils import escape as xml_escape
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -165,7 +166,49 @@ _SHOPIFY_DUPLICATE_SCAN_PROGRESS: dict[str, Any] = {
     "completed_at": "",
     "error": "",
 }
+
+
+def ensure_shopify_order_status_cache_table() -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopify_order_status_cache (
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                odoo_order_name TEXT NOT NULL,
+                route TEXT NOT NULL,
+                dest_name TEXT NOT NULL,
+                shop TEXT NOT NULL,
+                shopify_order_id TEXT,
+                shopify_order_name TEXT,
+                shopify_order_url TEXT,
+                financial_status TEXT,
+                fulfillment_status TEXT,
+                fulfillment_at TEXT,
+                cancelled_at TEXT,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (store_id, odoo_order_name, route, dest_name)
+            )
+            """
+        )
+        existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(shopify_order_status_cache)").fetchall()}
+        if "fulfillment_at" not in existing_cols:
+            conn.execute("ALTER TABLE shopify_order_status_cache ADD COLUMN fulfillment_at TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shopify_order_status_order ON shopify_order_status_cache(store_id, odoo_order_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shopify_order_status_fulfillment ON shopify_order_status_cache(store_id, fulfillment_status)")
 _SHOPIFY_DUPLICATE_SCAN_RESULTS: list[dict[str, Any]] = []
+_SHOPIFY_ORDER_STATUS_FORCE_SYNC_LOCK = threading.Lock()
+_SHOPIFY_ORDER_STATUS_FORCE_SYNC_PROGRESS: dict[str, Any] = {
+    "status": "idle",
+    "total": 0,
+    "processed": 0,
+    "matched": 0,
+    "current_order": "",
+    "message": "Shopify order status sync is idle.",
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "error": "",
+}
 _SHOPIFY_PRODUCT_REPAIR_LOCK = threading.Lock()
 _SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK = threading.Lock()
 _SHOPIFY_PRODUCT_REPAIR_CANCEL_EVENT = threading.Event()
@@ -777,6 +820,23 @@ def init_db() -> None:
                 PRIMARY KEY (state_scope, dest_name, src_order_key)
             );
 
+            CREATE TABLE IF NOT EXISTS shopify_order_status_cache (
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                odoo_order_name TEXT NOT NULL,
+                route TEXT NOT NULL,
+                dest_name TEXT NOT NULL,
+                shop TEXT NOT NULL,
+                shopify_order_id TEXT,
+                shopify_order_name TEXT,
+                shopify_order_url TEXT,
+                financial_status TEXT,
+                fulfillment_status TEXT,
+                fulfillment_at TEXT,
+                cancelled_at TEXT,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (store_id, odoo_order_name, route, dest_name)
+            );
+
             CREATE TABLE IF NOT EXISTS shopify_export_sku_map (
                 state_scope TEXT NOT NULL,
                 dest_name TEXT NOT NULL,
@@ -906,6 +966,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_shopify_fulfilment_jobs_order ON shopify_fulfilment_jobs(store_id, odoo_order_name)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_jobs_status ON shopify_tracking_jobs(status, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_export_order_dest ON shopify_export_order_map(dest_name, src_order_key)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_order_status_order ON shopify_order_status_cache(store_id, odoo_order_name)",
+            "CREATE INDEX IF NOT EXISTS idx_shopify_order_status_fulfillment ON shopify_order_status_cache(store_id, fulfillment_status)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_export_sku_dest ON shopify_export_sku_map(dest_name, sku)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_export_customer_dest ON shopify_export_customer_map(dest_name, map_key)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_sync_order ON shopify_tracking_sync_log(odoo_db, odoo_order)",
@@ -969,6 +1031,9 @@ def init_db() -> None:
             existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(pull_jobs)").fetchall()}
             if column not in existing_cols:
                 conn.execute(ddl)
+        existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(shopify_order_status_cache)").fetchall()}
+        if "fulfillment_at" not in existing_cols:
+            conn.execute("ALTER TABLE shopify_order_status_cache ADD COLUMN fulfillment_at TEXT")
         ensure_performance_indexes(conn)
         conn.execute("UPDATE order_lines SET pulled_at = COALESCE(NULLIF(pulled_at, ''), created_at)")
         conn.execute(
@@ -1792,6 +1857,22 @@ def amazon_history_order_record(order: Any) -> dict[str, Any]:
     }
 
 
+def parse_amazon_order_placed_date(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    parsed = parse_iso_date(text)
+    if parsed:
+        return parsed.astimezone(timezone.utc).isoformat()
+    normalized = re.sub(r"\s+", " ", text).strip()
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(normalized, fmt).replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
 def amazon_history_lookup_records(payload: AmazonHistoryLookupPayload) -> list[dict[str, Any]]:
     by_id: dict[str, dict[str, Any]] = {}
     for order in payload.orders or []:
@@ -1819,6 +1900,7 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
                order_lines.asin,
                order_lines.quantity,
                order_lines.state,
+               order_lines.ordered_at,
                stores.name AS store_name,
                stores.odoo_url AS odoo_url
         FROM order_lines
@@ -1850,13 +1932,17 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
                 "lines": [],
                 "asins": [],
                 "state": row["state"],
+                "ordered_at_values": [],
             }
             grouped[key] = order
             match["orders"].append(order)
         order["line_ids"].append(row["id"])
         asin = normalize_asin(row["asin"])
         if asin:
-            order["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row["quantity"] or 1)})
+            ordered_at = clean_text(row["ordered_at"])
+            order["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row["quantity"] or 1), "ordered_at": ordered_at})
+            if ordered_at and ordered_at not in order["ordered_at_values"]:
+                order["ordered_at_values"].append(ordered_at)
             if asin not in order["asins"]:
                 order["asins"].append(asin)
             order.setdefault("asin_quantities", {})
@@ -1885,6 +1971,7 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                order_lines.asin,
                order_lines.quantity,
                order_lines.state,
+               order_lines.ordered_at,
                order_lines.amazon_order_id AS current_amazon_order_id,
                stores.name AS store_name,
                stores.odoo_url AS odoo_url
@@ -1918,13 +2005,17 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                         "lines": [],
                         "asins": [],
                         "state": row["state"],
+                        "ordered_at_values": [],
                         "current_amazon_order_id": row.get("current_amazon_order_id") or "",
                     }
                     grouped[key] = suggestion
                 suggestion["line_ids"].append(row["id"])
                 asin = normalize_asin(row.get("asin"))
                 if asin:
-                    suggestion["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row.get("quantity") or 1)})
+                    ordered_at = clean_text(row.get("ordered_at"))
+                    suggestion["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row.get("quantity") or 1), "ordered_at": ordered_at})
+                    if ordered_at and ordered_at not in suggestion["ordered_at_values"]:
+                        suggestion["ordered_at_values"].append(ordered_at)
                     if asin not in suggestion["asins"]:
                         suggestion["asins"].append(asin)
                     suggestion.setdefault("asin_quantities", {})
@@ -1961,6 +2052,33 @@ def amazon_history_apply_quantity_checks(records: list[dict[str, Any]], *groups:
                     })
                 candidate["quantity_checks"] = checks
                 candidate["quantity_matches"] = bool(checks) and all(check["matches"] for check in checks)
+
+
+def amazon_history_apply_order_date_checks(records: list[dict[str, Any]], *groups: dict[str, Any]) -> None:
+    records_by_order = {record["amazon_order_id"]: record for record in records if record.get("amazon_order_id")}
+    for group in groups:
+        for amazon_order_id, value in (group or {}).items():
+            amazon_placed_at = parse_amazon_order_placed_date((records_by_order.get(amazon_order_id) or {}).get("order_date"))
+            amazon_dt = parse_iso_date(amazon_placed_at)
+            candidates = value.get("orders") if isinstance(value, dict) and "orders" in value else value
+            for candidate in candidates or []:
+                checks: list[dict[str, Any]] = []
+                if amazon_dt:
+                    for line in candidate.get("lines") or []:
+                        app_dt = parse_iso_date(clean_text(line.get("ordered_at")))
+                        if not app_dt:
+                            continue
+                        checks.append({
+                            "line_id": line.get("id"),
+                            "asin": line.get("asin") or "",
+                            "amazon_order_date": amazon_dt.date().isoformat(),
+                            "app_ordered_at": app_dt.isoformat(),
+                            "app_ordered_date": app_dt.date().isoformat(),
+                            "matches": app_dt.date() == amazon_dt.date(),
+                        })
+                candidate["order_date_checks"] = checks
+                candidate["order_date_mismatch"] = bool(checks) and any(not check["matches"] for check in checks)
+                candidate["amazon_order_placed_at"] = amazon_placed_at
 
 
 def amazon_history_asin_conflicts(
@@ -5343,12 +5461,69 @@ def order_condition_filter(condition: str, store_id: Optional[int] = None) -> tu
     return " && ".join(filters), condition_key != "all"
 
 
+def order_sort_sql(sort_by: str = "", sort_dir: str = "") -> str:
+    direction = "ASC" if clean_text(sort_dir).lower() == "asc" else "DESC"
+    nulls = "NULLS FIRST" if direction == "ASC" else "NULLS LAST"
+    sort_key = clean_text(sort_by).lower()
+    expressions = {
+        "odoo_order_name": "COALESCE(odoo_order_id, 0)",
+        "odoo_order_date": "NULLIF(odoo_order_date, '')::timestamp",
+        "pulled_at": "NULLIF(pulled_at, '')::timestamp",
+        "ordered_at": "NULLIF(ordered_at, '')::timestamp",
+        "destination_country": "COALESCE(CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_name' ELSE '' END, '')",
+        "product_name": "COALESCE(product_name, '')",
+        "default_code": "COALESCE(default_code, '')",
+        "asin": "COALESCE(asin, '')",
+        "supplier_part_auxiliary_id": "COALESCE(supplier_part_auxiliary_id, '')",
+        "quantity": "COALESCE(quantity, 0)",
+        "odoo_status_label": "COALESCE(odoo_status_label, '')",
+        "state": "COALESCE(state, '')",
+        "order_engine": "COALESCE(order_engine, '')",
+        "amazon_account_name": "COALESCE(amazon_account_name, '')",
+        "tracking_status": "COALESCE(tracking_status, '')",
+        "amazon_cancelled_order_id": "COALESCE(amazon_cancelled_order_id, '')",
+        "amazon_order_id": "COALESCE(amazon_order_id, '')",
+        "fulfilment_note": "COALESCE(fulfilment_note, '')",
+        "last_error": "COALESCE(last_error, '')",
+    }
+    expression = expressions.get(sort_key, "COALESCE(odoo_order_id, 0)")
+    return f"{expression} {direction} {nulls}, COALESCE(odoo_order_id, 0) {direction}, asin ASC, id ASC"
+
+
+def order_sort_for_typesense(sort_by: str = "", sort_dir: str = "") -> str:
+    direction = "asc" if clean_text(sort_dir).lower() == "asc" else "desc"
+    sort_key = clean_text(sort_by).lower()
+    fields = {
+        "odoo_order_name": "odoo_order_id",
+        "odoo_order_date": "order_date_ts",
+        "pulled_at": "pulled_ts",
+        "ordered_at": "ordered_ts",
+        "product_name": "product_name",
+        "default_code": "default_code",
+        "asin": "asin",
+        "supplier_part_auxiliary_id": "supplier_part_auxiliary_id",
+        "quantity": "quantity",
+        "odoo_status_label": "odoo_status_label",
+        "state": "state",
+        "amazon_account_name": "amazon_account_name",
+        "tracking_status": "tracking_status",
+        "amazon_cancelled_order_id": "amazon_cancelled_order_id",
+        "amazon_order_id": "amazon_order_id",
+        "fulfilment_note": "fulfilment_note",
+        "last_error": "last_error",
+    }
+    field = fields.get(sort_key, "odoo_order_id")
+    return f"{field}:{direction},odoo_order_id:{direction}"
+
+
 def typesense_search_order_lines(
     query: str,
     store_id: Optional[int],
     page: int = 1,
     per_page: int = 100,
     filter_by: str = "",
+    sort_by: str = "odoo_order_name",
+    sort_dir: str = "desc",
 ) -> dict[str, Any]:
     settings = get_service_settings()
     if not typesense_enabled(settings):
@@ -5388,6 +5563,7 @@ def typesense_search_order_lines(
         "infix": "always",
         "num_typos": "1",
         "drop_tokens_threshold": "0",
+        "sort_by": order_sort_for_typesense(sort_by, sort_dir),
     }
     if filter_by:
         params["filter_by"] = filter_by
@@ -6262,6 +6438,12 @@ def queue_chrome_order_groups_fast(
             if candidate_blocked:
                 allowed_set = set(allowed_ids or [])
                 lines = [line for line in lines if int(line["id"]) in allowed_set]
+        if lines:
+            lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
+            blocked += date_blocked
+        if lines:
+            lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
+            blocked += shopify_blocked
         if not lines:
             return 0, int(cleared_cursor.rowcount or 0), blocked, account, []
 
@@ -6768,6 +6950,12 @@ def place_orders(
             if candidate_blocked:
                 allowed_set = set(allowed_ids or [])
                 lines = [line for line in lines if int(line["id"]) in allowed_set]
+        if lines:
+            lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
+            failed += date_blocked
+        if lines:
+            lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
+            failed += shopify_blocked
     inventory_lines: list[dict[str, Any]] = []
     purchase_lines: list[dict[str, Any]] = []
     for line in lines:
@@ -9551,6 +9739,8 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
     for row in rows:
         if not row.get("amazon_order_id"):
             continue
+        if clean_text(row.get("order_engine")) not in {"chrome", "rest", "cxml", "manual_amazon", "third_party"}:
+            continue
         grouped.setdefault((int(row["store_id"]), int(row["odoo_order_id"]), str(row["odoo_order_name"])), []).append(int(row["id"]))
     inserted = 0
     max_attempts = max(1, min(20, int(float(settings.get("shopify_job_max_attempts") or 5))))
@@ -9773,6 +9963,23 @@ def shopify_admin_order_url(shop: str, order_id: Any) -> str:
     return f"https://admin.shopify.com/store/{shop_slug}/orders/{order_id_text}"
 
 
+def shopify_fulfillment_at_from_node(node: dict[str, Any]) -> str:
+    fulfillments = node.get("fulfillments") or []
+    if isinstance(fulfillments, dict):
+        fulfillments = fulfillments.get("nodes") or fulfillments.get("edges") or []
+    dates: list[str] = []
+    for item in fulfillments if isinstance(fulfillments, list) else []:
+        fulfillment = item.get("node") if isinstance(item, dict) and item.get("node") else item
+        if not isinstance(fulfillment, dict):
+            continue
+        for key in ("deliveredAt", "updatedAt", "createdAt"):
+            value = clean_text(fulfillment.get(key))
+            if value:
+                dates.append(value)
+                break
+    return min(dates) if dates else ""
+
+
 def shopify_orders_by_name(shop: Any, order_name: str, limit: int = 20) -> list[dict[str, Any]]:
     clean_name = clean_text(order_name)
     if not clean_name:
@@ -9788,6 +9995,13 @@ def shopify_orders_by_name(shop: Any, order_name: str, limit: int = 20) -> list[
           cancelledAt
           displayFinancialStatus
           displayFulfillmentStatus
+          fulfillments(first: 10) {
+            id
+            status
+            createdAt
+            updatedAt
+            deliveredAt
+          }
         }
       }
     }
@@ -9809,6 +10023,7 @@ def shopify_orders_by_name(shop: Any, order_name: str, limit: int = 20) -> list[
             "cancelled_at": clean_text(node.get("cancelledAt")),
             "financial_status": clean_text(node.get("displayFinancialStatus")),
             "fulfillment_status": clean_text(node.get("displayFulfillmentStatus")),
+            "fulfillment_at": shopify_fulfillment_at_from_node(node),
             "url": shopify_admin_order_url(shop.shop, legacy_id),
         })
     matching.sort(key=lambda row: row.get("created_at") or "")
@@ -9830,6 +10045,13 @@ def shopify_order_by_id(shop: Any, order_id: Any) -> dict[str, Any] | None:
           cancelledAt
           displayFinancialStatus
           displayFulfillmentStatus
+          fulfillments(first: 10) {
+            id
+            status
+            createdAt
+            updatedAt
+            deliveredAt
+          }
         }
       }
     }
@@ -9847,6 +10069,7 @@ def shopify_order_by_id(shop: Any, order_id: Any) -> dict[str, Any] | None:
         "cancelled_at": clean_text(node.get("cancelledAt")),
         "financial_status": clean_text(node.get("displayFinancialStatus")),
         "fulfillment_status": clean_text(node.get("displayFulfillmentStatus")),
+        "fulfillment_at": shopify_fulfillment_at_from_node(node),
         "url": shopify_admin_order_url(shop.shop, returned_legacy_id),
     }
 
@@ -9854,6 +10077,350 @@ def shopify_order_by_id(shop: Any, order_id: Any) -> dict[str, Any] | None:
 def shopify_order_is_fulfilled(order: dict[str, Any]) -> bool:
     status = clean_text(order.get("fulfillment_status")).upper().replace(" ", "_")
     return status in {"FULFILLED", "PARTIALLY_FULFILLED", "PARTIAL"}
+
+
+def shopify_status_is_fulfilled(status: Any) -> bool:
+    normalized = clean_text(status).upper().replace(" ", "_")
+    return normalized in {"FULFILLED", "PARTIALLY_FULFILLED", "PARTIAL"}
+
+
+ODOO_DISPLAY_TIMEZONE = ZoneInfo(os.getenv("ODOO_DISPLAY_TIMEZONE", "Asia/Kolkata"))
+MIN_PLACEABLE_ODOO_ORDER_DATE = datetime(2026, 5, 18, tzinfo=ODOO_DISPLAY_TIMEZONE)
+
+
+def odoo_order_date_for_guard(row: dict[str, Any]) -> Optional[datetime]:
+    return (
+        parse_iso_date(clean_text(row.get("odoo_order_date")))
+        or parse_iso_date(clean_text(row.get("pulled_at")))
+        or parse_iso_date(clean_text(row.get("created_at")))
+    )
+
+
+def odoo_display_date_for_guard(value: datetime) -> datetime.date:
+    return value.astimezone(ODOO_DISPLAY_TIMEZONE).date()
+
+
+def amazon_order_date_guard_enabled() -> bool:
+    return str(get_service_settings().get("amazon_order_date_guard_enabled", "true")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def block_lines_before_min_odoo_order_date(conn: Any, lines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, list[str]]:
+    if not lines:
+        return lines, 0, []
+    if not amazon_order_date_guard_enabled():
+        return lines, 0, []
+    allowed: list[dict[str, Any]] = []
+    blocked_ids: list[int] = []
+    messages: list[str] = []
+    for line in lines:
+        order_date = odoo_order_date_for_guard(line)
+        display_date = odoo_display_date_for_guard(order_date) if order_date else None
+        if not display_date or display_date >= MIN_PLACEABLE_ODOO_ORDER_DATE.date():
+            allowed.append(line)
+            continue
+        blocked_ids.append(int(line["id"]))
+        order_name = clean_text(line.get("odoo_order_name")) or str(line.get("odoo_order_id") or "")
+        messages.append(f"{order_name}: Odoo order date {display_date.isoformat()} is before 2026-05-18.")
+    if blocked_ids:
+        conn.execute(
+            f"""
+            UPDATE order_lines
+            SET state='error',
+                last_error=?,
+                updated_at=?
+            WHERE id IN ({",".join("?" for _ in blocked_ids)})
+              AND COALESCE(amazon_order_id, '') = ''
+            """,
+            [
+                "Blocked: Odoo order date is before 2026-05-18, so this order must never be placed.",
+                utc_now(),
+                *blocked_ids,
+            ],
+        )
+    return allowed, len(set(blocked_ids)), sorted(set(messages))
+
+
+def upsert_shopify_order_status(
+    store_id: int,
+    route: str,
+    dest_name: str,
+    shop: str,
+    odoo_order_name: str,
+    order: Optional[dict[str, Any]],
+) -> None:
+    if not order:
+        return
+    ensure_shopify_order_status_cache_table()
+    order_id = clean_text(order.get("id"))
+    order_name = clean_text(order.get("name")) or clean_text(odoo_order_name)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO shopify_order_status_cache
+            (store_id, odoo_order_name, route, dest_name, shop, shopify_order_id, shopify_order_name,
+             shopify_order_url, financial_status, fulfillment_status, fulfillment_at, cancelled_at, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(store_id, odoo_order_name, route, dest_name) DO UPDATE SET
+              shop=excluded.shop,
+              shopify_order_id=excluded.shopify_order_id,
+              shopify_order_name=excluded.shopify_order_name,
+              shopify_order_url=excluded.shopify_order_url,
+              financial_status=excluded.financial_status,
+              fulfillment_status=excluded.fulfillment_status,
+              fulfillment_at=excluded.fulfillment_at,
+              cancelled_at=excluded.cancelled_at,
+              synced_at=excluded.synced_at
+            """,
+            (
+                int(store_id),
+                clean_text(odoo_order_name),
+                clean_text(route).lower(),
+                clean_text(dest_name),
+                clean_text(shop),
+                order_id,
+                order_name,
+                clean_text(order.get("url")) or shopify_admin_order_url(shop, order_id),
+                clean_text(order.get("financial_status")),
+                clean_text(order.get("fulfillment_status")) or "UNFULFILLED",
+                clean_text(order.get("fulfillment_at")),
+                clean_text(order.get("cancelled_at")),
+                utc_now(),
+            ),
+        )
+
+
+def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], force: bool = False) -> None:
+    clean_names = sorted({clean_text(name).upper() for name in order_names if clean_text(name)})
+    if not clean_names:
+        return
+    ensure_shopify_order_status_cache_table()
+    now = datetime.now(timezone.utc)
+    if not force:
+        with db() as conn:
+            cached = conn.execute(
+                f"""
+                SELECT odoo_order_name, MAX(synced_at) AS synced_at
+                FROM shopify_order_status_cache
+                WHERE store_id=?
+                  AND UPPER(odoo_order_name) IN ({",".join("?" for _ in clean_names)})
+                GROUP BY odoo_order_name
+                """,
+                [store_id, *clean_names],
+            ).fetchall()
+        fresh_names = set()
+        for row in cached:
+            synced_at = parse_iso_date(clean_text(row.get("synced_at")))
+            if synced_at and (now - synced_at).total_seconds() < 1800:
+                fresh_names.add(clean_text(row.get("odoo_order_name")).upper())
+        clean_names = [name for name in clean_names if name not in fresh_names]
+        if not clean_names:
+            return
+    for route in ("dtc", "dtb"):
+        try:
+            module, _script_path, state_scope = shopify_route_script_config(route)
+            state = module.StateDB(state_scope)
+            clients = []
+            for dest in module.DESTS:
+                token = module.get_shopify_access_token(dest, state)
+                clients.append(module.ShopifyClient(dest["name"], dest["shop"], token, dest.get("api_version") or "2025-10"))
+        except Exception:
+            continue
+        for shop in clients:
+            for order_name in clean_names:
+                try:
+                    orders = shopify_orders_by_name(shop, order_name, limit=10)
+                    active = [order for order in orders if not order.get("cancelled_at")]
+                    chosen = next((order for order in active if shopify_order_is_fulfilled(order)), active[0] if active else (orders[0] if orders else None))
+                    if chosen:
+                        upsert_shopify_order_status(store_id, route, shop.name, shop.shop, order_name, chosen)
+                except Exception:
+                    continue
+
+
+def attach_shopify_status_to_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    store_ids = sorted({int(row["store_id"]) for row in rows if row.get("store_id")})
+    order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in rows if clean_text(row.get("odoo_order_name"))})
+    if not store_ids or not order_names:
+        return rows
+    ensure_shopify_order_status_cache_table()
+    with db() as conn:
+        cached_rows = conn.execute(
+            f"""
+            SELECT DISTINCT ON (store_id, UPPER(odoo_order_name))
+                   *
+            FROM shopify_order_status_cache
+            WHERE store_id = ANY(?::int[])
+              AND UPPER(odoo_order_name) = ANY(?::text[])
+            ORDER BY store_id, UPPER(odoo_order_name),
+                     CASE WHEN fulfillment_status ILIKE '%FULFILLED%' THEN 0 ELSE 1 END,
+                     synced_at DESC
+            """,
+            (store_ids, order_names),
+        ).fetchall()
+    status_by_key = {
+        (int(row["store_id"]), clean_text(row["odoo_order_name"]).upper()): dict(row)
+        for row in cached_rows
+    }
+    for row in rows:
+        cached = status_by_key.get((int(row.get("store_id") or 0), clean_text(row.get("odoo_order_name")).upper()))
+        row["shopify_order_id"] = clean_text((cached or {}).get("shopify_order_id"))
+        row["shopify_order_name"] = clean_text((cached or {}).get("shopify_order_name"))
+        row["shopify_order_url"] = clean_text((cached or {}).get("shopify_order_url"))
+        row["shopify_financial_status"] = clean_text((cached or {}).get("financial_status"))
+        row["shopify_fulfillment_status"] = clean_text((cached or {}).get("fulfillment_status"))
+        row["shopify_fulfillment_at"] = clean_text((cached or {}).get("fulfillment_at"))
+        row["shopify_synced_at"] = clean_text((cached or {}).get("synced_at"))
+    return rows
+
+
+def block_lines_with_fulfilled_shopify_orders(conn: Any, store_id: int, lines: list[dict[str, Any]], live_sync: bool = True) -> tuple[list[dict[str, Any]], int, list[str]]:
+    if not lines:
+        return lines, 0, []
+    order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in lines if clean_text(row.get("odoo_order_name"))})
+    ensure_shopify_order_status_cache_table()
+    if live_sync:
+        sync_shopify_status_for_order_names(store_id, order_names, force=True)
+    cached_rows = conn.execute(
+        f"""
+        SELECT *
+        FROM shopify_order_status_cache
+        WHERE store_id=?
+          AND UPPER(odoo_order_name) IN ({",".join("?" for _ in order_names)})
+          AND COALESCE(cancelled_at, '') = ''
+        """,
+        [store_id, *order_names],
+    ).fetchall() if order_names else []
+    fulfilled_by_order: dict[str, dict[str, Any]] = {}
+    for cached in cached_rows:
+        if shopify_status_is_fulfilled(cached.get("fulfillment_status")):
+            fulfilled_by_order[clean_text(cached.get("odoo_order_name")).upper()] = dict(cached)
+    if not fulfilled_by_order:
+        return lines, 0, []
+    allowed: list[dict[str, Any]] = []
+    blocked_ids: list[int] = []
+    messages: list[str] = []
+    for line in lines:
+        order_name = clean_text(line.get("odoo_order_name")).upper()
+        blocked = fulfilled_by_order.get(order_name)
+        if not blocked:
+            allowed.append(line)
+            continue
+        blocked_ids.append(int(line["id"]))
+        shopify_ref = clean_text(blocked.get("shopify_order_name")) or clean_text(blocked.get("shopify_order_id")) or order_name
+        messages.append(f"{order_name}: Shopify order {shopify_ref} is already fulfilled; customer may have received it.")
+    if blocked_ids:
+        conn.execute(
+            f"""
+            UPDATE order_lines
+            SET state='error',
+                last_error=?,
+                updated_at=?
+            WHERE id IN ({",".join("?" for _ in blocked_ids)})
+              AND COALESCE(amazon_order_id, '') = ''
+            """,
+            [
+                "Shopify order is already fulfilled. Amazon order or third-party reference is blocked because the customer may have received it.",
+                utc_now(),
+                *blocked_ids,
+            ],
+        )
+    return allowed, len(set(blocked_ids)), sorted(set(messages))
+
+
+def set_shopify_order_status_force_sync_progress(**updates: Any) -> dict[str, Any]:
+    with _SHOPIFY_ORDER_STATUS_FORCE_SYNC_LOCK:
+        _SHOPIFY_ORDER_STATUS_FORCE_SYNC_PROGRESS.update(updates)
+        _SHOPIFY_ORDER_STATUS_FORCE_SYNC_PROGRESS["updated_at"] = utc_now()
+        return dict(_SHOPIFY_ORDER_STATUS_FORCE_SYNC_PROGRESS)
+
+
+def shopify_order_status_force_sync_progress() -> dict[str, Any]:
+    with _SHOPIFY_ORDER_STATUS_FORCE_SYNC_LOCK:
+        return dict(_SHOPIFY_ORDER_STATUS_FORCE_SYNC_PROGRESS)
+
+
+def count_distinct_odoo_orders(store_id: Optional[int] = None, where_sql: str = "", params: Optional[list[Any]] = None) -> int:
+    clause = "WHERE odoo_order_id IS NOT NULL"
+    query_params: list[Any] = []
+    if store_id is not None:
+        clause += " AND store_id=?"
+        query_params.append(store_id)
+    if where_sql:
+        clause += f" AND ({where_sql})"
+        query_params.extend(params or [])
+    with db() as conn:
+        row = conn.execute(f"SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) AS count FROM order_lines {clause}", query_params).fetchone()
+    return int(row["count"] or 0)
+
+
+def force_sync_shopify_order_statuses(store_id: Optional[int] = None, batch_size: int = 25, pause_seconds: float = 1.0) -> None:
+    batch_size = max(5, min(50, int(batch_size or 25)))
+    pause_seconds = max(0.2, min(5.0, float(pause_seconds or 1.0)))
+    started_at = utc_now()
+    try:
+        with db() as conn:
+            rows = rows_to_dicts(conn.execute(
+                """
+                SELECT DISTINCT store_id, odoo_order_name
+                FROM order_lines
+                WHERE (? IS NULL OR store_id=?)
+                  AND COALESCE(odoo_order_name, '') != ''
+                ORDER BY store_id, odoo_order_name DESC
+                """,
+                (store_id, store_id),
+            ).fetchall())
+        total = len(rows)
+        set_shopify_order_status_force_sync_progress(
+            status="running",
+            total=total,
+            processed=0,
+            matched=0,
+            current_order="",
+            message=f"Force syncing Shopify status for {total} Odoo order{'s' if total != 1 else ''} in batches of {batch_size}.",
+            started_at=started_at,
+            completed_at="",
+            error="",
+        )
+        matched_before = 0
+        processed = 0
+        for offset in range(0, total, batch_size):
+            batch = rows[offset:offset + batch_size]
+            by_store: dict[int, list[str]] = {}
+            for row in batch:
+                by_store.setdefault(int(row["store_id"]), []).append(clean_text(row["odoo_order_name"]))
+            for batch_store_id, order_names in by_store.items():
+                sync_shopify_status_for_order_names(batch_store_id, order_names, force=True)
+            processed += len(batch)
+            with db() as conn:
+                matched = int(conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT store_id || ':' || odoo_order_name) AS count
+                    FROM shopify_order_status_cache
+                    WHERE (? IS NULL OR store_id=?)
+                    """,
+                    (store_id, store_id),
+                ).fetchone()["count"] or 0)
+            matched_before = matched
+            set_shopify_order_status_force_sync_progress(
+                processed=processed,
+                matched=matched,
+                current_order=clean_text(batch[-1].get("odoo_order_name")) if batch else "",
+                message=f"Synced {processed} of {total} Odoo order{'s' if total != 1 else ''}; matched {matched} Shopify order{'s' if matched != 1 else ''}.",
+            )
+            if processed < total:
+                time.sleep(pause_seconds)
+        set_shopify_order_status_force_sync_progress(
+            status="completed",
+            processed=total,
+            matched=matched_before,
+            current_order="",
+            completed_at=utc_now(),
+            message=f"Shopify status force sync complete. Matched {matched_before} of {total} Odoo order{'s' if total != 1 else ''}.",
+        )
+    except Exception as exc:
+        set_shopify_order_status_force_sync_progress(status="failed", error=str(exc), completed_at=utc_now(), message=f"Shopify status force sync failed: {exc}")
 
 
 def pushed_shopify_order_targets(store_id: Optional[int] = None) -> list[dict[str, str]]:
@@ -10563,8 +11130,12 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
                 fulfilled = [order for order in active_existing if shopify_order_is_fulfilled(order)]
                 keep = fulfilled[0] if fulfilled else active_existing[0]
                 state.mark_order_synced(shop.name, src_order_key, clean_text(keep.get("id")) or None)
+                upsert_shopify_order_status(int(job["store_id"]), route, shop.name, shop.shop, str(job["odoo_order_name"]), keep)
                 return
         module.sync_one_order_to_dest(odoo, shop, state, str(job["odoo_order_name"]), rename_manager)
+        synced_orders = [order for order in shopify_orders_by_name(shop, str(job["odoo_order_name"]), limit=5) if not order.get("cancelled_at")]
+        if synced_orders:
+            upsert_shopify_order_status(int(job["store_id"]), route, shop.name, shop.shop, str(job["odoo_order_name"]), synced_orders[-1])
 
 
 def process_one_shopify_fulfilment_job(worker_name: str = "") -> bool:
@@ -11191,8 +11762,9 @@ def get_default_ordering_engine() -> str:
     return normalize_ordering_engine(get_setting("default_ordering_engine", "rest"))
 
 
-def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
+    order_by_sql = order_sort_sql(sort_by, sort_dir)
     with db() as conn:
         payload = conn.execute(
             f"""
@@ -11204,10 +11776,10 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
             ),
             page_rows AS (
                 SELECT {ORDER_LINE_PAGE_SELECT},
-                       ROW_NUMBER() OVER (ORDER BY odoo_order_id DESC, asin, id) AS sort_order
+                       ROW_NUMBER() OVER (ORDER BY {order_by_sql}) AS sort_order
                 FROM order_lines
                 WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
-                ORDER BY odoo_order_id DESC, asin, id
+                ORDER BY {order_by_sql}
                 LIMIT ? OFFSET ?
             ),
             page_asins AS (
@@ -11279,7 +11851,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(ac)), '[]'::json) FROM (SELECT * FROM amazon_accounts ORDER BY is_default DESC, name) ac) AS amazon_accounts,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(p)), '[]'::json) FROM (SELECT * FROM punchout_return_urls ORDER BY is_default DESC, label) p) AS punchout_return_urls,
                 (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order), '[]'::json) FROM line_rows) AS rows,
-                (SELECT COUNT(*) FROM order_lines WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))) AS total,
+                (SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) FROM order_lines WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen)) AND odoo_order_id IS NOT NULL) AS total,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(c)), '[]'::json) FROM (
                     SELECT state, COUNT(*) AS count
                     FROM order_lines
@@ -11303,6 +11875,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     row_dicts = payload.get("rows") or []
     stores_by_id = {store["id"]: store for store in stores}
     row_dicts = backfill_missing_order_dates(row_dicts)
+    attach_shopify_status_to_rows(row_dicts)
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
@@ -11334,17 +11907,18 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     }
 
 
-def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
+    order_by_sql = order_sort_sql(sort_by, sort_dir)
     with db() as conn:
         payload = conn.execute(
             f"""
             WITH page_rows AS (
                 SELECT {ORDER_LINE_PAGE_SELECT},
-                       ROW_NUMBER() OVER (ORDER BY odoo_order_id DESC, asin, id) AS sort_order
+                       ROW_NUMBER() OVER (ORDER BY {order_by_sql}) AS sort_order
                 FROM order_lines
                 WHERE (? IS NULL OR store_id=?)
-                ORDER BY odoo_order_id DESC, asin, id
+                ORDER BY {order_by_sql}
                 LIMIT ? OFFSET ?
             ),
             page_asins AS (
@@ -11412,7 +11986,7 @@ def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_pag
             )
             SELECT
                 (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order), '[]'::json) FROM line_rows) AS rows,
-                (SELECT COUNT(*) FROM order_lines WHERE (? IS NULL OR store_id=?)) AS total
+                (SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) FROM order_lines WHERE (? IS NULL OR store_id=?) AND odoo_order_id IS NOT NULL) AS total
             """,
             (store_id, store_id, per_page, offset, store_id, store_id),
         ).fetchone()
@@ -11451,6 +12025,7 @@ def hydrate_order_line_rows(rows: list[dict[str, Any]], stores: Optional[list[di
     stores = stores or rows_to_dicts(list_stores())
     stores_by_id = {store["id"]: store for store in stores}
     row_dicts = backfill_missing_order_dates(row_dicts)
+    attach_shopify_status_to_rows(row_dicts)
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
@@ -11513,9 +12088,10 @@ def order_lines_by_ids(ids: list[int], stores: Optional[list[dict[str, Any]]] = 
     return hydrate_order_line_rows(rows, stores)
 
 
-def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100) -> dict[str, Any]:
+def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
     clean_query = query.strip()
+    order_by_sql = order_sort_sql(sort_by, sort_dir)
     exact_columns = (
         "odoo_order_name",
         "amazon_order_id",
@@ -11534,14 +12110,14 @@ def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, p
         exact_params.append(int(store_id))
     with db() as conn:
         exact_total = int(conn.execute(
-            f"SELECT COUNT(*) AS count FROM order_lines WHERE ({exact_clause}){exact_store_clause}",
+            f"SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) AS count FROM order_lines WHERE ({exact_clause}){exact_store_clause} AND odoo_order_id IS NOT NULL",
             exact_params,
         ).fetchone()["count"] or 0)
         if exact_total:
             rows = conn.execute(
                 f"""
                 {order_line_search_select_sql(f"WHERE ({exact_clause}){exact_store_clause}")}
-                ORDER BY odoo_order_id DESC, asin, id
+                ORDER BY {order_by_sql}
                 LIMIT ? OFFSET ?
                 """,
                 [*exact_params, per_page, offset],
@@ -11563,13 +12139,13 @@ def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, p
     where_sql = f"WHERE ({search_clause}){store_clause}"
     with db() as conn:
         total = int(conn.execute(
-            f"SELECT COUNT(*) AS count FROM order_lines {where_sql}",
+            f"SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) AS count FROM order_lines {where_sql} AND odoo_order_id IS NOT NULL",
             params,
         ).fetchone()["count"] or 0)
         rows = conn.execute(
             f"""
             {order_line_search_select_sql(where_sql)}
-            ORDER BY odoo_order_id DESC, asin, id
+            ORDER BY {order_by_sql}
             LIMIT ? OFFSET ?
             """,
             [*params, per_page, offset],
@@ -11701,6 +12277,7 @@ def startup() -> None:
     if not _sync_thread_started:
         with db() as conn:
             conn.execute("SELECT 1")
+        ensure_shopify_order_status_cache_table()
         should_reindex_typesense = typesense_enabled() and get_setting("typesense_schema_version", "") != TYPESENSE_SCHEMA_VERSION
         threading.Thread(target=init_db, daemon=True).start()
         threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
@@ -11713,15 +12290,15 @@ def startup() -> None:
 
 
 @app.get("/api/dashboard")
-def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    return dashboard_data(store_id, page, per_page)
+def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
+    return dashboard_data(store_id, page, per_page, sort_by, sort_dir)
 
 
 @app.get("/api/orders")
-def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all") -> dict[str, Any]:
+def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
     filter_by, filtered = order_condition_filter(condition, store_id)
     if filtered:
-        result = typesense_search_order_lines("*", store_id, page, per_page, filter_by=filter_by)
+        result = typesense_search_order_lines("*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
         if not result.get("enabled"):
             raise HTTPException(503, "Typesense is required for order condition filters.")
         return {
@@ -11731,7 +12308,7 @@ def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 10
             "total": int(result.get("total") or 0),
             "search_engine": "typesense",
         }
-    data = order_lines_page_data(store_id, page, per_page)
+    data = order_lines_page_data(store_id, page, per_page, sort_by, sort_dir)
     data["search_engine"] = "postgres"
     return data
 
@@ -11927,13 +12504,13 @@ def api_delete_backup(payload: BackupKeyPayload) -> dict[str, Any]:
 
 
 @app.get("/api/search")
-def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all") -> dict[str, Any]:
+def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_name", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
     filter_by, filtered = order_condition_filter(condition, store_id)
     if not q.strip() and not filtered:
-        return dashboard_data(store_id, page, per_page)
+        return dashboard_data(store_id, page, per_page, sort_by, sort_dir)
     try:
-        search_result = typesense_search_order_lines(q or "*", store_id, page, per_page, filter_by=filter_by)
+        search_result = typesense_search_order_lines(q or "*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
         ids = list(search_result.get("ids") or [])
         if search_result.get("enabled"):
             return {
@@ -11952,7 +12529,7 @@ def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_p
                 raise exc
             raise HTTPException(503, f"Typesense order filter failed: {exc}")
         search_warning = str(exc)
-    fallback = search_order_lines_sql(q, store_id, page, per_page)
+    fallback = search_order_lines_sql(q, store_id, page, per_page, sort_by, sort_dir)
     fallback["search_engine"] = "postgres"
     fallback["search_warning"] = search_warning
     return fallback
@@ -13368,6 +13945,7 @@ def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None, limit: int = 
             FROM order_lines
             WHERE (? IS NULL OR store_id=?)
               AND COALESCE(amazon_order_id, '') != ''
+              AND order_engine IN ('chrome', 'rest', 'cxml', 'manual_amazon', 'third_party')
               AND state IN ('ordered', 'dispatched', 'delivered')
             ORDER BY ordered_at DESC, updated_at DESC
             LIMIT ?
@@ -13423,6 +14001,47 @@ def api_shopify_fulfilment_run_one() -> dict[str, Any]:
 @app.get("/api/shopify/fulfilment/progress")
 def api_shopify_fulfilment_progress() -> dict[str, Any]:
     return {"ok": True, "progress": shopify_fulfilment_progress()}
+
+
+@app.post("/api/shopify/orders/status/sync")
+def api_shopify_orders_status_sync(payload: dict[str, Any]) -> dict[str, Any]:
+    store_id = int(payload.get("store_id") or 0)
+    if not store_id:
+        raise HTTPException(400, "store_id is required")
+    order_names = [clean_text(name).upper() for name in (payload.get("order_names") or []) if clean_text(name)]
+    if not order_names:
+        return {"ok": True, "synced": 0, "rows": []}
+    order_names = sorted(set(order_names))[:100]
+    sync_shopify_status_for_order_names(store_id, order_names, force=bool(payload.get("force")))
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM shopify_order_status_cache
+            WHERE store_id=?
+              AND UPPER(odoo_order_name) IN ({",".join("?" for _ in order_names)})
+            ORDER BY synced_at DESC
+            """,
+            [store_id, *order_names],
+        ).fetchall()
+    return {"ok": True, "synced": len(rows), "rows": rows_to_dicts(rows)}
+
+
+@app.post("/api/shopify/orders/status/force-sync")
+def api_shopify_orders_status_force_sync(payload: dict[str, Any]) -> dict[str, Any]:
+    progress = shopify_order_status_force_sync_progress()
+    if str(progress.get("status") or "") == "running":
+        return {"ok": True, "message": "Shopify order status force sync is already running.", "progress": progress}
+    store_id = parse_optional_int(payload.get("store_id"))
+    batch_size = int(payload.get("batch_size") or 25)
+    pause_seconds = float(payload.get("pause_seconds") or 1.0)
+    threading.Thread(target=force_sync_shopify_order_statuses, args=(store_id, batch_size, pause_seconds), daemon=True).start()
+    return {"ok": True, "message": "Shopify order status force sync started.", "progress": shopify_order_status_force_sync_progress()}
+
+
+@app.get("/api/shopify/orders/status/force-sync")
+def api_shopify_orders_status_force_sync_progress() -> dict[str, Any]:
+    return {"ok": True, "progress": shopify_order_status_force_sync_progress()}
 
 
 @app.post("/api/shopify/fulfilment/duplicates/scan")
@@ -13669,6 +14288,7 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
         suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
         conflicts = amazon_history_asin_conflicts(conn, records, matches, suggestions)
         amazon_history_apply_quantity_checks(records, matches, suggestions)
+        amazon_history_apply_order_date_checks(records, matches, suggestions)
         unmatched = upsert_amazon_history_unmatched(conn, records, set(matches.keys()))
     for record in records:
         match = matches.get(record["amazon_order_id"])
@@ -15040,6 +15660,8 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         return {"ok": True, "matched": 0, "skipped": 0, "order_names": [], "message": f"No Nutricity order references found for {amazon_order_id}."}
     amazon_order_url = clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id)
     amazon_account_name = clean_text(payload.amazon_account_name) or "Chrome Manual Matcher"
+    amazon_order_placed_at = parse_amazon_order_placed_date(payload.order_date)
+    ordered_at = amazon_order_placed_at or utc_now()
     line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
     with db() as conn:
         params: list[Any] = refs[:]
@@ -15068,11 +15690,51 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         ).fetchall())
         if not rows:
             return {"ok": True, "matched": 0, "skipped": len(refs), "order_names": refs, "message": f"No unmatched pulled rows found for {', '.join(refs)}."}
+        date_repair_only = bool(amazon_order_placed_at) and all(clean_text(row.get("amazon_order_id")) == amazon_order_id for row in rows)
+        if not date_repair_only:
+            allowed_rows: list[dict[str, Any]] = []
+            blocked_total = 0
+            blocked_messages: list[str] = []
+            for row_store_id in sorted({int(row["store_id"]) for row in rows}):
+                store_rows = [row for row in rows if int(row["store_id"]) == row_store_id]
+                date_allowed, date_blocked, date_messages = block_lines_before_min_odoo_order_date(conn, store_rows)
+                allowed, blocked_count, messages = block_lines_with_fulfilled_shopify_orders(conn, row_store_id, date_allowed)
+                allowed_rows.extend(allowed)
+                blocked_total += date_blocked + blocked_count
+                blocked_messages.extend([*date_messages, *messages])
+            rows = allowed_rows
+            if not rows:
+                return {
+                    "ok": False,
+                    "matched": 0,
+                    "skipped": blocked_total,
+                    "order_names": refs,
+                    "message": "Blocked because selected order is not placeable. " + " | ".join(sorted(set(blocked_messages))),
+                }
         now = utc_now()
         updated_for_shopify: list[dict[str, Any]] = []
         for row in rows:
             if clean_text(row.get("amazon_order_id")) == amazon_order_id:
-                updated_for_shopify.append(dict(row))
+                if amazon_order_placed_at:
+                    conn.execute(
+                        """
+                        UPDATE order_lines
+                        SET amazon_order_url=?,
+                            amazon_account_name=?,
+                            order_engine='chrome',
+                            amazon_status='ordered',
+                            state='ordered',
+                            last_error=NULL,
+                            ordered_at=?,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (amazon_order_url, amazon_account_name, amazon_order_placed_at, now, row["id"]),
+                    )
+                    updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+                    updated_for_shopify.append(dict(updated) if updated else dict(row))
+                else:
+                    updated_for_shopify.append(dict(row))
                 continue
             conn.execute(
                 """
@@ -15089,11 +15751,11 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                     amazon_status='ordered',
                     state='ordered',
                     last_error=NULL,
-                    ordered_at=COALESCE(ordered_at, ?),
+                    ordered_at=?,
                     updated_at=?
                 WHERE id=?
                 """,
-                (amazon_order_id, amazon_order_url, amazon_account_name, amazon_order_id, now, now, row["id"]),
+                (amazon_order_id, amazon_order_url, amazon_account_name, amazon_order_id, ordered_at, now, row["id"]),
             )
             updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
             if updated:
@@ -15172,6 +15834,20 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
         ).fetchall())
         if not rows:
             raise HTTPException(400, "No open lines found for the selected Odoo order.")
+        rows, date_blocked, date_messages = block_lines_before_min_odoo_order_date(conn, rows)
+        if not rows:
+            raise HTTPException(
+                409,
+                "Blocked because Odoo order date is before 2026-05-18. "
+                + (" | ".join(date_messages) if date_messages else "This order must never be placed."),
+            )
+        rows, shopify_blocked, shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, rows)
+        if not rows:
+            raise HTTPException(
+                409,
+                "Blocked because matching Shopify order is already fulfilled. "
+                + (" | ".join(shopify_messages) if shopify_messages else "The customer may have received it."),
+            )
         total_store_value = sum(order_line_store_total(row) for row in rows)
         third_party_cost_by_id: dict[int, float] = {}
         if third_party:

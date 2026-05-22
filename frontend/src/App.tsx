@@ -188,6 +188,12 @@ type OrderLine = {
   odoo_status_label: string
   amazon_order_id: string
   amazon_order_url: string
+  shopify_order_id?: string
+  shopify_order_name?: string
+  shopify_order_url?: string
+  shopify_financial_status?: string
+  shopify_fulfillment_status?: string
+  shopify_fulfillment_at?: string
   amazon_account_name: string
   order_engine: string
   tracking_status: string
@@ -757,6 +763,17 @@ type ShopifyProductRepairLog = {
   logged_at?: string
 }
 
+type ShopifyOrderStatusForceSyncProgress = {
+  status: string
+  total: number
+  processed: number
+  matched: number
+  current_order?: string
+  message?: string
+  error?: string
+  completed_at?: string
+}
+
 type ShopifyTrackingJob = {
   id: string
   status: string
@@ -974,10 +991,32 @@ type OrderColumnKey =
   | "tracking"
   | "cancelled_earlier"
   | "amazon_order"
+  | "shopify_order"
+  | "shopify_fulfillment"
+  | "shopify_fulfillment_at"
   | "comments"
   | "error"
 
-type SortKey = "odoo_order_date" | "pulled_at" | "ordered_at" | "odoo_order_name"
+type SortKey =
+  | "odoo_order_name"
+  | "odoo_order_date"
+  | "destination_country"
+  | "product_name"
+  | "default_code"
+  | "pulled_at"
+  | "ordered_at"
+  | "asin"
+  | "supplier_part_auxiliary_id"
+  | "quantity"
+  | "odoo_status_label"
+  | "state"
+  | "order_engine"
+  | "amazon_account_name"
+  | "tracking_status"
+  | "amazon_cancelled_order_id"
+  | "amazon_order_id"
+  | "fulfilment_note"
+  | "last_error"
 type SortDirection = "asc" | "desc"
 
 type OrderColumn = {
@@ -993,24 +1032,27 @@ const ORDER_TABLE_STORAGE_KEY = "fulfilment.orderTable.columns.v1"
 const defaultOrderColumns: OrderColumn[] = [
   { key: "odoo_order", label: "Odoo Order", width: "w-32", sortable: "odoo_order_name" },
   { key: "odoo_order_date", label: "Order Date", width: "w-44", sortable: "odoo_order_date" },
-  { key: "destination_country", label: "Country", width: "w-36" },
-  { key: "product", label: "Product", width: "w-[520px]" },
-  { key: "reference", label: "Reference", width: "w-48" },
+  { key: "destination_country", label: "Country", width: "w-36", sortable: "destination_country" },
+  { key: "product", label: "Product", width: "w-[520px]", sortable: "product_name" },
+  { key: "reference", label: "Reference", width: "w-48", sortable: "default_code" },
   { key: "pulled_at", label: "Pulled At", width: "w-44", sortable: "pulled_at" },
   { key: "ordered_at", label: "Placed At", width: "w-44", sortable: "ordered_at" },
-  { key: "asin", label: "ASIN", width: "w-36" },
-  { key: "spaid", label: "SPAID", width: "w-44" },
-  { key: "qty", label: "Qty", width: "w-20" },
-  { key: "odoo_status", label: "Odoo Status", width: "w-32" },
+  { key: "asin", label: "ASIN", width: "w-36", sortable: "asin" },
+  { key: "spaid", label: "SPAID", width: "w-44", sortable: "supplier_part_auxiliary_id" },
+  { key: "qty", label: "Qty", width: "w-20", sortable: "quantity" },
+  { key: "odoo_status", label: "Odoo Status", width: "w-32", sortable: "odoo_status_label" },
   { key: "inventory", label: "Inventory", width: "w-36" },
-  { key: "state", label: "State", width: "w-28" },
-  { key: "engine", label: "Engine", width: "w-28" },
-  { key: "amazon_account", label: "Amazon Account", width: "w-44" },
-  { key: "tracking", label: "Tracking", width: "w-36" },
-  { key: "cancelled_earlier", label: "Cancelled Earlier", width: "w-36" },
-  { key: "amazon_order", label: "Amazon Order", width: "w-44" },
-  { key: "comments", label: "Comments", width: "w-80" },
-  { key: "error", label: "Error", width: "w-64" },
+  { key: "state", label: "State", width: "w-28", sortable: "state" },
+  { key: "engine", label: "Engine", width: "w-28", sortable: "order_engine" },
+  { key: "amazon_account", label: "Amazon Account", width: "w-44", sortable: "amazon_account_name" },
+  { key: "tracking", label: "Tracking", width: "w-36", sortable: "tracking_status" },
+  { key: "cancelled_earlier", label: "Cancelled Earlier", width: "w-36", sortable: "amazon_cancelled_order_id" },
+  { key: "amazon_order", label: "Amazon Order", width: "w-44", sortable: "amazon_order_id" },
+  { key: "shopify_order", label: "Shopify Order", width: "w-44" },
+  { key: "shopify_fulfillment", label: "Shopify Fulfilment", width: "w-40" },
+  { key: "shopify_fulfillment_at", label: "Shopify Fulfilled At", width: "w-44" },
+  { key: "comments", label: "Comments", width: "w-80", sortable: "fulfilment_note" },
+  { key: "error", label: "Error", width: "w-64", sortable: "last_error" },
 ]
 
 function loadOrderColumns() {
@@ -1032,9 +1074,13 @@ function loadOrderColumns() {
 
 function formatDateTime(value?: string) {
   if (!value) return ""
-  const date = new Date(value.includes("T") ? value : value.replace(" ", "T"))
+  const normalized = value.includes("T") ? value : value.replace(" ", "T")
+  const hasTime = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(normalized)
+  const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized)
+  const date = new Date(hasTime && !hasTimezone ? `${normalized}Z` : normalized)
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString(undefined, {
+    timeZone: "Asia/Kolkata",
     year: "numeric",
     month: "short",
     day: "2-digit",
@@ -1048,12 +1094,6 @@ function formatFileSize(value?: number) {
   if (!bytes) return "0 KB"
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-}
-
-function dateTimeValue(value?: string) {
-  if (!value) return 0
-  const parsed = Date.parse(value.includes("T") ? value : value.replace(" ", "T"))
-  return Number.isNaN(parsed) ? 0 : parsed
 }
 
 function formatMoney(value?: number) {
@@ -1654,12 +1694,14 @@ function PaginationControls({
   onPage,
   disabled = false,
   perPage = PAGE_SIZE,
+  label = "rows",
 }: {
   page: number
   total: number
   onPage: (page: number) => void
   disabled?: boolean
   perPage?: number
+  label?: string
 }) {
   const totalPages = Math.max(1, Math.ceil(total / perPage))
   const candidatePages = Array.from(new Set([
@@ -1684,7 +1726,7 @@ function PaginationControls({
   return (
     <div className="pagination-wrap">
       <p className="m-0 text-sm text-muted-foreground">
-        Page {page} / {totalPages} - {total.toLocaleString()} rows
+        Page {page} / {totalPages} - {total.toLocaleString()} {label}
       </p>
       <ul className="pagination pagination-outline m-0">
         <li className={`page-item ${disabled || page <= 1 ? "disabled" : ""}`}>
@@ -1874,6 +1916,7 @@ function App() {
   const [columnDropTarget, setColumnDropTarget] = useState<{ key: OrderColumnKey; after: boolean } | null>(null)
   const [busy, setBusy] = useState("")
   const [modal, setModal] = useState<ModalState>(null)
+  const [shopifyStatusForceSync, setShopifyStatusForceSync] = useState<ShopifyOrderStatusForceSyncProgress | null>(null)
   const [adminTokenSaved, setAdminTokenSaved] = useState(Boolean(savedAdminToken()))
   const [adminAccessOpen, setAdminAccessOpen] = useState(!savedAdminToken())
   const [adminAuthError, setAdminAuthError] = useState("")
@@ -1881,6 +1924,9 @@ function App() {
   const [uiCopy, setUiCopy] = useState<UiCopy>({})
   const [editingCopyKey, setEditingCopyKey] = useState<string | null>(null)
   const searchAbortRef = useRef<AbortController | null>(null)
+  const shopifyStatusSyncKeyRef = useRef("")
+  const ordersRequestSeqRef = useRef(0)
+  const shopifyStatusCompletedRefreshRef = useRef("")
 
   function pagedQuery(nextStoreId: string, nextPage = 1, extra?: Record<string, string | number>) {
     const query = new URLSearchParams()
@@ -1934,6 +1980,20 @@ function App() {
     setSelected([])
   }
 
+  function updateSortKey(value: SortKey) {
+    setSortKey(value)
+    setOrdersPage(1)
+    setOrdersSelectAll(false)
+    setSelected([])
+  }
+
+  function updateSortDirection(value: SortDirection) {
+    setSortDirection(value)
+    setOrdersPage(1)
+    setOrdersSelectAll(false)
+    setSelected([])
+  }
+
   function applyDashboardData(next: DashboardData, nextPage = ordersPage) {
     setData(next)
     saveDashboardCache(next)
@@ -1955,23 +2015,43 @@ function App() {
   }
 
   async function refresh(nextStoreId = storeId, nextPage = ordersPage) {
-    const query = pagedQuery(nextStoreId, nextPage)
+    const requestSeq = ++ordersRequestSeqRef.current
+    const query = pagedQuery(nextStoreId, nextPage, { sort_by: sortKey, sort_dir: sortDirection })
     const next = await api<DashboardData>(`/api/dashboard${query}`)
+    if (requestSeq !== ordersRequestSeqRef.current) return
     applyDashboardData(next, nextPage)
   }
 
   async function refreshOrdersPage(nextStoreId = storeId, nextPage = ordersPage) {
+    const requestSeq = ++ordersRequestSeqRef.current
     const result = await api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(
-      `/api/orders${pagedQuery(nextStoreId, nextPage, { condition: orderCondition })}`,
+      `/api/orders${pagedQuery(nextStoreId, nextPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}`,
     )
+    if (requestSeq !== ordersRequestSeqRef.current) return
     setData((current) => {
       if (!current) return current
       const next = { ...current, rows: result.rows, page: result.page || nextPage, per_page: result.per_page, total: result.total }
       saveDashboardCache(next)
       return next
     })
-    setOrdersPage(result.page || nextPage)
     setOrdersTotal(result.total || 0)
+  }
+
+  async function forceSyncShopifyStatuses() {
+    if (!storeId || busy) return
+    try {
+      setBusy("Force Sync Shopify")
+      const result = await api<{ ok: boolean; message: string; progress: ShopifyOrderStatusForceSyncProgress }>("/api/shopify/orders/status/force-sync", {
+        method: "POST",
+        body: JSON.stringify({ store_id: Number(storeId), batch_size: 25, pause_seconds: 1 }),
+      })
+      setShopifyStatusForceSync(result.progress)
+      setModal({ ok: result.ok, title: "Shopify Status Sync", message: result.message || "Shopify status sync started." })
+    } catch (error) {
+      setModal({ ok: false, title: "Shopify Status Sync", message: String(error) })
+    } finally {
+      setBusy("")
+    }
   }
 
   async function loadUiCopy() {
@@ -2000,7 +2080,7 @@ function App() {
     setAdminAuthError("")
     setModal(null)
     try {
-      const next = await apiWithAdminToken<DashboardData>(`/api/dashboard${pagedQuery(storeId, ordersPage)}`, nextToken)
+      const next = await apiWithAdminToken<DashboardData>(`/api/dashboard${pagedQuery(storeId, ordersPage, { sort_by: sortKey, sort_dir: sortDirection })}`, nextToken)
       window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY)
       window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY)
       if (remember) {
@@ -2080,7 +2160,7 @@ function App() {
       setModal({ ok: false, title: "Unable to load app", message: String(error) })
     })
     if (!initialDashboardRefreshDone.current) loadUiCopy().catch(() => undefined)
-  }, [ordersPage])
+  }, [ordersPage, sortKey, sortDirection, storeId])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2293,7 +2373,7 @@ function App() {
       const controller = new AbortController()
       searchAbortRef.current = controller
       api<DashboardData>(
-        `/api/search${pagedQuery(storeId, ordersPage, { condition: orderCondition })}&q=${encodeURIComponent(term)}`,
+        `/api/search${pagedQuery(storeId, ordersPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}&q=${encodeURIComponent(term)}`,
         { signal: controller.signal },
       )
         .then((result) => {
@@ -2311,7 +2391,7 @@ function App() {
       window.clearTimeout(timer)
       searchAbortRef.current?.abort()
     }
-  }, [search, orderCondition, storeId, ordersPage])
+  }, [search, orderCondition, storeId, ordersPage, sortKey, sortDirection])
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -2321,41 +2401,58 @@ function App() {
   }, [orderColumns])
 
   const rows = search.trim() || orderCondition !== "all" ? (searchRows || data?.rows || []) : data?.rows || []
+  useEffect(() => {
+    if (page !== "orders" || !storeId || !rows.length) return
+    const orderNames = Array.from(new Set(rows.map((row) => row.odoo_order_name).filter(Boolean))).slice(0, 100)
+    if (!orderNames.length) return
+    const missingStatus = rows.some((row) => !row.shopify_order_id && !row.shopify_fulfillment_status)
+      || rows.some((row) => String(row.shopify_fulfillment_status || "").toLowerCase().includes("fulfilled") && !row.shopify_fulfillment_at)
+    if (!missingStatus) return
+    const syncKey = `${storeId}:${orderNames.join(",")}`
+    if (shopifyStatusSyncKeyRef.current === syncKey) return
+    shopifyStatusSyncKeyRef.current = syncKey
+    api<{ ok: boolean; synced: number }>("/api/shopify/orders/status/sync", {
+      method: "POST",
+      body: JSON.stringify({ store_id: Number(storeId), order_names: orderNames }),
+    })
+      .then((result) => {
+        if (result.synced) refreshOrdersPage(storeId, ordersPage)
+      })
+      .catch(() => {
+        // Shopify status is auxiliary on the Orders table; keep the page usable if OAuth is missing.
+      })
+  }, [page, storeId, rows, ordersPage])
+  useEffect(() => {
+    if (page !== "orders") return
+    let active = true
+    const load = async () => {
+      try {
+        const result = await api<{ ok: boolean; progress: ShopifyOrderStatusForceSyncProgress }>("/api/shopify/orders/status/force-sync")
+        if (!active) return
+        setShopifyStatusForceSync(result.progress)
+        if (result.progress?.status === "completed") {
+          const completedKey = `${result.progress.completed_at || ""}:${result.progress.processed || 0}:${result.progress.total || 0}`
+          if (shopifyStatusCompletedRefreshRef.current === completedKey) return
+          shopifyStatusCompletedRefreshRef.current = completedKey
+          refreshOrdersPage(storeId, ordersPage).catch(() => undefined)
+        }
+      } catch {
+        // Background progress is informational only.
+      }
+    }
+    load()
+    const timer = window.setInterval(load, 5000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [page, storeId, ordersPage])
   const filteredRows = useMemo(() => {
     return rows
   }, [rows])
-  const sortedRows = useMemo(() => {
-    const multiplier = sortDirection === "asc" ? 1 : -1
-    const grouped = new Map<string, OrderLine[]>()
-    filteredRows.forEach((row) => {
-      const groupKey = Number(row.odoo_order_distinct_asin_count || 0) > 1
-        ? `order-${row.odoo_order_id || row.odoo_order_name}`
-        : `line-${row.id}`
-      grouped.set(groupKey, [...(grouped.get(groupKey) || []), row])
-    })
-    const groupValue = (group: OrderLine[]) => {
-      if (sortKey === "odoo_order_name") {
-        return group[0]?.odoo_order_name || ""
-      }
-      const values = group.map((row) => dateTimeValue(row[sortKey] || "")).filter((value) => value > 0)
-      if (!values.length) return 0
-      return sortDirection === "asc" ? Math.min(...values) : Math.max(...values)
-    }
-    return Array.from(grouped.values()).sort((a, b) => {
-      if (sortKey === "odoo_order_name") {
-        return String(groupValue(a)).localeCompare(String(groupValue(b)), undefined, { numeric: true, sensitivity: "base" }) * multiplier
-      }
-      return (Number(groupValue(a)) - Number(groupValue(b))) * multiplier
-    }).flatMap((group) =>
-      [...group].sort((a, b) =>
-        a.odoo_order_name.localeCompare(b.odoo_order_name, undefined, { numeric: true, sensitivity: "base" })
-          || a.asin.localeCompare(b.asin)
-          || a.id - b.id,
-      ),
-    )
-  }, [filteredRows, sortDirection, sortKey])
+  const sortedRows = filteredRows
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
-  const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
+  const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
   const selectedRows = rows.filter((row) => selected.includes(row.id))
   const selectedClubName = selectedRows.length
     ? `Nutricity ${Array.from(new Set(selectedRows.map((row) => row.odoo_order_name))).join(" ")}`
@@ -2597,10 +2694,10 @@ function App() {
 
   function applySort(nextSortKey: SortKey) {
     if (sortKey === nextSortKey) {
-      setSortDirection((current) => (current === "asc" ? "desc" : "asc"))
+      updateSortDirection(sortDirection === "asc" ? "desc" : "asc")
       return
     }
-    setSortKey(nextSortKey)
+    updateSortKey(nextSortKey)
     setSortDirection(nextSortKey === "odoo_order_name" ? "asc" : "desc")
   }
 
@@ -2727,6 +2824,22 @@ function App() {
         ) : (
           row.amazon_order_id
         )
+      case "shopify_order":
+        return row.shopify_order_id || row.shopify_order_name ? (
+          row.shopify_order_url ? (
+            <a className="text-primary underline-offset-4 hover:underline" href={row.shopify_order_url} target="_blank">
+              {row.shopify_order_name || row.shopify_order_id}
+            </a>
+          ) : (
+            <span className="font-mono text-xs">{row.shopify_order_name || row.shopify_order_id}</span>
+          )
+        ) : (
+          ""
+        )
+      case "shopify_fulfillment":
+        return row.shopify_fulfillment_status ? <StatusBadge value={row.shopify_fulfillment_status} /> : ""
+      case "shopify_fulfillment_at":
+        return <span className="text-xs text-muted-foreground">{formatDateTime(row.shopify_fulfillment_at)}</span>
       case "comments":
         return row.fulfilment_note ? (
           <Tooltip>
@@ -3287,15 +3400,22 @@ function App() {
                 <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
                   <CardTitle>Odoo Order Lines</CardTitle>
                   <div className="btn-list">
-                    <SelectField className="w-[190px]" label="Sort by" value={sortKey} onChange={(value) => setSortKey(value as SortKey)}>
+                    <SelectField className="w-[190px]" label="Sort by" value={sortKey} onChange={(value) => updateSortKey(value as SortKey)}>
                       <option value="odoo_order_date">Order date</option>
                       <option value="pulled_at">Pulled date</option>
                       <option value="ordered_at">Placed date</option>
                       <option value="odoo_order_name">Order number</option>
+                      <option value="product_name">Product</option>
+                      <option value="default_code">Reference</option>
+                      <option value="asin">ASIN</option>
+                      <option value="supplier_part_auxiliary_id">SPAID</option>
+                      <option value="quantity">Quantity</option>
+                      <option value="state">State</option>
+                      <option value="amazon_order_id">Amazon order</option>
                     </SelectField>
                     <div className="grid gap-1.5">
                       <Label>Direction</Label>
-                      <Button variant="outline" onClick={() => setSortDirection((current) => (current === "asc" ? "desc" : "asc"))}>
+                      <Button variant="outline" onClick={() => updateSortDirection(sortDirection === "asc" ? "desc" : "asc")}>
                         {sortDirection === "asc" ? "Ascending" : "Descending"}
                       </Button>
                     </div>
@@ -3308,6 +3428,14 @@ function App() {
                     <Button variant="outline" onClick={() => setShowColumnSettings((current) => !current)}>
                       <Columns3 className="size-4" />
                       Columns
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={!storeId || Boolean(busy) || shopifyStatusForceSync?.status === "running"}
+                      onClick={forceSyncShopifyStatuses}
+                    >
+                      <RefreshCw className="size-4" />
+                      Force Sync Shopify
                     </Button>
                     <Button
                       variant="outline"
@@ -3366,7 +3494,23 @@ function App() {
                     </Button>
                   </div>
                 </div>
-                <PaginationControls page={ordersPage} total={ordersTotal} onPage={setOrdersPage} disabled={Boolean(busy)} />
+                {shopifyStatusForceSync?.status === "running" && (
+                  <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span>{shopifyStatusForceSync.message || "Syncing Shopify order statuses..."}</span>
+                      <span className="font-mono">
+                        {Number(shopifyStatusForceSync.processed || 0).toLocaleString()} / {Number(shopifyStatusForceSync.total || 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="mt-2 h-2 overflow-hidden rounded bg-blue-100">
+                      <div
+                        className="h-full bg-blue-600 transition-all"
+                        style={{ width: `${Math.min(100, Math.round((Number(shopifyStatusForceSync.processed || 0) / Math.max(1, Number(shopifyStatusForceSync.total || 0))) * 100))}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+                <PaginationControls page={ordersPage} total={ordersTotal} onPage={setOrdersPage} disabled={Boolean(busy)} label="orders" />
                 {selectedClubName && <p className="text-sm text-muted-foreground">Clubbed recipient: {selectedClubName}</p>}
                 {orderingEngine === "cxml" && (
                   <label className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -8467,6 +8611,10 @@ function SettingsPage({
               <option value="true">Enabled</option>
               <option value="false">Disabled</option>
             </SelectField>
+            <SelectField label="Block Old Odoo Orders" value={settings.amazon_order_date_guard_enabled || "true"} onChange={(value) => setSetting("amazon_order_date_guard_enabled", value)}>
+              <option value="true">Enabled - block before 18 May</option>
+              <option value="false">Disabled - allow old orders</option>
+            </SelectField>
             <SelectField label="Generic Product Names" value={settings.shopify_product_rename_enabled || "true"} onChange={(value) => setSetting("shopify_product_rename_enabled", value)}>
               <option value="true">Use generic product name</option>
               <option value="false">Use original product names</option>
@@ -8509,6 +8657,7 @@ function SettingsPage({
                 "shopify_tracking_client_secret",
                 "odoo_script_password",
                 "shopify_auto_enqueue_enabled",
+                "amazon_order_date_guard_enabled",
                 "shopify_product_rename_enabled",
                 "shopify_generic_product_name",
                 "shopify_job_max_attempts",

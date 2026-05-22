@@ -138,6 +138,7 @@ class ManualAmazonOrderMatchPayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
     amazon_account_name: str = ""
+    order_date: str = ""
     order_names: list[str] = []
     line_ids: list[int] = []
     source_text: str = ""
