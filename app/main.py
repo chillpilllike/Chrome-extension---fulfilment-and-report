@@ -9768,15 +9768,37 @@ def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> tuple[li
         total = int(conn.execute("SELECT COUNT(*) AS count FROM shopify_fulfilment_jobs").fetchone()["count"] or 0)
         rows = conn.execute(
             """
-            SELECT shopify_fulfilment_jobs.*, stores.name AS store_name
+            SELECT shopify_fulfilment_jobs.*,
+                   stores.name AS store_name,
+                   stores.odoo_url AS odoo_url,
+                   shopify_export_order_map.dest_name AS shopify_dest_name,
+                   shopify_export_order_map.dest_order_id AS shopify_order_id,
+                   shopify_export_oauth_tokens.shop AS shopify_shop
             FROM shopify_fulfilment_jobs
             LEFT JOIN stores ON stores.id=shopify_fulfilment_jobs.store_id
+            LEFT JOIN shopify_export_order_map
+              ON shopify_export_order_map.state_scope=shopify_fulfilment_jobs.route
+             AND shopify_export_order_map.src_order_key=(stores.odoo_db || ':' || shopify_fulfilment_jobs.odoo_order_name)
+            LEFT JOIN shopify_export_oauth_tokens
+              ON shopify_export_oauth_tokens.state_scope=shopify_fulfilment_jobs.route
+             AND shopify_export_oauth_tokens.dest_name=shopify_export_order_map.dest_name
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
             """,
             (per_page, offset),
         ).fetchall()
-    return rows_to_dicts(rows), total, page, per_page
+    result = rows_to_dicts(rows)
+    for row in result:
+        row["odoo_order_url"] = odoo_order_admin_url({"odoo_url": row.get("odoo_url") or ""}, row.get("odoo_order_id")) if row.get("odoo_url") else ""
+        shopify_order_id = clean_text(row.get("shopify_order_id"))
+        shop = clean_text(row.get("shopify_shop"))
+        if shopify_order_id and shop:
+            row["shopify_order_url"] = f"https://admin.shopify.com/store/{shop.split('.')[0]}/orders/{shopify_order_id}"
+        elif shopify_order_id:
+            row["shopify_order_url"] = ""
+        else:
+            row["shopify_order_url"] = ""
+    return result, total, page, per_page
 
 
 def list_shopify_tracking_jobs(page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:

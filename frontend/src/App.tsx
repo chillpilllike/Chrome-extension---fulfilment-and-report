@@ -632,10 +632,14 @@ type ShopifyFulfilmentJob = {
   id: string
   store_name: string
   odoo_order_name: string
+  odoo_order_url?: string
   route: string
   status: string
   attempts: number
   max_attempts: number
+  shopify_dest_name?: string
+  shopify_order_id?: string
+  shopify_order_url?: string
   last_error: string
   created_at: string
   updated_at: string
@@ -7212,6 +7216,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [oauthMissing, setOauthMissing] = useState<ShopifyOAuthMissing[]>([])
   const [oauthStatus, setOauthStatus] = useState<ShopifyOAuthMissing[]>([])
   const [progress, setProgress] = useState<ShopifyFulfilmentProgress | null>(null)
+  const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [busy, setBusy] = useState("")
   const progressTotal = Math.max(0, Number(progress?.total || 0))
@@ -7220,21 +7225,28 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const progressRunning = progress?.status === "running" || progress?.status === "queued"
   const showProgress = Boolean(progress && (progressRunning || progressTotal > 0 || progress.message))
 
-  async function load() {
-    const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; total: number }>("/api/shopify/fulfilment/jobs?page=1&per_page=100")
+  async function load(nextPage = page) {
+    const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?page=${nextPage}&per_page=${PAGE_SIZE}`)
     setJobs(result.jobs || [])
     setOauthMissing(result.oauth_missing || [])
     setOauthStatus(result.oauth_status || [])
     setProgress(result.progress || null)
+    setPage(result.page || nextPage)
     setTotal(result.total || 0)
   }
   useEffect(() => {
-    load().catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
-    const timer = window.setInterval(() => load().catch(() => undefined), 5000)
+    load(page).catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
+    const timer = window.setInterval(() => load(page).catch(() => undefined), 5000)
     return () => window.clearInterval(timer)
-  }, [])
+  }, [page, storeId])
   async function enqueuePending() {
     setBusy("Queue")
+    setProgress({
+      status: "queued",
+      total: Math.max(1, total || jobs.length || 1),
+      processed: 0,
+      message: "Queueing Shopify fulfilment jobs.",
+    })
     try {
       const path = `/api/shopify/fulfilment/enqueue${storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""}`
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
@@ -7247,6 +7259,12 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   }
   async function enqueueOneTestOrder() {
     setBusy("QueueOne")
+    setProgress({
+      status: "queued",
+      total: 1,
+      processed: 0,
+      message: "Queueing one Shopify test order.",
+    })
     try {
       const path = `/api/shopify/fulfilment/enqueue?limit=1${storeId ? `&store_id=${encodeURIComponent(storeId)}` : ""}`
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
@@ -7259,6 +7277,12 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   }
   async function runWorker() {
     setBusy("Run")
+    setProgress({
+      status: "running",
+      total: Math.max(1, total || jobs.length || 1),
+      processed: 0,
+      message: "Starting Shopify fulfilment worker.",
+    })
     try {
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>("/api/shopify/fulfilment/run", { method: "POST" })
       if (result.progress) setProgress(result.progress)
@@ -7270,6 +7294,12 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   }
   async function runOneJob() {
     setBusy("RunOne")
+    setProgress({
+      status: "running",
+      total: 1,
+      processed: 0,
+      message: "Running one Shopify fulfilment job.",
+    })
     try {
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>("/api/shopify/fulfilment/run-one", { method: "POST" })
       if (result.progress) setProgress(result.progress)
@@ -7327,12 +7357,12 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
               </Button>
             ))}
             {oauthStatus.filter((item) => item.authorized).map((item) => (
-              <span key={`${item.route}-${item.dest_name}-connected`} className="shopify-connected-pill">
+              <span key={`${item.route}-${item.dest_name}-connected`} className="btn btn-success shopify-connected-button">
                 <CheckCircle2 className="size-4" />
                 Connected {item.route.toUpperCase()}
               </span>
             ))}
-            <Button variant="outline" onClick={load}>Refresh</Button>
+            <Button variant="outline" onClick={() => load()}>Refresh</Button>
           </div>
           {showProgress ? (
             <div className="form-fieldset">
@@ -7374,17 +7404,38 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
         </CardContent>
       </Card>
       <Card>
-        <CardHeader>
-          <CardTitle>Jobs</CardTitle>
-          <CardDescription>{total.toLocaleString()} Shopify fulfilment job(s).</CardDescription>
+        <CardHeader className="gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <CardTitle>Jobs</CardTitle>
+            <CardDescription>{total.toLocaleString()} Shopify fulfilment job(s).</CardDescription>
+          </div>
+          <PaginationControls page={page} total={total} onPage={setPage} disabled={Boolean(busy)} />
         </CardHeader>
         <CardContent className="p-0">
           <Table>
-            <TableHeader><TableRow><TableHead>Order</TableHead><TableHead>Store</TableHead><TableHead>Route</TableHead><TableHead>Status</TableHead><TableHead>Attempts</TableHead><TableHead>Updated</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>Odoo Order</TableHead><TableHead>Shopify Ref</TableHead><TableHead>Store</TableHead><TableHead>Route</TableHead><TableHead>Status</TableHead><TableHead>Attempts</TableHead><TableHead>Updated</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
             <TableBody>
               {jobs.map((job) => (
                 <TableRow key={job.id}>
-                  <TableCell className="font-medium">{job.odoo_order_name}</TableCell>
+                  <TableCell className="font-medium">
+                    {job.odoo_order_url ? (
+                      <a className="text-primary underline-offset-4 hover:underline" href={job.odoo_order_url} target="_blank" rel="noreferrer">
+                        {job.odoo_order_name}
+                      </a>
+                    ) : job.odoo_order_name}
+                  </TableCell>
+                  <TableCell>
+                    {job.shopify_order_url ? (
+                      <a className="text-primary underline-offset-4 hover:underline" href={job.shopify_order_url} target="_blank" rel="noreferrer">
+                        {job.odoo_order_name}
+                      </a>
+                    ) : job.shopify_order_id ? (
+                      <span className="font-mono text-xs">{job.shopify_order_id}</span>
+                    ) : (
+                      <span className="text-muted-foreground">Not synced</span>
+                    )}
+                    {job.shopify_dest_name ? <div className="text-xs text-muted-foreground">{job.shopify_dest_name}</div> : null}
+                  </TableCell>
                   <TableCell>{job.store_name}</TableCell>
                   <TableCell><Badge variant="outline">{job.route?.toUpperCase()}</Badge></TableCell>
                   <TableCell><StatusBadge value={job.status} /></TableCell>
@@ -7394,10 +7445,13 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                   <TableCell>{["failed", "dead"].includes(job.status) && <Button size="sm" variant="outline" onClick={() => retryJob(job.id)}>Retry</Button>}</TableCell>
                 </TableRow>
               ))}
-              {!jobs.length && <TableRow><TableCell colSpan={8} className="py-8 text-center text-muted-foreground">No Shopify fulfilment jobs yet.</TableCell></TableRow>}
+              {!jobs.length && <TableRow><TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No Shopify fulfilment jobs yet.</TableCell></TableRow>}
             </TableBody>
           </Table>
         </CardContent>
+        <CardFooter>
+          <PaginationControls page={page} total={total} onPage={setPage} disabled={Boolean(busy)} />
+        </CardFooter>
       </Card>
     </div>
   )
