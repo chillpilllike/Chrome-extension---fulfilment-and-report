@@ -114,7 +114,8 @@ class PostgresConnection:
             with _pool_lock:
                 if _pool is None:
                     max_connections = int(os.getenv("POSTGRES_POOL_MAX", "30"))
-                    _pool = pool.ThreadedConnectionPool(1, max_connections, POSTGRES_URL)
+                    connect_timeout = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "8"))
+                    _pool = pool.ThreadedConnectionPool(1, max_connections, POSTGRES_URL, connect_timeout=connect_timeout)
         last_error: Exception | None = None
         for attempt in range(int(os.getenv("POSTGRES_POOL_RETRIES", "5"))):
             try:
@@ -187,3 +188,11 @@ def db() -> Iterable[PostgresConnection]:
         raise
     finally:
         conn.close()
+
+
+def close_pool() -> None:
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            _pool.closeall()
+            _pool = None

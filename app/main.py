@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import csv
 import html
+import http.client
 import importlib.util
 import io
 import json
 import os
 import re
+import shutil
 import smtplib
+import socket
+import subprocess
 import threading
 import time
 import tempfile
@@ -38,10 +42,13 @@ from fastapi.templating import Jinja2Templates
 from app.core.config import BASE_DIR, DEFAULT_SERVICE_SETTINGS, FRONTEND_DIST, env_bool
 from app.core.time import utc_now
 from app.db.session import db
+from app.db import session as db_session
 from app.schemas import (
     AddressPayload,
     AdminSettingsPayload,
     AmazonAccountPayload,
+    AmazonHistoryLookupPayload,
+    BackupKeyPayload,
     BulkPlacePayload,
     ChromeJobCompletePayload,
     ChromeJobCostlyPayload,
@@ -121,6 +128,7 @@ MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
 _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
 _STORE_CACHE: dict[int, tuple[Store, float]] = {}
+_STORES_LIST_CACHE: tuple[list[dict[str, Any]], float] = ([], 0.0)
 _STORE_CACHE_LOCK = threading.Lock()
 _SHOPIFY_QUEUE_LOCK = threading.Lock()
 _SHOPIFY_OAUTH_LOCK = threading.Lock()
@@ -161,6 +169,8 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_order_lines_state_updated ON order_lines(state, updated_at DESC, odoo_order_id DESC, id)",
         # Duplicate ASIN, bulk, inventory matching, and selected-order expansion.
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_asin_open ON order_lines(store_id, asin, odoo_order_name) WHERE COALESCE(asin, '') != '' AND COALESCE(amazon_order_id, '') = ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_asin_open_count ON order_lines(store_id, asin) WHERE COALESCE(asin, '') != '' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_open_asin_count ON order_lines(store_id, odoo_order_id, asin) WHERE COALESCE(asin, '') != '' AND COALESCE(amazon_order_id, '') = '' AND state != 'missing' AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_open ON order_lines(store_id, odoo_order_id, id) WHERE COALESCE(amazon_order_id, '') = ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_state_order ON order_lines(store_id, state, odoo_order_id, id)",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_line_unique_lookup ON order_lines(store_id, odoo_line_id)",
@@ -199,6 +209,7 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_payment_failures_status_detected ON amazon_payment_failures(status, detected_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_payment_failures_store_status ON amazon_payment_failures(store_id, status, detected_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_partial_fulfilments_store_status ON partial_fulfilments(store_id, status, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_amazon_order_history_unmatched_open ON amazon_order_history_unmatched(resolved_at, last_seen_at DESC)",
     )
     for index_sql in index_statements:
         conn.execute(index_sql)
@@ -378,6 +389,19 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 error TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS amazon_order_history_unmatched (
+                amazon_order_id TEXT PRIMARY KEY,
+                amazon_order_url TEXT,
+                recipient TEXT,
+                status TEXT,
+                order_date TEXT,
+                asins_json TEXT NOT NULL DEFAULT '[]',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                resolved_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS fulfilment_addresses (
@@ -765,6 +789,7 @@ def init_db() -> None:
                 conn.execute(ddl)
         for index_sql in (
             "CREATE INDEX IF NOT EXISTS idx_inventory_store_asin_status ON inventory_items(store_id, asin, status)",
+            "CREATE INDEX IF NOT EXISTS idx_inventory_store_asin_available_qty ON inventory_items(store_id, asin) WHERE status='available'",
             "CREATE INDEX IF NOT EXISTS idx_inventory_reserved_line ON inventory_items(reserved_order_line_id)",
             "CREATE INDEX IF NOT EXISTS idx_export_jobs_status ON export_jobs(status, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_export_files_expiry ON export_files(expires_at, deleted_at)",
@@ -1009,13 +1034,65 @@ _ODOO_FIELDS_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 _ODOO_FIELDS_CACHE_LOCK = threading.Lock()
 _ODOO_UID_CACHE: dict[tuple[str, str, str, str], int] = {}
 _ODOO_UID_CACHE_LOCK = threading.Lock()
+_PULL_EXECUTION_LOCK = threading.Lock()
+ODOO_XMLRPC_TIMEOUT_SECONDS = max(5, int(os.getenv("ODOO_XMLRPC_TIMEOUT_SECONDS", "45")))
+PULL_JOB_STALE_MINUTES = max(3, int(os.getenv("PULL_JOB_STALE_MINUTES", "5")))
+socket.setdefaulttimeout(ODOO_XMLRPC_TIMEOUT_SECONDS)
+
+
+class PullJobCancelled(Exception):
+    pass
+
+
+class TimeoutTransport(xmlrpc.client.Transport):
+    def __init__(self, timeout: int):
+        super().__init__()
+        self.timeout = timeout
+
+    def make_connection(self, host: str) -> Any:
+        if self._connection and host == self._connection[0]:
+            connection = self._connection[1]
+            connection.timeout = self.timeout
+            return connection
+        chost, self._extra_headers, _x509 = self.get_host_info(host)
+        connection = http.client.HTTPConnection(chost, timeout=self.timeout)
+        self._connection = host, connection
+        return connection
+
+
+class TimeoutSafeTransport(xmlrpc.client.SafeTransport):
+    def __init__(self, timeout: int):
+        super().__init__()
+        self.timeout = timeout
+
+    def make_connection(self, host: str) -> Any:
+        if self._connection and host == self._connection[0]:
+            connection = self._connection[1]
+            connection.timeout = self.timeout
+            return connection
+        chost, self._extra_headers, x509 = self.get_host_info(host)
+        kwargs: dict[str, Any] = {"timeout": self.timeout}
+        if self.context is not None:
+            kwargs["context"] = self.context
+        if x509:
+            kwargs.update(x509)
+        connection = http.client.HTTPSConnection(chost, **kwargs)
+        self._connection = host, connection
+        return connection
+
+
+def odoo_xmlrpc_transport(url: str) -> xmlrpc.client.Transport:
+    transport_cls = TimeoutSafeTransport if urlsplit(url).scheme == "https" else TimeoutTransport
+    return transport_cls(ODOO_XMLRPC_TIMEOUT_SECONDS)
 
 
 class OdooClient:
     def __init__(self, store: Store):
         self.store = store
-        self.common = xmlrpc.client.ServerProxy(f"{store.odoo_url}/xmlrpc/2/common", allow_none=True)
-        self.object = xmlrpc.client.ServerProxy(f"{store.odoo_url}/xmlrpc/2/object", allow_none=True)
+        common_url = f"{store.odoo_url}/xmlrpc/2/common"
+        object_url = f"{store.odoo_url}/xmlrpc/2/object"
+        self.common = xmlrpc.client.ServerProxy(common_url, allow_none=True, transport=odoo_xmlrpc_transport(common_url))
+        self.object = xmlrpc.client.ServerProxy(object_url, allow_none=True, transport=odoo_xmlrpc_transport(object_url))
         uid_cache_key = (store.odoo_url, store.odoo_db, store.odoo_user, store.odoo_password)
         with _ODOO_UID_CACHE_LOCK:
             self.uid = _ODOO_UID_CACHE.get(uid_cache_key)
@@ -1458,8 +1535,17 @@ def get_store(store_id: int) -> Store:
 
 
 def list_stores() -> list[dict[str, Any]]:
+    global _STORES_LIST_CACHE
+    now = time.monotonic()
+    with _STORE_CACHE_LOCK:
+        cached_stores, expires_at = _STORES_LIST_CACHE
+    if cached_stores and expires_at > now:
+        return [dict(store) for store in cached_stores]
     with db() as conn:
-        return conn.execute("SELECT * FROM stores ORDER BY name").fetchall()
+        stores = conn.execute("SELECT * FROM stores ORDER BY name").fetchall()
+    with _STORE_CACHE_LOCK:
+        _STORES_LIST_CACHE = ([dict(store) for store in stores], now + 60)
+    return stores
 
 
 def row_to_dict(row: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -1493,6 +1579,336 @@ def odoo_order_admin_url(store: dict[str, Any], order_id: Any) -> str:
 def order_line_amazon_url(order_id: str) -> str:
     order_id = clean_text(order_id)
     return f"https://www.amazon.com/your-orders/order-details?orderID={quote_plus(order_id)}" if order_id else ""
+
+
+def normalize_amazon_order_id(value: Any) -> str:
+    order_id = clean_text(value)
+    return order_id if re.fullmatch(r"\d{3}-\d{7}-\d{7}", order_id) else ""
+
+
+def amazon_history_order_record(order: Any) -> dict[str, Any]:
+    data = order.model_dump() if hasattr(order, "model_dump") else dict(order or {})
+    order_id = normalize_amazon_order_id(data.get("amazon_order_id"))
+    asin_quantities: dict[str, float] = {}
+    items = data.get("items") or []
+    for item in items:
+        normalized_asin = normalize_asin(str((item or {}).get("asin") or ""))
+        if not normalized_asin:
+            continue
+        try:
+            qty = float((item or {}).get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1.0
+        asin_quantities[normalized_asin] = asin_quantities.get(normalized_asin, 0.0) + max(1.0, qty)
+    if not asin_quantities:
+        for asin, quantity in (data.get("asin_quantities") or {}).items():
+            normalized_asin = normalize_asin(asin)
+            if not normalized_asin:
+                continue
+            try:
+                qty = float(quantity or 1)
+            except (TypeError, ValueError):
+                qty = 1.0
+            asin_quantities[normalized_asin] = asin_quantities.get(normalized_asin, 0.0) + max(1.0, qty)
+    for asin in data.get("asins") or []:
+        normalized_asin = normalize_asin(asin)
+        if normalized_asin and normalized_asin not in asin_quantities:
+            asin_quantities[normalized_asin] = 1.0
+    asins = sorted(asin_quantities.keys())
+    status = clean_text(data.get("status"))
+    cancelled = bool(data.get("cancelled")) or status.lower() == "cancelled"
+    return {
+        "amazon_order_id": order_id,
+        "amazon_order_url": clean_text(data.get("amazon_order_url")) or order_line_amazon_url(order_id),
+        "recipient": clean_text(data.get("recipient")),
+        "status": status,
+        "order_date": clean_text(data.get("order_date")),
+        "asins": asins,
+        "asin_quantities": asin_quantities,
+        "cancelled": cancelled,
+    }
+
+
+def amazon_history_lookup_records(payload: AmazonHistoryLookupPayload) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for order in payload.orders or []:
+        record = amazon_history_order_record(order)
+        if record["amazon_order_id"]:
+            by_id[record["amazon_order_id"]] = record
+    for order_id in payload.amazon_order_ids or []:
+        normalized = normalize_amazon_order_id(order_id)
+        if normalized and normalized not in by_id:
+            by_id[normalized] = amazon_history_order_record({"amazon_order_id": normalized})
+    return list(by_id.values())[:80]
+
+
+def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not order_ids:
+        return {}
+    placeholders = ",".join("?" for _ in order_ids)
+    rows = conn.execute(
+        f"""
+        SELECT order_lines.id,
+               order_lines.amazon_order_id,
+               order_lines.store_id,
+               order_lines.odoo_order_id,
+               order_lines.odoo_order_name,
+               order_lines.asin,
+               order_lines.quantity,
+               order_lines.state,
+               stores.name AS store_name,
+               stores.odoo_url AS odoo_url
+        FROM order_lines
+        JOIN stores ON stores.id=order_lines.store_id
+        WHERE order_lines.amazon_order_id IN ({placeholders})
+          AND COALESCE(order_lines.amazon_order_id, '') != ''
+        ORDER BY order_lines.amazon_order_id, order_lines.store_id, order_lines.odoo_order_id, order_lines.id
+        """,
+        order_ids,
+    ).fetchall()
+    matches: dict[str, dict[str, Any]] = {}
+    grouped: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for row in rows:
+        amazon_order_id = clean_text(row["amazon_order_id"])
+        if not amazon_order_id:
+            continue
+        match = matches.setdefault(amazon_order_id, {"amazon_order_id": amazon_order_id, "orders": []})
+        key = (amazon_order_id, int(row["store_id"]), int(row["odoo_order_id"]))
+        order = grouped.get(key)
+        if order is None:
+            store = {"odoo_url": row["odoo_url"]}
+            order = {
+                "store_id": row["store_id"],
+                "store_name": row["store_name"],
+                "odoo_order_id": row["odoo_order_id"],
+                "odoo_order_name": row["odoo_order_name"],
+                "odoo_order_url": odoo_order_admin_url(store, row["odoo_order_id"]),
+                "line_ids": [],
+                "lines": [],
+                "asins": [],
+                "state": row["state"],
+            }
+            grouped[key] = order
+            match["orders"].append(order)
+        order["line_ids"].append(row["id"])
+        asin = normalize_asin(row["asin"])
+        if asin:
+            order["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row["quantity"] or 1)})
+            if asin not in order["asins"]:
+                order["asins"].append(asin)
+            order.setdefault("asin_quantities", {})
+            order["asin_quantities"][asin] = float(order["asin_quantities"].get(asin) or 0) + float(row["quantity"] or 1)
+    return matches
+
+
+def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], matched_ids: set[str]) -> dict[str, list[dict[str, Any]]]:
+    refs_by_order: dict[str, list[str]] = {}
+    for record in records:
+        order_id = record["amazon_order_id"]
+        if not order_id or order_id in matched_ids or record.get("cancelled"):
+            continue
+        refs = list(dict.fromkeys(match.group(0).upper() for match in ORDER_REF_RE.finditer(record.get("recipient") or "")))
+        if refs:
+            refs_by_order[order_id] = refs
+    all_refs = sorted({ref for refs in refs_by_order.values() for ref in refs})
+    if not all_refs:
+        return {}
+    rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT order_lines.id,
+               order_lines.store_id,
+               order_lines.odoo_order_id,
+               order_lines.odoo_order_name,
+               order_lines.asin,
+               order_lines.quantity,
+               order_lines.state,
+               order_lines.amazon_order_id AS current_amazon_order_id,
+               stores.name AS store_name,
+               stores.odoo_url AS odoo_url
+        FROM order_lines
+        JOIN stores ON stores.id=order_lines.store_id
+        WHERE UPPER(order_lines.odoo_order_name) IN ({','.join('?' for _ in all_refs)})
+          AND order_lines.state NOT IN ('cancelled', 'refunded')
+          AND COALESCE(order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+        ORDER BY order_lines.store_id, order_lines.odoo_order_id, order_lines.id
+        """,
+        all_refs,
+    ).fetchall())
+    rows_by_ref: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_ref.setdefault(str(row["odoo_order_name"]).upper(), []).append(row)
+    suggestions: dict[str, list[dict[str, Any]]] = {}
+    for amazon_order_id, refs in refs_by_order.items():
+        grouped: dict[tuple[int, int], dict[str, Any]] = {}
+        for ref in refs:
+            for row in rows_by_ref.get(ref, []):
+                key = (int(row["store_id"]), int(row["odoo_order_id"]))
+                suggestion = grouped.get(key)
+                if suggestion is None:
+                    suggestion = {
+                        "store_id": row["store_id"],
+                        "store_name": row["store_name"],
+                        "odoo_order_id": row["odoo_order_id"],
+                        "odoo_order_name": row["odoo_order_name"],
+                        "odoo_order_url": odoo_order_admin_url({"odoo_url": row["odoo_url"]}, row["odoo_order_id"]),
+                        "line_ids": [],
+                        "lines": [],
+                        "asins": [],
+                        "state": row["state"],
+                        "current_amazon_order_id": row.get("current_amazon_order_id") or "",
+                    }
+                    grouped[key] = suggestion
+                suggestion["line_ids"].append(row["id"])
+                asin = normalize_asin(row.get("asin"))
+                if asin:
+                    suggestion["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row.get("quantity") or 1)})
+                    if asin not in suggestion["asins"]:
+                        suggestion["asins"].append(asin)
+                    suggestion.setdefault("asin_quantities", {})
+                    suggestion["asin_quantities"][asin] = float(suggestion["asin_quantities"].get(asin) or 0) + float(row.get("quantity") or 1)
+        if grouped:
+            suggestions[amazon_order_id] = list(grouped.values())
+    return suggestions
+
+
+def amazon_history_apply_quantity_checks(records: list[dict[str, Any]], *groups: dict[str, Any]) -> None:
+    records_by_order = {record["amazon_order_id"]: record for record in records if record.get("amazon_order_id")}
+    for group in groups:
+        for amazon_order_id, value in (group or {}).items():
+            record = records_by_order.get(amazon_order_id) or {}
+            actual_by_asin = {
+                normalize_asin(asin): float(quantity or 0)
+                for asin, quantity in (record.get("asin_quantities") or {}).items()
+                if normalize_asin(asin)
+            }
+            candidates = value.get("orders") if isinstance(value, dict) and "orders" in value else value
+            for candidate in candidates or []:
+                checks: list[dict[str, Any]] = []
+                expected_by_asin = candidate.get("asin_quantities") or {}
+                for asin in sorted({normalize_asin(value) for value in expected_by_asin.keys() if normalize_asin(value)}):
+                    if asin not in actual_by_asin:
+                        continue
+                    expected = float(expected_by_asin.get(asin) or 0)
+                    actual = float(actual_by_asin.get(asin) or 0)
+                    checks.append({
+                        "asin": asin,
+                        "expected": expected,
+                        "actual": actual,
+                        "matches": abs(expected - actual) < 0.0001,
+                    })
+                candidate["quantity_checks"] = checks
+                candidate["quantity_matches"] = bool(checks) and all(check["matches"] for check in checks)
+
+
+def amazon_history_asin_conflicts(
+    conn: Any,
+    records: list[dict[str, Any]],
+    matches: dict[str, dict[str, Any]],
+    suggestions: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    conflicts: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        amazon_order_id = record["amazon_order_id"]
+        record_asins = sorted({normalize_asin(asin) for asin in record.get("asins") or [] if normalize_asin(asin)})
+        if not amazon_order_id or not record_asins:
+            continue
+        candidates = list((matches.get(amazon_order_id) or {}).get("orders") or [])
+        candidates.extend(suggestions.get(amazon_order_id) or [])
+        order_pairs = sorted({
+            (int(candidate["store_id"]), int(candidate["odoo_order_id"]))
+            for candidate in candidates
+            if candidate.get("store_id") and candidate.get("odoo_order_id")
+        })
+        if not order_pairs:
+            continue
+        pair_clause = " OR ".join("(store_id=? AND odoo_order_id=?)" for _ in order_pairs)
+        asin_clause = ",".join("?" for _ in record_asins)
+        params = [value for pair in order_pairs for value in pair]
+        params.extend(record_asins)
+        params.append(amazon_order_id)
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT id,
+                   store_id,
+                   odoo_order_id,
+                   odoo_order_name,
+                   asin,
+                   amazon_order_id,
+                   amazon_order_url,
+                   state
+            FROM order_lines
+            WHERE ({pair_clause})
+              AND UPPER(COALESCE(asin, '')) IN ({asin_clause})
+              AND COALESCE(amazon_order_id, '') != ''
+              AND amazon_order_id != ?
+              AND state NOT IN ('cancelled', 'refunded')
+              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            ORDER BY store_id, odoo_order_id, asin, amazon_order_id, id
+            """,
+            params,
+        ).fetchall())
+        seen: set[tuple[Any, ...]] = set()
+        for row in rows:
+            key = (row["store_id"], row["odoo_order_id"], row["asin"], row["amazon_order_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            conflicts.setdefault(amazon_order_id, []).append({
+                "store_id": row["store_id"],
+                "odoo_order_id": row["odoo_order_id"],
+                "odoo_order_name": row["odoo_order_name"],
+                "asin": normalize_asin(row["asin"]),
+                "existing_amazon_order_id": row["amazon_order_id"],
+                "existing_amazon_order_url": row["amazon_order_url"] or order_line_amazon_url(row["amazon_order_id"]),
+                "state": row["state"],
+            })
+    return conflicts
+
+
+def upsert_amazon_history_unmatched(conn: Any, records: list[dict[str, Any]], matched_ids: set[str]) -> list[str]:
+    now = utc_now()
+    unmatched: list[str] = []
+    if matched_ids:
+        conn.execute(
+            f"""
+            UPDATE amazon_order_history_unmatched
+            SET resolved_at=COALESCE(resolved_at, ?)
+            WHERE amazon_order_id IN ({','.join('?' for _ in matched_ids)})
+            """,
+            [now, *sorted(matched_ids)],
+        )
+    for record in records:
+        order_id = record["amazon_order_id"]
+        if not order_id or order_id in matched_ids or record.get("cancelled"):
+            continue
+        unmatched.append(order_id)
+        conn.execute(
+            """
+            INSERT INTO amazon_order_history_unmatched
+                (amazon_order_id, amazon_order_url, recipient, status, order_date, asins_json, first_seen_at, last_seen_at, seen_count, resolved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL)
+            ON CONFLICT(amazon_order_id) DO UPDATE SET
+                amazon_order_url=COALESCE(NULLIF(excluded.amazon_order_url, ''), amazon_order_history_unmatched.amazon_order_url),
+                recipient=COALESCE(NULLIF(excluded.recipient, ''), amazon_order_history_unmatched.recipient),
+                status=COALESCE(NULLIF(excluded.status, ''), amazon_order_history_unmatched.status),
+                order_date=COALESCE(NULLIF(excluded.order_date, ''), amazon_order_history_unmatched.order_date),
+                asins_json=excluded.asins_json,
+                last_seen_at=excluded.last_seen_at,
+                seen_count=amazon_order_history_unmatched.seen_count + 1,
+                resolved_at=NULL
+            """,
+            (
+                order_id,
+                record["amazon_order_url"],
+                record["recipient"],
+                record["status"],
+                record["order_date"],
+                json.dumps(record["asins"]),
+                now,
+                now,
+            ),
+        )
+    return unmatched
 
 
 def asin_product_url(asin: str) -> str:
@@ -1684,6 +2100,25 @@ def stored_pull_batch_size() -> int:
     return normalize_pull_batch_size(get_service_settings().get("pull_orders_batch_size", "50"))
 
 
+ORDER_LINE_PAGE_SELECT = """
+    id, store_id, odoo_order_id, odoo_order_name, odoo_order_date, odoo_line_id,
+    product_id, product_tmpl_id, product_name, default_code, asin_from_reference,
+    asin_from_note, asin, supplier_part_auxiliary_id, quantity, store_unit_price,
+    store_total_price, store_currency, store_currency_rate_to_usd, store_subtotal_native,
+    store_delivery_native, store_discount_native, store_adjustment_native, store_total_native,
+    amazon_unit_price, amazon_total_price, chrome_profit_total, fulfilment_note,
+    odoo_order_state, odoo_invoice_status, odoo_status_label, state, amazon_order_id,
+    amazon_order_url, amazon_account_id, amazon_account_name, order_engine, amazon_group_key,
+    amazon_status, tracking_status, tracking_checked_at, amazon_cancelled_at,
+    amazon_cancelled_order_id, chrome_claimed_by, chrome_claimed_at, chrome_claim_expires_at,
+    last_error, missing_asin, original_asin, replacement_asin, replacement_product_name,
+    replacement_note, replacement_assigned_at, cost_approved_at, cost_review_loss,
+    source_line_count, pulled_at, ordered_at, created_at, updated_at,
+    CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_code' ELSE '' END AS destination_country_code,
+    CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_name' ELSE '' END AS destination_country_name
+"""
+
+
 def order_date_window_sql() -> str:
     return """
       AND COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at)::timestamp::date
@@ -1761,11 +2196,14 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
         id_clause = " AND id = ANY(?::int[])"
         id_params.append(candidate_ids)
     with db() as conn:
-        total_row = conn.execute(
+        rows = conn.execute(
             f"""
-            SELECT COUNT(*) AS count
-            FROM (
-                SELECT asin
+            WITH duplicate_groups AS (
+                SELECT asin,
+                       COUNT(*) AS line_count,
+                       COUNT(DISTINCT odoo_order_name) AS order_count,
+                       SUM(quantity) AS total_quantity,
+                       STRING_AGG(DISTINCT odoo_order_name, ',') AS orders
                 FROM order_lines
                 WHERE (? IS NULL OR store_id=?)
                   AND COALESCE(asin, '') != ''
@@ -1776,33 +2214,26 @@ def duplicate_asin_groups(store_id: Optional[int] = None, page: int = 1, per_pag
                   {id_clause}
                 GROUP BY asin
                 HAVING COUNT(DISTINCT odoo_order_name) > 1
-            ) AS duplicate_groups
-            """,
-            (store_id, store_id, days, *id_params),
-        ).fetchone()
-        rows = conn.execute(
-            f"""
-            SELECT asin,
-                   COUNT(*) AS line_count,
-                   COUNT(DISTINCT odoo_order_name) AS order_count,
-                   SUM(quantity) AS total_quantity,
-                   STRING_AGG(DISTINCT odoo_order_name, ',') AS orders
-            FROM order_lines
-            WHERE (? IS NULL OR store_id=?)
-              AND COALESCE(asin, '') != ''
-              AND COALESCE(amazon_order_id, '') = ''
-              AND state = 'pulled'
-              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-              {order_date_window_sql()}
-              {id_clause}
-            GROUP BY asin
-            HAVING COUNT(DISTINCT odoo_order_name) > 1
+            ),
+            counted_groups AS (
+                SELECT duplicate_groups.*,
+                       COUNT(*) OVER () AS total_count
+                FROM duplicate_groups
+            )
+            SELECT *
+            FROM counted_groups
             ORDER BY order_count DESC, total_quantity DESC, asin
             LIMIT ? OFFSET ?
             """,
             (store_id, store_id, days, *id_params, per_page, offset),
         ).fetchall()
-    return rows_to_dicts(rows), int(total_row["count"] or 0), page, per_page
+    total = int(rows[0]["total_count"] or 0) if rows else 0
+    if not rows and page > 1:
+        return duplicate_asin_groups(store_id, 1, per_page, days, candidate_ids)
+    row_dicts = rows_to_dicts(rows)
+    for row in row_dicts:
+        row.pop("total_count", None)
+    return row_dicts, total, page, per_page
 
 
 def consolidate_existing_asin_lines(store_id: Optional[int] = None) -> None:
@@ -2614,8 +3045,8 @@ def country_label(code: str, name: str = "") -> str:
 def destination_country_from_row(row: dict[str, Any]) -> tuple[str, str, str]:
     payload = safe_json(row.get("raw_json"))
     order = payload.get("order") or {}
-    code = clean_text(order.get("destination_country_code")).upper()
-    name = clean_text(order.get("destination_country_name"))
+    code = clean_text(row.get("destination_country_code") or order.get("destination_country_code")).upper()
+    name = clean_text(row.get("destination_country_name") or order.get("destination_country_name"))
     if not code:
         note_text = f"{order.get('note') or ''} {row.get('fulfilment_note') or ''} {row.get('last_error') or ''}"
         note_lower = note_text.lower()
@@ -2862,25 +3293,41 @@ def process_odoo_order_batch(
         return 0
     all_line_ids = sorted({int(line_id) for order in orders for line_id in (order.get("order_line") or [])})
     all_invoice_ids = sorted({int(invoice_id) for order in orders for invoice_id in (order.get("invoice_ids") or [])})
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        line_future = executor.submit(lambda: OdooClient(store).read("sale.order.line", all_line_ids, line_fields))
-        invoice_future = executor.submit(lambda: OdooClient(store).read("account.move", all_invoice_ids, invoice_fields))
-        all_lines = line_future.result()
-        invoice_rows = invoice_future.result()
+    step_started_at = time.monotonic()
+    all_lines = odoo.read("sale.order.line", all_line_ids, line_fields)
+    print(f"[pull] store={store.id} read {len(all_lines)} sale.order.line rows in {time.monotonic() - step_started_at:.1f}s", flush=True)
+    step_started_at = time.monotonic()
+    invoice_rows = odoo.read("account.move", all_invoice_ids, invoice_fields)
+    print(f"[pull] store={store.id} read {len(invoice_rows)} account.move rows in {time.monotonic() - step_started_at:.1f}s", flush=True)
     lines_by_id = {int(line["id"]): line for line in all_lines}
     product_ids = sorted({int(line["product_id"][0]) for line in all_lines if line.get("product_id")})
+    step_started_at = time.monotonic()
     all_products = odoo.read("product.product", product_ids, product_fields)
+    print(f"[pull] store={store.id} read {len(all_products)} product.product rows in {time.monotonic() - step_started_at:.1f}s", flush=True)
     products = {int(product["id"]): product for product in all_products}
     tmpl_ids = sorted({int(product["product_tmpl_id"][0]) for product in all_products if product.get("product_tmpl_id")})
+    step_started_at = time.monotonic()
     templates = {int(template["id"]): template for template in odoo.read("product.template", tmpl_ids, tmpl_fields)}
+    print(f"[pull] store={store.id} read {len(templates)} product.template rows in {time.monotonic() - step_started_at:.1f}s", flush=True)
     invoices = {int(invoice["id"]): invoice for invoice in invoice_rows}
     count = 0
     pending_saves: list[tuple[dict[str, Any], dict[str, Any], str]] = []
     all_invalid_line_ids: set[int] = set()
+    cached_rates = cached_openexchange_rates()
+
+    def cached_rate_to_usd(currency: str) -> float:
+        code = clean_text(currency).upper() or "USD"
+        if code == "USD":
+            return 1.0
+        source_rate = float(cached_rates.get(code) or 0)
+        usd_rate = float(cached_rates.get("USD") or 1)
+        return (usd_rate / source_rate) if source_rate > 0 else 1.0
+
+    print(f"[pull] store={store.id} preparing {len(orders)} Odoo orders for local save", flush=True)
     with db() as conn:
         for order in orders:
             currency = order_currency_code(order)
-            rate_to_usd = conversion_rate_to_usd(currency, service_settings)
+            rate_to_usd = cached_rate_to_usd(currency)
             line_ids = order.get("order_line") or []
             lines = [lines_by_id[int(line_id)] for line_id in line_ids if int(line_id) in lines_by_id]
             invoice_rows = [invoices[int(invoice_id)] for invoice_id in (order.get("invoice_ids") or []) if int(invoice_id) in invoices]
@@ -2960,6 +3407,7 @@ def process_odoo_order_batch(
                 combined["store_unit_usd"] = (combined["store_total_usd"] / float(combined.get("quantity") or 1)) if combined.get("quantity") else 0.0
                 combined["order_adjustment_lines"] = adjustment_lines
                 pending_saves.append((order, combined, status_label))
+        print(f"[pull] store={store.id} prepared {len(pending_saves)} local order-line records", flush=True)
         if all_invalid_line_ids:
             invalid_ids = sorted(all_invalid_line_ids)
             conn.execute(
@@ -2996,23 +3444,146 @@ def process_odoo_order_batch(
                 f"DELETE FROM order_lines WHERE store_id = ? AND odoo_line_id IN ({','.join('?' for _ in duplicate_line_ids)})",
                 [store.id, *duplicate_line_ids],
             )
+        bulk_rows: list[tuple[Any, ...]] = []
+        new_record_count = 0
         for order, combined, status_label in pending_saves:
             combined_existing_rows = [
                 row
                 for line_id in sorted(int(value) for value in combined["line_ids"])
                 for row in existing_by_line_id.get(line_id, [])
             ]
-            if save_combined_order_line(
-                store,
-                order,
-                combined,
-                status_label,
-                post_process=False,
-                conn=conn,
-                existing_rows=combined_existing_rows,
-                delete_duplicates=False,
-            ):
-                count += 1
+            source_line_ids = sorted(int(line_id) for line_id in combined["line_ids"])
+            if not source_line_ids:
+                continue
+            canonical_line_id = source_line_ids[0]
+            preserved = next((row for row in combined_existing_rows if row["amazon_order_id"]), combined_existing_rows[0] if combined_existing_rows else None)
+            if not combined_existing_rows:
+                new_record_count += 1
+            raw = {
+                "order": order,
+                "combined_source_lines": combined["raw_lines"],
+                "order_adjustment_lines": combined.get("order_adjustment_lines") or [],
+                "source_line_ids": source_line_ids,
+            }
+            now = utc_now()
+            bulk_rows.append(
+                (
+                    store.id,
+                    order["id"],
+                    order["name"],
+                    order.get("date_order") or "",
+                    canonical_line_id,
+                    combined.get("product_id"),
+                    combined.get("product_tmpl_id"),
+                    combined.get("product_name") or "",
+                    combined.get("default_code") or "",
+                    combined.get("internal_note") or "",
+                    combined.get("asin_from_reference") or "",
+                    combined.get("asin_from_note") or "",
+                    combined["asin"],
+                    preserved["supplier_part_auxiliary_id"] if preserved and "supplier_part_auxiliary_id" in preserved.keys() else None,
+                    combined["quantity"],
+                    combined.get("store_unit_usd") or 0,
+                    combined.get("store_total_usd") or 0,
+                    combined.get("store_currency") or order_currency_code(order),
+                    combined.get("store_currency_rate_to_usd") or 1,
+                    combined.get("store_subtotal_native") or 0,
+                    combined.get("store_delivery_native") or 0,
+                    combined.get("store_discount_native") or 0,
+                    combined.get("store_adjustment_native") or 0,
+                    combined.get("store_total_native") or 0,
+                    order.get("state") or "",
+                    order.get("invoice_status") or "",
+                    status_label,
+                    preserved["amazon_order_id"] if preserved else None,
+                    preserved["amazon_order_url"] if preserved else None,
+                    preserved["amazon_account_id"] if preserved else None,
+                    preserved["amazon_account_name"] if preserved else None,
+                    preserved["amazon_group_key"] if preserved else None,
+                    preserved["amazon_status"] if preserved else None,
+                    preserved["tracking_status"] if preserved else None,
+                    preserved["tracking_payload"] if preserved else None,
+                    preserved["tracking_checked_at"] if preserved else None,
+                    preserved["state"] if preserved and preserved["amazon_order_id"] else "pulled",
+                    preserved["last_error"] if preserved and preserved["amazon_order_id"] else None,
+                    ",".join(str(line_id) for line_id in source_line_ids),
+                    len(source_line_ids),
+                    json.dumps(raw, default=str),
+                    preserved["pulled_at"] if preserved and "pulled_at" in preserved.keys() and preserved["pulled_at"] else now,
+                    preserved["ordered_at"] if preserved and "ordered_at" in preserved.keys() and preserved["ordered_at"] else None,
+                    now,
+                    now,
+                )
+            )
+        if bulk_rows:
+            conn.execute_values(
+                """
+                INSERT INTO order_lines
+                (store_id, odoo_order_id, odoo_order_name, odoo_order_date, odoo_line_id, product_id, product_tmpl_id,
+                 product_name, default_code, internal_note, asin_from_reference, asin_from_note, asin,
+                 supplier_part_auxiliary_id,
+                 quantity, store_unit_price, store_total_price, store_currency, store_currency_rate_to_usd,
+                 store_subtotal_native, store_delivery_native, store_discount_native, store_adjustment_native, store_total_native,
+                 odoo_order_state, odoo_invoice_status, odoo_status_label, amazon_order_id,
+                 amazon_order_url, amazon_account_id, amazon_account_name, amazon_group_key, amazon_status,
+                 tracking_status, tracking_payload, tracking_checked_at, state, last_error, source_odoo_line_ids,
+                 source_line_count, raw_json, pulled_at, ordered_at, created_at, updated_at)
+                VALUES ?
+                ON CONFLICT(store_id, odoo_line_id) DO UPDATE SET
+                    odoo_order_name=excluded.odoo_order_name,
+                    odoo_order_date=excluded.odoo_order_date,
+                    product_id=excluded.product_id,
+                    product_tmpl_id=excluded.product_tmpl_id,
+                    product_name=excluded.product_name,
+                    default_code=excluded.default_code,
+                    internal_note=excluded.internal_note,
+                    asin_from_reference=excluded.asin_from_reference,
+                    asin_from_note=excluded.asin_from_note,
+                    asin=excluded.asin,
+                    supplier_part_auxiliary_id=COALESCE(NULLIF(order_lines.supplier_part_auxiliary_id, ''), excluded.supplier_part_auxiliary_id),
+                    quantity=excluded.quantity,
+                    store_unit_price=excluded.store_unit_price,
+                    store_total_price=excluded.store_total_price,
+                    store_currency=excluded.store_currency,
+                    store_currency_rate_to_usd=excluded.store_currency_rate_to_usd,
+                    store_subtotal_native=excluded.store_subtotal_native,
+                    store_delivery_native=excluded.store_delivery_native,
+                    store_discount_native=excluded.store_discount_native,
+                    store_adjustment_native=excluded.store_adjustment_native,
+                    store_total_native=excluded.store_total_native,
+                    odoo_order_state=excluded.odoo_order_state,
+                    odoo_invoice_status=excluded.odoo_invoice_status,
+                    odoo_status_label=excluded.odoo_status_label,
+                    amazon_order_id=COALESCE(order_lines.amazon_order_id, excluded.amazon_order_id),
+                    amazon_order_url=COALESCE(order_lines.amazon_order_url, excluded.amazon_order_url),
+                    amazon_account_id=COALESCE(order_lines.amazon_account_id, excluded.amazon_account_id),
+                    amazon_account_name=COALESCE(order_lines.amazon_account_name, excluded.amazon_account_name),
+                    amazon_group_key=COALESCE(order_lines.amazon_group_key, excluded.amazon_group_key),
+                    amazon_status=COALESCE(order_lines.amazon_status, excluded.amazon_status),
+                    tracking_status=COALESCE(order_lines.tracking_status, excluded.tracking_status),
+                    tracking_payload=COALESCE(order_lines.tracking_payload, excluded.tracking_payload),
+                    tracking_checked_at=COALESCE(order_lines.tracking_checked_at, excluded.tracking_checked_at),
+                    state=CASE
+                        WHEN COALESCE(order_lines.amazon_order_id, '') != '' THEN order_lines.state
+                        ELSE excluded.state
+                    END,
+                    last_error=CASE
+                        WHEN COALESCE(order_lines.amazon_order_id, '') != '' THEN order_lines.last_error
+                        ELSE excluded.last_error
+                    END,
+                    source_odoo_line_ids=excluded.source_odoo_line_ids,
+                    source_line_count=excluded.source_line_count,
+                    raw_json=excluded.raw_json,
+                    pulled_at=COALESCE(order_lines.pulled_at, excluded.pulled_at),
+                    ordered_at=COALESCE(order_lines.ordered_at, excluded.ordered_at),
+                    updated_at=excluded.updated_at
+                """,
+                bulk_rows,
+                template=f"({','.join('?' for _ in range(45))})",
+                page_size=500,
+            )
+            count = new_record_count
+        print(f"[pull] store={store.id} saved {len(bulk_rows)} local order-line records; new={count}", flush=True)
     return count
 
 
@@ -3032,6 +3603,8 @@ def fetch_odoo_lines(
     batch_size: int = 50,
     progress: Optional[Callable[[int, int, int], None]] = None,
 ) -> int:
+    started_at = time.monotonic()
+    print(f"[pull] store={store.id} days={days} limit={limit} batch_size={batch_size} connecting to Odoo", flush=True)
     odoo = OdooClient(store)
     domain: list[Any] = [("state", "in", ["sale", "done", "cancel"])]
     if store.website_id:
@@ -3050,8 +3623,10 @@ def fetch_odoo_lines(
     service_settings = get_service_settings()
     batch_size = normalize_pull_batch_size(batch_size)
     limit = normalize_pull_limit(limit, 0)
+    print(f"[pull] store={store.id} counting Odoo sale orders", flush=True)
     total_available = int(odoo.execute("sale.order", "search_count", [domain]) or 0)
     target_total = min(total_available, limit) if limit else total_available
+    print(f"[pull] store={store.id} total={target_total} available={total_available}", flush=True)
     processed_orders = 0
     inserted_records = 0
     offset = 0
@@ -3059,6 +3634,8 @@ def fetch_odoo_lines(
         progress(processed_orders, target_total, inserted_records)
     while processed_orders < target_total:
         current_limit = min(batch_size, target_total - processed_orders)
+        batch_started_at = time.monotonic()
+        print(f"[pull] store={store.id} fetching batch offset={offset} limit={current_limit}", flush=True)
         orders = odoo.search_read(
             "sale.order",
             domain,
@@ -3069,7 +3646,11 @@ def fetch_odoo_lines(
         )
         if not orders:
             break
+        print(f"[pull] store={store.id} batch offset={offset} fetched {len(orders)} orders", flush=True)
+        enrich_started_at = time.monotonic()
         enrich_orders_with_destination_countries(odoo, orders)
+        print(f"[pull] store={store.id} batch offset={offset} enriched countries in {time.monotonic() - enrich_started_at:.1f}s", flush=True)
+        process_started_at = time.monotonic()
         inserted_records += process_odoo_order_batch(
             store,
             odoo,
@@ -3080,11 +3661,36 @@ def fetch_odoo_lines(
             invoice_fields,
             service_settings,
         )
+        print(f"[pull] store={store.id} batch offset={offset} processed records in {time.monotonic() - process_started_at:.1f}s", flush=True)
         processed_orders += len(orders)
         offset += len(orders)
         if progress:
             progress(processed_orders, target_total, inserted_records)
+        print(
+            f"[pull] store={store.id} batch offset={offset} done in {time.monotonic() - batch_started_at:.1f}s "
+            f"progress={processed_orders}/{target_total} inserted={inserted_records}",
+            flush=True,
+        )
+    print(f"[pull] store={store.id} finished in {time.monotonic() - started_at:.1f}s inserted={inserted_records}", flush=True)
     return inserted_records
+
+
+def fetch_odoo_lines_exclusive(
+    store: Store,
+    days: int,
+    limit: int,
+    batch_size: int = 50,
+    progress: Optional[Callable[[int, int, int], None]] = None,
+    wait: bool = True,
+) -> Optional[int]:
+    acquired = _PULL_EXECUTION_LOCK.acquire(blocking=wait)
+    if not acquired:
+        print(f"[pull] store={store.id} skipped because another Odoo pull is already running", flush=True)
+        return None
+    try:
+        return fetch_odoo_lines(store, days, limit, batch_size, progress)
+    finally:
+        _PULL_EXECUTION_LOCK.release()
 
 def existing_amazon_order_in_odoo(store: Store, order_id: int) -> str:
     try:
@@ -3165,6 +3771,34 @@ def note_manual_amazon_match(rows: list[dict[str, Any]], amazon_order_id: str, a
                 odoo.post_order_note(order_id, note)
         except Exception:
             continue
+
+
+def manual_amazon_match_followups(
+    rows: list[dict[str, Any]],
+    updated_for_shopify: list[dict[str, Any]],
+    amazon_order_id: str,
+    amazon_order_url: str,
+    amazon_account_name: str,
+) -> None:
+    for row in updated_for_shopify:
+        try:
+            ensure_inventory_for_line(row)
+            index_order_line(row)
+        except Exception as exc:
+            print(f"Manual Amazon match line followup failed for {row.get('id')}: {exc}", flush=True)
+    try:
+        enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+    except Exception as exc:
+        print(f"Manual Amazon match Shopify enqueue failed: {exc}", flush=True)
+    try:
+        note_manual_amazon_match(rows, amazon_order_id, amazon_order_url, amazon_account_name)
+    except Exception as exc:
+        print(f"Manual Amazon match Odoo note failed: {exc}", flush=True)
+    try:
+        for store_id in sorted({int(row["store_id"]) for row in rows}):
+            write_report(store_id)
+    except Exception as exc:
+        print(f"Manual Amazon match report refresh failed: {exc}", flush=True)
 
 
 def backfill_cxml_order_references() -> int:
@@ -4386,15 +5020,34 @@ def mark_line_error_with_engine(line_id: int, message: str, order_engine: str) -
         )
 
 
-def chrome_recipient_name(order_names: Union[list[str], str]) -> str:
+CHROME_PART_GROUP_RE = re.compile(r"-part(\d+)of(\d+)$", re.IGNORECASE)
+
+
+def chrome_part_suffix(group_key: str) -> str:
+    match = CHROME_PART_GROUP_RE.search(clean_text(group_key))
+    if not match:
+        return ""
+    return f"Part{int(match.group(1))}of{int(match.group(2))}"
+
+
+def is_chrome_part_group(group_key: str) -> bool:
+    return bool(CHROME_PART_GROUP_RE.search(clean_text(group_key)))
+
+
+def chrome_recipient_name(order_names: Union[list[str], str], suffix: str = "") -> str:
     if isinstance(order_names, str):
         names = [order_names]
     else:
         names = list(dict.fromkeys(str(name or "").strip() for name in order_names if str(name or "").strip()))
-    return f"Nutricity {' '.join(names)}".strip()
+    parts = ["Nutricity", *names]
+    suffix = clean_text(suffix).replace(" ", "")
+    if suffix:
+        parts.append(suffix)
+    return " ".join(part for part in parts if part).strip()
 
 
 CHROME_JOB_LEASE_MINUTES = 20
+CHROME_ORDER_SUBMITTED_STATUS = "order_submitted"
 
 
 def chrome_job_lease_expiry() -> str:
@@ -4430,6 +5083,7 @@ def clear_expired_chrome_claims(conn: Any) -> None:
         WHERE order_engine='chrome'
           AND state='submitted'
           AND COALESCE(amazon_order_id, '') = ''
+          AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
           AND COALESCE(chrome_claim_expires_at, '') != ''
           AND chrome_claim_expires_at <= ?
         """,
@@ -4438,17 +5092,31 @@ def clear_expired_chrome_claims(conn: Any) -> None:
 
 
 def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optional[dict[int, dict[str, Any]]] = None) -> dict[str, Any]:
+    group_rows = [
+        row
+        for row in group_rows
+        if clean_text(row.get("state")) == "submitted" and not clean_text(row.get("amazon_order_id"))
+    ]
+    if not group_rows:
+        raise ValueError("Chrome job has no submitted rows.")
     order_names = list(dict.fromkeys(str(row["odoo_order_name"]) for row in group_rows))
     account_id = int(group_rows[0]["amazon_account_id"] or 0)
     account = (accounts_by_id or {}).get(account_id) or get_amazon_account(account_id)
     items = aggregate_items_by_asin(group_rows)
+    group_key = str(group_rows[0]["amazon_group_key"])
+    part_suffix = chrome_part_suffix(group_key)
+    amazon_statuses = [clean_text(row.get("amazon_status")) for row in group_rows if clean_text(row.get("amazon_status"))]
+    amazon_status = "order_submitted" if "order_submitted" in amazon_statuses else ("reporting_complete" if "reporting_complete" in amazon_statuses else (amazon_statuses[0] if amazon_statuses else ""))
     return {
-        "group_key": str(group_rows[0]["amazon_group_key"]),
+        "group_key": group_key,
         "store_id": group_rows[0]["store_id"],
         "amazon_account_id": account["id"],
         "amazon_account_name": account["name"],
+        "amazon_status": amazon_status,
+        "submitted_to_amazon": amazon_status in {"order_submitted", "reporting_complete"},
         "order_names": order_names,
-        "recipient_name": chrome_recipient_name(order_names),
+        "recipient_name": chrome_recipient_name(order_names, part_suffix),
+        "recipient_suffix": part_suffix,
         "line_ids": [row["id"] for row in group_rows],
         "claimed_by": group_rows[0].get("chrome_claimed_by") or "",
         "claim_expires_at": group_rows[0].get("chrome_claim_expires_at") or "",
@@ -4473,7 +5141,8 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
     }
 
 
-def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = True) -> dict[str, Any]:
+def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = True, limit: int = 50) -> dict[str, Any]:
+    limit = max(1, min(int(limit or 50), 250))
     with db() as conn:
         if clear_expired:
             clear_expired_chrome_claims(conn)
@@ -4491,19 +5160,46 @@ def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = 
             """,
             (store_id, store_id),
         ).fetchall())
-        rows = conn.execute(
+        candidate_rows = conn.execute(
             """
-            SELECT *
+            SELECT amazon_group_key,
+                   COALESCE(MAX(CASE WHEN COALESCE(chrome_claimed_by, '') != '' THEN 1 ELSE 0 END), 0) AS locked,
+                   MAX(COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at)) AS newest_order_date,
+                   MAX(odoo_order_id) AS newest_order_id,
+                   MIN(id) AS first_line_id
             FROM order_lines
             WHERE order_engine='chrome'
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
               AND COALESCE(amazon_group_key, '') != ''
               AND (? IS NULL OR store_id=?)
-            ORDER BY COALESCE(chrome_claimed_by, '') != '', updated_at ASC, odoo_order_id DESC, id ASC
+            GROUP BY amazon_group_key
+            ORDER BY locked ASC, newest_order_date DESC, newest_order_id DESC, first_line_id ASC
+            LIMIT ?
             """,
-            (store_id, store_id),
+            (store_id, store_id, limit),
         ).fetchall()
+        group_keys = [str(row["amazon_group_key"]) for row in candidate_rows]
+        rows = []
+        if group_keys:
+            placeholders = ",".join("?" for _ in group_keys)
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM order_lines
+                WHERE amazon_group_key IN ({placeholders})
+                  AND order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                ORDER BY COALESCE(chrome_claimed_by, '') != '',
+                         COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at) DESC,
+                         odoo_order_id DESC,
+                         id ASC
+                """,
+                group_keys,
+            ).fetchall()
         account_rows = rows_to_dicts(conn.execute("SELECT * FROM amazon_accounts").fetchall())
     accounts_by_id = {int(row["id"]): row for row in account_rows if row.get("id") is not None}
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -4513,55 +5209,220 @@ def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = 
     return {"jobs": jobs, "counts": counts}
 
 
-def claim_next_chrome_job(store_id: Optional[int], worker_id: str) -> Optional[dict[str, Any]]:
+def split_chrome_group_by_asin_if_needed(conn: Any, group_key: str) -> str:
+    group_key = clean_text(group_key)
+    if not group_key or is_chrome_part_group(group_key):
+        return group_key
+    rows = rows_to_dicts(conn.execute(
+        """
+        SELECT *
+        FROM order_lines
+        WHERE amazon_group_key=?
+          AND order_engine='chrome'
+          AND state='submitted'
+          AND COALESCE(amazon_order_id, '') = ''
+          AND COALESCE(chrome_claimed_by, '') = ''
+          AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+        ORDER BY id
+        """,
+        (group_key,),
+    ).fetchall())
+    if len(rows) <= 1:
+        return group_key
+    rows_by_asin: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        asin = normalize_asin(row.get("asin"))
+        if not asin:
+            return group_key
+        rows_by_asin.setdefault(asin, []).append(row)
+    if len(rows_by_asin) <= 1:
+        return group_key
+
+    now = utc_now()
+    first_part_key = group_key
+    total_parts = len(rows_by_asin)
+    for part_index, asin_rows in enumerate(rows_by_asin.values(), start=1):
+        part_key = f"{group_key}-part{part_index}of{total_parts}"
+        if part_index == 1:
+            first_part_key = part_key
+        row_ids = [int(row["id"]) for row in asin_rows]
+        placeholders = ",".join("?" for _ in row_ids)
+        conn.execute(
+            f"""
+            UPDATE order_lines
+            SET amazon_group_key=?,
+                updated_at=?
+            WHERE id IN ({placeholders})
+            """,
+            [part_key, now, *row_ids],
+        )
+        conn.execute(
+            """
+            INSERT INTO amazon_attempts
+            (order_line_id, external_id, mode, request_json, response_json, status, error, created_at)
+            VALUES (?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)
+            """,
+            (
+                row_ids[0],
+                part_key,
+                json.dumps(
+                    {
+                        "event": "split_multi_asin_order",
+                        "source_group_key": group_key,
+                        "part": part_index,
+                        "total_parts": total_parts,
+                        "asins": sorted({normalize_asin(row.get("asin")) for row in asin_rows if normalize_asin(row.get("asin"))}),
+                        "line_ids": row_ids,
+                    }
+                ),
+                now,
+            ),
+        )
+    return first_part_key
+
+
+def claim_next_chrome_job(
+    store_id: Optional[int],
+    worker_id: str,
+    resume_existing: bool = True,
+    split_mixed_asin: bool = False,
+) -> Optional[dict[str, Any]]:
     worker_id = clean_text(worker_id)[:120] or f"worker-{uuid.uuid4().hex[:12]}"
     with db() as conn:
         clear_expired_chrome_claims(conn)
-        existing = conn.execute(
-            """
-            SELECT *
-            FROM order_lines
-            WHERE order_engine='chrome'
-              AND state='submitted'
-              AND COALESCE(amazon_order_id, '') = ''
-              AND COALESCE(amazon_group_key, '') != ''
-              AND chrome_claimed_by=?
-              AND (? IS NULL OR store_id=?)
-            ORDER BY updated_at ASC, odoo_order_id DESC, id ASC
-            """,
-            (worker_id, store_id, store_id),
-        ).fetchall()
-        if existing:
-            expiry = chrome_job_lease_expiry()
-            group_key = str(existing[0]["amazon_group_key"])
+        if not resume_existing:
+            stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
             conn.execute(
                 """
                 UPDATE order_lines
-                SET chrome_claim_expires_at=?, updated_at=?
-                WHERE amazon_group_key=? AND chrome_claimed_by=?
+                SET chrome_claimed_by=NULL,
+                    chrome_claimed_at=NULL,
+                    chrome_claim_expires_at=NULL,
+                    updated_at=?
+                WHERE order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND chrome_claimed_by=?
+                  AND (? IS NULL OR store_id=?)
+                  AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  AND COALESCE(updated_at, '') < ?
                 """,
-                (expiry, utc_now(), group_key, worker_id),
+                (utc_now(), worker_id, store_id, store_id, stale_cutoff),
             )
-            rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_group_key=? ORDER BY id", (group_key,)).fetchall())
-            return chrome_job_from_rows(rows)
+        if resume_existing:
+            submitted_existing = conn.execute(
+                """
+                SELECT *
+                FROM order_lines
+                WHERE order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND COALESCE(amazon_group_key, '') != ''
+                  AND chrome_claimed_by=?
+                  AND COALESCE(amazon_status, '') IN ('order_submitted', 'reporting_complete')
+                  AND (? IS NULL OR store_id=?)
+                ORDER BY COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at) DESC,
+                         odoo_order_id DESC,
+                         id ASC
+                """,
+                (worker_id, store_id, store_id),
+            ).fetchall()
+            if submitted_existing:
+                expiry = chrome_job_lease_expiry()
+                group_key = str(submitted_existing[0]["amazon_group_key"])
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET chrome_claim_expires_at=?, updated_at=?
+                    WHERE amazon_group_key=?
+                      AND chrome_claimed_by=?
+                      AND order_engine='chrome'
+                      AND state='submitted'
+                      AND COALESCE(amazon_order_id, '') = ''
+                    """,
+                    (expiry, utc_now(), group_key, worker_id),
+                )
+                rows = rows_to_dicts(conn.execute(
+                    """
+                    SELECT *
+                    FROM order_lines
+                    WHERE amazon_group_key=?
+                      AND order_engine='chrome'
+                      AND state='submitted'
+                      AND COALESCE(amazon_order_id, '') = ''
+                    ORDER BY id
+                    """,
+                    (group_key,),
+                ).fetchall())
+                return chrome_job_from_rows(rows)
+            existing = conn.execute(
+                """
+                SELECT *
+                FROM order_lines
+                WHERE order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND COALESCE(amazon_group_key, '') != ''
+                  AND chrome_claimed_by=?
+                  AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  AND (? IS NULL OR store_id=?)
+                ORDER BY COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at) DESC,
+                         odoo_order_id DESC,
+                         id ASC
+                """,
+                (worker_id, store_id, store_id),
+            ).fetchall()
+            if existing:
+                expiry = chrome_job_lease_expiry()
+                group_key = str(existing[0]["amazon_group_key"])
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET chrome_claim_expires_at=?, updated_at=?
+                    WHERE amazon_group_key=? AND chrome_claimed_by=?
+                    """,
+                    (expiry, utc_now(), group_key, worker_id),
+                )
+                rows = rows_to_dicts(conn.execute(
+                    """
+                    SELECT *
+                    FROM order_lines
+                    WHERE amazon_group_key=?
+                      AND order_engine='chrome'
+                      AND state='submitted'
+                      AND COALESCE(amazon_order_id, '') = ''
+                      AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                    ORDER BY id
+                    """,
+                    (group_key,),
+                ).fetchall())
+                return chrome_job_from_rows(rows)
         candidates = conn.execute(
             """
-            SELECT amazon_group_key, MIN(updated_at) AS first_updated
+            SELECT amazon_group_key,
+                   MAX(COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at)) AS newest_order_date,
+                   MAX(odoo_order_id) AS newest_order_id,
+                   MIN(id) AS first_line_id
             FROM order_lines
             WHERE order_engine='chrome'
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
               AND COALESCE(amazon_group_key, '') != ''
               AND COALESCE(chrome_claimed_by, '') = ''
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
               AND (? IS NULL OR store_id=?)
             GROUP BY amazon_group_key
-            ORDER BY first_updated ASC
+            ORDER BY newest_order_date DESC, newest_order_id DESC, first_line_id ASC
             LIMIT 10
             """,
             (store_id, store_id),
         ).fetchall()
         for candidate in candidates:
             group_key = str(candidate["amazon_group_key"])
+            if split_mixed_asin:
+                group_key = split_chrome_group_by_asin_if_needed(conn, group_key)
+                if not group_key:
+                    continue
             expiry = chrome_job_lease_expiry()
             cursor = conn.execute(
                 """
@@ -4575,11 +5436,23 @@ def claim_next_chrome_job(store_id: Optional[int], worker_id: str) -> Optional[d
                   AND state='submitted'
                   AND COALESCE(amazon_order_id, '') = ''
                   AND COALESCE(chrome_claimed_by, '') = ''
+                  AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
                 """,
                 (worker_id, utc_now(), expiry, utc_now(), group_key),
             )
             if cursor.rowcount:
-                rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_group_key=? ORDER BY id", (group_key,)).fetchall())
+                rows = rows_to_dicts(conn.execute(
+                    """
+                    SELECT *
+                    FROM order_lines
+                    WHERE amazon_group_key=?
+                      AND order_engine='chrome'
+                      AND state='submitted'
+                      AND COALESCE(amazon_order_id, '') = ''
+                    ORDER BY id
+                    """,
+                    (group_key,),
+                ).fetchall())
                 return chrome_job_from_rows(rows)
     return None
 
@@ -6559,6 +7432,134 @@ def s3_storage_client() -> Optional[Any]:
     )
 
 
+def backup_s3_client() -> Optional[Any]:
+    settings = get_service_settings()
+    endpoint = settings.get("backup_s3_endpoint") or settings.get("storage_s3_endpoint")
+    bucket = settings.get("backup_s3_bucket") or settings.get("storage_s3_bucket")
+    if not endpoint or not bucket:
+        return None
+    try:
+        import boto3  # type: ignore
+    except Exception:
+        return None
+    return boto3.client(
+        "s3",
+        endpoint_url=s3_endpoint_base(endpoint),
+        region_name=settings["storage_s3_region"] or "auto",
+        aws_access_key_id=settings["storage_s3_access_key_id"],
+        aws_secret_access_key=settings["storage_s3_secret_access_key"],
+    )
+
+
+def require_backup_client() -> tuple[Any, str]:
+    settings = get_service_settings()
+    bucket = settings.get("backup_s3_bucket") or settings.get("storage_s3_bucket")
+    client = backup_s3_client()
+    if not client or not bucket:
+        raise RuntimeError("Cloudflare R2 backup storage is required. Configure backup endpoint/bucket plus R2 access key and secret.")
+    return client, bucket
+
+
+def active_postgres_url(settings: Optional[dict[str, str]] = None) -> str:
+    settings = settings or get_service_settings()
+    return settings.get("postgres_url") or os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL") or ""
+
+
+def backup_key_for_now(postgres_url: str) -> str:
+    parsed = urlsplit(postgres_url)
+    db_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", (parsed.path or "/postgres").strip("/") or "postgres")
+    return f"postgres-backups/{db_name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.dump"
+
+
+def format_backup_item(obj: dict[str, Any]) -> dict[str, Any]:
+    key = str(obj.get("Key") or "")
+    name = key.rsplit("/", 1)[-1] or key
+    return {
+        "key": key,
+        "name": name,
+        "size": int(obj.get("Size") or 0),
+        "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else "",
+    }
+
+
+def list_database_backups() -> list[dict[str, Any]]:
+    client, bucket = require_backup_client()
+    paginator = client.get_paginator("list_objects_v2")
+    items: list[dict[str, Any]] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix="postgres-backups/"):
+        items.extend(format_backup_item(obj) for obj in page.get("Contents", []) if str(obj.get("Key") or "").endswith(".dump"))
+    return sorted(items, key=lambda item: item.get("last_modified") or "", reverse=True)
+
+
+def run_checked(command: list[str], timeout: int) -> None:
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "Command failed.").strip()
+        raise RuntimeError(message[-1200:])
+
+
+def create_database_backup() -> dict[str, Any]:
+    settings = get_service_settings()
+    postgres_url = active_postgres_url(settings)
+    if not postgres_url:
+        raise RuntimeError("Postgres URL is required before backup can run.")
+    pg_dump = shutil.which("pg_dump")
+    if not pg_dump:
+        raise RuntimeError("pg_dump is not installed in this app environment.")
+    client, bucket = require_backup_client()
+    key = backup_key_for_now(postgres_url)
+    with tempfile.NamedTemporaryFile(suffix=".dump") as dump_file:
+        run_checked([pg_dump, "--format=custom", "--no-owner", "--no-acl", "--file", dump_file.name, postgres_url], timeout=20 * 60)
+        client.upload_file(
+            dump_file.name,
+            bucket,
+            key,
+            ExtraArgs={"ContentType": "application/octet-stream", "Metadata": {"created-by": "nutricity-app", "kind": "postgres"}},
+        )
+        size = Path(dump_file.name).stat().st_size
+    return {"key": key, "name": key.rsplit("/", 1)[-1], "size": size}
+
+
+def restore_database_backup(key: str) -> dict[str, Any]:
+    clean_key = clean_text(key)
+    if not clean_key.startswith("postgres-backups/") or not clean_key.endswith(".dump"):
+        raise RuntimeError("Select a valid Postgres backup.")
+    settings = get_service_settings()
+    postgres_url = active_postgres_url(settings)
+    if not postgres_url:
+        raise RuntimeError("Postgres URL is required before restore can run.")
+    pg_restore = shutil.which("pg_restore")
+    if not pg_restore:
+        raise RuntimeError("pg_restore is not installed in this app environment.")
+    client, bucket = require_backup_client()
+    with tempfile.NamedTemporaryFile(suffix=".dump") as dump_file:
+        client.download_file(bucket, clean_key, dump_file.name)
+        db_session.close_pool()
+        run_checked(
+            [
+                pg_restore,
+                "--clean",
+                "--if-exists",
+                "--no-owner",
+                "--no-acl",
+                "--dbname",
+                postgres_url,
+                dump_file.name,
+            ],
+            timeout=30 * 60,
+        )
+    return {"key": clean_key, "name": clean_key.rsplit("/", 1)[-1]}
+
+
+def delete_database_backup(key: str) -> dict[str, Any]:
+    clean_key = clean_text(key)
+    if not clean_key.startswith("postgres-backups/") or not clean_key.endswith(".dump"):
+        raise RuntimeError("Select a valid Postgres backup.")
+    client, bucket = require_backup_client()
+    client.delete_object(Bucket=bucket, Key=clean_key)
+    return {"key": clean_key}
+
+
 def require_storage_client() -> Any:
     client = s3_storage_client()
     if not client:
@@ -8509,51 +9510,90 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     page, per_page, offset = pagination_bounds(page, per_page)
     with db() as conn:
         payload = conn.execute(
-            """
+            f"""
             WITH stores_cte AS (
                 SELECT * FROM stores ORDER BY name
             ),
             chosen AS (
                 SELECT COALESCE(?, (SELECT id FROM stores_cte LIMIT 1)) AS store_id
             ),
-            line_rows AS (
-                SELECT order_lines.*,
-                       COALESCE((
-                           SELECT COUNT(*)
-                           FROM order_lines AS duplicate_lines
-                           WHERE duplicate_lines.store_id = order_lines.store_id
-                             AND duplicate_lines.asin = order_lines.asin
-                             AND COALESCE(duplicate_lines.amazon_order_id, '') = ''
-                             AND COALESCE(duplicate_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-                       ), 0) AS duplicate_asin_count,
-                       COALESCE((
-                           SELECT SUM(quantity)
-                           FROM inventory_items
-                           WHERE inventory_items.store_id = order_lines.store_id
-                             AND inventory_items.asin = order_lines.asin
-                             AND inventory_items.status = 'available'
-                       ), 0) AS inventory_quantity,
-                       COALESCE((
-                           SELECT COUNT(DISTINCT same_order_lines.asin)
-                           FROM order_lines AS same_order_lines
-                           WHERE same_order_lines.store_id = order_lines.store_id
-                             AND same_order_lines.odoo_order_id = order_lines.odoo_order_id
-                             AND COALESCE(same_order_lines.asin, '') != ''
-                             AND COALESCE(same_order_lines.amazon_order_id, '') = ''
-                             AND same_order_lines.state != 'missing'
-                             AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-                       ), 0) AS odoo_order_distinct_asin_count
+            page_rows AS (
+                SELECT {ORDER_LINE_PAGE_SELECT},
+                       ROW_NUMBER() OVER (ORDER BY odoo_order_id DESC, asin, id) AS sort_order
                 FROM order_lines
                 WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))
                 ORDER BY odoo_order_id DESC, asin, id
                 LIMIT ? OFFSET ?
+            ),
+            page_asins AS (
+                SELECT DISTINCT store_id, asin
+                FROM page_rows
+                WHERE COALESCE(asin, '') != ''
+            ),
+            page_orders AS (
+                SELECT DISTINCT store_id, odoo_order_id
+                FROM page_rows
+                WHERE odoo_order_id IS NOT NULL
+            ),
+            duplicate_counts AS (
+                SELECT duplicate_lines.store_id,
+                       duplicate_lines.asin,
+                       COUNT(*) AS duplicate_asin_count
+                FROM order_lines AS duplicate_lines
+                JOIN page_asins
+                  ON page_asins.store_id = duplicate_lines.store_id
+                 AND page_asins.asin = duplicate_lines.asin
+                WHERE COALESCE(duplicate_lines.amazon_order_id, '') = ''
+                  AND COALESCE(duplicate_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                GROUP BY duplicate_lines.store_id, duplicate_lines.asin
+            ),
+            inventory_counts AS (
+                SELECT inventory_items.store_id,
+                       inventory_items.asin,
+                       SUM(inventory_items.quantity) AS inventory_quantity
+                FROM inventory_items
+                JOIN page_asins
+                  ON page_asins.store_id = inventory_items.store_id
+                 AND page_asins.asin = inventory_items.asin
+                WHERE inventory_items.status = 'available'
+                GROUP BY inventory_items.store_id, inventory_items.asin
+            ),
+            order_asin_counts AS (
+                SELECT same_order_lines.store_id,
+                       same_order_lines.odoo_order_id,
+                       COUNT(DISTINCT same_order_lines.asin) AS odoo_order_distinct_asin_count
+                FROM order_lines AS same_order_lines
+                JOIN page_orders
+                  ON page_orders.store_id = same_order_lines.store_id
+                 AND page_orders.odoo_order_id = same_order_lines.odoo_order_id
+                WHERE COALESCE(same_order_lines.asin, '') != ''
+                  AND COALESCE(same_order_lines.amazon_order_id, '') = ''
+                  AND same_order_lines.state != 'missing'
+                  AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                GROUP BY same_order_lines.store_id, same_order_lines.odoo_order_id
+            ),
+            line_rows AS (
+                SELECT page_rows.*,
+                       COALESCE(duplicate_counts.duplicate_asin_count, 0) AS duplicate_asin_count,
+                       COALESCE(inventory_counts.inventory_quantity, 0) AS inventory_quantity,
+                       COALESCE(order_asin_counts.odoo_order_distinct_asin_count, 0) AS odoo_order_distinct_asin_count
+                FROM page_rows
+                LEFT JOIN duplicate_counts
+                  ON duplicate_counts.store_id = page_rows.store_id
+                 AND duplicate_counts.asin = page_rows.asin
+                LEFT JOIN inventory_counts
+                  ON inventory_counts.store_id = page_rows.store_id
+                 AND inventory_counts.asin = page_rows.asin
+                LEFT JOIN order_asin_counts
+                  ON order_asin_counts.store_id = page_rows.store_id
+                 AND order_asin_counts.odoo_order_id = page_rows.odoo_order_id
             )
             SELECT
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(stores_cte)), '[]'::json) FROM stores_cte) AS stores,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(a)), '[]'::json) FROM (SELECT * FROM fulfilment_addresses ORDER BY is_default DESC, label) a) AS addresses,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(ac)), '[]'::json) FROM (SELECT * FROM amazon_accounts ORDER BY is_default DESC, name) ac) AS amazon_accounts,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(p)), '[]'::json) FROM (SELECT * FROM punchout_return_urls ORDER BY is_default DESC, label) p) AS punchout_return_urls,
-                (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(line_rows)), '[]'::json) FROM line_rows) AS rows,
+                (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order), '[]'::json) FROM line_rows) AS rows,
                 (SELECT COUNT(*) FROM order_lines WHERE ((SELECT store_id FROM chosen) IS NULL OR store_id=(SELECT store_id FROM chosen))) AS total,
                 (SELECT COALESCE(JSON_AGG(ROW_TO_JSON(c)), '[]'::json) FROM (
                     SELECT state, COUNT(*) AS count
@@ -8562,7 +9602,10 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                     GROUP BY state
                 ) c) AS counts,
                 (SELECT store_id FROM chosen) AS current_store_id,
-                (SELECT value FROM app_settings WHERE key='default_ordering_engine') AS default_ordering_engine
+                (SELECT value FROM app_settings WHERE key='default_ordering_engine') AS default_ordering_engine,
+                (SELECT value FROM app_settings WHERE key='pull_orders_days') AS pull_orders_days,
+                (SELECT value FROM app_settings WHERE key='pull_orders_limit') AS pull_orders_limit,
+                (SELECT value FROM app_settings WHERE key='pull_orders_batch_size') AS pull_orders_batch_size
             """
             ,
             (store_id, per_page, offset),
@@ -8600,9 +9643,99 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
         "duplicate_asins_per_page": 12,
         "duplicate_asins_total": 0,
         "default_ordering_engine": normalize_ordering_engine(str(payload.get("default_ordering_engine") or "rest")),
-        "pull_orders_days": int(get_setting("pull_orders_days", "7") or 7),
-        "pull_orders_limit": stored_pull_limit(),
-        "pull_orders_batch_size": stored_pull_batch_size(),
+        "pull_orders_days": int(payload.get("pull_orders_days") or DEFAULT_SERVICE_SETTINGS.get("pull_orders_days", "7") or 7),
+        "pull_orders_limit": normalize_pull_limit(payload.get("pull_orders_limit") or DEFAULT_SERVICE_SETTINGS.get("pull_orders_limit", "0"), 0),
+        "pull_orders_batch_size": normalize_pull_batch_size(payload.get("pull_orders_batch_size") or DEFAULT_SERVICE_SETTINGS.get("pull_orders_batch_size", "50")),
+    }
+
+
+def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    with db() as conn:
+        payload = conn.execute(
+            f"""
+            WITH page_rows AS (
+                SELECT {ORDER_LINE_PAGE_SELECT},
+                       ROW_NUMBER() OVER (ORDER BY odoo_order_id DESC, asin, id) AS sort_order
+                FROM order_lines
+                WHERE (? IS NULL OR store_id=?)
+                ORDER BY odoo_order_id DESC, asin, id
+                LIMIT ? OFFSET ?
+            ),
+            page_asins AS (
+                SELECT DISTINCT store_id, asin
+                FROM page_rows
+                WHERE COALESCE(asin, '') != ''
+            ),
+            page_orders AS (
+                SELECT DISTINCT store_id, odoo_order_id
+                FROM page_rows
+                WHERE odoo_order_id IS NOT NULL
+            ),
+            duplicate_counts AS (
+                SELECT duplicate_lines.store_id,
+                       duplicate_lines.asin,
+                       COUNT(*) AS duplicate_asin_count
+                FROM order_lines AS duplicate_lines
+                JOIN page_asins
+                  ON page_asins.store_id = duplicate_lines.store_id
+                 AND page_asins.asin = duplicate_lines.asin
+                WHERE COALESCE(duplicate_lines.amazon_order_id, '') = ''
+                  AND COALESCE(duplicate_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                GROUP BY duplicate_lines.store_id, duplicate_lines.asin
+            ),
+            inventory_counts AS (
+                SELECT inventory_items.store_id,
+                       inventory_items.asin,
+                       SUM(inventory_items.quantity) AS inventory_quantity
+                FROM inventory_items
+                JOIN page_asins
+                  ON page_asins.store_id = inventory_items.store_id
+                 AND page_asins.asin = inventory_items.asin
+                WHERE inventory_items.status = 'available'
+                GROUP BY inventory_items.store_id, inventory_items.asin
+            ),
+            order_asin_counts AS (
+                SELECT same_order_lines.store_id,
+                       same_order_lines.odoo_order_id,
+                       COUNT(DISTINCT same_order_lines.asin) AS odoo_order_distinct_asin_count
+                FROM order_lines AS same_order_lines
+                JOIN page_orders
+                  ON page_orders.store_id = same_order_lines.store_id
+                 AND page_orders.odoo_order_id = same_order_lines.odoo_order_id
+                WHERE COALESCE(same_order_lines.asin, '') != ''
+                  AND COALESCE(same_order_lines.amazon_order_id, '') = ''
+                  AND same_order_lines.state != 'missing'
+                  AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                GROUP BY same_order_lines.store_id, same_order_lines.odoo_order_id
+            ),
+            line_rows AS (
+                SELECT page_rows.*,
+                       COALESCE(duplicate_counts.duplicate_asin_count, 0) AS duplicate_asin_count,
+                       COALESCE(inventory_counts.inventory_quantity, 0) AS inventory_quantity,
+                       COALESCE(order_asin_counts.odoo_order_distinct_asin_count, 0) AS odoo_order_distinct_asin_count
+                FROM page_rows
+                LEFT JOIN duplicate_counts
+                  ON duplicate_counts.store_id = page_rows.store_id
+                 AND duplicate_counts.asin = page_rows.asin
+                LEFT JOIN inventory_counts
+                  ON inventory_counts.store_id = page_rows.store_id
+                 AND inventory_counts.asin = page_rows.asin
+                LEFT JOIN order_asin_counts
+                  ON order_asin_counts.store_id = page_rows.store_id
+                 AND order_asin_counts.odoo_order_id = page_rows.odoo_order_id
+            )
+            SELECT
+                (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order), '[]'::json) FROM line_rows) AS rows,
+                (SELECT COUNT(*) FROM order_lines WHERE (? IS NULL OR store_id=?)) AS total
+            """,
+            (store_id, store_id, per_page, offset, store_id, store_id),
+        ).fetchone()
+    return {
+        "rows": hydrate_order_line_rows(payload.get("rows") or []),
+        "page": page,
+        "per_page": per_page,
+        "total": int(payload.get("total") or 0),
     }
 
 
@@ -8890,6 +10023,11 @@ def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int =
     return dashboard_data(store_id, page, per_page)
 
 
+@app.get("/api/orders")
+def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    return order_lines_page_data(store_id, page, per_page)
+
+
 @app.post("/api/settings/ordering-engine")
 def api_save_ordering_engine(payload: EnginePayload) -> dict[str, Any]:
     engine = normalize_ordering_engine(payload.ordering_engine)
@@ -9050,8 +10188,25 @@ def api_typesense_reindex_status() -> dict[str, Any]:
 
 @app.post("/api/settings/backup/run")
 def api_run_backup() -> dict[str, Any]:
-    key = verify_product_storage()
-    return {"ok": True, "message": "Postgres and Cloudflare R2 are reachable.", "key": key}
+    backup = create_database_backup()
+    return {"ok": True, "message": f"Postgres backup uploaded to Cloudflare R2: {backup['name']}.", "backup": backup, "backups": list_database_backups()}
+
+
+@app.get("/api/settings/backup/list")
+def api_list_backups() -> dict[str, Any]:
+    return {"ok": True, "backups": list_database_backups()}
+
+
+@app.post("/api/settings/backup/restore")
+def api_restore_backup(payload: BackupKeyPayload) -> dict[str, Any]:
+    backup = restore_database_backup(payload.key)
+    return {"ok": True, "message": f"Postgres restored from Cloudflare R2 backup: {backup['name']}.", "backup": backup}
+
+
+@app.post("/api/settings/backup/delete")
+def api_delete_backup(payload: BackupKeyPayload) -> dict[str, Any]:
+    backup = delete_database_backup(payload.key)
+    return {"ok": True, "message": "Backup deleted from Cloudflare R2.", "backup": backup, "backups": list_database_backups()}
 
 
 @app.get("/api/search")
@@ -9080,8 +10235,8 @@ def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_p
 
 
 def autosync_loop() -> None:
-    last_run = 0.0
-    last_chrome_run = 0.0
+    last_run = time.time()
+    last_chrome_run = time.time()
     while True:
         try:
             settings = get_service_settings()
@@ -9089,7 +10244,9 @@ def autosync_loop() -> None:
             if interval > 0 and time.time() - last_run >= interval * 60:
                 pulled_count = 0
                 for store in list_stores():
-                    pulled_count += fetch_odoo_lines(get_store(int(store["id"])), days=2, limit=100)
+                    store_id = int(store["id"])
+                    count = fetch_odoo_lines_exclusive(get_store(store_id), days=2, limit=100, wait=False)
+                    pulled_count += int(count or 0)
                 if pulled_count:
                     start_typesense_reindex_job()
                 last_run = time.time()
@@ -9099,10 +10256,11 @@ def autosync_loop() -> None:
                 limit = max(1, min(500, int(float(settings.get("auto_chrome_fulfil_limit") or 100))))
                 for store in list_stores():
                     store_id = int(store["id"])
-                    pulled_count = fetch_odoo_lines(get_store(store_id), days=days, limit=limit)
+                    pulled_count = fetch_odoo_lines_exclusive(get_store(store_id), days=days, limit=limit, wait=False)
                     if pulled_count:
                         start_typesense_reindex_job()
-                    place_orders(store_id, ordering_engine="chrome")
+                    if pulled_count is not None:
+                        place_orders(store_id, ordering_engine="chrome")
                 last_chrome_run = time.time()
         except Exception:
             pass
@@ -9130,7 +10288,7 @@ def backup_loop() -> None:
             settings = get_service_settings()
             interval = int(float(settings.get("backup_interval_minutes") or 0))
             if interval > 0 and time.time() - last_run >= interval * 60:
-                verify_product_storage()
+                create_database_backup()
                 last_run = time.time()
         except Exception:
             pass
@@ -9182,7 +10340,7 @@ def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
     manual_reference = f"manual-{uuid.uuid4().hex[:10]}"
     with db() as conn:
         cursor = conn.execute(
-            """
+            f"""
             INSERT INTO inventory_items
             (store_id, order_line_id, asin, quantity, product_name, source_odoo_order_id, source_odoo_order_name,
              amazon_order_id, amazon_order_url, amazon_account_name, status, source_type, notes, manual_reference, created_at, updated_at)
@@ -9282,15 +10440,7 @@ def api_partial_fulfilment_processed(partial_id: int) -> dict[str, Any]:
 def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page: int = 12, days: int = 2) -> dict[str, Any]:
     days = normalize_days_window(days)
     search_engine = "postgres"
-    try:
-        candidate_ids = typesense_order_line_ids_for_filter(line_filter_for_typesense(store_id, "pulled", order_window_since_ts(days)))
-        if candidate_ids:
-            rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days, candidate_ids)
-            search_engine = "typesense"
-        else:
-            rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
-    except Exception:
-        rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
+    rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
     return {
         "ok": True,
         "stores": rows_to_dicts(list_stores()),
@@ -9369,15 +10519,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
 def api_bulk(store_id: Optional[int] = None, days: int = 2, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     days = normalize_days_window(days)
     search_engine = "postgres"
-    try:
-        candidate_ids = typesense_order_line_ids_for_filter(line_filter_for_typesense(store_id, "pulled", order_window_since_ts(days)))
-        if candidate_ids:
-            groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days, candidate_ids), page, per_page)
-            search_engine = "typesense"
-        else:
-            groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
-    except Exception:
-        groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
+    groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
     return {"ok": True, "stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days, "search_engine": search_engine}
 
 
@@ -9672,42 +10814,73 @@ def run_pull_job(job_id: str) -> None:
             if not job:
                 return
             batch_size = normalize_pull_batch_size(job["batch_size"] if "batch_size" in job.keys() else stored_pull_batch_size())
-            conn.execute("UPDATE pull_jobs SET status='running', batch_size=?, updated_at=? WHERE id=?", (batch_size, utc_now(), job_id))
+            cursor = conn.execute("UPDATE pull_jobs SET status='running', batch_size=?, updated_at=? WHERE id=? AND status='queued'", (batch_size, utc_now(), job_id))
+            if cursor.rowcount <= 0:
+                return
 
         def progress(processed_orders: int, total_orders: int, inserted_records: int) -> None:
             with db() as progress_conn:
-                progress_conn.execute(
+                cursor = progress_conn.execute(
                     """
                     UPDATE pull_jobs
                     SET processed_orders=?, total_orders=?, inserted_records=?, updated_at=?
-                    WHERE id=?
+                    WHERE id=? AND status='running'
                     """,
                     (processed_orders, total_orders, inserted_records, utc_now(), job_id),
                 )
+                if cursor.rowcount <= 0:
+                    raise PullJobCancelled("Pull job was stopped.")
 
-        inserted = fetch_odoo_lines(
+        inserted = fetch_odoo_lines_exclusive(
             get_store(int(job["store_id"])),
             int(job["days"] or 7),
             normalize_pull_limit(job["limit_value"], 0),
             batch_size,
             progress,
+            wait=True,
         )
+        inserted = int(inserted or 0)
         with db() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE pull_jobs
                 SET status='completed', inserted_records=?, updated_at=?, completed_at=?
-                WHERE id=?
+                WHERE id=? AND status='running'
                 """,
                 (inserted, utc_now(), utc_now(), job_id),
             )
-        start_typesense_reindex_job()
+        if cursor.rowcount > 0:
+            start_typesense_reindex_job()
+    except PullJobCancelled:
+        return
     except Exception as exc:
         with db() as conn:
             conn.execute(
-                "UPDATE pull_jobs SET status='failed', error=?, updated_at=?, completed_at=? WHERE id=?",
+                "UPDATE pull_jobs SET status='failed', error=?, updated_at=?, completed_at=? WHERE id=? AND status IN ('queued', 'running')",
                 (str(exc)[:1000], utc_now(), utc_now(), job_id),
             )
+
+
+def mark_stale_pull_jobs(conn: Any) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=PULL_JOB_STALE_MINUTES)).isoformat()
+    cursor = conn.execute(
+        """
+        UPDATE pull_jobs
+        SET status='failed',
+            error=?,
+            updated_at=?,
+            completed_at=?
+        WHERE status IN ('queued', 'running')
+          AND COALESCE(NULLIF(updated_at, ''), created_at)::timestamp < ?::timestamp
+        """,
+        (
+            f"Pull job stopped updating for more than {PULL_JOB_STALE_MINUTES} minutes. Start the pull again; Odoo calls now have a timeout so a stalled batch can fail cleanly.",
+            utc_now(),
+            utc_now(),
+            cutoff,
+        ),
+    )
+    return cursor.rowcount
 
 
 def start_pull_job(store_id: int, days: int, limit: int, batch_size: int) -> dict[str, Any]:
@@ -9738,6 +10911,25 @@ def api_pull_orders(payload: PullPayload) -> dict[str, Any]:
     set_setting("pull_orders_days", str(days))
     set_setting("pull_orders_limit", str(limit))
     set_service_settings({"pull_orders_batch_size": str(batch_size)})
+    with db() as conn:
+        mark_stale_pull_jobs(conn)
+        active_jobs = conn.execute(
+            """
+            SELECT pull_jobs.*, stores.name AS store_name
+            FROM pull_jobs
+            LEFT JOIN stores ON stores.id = pull_jobs.store_id
+            WHERE pull_jobs.status IN ('queued', 'running')
+            ORDER BY pull_jobs.created_at ASC
+            """
+        ).fetchall()
+        if active_jobs:
+            jobs = rows_to_dicts(active_jobs)
+            return {
+                "ok": True,
+                "message": f"An Odoo pull is already running. Reusing {len(jobs)} active job{'s' if len(jobs) != 1 else ''} instead of starting a duplicate.",
+                "jobs": jobs,
+                "defer_refresh": True,
+            }
     jobs = [start_pull_job(store_id, days, limit, batch_size) for store_id in store_ids]
     message = f"Started {len(jobs)} background pull job{'s' if len(jobs) != 1 else ''}."
     return {"ok": True, "message": message, "jobs": jobs, "defer_refresh": True}
@@ -9759,6 +10951,32 @@ def api_pull_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
             (per_page, offset),
         ).fetchall()
     return {"ok": True, "jobs": rows_to_dicts(rows), "page": page, "per_page": per_page, "total": total}
+
+
+@app.post("/api/pull/jobs/{job_id}/cancel")
+def api_cancel_pull_job(job_id: str) -> dict[str, Any]:
+    clean_job_id = clean_text(job_id)
+    if not clean_job_id:
+        raise HTTPException(400, "Missing pull job id.")
+    now = utc_now()
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE pull_jobs
+            SET status='cancelled',
+                error=?,
+                updated_at=?,
+                completed_at=?
+            WHERE id=? AND status IN ('queued', 'running')
+            """,
+            ("Stopped by user.", now, now, clean_job_id),
+        )
+        row = conn.execute("SELECT pull_jobs.*, stores.name AS store_name FROM pull_jobs LEFT JOIN stores ON stores.id=pull_jobs.store_id WHERE pull_jobs.id=?", (clean_job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Pull job not found.")
+    if cursor.rowcount <= 0:
+        return {"ok": True, "message": f"Pull job is already {row['status']}.", "job": row_to_dict(row)}
+    return {"ok": True, "message": "Pull job stopped.", "job": row_to_dict(row)}
 
 
 @app.post("/api/settings/pull-defaults")
@@ -9999,13 +11217,141 @@ def api_shopify_tracking_retry(job_id: str) -> dict[str, Any]:
     return {"ok": True, "message": f"Requeued {cursor.rowcount} tracking sync job(s)."}
 
 
+@app.post("/api/chrome/order-history/lookup")
+def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict[str, Any]:
+    records = amazon_history_lookup_records(payload)
+    if not records:
+        return {"ok": True, "matches": {}, "unmatched": [], "not_found_url": "/amazon-order-history-unmatched"}
+    order_ids = [record["amazon_order_id"] for record in records if record["amazon_order_id"]]
+    with db() as conn:
+        matches = amazon_history_matches(conn, order_ids)
+        suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
+        conflicts = amazon_history_asin_conflicts(conn, records, matches, suggestions)
+        amazon_history_apply_quantity_checks(records, matches, suggestions)
+        unmatched = upsert_amazon_history_unmatched(conn, records, set(matches.keys()))
+    for record in records:
+        match = matches.get(record["amazon_order_id"])
+        if match:
+            match["amazon_order_url"] = record["amazon_order_url"] or order_line_amazon_url(record["amazon_order_id"])
+            match["recipient"] = record["recipient"]
+            match["status"] = record["status"]
+            match["order_date"] = record["order_date"]
+            match["asins"] = record["asins"]
+            match["asin_quantities"] = record["asin_quantities"]
+    return {
+        "ok": True,
+        "matches": matches,
+        "suggestions": suggestions,
+        "conflicts": conflicts,
+        "unmatched": unmatched,
+        "not_found_url": "/amazon-order-history-unmatched",
+    }
+
+
+@app.get("/api/chrome/order-history/unmatched")
+def api_chrome_order_history_unmatched(limit: int = 250) -> dict[str, Any]:
+    limit = max(1, min(1000, int(limit or 250)))
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM amazon_order_history_unmatched
+            WHERE COALESCE(resolved_at, '') = ''
+            ORDER BY last_seen_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall())
+    for row in rows:
+        try:
+            row["asins"] = json.loads(row.get("asins_json") or "[]")
+        except Exception:
+            row["asins"] = []
+    return {"ok": True, "rows": rows}
+
+
 @app.get("/api/chrome/jobs")
-def api_chrome_jobs(store_id: Optional[int] = None, worker_id: str = "", claim: bool = True) -> dict[str, Any]:
+def api_chrome_jobs(
+    store_id: Optional[int] = None,
+    worker_id: str = "",
+    claim: bool = True,
+    resume_existing: bool = True,
+    job_limit: int = 50,
+    split_mixed_asin: bool = False,
+) -> dict[str, Any]:
     if claim:
-        job = claim_next_chrome_job(store_id, worker_id)
+        # Older loaded extension workers used resume_existing=false, which can
+        # abandon an in-progress checkout and jump to a different order. Claims
+        # should be resumed by default for the same worker so a refresh/reload
+        # continues the current Amazon flow instead of corrupting the queue.
+        resume_existing = True
+        job = claim_next_chrome_job(
+            store_id,
+            worker_id,
+            resume_existing=resume_existing,
+            split_mixed_asin=split_mixed_asin,
+        )
         return {"ok": True, "jobs": [job] if job else []}
-    snapshot = chrome_queue_snapshot(store_id)
+    snapshot = chrome_queue_snapshot(store_id, limit=job_limit)
     return {"ok": True, **snapshot}
+
+
+@app.get("/api/chrome/jobs/recover-submitted")
+def api_chrome_recover_submitted_job(
+    store_id: Optional[int] = None,
+    worker_id: str = "",
+) -> dict[str, Any]:
+    worker_id = clean_text(worker_id)[:120]
+    if not worker_id:
+        return {"ok": True, "job": None}
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_group_key, '') != ''
+              AND chrome_claimed_by=?
+              AND COALESCE(amazon_status, '') = ?
+              AND (? IS NULL OR store_id=?)
+            ORDER BY COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at) DESC,
+                     odoo_order_id DESC,
+                     id ASC
+            """,
+            (worker_id, CHROME_ORDER_SUBMITTED_STATUS, store_id, store_id),
+        ).fetchall()
+        if not rows:
+            return {"ok": True, "job": None}
+        group_key = str(rows[0]["amazon_group_key"])
+        expiry = chrome_job_lease_expiry()
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET chrome_claim_expires_at=?, updated_at=?
+            WHERE amazon_group_key=?
+              AND chrome_claimed_by=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_status, '') = ?
+            """,
+            (expiry, utc_now(), group_key, worker_id, CHROME_ORDER_SUBMITTED_STATUS),
+        )
+        group_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+            ORDER BY id
+            """,
+            (group_key,),
+        ).fetchall())
+    return {"ok": True, "job": chrome_job_from_rows(group_rows), "claim_expires_at": expiry}
 
 
 @app.post("/api/chrome/jobs/{group_key}/heartbeat")
@@ -10032,6 +11378,35 @@ def api_chrome_job_heartbeat(group_key: str, payload: ChromeJobHeartbeatPayload)
     return {"ok": True, "claim_expires_at": expiry}
 
 
+@app.post("/api/chrome/jobs/{group_key}/submitted")
+def api_chrome_job_submitted(group_key: str, payload: ChromeJobHeartbeatPayload) -> dict[str, Any]:
+    worker_id = clean_text(payload.worker_id)
+    if not worker_id:
+        raise HTTPException(400, "worker_id is required")
+    expiry = chrome_job_lease_expiry()
+    now = utc_now()
+    with db() as conn:
+        ensure_chrome_job_owner(conn, group_key, worker_id)
+        cursor = conn.execute(
+            """
+            UPDATE order_lines
+            SET amazon_status=?,
+                chrome_claimed_by=?,
+                chrome_claimed_at=COALESCE(chrome_claimed_at, ?),
+                chrome_claim_expires_at=?,
+                updated_at=?
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+            """,
+            (CHROME_ORDER_SUBMITTED_STATUS, worker_id, now, expiry, now, group_key),
+        )
+    if not cursor.rowcount:
+        raise HTTPException(404, "Chrome job not found")
+    return {"ok": True, "submitted": cursor.rowcount, "claim_expires_at": expiry}
+
+
 @app.post("/api/chrome/jobs/{group_key}/release")
 def api_chrome_job_release(group_key: str, payload: ChromeJobHeartbeatPayload) -> dict[str, Any]:
     worker_id = clean_text(payload.worker_id)
@@ -10050,6 +11425,7 @@ def api_chrome_job_release(group_key: str, payload: ChromeJobHeartbeatPayload) -
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
               AND chrome_claimed_by=?
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
             """,
             (utc_now(), group_key, worker_id),
         )
@@ -10219,6 +11595,7 @@ def api_chrome_job_force_release(group_key: str, store_id: Optional[int] = None)
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
               AND COALESCE(chrome_claimed_by, '') != ''
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
               AND (? IS NULL OR store_id=?)
             """,
             (utc_now(), cleaned_group_key, store_id, store_id),
@@ -10311,6 +11688,22 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
         asin = normalize_asin(str(item.get("asin") or ""))
         if asin:
             pricing_by_asin[asin] = item
+    order_by_line_id: dict[int, dict[str, str]] = {}
+    order_by_asin: dict[str, dict[str, str]] = {}
+    for mapping in payload.order_mappings or []:
+        mapped_order_id = clean_text(str(mapping.get("amazon_order_id") or ""))
+        if not mapped_order_id:
+            continue
+        mapped_url = clean_text(str(mapping.get("amazon_order_url") or "")) or order_line_amazon_url(mapped_order_id)
+        normalized_mapping = {"amazon_order_id": mapped_order_id, "amazon_order_url": mapped_url}
+        for line_id in mapping.get("line_ids") or []:
+            try:
+                order_by_line_id[int(line_id)] = normalized_mapping
+            except (TypeError, ValueError):
+                continue
+        mapped_asin = normalize_asin(str(mapping.get("asin") or ""))
+        if mapped_asin:
+            order_by_asin[mapped_asin] = normalized_mapping
     with db() as conn:
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
         params: list[Any] = [group_key]
@@ -10324,15 +11717,40 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
             FROM order_lines
             WHERE amazon_group_key=?
               AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
               {line_filter}
             """,
             params,
         ).fetchall()
         if not rows:
+            existing = conn.execute(
+                """
+                SELECT amazon_order_id
+                FROM order_lines
+                WHERE amazon_group_key=?
+                  AND order_engine='chrome'
+                  AND COALESCE(amazon_order_id, '') != ''
+                ORDER BY ordered_at DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (group_key,),
+            ).fetchone()
+            if existing:
+                return {
+                    "ok": True,
+                    "message": f"Chrome job {group_key} was already marked ordered.",
+                    "amazon_order_id": existing["amazon_order_id"],
+                    "already_completed": True,
+                }
             raise HTTPException(404, "Chrome job not found")
         updated_for_shopify: list[dict[str, Any]] = []
         for row in rows:
             pricing = pricing_by_asin.get(str(row["asin"] or "").upper(), {})
+            row_asin = normalize_asin(str(row["asin"] or ""))
+            row_order = order_by_line_id.get(int(row["id"])) or order_by_asin.get(row_asin) or {}
+            row_amazon_order_id = row_order.get("amazon_order_id") or amazon_order_id
+            row_amazon_order_url = row_order.get("amazon_order_url") or amazon_order_url
             quantity = float(row["quantity"] or 1)
             store_total = order_line_store_total(row)
             amazon_unit = float(pricing.get("amazon_unit_price") or 0)
@@ -10353,14 +11771,17 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     amazon_account_name=?,
                     amazon_status='ordered',
                     state='ordered',
+                    chrome_claimed_by=NULL,
+                    chrome_claimed_at=NULL,
+                    chrome_claim_expires_at=NULL,
                     last_error=NULL,
                     ordered_at=COALESCE(ordered_at, ?),
                     updated_at=?
                 WHERE id=?
                 """,
                 (
-                    amazon_order_id,
-                    amazon_order_url,
+                    row_amazon_order_id,
+                    row_amazon_order_url,
                     (store_total / quantity) if quantity else 0,
                     store_total,
                     amazon_unit or None,
@@ -10384,6 +11805,8 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                         {
                             "amazon_order_id": amazon_order_id,
                             "amazon_order_url": amazon_order_url,
+                            "line_amazon_order_id": row_amazon_order_id,
+                            "line_amazon_order_url": row_amazon_order_url,
                             "pricing": pricing,
                             "store_total_price": store_total,
                             "amazon_total_price": amazon_total,
@@ -10807,21 +12230,28 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         return {"ok": True, "matched": 0, "skipped": 0, "order_names": [], "message": f"No Nutricity order references found for {amazon_order_id}."}
     amazon_order_url = clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id)
     amazon_account_name = clean_text(payload.amazon_account_name) or "Chrome Manual Matcher"
+    line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
     with db() as conn:
         params: list[Any] = refs[:]
         store_filter = ""
+        line_filter = ""
+        params.append(1 if payload.replace_existing else 0)
         if payload.store_id:
             store_filter = " AND store_id=?"
             params.append(int(payload.store_id))
+        if line_ids:
+            line_filter = f" AND id IN ({','.join('?' for _ in line_ids)})"
+            params.extend(line_ids)
         rows = rows_to_dicts(conn.execute(
             f"""
             SELECT *
             FROM order_lines
             WHERE UPPER(odoo_order_name) IN ({','.join('?' for _ in refs)})
-              AND COALESCE(amazon_order_id, '') = ''
+              AND (? = 1 OR COALESCE(amazon_order_id, '') = '')
               AND state NOT IN ('cancelled', 'refunded')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {store_filter}
+              {line_filter}
             ORDER BY store_id, odoo_order_id, id
             """,
             params,
@@ -10831,12 +12261,20 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         now = utc_now()
         updated_for_shopify: list[dict[str, Any]] = []
         for row in rows:
+            if clean_text(row.get("amazon_order_id")) == amazon_order_id:
+                updated_for_shopify.append(dict(row))
+                continue
             conn.execute(
                 """
                 UPDATE order_lines
                 SET amazon_order_id=?,
                     amazon_order_url=?,
                     amazon_account_name=?,
+                    amazon_cancelled_order_id=CASE
+                        WHEN COALESCE(amazon_order_id, '') != '' AND amazon_order_id != ?
+                        THEN COALESCE(NULLIF(amazon_cancelled_order_id, ''), amazon_order_id)
+                        ELSE amazon_cancelled_order_id
+                    END,
                     order_engine='chrome',
                     amazon_status='ordered',
                     state='ordered',
@@ -10845,17 +12283,26 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                     updated_at=?
                 WHERE id=?
                 """,
-                (amazon_order_id, amazon_order_url, amazon_account_name, now, now, row["id"]),
+                (amazon_order_id, amazon_order_url, amazon_account_name, amazon_order_id, now, now, row["id"]),
             )
             updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
             if updated:
                 updated_for_shopify.append(dict(updated))
-                ensure_inventory_for_line(updated)
-                index_order_line(updated)
-    enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
-    note_manual_amazon_match(rows, amazon_order_id, amazon_order_url, amazon_account_name)
-    write_report(rows[0]["store_id"])
+        conn.execute(
+            """
+            UPDATE amazon_order_history_unmatched
+            SET resolved_at=COALESCE(resolved_at, ?),
+                last_seen_at=?
+            WHERE amazon_order_id=?
+            """,
+            (now, now, amazon_order_id),
+        )
     matched_refs = sorted({str(row["odoo_order_name"]).upper() for row in rows})
+    threading.Timer(
+        0.1,
+        manual_amazon_match_followups,
+        args=(rows, updated_for_shopify, amazon_order_id, amazon_order_url, amazon_account_name),
+    ).start()
     return {
         "ok": True,
         "matched": len(rows),
@@ -12466,7 +13913,7 @@ def test_store(store_id: int) -> RedirectResponse:
 
 @app.post("/pull")
 def pull_orders(store_id: int = Form(...), days: int = Form(7), limit: int = Form(50)) -> RedirectResponse:
-    if fetch_odoo_lines(get_store(store_id), days, limit):
+    if fetch_odoo_lines_exclusive(get_store(store_id), days, limit):
         start_typesense_reindex_job()
     return RedirectResponse(f"/?store_id={store_id}", status_code=303)
 
@@ -12539,6 +13986,29 @@ def health() -> dict[str, Any]:
     with db() as conn:
         conn.execute("SELECT 1")
     return {"ok": True, "db": "postgres", "storage": "cloudflare-r2"}
+
+
+@app.get("/amazon-order-history-unmatched", response_class=HTMLResponse)
+def amazon_order_history_unmatched_page(request: Request) -> HTMLResponse:
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM amazon_order_history_unmatched
+            WHERE COALESCE(resolved_at, '') = ''
+            ORDER BY last_seen_at DESC
+            LIMIT 500
+            """
+        ).fetchall())
+    for row in rows:
+        try:
+            row["asins"] = json.loads(row.get("asins_json") or "[]")
+        except Exception:
+            row["asins"] = []
+    return templates.TemplateResponse(
+        "amazon_order_history_unmatched.html",
+        {"request": request, "rows": rows},
+    )
 
 
 @app.get("/{frontend_path:path}")

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="orders-shell">
+  <div class="orders-toolbar">
+    <div>
+      <h1>Amazon History Not Found</h1>
+      <p class="muted">Amazon orders seen on the order history page that do not yet match an Odoo order in this app.</p>
+    </div>
+    <a class="button" href="/legacy">Orders</a>
+  </div>
+
+  <section class="table-wrap">
+    <table id="amazon-history-unmatched-table">
+      <thead>
+        <tr>
+          <th>Amazon order</th>
+          <th>Recipient</th>
+          <th>Status</th>
+          <th>Order date</th>
+          <th>ASINs</th>
+          <th>Seen</th>
+          <th>Last seen</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>
+            {% if row.amazon_order_url %}
+            <a href="{{ row.amazon_order_url }}" target="_blank" rel="noreferrer">{{ row.amazon_order_id }}</a>
+            {% else %}
+            {{ row.amazon_order_id }}
+            {% endif %}
+          </td>
+          <td>{{ row.recipient or "" }}</td>
+          <td>{{ row.status or "" }}</td>
+          <td>{{ row.order_date or "" }}</td>
+          <td>
+            {% for asin in row.asins %}
+            <code>{{ asin }}</code>{% if not loop.last %} {% endif %}
+            {% endfor %}
+          </td>
+          <td>{{ row.seen_count }}</td>
+          <td>{{ row.last_seen_at }}</td>
+        </tr>
+        {% endfor %}
+        {% if not rows %}
+        <tr>
+          <td colspan="7">No unmatched Amazon history orders found.</td>
+        </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </section>
+</section>
+{% endblock %}

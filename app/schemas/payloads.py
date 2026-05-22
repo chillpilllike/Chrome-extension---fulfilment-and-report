@@ -77,6 +77,7 @@ class ChromeJobCompletePayload(BaseModel):
     amazon_order_url: str = ""
     amazon_account_name: str = ""
     line_ids: list[int] = []
+    order_mappings: list[dict[str, Any]] = []
     pricing_summary: list[dict[str, Any]] = []
     worker_id: str = ""
 
@@ -115,13 +116,32 @@ class ChromeTrackingUpdatePayload(BaseModel):
     alert_html: str = ""
 
 
+class AmazonHistoryOrderPayload(BaseModel):
+    amazon_order_id: str
+    amazon_order_url: str = ""
+    recipient: str = ""
+    status: str = ""
+    order_date: str = ""
+    asins: list[str] = []
+    items: list[dict[str, Any]] = []
+    asin_quantities: dict[str, float] = {}
+    cancelled: bool = False
+
+
+class AmazonHistoryLookupPayload(BaseModel):
+    orders: list[AmazonHistoryOrderPayload] = []
+    amazon_order_ids: list[str] = []
+
+
 class ManualAmazonOrderMatchPayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
     amazon_account_name: str = ""
     order_names: list[str] = []
+    line_ids: list[int] = []
     source_text: str = ""
     store_id: Optional[int] = None
+    replace_existing: bool = False
 
 
 class ManualFulfilmentPayload(BaseModel):
@@ -212,6 +232,10 @@ class EnginePayload(BaseModel):
 
 class ServiceSettingsPayload(BaseModel):
     settings: dict[str, str] = {}
+
+
+class BackupKeyPayload(BaseModel):
+    key: str
 
 
 class AdminSettingsPayload(BaseModel):

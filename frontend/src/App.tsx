@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import type { DragEvent, ReactNode } from "react"
+import type { DragEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
 import {
   IconAlertCircle as AlertCircle,
   IconBell as Bell,
   IconBuildingStore as StoreIcon,
+  IconCheck as Check,
   IconCircleCheck as CheckCircle2,
   IconChevronDown as ChevronDown,
   IconChevronLeft as ChevronLeft,
@@ -46,6 +47,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { cn } from "@/lib/utils"
 
 type SelectId = number | string
 const KNOWN_APP_PAGES = new Set([
@@ -433,6 +435,8 @@ const ADMIN_TOKEN_STORAGE_KEY = "admin_access_token"
 const PULL_DAYS_STORAGE_KEY = "pull_orders_days"
 const PULL_LIMIT_STORAGE_KEY = "pull_orders_limit"
 const PULL_STORE_IDS_STORAGE_KEY = "pull_orders_store_ids"
+const DASHBOARD_CACHE_STORAGE_KEY = "fulfilment.dashboard.cache.v1"
+const DASHBOARD_CACHE_MAX_AGE_MS = 10 * 60 * 1000
 
 const defaultUiCopy: UiCopy = {
   app_header: {
@@ -497,6 +501,26 @@ function savedPullStoreIds() {
     return Array.isArray(parsed) ? parsed.map(String) : []
   } catch {
     return []
+  }
+}
+
+function cachedDashboardData() {
+  if (typeof window === "undefined" || !savedAdminToken()) return null
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(DASHBOARD_CACHE_STORAGE_KEY) || "null")
+    if (!parsed || Date.now() - Number(parsed.savedAt || 0) > DASHBOARD_CACHE_MAX_AGE_MS) return null
+    return parsed.data as DashboardData
+  } catch {
+    return null
+  }
+}
+
+function saveDashboardCache(data: DashboardData) {
+  if (typeof window === "undefined" || !savedAdminToken()) return
+  try {
+    window.localStorage.setItem(DASHBOARD_CACHE_STORAGE_KEY, JSON.stringify({ savedAt: Date.now(), data }))
+  } catch {
+    // Ignore quota failures; the live API remains the source of truth.
   }
 }
 
@@ -674,6 +698,12 @@ type PunchoutReturnUrl = {
 }
 
 type ServiceSettings = Record<string, string>
+type DatabaseBackup = {
+  key: string
+  name: string
+  size: number
+  last_modified: string
+}
 
 type UiCopy = Record<string, { title?: string; description?: string; icon?: string }>
 
@@ -835,6 +865,13 @@ function formatDateTime(value?: string) {
     hour: "2-digit",
     minute: "2-digit",
   })
+}
+
+function formatFileSize(value?: number) {
+  const bytes = Number(value || 0)
+  if (!bytes) return "0 KB"
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
 function dateTimeValue(value?: string) {
@@ -1529,12 +1566,13 @@ function ExportControls({
 }
 
 function App() {
-  const [data, setData] = useState<DashboardData | null>(null)
+  const initialDashboard = cachedDashboardData()
+  const [data, setData] = useState<DashboardData | null>(() => initialDashboard)
   const [inventory, setInventory] = useState<InventoryItem[]>([])
   const [inventoryPage, setInventoryPage] = useState(1)
   const [inventoryTotal, setInventoryTotal] = useState(0)
   const [ordersPage, setOrdersPage] = useState(1)
-  const [ordersTotal, setOrdersTotal] = useState(0)
+  const [ordersTotal, setOrdersTotal] = useState(() => initialDashboard?.total || 0)
   const [missingRows, setMissingRows] = useState<OrderLine[]>([])
   const [missingPage, setMissingPage] = useState(1)
   const [missingTotal, setMissingTotal] = useState(0)
@@ -1573,10 +1611,12 @@ function App() {
   const [openNavGroup, setOpenNavGroup] = useState<string | null>(null)
   const navTabsRef = useRef<HTMLDivElement | null>(null)
   const ordersSelectionAnchor = useRef<number | null>(null)
-  const [storeId, setStoreId] = useState("")
-  const [addressId, setAddressId] = useState("")
-  const [amazonAccountId, setAmazonAccountId] = useState("")
-  const [orderingEngine, setOrderingEngine] = useState("rest")
+  const ordersShiftKeyDown = useRef(false)
+  const initialDashboardRefreshDone = useRef(false)
+  const [storeId, setStoreId] = useState(() => String(initialDashboard?.current_store_id || ""))
+  const [addressId, setAddressId] = useState(() => String(initialDashboard?.addresses.find((address) => address.is_default)?.id || initialDashboard?.addresses[0]?.id || ""))
+  const [amazonAccountId, setAmazonAccountId] = useState(() => String(initialDashboard?.amazon_accounts.find((account) => account.is_default)?.id || initialDashboard?.amazon_accounts[0]?.id || ""))
+  const [orderingEngine, setOrderingEngine] = useState(() => initialDashboard?.default_ordering_engine || "rest")
   const [days, setDays] = useState(() => savedPullSetting(PULL_DAYS_STORAGE_KEY, "7"))
   const [limit, setLimit] = useState(() => savedPullSetting(PULL_LIMIT_STORAGE_KEY, "0"))
   const [pullStoreIds, setPullStoreIds] = useState<string[]>(savedPullStoreIds)
@@ -1599,6 +1639,7 @@ function App() {
   const [editingSpaid, setEditingSpaid] = useState<OrderLine | null>(null)
   const [editingReplacement, setEditingReplacement] = useState<OrderLine | null>(null)
   const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
+  const [resetFulfilmentConfirmOpen, setResetFulfilmentConfirmOpen] = useState(false)
   const [allowMissingSpaid, setAllowMissingSpaid] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>("pulled_at")
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc")
@@ -1662,6 +1703,7 @@ function App() {
 
   function applyDashboardData(next: DashboardData, nextPage = ordersPage) {
     setData(next)
+    saveDashboardCache(next)
     setOrdersPage(next.page || nextPage)
     setOrdersTotal(next.total || 0)
     const resolvedStore = String(next.current_store_id || "")
@@ -1683,6 +1725,18 @@ function App() {
     const query = pagedQuery(nextStoreId, nextPage)
     const next = await api<DashboardData>(`/api/dashboard${query}`)
     applyDashboardData(next, nextPage)
+  }
+
+  async function refreshOrdersPage(nextStoreId = storeId, nextPage = ordersPage) {
+    const result = await api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(`/api/orders${pagedQuery(nextStoreId, nextPage)}`)
+    setData((current) => {
+      if (!current) return current
+      const next = { ...current, rows: result.rows, page: result.page || nextPage, per_page: result.per_page, total: result.total }
+      saveDashboardCache(next)
+      return next
+    })
+    setOrdersPage(result.page || nextPage)
+    setOrdersTotal(result.total || 0)
   }
 
   async function loadUiCopy() {
@@ -1743,6 +1797,7 @@ function App() {
   function clearAdminToken() {
     window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY)
     window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY)
+    window.localStorage.removeItem(DASHBOARD_CACHE_STORAGE_KEY)
     setAdminAuthError("")
     setAdminTokenSaved(false)
     setAdminAccessOpen(true)
@@ -1780,12 +1835,41 @@ function App() {
       setAdminTokenSaved(false)
       return
     }
-    refresh(storeId, ordersPage).catch((error) => {
+    const load = initialDashboardRefreshDone.current && page === "orders" && storeId && data
+      ? refreshOrdersPage(storeId, ordersPage)
+      : refresh(storeId, ordersPage).finally(() => {
+        initialDashboardRefreshDone.current = true
+      })
+    load.catch((error) => {
       if (error instanceof AdminAuthError) return
       setModal({ ok: false, title: "Unable to load app", message: String(error) })
     })
-    loadUiCopy().catch(() => undefined)
+    if (!initialDashboardRefreshDone.current) loadUiCopy().catch(() => undefined)
   }, [ordersPage])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Shift") ordersShiftKeyDown.current = true
+    }
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Shift") ordersShiftKeyDown.current = false
+    }
+    const handleBlur = () => {
+      ordersShiftKeyDown.current = false
+    }
+    window.addEventListener("keydown", handleKeyDown)
+    window.addEventListener("keyup", handleKeyUp)
+    window.addEventListener("blur", handleBlur)
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown)
+      window.removeEventListener("keyup", handleKeyUp)
+      window.removeEventListener("blur", handleBlur)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!selected.length) ordersSelectionAnchor.current = null
+  }, [selected.length])
 
   useEffect(() => {
     window.localStorage.setItem(PULL_DAYS_STORAGE_KEY, days)
@@ -2013,6 +2097,98 @@ function App() {
   const selectedClubName = selectedRows.length
     ? `Nutricity ${Array.from(new Set(selectedRows.map((row) => row.odoo_order_name))).join(" ")}`
     : ""
+
+  function isSelectionControlClick(event: MouseEvent<HTMLElement>) {
+    const target = event.target
+    return target instanceof Element && Boolean(target.closest("a, button, input, select, textarea, [role='button']"))
+  }
+
+  function selectOrderRow(row: OrderLine, shiftKey: boolean, checked?: boolean) {
+    setOrdersSelectAll(false)
+    const visibleIds = sortedRows.map((item) => item.id)
+    const previousAnchor = ordersSelectionAnchor.current
+    setSelected((current) => {
+      const anchor = previousAnchor ?? current[current.length - 1] ?? null
+      const shouldCheck = checked ?? !current.includes(row.id)
+      const next = rangeSelection(visibleIds, current, row.id, shouldCheck, shiftKey, anchor)
+      if (!next.length) ordersSelectionAnchor.current = null
+      return next
+    })
+    ordersSelectionAnchor.current = row.id
+  }
+
+  function selectOrderCheckbox(row: OrderLine, event: MouseEvent<HTMLButtonElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    const shiftKey = Boolean(event.shiftKey || event.getModifierState("Shift") || ordersShiftKeyDown.current)
+    selectOrderRow(row, shiftKey)
+  }
+
+  function selectOrderCheckboxFromKeyboard(row: OrderLine, event: ReactKeyboardEvent<HTMLButtonElement>) {
+    if (event.key !== " " && event.key !== "Enter") return
+    event.preventDefault()
+    event.stopPropagation()
+    const shiftKey = Boolean(event.shiftKey || event.getModifierState("Shift") || ordersShiftKeyDown.current)
+    selectOrderRow(row, shiftKey, !selected.includes(row.id))
+  }
+
+  function placeSelectedOrders() {
+    return runAction("Place Selected", () =>
+      api<DashboardData>("/api/place", {
+        method: "POST",
+        body: JSON.stringify({
+          store_id: Number(storeId),
+          address_id: Number(addressId),
+          amazon_account_id: Number(amazonAccountId),
+          line_ids: selected,
+          ordering_engine: orderingEngine,
+          allow_missing_spaid: allowMissingSpaid,
+        }),
+      }),
+    )
+  }
+
+  function clubPlaceSelectedOrders() {
+    return runAction("Club Place Selected", () =>
+      api<DashboardData>("/api/place", {
+        method: "POST",
+        body: JSON.stringify({
+          store_id: Number(storeId),
+          address_id: Number(addressId),
+          amazon_account_id: Number(amazonAccountId),
+          line_ids: selected,
+          club: true,
+          ordering_engine: orderingEngine,
+          allow_missing_spaid: allowMissingSpaid,
+        }),
+      }),
+    )
+  }
+
+  function resetSelectedOrders() {
+    if (!selected.length || busy) return
+    setResetFulfilmentConfirmOpen(true)
+  }
+
+  function confirmResetSelectedOrders() {
+    setResetFulfilmentConfirmOpen(false)
+    return runAction("Reset Selected", () =>
+      api<DashboardData>("/api/lines/reset-fulfilment", {
+        method: "POST",
+        body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
+      }),
+    )
+  }
+
+  function deleteSelectedOrders() {
+    return runAction("Delete Selected Lines", () =>
+      api<DashboardData>("/api/lines/delete", {
+        method: "POST",
+        body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
+      }),
+    )
+  }
 
   async function runAction(title: string, fn: () => Promise<DashboardData | { message?: string; ok?: boolean; defer_refresh?: boolean }>) {
     try {
@@ -2344,6 +2520,30 @@ function App() {
           setSelected([])
         }}
       />
+      <Dialog open={resetFulfilmentConfirmOpen} onOpenChange={(open) => !open && setResetFulfilmentConfirmOpen(false)}>
+        <DialogContent className="border-destructive/50 sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertCircle className="size-5" />
+              Reset selected fulfilment?
+            </DialogTitle>
+            <DialogDescription>
+              This will clear Amazon order IDs, Chrome job state, tracking, pricing, and errors for {selected.length.toLocaleString()} selected line{selected.length === 1 ? "" : "s"}. Was this intentional?
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+            Do you really want to reset these orders, or was this accidental?
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={Boolean(busy)} onClick={() => setResetFulfilmentConfirmOpen(false)}>
+              No, cancel
+            </Button>
+            <Button variant="destructive" disabled={Boolean(busy) || !selected.length} onClick={confirmResetSelectedOrders}>
+              Yes, reset
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <AdminAccessDialog open={adminAccessOpen} onSubmit={handleAdminTokenSave} onClose={() => setAdminAccessOpen(false)} error={adminAuthError} busy={adminAuthBusy} />
       <header className="navbar navbar-expand-md d-print-none">
         <div className="container-xl flex items-center justify-between gap-4 py-3">
@@ -2728,21 +2928,7 @@ function App() {
                     <Button
                       variant="outline"
                       disabled={!selected.length || Boolean(busy)}
-                      onClick={() =>
-                        runAction("Place Selected", () =>
-                          api<DashboardData>("/api/place", {
-                            method: "POST",
-                            body: JSON.stringify({
-                              store_id: Number(storeId),
-                              address_id: Number(addressId),
-                              amazon_account_id: Number(amazonAccountId),
-                              line_ids: selected,
-                              ordering_engine: orderingEngine,
-                              allow_missing_spaid: allowMissingSpaid,
-                            }),
-                          }),
-                        )
-                      }
+                      onClick={placeSelectedOrders}
                     >
                       Place Selected
                     </Button>
@@ -2756,38 +2942,14 @@ function App() {
                     </Button>
                     <Button
                       disabled={!selected.length || Boolean(busy)}
-                      onClick={() =>
-                        runAction("Club Place Selected", () =>
-                          api<DashboardData>("/api/place", {
-                            method: "POST",
-                            body: JSON.stringify({
-                              store_id: Number(storeId),
-                              address_id: Number(addressId),
-                              amazon_account_id: Number(amazonAccountId),
-                              line_ids: selected,
-                              club: true,
-                              ordering_engine: orderingEngine,
-                              allow_missing_spaid: allowMissingSpaid,
-                            }),
-                          }),
-                        )
-                      }
+                      onClick={clubPlaceSelectedOrders}
                     >
                       Club Place
                     </Button>
                     <Button
                       variant="outline"
                       disabled={!selected.length || Boolean(busy)}
-                      onClick={() => {
-                        const confirmed = window.confirm("Reset selected lines to fresh pulled status? This clears Amazon order IDs, Chrome job state, tracking, pricing, and errors for those lines.")
-                        if (!confirmed) return
-                        runAction("Reset Selected", () =>
-                          api<DashboardData>("/api/lines/reset-fulfilment", {
-                            method: "POST",
-                            body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
-                          }),
-                        )
-                      }}
+                      onClick={resetSelectedOrders}
                     >
                       <RefreshCw className="size-4" />
                       Reset Selected
@@ -2795,14 +2957,7 @@ function App() {
                     <Button
                       variant="destructive"
                       disabled={!selected.length || Boolean(busy)}
-                      onClick={() =>
-                        runAction("Delete Selected Lines", () =>
-                          api<DashboardData>("/api/lines/delete", {
-                            method: "POST",
-                            body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
-                          }),
-                        )
-                      }
+                      onClick={deleteSelectedOrders}
                     >
                       <Trash2 className="size-4" />
                       Delete
@@ -2834,16 +2989,7 @@ function App() {
                       variant="outline"
                       size="sm"
                       disabled={!selected.length || Boolean(busy)}
-                      onClick={() => {
-                        const confirmed = window.confirm("Reset selected lines to fresh pulled status? This clears Amazon order IDs, Chrome job state, tracking, pricing, and errors for those lines.")
-                        if (!confirmed) return
-                        runAction("Reset Selected", () =>
-                          api<DashboardData>("/api/lines/reset-fulfilment", {
-                            method: "POST",
-                            body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
-                          }),
-                        )
-                      }}
+                      onClick={resetSelectedOrders}
                     >
                       <RefreshCw className="size-4" />
                       Reset Fulfilment
@@ -2929,8 +3075,15 @@ function App() {
                     {sortedRows.map((row) => (
                       <TableRow
                         key={row.id}
+                        onClick={(event) => {
+                          if (isSelectionControlClick(event)) return
+                          selectOrderRow(row, event.shiftKey)
+                        }}
                         className={
-                          isLimitPurchaseLine(row)
+                          [
+                            "cursor-pointer",
+                            selected.includes(row.id) ? "outline outline-1 -outline-offset-1 outline-primary/35" : "",
+                            isLimitPurchaseLine(row)
                             ? "bg-[#f5f0ff]"
                             : row.amazon_cancelled_at
                             ? "bg-red-50"
@@ -2940,19 +3093,26 @@ function App() {
                             ? "bg-destructive/5"
                             : Number(row.odoo_order_distinct_asin_count || 0) > 1
                               ? "bg-parrot-green-lt"
-                              : ""
+                              : "",
+                          ].filter(Boolean).join(" ")
                         }
                       >
                         <TableCell>
-                          <Checkbox
-                            checked={selected.includes(row.id)}
-                            onCheckedChange={(checked, event) => {
-                              setOrdersSelectAll(false)
-                              const visibleIds = sortedRows.map((item) => item.id)
-                              setSelected((current) => rangeSelection(visibleIds, current, row.id, Boolean(checked), event.shiftKey, ordersSelectionAnchor.current))
-                              ordersSelectionAnchor.current = row.id
-                            }}
-                          />
+                          <button
+                            type="button"
+                            role="checkbox"
+                            aria-checked={selected.includes(row.id)}
+                            aria-label={`Select order ${row.odoo_order_name}`}
+                            data-checked={selected.includes(row.id) ? "true" : undefined}
+                            className={cn(
+                              "flex size-4 items-center justify-center rounded border border-input bg-background text-primary-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                              selected.includes(row.id) ? "border-primary bg-primary" : "hover:border-primary/60",
+                            )}
+                            onClick={(event) => selectOrderCheckbox(row, event)}
+                            onKeyDown={(event) => selectOrderCheckboxFromKeyboard(row, event)}
+                          >
+                            {selected.includes(row.id) ? <Check className="size-3" strokeWidth={3} /> : null}
+                          </button>
                         </TableCell>
                         {visibleOrderColumns.map((column) => (
                           <TableCell key={column.key} className="overflow-hidden">
@@ -2965,6 +3125,42 @@ function App() {
                 </Table>
               </CardContent>
             </Card>
+            {selected.length ? (
+              <>
+                <div className="h-28" />
+                <div className="fixed inset-x-0 bottom-0 z-40 border-t bg-background/95 px-4 py-3 shadow-[0_-10px_30px_rgba(24,36,51,0.12)] backdrop-blur supports-[backdrop-filter]:bg-background/85">
+                  <div className="mx-auto flex max-w-6xl flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <div className="flex items-center gap-3">
+                      <Badge variant="secondary" className="px-3 py-1 text-sm">{selected.length.toLocaleString()} selected</Badge>
+                      {selectedClubName ? <span className="hidden max-w-xl truncate text-sm text-muted-foreground lg:block">{selectedClubName}</span> : null}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button variant="outline" disabled={Boolean(busy)} onClick={placeSelectedOrders}>
+                        Place Selected
+                      </Button>
+                      <Button variant="outline" disabled={Boolean(busy)} onClick={() => setManualFulfilmentOpen(true)}>
+                        <CheckCircle2 className="size-4" />
+                        Manually Fulfilled
+                      </Button>
+                      <Button disabled={Boolean(busy)} onClick={clubPlaceSelectedOrders}>
+                        Club Place
+                      </Button>
+                      <Button variant="outline" disabled={Boolean(busy)} onClick={resetSelectedOrders}>
+                        <RefreshCw className="size-4" />
+                        Reset
+                      </Button>
+                      <Button variant="ghost" disabled={Boolean(busy)} onClick={() => { setOrdersSelectAll(false); setSelected([]) }}>
+                        Clear
+                      </Button>
+                      <Button variant="destructive" disabled={Boolean(busy)} onClick={deleteSelectedOrders}>
+                        <Trash2 className="size-4" />
+                        Delete
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </>
+            ) : null}
             {editingSpaid && (
               <SpaidDialog
                 line={editingSpaid}
@@ -5672,6 +5868,7 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
   const [jobs, setJobs] = useState<PullJob[]>([])
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
+  const [stoppingIds, setStoppingIds] = useState<string[]>([])
   async function refresh() {
     try {
       const result = await api<{ jobs: PullJob[]; total: number }>(`/api/pull/jobs?page=${page}&per_page=${PAGE_SIZE}`)
@@ -5691,6 +5888,19 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
     const processedOrders = Number(job.processed_orders || 0)
     if (!totalOrders) return job.status === "completed" ? 100 : 0
     return Math.max(0, Math.min(100, (processedOrders / totalOrders) * 100))
+  }
+  async function stopJob(job: PullJob) {
+    setStoppingIds((ids) => Array.from(new Set([...ids, job.id])))
+    try {
+      const result = await api<{ message: string; job: PullJob }>(`/api/pull/jobs/${encodeURIComponent(job.id)}/cancel`, { method: "POST" })
+      setJobs((current) => current.map((item) => (item.id === job.id ? result.job : item)))
+      onResult({ ok: true, title: "Pull Job Stopped", message: result.message || "Pull job stopped." })
+      await refresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Stop Pull Job Failed", message: String(error) })
+    } finally {
+      setStoppingIds((ids) => ids.filter((id) => id !== job.id))
+    }
   }
   return (
     <Card>
@@ -5715,6 +5925,7 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
               <TableHead>Inserted</TableHead>
               <TableHead>Updated</TableHead>
               <TableHead>Error</TableHead>
+              <TableHead className="text-right">Action</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -5754,11 +5965,26 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
                 <TableCell>{Number(job.inserted_records || 0).toLocaleString()}</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{formatDateTime(job.updated_at || job.created_at)}</TableCell>
                 <TableCell className="max-w-[420px] text-xs"><ErrorTooltip value={job.error} /></TableCell>
+                <TableCell className="text-right">
+                  {["queued", "running"].includes(String(job.status || "").toLowerCase()) ? (
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => stopJob(job)}
+                      disabled={stoppingIds.includes(job.id)}
+                    >
+                      <AlertCircle className="size-4" />
+                      {stoppingIds.includes(job.id) ? "Stopping" : "Stop"}
+                    </Button>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">-</span>
+                  )}
+                </TableCell>
               </TableRow>
             ))}
             {!jobs.length && (
               <TableRow>
-                <TableCell colSpan={7} className="py-8 text-center text-muted-foreground">No pull jobs yet.</TableCell>
+                <TableCell colSpan={8} className="py-8 text-center text-muted-foreground">No pull jobs yet.</TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -6495,6 +6721,9 @@ function SettingsPage({
   const [activeShopifyScript, setActiveShopifyScript] = useState("dtc")
   const [savingServices, setSavingServices] = useState("")
   const [reindexProgress, setReindexProgress] = useState<ReindexProgress | null>(null)
+  const [backups, setBackups] = useState<DatabaseBackup[]>([])
+  const [selectedBackupKey, setSelectedBackupKey] = useState("")
+  const [backupBusy, setBackupBusy] = useState("")
   const [adminCode, setAdminCode] = useState("")
   const [adminCodeConfirm, setAdminCodeConfirm] = useState("")
   useEffect(() => {
@@ -6505,6 +6734,7 @@ function SettingsPage({
       .then((result) => setShopifyScriptConfig(result.config))
       .catch(() => setShopifyScriptConfig(null))
     loadReindexProgress()
+    loadBackups()
   }, [])
 
   useEffect(() => {
@@ -6522,6 +6752,15 @@ function SettingsPage({
       setReindexProgress(result.progress)
     } catch {
       // Keep settings usable even if progress cannot be loaded.
+    }
+  }
+  async function loadBackups() {
+    try {
+      const result = await api<{ ok: boolean; backups: DatabaseBackup[] }>("/api/settings/backup/list")
+      setBackups(result.backups || [])
+      setSelectedBackupKey((current) => current && result.backups?.some((backup) => backup.key === current) ? current : "")
+    } catch {
+      setBackups([])
     }
   }
 
@@ -6552,8 +6791,49 @@ function SettingsPage({
     onResult({ ok: result.ok, title: "Typesense Reindex", message: result.message })
   }
   async function runBackup() {
-    const result = await api<{ ok: boolean; message: string }>("/api/settings/backup/run", { method: "POST" })
-    onResult({ ok: result.ok, title: "Backup", message: result.message })
+    setBackupBusy("backup")
+    try {
+      const result = await api<{ ok: boolean; message: string; backups: DatabaseBackup[]; backup?: DatabaseBackup }>("/api/settings/backup/run", { method: "POST" })
+      setBackups(result.backups || [])
+      if (result.backup?.key) setSelectedBackupKey(result.backup.key)
+      onResult({ ok: result.ok, title: "Backup", message: result.message })
+    } finally {
+      setBackupBusy("")
+    }
+  }
+  async function restoreBackup() {
+    if (!selectedBackupKey) return
+    const backup = backups.find((item) => item.key === selectedBackupKey)
+    const confirmed = window.confirm(`Restore the full Postgres database from ${backup?.name || selectedBackupKey}? This replaces current database tables and data.`)
+    if (!confirmed) return
+    setBackupBusy("restore")
+    try {
+      const result = await api<{ ok: boolean; message: string }>("/api/settings/backup/restore", {
+        method: "POST",
+        body: JSON.stringify({ key: selectedBackupKey }),
+      })
+      onResult({ ok: result.ok, title: "Restore Backup", message: result.message })
+    } finally {
+      setBackupBusy("")
+    }
+  }
+  async function deleteBackup() {
+    if (!selectedBackupKey) return
+    const backup = backups.find((item) => item.key === selectedBackupKey)
+    const confirmed = window.confirm(`Delete ${backup?.name || selectedBackupKey} from Cloudflare R2?`)
+    if (!confirmed) return
+    setBackupBusy("delete")
+    try {
+      const result = await api<{ ok: boolean; message: string; backups: DatabaseBackup[] }>("/api/settings/backup/delete", {
+        method: "POST",
+        body: JSON.stringify({ key: selectedBackupKey }),
+      })
+      setBackups(result.backups || [])
+      setSelectedBackupKey("")
+      onResult({ ok: result.ok, title: "Delete Backup", message: result.message })
+    } finally {
+      setBackupBusy("")
+    }
   }
   async function syncAmazonOtp() {
     const result = await api<{ ok: boolean; message: string }>("/api/settings/amazon-otp/sync", { method: "POST" })
@@ -6908,7 +7188,7 @@ function SettingsPage({
               <Download className="size-4 text-muted-foreground" />
               <CardTitle>Backups</CardTitle>
             </div>
-            <CardDescription>Backup destination and recurring backup interval.</CardDescription>
+            <CardDescription>Full Postgres backups stored in Cloudflare R2.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4">
             <div className="grid gap-3 md:grid-cols-2">
@@ -6918,6 +7198,14 @@ function SettingsPage({
                 {["0", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
               </SelectField>
             </div>
+            <SelectField label="Restore From Backup" value={selectedBackupKey} onChange={setSelectedBackupKey}>
+              <option value="">{backups.length ? "Select backup" : "No backups found"}</option>
+              {backups.map((backup) => (
+                <option key={backup.key} value={backup.key}>
+                  {backup.name} · {formatFileSize(backup.size)}{backup.last_modified ? ` · ${formatDateTime(backup.last_modified)}` : ""}
+                </option>
+              ))}
+            </SelectField>
             <div className="btn-list">
               <Button
                 onClick={() => saveSettingsGroup("Backups", [
@@ -6929,8 +7217,22 @@ function SettingsPage({
               >
                 {savingServices === "Backups" ? "Saving..." : "Save Backups"}
               </Button>
-              <Button variant="outline" onClick={runBackup}>Run Backup Now</Button>
+              <Button variant="outline" onClick={loadBackups} disabled={Boolean(backupBusy)}>
+                Refresh List
+              </Button>
+              <Button variant="outline" onClick={runBackup} disabled={Boolean(backupBusy)}>
+                {backupBusy === "backup" ? "Backing Up..." : "Run Backup Now"}
+              </Button>
+              <Button variant="outline" onClick={restoreBackup} disabled={!selectedBackupKey || Boolean(backupBusy)}>
+                {backupBusy === "restore" ? "Restoring..." : "Restore Selected"}
+              </Button>
+              <Button variant="destructive" onClick={deleteBackup} disabled={!selectedBackupKey || Boolean(backupBusy)}>
+                {backupBusy === "delete" ? "Deleting..." : "Delete Selected"}
+              </Button>
             </div>
+            <p className="text-xs text-muted-foreground">
+              Restore downloads the selected R2 dump and replaces the current Postgres schema/data using pg_restore.
+            </p>
           </CardContent>
         </Card>
 

@@ -28,6 +28,7 @@
             <a class="nav-link {% if path == '/addresses' %}active{% endif %}" href="/addresses">Addresses</a>
             <a class="nav-link {% if path == '/amazon-accounts' %}active{% endif %}" href="/amazon-accounts">Amazon Accounts</a>
             <a class="nav-link {% if path == '/inventory' %}active{% endif %}" href="/inventory">Inventory</a>
+            <a class="nav-link {% if path == '/amazon-order-history-unmatched' %}active{% endif %}" href="/amazon-order-history-unmatched">History Not Found</a>
           </nav>
         </div>
       </header>
@@ -67,12 +68,49 @@
         document.querySelectorAll(".line-check").forEach((cb) => {
           cb.checked = cb.dataset.asin === asin;
         });
+        window.__lineCheckSelectionAnchor = null;
         const search = document.getElementById("orders-search");
         if (search) {
           search.value = asin;
           filterTable("orders-search", "orders-table");
         }
       }
+      function initializeShiftRangeSelection(selector) {
+        let anchor = null;
+        window.__lineCheckSelectionAnchor = null;
+        const selectRange = (checkbox, shiftKey) => {
+          if (!checkbox) return;
+          const visibleChecks = Array.from(document.querySelectorAll(selector)).filter((item) => {
+            const row = item.closest("tr");
+            return !row || !row.hidden;
+          });
+          const start = visibleChecks.indexOf(anchor || window.__lineCheckSelectionAnchor);
+          const end = visibleChecks.indexOf(checkbox);
+          if (shiftKey && start >= 0 && end >= 0) {
+            const [from, to] = start < end ? [start, end] : [end, start];
+            visibleChecks.slice(from, to + 1).forEach((item) => {
+              item.checked = checkbox.checked;
+            });
+          }
+          anchor = checkbox;
+          window.__lineCheckSelectionAnchor = checkbox;
+        };
+        document.addEventListener("click", (event) => {
+          if (!(event.target instanceof Element)) return;
+          const checkbox = event.target.closest(selector);
+          if (checkbox) {
+            selectRange(checkbox, event.shiftKey);
+            return;
+          }
+          if (event.target.closest("a, button, input, select, textarea")) return;
+          const row = event.target.closest("tbody tr");
+          const rowCheckbox = row ? row.querySelector(selector) : null;
+          if (!rowCheckbox) return;
+          rowCheckbox.checked = !rowCheckbox.checked;
+          selectRange(rowCheckbox, event.shiftKey);
+        });
+      }
+      initializeShiftRangeSelection(".line-check");
       document.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
           document.querySelectorAll(".modal-backdrop").forEach((el) => {
