@@ -71,6 +71,7 @@ const KNOWN_APP_PAGES = new Set([
   "shopify-fulfilment",
   "shopify-tracking",
   "inventory",
+  "cancelled-orders",
   "settings",
 ])
 
@@ -369,6 +370,12 @@ type InventoryItem = {
   updated_at: string
 }
 
+type CancelledOrderRow = OrderLine & {
+  inventory_item_id?: number
+  inventory_status?: string
+  inventory_updated_at?: string
+}
+
 type BulkGroup = {
   asin: string
   asin_url: string
@@ -466,6 +473,7 @@ const defaultUiCopy: UiCopy = {
   "shopify-fulfilment": { title: "Shopify Fulfilment", description: "Queue Amazon-ordered Odoo sales into DTC or DTB Shopify fulfilment." },
   "shopify-tracking": { title: "Shopify Tracking to Odoo", description: "Sync Shopify tracking codes back to matching Odoo deliveries." },
   inventory: { title: "Inventory", description: "Use available stock before placing Amazon orders." },
+  "cancelled-orders": { title: "Cancelled Orders", description: "Find cancelled Odoo orders that already have Amazon orders." },
   settings: { title: "Settings", description: "Configure stores, accounts, automation, alerts, and integrations." },
 }
 
@@ -1594,6 +1602,9 @@ function App() {
   const [inventory, setInventory] = useState<InventoryItem[]>([])
   const [inventoryPage, setInventoryPage] = useState(1)
   const [inventoryTotal, setInventoryTotal] = useState(0)
+  const [cancelledOrders, setCancelledOrders] = useState<CancelledOrderRow[]>([])
+  const [cancelledOrdersPage, setCancelledOrdersPage] = useState(1)
+  const [cancelledOrdersTotal, setCancelledOrdersTotal] = useState(0)
   const [ordersPage, setOrdersPage] = useState(1)
   const [ordersTotal, setOrdersTotal] = useState(() => initialDashboard?.total || 0)
   const [missingRows, setMissingRows] = useState<OrderLine[]>([])
@@ -1949,6 +1960,20 @@ function App() {
       })
       .catch((error) => setModal({ ok: false, title: "Inventory load failed", message: String(error) }))
   }, [page, storeId, inventoryPage])
+
+  useEffect(() => {
+    if (page !== "cancelled-orders") return
+    const query = new URLSearchParams()
+    if (storeId) query.set("store_id", storeId)
+    query.set("page", String(cancelledOrdersPage))
+    query.set("per_page", String(PAGE_SIZE))
+    api<{ rows: CancelledOrderRow[]; total: number }>(`/api/cancelled-orders?${query.toString()}`)
+      .then((result) => {
+        setCancelledOrders(result.rows || [])
+        setCancelledOrdersTotal(result.total || 0)
+      })
+      .catch((error) => setModal({ ok: false, title: "Cancelled orders load failed", message: String(error) }))
+  }, [page, storeId, cancelledOrdersPage])
 
   useEffect(() => {
     if (page !== "missing") return
@@ -2505,6 +2530,7 @@ function App() {
         ["costly", "Cost Review", AlertCircle],
         ["fulfilment-pending", "Pending Dispatch", AlertCircle],
         ["inventory", "Inventory", PackageCheck],
+        ["cancelled-orders", "Cancelled Orders", AlertCircle],
       ],
     },
     {
@@ -3355,6 +3381,20 @@ function App() {
             onRows={(items, total) => {
               setInventory(items)
               setInventoryTotal(total)
+            }}
+            onResult={setModal}
+          />
+        )}
+        {page === "cancelled-orders" && (
+          <CancelledOrdersPage
+            rows={cancelledOrders}
+            storeId={storeId}
+            page={cancelledOrdersPage}
+            total={cancelledOrdersTotal}
+            onPage={setCancelledOrdersPage}
+            onRows={(rows, total) => {
+              setCancelledOrders(rows)
+              setCancelledOrdersTotal(total)
             }}
             onResult={setModal}
           />
@@ -4881,14 +4921,14 @@ function InventoryPage({
   onRows: (rows: InventoryItem[], total: number) => void
   onResult: (modal: ModalState) => void
 }) {
-  const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", notes: "" })
+  const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
   async function addManualInventory() {
     try {
       const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>("/api/inventory", {
         method: "POST",
         body: JSON.stringify({ ...form, store_id: Number(storeId), quantity: Number(form.quantity || 1) }),
       })
-      setForm({ asin: "", quantity: "1", product_name: "", notes: "" })
+      setForm({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
       onPage(1)
       onRows(result.items, result.total || 0)
       onResult({ ok: true, title: "Inventory Added", message: result.message })
@@ -4903,7 +4943,7 @@ function InventoryPage({
           <CardTitle>Inventory</CardTitle>
           <CardDescription>Available warehouse stock from delivered Amazon orders whose Odoo order was cancelled/refunded, plus manually added stock. Inventory-matched orders are not auto-bought by Chrome.</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-[1fr_120px_1.2fr_1.2fr_auto]">
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1fr_120px_1.2fr_1fr_1fr_1.2fr_auto]">
           <div className="grid gap-1.5">
             <Label>ASIN</Label>
             <Input value={form.asin} onChange={(event) => setForm({ ...form, asin: event.target.value.toUpperCase() })} />
@@ -4917,11 +4957,19 @@ function InventoryPage({
             <Input value={form.product_name} onChange={(event) => setForm({ ...form, product_name: event.target.value })} />
           </div>
           <div className="grid gap-1.5">
+            <Label>Odoo Ref</Label>
+            <Input value={form.odoo_order_name} onChange={(event) => setForm({ ...form, odoo_order_name: event.target.value })} />
+          </div>
+          <div className="grid gap-1.5">
+            <Label>Amazon Order</Label>
+            <Input value={form.amazon_order_id} onChange={(event) => setForm({ ...form, amazon_order_id: event.target.value })} />
+          </div>
+          <div className="grid gap-1.5">
             <Label>Notes</Label>
             <Input value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} />
           </div>
           <div className="flex items-end">
-            <Button disabled={!storeId || !form.asin.trim()} onClick={addManualInventory}>
+            <Button disabled={!storeId || (!form.asin.trim() && !form.odoo_order_name.trim() && !form.amazon_order_id.trim())} onClick={addManualInventory}>
               <Plus className="size-4" />
               Add
             </Button>
@@ -4975,6 +5023,115 @@ function InventoryPage({
               {!rows.length && (
                 <TableRow>
                   <TableCell colSpan={8} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function CancelledOrdersPage({
+  rows,
+  storeId,
+  page,
+  total,
+  onPage,
+  onRows,
+  onResult,
+}: {
+  rows: CancelledOrderRow[]
+  storeId: string
+  page: number
+  total: number
+  onPage: (page: number) => void
+  onRows: (rows: CancelledOrderRow[], total: number) => void
+  onResult: (modal: ModalState) => void
+}) {
+  const [syncing, setSyncing] = useState(false)
+  async function syncCancelledOrders() {
+    setSyncing(true)
+    try {
+      const result = await api<{ ok: boolean; message: string; rows: CancelledOrderRow[]; total: number }>("/api/cancelled-orders/sync", {
+        method: "POST",
+        body: JSON.stringify({ store_id: storeId ? Number(storeId) : null }),
+      })
+      onPage(1)
+      onRows(result.rows || [], result.total || 0)
+      onResult({ ok: result.ok, title: "Cancelled Orders Sync", message: result.message })
+    } catch (error) {
+      onResult({ ok: false, title: "Cancelled Orders Sync Failed", message: String(error) })
+    } finally {
+      setSyncing(false)
+    }
+  }
+  return (
+    <div className="grid gap-5">
+      <section className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">Cancelled Orders</h2>
+          <p className="text-sm text-muted-foreground">Cancelled or refunded Odoo orders with an Amazon order reference are tracked here and added to inventory when delivered.</p>
+        </div>
+        <div className="btn-list">
+          <Button variant="outline" onClick={syncCancelledOrders} disabled={syncing}>
+            <RefreshCw className="size-4" />
+            {syncing ? "Syncing..." : "Check Odoo"}
+          </Button>
+          <PaginationControls page={page} total={total} onPage={onPage} disabled={syncing} />
+        </div>
+      </section>
+      <Card>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Odoo Order</TableHead>
+                <TableHead>Amazon Order</TableHead>
+                <TableHead>ASIN</TableHead>
+                <TableHead>Item</TableHead>
+                <TableHead>Qty</TableHead>
+                <TableHead>Odoo Status</TableHead>
+                <TableHead>Amazon Status</TableHead>
+                <TableHead>Inventory</TableHead>
+                <TableHead>Updated</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell>
+                    {row.odoo_order_url ? (
+                      <a className="font-semibold text-primary underline-offset-4 hover:underline" href={row.odoo_order_url} target="_blank">{row.odoo_order_name}</a>
+                    ) : row.odoo_order_name}
+                  </TableCell>
+                  <TableCell>
+                    <a className="font-mono text-xs text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">{row.amazon_order_id}</a>
+                    <div className="text-xs text-muted-foreground">{row.amazon_account_name || ""}</div>
+                  </TableCell>
+                  <TableCell>
+                    <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.asin_url || `https://www.amazon.com/dp/${row.asin}`} target="_blank">{row.asin}</a>
+                  </TableCell>
+                  <TableCell className="max-w-[360px] truncate">{row.product_name}</TableCell>
+                  <TableCell>{row.quantity}</TableCell>
+                  <TableCell><StatusBadge value={row.odoo_status_label} /></TableCell>
+                  <TableCell>
+                    <StatusBadge value={row.tracking_status || row.state || "ordered"} />
+                  </TableCell>
+                  <TableCell>
+                    {row.inventory_item_id ? (
+                      <Badge variant={row.inventory_status === "available" ? "default" : "secondary"}>{row.inventory_status || "inventory"}</Badge>
+                    ) : (
+                      <span className="text-muted-foreground">Not added</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.updated_at)}</TableCell>
+                </TableRow>
+              ))}
+              {!rows.length && (
+                <TableRow>
+                  <TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No cancelled ordered rows found for this filter.</TableCell>
                 </TableRow>
               )}
             </TableBody>
@@ -7238,6 +7395,12 @@ function SettingsPage({
                 {["1", "2", "3", "7", "14", "30"].map((value) => <option key={value} value={value}>Last {value} day{value === "1" ? "" : "s"}</option>)}
               </SelectField>
               <TextField label="Auto Fulfil Pull Limit" value={settings.auto_chrome_fulfil_limit || "100"} onChange={(value) => setSetting("auto_chrome_fulfil_limit", value)} />
+              <SelectField label="Cancelled Order Sync" value={settings.cancelled_orders_sync_interval_minutes || "0"} onChange={(value) => setSetting("cancelled_orders_sync_interval_minutes", value)}>
+                {["0", "60", "1440", "2880", "4320", "10080"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
+              </SelectField>
+              <SelectField label="Cancelled Pull Window" value={settings.cancelled_orders_sync_days || "30"} onChange={(value) => setSetting("cancelled_orders_sync_days", value)}>
+                {["7", "14", "30", "60", "90", "180"].map((value) => <option key={value} value={value}>Last {value} days</option>)}
+              </SelectField>
               <TextField label="Odoo Pull Batch Size" value={settings.pull_orders_batch_size || "50"} onChange={(value) => setSetting("pull_orders_batch_size", value)} />
             </div>
             <p className="text-xs text-muted-foreground">Order pulls read Odoo in batches and save each batch before moving to the next one. Use 50 unless Odoo starts throttling, then reduce it.</p>
@@ -7249,6 +7412,8 @@ function SettingsPage({
                   "auto_chrome_fulfil_interval_minutes",
                   "auto_chrome_fulfil_days",
                   "auto_chrome_fulfil_limit",
+                  "cancelled_orders_sync_interval_minutes",
+                  "cancelled_orders_sync_days",
                   "pull_orders_batch_size",
                 ])}
                 disabled={savingServices === "Database & Automation"}

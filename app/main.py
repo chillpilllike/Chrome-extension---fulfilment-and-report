@@ -167,6 +167,7 @@ FRONTEND_SHELL_PATHS = {
     "/shopify-fulfilment",
     "/shopify-tracking",
     "/inventory",
+    "/cancelled-orders",
     "/chrome-queue",
     "/settings",
 }
@@ -1311,6 +1312,67 @@ class OdooClient:
         return found
 
 
+ODOO_ORDERED_TAG_NAME = "ordered"
+
+
+def odoo_order_tag_model(odoo: OdooClient) -> str:
+    fields = odoo.fields_get("sale.order")
+    tag_field = fields.get("tag_ids") or {}
+    return clean_text(tag_field.get("relation")) if isinstance(tag_field, dict) else ""
+
+
+def ensure_odoo_order_tag(odoo: OdooClient, tag_name: str = ODOO_ORDERED_TAG_NAME) -> Optional[int]:
+    model = odoo_order_tag_model(odoo)
+    if not model:
+        return None
+    rows = odoo.search_read(model, [("name", "=", tag_name)], ["id", "name"], limit=1)
+    if rows:
+        return int(rows[0]["id"])
+    tag_id = odoo.execute(model, "create", [{"name": tag_name}])
+    return int(tag_id) if tag_id else None
+
+
+def set_odoo_order_tag(store_id: int, order_ids: list[int], present: bool, tag_name: str = ODOO_ORDERED_TAG_NAME) -> None:
+    cleaned_order_ids = sorted({int(order_id) for order_id in order_ids if int(order_id or 0) > 0})
+    if not cleaned_order_ids:
+        return
+    try:
+        odoo = OdooClient(get_store(int(store_id)))
+        tag_id = ensure_odoo_order_tag(odoo, tag_name)
+        if not tag_id:
+            return
+        command = (4, tag_id) if present else (3, tag_id)
+        odoo.write("sale.order", cleaned_order_ids, {"tag_ids": [command]})
+    except Exception as exc:
+        print(f"Odoo ordered tag sync failed for store {store_id}: {exc}", flush=True)
+
+
+def sync_odoo_ordered_tags_for_pairs(pairs: set[tuple[int, int]]) -> None:
+    if not pairs:
+        return
+    by_store: dict[int, dict[str, list[int]]] = {}
+    with db() as conn:
+        for store_id, order_id in pairs:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM order_lines
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND COALESCE(amazon_order_id, '') != ''
+                  AND state IN ('ordered', 'dispatched', 'delivered')
+                """,
+                (store_id, order_id),
+            ).fetchone()
+            key = "add" if row and int(row["count"] or 0) > 0 else "remove"
+            by_store.setdefault(int(store_id), {"add": [], "remove": []})[key].append(int(order_id))
+    for store_id, grouped in by_store.items():
+        if grouped["add"]:
+            set_odoo_order_tag(store_id, grouped["add"], True)
+        if grouped["remove"]:
+            set_odoo_order_tag(store_id, grouped["remove"], False)
+
+
 class AmazonBusinessClient:
     def __init__(self, account: Optional[dict[str, Any]] = None) -> None:
         self.account = account
@@ -1969,6 +2031,49 @@ def list_inventory_items(store_id: Optional[int] = None, page: int = 1, per_page
         else:
             rows = conn.execute("SELECT * FROM inventory_items ORDER BY updated_at DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
     return rows, int(total)
+
+
+def list_cancelled_order_lines(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int]:
+    page = max(1, int(page or 1))
+    per_page = max(1, min(100, int(per_page or 100)))
+    offset = (page - 1) * per_page
+    params: list[Any] = [store_id, store_id]
+    where = """
+        WHERE (? IS NULL OR order_lines.store_id=?)
+          AND COALESCE(order_lines.amazon_order_id, '') != ''
+          AND LOWER(COALESCE(order_lines.odoo_status_label, '')) IN ('cancelled', 'refunded')
+    """
+    with db() as conn:
+        total = conn.execute(f"SELECT COUNT(*) AS count FROM order_lines {where}", params).fetchone()["count"]
+        rows = conn.execute(
+            f"""
+            SELECT order_lines.*,
+                   inventory_items.id AS inventory_item_id,
+                   inventory_items.status AS inventory_status,
+                   inventory_items.updated_at AS inventory_updated_at
+            FROM order_lines
+            LEFT JOIN inventory_items
+              ON inventory_items.store_id = order_lines.store_id
+             AND inventory_items.order_line_id = order_lines.id
+            {where}
+            ORDER BY order_lines.updated_at DESC, order_lines.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+    return rows, int(total)
+
+
+def cancelled_order_rows_payload(rows: list[Any], stores: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    data = rows_to_dicts(rows)
+    stores = stores or rows_to_dicts(list_stores())
+    stores_by_id = {int(store["id"]): store for store in stores}
+    for row in data:
+        store = stores_by_id.get(int(row.get("store_id") or 0))
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        row["amazon_order_url"] = clean_text(row.get("amazon_order_url")) or order_line_amazon_url(row.get("amazon_order_id") or "")
+        row["asin_url"] = asin_product_url(row.get("asin") or "")
+    return data
 
 
 def available_inventory_quantity(store_id: int, asin: str) -> float:
@@ -8373,6 +8478,84 @@ def sync_inventory_for_store(store_id: int) -> None:
         ensure_inventory_for_line(row)
 
 
+def sync_cancelled_orders_for_store(store_id: int, days: int = 30, limit: int = 500) -> dict[str, Any]:
+    store = get_store(store_id)
+    odoo = OdooClient(store)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days or 30)))
+    order_fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status", "date_order", "write_date"])
+    date_field = "write_date" if "write_date" in order_fields else "date_order"
+    orders = odoo.search_read(
+        "sale.order",
+        [(date_field, ">=", cutoff.strftime("%Y-%m-%d %H:%M:%S")), ("state", "=", "cancel")],
+        order_fields,
+        limit=max(1, min(2000, int(limit or 500))),
+        order=f"{date_field} desc",
+    )
+    touched_rows: list[dict[str, Any]] = []
+    now = utc_now()
+    with db() as conn:
+        for order in orders:
+            status_label = derive_odoo_status(order, [])
+            if status_label not in {"cancelled", "refunded"}:
+                continue
+            order_id = int(order.get("id") or 0)
+            order_name = clean_text(order.get("name"))
+            rows = conn.execute(
+                """
+                SELECT * FROM order_lines
+                WHERE store_id=?
+                  AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
+                  AND COALESCE(amazon_order_id, '') != ''
+                """,
+                (store_id, order_id, order_name),
+            ).fetchall()
+            if not rows:
+                continue
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET odoo_order_state=?,
+                    odoo_invoice_status=?,
+                    odoo_status_label=?,
+                    updated_at=?
+                WHERE store_id=?
+                  AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
+                  AND COALESCE(amazon_order_id, '') != ''
+                """,
+                (
+                    clean_text(order.get("state")),
+                    clean_text(order.get("invoice_status")),
+                    status_label,
+                    now,
+                    store_id,
+                    order_id,
+                    order_name,
+                ),
+            )
+            touched_rows.extend(
+                rows_to_dicts(conn.execute(
+                    """
+                    SELECT * FROM order_lines
+                    WHERE store_id=?
+                      AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
+                      AND COALESCE(amazon_order_id, '') != ''
+                    """,
+                    (store_id, order_id, order_name),
+                ).fetchall())
+            )
+    for row in touched_rows:
+        ensure_inventory_for_line(row)
+        index_order_line(row)
+    sync_inventory_for_store(store_id)
+    return {
+        "ok": True,
+        "store_id": store_id,
+        "checked": len(orders),
+        "updated": len(touched_rows),
+        "message": f"Checked {len(orders)} cancelled Odoo order(s), updated {len(touched_rows)} ordered line(s).",
+    }
+
+
 def check_deliveries(store_id: int) -> tuple[int, int]:
     store = get_store(store_id)
     delivered = 0
@@ -10411,6 +10594,7 @@ def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_p
 def autosync_loop() -> None:
     last_run = time.time()
     last_chrome_run = time.time()
+    last_cancelled_run = time.time()
     while True:
         try:
             settings = get_service_settings()
@@ -10436,6 +10620,12 @@ def autosync_loop() -> None:
                     if pulled_count is not None:
                         place_orders(store_id, ordering_engine="chrome")
                 last_chrome_run = time.time()
+            cancelled_interval = int(float(settings.get("cancelled_orders_sync_interval_minutes") or 0))
+            if cancelled_interval > 0 and time.time() - last_cancelled_run >= cancelled_interval * 60:
+                days = max(1, min(365, int(float(settings.get("cancelled_orders_sync_days") or 30))))
+                for store in list_stores():
+                    sync_cancelled_orders_for_store(int(store["id"]), days=days)
+                last_cancelled_run = time.time()
         except Exception:
             pass
         time.sleep(60)
@@ -10503,14 +10693,97 @@ def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int =
     }
 
 
+@app.get("/api/cancelled-orders")
+def api_cancelled_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    page, per_page, _ = pagination_bounds(page, per_page)
+    rows, total = list_cancelled_order_lines(store_id, page, per_page)
+    stores = rows_to_dicts(list_stores())
+    for store in stores:
+        if store.get("odoo_password"):
+            store["odoo_password"] = "********"
+    data = cancelled_order_rows_payload(rows, stores)
+    return {"ok": True, "stores": stores, "rows": data, "page": page, "per_page": per_page, "total": total}
+
+
+@app.post("/api/cancelled-orders/sync")
+def api_cancelled_orders_sync(payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    payload = payload or {}
+    store_id = parse_optional_int(payload.get("store_id"))
+    days = max(1, min(365, int(float(payload.get("days") or get_service_settings().get("cancelled_orders_sync_days") or 30))))
+    stores = [get_store(store_id)] if store_id else list_stores()
+    results = []
+    total_updated = 0
+    for store in stores:
+        result = sync_cancelled_orders_for_store(int(store["id"]), days=days)
+        results.append(result)
+        total_updated += int(result.get("updated") or 0)
+    rows, total = list_cancelled_order_lines(store_id, 1, 100)
+    stores_payload = rows_to_dicts(list_stores())
+    for store in stores_payload:
+        if store.get("odoo_password"):
+            store["odoo_password"] = "********"
+    return {
+        "ok": True,
+        "message": f"Cancelled order sync complete. Updated {total_updated} ordered line(s).",
+        "results": results,
+        "rows": cancelled_order_rows_payload(rows, stores_payload),
+        "page": 1,
+        "per_page": 100,
+        "total": total,
+    }
+
+
 @app.post("/api/inventory")
-def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
-    asin = normalize_asin(payload.asin)
+def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+    store_id = int(payload.get("store_id") or 0)
+    if not store_id:
+        raise HTTPException(400, "Store is required.")
+    asin = normalize_asin(str(payload.get("asin") or ""))
+    odoo_order_name = clean_text(payload.get("odoo_order_name"))
+    amazon_order_id = clean_text(payload.get("amazon_order_id"))
+    matched_line = None
+    if odoo_order_name or amazon_order_id:
+        clauses = ["store_id=?"]
+        params: list[Any] = [store_id]
+        if odoo_order_name:
+            clauses.append("UPPER(odoo_order_name)=UPPER(?)")
+            params.append(odoo_order_name)
+        if amazon_order_id:
+            clauses.append("amazon_order_id=?")
+            params.append(amazon_order_id)
+        with db() as conn:
+            candidates = rows_to_dicts(conn.execute(
+                f"""
+                SELECT *
+                FROM order_lines
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 50
+                """,
+                params,
+            ).fetchall())
+        if asin:
+            matched_line = next((row for row in candidates if normalize_asin(row.get("asin") or "") == asin), None)
+        elif candidates:
+            asins = sorted({normalize_asin(row.get("asin") or "") for row in candidates if normalize_asin(row.get("asin") or "")})
+            if len(asins) == 1:
+                asin = asins[0]
+                matched_line = candidates[0]
+            else:
+                raise HTTPException(400, "Enter ASIN too because the Odoo/Amazon reference has multiple items.")
     if not asin:
         raise HTTPException(400, "ASIN is required.")
-    quantity = float(payload.quantity or 0)
+    quantity = float(payload.get("quantity") or 0)
+    if not quantity and matched_line:
+        quantity = float(matched_line.get("quantity") or 0)
     if quantity <= 0:
         raise HTTPException(400, "Quantity must be greater than zero.")
+    product_name = clean_text(payload.get("product_name")) or (clean_text(matched_line.get("product_name")) if matched_line else "")
+    notes = clean_text(payload.get("notes"))
+    amazon_order_url = clean_text(payload.get("amazon_order_url")) or (clean_text(matched_line.get("amazon_order_url")) if matched_line else "") or (order_line_amazon_url(amazon_order_id) if amazon_order_id else "")
+    amazon_account_name = clean_text(payload.get("amazon_account_name")) or (clean_text(matched_line.get("amazon_account_name")) if matched_line else "")
+    source_odoo_order_id = int(matched_line.get("odoo_order_id") or 0) if matched_line else None
+    source_odoo_order_name = odoo_order_name or (clean_text(matched_line.get("odoo_order_name")) if matched_line else "")
     manual_reference = f"manual-{uuid.uuid4().hex[:10]}"
     with db() as conn:
         cursor = conn.execute(
@@ -10518,15 +10791,20 @@ def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
             INSERT INTO inventory_items
             (store_id, order_line_id, asin, quantity, product_name, source_odoo_order_id, source_odoo_order_name,
              amazon_order_id, amazon_order_url, amazon_account_name, status, source_type, notes, manual_reference, created_at, updated_at)
-            VALUES (?, NULL, ?, ?, ?, NULL, '', '', '', '', 'available', 'manual', ?, ?, ?, ?)
+            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 'manual', ?, ?, ?, ?)
             RETURNING id
             """,
             (
-                payload.store_id,
+                store_id,
                 asin,
                 quantity,
-                clean_text(payload.product_name),
-                clean_text(payload.notes),
+                product_name,
+                source_odoo_order_id,
+                source_odoo_order_name,
+                amazon_order_id,
+                amazon_order_url,
+                amazon_account_name,
+                notes,
                 manual_reference,
                 utc_now(),
                 utc_now(),
@@ -10536,13 +10814,13 @@ def api_create_inventory(payload: InventoryCreatePayload) -> dict[str, Any]:
         if not inserted:
             row = conn.execute(
                 "SELECT * FROM inventory_items WHERE store_id=? AND manual_reference=? ORDER BY id DESC LIMIT 1",
-                (payload.store_id, manual_reference),
+                (store_id, manual_reference),
             ).fetchone()
         else:
             row = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inserted["id"],)).fetchone()
     if row:
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(row) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
-    items, total = list_inventory_items(payload.store_id, 1, 100)
+    items, total = list_inventory_items(store_id, 1, 100)
     return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {asin}.", "items": rows_to_dicts(items), "page": 1, "per_page": 100, "total": total}
 
 
@@ -11879,6 +12157,7 @@ def api_chrome_job_reset_fulfilment(group_key: str, payload: ChromeJobResetPaylo
         ).fetchall()
         if not rows:
             raise HTTPException(404, "Chrome job lines not found.")
+        tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in rows}
         cursor = conn.execute(
             f"""
             UPDATE order_lines
@@ -11922,6 +12201,7 @@ def api_chrome_job_reset_fulfilment(group_key: str, payload: ChromeJobResetPaylo
         ).fetchall()
     for row in updated_rows:
         index_order_line(row)
+    threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
     return {
         "ok": True,
         "reset": cursor.rowcount,
@@ -12036,6 +12316,10 @@ def chrome_complete_followups(
             odoo.post_order_note(order_id, order_note)
     except Exception as exc:
         print(f"Chrome complete Odoo note failed: {exc}", flush=True)
+    try:
+        sync_odoo_ordered_tags_for_pairs({(int(row["store_id"]), int(row["odoo_order_id"])) for row in rows})
+    except Exception as exc:
+        print(f"Chrome complete Odoo tag failed: {exc}", flush=True)
     try:
         for store_id in sorted({int(row["store_id"]) for row in rows}):
             write_report(store_id)
@@ -12354,6 +12638,7 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
         if not rows:
             raise HTTPException(404, "Tracked Amazon order not found")
         if payload.order_cancelled:
+            tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in rows}
             now = utc_now()
             cancellation_message = clean_text(payload.cancellation_message) or "This order has been cancelled."
             note = f"Earlier Amazon order {amazon_order_id} was cancelled. Reset to fresh pulled state for reorder. {cancellation_message}"
@@ -12403,6 +12688,7 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     updated_rows.append(updated_row)
             for updated_row in updated_rows:
                 index_order_line(updated_row)
+            threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
             return {"ok": True, "updated": len(updated_rows), "tracking_status": "Amazon cancelled", "order_cancelled": True}
         if payload_has_payment_revision(payload):
             now = utc_now()
@@ -13451,6 +13737,11 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
     placeholders = ",".join("?" for _ in payload.line_ids)
     now = utc_now()
     with db() as conn:
+        selected_rows = conn.execute(
+            f"SELECT store_id, odoo_order_id FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
+            [payload.store_id, *payload.line_ids],
+        ).fetchall()
+        tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in selected_rows}
         cursor = conn.execute(
             f"""
             UPDATE order_lines
@@ -13498,6 +13789,7 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
         ).fetchall()
     for updated in updated_rows:
         index_order_line(updated)
+    threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
     data = dashboard_data(payload.store_id)
     data["message"] = f"Reset {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} to fresh pulled status."
     return data
@@ -13956,16 +14248,13 @@ def chrome_queue_release_lock(group_key: str = Form(...), store_id: str = Form("
 
 
 @app.get("/inventory", response_class=HTMLResponse)
-def inventory_page(request: Request, store_id: Optional[int] = None) -> HTMLResponse:
-    items, _total = list_inventory_items(store_id, 1, 100)
-    return templates.TemplateResponse(
-        "inventory.html",
-        {
-            "request": request,
-            "stores": list_stores(),
-            "current_store_id": store_id,
-            "items": items,
-        },
+def inventory_page(request: Request, store_id: Optional[int] = None) -> Response:
+    index_path = FRONTEND_DIST / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return HTMLResponse(
+        "<h1>Frontend not built</h1><p>Run <code>cd frontend && npm run build</code>, then restart FastAPI.</p>",
+        status_code=503,
     )
 
 
