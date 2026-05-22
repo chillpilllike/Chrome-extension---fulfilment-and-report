@@ -7302,8 +7302,8 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
           <CardDescription>Uses SRC_ODOO_DB and SRC_ODOO_ORDER tags only. Empty dates use the configured default window.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-4">
-          <TextField label="From Date" value={fromDate} onChange={setFromDate} />
-          <TextField label="To Date" value={toDate} onChange={setToDate} />
+          <TextField label="From Date" type="date" value={fromDate} onChange={setFromDate} />
+          <TextField label="To Date" type="date" value={toDate} onChange={setToDate} />
           <label className="form-check mt-6 w-fit cursor-pointer">
             <Checkbox checked={dryRun} onCheckedChange={(checked) => setDryRun(checked)} />
             <span className="form-check-label">Dry run</span>
