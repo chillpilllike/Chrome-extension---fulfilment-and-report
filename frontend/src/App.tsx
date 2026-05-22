@@ -7543,15 +7543,16 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       setBusy("")
     }
   }
-  async function startOAuth(route: string) {
-    setBusy(`OAuth-${route}`)
+  async function startOAuth(route: string, force = false) {
+    const busyKey = `${force ? "Reauth" : "OAuth"}-${route}`
+    setBusy(busyKey)
     try {
-      const result = await api<{ ok: boolean; authorized?: boolean; auth_url?: string; message: string }>(`/api/shopify/fulfilment/oauth/start?route=${encodeURIComponent(route)}`, { method: "POST" })
+      const result = await api<{ ok: boolean; authorized?: boolean; auth_url?: string; message: string }>(`/api/shopify/fulfilment/oauth/start?route=${encodeURIComponent(route)}${force ? "&force=true" : ""}`, { method: "POST" })
       if (result.auth_url) {
         window.open(result.auth_url, "_blank", "noopener,noreferrer")
       }
       await load()
-      onResult({ ok: result.ok, title: "Shopify OAuth", message: result.message })
+      onResult({ ok: result.ok, title: force ? "Reauthenticate Shopify" : "Shopify OAuth", message: result.message })
     } finally {
       setBusy("")
     }
@@ -7665,10 +7666,17 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
               </Button>
             ))}
             {oauthStatus.filter((item) => item.authorized).map((item) => (
-              <span key={`${item.route}-${item.dest_name}-connected`} className="btn btn-success shopify-connected-button">
+              <Button
+                key={`${item.route}-${item.dest_name}-connected`}
+                variant="success"
+                className="shopify-connected-button"
+                onClick={() => startOAuth(item.route, true)}
+                disabled={Boolean(busy)}
+                title={`Reconnect ${item.dest_name || item.route.toUpperCase()}`}
+              >
                 <CheckCircle2 className="size-4" />
-                Connected {item.route.toUpperCase()}
-              </span>
+                {busy === `Reauth-${item.route}` ? "Opening..." : `Connected ${item.route.toUpperCase()}`}
+              </Button>
             ))}
             <Button variant="outline" onClick={() => load()}>Refresh</Button>
           </div>

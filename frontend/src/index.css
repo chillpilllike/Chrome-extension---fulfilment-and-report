@@ -877,8 +877,7 @@
 }
 
 .shopify-connected-button {
-    cursor: default;
-    pointer-events: none;
+    cursor: pointer;
     text-decoration: none;
 }
 

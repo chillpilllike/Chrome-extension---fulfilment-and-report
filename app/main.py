@@ -9442,12 +9442,12 @@ def complete_shopify_oauth_session(state_key: str, code: str) -> str:
     return route
 
 
-def start_shopify_oauth(route: str, request: Request) -> dict[str, Any]:
+def start_shopify_oauth(route: str, request: Request, force: bool = False) -> dict[str, Any]:
     module, _script_path, state_scope = shopify_route_script_config(route)
     state_db_obj = module.StateDB(state_scope)
     missing_dest = None
     for dest in module.DESTS:
-        if not shopify_dest_has_access(module, state_db_obj, dest):
+        if force or not shopify_dest_has_access(module, state_db_obj, dest):
             missing_dest = dest
             break
     if not missing_dest:
@@ -13200,8 +13200,8 @@ def api_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100) -> dict[str,
 
 
 @app.post("/api/shopify/fulfilment/oauth/start")
-def api_shopify_fulfilment_oauth_start(request: Request, route: str) -> dict[str, Any]:
-    return start_shopify_oauth(route, request)
+def api_shopify_fulfilment_oauth_start(request: Request, route: str, force: bool = False) -> dict[str, Any]:
+    return start_shopify_oauth(route, request, force=force)
 
 
 @app.get("/api/shopify/fulfilment/oauth/callback")
