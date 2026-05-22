@@ -1276,20 +1276,23 @@ function ManualFulfilmentDialog({
   open: boolean
   selectedCount: number
   onClose: () => void
-  onSubmit: (payload: { reference: string; url: string; third_party: boolean }) => Promise<void>
+  onSubmit: (payload: { reference: string; url: string; third_party: boolean; total_cost: number }) => Promise<void>
 }) {
   const [thirdParty, setThirdParty] = useState(false)
   const [reference, setReference] = useState("")
   const [url, setUrl] = useState("")
+  const [totalCost, setTotalCost] = useState("")
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     if (!open) return
     setThirdParty(false)
     setReference("")
     setUrl("")
+    setTotalCost("")
     setBusy(false)
   }, [open])
-  const canSave = thirdParty ? Boolean(reference.trim() || url.trim()) : Boolean(reference.trim())
+  const costValue = Number(totalCost || 0)
+  const canSave = thirdParty ? Boolean(reference.trim() || url.trim()) && costValue > 0 : Boolean(reference.trim())
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
       <DialogContent>
@@ -1319,6 +1322,14 @@ function ManualFulfilmentDialog({
             value={url}
             onChange={setUrl}
           />
+          {thirdParty && (
+            <TextField
+              label="Third-party total cost"
+              type="number"
+              value={totalCost}
+              onChange={setTotalCost}
+            />
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
@@ -1327,7 +1338,7 @@ function ManualFulfilmentDialog({
             onClick={async () => {
               setBusy(true)
               try {
-                await onSubmit({ reference, url, third_party: thirdParty })
+                await onSubmit({ reference, url, third_party: thirdParty, total_cost: costValue })
               } finally {
                 setBusy(false)
               }
@@ -2229,6 +2240,28 @@ function App() {
     )
   }
 
+  function placeRecentChromeOrders() {
+    if (!storeId || busy) return
+    const answer = window.prompt("Pull and queue how many days? Today is 1; enter 5 for today plus the previous 4 days.", days || "5")
+    if (answer === null) return
+    const requestedDays = Math.max(1, Math.min(365, Number(answer || 0)))
+    if (!Number.isFinite(requestedDays) || requestedDays < 1) {
+      setModal({ ok: false, title: "Place Recent Orders", message: "Enter a valid day count." })
+      return
+    }
+    return runAction("Place Recent Orders", () =>
+      api<DashboardData>("/api/place/recent-chrome", {
+        method: "POST",
+        body: JSON.stringify({
+          store_id: Number(storeId),
+          address_id: Number(addressId || 0) || null,
+          amazon_account_id: Number(amazonAccountId || 0) || null,
+          days: requestedDays,
+        }),
+      }),
+    )
+  }
+
   function resetSelectedOrders() {
     if (!selected.length || busy) return
     setResetFulfilmentConfirmOpen(true)
@@ -2431,9 +2464,25 @@ function App() {
         return <span className="text-xs text-muted-foreground">{formatDateTime(row.ordered_at)}</span>
       case "asin":
         return row.asin ? (
-          <a className="text-primary underline-offset-4 hover:underline" href={`https://www.amazon.com/dp/${row.asin}`} target="_blank">
-            {row.asin}
-          </a>
+          row.replacement_asin ? (
+            <Tooltip>
+              <TooltipTrigger
+                className="inline-flex items-center gap-1 rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 font-mono text-xs font-semibold text-amber-900 underline-offset-4 hover:underline"
+                onClick={() => window.open(`https://www.amazon.com/dp/${row.asin}`, "_blank")}
+              >
+                {row.asin}
+              </TooltipTrigger>
+              <TooltipContent side="top" align="start" className="max-w-sm whitespace-normal leading-relaxed">
+                Original ASIN: {row.original_asin || "unknown"}<br />
+                Replacement ASIN: {row.replacement_asin}
+                {row.replacement_note ? <><br />Note: {row.replacement_note}</> : null}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <a className="text-primary underline-offset-4 hover:underline" href={`https://www.amazon.com/dp/${row.asin}`} target="_blank">
+              {row.asin}
+            </a>
+          )
         ) : ""
       case "spaid":
         return (
@@ -2881,6 +2930,14 @@ function App() {
                     </Button>
                     <Button
                       variant="outline"
+                      disabled={!storeId || !addressId || !amazonAccountId || Boolean(busy)}
+                      onClick={placeRecentChromeOrders}
+                    >
+                      <ShoppingCart className="size-4" />
+                      Place Recent
+                    </Button>
+                    <Button
+                      variant="outline"
                       disabled={!storeId || Boolean(busy)}
                       onClick={() =>
                         runAction("Check Delivered and Dispatch", () =>
@@ -3017,6 +3074,16 @@ function App() {
                     >
                       <CheckCircle2 className="size-4" />
                       Manually Fulfilled
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={selected.length !== 1 || Boolean(busy)}
+                      onClick={() => {
+                        const line = rows.find((row) => row.id === selected[0])
+                        if (line) setEditingReplacement(line)
+                      }}
+                    >
+                      Replace ASIN
                     </Button>
                     <Button
                       disabled={!selected.length || Boolean(busy)}
@@ -6304,7 +6371,7 @@ function ReplacementDialog({
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>Assign Replacement ASIN</DialogTitle>
-          <DialogDescription>{line.odoo_order_name} / missing {line.missing_asin || line.asin}</DialogDescription>
+          <DialogDescription>{line.odoo_order_name} / current {line.asin}</DialogDescription>
         </DialogHeader>
         <div className="form-fieldset grid gap-3">
           <TextField label="Replacement ASIN" value={asin} onChange={(value) => setAsin(value.toUpperCase())} />
@@ -6315,7 +6382,7 @@ function ReplacementDialog({
           <Button
             onClick={async () => {
               try {
-                const result = await api<{ ok: boolean; message: string }>(`/api/missing/lines/${line.id}/replacement`, {
+                const result = await api<{ ok: boolean; message: string }>(`/api/lines/${line.id}/replacement`, {
                   method: "POST",
                   body: JSON.stringify({ store_id: storeId, asin, note }),
                 })

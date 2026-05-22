@@ -10912,7 +10912,7 @@ def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page:
     }
 
 
-@app.post("/api/missing/lines/{line_id}/replacement")
+@app.post("/api/lines/{line_id}/replacement")
 def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[str, Any]:
     replacement_asin = normalize_asin(payload.asin)
     if not replacement_asin:
@@ -10921,7 +10921,9 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, payload.store_id)).fetchone()
         if not row:
-            raise HTTPException(404, "Missing order line not found.")
+            raise HTTPException(404, "Order line not found.")
+        if row["amazon_order_id"]:
+            raise HTTPException(400, "Reset fulfilment before changing the ASIN on an already fulfilled line.")
         original_asin = row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"]
         replacement_name = title or f"Replacement ASIN {replacement_asin}"
         conn.execute(
@@ -10971,6 +10973,11 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if updated:
         index_order_line(updated)
     return {"ok": True, "message": f"Replacement {replacement_asin} assigned and marked ready to queue.", "row": row_to_dict(updated)}
+
+
+@app.post("/api/missing/lines/{line_id}/replacement")
+def api_assign_missing_replacement(line_id: int, payload: ReplacementPayload) -> dict[str, Any]:
+    return api_assign_replacement(line_id, payload)
 
 
 @app.get("/api/bulk")
@@ -11572,6 +11579,36 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
             )
             data["punchout_launch_url"] = f"/punchout/launch?{query}"
             data["message"] += " Opening Amazon Punchout to create the required cart/session."
+    return data
+
+
+@app.post("/api/place/recent-chrome")
+def api_place_recent_chrome(payload: dict[str, Any]) -> dict[str, Any]:
+    store_id = int(payload.get("store_id") or 0)
+    if not store_id:
+        raise HTTPException(400, "Store is required.")
+    days = normalize_days_window(int(payload.get("days") or 1), 1)
+    address_id = parse_optional_int(payload.get("address_id"))
+    amazon_account_id = parse_optional_int(payload.get("amazon_account_id"))
+    pulled = fetch_odoo_lines_exclusive(get_store(store_id), days=days, limit=0, batch_size=stored_pull_batch_size(), wait=True)
+    queued, skipped = place_orders(
+        store_id,
+        address_id=address_id,
+        amazon_account_id=amazon_account_id,
+        line_ids=None,
+        club=False,
+        ordering_engine="chrome",
+        allow_missing_spaid=True,
+    )
+    data = dashboard_data(store_id)
+    data["message"] = (
+        f"Pulled last {days} day{'s' if days != 1 else ''} fresh from Odoo and queued {queued} Chrome order group"
+        f"{'s' if queued != 1 else ''}. Skipped {skipped} order{'s' if skipped != 1 else ''} already fulfilled or blocked."
+    )
+    data["ok"] = True
+    data["pulled"] = pulled or 0
+    data["queued"] = queued
+    data["skipped"] = skipped
     return data
 
 
@@ -12964,14 +13001,20 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
 
 
 @app.post("/api/lines/manual-fulfilment")
-def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, Any]:
-    if not payload.line_ids:
+def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
+    store_id = int(payload.get("store_id") or 0)
+    line_ids = [int(line_id) for line_id in (payload.get("line_ids") or []) if int(line_id or 0) > 0]
+    reference = clean_text(payload.get("reference"))
+    url = clean_text(payload.get("url"))
+    third_party = bool(payload.get("third_party"))
+    total_cost = float(payload.get("total_cost") or 0)
+    if not line_ids:
         raise HTTPException(400, "Select at least one order line.")
-    reference = clean_text(payload.reference)
-    url = clean_text(payload.url)
     if not reference and not url:
         raise HTTPException(400, "Enter an Amazon order ID, third-party order number, or URL.")
-    selected_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
+    if third_party and total_cost <= 0:
+        raise HTTPException(400, "Enter the third-party order cost for profit/loss.")
+    selected_ids = sorted(set(line_ids))
     placeholders = ",".join("?" for _ in selected_ids)
     now = utc_now()
     updated_for_shopify: list[dict[str, Any]] = []
@@ -12986,7 +13029,7 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
               AND state NOT IN ('cancelled', 'refunded', 'delivered', 'dispatched', 'ignored')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
             """,
-            [payload.store_id, *selected_ids],
+            [store_id, *selected_ids],
         ).fetchall())
         if not selected_rows:
             raise HTTPException(400, "No selected unfulfilled order lines can be manually fulfilled.")
@@ -13003,16 +13046,31 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
             ORDER BY odoo_order_id, id
             """,
-            [payload.store_id, *order_ids],
+            [store_id, *order_ids],
         ).fetchall())
         if not rows:
             raise HTTPException(400, "No open lines found for the selected Odoo order.")
-        if payload.third_party:
+        total_store_value = sum(order_line_store_total(row) for row in rows)
+        third_party_cost_by_id: dict[int, float] = {}
+        if third_party:
+            remaining_cost = total_cost
+            for index, row in enumerate(rows):
+                if index == len(rows) - 1:
+                    line_cost = remaining_cost
+                elif total_store_value > 0:
+                    line_cost = round(total_cost * (order_line_store_total(row) / total_store_value), 2)
+                else:
+                    line_cost = round(total_cost / max(1, len(rows)), 2)
+                third_party_cost_by_id[int(row["id"])] = max(0.0, line_cost)
+                remaining_cost -= line_cost
             manual_ref = reference or url
             note = f"Third-party fulfilled: {manual_ref}"
             if url and url != manual_ref:
                 note += f" ({url})"
             for row in rows:
+                line_cost = third_party_cost_by_id.get(int(row["id"]), 0.0)
+                quantity = float(row["quantity"] or 1)
+                store_total = order_line_store_total(row)
                 conn.execute(
                     """
                     UPDATE order_lines
@@ -13024,6 +13082,9 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
                         amazon_group_key=NULL,
                         amazon_status='third_party_fulfilled',
                         state='ordered',
+                        amazon_unit_price=?,
+                        amazon_total_price=?,
+                        chrome_profit_total=?,
                         fulfilment_note=CASE
                           WHEN COALESCE(fulfilment_note, '') = '' THEN ?
                           ELSE fulfilment_note || ' | ' || ?
@@ -13033,7 +13094,18 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
                         updated_at=?
                     WHERE id=?
                     """,
-                    (manual_ref, url, note, note, now, now, row["id"]),
+                    (
+                        manual_ref,
+                        url,
+                        (line_cost / quantity) if quantity else line_cost,
+                        line_cost,
+                        store_total - line_cost,
+                        f"{note}; cost {line_cost:.2f}",
+                        f"{note}; cost {line_cost:.2f}",
+                        now,
+                        now,
+                        row["id"],
+                    ),
                 )
         else:
             amazon_order_id = reference
@@ -13067,20 +13139,22 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
                 updated_for_shopify.append(dict(updated))
     if updated_for_shopify:
         enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
-    if payload.third_party:
-        for store_id, store_rows in {payload.store_id: rows}.items():
-            try:
-                odoo = OdooClient(get_store(store_id))
-                note = f"Third-party fulfilment recorded and queued to Shopify: {reference or url}"
-                for order_id in sorted({int(row["odoo_order_id"]) for row in store_rows}):
-                    odoo.post_order_note(order_id, note)
-            except Exception:
-                pass
+    if third_party:
+        try:
+            odoo = OdooClient(get_store(store_id))
+            note = f"Third-party fulfilment recorded and queued to Shopify: {reference or url}"
+            if url:
+                note += f"\nThird-party order link: {url}"
+            note += f"\nThird-party total cost: {total_cost:.2f}"
+            for order_id in sorted({int(row["odoo_order_id"]) for row in rows}):
+                odoo.post_order_note(order_id, note)
+        except Exception:
+            pass
     else:
         note_manual_amazon_match(rows, reference, url, "Manual Amazon")
-    write_report(payload.store_id)
-    data = dashboard_data(payload.store_id)
-    mode = "third-party" if payload.third_party else "manual Amazon"
+    write_report(store_id)
+    data = dashboard_data(store_id)
+    mode = "third-party" if third_party else "manual Amazon"
     data["message"] = f"Marked {len(rows)} line(s) across {len({row['odoo_order_name'] for row in rows})} Odoo order(s) as {mode} fulfilled."
     return data
 
