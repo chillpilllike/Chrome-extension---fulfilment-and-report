@@ -147,6 +147,22 @@ _SHOPIFY_FULFILMENT_PROGRESS: dict[str, Any] = {
     "completed_at": "",
     "error": "",
 }
+_SHOPIFY_DUPLICATE_SCAN_LOCK = threading.Lock()
+_SHOPIFY_DUPLICATE_SCAN_RUNNING_LOCK = threading.Lock()
+_SHOPIFY_DUPLICATE_SCAN_PROGRESS: dict[str, Any] = {
+    "status": "idle",
+    "total": 0,
+    "processed": 0,
+    "duplicates_found": 0,
+    "cancelled": 0,
+    "cancel_failed": 0,
+    "message": "Shopify duplicate scanner is idle.",
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "error": "",
+}
+_SHOPIFY_DUPLICATE_SCAN_RESULTS: list[dict[str, Any]] = []
 _CHROME_BROWSERLESS_LOCK = threading.Lock()
 _CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "running": False,
@@ -9597,6 +9613,254 @@ def shopify_fulfilment_progress() -> dict[str, Any]:
         return dict(_SHOPIFY_FULFILMENT_PROGRESS)
 
 
+def set_shopify_duplicate_progress(**updates: Any) -> dict[str, Any]:
+    with _SHOPIFY_DUPLICATE_SCAN_LOCK:
+        _SHOPIFY_DUPLICATE_SCAN_PROGRESS.update(updates)
+        _SHOPIFY_DUPLICATE_SCAN_PROGRESS["updated_at"] = utc_now()
+        return dict(_SHOPIFY_DUPLICATE_SCAN_PROGRESS)
+
+
+def shopify_duplicate_progress() -> dict[str, Any]:
+    with _SHOPIFY_DUPLICATE_SCAN_LOCK:
+        return dict(_SHOPIFY_DUPLICATE_SCAN_PROGRESS)
+
+
+def shopify_duplicate_results() -> list[dict[str, Any]]:
+    with _SHOPIFY_DUPLICATE_SCAN_LOCK:
+        return [dict(row) for row in _SHOPIFY_DUPLICATE_SCAN_RESULTS]
+
+
+def shopify_clients_for_route(route: str) -> list[Any]:
+    module, _script_path, state_scope = shopify_route_script_config(route)
+    state = module.StateDB(state_scope)
+    clients = []
+    for dest in module.DESTS:
+        token = module.get_shopify_access_token(dest, state)
+        clients.append(module.ShopifyClient(dest["name"], dest["shop"], token, dest.get("api_version") or "2025-10"))
+    return clients
+
+
+def shopify_admin_order_url(shop: str, order_id: Any) -> str:
+    shop_slug = clean_text(shop).split(".")[0]
+    order_id_text = clean_text(order_id)
+    if not shop_slug or not order_id_text:
+        return ""
+    return f"https://admin.shopify.com/store/{shop_slug}/orders/{order_id_text}"
+
+
+def shopify_orders_by_name(shop: Any, order_name: str, limit: int = 20) -> list[dict[str, Any]]:
+    clean_name = clean_text(order_name)
+    if not clean_name:
+        return []
+    query = """
+    query($q: String!, $limit: Int!) {
+      orders(first: $limit, query: $q, sortKey: CREATED_AT) {
+        nodes {
+          id
+          legacyResourceId
+          name
+          createdAt
+          cancelledAt
+          displayFinancialStatus
+        }
+      }
+    }
+    """
+    search = f'name:"{clean_name}"'
+    data = shop.graphql(query, {"q": search, "limit": max(1, min(50, int(limit or 20)))})
+    nodes = ((data.get("orders") or {}).get("nodes") or [])
+    matching = []
+    for node in nodes:
+        node_name = clean_text(node.get("name"))
+        if node_name.lstrip("#") != clean_name.lstrip("#"):
+            continue
+        legacy_id = clean_text(node.get("legacyResourceId"))
+        matching.append({
+            "id": legacy_id,
+            "gid": clean_text(node.get("id")),
+            "name": node_name,
+            "created_at": clean_text(node.get("createdAt")),
+            "cancelled_at": clean_text(node.get("cancelledAt")),
+            "financial_status": clean_text(node.get("displayFinancialStatus")),
+            "url": shopify_admin_order_url(shop.shop, legacy_id),
+        })
+    matching.sort(key=lambda row: row.get("created_at") or "")
+    return matching
+
+
+def pushed_shopify_order_targets(store_id: Optional[int] = None) -> list[dict[str, str]]:
+    with db() as conn:
+        params: list[Any] = [store_id, store_id]
+        rows = conn.execute(
+            """
+            SELECT DISTINCT route, odoo_order_name
+            FROM shopify_fulfilment_jobs
+            WHERE (? IS NULL OR store_id=?)
+              AND COALESCE(odoo_order_name, '') != ''
+              AND route IN ('dtc', 'dtb')
+            ORDER BY route, odoo_order_name
+            """,
+            params,
+        ).fetchall()
+        map_rows = conn.execute(
+            """
+            SELECT DISTINCT state_scope AS route, src_order_key
+            FROM shopify_export_order_map
+            WHERE state_scope IN ('dtc', 'dtb')
+            ORDER BY state_scope, src_order_key
+            """
+        ).fetchall()
+    targets: dict[tuple[str, str], dict[str, str]] = {}
+    for row in rows:
+        route = clean_text(row["route"]).lower()
+        order_name = clean_text(row["odoo_order_name"])
+        if route and order_name:
+            targets[(route, order_name)] = {"route": route, "odoo_order_name": order_name}
+    for row in map_rows:
+        route = clean_text(row["route"]).lower()
+        src_order_key = clean_text(row["src_order_key"])
+        order_name = src_order_key.split(":", 1)[1] if ":" in src_order_key else src_order_key
+        if route and order_name:
+            targets[(route, order_name)] = {"route": route, "odoo_order_name": order_name}
+    return list(targets.values())
+
+
+def scan_shopify_duplicate_orders(store_id: Optional[int] = None) -> None:
+    if not _SHOPIFY_DUPLICATE_SCAN_RUNNING_LOCK.acquire(blocking=False):
+        return
+    try:
+        targets = pushed_shopify_order_targets(store_id)
+        set_shopify_duplicate_progress(
+            status="running",
+            total=len(targets),
+            processed=0,
+            duplicates_found=0,
+            cancelled=0,
+            cancel_failed=0,
+            message=f"Scanning {len(targets)} pushed Shopify order reference{'s' if len(targets) != 1 else ''}.",
+            started_at=utc_now(),
+            completed_at="",
+            error="",
+        )
+        with _SHOPIFY_DUPLICATE_SCAN_LOCK:
+            _SHOPIFY_DUPLICATE_SCAN_RESULTS.clear()
+        clients_by_route: dict[str, list[Any]] = {}
+        duplicates_found = 0
+        for index, target in enumerate(targets, start=1):
+            route = target["route"]
+            order_name = target["odoo_order_name"]
+            try:
+                clients = clients_by_route.setdefault(route, shopify_clients_for_route(route))
+                for client in clients:
+                    orders = shopify_orders_by_name(client, order_name)
+                    active_orders = [order for order in orders if not order.get("cancelled_at")]
+                    if len(active_orders) <= 1:
+                        continue
+                    keep_id = active_orders[0].get("id")
+                    duplicate_orders = []
+                    for order in active_orders:
+                        duplicate_orders.append({
+                            **order,
+                            "keep": order.get("id") == keep_id,
+                            "duplicate": order.get("id") != keep_id,
+                            "cancel_status": "keep" if order.get("id") == keep_id else "pending",
+                            "cancel_error": "",
+                        })
+                    row = {
+                        "key": f"{route}:{client.name}:{order_name}",
+                        "route": route,
+                        "dest_name": client.name,
+                        "shop": client.shop,
+                        "odoo_order_name": order_name,
+                        "duplicate_count": max(0, len(active_orders) - 1),
+                        "orders": duplicate_orders,
+                    }
+                    duplicates_found += int(row["duplicate_count"])
+                    with _SHOPIFY_DUPLICATE_SCAN_LOCK:
+                        _SHOPIFY_DUPLICATE_SCAN_RESULTS.append(row)
+            except Exception as exc:
+                with _SHOPIFY_DUPLICATE_SCAN_LOCK:
+                    _SHOPIFY_DUPLICATE_SCAN_RESULTS.append({
+                        "key": f"{route}:error:{order_name}",
+                        "route": route,
+                        "dest_name": "",
+                        "shop": "",
+                        "odoo_order_name": order_name,
+                        "duplicate_count": 0,
+                        "orders": [],
+                        "error": str(exc)[:1000],
+                    })
+            set_shopify_duplicate_progress(
+                processed=index,
+                duplicates_found=duplicates_found,
+                message=f"Scanned {index} of {len(targets)} order reference{'s' if len(targets) != 1 else ''}; found {duplicates_found} duplicate order{'s' if duplicates_found != 1 else ''}.",
+            )
+        set_shopify_duplicate_progress(
+            status="completed",
+            processed=len(targets),
+            total=len(targets),
+            duplicates_found=duplicates_found,
+            completed_at=utc_now(),
+            message=f"Duplicate scan complete. Found {duplicates_found} duplicate Shopify order{'s' if duplicates_found != 1 else ''}.",
+        )
+    except Exception as exc:
+        set_shopify_duplicate_progress(status="failed", error=str(exc), completed_at=utc_now(), message=f"Duplicate scan failed: {exc}")
+    finally:
+        _SHOPIFY_DUPLICATE_SCAN_RUNNING_LOCK.release()
+
+
+def cancel_scanned_shopify_duplicates() -> dict[str, Any]:
+    progress = set_shopify_duplicate_progress(
+        status="cancelling",
+        cancelled=0,
+        cancel_failed=0,
+        message="Cancelling scanned duplicate Shopify orders.",
+        error="",
+    )
+    results = shopify_duplicate_results()
+    client_cache: dict[tuple[str, str], Any] = {}
+    cancelled = 0
+    failed = 0
+    for group in results:
+        route = clean_text(group.get("route")).lower()
+        dest_name = clean_text(group.get("dest_name"))
+        if not route or not dest_name:
+            continue
+        try:
+            cache_key = (route, dest_name)
+            if cache_key not in client_cache:
+                clients = shopify_clients_for_route(route)
+                client_cache[cache_key] = next(client for client in clients if client.name == dest_name)
+            client = client_cache[cache_key]
+        except Exception as exc:
+            failed += int(group.get("duplicate_count") or 0)
+            group["error"] = str(exc)[:1000]
+            continue
+        for order in group.get("orders") or []:
+            if not order.get("duplicate") or order.get("cancel_status") == "cancelled":
+                continue
+            try:
+                client.cancel_order(int(order["id"]), restock=False, refund=False, reason="other")
+                order["cancel_status"] = "cancelled"
+                order["cancelled_at"] = utc_now()
+                order["cancel_error"] = ""
+                cancelled += 1
+            except Exception as exc:
+                order["cancel_status"] = "failed"
+                order["cancel_error"] = str(exc)[:1000]
+                failed += 1
+            set_shopify_duplicate_progress(cancelled=cancelled, cancel_failed=failed, message=f"Cancelled {cancelled} duplicate order{'s' if cancelled != 1 else ''}; {failed} failed.")
+    with _SHOPIFY_DUPLICATE_SCAN_LOCK:
+        _SHOPIFY_DUPLICATE_SCAN_RESULTS[:] = results
+    return set_shopify_duplicate_progress(
+        status="completed",
+        cancelled=cancelled,
+        cancel_failed=failed,
+        completed_at=utc_now(),
+        message=f"Duplicate cancellation complete. Cancelled {cancelled}; failed {failed}.",
+    )
+
+
 def run_shopify_script_export(job: dict[str, Any]) -> None:
     settings = get_service_settings()
     store = get_store(int(job["store_id"]))
@@ -9637,6 +9901,17 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
     if not shops:
         raise RuntimeError(f"No Shopify destination configured in {script_path}")
     for shop in shops:
+        src_order_key = f"{store.odoo_db}:{job['odoo_order_name']}"
+        existing_orders = shopify_orders_by_name(shop, str(job["odoo_order_name"]), limit=10)
+        active_existing = [order for order in existing_orders if not order.get("cancelled_at")]
+        if active_existing:
+            state.mark_order_synced(shop.name, src_order_key, clean_text(active_existing[0].get("id")) or None)
+            if len(active_existing) > 1:
+                raise RuntimeError(
+                    f"Duplicate Shopify orders already exist for {job['odoo_order_name']} in {shop.name}; "
+                    "run Duplicate Finder and cancel extras before retrying."
+                )
+            continue
         module.sync_one_order_to_dest(odoo, shop, state, str(job["odoo_order_name"]), rename_manager)
 
 
@@ -12422,7 +12697,6 @@ def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None, limit: int = 
             FROM order_lines
             WHERE (? IS NULL OR store_id=?)
               AND COALESCE(amazon_order_id, '') != ''
-              AND COALESCE(order_engine, '') != 'third_party'
               AND state IN ('ordered', 'dispatched', 'delivered')
             ORDER BY ordered_at DESC, updated_at DESC
             LIMIT ?
@@ -12478,6 +12752,27 @@ def api_shopify_fulfilment_run_one() -> dict[str, Any]:
 @app.get("/api/shopify/fulfilment/progress")
 def api_shopify_fulfilment_progress() -> dict[str, Any]:
     return {"ok": True, "progress": shopify_fulfilment_progress()}
+
+
+@app.post("/api/shopify/fulfilment/duplicates/scan")
+def api_shopify_duplicate_scan(store_id: Optional[int] = None) -> dict[str, Any]:
+    if _SHOPIFY_DUPLICATE_SCAN_RUNNING_LOCK.locked():
+        return {"ok": True, "message": "Shopify duplicate scan is already running.", "progress": shopify_duplicate_progress(), "duplicates": shopify_duplicate_results()}
+    threading.Thread(target=scan_shopify_duplicate_orders, args=(store_id,), daemon=True).start()
+    return {"ok": True, "message": "Shopify duplicate scan started.", "progress": shopify_duplicate_progress(), "duplicates": shopify_duplicate_results()}
+
+
+@app.get("/api/shopify/fulfilment/duplicates")
+def api_shopify_duplicates() -> dict[str, Any]:
+    return {"ok": True, "progress": shopify_duplicate_progress(), "duplicates": shopify_duplicate_results()}
+
+
+@app.post("/api/shopify/fulfilment/duplicates/cancel")
+def api_shopify_duplicate_cancel() -> dict[str, Any]:
+    if _SHOPIFY_DUPLICATE_SCAN_RUNNING_LOCK.locked():
+        raise HTTPException(409, "Wait for the duplicate scan to finish before cancelling duplicates.")
+    progress = cancel_scanned_shopify_duplicates()
+    return {"ok": progress.get("cancel_failed", 0) == 0, "message": progress.get("message") or "Duplicate cancellation complete.", "progress": progress, "duplicates": shopify_duplicate_results()}
 
 
 @app.post("/api/shopify/fulfilment/jobs/{job_id}/retry")

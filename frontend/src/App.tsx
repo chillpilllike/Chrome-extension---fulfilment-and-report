@@ -667,6 +667,41 @@ type ShopifyFulfilmentProgress = {
   error?: string
 }
 
+type ShopifyDuplicateOrder = {
+  id: string
+  name: string
+  created_at: string
+  cancelled_at?: string
+  financial_status?: string
+  url?: string
+  keep?: boolean
+  duplicate?: boolean
+  cancel_status?: string
+  cancel_error?: string
+}
+
+type ShopifyDuplicateGroup = {
+  key: string
+  route: string
+  dest_name: string
+  shop: string
+  odoo_order_name: string
+  duplicate_count: number
+  orders: ShopifyDuplicateOrder[]
+  error?: string
+}
+
+type ShopifyDuplicateProgress = {
+  status: string
+  total: number
+  processed: number
+  duplicates_found: number
+  cancelled: number
+  cancel_failed: number
+  message?: string
+  error?: string
+}
+
 type ShopifyTrackingJob = {
   id: string
   status: string
@@ -7216,6 +7251,9 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [oauthMissing, setOauthMissing] = useState<ShopifyOAuthMissing[]>([])
   const [oauthStatus, setOauthStatus] = useState<ShopifyOAuthMissing[]>([])
   const [progress, setProgress] = useState<ShopifyFulfilmentProgress | null>(null)
+  const [duplicateProgress, setDuplicateProgress] = useState<ShopifyDuplicateProgress | null>(null)
+  const [duplicateGroups, setDuplicateGroups] = useState<ShopifyDuplicateGroup[]>([])
+  const [duplicateFilter, setDuplicateFilter] = useState("duplicates")
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [busy, setBusy] = useState("")
@@ -7224,6 +7262,16 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const progressPercent = progressTotal ? Math.max(0, Math.min(100, Math.round((progressProcessed / progressTotal) * 100))) : 0
   const progressRunning = progress?.status === "running" || progress?.status === "queued"
   const showProgress = Boolean(progress && (progressRunning || progressTotal > 0 || progress.message))
+  const duplicateTotal = Math.max(0, Number(duplicateProgress?.total || 0))
+  const duplicateProcessed = Math.max(0, Number(duplicateProgress?.processed || 0))
+  const duplicatePercent = duplicateTotal ? Math.max(0, Math.min(100, Math.round((duplicateProcessed / duplicateTotal) * 100))) : 0
+  const duplicateBusy = duplicateProgress?.status === "running" || duplicateProgress?.status === "cancelling"
+  const filteredDuplicateGroups = duplicateGroups.filter((group) => {
+    if (duplicateFilter === "duplicates") return Number(group.duplicate_count || 0) > 0
+    if (duplicateFilter === "errors") return Boolean(group.error || group.orders.some((order) => order.cancel_error))
+    if (duplicateFilter === "cancelled") return group.orders.some((order) => order.cancel_status === "cancelled")
+    return true
+  })
 
   async function load(nextPage = page) {
     const result = await api<{ jobs: ShopifyFulfilmentJob[]; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?page=${nextPage}&per_page=${PAGE_SIZE}`)
@@ -7234,11 +7282,21 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     setPage(result.page || nextPage)
     setTotal(result.total || 0)
   }
+  async function loadDuplicates() {
+    const result = await api<{ progress?: ShopifyDuplicateProgress; duplicates?: ShopifyDuplicateGroup[] }>("/api/shopify/fulfilment/duplicates")
+    setDuplicateProgress(result.progress || null)
+    setDuplicateGroups(result.duplicates || [])
+  }
   useEffect(() => {
     load(page).catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
     const timer = window.setInterval(() => load(page).catch(() => undefined), 5000)
     return () => window.clearInterval(timer)
   }, [page, storeId])
+  useEffect(() => {
+    loadDuplicates().catch(() => undefined)
+    const timer = window.setInterval(() => loadDuplicates().catch(() => undefined), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
   async function enqueuePending() {
     setBusy("Queue")
     setProgress({
@@ -7327,6 +7385,29 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       setBusy("")
     }
   }
+  async function scanDuplicates() {
+    setBusy("DuplicateScan")
+    try {
+      const path = `/api/shopify/fulfilment/duplicates/scan${storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""}`
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyDuplicateProgress; duplicates?: ShopifyDuplicateGroup[] }>(path, { method: "POST" })
+      setDuplicateProgress(result.progress || null)
+      setDuplicateGroups(result.duplicates || [])
+      onResult({ ok: result.ok, title: "Shopify Duplicate Scan", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  async function cancelDuplicates() {
+    setBusy("DuplicateCancel")
+    try {
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyDuplicateProgress; duplicates?: ShopifyDuplicateGroup[] }>("/api/shopify/fulfilment/duplicates/cancel", { method: "POST" })
+      setDuplicateProgress(result.progress || null)
+      setDuplicateGroups(result.duplicates || [])
+      onResult({ ok: result.ok, title: "Cancel Shopify Duplicates", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
   return (
     <div className="grid gap-5">
       <section className="page-section">
@@ -7401,6 +7482,102 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
               <AlertDescription>{oauthMissing.map((item) => `${item.dest_name || item.route.toUpperCase()} is not connected`).join(", ")}</AlertDescription>
             </Alert>
           ) : null}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <CardTitle>Duplicate Finder</CardTitle>
+            <CardDescription>Scan pushed Shopify orders by Odoo order number and cancel duplicate Shopify orders while keeping the oldest active order.</CardDescription>
+          </div>
+          <div className="btn-list">
+            <SelectField className="w-[190px]" label="Filter" value={duplicateFilter} onChange={setDuplicateFilter}>
+              <option value="duplicates">Duplicates only</option>
+              <option value="all">All scan results</option>
+              <option value="cancelled">Cancelled</option>
+              <option value="errors">Errors</option>
+            </SelectField>
+            <Button variant="outline" onClick={scanDuplicates} disabled={Boolean(busy) || duplicateBusy}>
+              {busy === "DuplicateScan" || duplicateProgress?.status === "running" ? "Scanning..." : "Scan Duplicates"}
+            </Button>
+            <Button variant="destructive" onClick={cancelDuplicates} disabled={Boolean(busy) || duplicateBusy || !duplicateGroups.some((group) => group.orders.some((order) => order.duplicate && order.cancel_status !== "cancelled"))}>
+              {busy === "DuplicateCancel" || duplicateProgress?.status === "cancelling" ? "Cancelling..." : "Cancel Duplicates"}
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          {duplicateProgress ? (
+            <div className="form-fieldset">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="font-medium">Duplicate scan: {duplicateProgress.status || "idle"}</span>
+                <span className="text-muted-foreground">
+                  {duplicateProcessed.toLocaleString()} / {duplicateTotal.toLocaleString()} scanned · {Number(duplicateProgress.duplicates_found || 0).toLocaleString()} duplicate{Number(duplicateProgress.duplicates_found || 0) === 1 ? "" : "s"} found
+                </span>
+              </div>
+              <div className="progress">
+                <div
+                  className={`progress-bar bg-primary transition-all ${duplicateBusy ? "progress-bar-striped progress-bar-animated" : ""}`}
+                  role="progressbar"
+                  aria-valuenow={duplicatePercent}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Shopify duplicate scan ${duplicatePercent}% complete`}
+                  style={{ width: `${duplicatePercent}%` }}
+                />
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>{duplicateProgress.message || "No duplicate scan has run yet."}</span>
+                <span>{Number(duplicateProgress.cancelled || 0).toLocaleString()} cancelled · {Number(duplicateProgress.cancel_failed || 0).toLocaleString()} failed</span>
+              </div>
+              {duplicateProgress.error ? <p className="text-xs text-destructive">{duplicateProgress.error}</p> : null}
+            </div>
+          ) : null}
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow><TableHead>Odoo Order</TableHead><TableHead>Shopify Store</TableHead><TableHead>Duplicate Orders</TableHead><TableHead>Status</TableHead></TableRow>
+              </TableHeader>
+              <TableBody>
+                {filteredDuplicateGroups.map((group) => (
+                  <TableRow key={group.key}>
+                    <TableCell className="font-medium">{group.odoo_order_name}</TableCell>
+                    <TableCell>
+                      <div>{group.dest_name || group.route?.toUpperCase()}</div>
+                      <div className="text-xs text-muted-foreground">{group.shop}</div>
+                    </TableCell>
+                    <TableCell className="min-w-[320px]">
+                      <div className="grid gap-1">
+                        {(group.orders || []).map((order) => (
+                          <div key={`${group.key}-${order.id}`} className="flex flex-wrap items-center gap-2 text-sm">
+                            {order.url ? (
+                              <a className="text-primary underline-offset-4 hover:underline" href={order.url} target="_blank" rel="noreferrer">
+                                {order.name || order.id}
+                              </a>
+                            ) : (
+                              <span>{order.name || order.id}</span>
+                            )}
+                            <Badge variant={order.keep ? "secondary" : order.cancel_status === "cancelled" ? "outline" : "destructive"}>
+                              {order.keep ? "Keep" : order.cancel_status === "cancelled" ? "Cancelled" : "Duplicate"}
+                            </Badge>
+                            <span className="text-xs text-muted-foreground">{order.created_at ? formatDateTime(order.created_at) : ""}</span>
+                            {order.cancel_error ? <span className="text-xs text-destructive">{order.cancel_error}</span> : null}
+                          </div>
+                        ))}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      {group.error ? <span className="text-destructive">{group.error}</span> : `${Number(group.duplicate_count || 0).toLocaleString()} duplicate${Number(group.duplicate_count || 0) === 1 ? "" : "s"}`}
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {!filteredDuplicateGroups.length && (
+                  <TableRow>
+                    <TableCell colSpan={4} className="py-8 text-center text-muted-foreground">No duplicate scan results for this filter.</TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
         </CardContent>
       </Card>
       <Card>
