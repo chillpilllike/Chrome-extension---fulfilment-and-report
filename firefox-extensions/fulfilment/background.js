@@ -7,6 +7,7 @@ async function getSettings() {
   const data = await chrome.storage.local.get({
     apiBase: DEFAULT_API_BASE,
     adminToken: "",
+    cardLast4Preference: "",
     workerId: "",
     activeJob: null,
     activeJobsByWindow: {},
@@ -98,7 +99,7 @@ async function testConnection() {
 async function getQueueStatus() {
   const workerId = await getWorkerId();
   const payload = await api("/api/chrome/jobs?claim=false");
-  return { ok: true, jobs: payload.jobs || [], workerId };
+  return { ok: true, jobs: payload.jobs || [], counts: payload.counts || [], workerId };
 }
 
 async function refreshActiveJobFromQueue(windowId, force = false) {
@@ -162,7 +163,34 @@ async function navigateWindowToCart(windowId) {
   await chrome.windows.update(windowId, { focused: true });
 }
 
-async function startNextJob() {
+async function windowIsIncognito(windowId) {
+  if (!windowId) return false;
+  try {
+    const windowInfo = await chrome.windows.get(windowId);
+    return Boolean(windowInfo?.incognito);
+  } catch {
+    return false;
+  }
+}
+
+async function createAmazonWorkerWindow(incognito = false) {
+  const createData = {
+    url: "https://www.amazon.com/cart?ref_=sw_gtc",
+    type: "normal",
+    focused: true,
+    ...(incognito ? { incognito: true } : {}),
+  };
+  try {
+    return await chrome.windows.create(createData);
+  } catch (error) {
+    await log(`Could not open new ${incognito ? "private " : ""}Firefox window: ${error.message}`);
+    if (incognito) throw error;
+  }
+  const createdTab = await chrome.tabs.create({ url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
+  return createdTab.windowId ? await chrome.windows.get(createdTab.windowId) : null;
+}
+
+async function startNextJob(sourceWindowId = null) {
   const workerId = await getWorkerId();
   const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true`);
   const job = payload.jobs?.[0];
@@ -170,11 +198,33 @@ async function startNextJob() {
     await log("No queued Firefox jobs found.");
     return { ok: false, message: "No queued Firefox jobs found." };
   }
-  const createdWindow = await chrome.windows.create({ url: "https://www.amazon.com/cart?ref_=sw_gtc", type: "normal", focused: true });
-  const targetWindowId = createdWindow.id;
+  const incognito = await windowIsIncognito(sourceWindowId);
+  let createdWindow;
+  try {
+    createdWindow = await createAmazonWorkerWindow(incognito);
+  } catch (error) {
+    try {
+      await api(`/api/chrome/jobs/${encodeURIComponent(job.group_key)}/release`, {
+        method: "POST",
+        body: JSON.stringify({ worker_id: workerId }),
+      });
+    } catch (releaseError) {
+      await log(`Could not release ${job.group_key} after window open failed: ${releaseError.message}`);
+    }
+    throw new Error(
+      incognito
+        ? "Could not open a private Amazon window. Check that this extension is allowed in private windows."
+        : `Could not open Amazon cart window: ${error.message}`,
+    );
+  }
+  const targetWindowId = createdWindow?.id || null;
+  if (!targetWindowId) {
+    throw new Error("Could not open Amazon cart window for the queued job.");
+  }
   const activeJob = activeJobFor(job, workerId, targetWindowId);
+  activeJob.incognito = incognito;
   await setWindowJob(targetWindowId, activeJob);
-  await log(`Started ${job.group_key} with ${job.items.length} item(s).`, targetWindowId);
+  await log(`Started ${job.group_key} with ${job.items.length} item(s) in ${incognito ? "private" : "normal"} window.`, targetWindowId);
   return { ok: true, message: `Started ${job.group_key}.`, targetWindowId };
 }
 
@@ -224,10 +274,17 @@ async function heartbeatJob(activeJob, windowId) {
 async function togglePause(windowId) {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
-  activeJob.paused = !activeJob.paused;
+  const nextPaused = !activeJob.paused;
+  if (nextPaused) {
+    activeJob.pausedStage = activeJob.stage || activeJob.pausedStage || "product";
+  } else if (activeJob.pausedStage) {
+    activeJob.stage = activeJob.pausedStage;
+    activeJob.pausedStage = null;
+  }
+  activeJob.paused = nextPaused;
   await setWindowJob(windowId, activeJob);
   await log(`${activeJob.paused ? "Paused" : "Resumed"} ${activeJob.job.group_key}.`, windowId);
-  return { ok: true, paused: activeJob.paused, message: activeJob.paused ? "Paused fulfilment." : "Resumed fulfilment." };
+  return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
 
 async function completeJob(orderId, orderUrl, amazonAccountName, windowId) {
@@ -309,7 +366,7 @@ chrome.action.onClicked.addListener((tab) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
-    if (message.type === "START_NEXT") return startNextJob();
+    if (message.type === "START_NEXT") return startNextJob(windowId);
     if (message.type === "STOP_JOB") return stopJob(windowId);
     if (message.type === "TOGGLE_PAUSE") return togglePause(windowId);
     if (message.type === "GET_STATE") {
@@ -340,7 +397,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true };
     }
     if (message.type === "SET_API_BASE") {
-      await chrome.storage.local.set({ apiBase: normalizeApiBase(message.apiBase), adminToken: message.adminToken || "" });
+      await chrome.storage.local.set({
+        apiBase: normalizeApiBase(message.apiBase),
+        adminToken: message.adminToken || "",
+        cardLast4Preference: message.cardLast4Preference || "",
+      });
       return { ok: true };
     }
     if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId);

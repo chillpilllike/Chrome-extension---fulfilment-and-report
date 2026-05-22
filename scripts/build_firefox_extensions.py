@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "firefox-extensions"
 DIST_DIR = OUT_DIR / "dist"
+FIREFOX_PACKAGE_VERSION = "0.1.1"
 
 FIREFOX_BUILDS = [
     {
@@ -56,6 +57,7 @@ def copy_source(source: Path, target: Path) -> None:
 
 def patch_manifest(manifest_path: Path, build: dict[str, str]) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["version"] = FIREFOX_PACKAGE_VERSION
     manifest["description"] = manifest.get("description", "").replace("Chrome-based", "browser-based")
     manifest["background"] = {"scripts": ["background.js"]}
     manifest["browser_specific_settings"] = {

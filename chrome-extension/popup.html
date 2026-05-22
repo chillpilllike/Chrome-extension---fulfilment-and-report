@@ -53,6 +53,16 @@
         <button id="resetDuplicateFulfilment" class="danger">Clear app order and continue</button>
       </section>
       <section id="status"></section>
+      <section class="order-progress" aria-label="Order progress">
+        <div class="order-progress-header">
+          <strong id="orderProgressTitle">Order progress</strong>
+          <span id="orderProgressCounter">0 / 0 processed</span>
+        </div>
+        <div class="order-progress-track">
+          <div id="orderProgressBar" class="order-progress-bar"></div>
+        </div>
+        <div id="orderProgressDetail" class="order-progress-detail">No order run started.</div>
+      </section>
       <section class="queue">
         <div class="section-title">
           <h2>Queued orders</h2>

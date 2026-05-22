@@ -85,6 +85,48 @@ button.danger {
   padding: 8px;
 }
 
+.order-progress {
+  display: grid;
+  gap: 7px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: white;
+  padding: 8px;
+}
+
+.order-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.order-progress-header strong {
+  font-size: 13px;
+}
+
+.order-progress-header span,
+.order-progress-detail {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.order-progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e2e8f0;
+}
+
+.order-progress-bar {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: #16a34a;
+  transition: width 180ms ease;
+}
+
 .connection-notice {
   border: 1px solid #86efac;
   border-radius: 6px;

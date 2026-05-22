@@ -1718,6 +1718,8 @@ function App() {
   const [editingReplacement, setEditingReplacement] = useState<OrderLine | null>(null)
   const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
   const [resetFulfilmentConfirmOpen, setResetFulfilmentConfirmOpen] = useState(false)
+  const [placeRecentConfirmOpen, setPlaceRecentConfirmOpen] = useState(false)
+  const [placeRecentDays, setPlaceRecentDays] = useState(() => savedPullSetting(PULL_DAYS_STORAGE_KEY, "5"))
   const [allowMissingSpaid, setAllowMissingSpaid] = useState(false)
   const [resendMissingAsins, setResendMissingAsins] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>("pulled_at")
@@ -2287,15 +2289,22 @@ function App() {
 
   function placeRecentChromeOrders() {
     if (!storeId || busy) return
-    const answer = window.prompt("Pull and queue how many days? Today is 1; enter 5 for today plus the previous 4 days.", days || "5")
-    if (answer === null) return
-    const requestedDays = Math.max(1, Math.min(365, Number(answer || 0)))
+    setPlaceRecentDays(days || "5")
+    setPlaceRecentConfirmOpen(true)
+  }
+
+  async function confirmPlaceRecentChromeOrders() {
+    if (!storeId || busy) return
+    const requestedDays = Math.max(1, Math.min(365, Number(placeRecentDays || 0)))
     if (!Number.isFinite(requestedDays) || requestedDays < 1) {
       setModal({ ok: false, title: "Place Recent Orders", message: "Enter a valid day count." })
       return
     }
-    return runAction("Place Recent Orders", () =>
-      api<DashboardData>("/api/place/recent-chrome", {
+    setPlaceRecentConfirmOpen(false)
+    const title = "Place Recent Orders"
+    try {
+      setBusy(title)
+      const result = await api<DashboardData & { queued?: number; pulled?: number; skipped?: number }>("/api/place/recent-chrome", {
         method: "POST",
         body: JSON.stringify({
           store_id: Number(storeId),
@@ -2304,8 +2313,18 @@ function App() {
           days: requestedDays,
           include_missing_asins: resendMissingAsins,
         }),
-      }),
-    )
+      })
+      applyDashboardData(result)
+      if (Number(result.queued || 0) > 0) {
+        setPage("chrome-queue")
+        await refreshChromeQueue(String(result.current_store_id || storeId))
+      }
+      setModal({ ok: result.ok ?? true, title, message: result.message || "Done." })
+    } catch (error) {
+      setModal({ ok: false, title, message: String(error) })
+    } finally {
+      setBusy("")
+    }
   }
 
   function resetSelectedOrders() {
@@ -2689,6 +2708,44 @@ function App() {
           setSelected([])
         }}
       />
+      <Dialog open={placeRecentConfirmOpen} onOpenChange={(open) => !open && setPlaceRecentConfirmOpen(false)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ShoppingCart className="size-5" />
+              Place recent orders?
+            </DialogTitle>
+            <DialogDescription>
+              Pull and queue recent Chrome orders for the selected store, address, and Amazon account.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4">
+            <div className="grid gap-1.5">
+              <Label>Days</Label>
+              <Input
+                type="number"
+                min="1"
+                max="365"
+                value={placeRecentDays}
+                onChange={(event) => setPlaceRecentDays(event.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Today is 1; enter 5 for today plus the previous 4 days.</p>
+            </div>
+            <label className="flex w-fit cursor-pointer items-center gap-2 text-sm">
+              <Checkbox checked={resendMissingAsins} onCheckedChange={(checked) => setResendMissingAsins(Boolean(checked))} />
+              Retry missing/out-of-stock ASINs too
+            </label>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={Boolean(busy)} onClick={() => setPlaceRecentConfirmOpen(false)}>
+              No, cancel
+            </Button>
+            <Button disabled={Boolean(busy) || !storeId || !addressId || !amazonAccountId} onClick={confirmPlaceRecentChromeOrders}>
+              {busy === "Place Recent Orders" ? "Pulling and queueing..." : "Place Recent"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={resetFulfilmentConfirmOpen} onOpenChange={(open) => !open && setResetFulfilmentConfirmOpen(false)}>
         <DialogContent className="border-destructive/50 sm:max-w-md">
           <DialogHeader>
@@ -2982,7 +3039,7 @@ function App() {
                       onClick={placeRecentChromeOrders}
                     >
                       <ShoppingCart className="size-4" />
-                      Place Recent
+                      {busy === "Place Recent Orders" ? "Pulling and queueing..." : "Place Recent"}
                     </Button>
                     <Button
                       variant="outline"

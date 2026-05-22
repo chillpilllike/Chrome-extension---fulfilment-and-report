@@ -137,6 +137,7 @@ _SHOPIFY_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 _CHROME_BROWSERLESS_LOCK = threading.Lock()
 _CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "running": False,
+    "total": 0,
     "processed": 0,
     "placed": 0,
     "failed": 0,
@@ -5477,6 +5478,23 @@ def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = 
             """,
             (store_id, store_id, limit),
         ).fetchall()
+        job_count = int(conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM (
+                SELECT amazon_group_key
+                FROM order_lines
+                WHERE order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  AND COALESCE(amazon_group_key, '') != ''
+                  AND (? IS NULL OR store_id=?)
+                GROUP BY amazon_group_key
+            ) queued_groups
+            """,
+            (store_id, store_id),
+        ).fetchone()["count"] or 0)
         group_keys = [str(row["amazon_group_key"]) for row in candidate_rows]
         rows = []
         if group_keys:
@@ -5503,7 +5521,7 @@ def chrome_queue_snapshot(store_id: Optional[int] = None, clear_expired: bool = 
     for row in rows_to_dicts(rows):
         grouped.setdefault(str(row["amazon_group_key"]), []).append(row)
     jobs = [chrome_job_from_rows(group_rows, accounts_by_id) for group_rows in grouped.values()]
-    return {"jobs": jobs, "counts": counts}
+    return {"jobs": jobs, "counts": counts, "job_count": job_count}
 
 
 def split_chrome_group_by_asin_if_needed(conn: Any, group_key: str) -> str:
@@ -12085,7 +12103,13 @@ def api_place_recent_chrome(payload: dict[str, Any]) -> dict[str, Any]:
         f"Pulled last {days} day{'s' if days != 1 else ''} fresh from Odoo and queued {queued} Chrome order group"
         f"{'s' if queued != 1 else ''}. Skipped {skipped} order{'s' if skipped != 1 else ''} already fulfilled or blocked."
     )
-    data["ok"] = True
+    if not queued:
+        data["message"] += (
+            " No Chrome jobs were created. Check that the selected store has recent eligible lines with ASINs, "
+            "no Amazon order ID, and a status that is not cancelled, refunded, costly, inventory, ignored, or already ordered. "
+            "Tick retry missing/out-of-stock ASINs if you want missing rows included."
+        )
+    data["ok"] = queued > 0
     data["pulled"] = pulled or 0
     data["queued"] = queued
     data["skipped"] = skipped
@@ -12301,18 +12325,41 @@ def chrome_job_attempt_address_id(group_key: str) -> Optional[int]:
         return None
 
 
+def active_visible_chrome_job_count(store_id: Optional[int] = None) -> int:
+    with db() as conn:
+        clear_expired_chrome_claims(conn)
+        return int(conn.execute(
+            """
+            SELECT COUNT(DISTINCT amazon_group_key) AS count
+            FROM order_lines
+            WHERE order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_group_key, '') != ''
+              AND COALESCE(chrome_claimed_by, '') != ''
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+              AND (? IS NULL OR store_id=?)
+            """,
+            (store_id, store_id),
+        ).fetchone()["count"] or 0)
+
+
 def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
     worker_id = clean_text(payload.worker_id)[:120] or f"browserless-{uuid.uuid4().hex[:12]}"
     ordering_engine = normalize_ordering_engine(payload.ordering_engine or "rest")
     if ordering_engine == "chrome":
         ordering_engine = "rest"
     max_jobs = max(0, int(payload.max_jobs or 0))
+    initial_total = chrome_queue_snapshot(payload.store_id, limit=1).get("job_count", 0)
+    if max_jobs:
+        initial_total = min(int(initial_total or 0), max_jobs)
     processed = 0
     placed_total = 0
     failed_total = 0
     try:
         set_chrome_browserless_progress(
             running=True,
+            total=initial_total,
             processed=0,
             placed=0,
             failed=0,
@@ -12336,9 +12383,9 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
             line_ids = [int(line_id) for line_id in job.get("line_ids") or [] if int(line_id or 0) > 0]
             if not group_key or not line_ids:
                 break
-            processed += 1
             set_chrome_browserless_progress(
                 processed=processed,
+                total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed + 1),
                 placed=placed_total,
                 failed=failed_total,
                 message=f"Placing {group_key} in browserless mode.",
@@ -12354,15 +12401,18 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
                     ordering_engine=ordering_engine,
                     allow_missing_spaid=True,
                 )
+                processed += 1
                 placed_total += int(placed or 0)
                 failed_total += int(failed or 0)
                 set_chrome_browserless_progress(
                     processed=processed,
+                    total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed),
                     placed=placed_total,
                     failed=failed_total,
                     message=f"Browserless placed {placed} line(s), failed/skipped {failed} for {group_key}.",
                 )
             except Exception as exc:
+                processed += 1
                 failed_total += len(line_ids)
                 with db() as conn:
                     conn.execute(
@@ -12381,6 +12431,7 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
                     )
                 set_chrome_browserless_progress(
                     processed=processed,
+                    total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed),
                     placed=placed_total,
                     failed=failed_total,
                     message=f"Browserless failed {group_key}: {exc}",
@@ -12389,6 +12440,7 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
         set_chrome_browserless_progress(
             running=False,
             processed=processed,
+            total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed),
             placed=placed_total,
             failed=failed_total,
             completed_at=utc_now(),
@@ -12414,8 +12466,23 @@ def api_chrome_browserless_run(payload: ChromeBrowserlessRunPayload) -> dict[str
             "message": _CHROME_BROWSERLESS_PROGRESS.get("message") or "Browserless ordering is already running.",
             "progress": dict(_CHROME_BROWSERLESS_PROGRESS),
         }
+    active_count = active_visible_chrome_job_count(payload.store_id)
+    if active_count:
+        _CHROME_BROWSERLESS_LOCK.release()
+        return {
+            "ok": False,
+            "running": False,
+            "message": f"Cannot start browserless ordering because {active_count} Chrome job{'s are' if active_count != 1 else ' is'} already active. Report or stop the active job first.",
+            "progress": dict(_CHROME_BROWSERLESS_PROGRESS),
+        }
+    max_jobs = max(0, int(payload.max_jobs or 0))
+    total = int(chrome_queue_snapshot(payload.store_id, limit=1).get("job_count") or 0)
+    if max_jobs:
+        total = min(total, max_jobs)
     progress = set_chrome_browserless_progress(
         running=True,
+        total=total,
+        processed=0,
         message="Browserless ordering queued.",
         started_at=utc_now(),
         completed_at="",

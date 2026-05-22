@@ -27,6 +27,7 @@ async function getSettings() {
     availabilityCheckInFlight: false,
     recentAmazonOrders: [],
     cachedQueueStatus: null,
+    orderProgress: null,
     logs: [],
     logsByWindow: {},
   });
@@ -107,6 +108,55 @@ async function log(message, windowId = null) {
   const next = { ...(logsByWindow || {}) };
   next[key] = [entry, ...(next[key] || [])].slice(0, 40);
   await chrome.storage.local.set({ logsByWindow: next, logs: next[key] });
+}
+
+async function setOrderProgress(progress) {
+  await chrome.storage.local.set({ orderProgress: progress });
+  return progress;
+}
+
+async function startOrderProgress(total = 0, message = "") {
+  const progress = {
+    running: true,
+    total: Math.max(0, Math.round(Number(total || 0))),
+    processed: 0,
+    message: message || "Starting order run.",
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  return setOrderProgress(progress);
+}
+
+async function incrementOrderProgress(message = "") {
+  const { orderProgress } = await getSettings();
+  const current = orderProgress || {};
+  const processed = Math.max(0, Math.round(Number(current.processed || 0))) + 1;
+  const total = Math.max(Math.round(Number(current.total || 0)), processed);
+  return setOrderProgress({
+    ...current,
+    running: processed < total,
+    total,
+    processed,
+    message: message || current.message || "Order progress updated.",
+    startedAt: current.startedAt || Date.now(),
+    updatedAt: Date.now(),
+  });
+}
+
+async function updateOrderProgressTotal(total = 0, message = "") {
+  const { orderProgress } = await getSettings();
+  const current = orderProgress || {};
+  const processed = Math.max(0, Math.round(Number(current.processed || 0)));
+  const nextTotal = Math.max(processed, Math.round(Number(total || 0)));
+  return setOrderProgress({
+    ...current,
+    running: processed < nextTotal,
+    total: nextTotal,
+    processed,
+    message: message || current.message || "",
+    startedAt: current.startedAt || Date.now(),
+    updatedAt: Date.now(),
+  });
 }
 
 function normalizeRecentAmazonOrder(order = {}) {
@@ -430,6 +480,12 @@ async function startNextJob(sourceWindowId = null) {
   if (startNextJobInFlight) return startNextJobInFlight;
   startNextJobInFlight = (async () => {
   await releaseMissingWindowJobs();
+  const browserless = await browserlessOrderStatus().catch(() => null);
+  if (browserless?.progress?.running === true) {
+    const message = browserless.progress.message || "Browserless ordering is already running. Wait for it to finish before starting visible Chrome ordering.";
+    await log(message, sourceWindowId);
+    return { ok: false, browserless_running: true, message };
+  }
   const blocking = await blockingActiveJob(sourceWindowId);
   if (blocking) {
     if (orderSubmitStarted(blocking)) {
@@ -445,9 +501,16 @@ async function startNextJob(sourceWindowId = null) {
   }
   const workerId = await getWorkerId();
   const { splitMixedAsinOrders } = await getSettings();
+  try {
+    const queueBefore = await api("/api/chrome/jobs?claim=false&job_limit=1");
+    await startOrderProgress(Number(queueBefore.job_count || queueBefore.jobs?.length || 0), "Visible Chrome order run started.");
+  } catch {
+    await startOrderProgress(0, "Visible Chrome order run started.");
+  }
   const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=${splitMixedAsinOrders === true ? "true" : "false"}`);
   const job = payload.jobs?.[0];
   if (!job) {
+    await updateOrderProgressTotal(0, "No queued Chrome jobs found.");
     await log("No queued Chrome jobs found.");
     return { ok: false, message: "No queued Chrome jobs found." };
   }
@@ -492,6 +555,13 @@ async function startNextJob(sourceWindowId = null) {
 }
 
 async function startBrowserlessOrderRun(sourceWindowId = null) {
+  await releaseMissingWindowJobs();
+  const blocking = await blockingActiveJob(sourceWindowId);
+  if (blocking) {
+    const message = `Finish or report ${blocking.job.group_key} before starting browserless ordering.`;
+    await log(message, sourceWindowId);
+    return { ok: false, active_job_running: true, message };
+  }
   const workerId = await getWorkerId();
   const { splitMixedAsinOrders } = await getSettings();
   const result = await api("/api/chrome/browserless/run", {
@@ -503,18 +573,47 @@ async function startBrowserlessOrderRun(sourceWindowId = null) {
     }),
     timeoutMs: 15000,
   });
+  if (result?.progress) {
+    await setOrderProgress({
+      running: result.progress.running === true,
+      total: Number(result.progress.total || 0),
+      processed: Number(result.progress.processed || 0),
+      message: result.progress.message || result.message || "Browserless ordering started.",
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      source: "browserless",
+    });
+  }
   await log(result.message || "Started browserless background ordering.", sourceWindowId);
   return result;
 }
 
 async function browserlessOrderStatus() {
-  return api("/api/chrome/browserless/status", { timeoutMs: 10000 });
+  const result = await api("/api/chrome/browserless/status", { timeoutMs: 10000 });
+  const progress = result?.progress || {};
+  if (Object.keys(progress).length) {
+    await setOrderProgress({
+      running: progress.running === true,
+      total: Number(progress.total || 0),
+      processed: Number(progress.processed || 0),
+      message: progress.message || "",
+      startedAt: progress.started_at || Date.now(),
+      updatedAt: progress.updated_at || Date.now(),
+      source: "browserless",
+    });
+  }
+  return result;
 }
 
 async function claimNextJobInWindow(windowId) {
   const claimKey = String(windowId || "global");
   if (claimNextJobInFlight.has(claimKey)) return claimNextJobInFlight.get(claimKey);
   const task = (async () => {
+  const browserless = await browserlessOrderStatus().catch(() => null);
+  if (browserless?.progress?.running === true) {
+    await log(browserless.progress.message || "Browserless ordering is running; did not claim another visible Chrome job.", windowId);
+    return null;
+  }
   const { activeJob: currentJob } = await getWindowState(windowId);
   if (activeJobBlocksNext(currentJob)) {
     await log(`Kept ${currentJob.job.group_key}; current job is not closed yet.`, windowId);
@@ -643,6 +742,7 @@ async function skipJob(windowId) {
   const groupKey = activeJob.job.group_key;
   const released = await releaseStoredJob(activeJob, windowId, "after manual skip");
   if (!released) return { ok: false, message: `Could not release ${groupKey} to skip it.` };
+  await incrementOrderProgress(`Processed ${groupKey}: skipped.`);
   const nextJob = await claimNextJobInWindow(windowId);
   return {
     ok: true,
@@ -898,6 +998,7 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
       body: JSON.stringify(body),
     });
     await log(`Completed ${groupKey} as ${result.amazon_order_id}.`, windowId);
+    await incrementOrderProgress(`Processed ${groupKey}: ordered.`);
     const latest = await getWindowState(windowId);
     if (latest.activeJob?.job?.group_key !== groupKey) {
       return { ...result, next_job_started: false, next_group_key: "" };
@@ -933,6 +1034,7 @@ async function failJob(message, details = {}, windowId) {
     }),
   });
   await log(`Failed ${activeJob.job.group_key}: ${message}`, windowId);
+  await incrementOrderProgress(`Processed ${activeJob.job.group_key}: failed or missing.`);
   await cleanupCartBeforeNextJob(activeJob, windowId, message);
   return { ...result, next_job_started: false, cleanup_required: true, next_group_key: "" };
 }
@@ -961,6 +1063,7 @@ async function markLineMissing(message, details = {}, windowId) {
   });
   await log(`Partially marked missing in ${activeJob.job.group_key}: ${message}`, windowId);
   if (result?.ok && Number(result.remaining_count || 0) === 0) {
+    await incrementOrderProgress(`Processed ${activeJob.job.group_key}: missing.`);
     await cleanupCartBeforeNextJob(activeJob, windowId, message);
   }
   return { ...result, next_job_started: false, cleanup_required: result?.ok && Number(result.remaining_count || 0) === 0, next_group_key: "" };
@@ -984,6 +1087,7 @@ async function costlyJob(message, details = {}, windowId) {
   });
   await setWindowJob(windowId, null);
   await log(`Costly review ${activeJob.job.group_key}: ${message}`, windowId);
+  await incrementOrderProgress(`Processed ${activeJob.job.group_key}: costly review.`);
   return result;
 }
 

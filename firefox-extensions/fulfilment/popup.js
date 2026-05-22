@@ -3,6 +3,7 @@ const chrome = globalThis.browser || globalThis.chrome;
 
 const apiBase = document.querySelector("#apiBase");
 const adminToken = document.querySelector("#adminToken");
+const cardLast4Preference = document.querySelector("#cardLast4Preference");
 const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
 const pricingRows = document.querySelector("#pricingRows");
@@ -19,16 +20,17 @@ let targetWindowId = Number(new URLSearchParams(location.search).get("targetWind
 let settingsDirty = false;
 let settingsHydrated = false;
 
-[apiBase, adminToken].forEach((input) => {
+[apiBase, adminToken, cardLast4Preference].forEach((input) => {
   input.addEventListener("input", () => {
     settingsDirty = true;
   });
 });
 
 function syncSettingsInputs(state) {
-  if (settingsHydrated || settingsDirty || [apiBase, adminToken].includes(document.activeElement)) return;
+  if (settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference].includes(document.activeElement)) return;
   apiBase.value = state.apiBase || "http://127.0.0.1:8000";
   adminToken.value = state.adminToken || "";
+  cardLast4Preference.value = state.cardLast4Preference || "";
   settingsHydrated = true;
 }
 
@@ -105,6 +107,13 @@ function renderQueuedJobs(jobs, workerId = "") {
   }
 }
 
+function queueCountDetails(counts = []) {
+  const extras = (Array.isArray(counts) ? counts : [])
+    .filter((item) => item.state !== "submitted" && Number(item.count || 0) > 0)
+    .map((item) => `${item.count} ${item.state}`)
+  return extras.length ? ` · ${extras.join(" · ")}` : "";
+}
+
 async function refresh() {
   const state = await send({ type: "GET_STATE" });
   syncSettingsInputs(state);
@@ -123,29 +132,35 @@ async function refresh() {
     const queue = await send({ type: "GET_QUEUE_STATUS" });
     if (!queue.ok) throw new Error(queue.message || "Could not load queue.");
     renderQueuedJobs(queue.jobs || [], queue.workerId || state.workerId || "");
+    queueCount.textContent += queueCountDetails(queue.counts || []);
   } catch (error) {
     queueCount.textContent = "Not loaded";
-    queuedJobs.innerHTML = `<div class="empty-queue">${error.message || "Could not load queue."}</div>`;
+    queuedJobs.innerHTML = `<div class="empty-queue">${error.message || "Could not load queue. Check App URL, Admin token, then click Save."}</div>`;
   }
 }
 
 document.querySelector("#save").addEventListener("click", async () => {
-  const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim() });
+  const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim() });
   if (result.ok) settingsDirty = false;
   setStatus(result.ok ? "Saved." : result.message);
 });
 
 document.querySelector("#testConnection").addEventListener("click", async () => {
-  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim() });
+  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim() });
   settingsDirty = false;
   const result = await send({ type: "TEST_CONNECTION" });
   setStatus(result.message || (result.ok ? "Connection ok." : "Connection failed."));
 });
 
 document.querySelector("#start").addEventListener("click", async () => {
-  const result = await send({ type: "START_NEXT" });
-  if (result.targetWindowId) targetWindowId = result.targetWindowId;
-  setStatus(result.message || (result.ok ? "Started." : "Could not start."));
+  setStatus("Starting next queued order...");
+  try {
+    const result = await send({ type: "START_NEXT" });
+    if (result.targetWindowId) targetWindowId = result.targetWindowId;
+    setStatus(result.message || (result.ok ? "Started." : "Could not start."));
+  } catch (error) {
+    setStatus(error.message || "Could not start queued order.");
+  }
 });
 
 document.querySelector("#stop").addEventListener("click", async () => {

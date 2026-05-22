@@ -29,6 +29,11 @@ async function setActiveJob(activeJob) {
   await send({ type: "SET_ACTIVE_JOB", activeJob });
 }
 
+async function getExtensionState() {
+  const data = await send({ type: "GET_STATE" });
+  return data || {};
+}
+
 async function isPaused() {
   const activeJob = await getActiveJob();
   return Boolean(activeJob?.paused);
@@ -36,7 +41,13 @@ async function isPaused() {
 
 async function waitIfPaused() {
   while (await isPaused()) {
-    showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
+    const activeJob = await getActiveJob();
+    showPanel(
+      "Nutricity fulfilment paused",
+      "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",
+      "I did it manually, continue",
+      () => continueAfterManualStep(activeJob),
+    );
     await sleep(1000);
   }
 }
@@ -116,7 +127,16 @@ async function togglePanelPause(event) {
     button.textContent = paused ? "Resume" : "Pause";
     button.classList.toggle("is-paused", paused);
     if (paused) {
-      showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
+      const activeJob = await getActiveJob();
+      showPanel(
+        "Nutricity fulfilment paused",
+        "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",
+        "I did it manually, continue",
+        () => continueAfterManualStep(activeJob),
+      );
+    } else {
+      showPanel("Nutricity fulfilment", `Resuming ${result?.stage || "last step"}.`, null, null);
+      setTimeout(runSafely, 250);
     }
   } finally {
     button.disabled = false;
@@ -668,7 +688,15 @@ function verifyCartQuantities(activeJob) {
 function lineIdForAsin(activeJob, asin) {
   const wanted = String(asin || "").toUpperCase();
   const item = (activeJob.job?.items || []).find((entry) => String(entry.asin || "").toUpperCase() === wanted);
-  return item ? itemPrimaryLineId(item) : null;
+  if (item) return itemPrimaryLineId(item);
+  const pricingItem = Object.values(activeJob.pricing || {}).find((entry) => {
+    const purchasedAsin = String(entry.purchased_asin || "").toUpperCase();
+    const originalAsin = String(entry.asin || "").toUpperCase();
+    return purchasedAsin === wanted || originalAsin === wanted;
+  });
+  if (!pricingItem?.asin) return null;
+  const originalItem = (activeJob.job?.items || []).find((entry) => String(entry.asin || "").toUpperCase() === String(pricingItem.asin || "").toUpperCase());
+  return originalItem ? itemPrimaryLineId(originalItem) : null;
 }
 
 function cartAlreadyHasExpectedItems(activeJob) {
@@ -714,6 +742,7 @@ function savingsRoots(context = "regular") {
         document.querySelector("#snsAccordionRow"),
         document.querySelector("#reinvent_price_desktop_snsAccordionRowMiddle"),
         document.querySelector("#promoPriceBlockMessage_feature_div"),
+        document.body,
       ].filter(Boolean)
     : [
         document.querySelector("#reinvent_price_desktop_newAccordionRow"),
@@ -765,10 +794,11 @@ async function clipVisibleCoupons(context = "regular") {
   for (const root of roots) {
     const candidates = [
       ...root.querySelectorAll("input[type='checkbox']:not(:checked)"),
+      ...root.querySelectorAll("[data-csa-c-action='clipPromotion'] input[type='checkbox']:not(:checked), [data-csa-c-owner='PromotionsDiscovery'] input[type='checkbox']:not(:checked)"),
       ...root.querySelectorAll(".a-checkbox:not(.aok-hidden) label, .a-icon-checkbox"),
     ].filter((element) => visible(element) || visible(element.closest?.("label, .a-checkbox, span, div")));
     for (const candidate of candidates) {
-      const target = candidate.closest?.("label") || candidate;
+      const target = candidate.matches?.("input[type='checkbox']") ? candidate : candidate.closest?.("label") || candidate;
       if (clicked.has(target)) continue;
       const nearbyText = (target.closest?.(".promoPriceBlockMessage, [data-csa-c-owner='PromotionsDiscovery'], #promoPriceBlockMessage_feature_div")?.innerText || target.parentElement?.innerText || "").toLowerCase();
       if (!nearbyText.includes("coupon") && !nearbyText.includes("save")) continue;
@@ -784,6 +814,34 @@ async function clipVisibleCoupons(context = "regular") {
     showPanel("Nutricity fulfilment", `Applied ${count} Amazon coupon${count === 1 ? "" : "s"}.`, null, null);
   }
   return count;
+}
+
+function unavailableMessage() {
+  const allBuyingOptions = [...document.querySelectorAll(
+    "a[href*='/gp/offer-listing/'], a[href*='/offer-listing/'], a[title='See All Buying Options'], a.a-button-text",
+  )].find((element) => {
+    const text = (element.innerText || element.textContent || element.getAttribute("title") || "").replace(/\s+/g, " ").trim().toLowerCase();
+    return visible(element) && text.includes("see all buying options");
+  });
+  if (allBuyingOptions) {
+    return "Amazon only shows See All Buying Options, so this ASIN is not directly available to add to cart.";
+  }
+  const roots = [
+    ...document.querySelectorAll("#availability, #outOfStock, #availabilityInsideBuyBox_feature_div, #desktop_qualifiedBuyBox, #buybox, #centerCol"),
+  ].filter(Boolean);
+  for (const root of roots) {
+    if (!visible(root) && root.id !== "centerCol") continue;
+    const text = (root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
+    const lowered = text.toLowerCase();
+    if (
+      lowered.includes("currently unavailable") ||
+      lowered.includes("we don't know when or if this item will be back in stock") ||
+      lowered.includes("we do not know when or if this item will be back in stock")
+    ) {
+      return text.match(/currently unavailable[^.]*\./i)?.[0] || "Currently unavailable. We do not know when or if this item will be back in stock.";
+    }
+  }
+  return "";
 }
 
 async function applyAdditionalSavings(context = "regular") {
@@ -1069,6 +1127,19 @@ async function handleProduct(activeJob) {
   rememberProductDosage(activeJob, item);
   await setActiveJob(activeJob);
 
+  const unavailable = unavailableMessage();
+  if (unavailable) {
+    await send({
+      type: "FAIL_JOB",
+      message: `ASIN ${expectedItem.asin} is unavailable on Amazon. ${unavailable}`,
+      missingAsin: item.asin,
+      missingLineId: itemPrimaryLineId(item),
+      failureCode: "unavailable",
+    });
+    showPanel("Nutricity fulfilment", "Amazon says this item is unavailable. Order moved to Missing ASINs.", null, null);
+    return;
+  }
+
   await applyAdditionalSavings("regular");
   const promoCount = markPromotions();
   if (promoCount && !activeJob.promoAcknowledged[item.asin]) {
@@ -1131,7 +1202,7 @@ async function handleProduct(activeJob) {
         fulfilledQuantity: lessQuantity ? availableQuantity : null,
         availableQuantity: lessQuantity ? availableQuantity : null,
       });
-      showPanel("Nutricity fulfilment", lessQuantity ? "Less quantity available. Order moved to Missing ASINs." : "Could not set item quantity. Job marked as error.", null, null);
+      showPanel("Nutricity fulfilment", lessQuantity ? "Less quantity available. Order moved to Missing ASINs." : "Could not set item quantity. Order moved to Missing ASINs.", null, null);
       return;
     }
     const addButton = await waitForElement(["#add-to-cart-button", "input[name='submit.add-to-cart']", "#buybox-add-to-cart-button input"], 18000);
@@ -1198,25 +1269,21 @@ async function handleCart(activeJob) {
   }
   const cartCheck = verifyCartQuantities(activeJob);
   if (!cartCheck.ok) {
-    const shortQuantity = (cartCheck.mismatches || []).find((item) => item.actual > 0 && item.actual < item.expected);
-    if (shortQuantity) {
-      await send({
-        type: "FAIL_JOB",
-        message: `Less quantity available for ASIN ${shortQuantity.asin}. Customer ordered ${shortQuantity.expected}, Amazon cart has ${shortQuantity.actual}.`,
-        missingAsin: shortQuantity.asin,
-        missingLineId: lineIdForAsin(activeJob, shortQuantity.asin),
-        failureCode: "partial_quantity",
-        requestedQuantity: shortQuantity.expected,
-        fulfilledQuantity: shortQuantity.actual,
-        availableQuantity: shortQuantity.actual,
-      });
-      showPanel("Cart quantity needs review", "Less quantity available. Order moved to Missing ASINs.", null, null);
-      return;
-    }
-    activeJob.paused = true;
-    activeJob.stage = "cart";
-    await setActiveJob(activeJob);
-    showPanel("Cart quantity needs review", `Paused before checkout. ${cartCheck.message}`, null, null);
+    const mismatch = (cartCheck.mismatches || [])[0];
+    const missingAsin = mismatch?.asin || "";
+    await send({
+      type: "FAIL_JOB",
+      message: mismatch
+        ? `Could not add the desired quantity for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}.`
+        : `Could not verify the desired Amazon cart quantities. ${cartCheck.message}`,
+      missingAsin,
+      missingLineId: lineIdForAsin(activeJob, missingAsin),
+      failureCode: "partial_quantity",
+      requestedQuantity: mismatch?.expected ?? null,
+      fulfilledQuantity: mismatch?.actual ?? 0,
+      availableQuantity: mismatch?.actual ?? 0,
+    });
+    showPanel("Cart quantity issue", "Could not add the desired quantity. Order moved to Missing ASINs.", null, null);
     return;
   }
   if (cartCheck.warning) {
@@ -1378,8 +1445,45 @@ function findPaymentRadio() {
     .find((element) => visible(element) && !element.disabled);
 }
 
-function findPaymentSelection() {
-  const radio = findPaymentRadio();
+function cardPreferenceList(value) {
+  return String(value || "")
+    .split(/[\s,;|]+/)
+    .map((item) => item.replace(/\D/g, "").slice(-4))
+    .filter((item) => item.length === 4);
+}
+
+function paymentRowForRadio(radio) {
+  return radio?.closest?.(".a-box-inner, .a-fixed-left-grid, [data-pmts-component-id], .pmts-instrument-selector") || radio?.closest?.("label") || radio?.parentElement || radio;
+}
+
+function paymentRowText(radio) {
+  const label = radio?.closest?.("label");
+  const labelledText = label?.innerText || label?.textContent || "";
+  const root = paymentRowForRadio(radio);
+  return [labelledText, root?.innerText || root?.textContent || "", radio?.value || ""].join(" ");
+}
+
+function cardDigitsForPaymentRadio(radio) {
+  const root = paymentRowForRadio(radio);
+  const dataNumber = root?.querySelector?.("[data-number]")?.getAttribute("data-number");
+  const text = paymentRowText(radio);
+  const endingMatch = text.match(/ending\s+in\s+(\d{4})/i);
+  return (dataNumber || endingMatch?.[1] || "").replace(/\D/g, "").slice(-4);
+}
+
+function findPaymentRadioForPreferences(preferences = []) {
+  const radios = [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
+    .filter((element) => visible(element) && !element.disabled);
+  if (!radios.length) return null;
+  for (const preferred of preferences) {
+    const radio = radios.find((candidate) => cardDigitsForPaymentRadio(candidate) === preferred);
+    if (radio) return radio;
+  }
+  return radios.find((radio) => radio.checked) || radios[0];
+}
+
+function findPaymentSelection(preferences = []) {
+  const radio = findPaymentRadioForPreferences(preferences);
   if (!radio) return null;
 
   const exactContinue = [...document.querySelectorAll("input[data-csa-c-slot-id*='continue-payselect'], button[data-csa-c-slot-id*='continue-payselect']")]
@@ -1398,10 +1502,23 @@ function findPaymentSelection() {
 }
 
 function findPlaceOrderButton() {
-  return [...document.querySelectorAll("#placeOrder, input.place-your-order-button, input[type='submit'], button, span.a-button")].find((element) => {
-    const text = normalizedText(element.value || element.innerText || element.textContent);
+  const selectors = [
+    "input#placeOrder",
+    "input[name='placeYourOrder1']",
+    "input[data-testid='SPC_selectPlaceOrder']",
+    "input[data-csa-c-slot-id='checkout-place-your-order-button']",
+    "input.place-your-order-button",
+    "input[title='Place your order']",
+    "input[value='Place your order']",
+    "button",
+    "span.a-button",
+  ].join(", ");
+  return [...document.querySelectorAll(selectors)].find((element) => {
+    const labelledBy = element.getAttribute?.("aria-labelledby");
+    const labelText = labelledBy ? document.getElementById(labelledBy)?.textContent : "";
+    const text = normalizedText(element.value || element.title || element.innerText || element.textContent || labelText);
     return visible(element) && !element.disabled && (
-      element.matches?.("#placeOrder, input.place-your-order-button") ||
+      element.matches?.("input#placeOrder, input[name='placeYourOrder1'], input[data-testid='SPC_selectPlaceOrder'], input[data-csa-c-slot-id='checkout-place-your-order-button'], input.place-your-order-button") ||
       text.includes("place your order")
     );
   });
@@ -1431,18 +1548,32 @@ async function handleBusinessCheckoutInterstitial() {
 }
 
 async function handlePaymentSelection(activeJob) {
-  let payment = findPaymentSelection();
+  const state = await getExtensionState();
+  const cardPreferences = cardPreferenceList(state.cardLast4Preference);
+  let payment = findPaymentSelection(cardPreferences);
   if (!payment) {
     if (!findPaymentRadio()) return false;
-    payment = await waitUntil(findPaymentSelection, 5000);
+    payment = await waitUntil(() => findPaymentSelection(cardPreferences), 5000);
     if (!payment) {
       await pauseForManualCheckout(activeJob, "Could not find the Use this payment method button.");
       return true;
     }
   }
-  showPanel("Nutricity checkout", "Selecting Amazon payment method.", null, null);
+  const selectedDigits = cardDigitsForPaymentRadio(payment.radio);
+  showPanel("Nutricity checkout", selectedDigits ? `Selecting card ending in ${selectedDigits}.` : "Selecting Amazon payment method.", null, null);
   if (!payment.radio.checked) {
-    await clickElement(payment.radio, "Payment method radio");
+    const target = payment.radio.closest?.("label") || payment.radio;
+    await clickElement(target, "Payment method radio");
+    if (!payment.radio.checked) {
+      payment.radio.checked = true;
+      payment.radio.dispatchEvent(new Event("input", { bubbles: true }));
+      payment.radio.dispatchEvent(new Event("change", { bubbles: true }));
+      await sleep(800);
+    }
+  }
+  if (cardPreferences.length && selectedDigits && !cardPreferences.includes(selectedDigits)) {
+    await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
+    return true;
   }
   await clickElement(payment.continueButton, "Use this payment method button");
   showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
@@ -1453,11 +1584,54 @@ async function handlePaymentSelection(activeJob) {
   return true;
 }
 
-async function pauseForManualCheckout(activeJob, message) {
-  activeJob.stage = "checkout";
+function manualNextStage(activeJob, requestedStage = "") {
+  if (requestedStage) return requestedStage;
+  const stage = String(activeJob?.stage || "");
+  if (stage === "clear_cart") return "product";
+  if (stage === "product") return "add_clicked";
+  if (stage === "add_clicked") return "navigate_next";
+  if (stage === "subscribe_checkout") return "checkout";
+  if (stage === "cart") return "checkout";
+  if (stage === "editing_address") return "checkout";
+  if (stage === "complete_pending") return "find_order_id";
+  return stage || "product";
+}
+
+async function continueAfterManualStep(activeJob, nextStage = "") {
+  const latest = await getActiveJob();
+  const next = { ...(latest || activeJob), paused: false, pausedStage: null };
+  const targetStage = manualNextStage(next, nextStage);
+  if (targetStage === "navigate_next") {
+    showPanel("Nutricity fulfilment", "Manual step done. Moving to the next item.", null, null);
+    await navigateToNext(next);
+    setTimeout(runSafely, 250);
+    return;
+  }
+  if (targetStage === "product") {
+    next.itemIndex = Number(next.itemIndex || 0);
+    next.cartCleared = true;
+  }
+  if (targetStage === "add_clicked") {
+    next.addClickedAt = Date.now();
+    markItemAdded(next);
+  }
+  next.stage = targetStage;
+  await setActiveJob(next);
+  showPanel("Nutricity fulfilment", `Manual step done. Continuing ${targetStage}.`, null, null);
+  setTimeout(runSafely, 250);
+}
+
+async function pauseForManualCheckout(activeJob, message, nextStage = "checkout") {
+  activeJob.pausedStage = activeJob.stage || "checkout";
+  activeJob.stage = activeJob.pausedStage;
   activeJob.paused = true;
   await setActiveJob(activeJob);
-  showPanel("Nutricity checkout needs attention", `${message} Make the needed Amazon checkout change, then click Resume.`, null, null);
+  showPanel(
+    "Nutricity checkout needs attention",
+    `${message} Make the needed Amazon checkout change, then click Resume to retry this step.`,
+    "I did it manually, continue",
+    () => continueAfterManualStep(activeJob, nextStage),
+  );
 }
 
 async function saveEditedAddress(activeJob, checkoutRecipient) {
@@ -1574,14 +1748,22 @@ async function handleCheckout(activeJob) {
   }
   if (activeJob.paused) return;
 
-  const placeOrder = await waitUntil(findPlaceOrderButton, 10000) || await waitForElement(["#placeOrder:not([disabled])", "input.place-your-order-button:not([disabled])"], 3000) || findButtonByText(["place your order"]);
+  const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
+    || await waitForElement([
+      "input#placeOrder:not([disabled])",
+      "input[name='placeYourOrder1']:not([disabled])",
+      "input[data-testid='SPC_selectPlaceOrder']:not([disabled])",
+      "input[data-csa-c-slot-id='checkout-place-your-order-button']:not([disabled])",
+      "input.place-your-order-button:not([disabled])",
+    ], 5000)
+    || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
     showPanel("Final step", "Clicking Place your order now.", null, null);
     activeJob.stage = "complete_pending";
     await setActiveJob(activeJob);
     await clickElement(placeOrder, "Place your order button");
   } else {
-    await pauseForManualCheckout(activeJob, "Could not find the payment or Place your order control.");
+    await pauseForManualCheckout(activeJob, "Could not find the payment or Place your order control.", "complete_pending");
   }
 }
 
@@ -1688,7 +1870,12 @@ async function run() {
   const activeJob = await getActiveJob();
   if (!activeJob?.job || !/amazon\.com$/i.test(location.hostname)) return;
   if (activeJob.paused) {
-    showPanel("Nutricity fulfilment paused", "Fulfilment is paused. Click Resume to continue.", null, null);
+    showPanel(
+      "Nutricity fulfilment paused",
+      "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",
+      "I did it manually, continue",
+      () => continueAfterManualStep(activeJob),
+    );
     return;
   }
   try {
@@ -1726,6 +1913,18 @@ async function run() {
     const item = activeJob.job.items?.[activeJob.itemIndex];
     const purchaseItem = item ? selectedVariantItem(activeJob, item) : item;
     const shouldMarkItemMissing = Boolean(error.failureCode || error.missingAsin);
+    if (!shouldMarkItemMissing) {
+      activeJob.pausedStage = activeJob.stage || "product";
+      activeJob.paused = true;
+      await setActiveJob(activeJob);
+      showPanel(
+        "Nutricity fulfilment needs attention",
+        `${error.message} Complete the stuck Amazon step manually, then continue.`,
+        "I did it manually, continue",
+        () => continueAfterManualStep(activeJob),
+      );
+      return;
+    }
     await send({
       type: "FAIL_JOB",
       message: error.message,

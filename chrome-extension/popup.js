@@ -7,6 +7,9 @@ const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
 const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
 const connectionNotice = document.querySelector("#connectionNotice");
 const statusBox = document.querySelector("#status");
+const orderProgressCounter = document.querySelector("#orderProgressCounter");
+const orderProgressBar = document.querySelector("#orderProgressBar");
+const orderProgressDetail = document.querySelector("#orderProgressDetail");
 const logsBox = document.querySelector("#logs");
 const pricingRows = document.querySelector("#pricingRows");
 const pricingTotal = document.querySelector("#pricingTotal");
@@ -224,11 +227,25 @@ function submittedQueueCount(counts = [], fallback = 0) {
 
 function renderQueueStatus(queue, state) {
   renderQueuedJobs(queue.jobs || [], queue.workerId || state.workerId || "");
-  queueCount.textContent = `${submittedQueueCount(queue.counts || [], (queue.jobs || []).length)} waiting`;
+  const jobCount = Number(queue.job_count);
+  const waiting = Number.isFinite(jobCount) ? jobCount : submittedQueueCount(queue.counts || [], (queue.jobs || []).length);
+  queueCount.textContent = `${waiting} job${waiting === 1 ? "" : "s"} waiting`;
   queueCount.textContent += queueCountDetails(queue.counts || []);
   if (queue.stale) {
     queueCount.textContent += " · last loaded";
   }
+}
+
+function renderOrderProgress(progress = {}, queue = null, activeJob = null) {
+  const processed = Math.max(0, Math.round(Number(progress.processed || 0)));
+  const queuedJobs = Number(queue?.job_count ?? queue?.jobs?.length ?? 0);
+  const total = Math.max(processed, Math.round(Number(progress.total || 0)), processed + (Number.isFinite(queuedJobs) ? queuedJobs : 0));
+  const percent = total ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+  const activeLabel = activeJob?.job?.group_key ? `Active: ${activeJob.job.group_key}` : "";
+  const detail = progress.message || activeLabel || (total ? "Order run in progress." : "No order run started.");
+  orderProgressCounter.textContent = `${processed} / ${total} processed`;
+  orderProgressBar.style.width = `${percent}%`;
+  orderProgressDetail.textContent = detail;
 }
 
 async function refresh() {
@@ -252,10 +269,12 @@ async function refresh() {
     setStatus(job ? `${state.activeJob.paused ? "Paused" : "Active"}: ${job.group_key} (${state.activeJob.stage})` : "No active job.");
     renderDuplicateOrder(state.activeJob);
     renderPricing(state.activeJob);
+    let browserlessProgress = null;
     if (browserlessOrderMode.checked && !job) {
       try {
         const browserless = await send({ type: "GET_BROWSERLESS_STATUS" });
         const progress = browserless?.progress || {};
+        browserlessProgress = progress;
         if (progress.message) setStatus(progress.message);
       } catch {
         // Queue status below will still show connection errors if the app is down.
@@ -271,9 +290,11 @@ async function refresh() {
       const queue = await send({ type: "GET_QUEUE_STATUS" });
       if (!queue.ok) throw new Error(queue.message || "Could not load queue.");
       renderQueueStatus(queue, state);
+      renderOrderProgress(browserlessProgress || state.orderProgress || {}, queue, state.activeJob);
       if (queue.stale && queue.message) setStatus(queue.message);
     } catch (error) {
       queueCount.textContent = "Not loaded";
+      renderOrderProgress(browserlessProgress || state.orderProgress || {}, null, state.activeJob);
       queuedJobs.innerHTML = `<div class="empty-queue">${error.message || "Could not load queue. Check App URL, Admin token, then click Save."}</div>`;
     }
   } finally {
