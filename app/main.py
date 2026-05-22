@@ -11105,6 +11105,15 @@ def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
     return {"ok": True, "message": "Approved and queued for Chrome fulfilment.", "queued": queued}
 
 
+@app.delete("/api/back-in-stock/{availability_id}")
+def api_back_in_stock_delete(availability_id: int) -> dict[str, Any]:
+    with db() as conn:
+        cursor = conn.execute("DELETE FROM missing_asin_availability WHERE id=?", (availability_id,))
+    if cursor.rowcount <= 0:
+        raise HTTPException(404, "Back-in-stock record not found.")
+    return {"ok": True, "message": "Back-in-stock review row removed. No fulfilment action was taken."}
+
+
 @app.get("/api/chrome/missing-asin-checks")
 def api_chrome_missing_asin_checks(limit: int = 40) -> dict[str, Any]:
     return {"ok": True, "candidates": missing_asin_check_candidates(limit)}

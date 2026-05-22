@@ -5577,6 +5577,7 @@ function BackInStockPage({
   onRefresh: () => Promise<void>
 }) {
   const [approving, setApproving] = useState<number | null>(null)
+  const [removing, setRemoving] = useState<number | null>(null)
   async function approve(row: BackInStockRow) {
     const confirmed = window.confirm(`Approve ${row.asin} for ${row.odoo_order_name || row.odoo_order_id}? The app will check Odoo first and only queue Chrome if the Odoo order is not cancelled.`)
     if (!confirmed) return
@@ -5589,6 +5590,20 @@ function BackInStockPage({
       onResult({ ok: false, title: "Approval Failed", message: String(error) })
     } finally {
       setApproving(null)
+    }
+  }
+  async function remove(row: BackInStockRow) {
+    const confirmed = window.confirm(`Remove ${row.asin} for ${row.odoo_order_name || row.odoo_order_id} from Back In Stock review? No fulfilment action will be taken.`)
+    if (!confirmed) return
+    setRemoving(row.id)
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/back-in-stock/${row.id}`, { method: "DELETE" })
+      onResult({ ok: result.ok, title: "Back In Stock Removed", message: result.message })
+      await onRefresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Remove Failed", message: String(error) })
+    } finally {
+      setRemoving(null)
     }
   }
   return (
@@ -5670,13 +5685,23 @@ function BackInStockPage({
                     </div>
                   </TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      size="sm"
-                      disabled={approving === row.id || Boolean(row.queued_at) || row.status !== "back_in_stock"}
-                      onClick={() => approve(row)}
-                    >
-                      {approving === row.id ? "Approving..." : "Approve"}
-                    </Button>
+                    <div className="flex justify-end gap-2">
+                      <Button
+                        size="sm"
+                        disabled={approving === row.id || removing === row.id || Boolean(row.queued_at) || row.status !== "back_in_stock"}
+                        onClick={() => approve(row)}
+                      >
+                        {approving === row.id ? "Approving..." : "Approve"}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={approving === row.id || removing === row.id}
+                        onClick={() => remove(row)}
+                      >
+                        {removing === row.id ? "Removing..." : "Remove"}
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
