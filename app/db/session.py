@@ -101,25 +101,41 @@ class PostgresCursor:
 
 
 class PostgresConnection:
-    def __init__(self, raw: Any) -> None:
+    def __init__(self, raw: Any, pooled: bool = False) -> None:
         self._raw = raw
+        self._pooled = pooled
         self._raw.autocommit = False
 
     @classmethod
     def open(cls) -> "PostgresConnection":
         if not POSTGRES_URL:
             raise RuntimeError("POSTGRES_URL or DATABASE_URL is required. SQLite is intentionally disabled.")
+        connect_timeout = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "8"))
+        statement_timeout_ms = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", "20000"))
+        use_pool = os.getenv("POSTGRES_USE_POOL", "false").strip().lower() in {"1", "true", "yes", "on"}
+        if not use_pool:
+            raw = psycopg2.connect(
+                POSTGRES_URL,
+                connect_timeout=connect_timeout,
+                options=f"-c statement_timeout={statement_timeout_ms} -c idle_in_transaction_session_timeout={statement_timeout_ms}",
+            )
+            return cls(raw, pooled=False)
         global _pool
         if _pool is None:
             with _pool_lock:
                 if _pool is None:
                     max_connections = int(os.getenv("POSTGRES_POOL_MAX", "30"))
-                    connect_timeout = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "8"))
-                    _pool = pool.ThreadedConnectionPool(1, max_connections, POSTGRES_URL, connect_timeout=connect_timeout)
+                    _pool = pool.ThreadedConnectionPool(
+                        1,
+                        max_connections,
+                        POSTGRES_URL,
+                        connect_timeout=connect_timeout,
+                        options=f"-c statement_timeout={statement_timeout_ms} -c idle_in_transaction_session_timeout={statement_timeout_ms}",
+                    )
         last_error: Exception | None = None
         for attempt in range(int(os.getenv("POSTGRES_POOL_RETRIES", "5"))):
             try:
-                return cls(_pool.getconn())
+                return cls(_pool.getconn(), pooled=True)
             except pool.PoolError as error:
                 last_error = error
                 time.sleep(0.2 * (attempt + 1))
@@ -171,7 +187,7 @@ class PostgresConnection:
 
     def close(self) -> None:
         global _pool
-        if _pool is not None:
+        if self._pooled and _pool is not None:
             _pool.putconn(self._raw)
         else:
             self._raw.close()

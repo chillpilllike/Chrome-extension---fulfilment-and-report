@@ -163,6 +163,25 @@ _SHOPIFY_DUPLICATE_SCAN_PROGRESS: dict[str, Any] = {
     "error": "",
 }
 _SHOPIFY_DUPLICATE_SCAN_RESULTS: list[dict[str, Any]] = []
+_SHOPIFY_PRODUCT_REPAIR_LOCK = threading.Lock()
+_SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK = threading.Lock()
+_SHOPIFY_PRODUCT_REPAIR_CANCEL_EVENT = threading.Event()
+_SHOPIFY_PRODUCT_REPAIR_LOGS: list[dict[str, Any]] = []
+_SHOPIFY_PRODUCT_REPAIR_PROGRESS: dict[str, Any] = {
+    "status": "idle",
+    "total": 0,
+    "processed": 0,
+    "repaired": 0,
+    "missing": 0,
+    "failed": 0,
+    "current_order": "",
+    "cancel_requested": False,
+    "message": "Shopify product repair is idle.",
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "error": "",
+}
 _CHROME_BROWSERLESS_LOCK = threading.Lock()
 _CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "running": False,
@@ -9639,6 +9658,30 @@ def shopify_duplicate_results() -> list[dict[str, Any]]:
         return [dict(row) for row in _SHOPIFY_DUPLICATE_SCAN_RESULTS]
 
 
+def set_shopify_product_repair_progress(**updates: Any) -> dict[str, Any]:
+    with _SHOPIFY_PRODUCT_REPAIR_LOCK:
+        _SHOPIFY_PRODUCT_REPAIR_PROGRESS.update(updates)
+        _SHOPIFY_PRODUCT_REPAIR_PROGRESS["updated_at"] = utc_now()
+        return dict(_SHOPIFY_PRODUCT_REPAIR_PROGRESS)
+
+
+def shopify_product_repair_progress() -> dict[str, Any]:
+    with _SHOPIFY_PRODUCT_REPAIR_LOCK:
+        return dict(_SHOPIFY_PRODUCT_REPAIR_PROGRESS)
+
+
+def shopify_product_repair_logs() -> list[dict[str, Any]]:
+    with _SHOPIFY_PRODUCT_REPAIR_LOCK:
+        return [dict(row) for row in _SHOPIFY_PRODUCT_REPAIR_LOGS]
+
+
+def append_shopify_product_repair_log(row: dict[str, Any]) -> None:
+    with _SHOPIFY_PRODUCT_REPAIR_LOCK:
+        _SHOPIFY_PRODUCT_REPAIR_LOGS.append({**row, "logged_at": utc_now()})
+        if len(_SHOPIFY_PRODUCT_REPAIR_LOGS) > 1000:
+            del _SHOPIFY_PRODUCT_REPAIR_LOGS[: len(_SHOPIFY_PRODUCT_REPAIR_LOGS) - 1000]
+
+
 def shopify_clients_for_route(route: str) -> list[Any]:
     module, _script_path, state_scope = shopify_route_script_config(route)
     state = module.StateDB(state_scope)
@@ -9944,6 +9987,420 @@ def cancel_scanned_shopify_duplicates() -> dict[str, Any]:
     )
 
 
+def synced_shopify_product_repair_targets(store_id: Optional[int] = None, limit: int = 500) -> list[dict[str, Any]]:
+    limit = max(1, min(5000, int(limit or 500)))
+    today_start = datetime.now(timezone.utc).date().isoformat() + "T00:00:00+00:00"
+    tomorrow_start = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat() + "T00:00:00+00:00"
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT shopify_fulfilment_jobs.route,
+                   shopify_fulfilment_jobs.store_id,
+                   shopify_fulfilment_jobs.odoo_order_id,
+                   shopify_fulfilment_jobs.odoo_order_name,
+                   shopify_fulfilment_jobs.completed_at,
+                   stores.odoo_url,
+                   stores.odoo_db,
+                   stores.odoo_user,
+                   stores.odoo_password,
+                   shopify_export_order_map.dest_name AS shopify_dest_name,
+                   shopify_export_order_map.dest_order_id AS shopify_order_id,
+                   shopify_export_oauth_tokens.shop AS shopify_shop
+            FROM shopify_fulfilment_jobs
+            JOIN stores ON stores.id=shopify_fulfilment_jobs.store_id
+            JOIN shopify_export_order_map
+              ON shopify_export_order_map.state_scope=shopify_fulfilment_jobs.route
+             AND shopify_export_order_map.src_order_key=(stores.odoo_db || ':' || shopify_fulfilment_jobs.odoo_order_name)
+            LEFT JOIN shopify_export_oauth_tokens
+              ON shopify_export_oauth_tokens.state_scope=shopify_fulfilment_jobs.route
+             AND shopify_export_oauth_tokens.dest_name=shopify_export_order_map.dest_name
+            WHERE (? IS NULL OR shopify_fulfilment_jobs.store_id=?)
+              AND shopify_fulfilment_jobs.route IN ('dtc', 'dtb')
+              AND COALESCE(shopify_export_order_map.dest_order_id, '') != ''
+              AND COALESCE(shopify_fulfilment_jobs.completed_at, shopify_export_order_map.created_at, shopify_fulfilment_jobs.updated_at) >= ?
+              AND COALESCE(shopify_fulfilment_jobs.completed_at, shopify_export_order_map.created_at, shopify_fulfilment_jobs.updated_at) < ?
+            ORDER BY COALESCE(shopify_fulfilment_jobs.completed_at, shopify_fulfilment_jobs.updated_at) DESC
+            LIMIT ?
+            """,
+            (store_id, store_id, today_start, tomorrow_start, limit),
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def shopify_order_line_variants(module: Any, shop: Any, order_id: Any) -> list[dict[str, Any]]:
+    order_id_text = clean_text(order_id)
+    if not order_id_text:
+        return []
+    query = """
+    query($id: ID!) {
+      node(id: $id) {
+        ... on Order {
+          lineItems(first: 250) {
+            nodes {
+              title
+              sku
+              variant {
+                id
+                legacyResourceId
+                sku
+                product {
+                  id
+                  legacyResourceId
+                  title
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = shop.graphql(query, {"id": f"gid://shopify/Order/{order_id_text}"})
+    nodes = (((data.get("node") or {}).get("lineItems") or {}).get("nodes") or [])
+    variants: list[dict[str, Any]] = []
+    for node in nodes:
+        variant = node.get("variant") or {}
+        product = variant.get("product") or {}
+        variant_id = clean_text(variant.get("legacyResourceId"))
+        product_id = clean_text(product.get("legacyResourceId"))
+        if not variant_id and variant.get("id"):
+            try:
+                variant_id = str(module.gid_to_int(variant["id"]))
+            except Exception:
+                variant_id = ""
+        if not product_id and product.get("id"):
+            try:
+                product_id = str(module.gid_to_int(product["id"]))
+            except Exception:
+                product_id = ""
+        if not variant_id:
+            continue
+        variants.append({
+            "variant_id": int(variant_id),
+            "product_id": int(product_id) if product_id else None,
+            "old_sku": clean_text(variant.get("sku") or node.get("sku")),
+            "old_product_title": clean_text(product.get("title") or node.get("title")),
+            "line_title": clean_text(node.get("title")),
+        })
+    return variants
+
+
+def shopify_variant_product_snapshot(module: Any, shop: Any, variant_id: int | None) -> dict[str, Any]:
+    if not variant_id:
+        return {}
+    query = """
+    query($id: ID!) {
+      productVariant(id: $id) {
+        legacyResourceId
+        sku
+        product {
+          legacyResourceId
+          title
+        }
+      }
+    }
+    """
+    data = shop.graphql(query, {"id": f"gid://shopify/ProductVariant/{int(variant_id)}"})
+    variant = data.get("productVariant") or {}
+    product = variant.get("product") or {}
+    return {
+        "verified_variant_sku": clean_text(variant.get("sku")),
+        "verified_product_title": clean_text(product.get("title")),
+        "verified_variant_id": clean_text(variant.get("legacyResourceId")),
+        "verified_product_id": clean_text(product.get("legacyResourceId")),
+    }
+
+
+def repair_shopify_synced_line_product(
+    module: Any,
+    odoo: Any,
+    shop: Any,
+    state: Any,
+    rename_manager: Any,
+    *,
+    line: dict[str, Any],
+    order_name: str,
+    shopify_order_id: Any,
+    order_variants: list[dict[str, Any]],
+) -> dict[str, Any]:
+    base_log = {
+        "odoo_order_name": order_name,
+        "shopify_order_id": clean_text(shopify_order_id),
+        "shopify_order_url": shopify_admin_order_url(shop.shop, shopify_order_id),
+        "dest_name": shop.name,
+        "shop": shop.shop,
+        "order_line_title": "",
+        "order_line_sku": "",
+        "old_product_title": "",
+        "old_sku": "",
+        "new_product_title": "",
+        "new_sku": "",
+        "verified_product_title": "",
+        "verified_variant_sku": "",
+        "status": "skipped",
+        "error": "",
+    }
+    if line.get("display_type"):
+        return base_log
+    qty_int = module.qty_to_int_or_none(float(line.get("product_uom_qty") or 0.0))
+    if qty_int is None:
+        return base_log
+    prod = line.get("product_id")
+    if not prod or not isinstance(prod, (list, tuple)) or len(prod) < 1:
+        return base_log
+    pp = odoo.get_product_product(int(prod[0]))
+    if not pp:
+        return {**base_log, "status": "missing", "error": "Odoo product was not found."}
+    sku_raw = clean_text(pp.get("default_code"))
+    sku = module.maybe_decode_asin_sku(sku_raw)
+    if module._should_ignore_odoo_line_item(sku or sku_raw or None, line.get("name")):
+        return base_log
+    tmpl = None
+    tmpl_ref = pp.get("product_tmpl_id")
+    if isinstance(tmpl_ref, (list, tuple)) and tmpl_ref:
+        tmpl = odoo.get_product_template(int(tmpl_ref[0]))
+    source_title_for_sku = clean_text(
+        pp.get("name")
+        or ((tmpl or {}).get("name") if tmpl else "")
+        or line.get("name")
+        or sku
+        or sku_raw
+        or "Item"
+    )
+    title = source_title_for_sku
+    if getattr(module, "STRIP_WORDS", None):
+        title = module.strip_words(title, module.STRIP_WORDS)
+    title = rename_manager.resolve_title(order_name=order_name, sku=sku or sku_raw, original_title=title)
+    source_sku = clean_text(sku or sku_raw) or None
+    destination_sku = rename_manager.destination_sku(source_sku=source_sku, source_title=source_title_for_sku)
+    if not destination_sku:
+        return base_log
+    candidates: list[str] = []
+    for candidate in (destination_sku, source_sku, sku_raw):
+        candidate = clean_text(candidate)
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    matched_variant = None
+    for variant in order_variants:
+        if clean_text(variant.get("old_sku")) in candidates:
+            matched_variant = variant
+            break
+    if not matched_variant:
+        return {
+            **base_log,
+            "new_product_title": title,
+            "new_sku": destination_sku,
+            "status": "missing",
+            "error": "No matching variant was found on the linked Shopify order.",
+        }
+    variant_id = int(matched_variant["variant_id"])
+    product_id = int(matched_variant["product_id"]) if matched_variant.get("product_id") else None
+    old_sku = clean_text(matched_variant.get("old_sku"))
+    old_product_title = clean_text(matched_variant.get("old_product_title"))
+    order_line_title = clean_text(matched_variant.get("line_title"))
+    if product_id:
+        shop.update_product(product_id, title=title)
+    if old_sku != destination_sku:
+        shop.update_variant(variant_id, sku=destination_sku)
+    verified = shopify_variant_product_snapshot(module, shop, variant_id)
+    state.set_variant_for_sku(shop.name, destination_sku, variant_id, product_id)
+    if source_sku and source_sku != destination_sku:
+        state.set_variant_for_sku(shop.name, source_sku, variant_id, product_id)
+    if sku_raw and sku_raw not in {source_sku, destination_sku}:
+        state.set_variant_for_sku(shop.name, sku_raw, variant_id, product_id)
+    return {
+        **base_log,
+        "order_line_title": order_line_title,
+        "order_line_sku": old_sku,
+        "old_product_title": old_product_title,
+        "old_sku": old_sku,
+        "new_product_title": title,
+        "new_sku": destination_sku,
+        "verified_product_title": verified.get("verified_product_title") or "",
+        "verified_variant_sku": verified.get("verified_variant_sku") or "",
+        "status": "repaired",
+    }
+
+
+def repair_shopify_synced_products(store_id: Optional[int] = None, limit: int = 500) -> None:
+    if not _SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK.acquire(blocking=False):
+        return
+    try:
+        _SHOPIFY_PRODUCT_REPAIR_CANCEL_EVENT.clear()
+        targets = synced_shopify_product_repair_targets(store_id, limit)
+        with _SHOPIFY_PRODUCT_REPAIR_LOCK:
+            _SHOPIFY_PRODUCT_REPAIR_LOGS.clear()
+        set_shopify_product_repair_progress(
+            status="running",
+            total=len(targets),
+            processed=0,
+            repaired=0,
+            missing=0,
+            failed=0,
+            current_order="",
+            cancel_requested=False,
+            message=f"Repairing products for {len(targets)} already-linked Shopify order{'s' if len(targets) != 1 else ''} synced today.",
+            started_at=utc_now(),
+            completed_at="",
+            error="",
+        )
+        settings = get_service_settings()
+        module_cache: dict[str, Any] = {}
+        client_cache: dict[str, list[Any]] = {}
+        odoo_cache: dict[int, Any] = {}
+        repaired = 0
+        missing = 0
+        failed = 0
+        for index, target in enumerate(targets, start=1):
+            if _SHOPIFY_PRODUCT_REPAIR_CANCEL_EVENT.is_set():
+                set_shopify_product_repair_progress(
+                    status="cancelled",
+                    processed=index - 1,
+                    repaired=repaired,
+                    missing=missing,
+                    failed=failed,
+                    current_order="",
+                    cancel_requested=False,
+                    completed_at=utc_now(),
+                    message=f"Product repair cancelled. Repaired {repaired}; missing {missing}; failed {failed}.",
+                )
+                return
+            route = clean_text(target.get("route")).lower()
+            order_name = clean_text(target.get("odoo_order_name"))
+            dest_name = clean_text(target.get("shopify_dest_name"))
+            shopify_order_id = clean_text(target.get("shopify_order_id"))
+            set_shopify_product_repair_progress(
+                processed=index - 1,
+                current_order=order_name,
+                cancel_requested=False,
+                message=f"Repairing product names/SKUs for {order_name} linked to Shopify order #{shopify_order_id}.",
+            )
+            try:
+                if route not in module_cache:
+                    module, _script_path, state_scope = shopify_route_script_config(route)
+                    module_cache[route] = (module, state_scope, shopify_product_rename_manager(module, settings))
+                module, state_scope, rename_manager = module_cache[route]
+                store_id_value = int(target["store_id"])
+                if store_id_value not in odoo_cache:
+                    odoo = module.OdooClient(target["odoo_url"], target["odoo_db"], target["odoo_user"], target["odoo_password"])
+                    odoo.connect()
+                    odoo_cache[store_id_value] = odoo
+                odoo = odoo_cache[store_id_value]
+                order = odoo.get_order_by_number(order_name)
+                if not order:
+                    missing += 1
+                    append_shopify_product_repair_log({
+                        "odoo_order_name": order_name,
+                        "shopify_order_id": shopify_order_id,
+                        "shopify_order_url": shopify_admin_order_url(clean_text(target.get("shopify_shop")), shopify_order_id),
+                        "dest_name": dest_name,
+                        "shop": clean_text(target.get("shopify_shop")),
+                        "old_product_title": "",
+                        "old_sku": "",
+                        "new_product_title": "",
+                        "new_sku": "",
+                        "status": "missing",
+                        "error": "Odoo order was not found.",
+                    })
+                    continue
+                lines = odoo.get_order_lines(order.get("order_line") or [])
+                if route not in client_cache:
+                    client_cache[route] = shopify_clients_for_route(route)
+                shops = [shop for shop in client_cache[route] if not dest_name or shop.name == dest_name]
+                state = module.StateDB(state_scope)
+                for shop in shops:
+                    order_variants = shopify_order_line_variants(module, shop, shopify_order_id)
+                    if not order_variants:
+                        missing += 1
+                        append_shopify_product_repair_log({
+                            "odoo_order_name": order_name,
+                            "shopify_order_id": shopify_order_id,
+                            "shopify_order_url": shopify_admin_order_url(shop.shop, shopify_order_id),
+                            "dest_name": shop.name,
+                            "shop": shop.shop,
+                            "old_product_title": "",
+                            "old_sku": "",
+                            "new_product_title": "",
+                            "new_sku": "",
+                            "status": "missing",
+                            "error": "No product variants were found on the linked Shopify order.",
+                        })
+                        continue
+                    for line in lines:
+                        if _SHOPIFY_PRODUCT_REPAIR_CANCEL_EVENT.is_set():
+                            set_shopify_product_repair_progress(
+                                status="cancelled",
+                                processed=index - 1,
+                                repaired=repaired,
+                                missing=missing,
+                                failed=failed,
+                                current_order="",
+                                cancel_requested=False,
+                                completed_at=utc_now(),
+                                message=f"Product repair cancelled. Repaired {repaired}; missing {missing}; failed {failed}.",
+                            )
+                            return
+                        try:
+                            result = repair_shopify_synced_line_product(
+                                module,
+                                odoo,
+                                shop,
+                                state,
+                                rename_manager,
+                                line=line,
+                                order_name=order_name,
+                                shopify_order_id=shopify_order_id,
+                                order_variants=order_variants,
+                            )
+                            if result.get("status") != "skipped":
+                                append_shopify_product_repair_log(result)
+                            if result.get("status") == "repaired":
+                                repaired += 1
+                            elif result.get("status") == "missing":
+                                missing += 1
+                        except Exception as exc:
+                            failed += 1
+                            append_shopify_product_repair_log({
+                                "odoo_order_name": order_name,
+                                "shopify_order_id": shopify_order_id,
+                                "shopify_order_url": shopify_admin_order_url(shop.shop, shopify_order_id),
+                                "dest_name": shop.name,
+                                "shop": shop.shop,
+                                "old_product_title": "",
+                                "old_sku": "",
+                                "new_product_title": "",
+                                "new_sku": "",
+                                "status": "failed",
+                                "error": str(exc)[:1000],
+                            })
+                set_shopify_product_repair_progress(
+                    processed=index,
+                    repaired=repaired,
+                    missing=missing,
+                    failed=failed,
+                    message=f"Repaired {repaired} product/variant record{'s' if repaired != 1 else ''}; {missing} missing; {failed} failed.",
+                )
+            except Exception as exc:
+                failed += 1
+                set_shopify_product_repair_progress(failed=failed, error=str(exc)[:1000])
+        set_shopify_product_repair_progress(
+            status="completed",
+            processed=len(targets),
+            total=len(targets),
+            repaired=repaired,
+            missing=missing,
+            failed=failed,
+            current_order="",
+            cancel_requested=False,
+            completed_at=utc_now(),
+            message=f"Product repair complete. Repaired {repaired}; missing {missing}; failed {failed}.",
+        )
+    except Exception as exc:
+        set_shopify_product_repair_progress(status="failed", error=str(exc), completed_at=utc_now(), message=f"Product repair failed: {exc}")
+    finally:
+        _SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK.release()
+
+
 def run_shopify_script_export(job: dict[str, Any]) -> None:
     settings = get_service_settings()
     store = get_store(int(job["store_id"]))
@@ -9988,13 +10445,14 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
         existing_orders = shopify_orders_by_name(shop, str(job["odoo_order_name"]), limit=10)
         active_existing = [order for order in existing_orders if not order.get("cancelled_at")]
         if active_existing:
-            state.mark_order_synced(shop.name, src_order_key, clean_text(active_existing[0].get("id")) or None)
-            if len(active_existing) > 1:
-                raise RuntimeError(
-                    f"Duplicate Shopify orders already exist for {job['odoo_order_name']} in {shop.name}; "
-                    "run Duplicate Finder and cancel extras before retrying."
-                )
-            continue
+            fulfilled = [order for order in active_existing if shopify_order_is_fulfilled(order)]
+            keep = fulfilled[0] if fulfilled else active_existing[0]
+            state.mark_order_synced(shop.name, src_order_key, clean_text(keep.get("id")) or None)
+            order_ids = ", ".join(f"#{order.get('id')}" for order in active_existing if order.get("id"))
+            raise RuntimeError(
+                f"Shopify order already exists for {job['odoo_order_name']} in {shop.name}: {order_ids or len(active_existing)}. "
+                "This job was marked synced to the existing order and was not pushed again."
+            )
         module.sync_one_order_to_dest(odoo, shop, state, str(job["odoo_order_name"]), rename_manager)
 
 
@@ -12858,6 +13316,32 @@ def api_shopify_duplicate_cancel() -> dict[str, Any]:
     return {"ok": progress.get("cancel_failed", 0) == 0, "message": progress.get("message") or "Duplicate cancellation complete.", "progress": progress, "duplicates": shopify_duplicate_results()}
 
 
+@app.post("/api/shopify/fulfilment/products/repair")
+def api_shopify_product_repair_start(store_id: Optional[int] = None, limit: int = 500) -> dict[str, Any]:
+    if _SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK.locked():
+        return {"ok": True, "message": "Shopify product repair is already running.", "progress": shopify_product_repair_progress(), "logs": shopify_product_repair_logs()}
+    threading.Thread(target=repair_shopify_synced_products, args=(store_id, limit), daemon=True).start()
+    return {"ok": True, "message": "Shopify product repair started for today's linked Shopify orders.", "progress": shopify_product_repair_progress(), "logs": shopify_product_repair_logs()}
+
+
+@app.get("/api/shopify/fulfilment/products/repair")
+def api_shopify_product_repair_progress() -> dict[str, Any]:
+    return {"ok": True, "progress": shopify_product_repair_progress(), "logs": shopify_product_repair_logs()}
+
+
+@app.post("/api/shopify/fulfilment/products/repair/cancel")
+def api_shopify_product_repair_cancel() -> dict[str, Any]:
+    if not _SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK.locked():
+        progress = shopify_product_repair_progress()
+        return {"ok": True, "message": "No Shopify product repair is running.", "progress": progress}
+    _SHOPIFY_PRODUCT_REPAIR_CANCEL_EVENT.set()
+    progress = set_shopify_product_repair_progress(
+        cancel_requested=True,
+        message="Cancelling Shopify product repair after the current safe checkpoint.",
+    )
+    return {"ok": True, "message": "Shopify product repair cancellation requested.", "progress": progress, "logs": shopify_product_repair_logs()}
+
+
 @app.post("/api/shopify/fulfilment/jobs/{job_id}/retry")
 def api_shopify_fulfilment_retry(job_id: str) -> dict[str, Any]:
     with db() as conn:
@@ -12871,6 +13355,134 @@ def api_shopify_fulfilment_retry(job_id: str) -> dict[str, Any]:
         )
     start_shopify_fulfilment_worker()
     return {"ok": True, "message": f"Requeued {cursor.rowcount} Shopify fulfilment job(s)."}
+
+
+@app.post("/api/shopify/fulfilment/jobs/{job_id}/repush")
+def api_shopify_fulfilment_repush(job_id: str) -> dict[str, Any]:
+    if not _SHOPIFY_QUEUE_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "Another Shopify fulfilment job is running. Try again after it finishes.")
+    try:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT shopify_fulfilment_jobs.*,
+                       stores.odoo_db,
+                       shopify_export_order_map.dest_name AS shopify_dest_name,
+                       shopify_export_order_map.dest_order_id AS shopify_order_id
+                FROM shopify_fulfilment_jobs
+                JOIN stores ON stores.id=shopify_fulfilment_jobs.store_id
+                LEFT JOIN shopify_export_order_map
+                  ON shopify_export_order_map.state_scope=shopify_fulfilment_jobs.route
+                 AND shopify_export_order_map.src_order_key=(stores.odoo_db || ':' || shopify_fulfilment_jobs.odoo_order_name)
+                WHERE shopify_fulfilment_jobs.id=?
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, "Shopify fulfilment job was not found.")
+        job = dict(row)
+        route = clean_text(job.get("route")).lower()
+        dest_name = clean_text(job.get("shopify_dest_name"))
+        shopify_order_id = clean_text(job.get("shopify_order_id"))
+        if route not in {"dtc", "dtb"} or not dest_name or not shopify_order_id:
+            raise HTTPException(400, "Only already-linked Shopify jobs can be repushed.")
+        clients = shopify_clients_for_route(route)
+        client = next((item for item in clients if item.name == dest_name), None)
+        if client is None:
+            raise HTTPException(400, f"Shopify destination {dest_name} is not configured.")
+        linked_order = shopify_order_by_id(client, shopify_order_id)
+        if not linked_order:
+            raise HTTPException(400, f"Linked Shopify order #{shopify_order_id} could not be found.")
+        if not linked_order.get("cancelled_at"):
+            raise HTTPException(409, f"Cancel Shopify order #{shopify_order_id} first, then repush this job.")
+        existing_orders = shopify_orders_by_name(client, clean_text(job.get("odoo_order_name")), limit=50)
+        active_existing = [order for order in existing_orders if not order.get("cancelled_at")]
+        if active_existing:
+            active_links = ", ".join(
+                f"#{order.get('id')}" for order in active_existing if order.get("id")
+            )
+            raise HTTPException(
+                409,
+                f"Cancel all active Shopify orders for {job['odoo_order_name']} before repush. Still active: {active_links or len(active_existing)}.",
+            )
+        src_order_key = f"{job['odoo_db']}:{job['odoo_order_name']}"
+        now = utc_now()
+        with db() as conn:
+            conn.execute(
+                """
+                DELETE FROM shopify_export_order_map
+                WHERE state_scope=? AND dest_name=? AND src_order_key=?
+                """,
+                (route, dest_name, src_order_key),
+            )
+            conn.execute(
+                """
+                UPDATE shopify_fulfilment_jobs
+                SET status='running',
+                    attempts=attempts+1,
+                    last_error='',
+                    locked_at=?,
+                    next_run_at=?,
+                    completed_at=NULL,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (now, now, now, job_id),
+            )
+        set_shopify_fulfilment_progress(
+            status="running",
+            total=1,
+            processed=0,
+            current_order=clean_text(job.get("odoo_order_name")),
+            current_route=route.upper(),
+            message=f"Repushing {job['odoo_order_name']} to Shopify after confirmed cancellation of #{shopify_order_id}.",
+            started_at=now,
+            completed_at="",
+            error="",
+        )
+        with db() as conn:
+            latest_job = conn.execute("SELECT * FROM shopify_fulfilment_jobs WHERE id=?", (job_id,)).fetchone()
+        if not latest_job:
+            raise HTTPException(404, "Shopify fulfilment job disappeared before repush.")
+        try:
+            run_shopify_script_export(latest_job)
+            with db() as conn:
+                conn.execute(
+                    "UPDATE shopify_fulfilment_jobs SET status='completed', last_error='', completed_at=?, updated_at=? WHERE id=?",
+                    (utc_now(), utc_now(), job_id),
+                )
+            progress = set_shopify_fulfilment_progress(
+                status="completed",
+                processed=1,
+                current_order="",
+                current_route="",
+                completed_at=utc_now(),
+                message=f"Repushed {job['odoo_order_name']} to Shopify.",
+            )
+            return {"ok": True, "message": progress["message"], "progress": progress}
+        except Exception as exc:
+            with db() as conn:
+                conn.execute(
+                    """
+                    UPDATE shopify_fulfilment_jobs
+                    SET status='failed', last_error=?, next_run_at=?, locked_at=NULL, updated_at=?
+                    WHERE id=?
+                    """,
+                    (str(exc)[:4000], utc_now(), utc_now(), job_id),
+                )
+            progress = set_shopify_fulfilment_progress(
+                status="failed",
+                processed=0,
+                current_order="",
+                current_route="",
+                completed_at=utc_now(),
+                error=str(exc),
+                message=f"Repush failed for {job['odoo_order_name']}: {exc}",
+            )
+            return {"ok": False, "message": progress["message"], "progress": progress}
+    finally:
+        _SHOPIFY_QUEUE_LOCK.release()
 
 
 @app.get("/api/shopify/tracking/jobs")

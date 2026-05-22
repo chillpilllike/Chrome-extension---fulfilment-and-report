@@ -526,7 +526,26 @@ class AdminAuthError extends Error {
 }
 
 function savedAdminToken() {
-  return typeof window !== "undefined" ? window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || "" : ""
+  if (typeof window === "undefined") return ""
+  const queryToken = new URLSearchParams(window.location.search).get("admin_token") || ""
+  let localToken = ""
+  let sessionToken = ""
+  try {
+    localToken = window.localStorage?.getItem(ADMIN_TOKEN_STORAGE_KEY) || ""
+  } catch {
+    localToken = ""
+  }
+  try {
+    sessionToken = window.sessionStorage?.getItem(ADMIN_TOKEN_STORAGE_KEY) || ""
+  } catch {
+    sessionToken = ""
+  }
+  return (
+    localToken
+    || sessionToken
+    || queryToken
+    || ""
+  )
 }
 
 function savedPullSetting(key: string, fallback: string) {
@@ -704,6 +723,38 @@ type ShopifyDuplicateProgress = {
   cancel_failed: number
   message?: string
   error?: string
+}
+
+type ShopifyProductRepairProgress = {
+  status: string
+  total: number
+  processed: number
+  repaired: number
+  missing: number
+  failed: number
+  current_order?: string
+  cancel_requested?: boolean
+  message?: string
+  error?: string
+}
+
+type ShopifyProductRepairLog = {
+  odoo_order_name: string
+  shopify_order_id: string
+  shopify_order_url?: string
+  dest_name: string
+  shop: string
+  order_line_title?: string
+  order_line_sku?: string
+  old_product_title: string
+  old_sku: string
+  new_product_title: string
+  new_sku: string
+  verified_product_title?: string
+  verified_variant_sku?: string
+  status: string
+  error?: string
+  logged_at?: string
 }
 
 type ShopifyTrackingJob = {
@@ -7283,6 +7334,12 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [duplicateProgress, setDuplicateProgress] = useState<ShopifyDuplicateProgress | null>(null)
   const [duplicateGroups, setDuplicateGroups] = useState<ShopifyDuplicateGroup[]>([])
   const [duplicateFilter, setDuplicateFilter] = useState("duplicates")
+  const [productRepairProgress, setProductRepairProgress] = useState<ShopifyProductRepairProgress | null>(null)
+  const [productRepairLogs, setProductRepairLogs] = useState<ShopifyProductRepairLog[]>([])
+  const [productRenameEnabled, setProductRenameEnabled] = useState("true")
+  const [genericProductName, setGenericProductName] = useState("")
+  const [productTitleLoaded, setProductTitleLoaded] = useState(false)
+  const [savingProductTitle, setSavingProductTitle] = useState(false)
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [busy, setBusy] = useState("")
@@ -7296,6 +7353,11 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const duplicateProcessed = Math.max(0, Number(duplicateProgress?.processed || 0))
   const duplicatePercent = duplicateTotal ? Math.max(0, Math.min(100, Math.round((duplicateProcessed / duplicateTotal) * 100))) : 0
   const duplicateBusy = duplicateProgress?.status === "running" || duplicateProgress?.status === "cancelling"
+  const productRepairTotal = Math.max(0, Number(productRepairProgress?.total || 0))
+  const productRepairProcessed = Math.max(0, Number(productRepairProgress?.processed || 0))
+  const productRepairPercent = productRepairTotal ? Math.max(0, Math.min(100, Math.round((productRepairProcessed / productRepairTotal) * 100))) : 0
+  const productRepairBusy = productRepairProgress?.status === "running"
+  const showProductRepairProgress = Boolean(productRepairProgress && (productRepairBusy || productRepairTotal > 0 || productRepairProgress.message))
   const filteredDuplicateGroups = duplicateGroups.filter((group) => {
     if (duplicateFilter === "duplicates") return Number(group.duplicate_count || 0) > 0
     if (duplicateFilter === "errors") return Boolean(group.error || group.orders.some((order) => order.cancel_error))
@@ -7325,6 +7387,50 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     setDuplicateProgress(result.progress || null)
     setDuplicateGroups(result.duplicates || [])
   }
+  async function loadProductRepair() {
+    const result = await api<{ progress?: ShopifyProductRepairProgress; logs?: ShopifyProductRepairLog[] }>("/api/shopify/fulfilment/products/repair")
+    setProductRepairProgress(result.progress || null)
+    setProductRepairLogs(result.logs || [])
+  }
+  async function fetchProductTitleSettings() {
+    const result = await api<{ settings: ServiceSettings }>("/api/settings/services")
+    setProductRenameEnabled(result.settings.shopify_product_rename_enabled || "true")
+    setGenericProductName(result.settings.shopify_generic_product_name || "")
+    setProductTitleLoaded(true)
+    return result.settings
+  }
+  async function loadProductTitleSettings() {
+    await fetchProductTitleSettings()
+  }
+  async function saveProductTitleSettings(showResult = true) {
+    let title = genericProductName.trim()
+    setSavingProductTitle(true)
+    try {
+      if (!title && !productTitleLoaded) {
+        const settings = await fetchProductTitleSettings()
+        title = (settings.shopify_generic_product_name || "").trim()
+      }
+      if (!title) {
+        if (showResult) onResult({ ok: false, title: "Product Title Required", message: "Enter the Shopify product title before saving or running repair." })
+        return
+      }
+      const result = await api<{ ok: boolean; message: string; settings: ServiceSettings }>("/api/settings/services", {
+        method: "POST",
+        body: JSON.stringify({
+          settings: {
+            shopify_product_rename_enabled: productRenameEnabled || "true",
+            shopify_generic_product_name: title,
+          },
+        }),
+      })
+      setProductRenameEnabled(result.settings.shopify_product_rename_enabled || productRenameEnabled || "true")
+      setGenericProductName(result.settings.shopify_generic_product_name || title)
+      setProductTitleLoaded(true)
+      if (showResult) onResult({ ok: result.ok, title: "Product Title Saved", message: `Shopify products will use: ${result.settings.shopify_generic_product_name || title}` })
+    } finally {
+      setSavingProductTitle(false)
+    }
+  }
   useEffect(() => {
     load(page).catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
     const timer = window.setInterval(() => load(page).catch(() => undefined), 5000)
@@ -7335,6 +7441,14 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     const timer = window.setInterval(() => loadDuplicates().catch(() => undefined), 5000)
     return () => window.clearInterval(timer)
   }, [])
+  useEffect(() => {
+    loadProductRepair().catch(() => undefined)
+    const timer = window.setInterval(() => loadProductRepair().catch(() => undefined), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
+  useEffect(() => {
+    loadProductTitleSettings().catch(() => undefined)
+  }, [])
   async function enqueuePending() {
     setBusy("Queue")
     setProgress({
@@ -7344,6 +7458,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       message: "Queueing Shopify fulfilment jobs.",
     })
     try {
+      await saveProductTitleSettings(false)
       const path = `/api/shopify/fulfilment/enqueue${storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""}`
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
       if (result.progress) setProgress(result.progress)
@@ -7362,6 +7477,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       message: "Queueing one Shopify test order.",
     })
     try {
+      await saveProductTitleSettings(false)
       const path = `/api/shopify/fulfilment/enqueue?limit=1${storeId ? `&store_id=${encodeURIComponent(storeId)}` : ""}`
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
       if (result.progress) setProgress(result.progress)
@@ -7380,6 +7496,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       message: "Starting Shopify fulfilment worker.",
     })
     try {
+      await saveProductTitleSettings(false)
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>("/api/shopify/fulfilment/run", { method: "POST" })
       if (result.progress) setProgress(result.progress)
       await load()
@@ -7397,6 +7514,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       message: "Running one Shopify fulfilment job.",
     })
     try {
+      await saveProductTitleSettings(false)
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>("/api/shopify/fulfilment/run-one", { method: "POST" })
       if (result.progress) setProgress(result.progress)
       await load()
@@ -7409,6 +7527,21 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     const result = await api<{ ok: boolean; message: string }>(`/api/shopify/fulfilment/jobs/${jobId}/retry`, { method: "POST" })
     await load()
     onResult({ ok: result.ok, title: "Retry Shopify Job", message: result.message })
+  }
+  async function repushJob(job: ShopifyFulfilmentJob) {
+    if (!job.shopify_order_id) return
+    const confirmed = window.confirm(`Only continue after Shopify order #${job.shopify_order_id} is cancelled. Repush ${job.odoo_order_name} now?`)
+    if (!confirmed) return
+    setBusy(`Repush-${job.id}`)
+    try {
+      await saveProductTitleSettings(false)
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(`/api/shopify/fulfilment/jobs/${job.id}/repush`, { method: "POST" })
+      if (result.progress) setProgress(result.progress)
+      await load()
+      onResult({ ok: result.ok, title: "Repush Shopify Job", message: result.message })
+    } finally {
+      setBusy("")
+    }
   }
   async function startOAuth(route: string) {
     setBusy(`OAuth-${route}`)
@@ -7446,6 +7579,39 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       setBusy("")
     }
   }
+  async function repairSyncedProducts() {
+    setBusy("ProductRepair")
+    setProductRepairProgress({
+      status: "running",
+      total: Math.max(1, total || jobs.length || 1),
+      processed: 0,
+      repaired: 0,
+      missing: 0,
+      failed: 0,
+      message: "Starting Shopify product repair for already-synced orders.",
+    })
+    try {
+      await saveProductTitleSettings(false)
+      const path = `/api/shopify/fulfilment/products/repair?limit=1000${storeId ? `&store_id=${encodeURIComponent(storeId)}` : ""}`
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyProductRepairProgress; logs?: ShopifyProductRepairLog[] }>(path, { method: "POST" })
+      if (result.progress) setProductRepairProgress(result.progress)
+      setProductRepairLogs(result.logs || [])
+      onResult({ ok: result.ok, title: "Repair Synced Products", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  async function cancelProductRepair() {
+    setBusy("ProductRepairCancel")
+    try {
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyProductRepairProgress; logs?: ShopifyProductRepairLog[] }>("/api/shopify/fulfilment/products/repair/cancel", { method: "POST" })
+      if (result.progress) setProductRepairProgress(result.progress)
+      setProductRepairLogs(result.logs || [])
+      onResult({ ok: result.ok, title: "Cancel Product Repair", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
   return (
     <div className="grid gap-5">
       <section className="page-section">
@@ -7459,11 +7625,34 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
           <CardDescription>Failed jobs stay visible and can be requeued. The worker claims one job at a time to avoid double exports.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3">
+          <div className="form-fieldset">
+            <div className="grid gap-3 md:grid-cols-[220px_minmax(260px,1fr)_auto] md:items-end">
+              <SelectField label="Product Title Mode" value={productRenameEnabled} onChange={setProductRenameEnabled}>
+                <option value="true">Use typed title</option>
+                <option value="false">Use original titles</option>
+              </SelectField>
+              <TextField label="Product Title" value={productTitleLoaded ? genericProductName : ""} onChange={(value) => { setProductTitleLoaded(true); setGenericProductName(value) }} />
+              <Button variant="outline" onClick={() => saveProductTitleSettings(true)} disabled={Boolean(busy) || savingProductTitle}>
+                {savingProductTitle ? "Saving..." : "Save Title"}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {productTitleLoaded
+                ? "When typed-title mode is on, synced Shopify products use this title and the original Odoo product name is kept in the SKU with a 39 character limit."
+                : "Loading saved Shopify product title."}
+            </p>
+          </div>
           <div className="btn-list">
             <Button onClick={enqueuePending} disabled={Boolean(busy)}>{busy === "Queue" ? "Queueing..." : "Queue Pending Amazon Orders"}</Button>
             <Button variant="outline" onClick={enqueueOneTestOrder} disabled={Boolean(busy)}>{busy === "QueueOne" ? "Queueing..." : "Queue 1 Test Order"}</Button>
             <Button variant="outline" onClick={runWorker} disabled={Boolean(busy)}>{busy === "Run" ? "Starting..." : "Run Worker"}</Button>
             <Button variant="outline" onClick={runOneJob} disabled={Boolean(busy)}>{busy === "RunOne" ? "Running..." : "Run One Job"}</Button>
+            <Button variant="outline" onClick={repairSyncedProducts} disabled={Boolean(busy) || productRepairBusy}>{busy === "ProductRepair" || productRepairBusy ? "Repairing..." : "Repair Synced Products"}</Button>
+            {productRepairBusy ? (
+              <Button variant="destructive" onClick={cancelProductRepair} disabled={busy === "ProductRepairCancel" || Boolean(productRepairProgress?.cancel_requested)}>
+                {busy === "ProductRepairCancel" || productRepairProgress?.cancel_requested ? "Cancelling..." : "Cancel Repair"}
+              </Button>
+            ) : null}
             {oauthMissing.map((item) => (
               <Button
                 key={`${item.route}-${item.dest_name}`}
@@ -7511,6 +7700,91 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                 <span>{progressPercent}%</span>
               </div>
               {progress?.error ? <p className="text-xs text-destructive">{progress.error}</p> : null}
+            </div>
+          ) : null}
+          {showProductRepairProgress ? (
+            <div className="form-fieldset">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="font-medium">
+                  Product repair: {productRepairProgress?.status || "idle"}
+                  {productRepairProgress?.current_order ? ` - ${productRepairProgress.current_order}` : ""}
+                </span>
+                <span className="text-muted-foreground">
+                  {productRepairProcessed.toLocaleString()} / {productRepairTotal.toLocaleString()} order{productRepairTotal === 1 ? "" : "s"}
+                </span>
+              </div>
+              <div className="progress">
+                <div
+                  className={`progress-bar bg-primary transition-all ${productRepairBusy ? "progress-bar-striped progress-bar-animated" : ""}`}
+                  role="progressbar"
+                  aria-valuenow={productRepairPercent}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Shopify product repair ${productRepairPercent}% complete`}
+                  style={{ width: `${productRepairPercent}%` }}
+                />
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>{productRepairProgress?.cancel_requested ? "Cancellation requested. Waiting for the current safe checkpoint." : productRepairProgress?.message || "No product repair has run yet."}</span>
+                <span>
+                  {Number(productRepairProgress?.repaired || 0).toLocaleString()} repaired · {Number(productRepairProgress?.missing || 0).toLocaleString()} missing · {Number(productRepairProgress?.failed || 0).toLocaleString()} failed
+                </span>
+              </div>
+              {productRepairProgress?.error ? <p className="text-xs text-destructive">{productRepairProgress.error}</p> : null}
+            </div>
+          ) : null}
+          {productRepairLogs.length ? (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Odoo Order</TableHead>
+                    <TableHead>Shopify Order</TableHead>
+                    <TableHead>Order Line Snapshot</TableHead>
+                    <TableHead>Before Product/Variant</TableHead>
+                    <TableHead>New Product Title</TableHead>
+                    <TableHead>New SKU</TableHead>
+                    <TableHead>Verified On Shopify</TableHead>
+                    <TableHead>Status</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {productRepairLogs.map((log, index) => (
+                    <TableRow key={`${log.odoo_order_name}-${log.shopify_order_id}-${index}`}>
+                      <TableCell className="font-medium">{log.odoo_order_name}</TableCell>
+                      <TableCell>
+                        {log.shopify_order_url ? (
+                          <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={log.shopify_order_url} target="_blank" rel="noreferrer" title="Open Shopify order" onClick={(event) => openExternalLink(event, log.shopify_order_url)}>
+                            #{log.shopify_order_id}
+                            <ExternalLink className="size-3.5" />
+                          </a>
+                        ) : (
+                          <span>{log.shopify_order_id || "Not linked"}</span>
+                        )}
+                        <div className="text-xs text-muted-foreground">{log.dest_name || log.shop}</div>
+                      </TableCell>
+                      <TableCell className="min-w-[240px]">
+                        <div>{log.order_line_title || <span className="text-muted-foreground">Empty</span>}</div>
+                        <div className="font-mono text-xs text-muted-foreground">{log.order_line_sku || ""}</div>
+                      </TableCell>
+                      <TableCell className="min-w-[240px]">
+                        <div>{log.old_product_title || <span className="text-muted-foreground">Empty</span>}</div>
+                        <div className="font-mono text-xs text-muted-foreground">{log.old_sku || ""}</div>
+                      </TableCell>
+                      <TableCell className="min-w-[220px]">{log.new_product_title || <span className="text-muted-foreground">Empty</span>}</TableCell>
+                      <TableCell className="font-mono text-xs">{log.new_sku || <span className="text-muted-foreground">Empty</span>}</TableCell>
+                      <TableCell className="min-w-[220px]">
+                        <div>{log.verified_product_title || <span className="text-muted-foreground">Not checked</span>}</div>
+                        <div className="font-mono text-xs text-muted-foreground">{log.verified_variant_sku || ""}</div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={log.status === "repaired" ? "secondary" : log.status === "failed" ? "destructive" : "outline"}>{log.status}</Badge>
+                        {log.error ? <div className="mt-1 max-w-[260px] text-xs text-destructive">{log.error}</div> : null}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             </div>
           ) : null}
           {oauthMissing.length ? (
@@ -7688,7 +7962,16 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                   <TableCell>{job.attempts}/{job.max_attempts}</TableCell>
                   <TableCell>{formatDateTime(job.updated_at || job.created_at)}</TableCell>
                   <TableCell className="max-w-md"><ErrorTooltip value={job.last_error} /></TableCell>
-                  <TableCell>{["failed", "dead"].includes(job.status) && <Button size="sm" variant="outline" onClick={() => retryJob(job.id)}>Retry</Button>}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-2">
+                      {["failed", "dead"].includes(job.status) ? <Button size="sm" variant="outline" onClick={() => retryJob(job.id)}>Retry</Button> : null}
+                      {job.shopify_order_id ? (
+                        <Button size="sm" variant="warning" disabled={Boolean(busy)} onClick={() => repushJob(job)}>
+                          {busy === `Repush-${job.id}` ? "Repushing..." : "Repush"}
+                        </Button>
+                      ) : null}
+                    </div>
+                  </TableCell>
                 </TableRow>
               ))}
               {!jobs.length && <TableRow><TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No Shopify fulfilment jobs yet.</TableCell></TableRow>}
@@ -8160,7 +8443,7 @@ function SettingsPage({
               <option value="true">Use generic product name</option>
               <option value="false">Use original product names</option>
             </SelectField>
-            <TextField label="Generic Product Name" value={settings.shopify_generic_product_name || "Generic Product"} onChange={(value) => setSetting("shopify_generic_product_name", value)} />
+            <TextField label="Generic Product Name" value={settings.shopify_generic_product_name || ""} onChange={(value) => setSetting("shopify_generic_product_name", value)} />
             <TextField label="Fulfilment Max Attempts" value={settings.shopify_job_max_attempts || "5"} onChange={(value) => setSetting("shopify_job_max_attempts", value)} />
             <TextField label="Tracking Default Days" value={settings.shopify_tracking_from_days || "7"} onChange={(value) => setSetting("shopify_tracking_from_days", value)} />
             <SelectField label="Tracking Validates Deliveries" value={settings.shopify_tracking_validate_deliveries || "true"} onChange={(value) => setSetting("shopify_tracking_validate_deliveries", value)}>
