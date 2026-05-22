@@ -70,6 +70,7 @@ class PlacePayload(BaseModel):
     club: bool = False
     ordering_engine: str = "rest"
     allow_missing_spaid: bool = False
+    include_missing_asins: bool = False
 
 
 class ChromeJobCompletePayload(BaseModel):
@@ -159,6 +160,14 @@ class ChromeJobHeartbeatPayload(BaseModel):
 class ChromeJobResetPayload(BaseModel):
     worker_id: str = ""
     line_ids: list[int] = []
+
+
+class ChromeBrowserlessRunPayload(BaseModel):
+    worker_id: str = ""
+    store_id: Optional[int] = None
+    ordering_engine: str = "rest"
+    split_mixed_asin: bool = False
+    max_jobs: int = 0
 
 
 class EpostTrackingUpdatePayload(BaseModel):

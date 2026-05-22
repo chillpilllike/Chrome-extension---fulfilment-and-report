@@ -1687,6 +1687,7 @@ function App() {
   const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
   const [resetFulfilmentConfirmOpen, setResetFulfilmentConfirmOpen] = useState(false)
   const [allowMissingSpaid, setAllowMissingSpaid] = useState(false)
+  const [resendMissingAsins, setResendMissingAsins] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>("pulled_at")
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc")
   const [showColumnSettings, setShowColumnSettings] = useState(false)
@@ -2218,6 +2219,7 @@ function App() {
           line_ids: selected,
           ordering_engine: orderingEngine,
           allow_missing_spaid: allowMissingSpaid,
+          include_missing_asins: resendMissingAsins,
         }),
       }),
     )
@@ -2235,6 +2237,7 @@ function App() {
           club: true,
           ordering_engine: orderingEngine,
           allow_missing_spaid: allowMissingSpaid,
+          include_missing_asins: resendMissingAsins,
         }),
       }),
     )
@@ -2257,6 +2260,7 @@ function App() {
           address_id: Number(addressId || 0) || null,
           amazon_account_id: Number(amazonAccountId || 0) || null,
           days: requestedDays,
+          include_missing_asins: resendMissingAsins,
         }),
       }),
     )
@@ -2920,6 +2924,7 @@ function App() {
                               amazon_account_id: Number(amazonAccountId),
                               ordering_engine: orderingEngine,
                               allow_missing_spaid: allowMissingSpaid,
+                              include_missing_asins: resendMissingAsins,
                             }),
                           }),
                         )
@@ -3125,6 +3130,10 @@ function App() {
                     Allow cXML submit without SPAID
                   </label>
                 )}
+                <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Checkbox checked={resendMissingAsins} onCheckedChange={(checked) => setResendMissingAsins(Boolean(checked))} />
+                  Resend missing/out-of-stock ASINs
+                </label>
                 <ExportControls
                   view="orders"
                   storeId={storeId}

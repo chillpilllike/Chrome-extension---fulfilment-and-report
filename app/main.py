@@ -5965,6 +5965,7 @@ def queue_chrome_order_groups_fast(
     address_id: Optional[int] = None,
     line_ids: Optional[list[int]] = None,
     club: bool = False,
+    include_missing_asins: bool = False,
 ) -> tuple[int, int, int, dict[str, Any], list[str]]:
     with db() as conn:
         cleared_cursor = conn.execute(
@@ -6006,8 +6007,10 @@ def queue_chrome_order_groups_fast(
         line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
         if line_ids is not None and not line_ids:
             return 0, int(cleared_cursor.rowcount or 0), blocked, account, []
-        if line_ids:
-            placeholders = ",".join("?" for _ in line_ids)
+        if line_ids or include_missing_asins:
+            placeholders = ",".join("?" for _ in (line_ids or []))
+            missing_state_filter = "AND state IN ('missing', 'error')" if line_ids else "AND state='missing'"
+            missing_line_filter = f"AND id IN ({placeholders})" if line_ids else ""
             conn.execute(
                 f"""
                 UPDATE order_lines
@@ -6026,11 +6029,11 @@ def queue_chrome_order_groups_fast(
                     ordered_at=NULL,
                     updated_at=?
                 WHERE store_id=?
-                  AND id IN ({placeholders})
+                  {missing_line_filter}
                   AND COALESCE(amazon_order_id, '') = ''
-                  AND state IN ('missing', 'error')
+                  {missing_state_filter}
                 """,
-                [utc_now(), store_id, *line_ids],
+                [utc_now(), store_id, *(line_ids or [])],
             )
         where_line_ids = ""
         params: list[Any] = [store_id]
@@ -6044,12 +6047,13 @@ def queue_chrome_order_groups_fast(
             WHERE store_id = ?
               AND asin IS NOT NULL AND asin != ''
               AND COALESCE(amazon_order_id, '') = ''
-              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory', 'ignored')
+              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory', 'ignored')
+              AND (? = 1 OR state != 'missing')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {where_line_ids}
             ORDER BY odoo_order_id DESC, id ASC
             """,
-            params,
+            [store_id, 1 if include_missing_asins else 0, *params[1:]],
         ).fetchall()
         if lines:
             allowed_ids, candidate_blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, [int(line["id"]) for line in lines])
@@ -6500,6 +6504,7 @@ def place_orders(
     club: bool = False,
     ordering_engine: str = "rest",
     allow_missing_spaid: bool = False,
+    include_missing_asins: bool = False,
 ) -> tuple[int, int]:
     store = get_store(store_id)
     amazon_account = get_amazon_account(amazon_account_id)
@@ -6521,18 +6526,40 @@ def place_orders(
             placeholders = ",".join("?" for _ in line_ids)
             where_line_ids = f" AND id IN ({placeholders})"
             params.extend(line_ids)
+        if include_missing_asins:
+            reset_filter = f"AND id IN ({','.join('?' for _ in line_ids)})" if line_ids else ""
+            conn.execute(
+                f"""
+                UPDATE order_lines
+                SET state='pulled',
+                    amazon_status=NULL,
+                    amazon_group_key=NULL,
+                    chrome_claimed_by=NULL,
+                    chrome_claimed_at=NULL,
+                    chrome_claim_expires_at=NULL,
+                    last_error=NULL,
+                    missing_asin=NULL,
+                    updated_at=?
+                WHERE store_id=?
+                  {reset_filter}
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND state='missing'
+                """,
+                [utc_now(), store_id, *(line_ids or [])],
+            )
         lines = conn.execute(
             f"""
             SELECT * FROM order_lines
             WHERE store_id = ?
               AND asin IS NOT NULL AND asin != ''
               AND COALESCE(amazon_order_id, '') = ''
-              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'missing', 'costly', 'inventory', 'ignored')
+              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory', 'ignored')
+              AND (? = 1 OR state != 'missing')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {where_line_ids}
             ORDER BY odoo_order_id DESC, id ASC
             """,
-            params,
+            [store_id, 1 if include_missing_asins else 0, *params[1:]],
         ).fetchall()
         if lines:
             allowed_ids, candidate_blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, [int(line["id"]) for line in lines])
@@ -11503,6 +11530,7 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
             payload.address_id,
             payload.line_ids or None,
             payload.club,
+            payload.include_missing_asins,
         )
         message = (
             f"Using engine: chrome. Queued {queued} order group{'s' if queued != 1 else ''} "
@@ -11534,6 +11562,7 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
         club=payload.club,
         ordering_engine=ordering_engine,
         allow_missing_spaid=payload.allow_missing_spaid,
+        include_missing_asins=payload.include_missing_asins,
     )
     if ordered:
         with db() as conn:
@@ -11599,6 +11628,7 @@ def api_place_recent_chrome(payload: dict[str, Any]) -> dict[str, Any]:
         club=False,
         ordering_engine="chrome",
         allow_missing_spaid=True,
+        include_missing_asins=bool(payload.get("include_missing_asins")),
     )
     data = dashboard_data(store_id)
     data["message"] = (
