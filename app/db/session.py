@@ -111,7 +111,7 @@ class PostgresConnection:
         if not POSTGRES_URL:
             raise RuntimeError("POSTGRES_URL or DATABASE_URL is required. SQLite is intentionally disabled.")
         connect_timeout = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "8"))
-        statement_timeout_ms = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", "20000"))
+        statement_timeout_ms = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", "120000"))
         use_pool = os.getenv("POSTGRES_USE_POOL", "false").strip().lower() in {"1", "true", "yes", "on"}
         if not use_pool:
             raw = psycopg2.connect(

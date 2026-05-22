@@ -20,7 +20,7 @@ import uuid
 import zipfile
 import xmlrpc.client
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from urllib.parse import urlencode, urlsplit
 from urllib.parse import quote_plus
@@ -132,6 +132,9 @@ _STORE_CACHE: dict[int, tuple[Store, float]] = {}
 _STORES_LIST_CACHE: tuple[list[dict[str, Any]], float] = ([], 0.0)
 _STORE_CACHE_LOCK = threading.Lock()
 _SHOPIFY_QUEUE_LOCK = threading.Lock()
+_SHOPIFY_WORKER_RUNNING_LOCK = threading.Lock()
+_SHOPIFY_RATE_LIMIT_LOCK = threading.Lock()
+_SHOPIFY_RATE_LIMIT_BUCKETS: dict[str, dict[str, float]] = {}
 _SHOPIFY_OAUTH_LOCK = threading.Lock()
 _SHOPIFY_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 _SHOPIFY_FULFILMENT_PROGRESS_LOCK = threading.Lock()
@@ -9604,31 +9607,25 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
 
 def claim_shopify_fulfilment_job() -> Optional[dict[str, Any]]:
     with db() as conn:
-        row = conn.execute(
+        return conn.execute(
             """
-            SELECT *
-            FROM shopify_fulfilment_jobs
-            WHERE status IN ('queued', 'failed')
-              AND attempts < max_attempts
-              AND (next_run_at IS NULL OR next_run_at='' OR next_run_at <= ?)
-            ORDER BY created_at ASC
-            LIMIT 1
-            """,
-            (utc_now(),),
-        ).fetchone()
-        if not row:
-            return None
-        cursor = conn.execute(
-            """
+            WITH next_job AS (
+                SELECT id
+                FROM shopify_fulfilment_jobs
+                WHERE status IN ('queued', 'failed')
+                  AND attempts < max_attempts
+                  AND (next_run_at IS NULL OR next_run_at='' OR next_run_at <= ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
             UPDATE shopify_fulfilment_jobs
             SET status='running', attempts=attempts+1, locked_at=?, updated_at=?
-            WHERE id=? AND status IN ('queued', 'failed')
+            WHERE id = (SELECT id FROM next_job)
+            RETURNING *
             """,
-            (utc_now(), utc_now(), row["id"]),
-        )
-        if not cursor.rowcount:
-            return None
-        return conn.execute("SELECT * FROM shopify_fulfilment_jobs WHERE id=?", (row["id"],)).fetchone()
+            (utc_now(), utc_now(), utc_now()),
+        ).fetchone()
 
 
 def due_shopify_fulfilment_job_count() -> int:
@@ -9652,9 +9649,69 @@ def set_shopify_fulfilment_progress(**updates: Any) -> dict[str, Any]:
         return dict(_SHOPIFY_FULFILMENT_PROGRESS)
 
 
+def increment_shopify_fulfilment_progress(**updates: Any) -> dict[str, Any]:
+    with _SHOPIFY_FULFILMENT_PROGRESS_LOCK:
+        processed = int(_SHOPIFY_FULFILMENT_PROGRESS.get("processed") or 0) + 1
+        current_total = int(_SHOPIFY_FULFILMENT_PROGRESS.get("total") or 0)
+        _SHOPIFY_FULFILMENT_PROGRESS["processed"] = processed
+        _SHOPIFY_FULFILMENT_PROGRESS["total"] = max(current_total, processed)
+        _SHOPIFY_FULFILMENT_PROGRESS.update(updates)
+        _SHOPIFY_FULFILMENT_PROGRESS["updated_at"] = utc_now()
+        return dict(_SHOPIFY_FULFILMENT_PROGRESS)
+
+
 def shopify_fulfilment_progress() -> dict[str, Any]:
     with _SHOPIFY_FULFILMENT_PROGRESS_LOCK:
         return dict(_SHOPIFY_FULFILMENT_PROGRESS)
+
+
+def shopify_positive_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(float(str(value or "").strip()))
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def shopify_positive_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(str(value or "").strip())
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def shopify_fulfilment_concurrency(settings: Optional[dict[str, Any]] = None) -> int:
+    settings = settings or get_service_settings()
+    return shopify_positive_int(settings.get("shopify_fulfilment_concurrency"), 3, 1, 8)
+
+
+def shopify_api_rate_config(settings: Optional[dict[str, Any]] = None) -> tuple[float, int]:
+    settings = settings or get_service_settings()
+    rate = shopify_positive_float(settings.get("shopify_admin_api_requests_per_second"), 2.0, 0.25, 20.0)
+    burst = shopify_positive_int(settings.get("shopify_admin_api_burst"), 35, 1, 80)
+    return rate, burst
+
+
+def shopify_wait_for_api_slot(shop_key: str, rate_per_second: float, burst: int) -> None:
+    if rate_per_second <= 0:
+        return
+    bucket_key = clean_text(shop_key) or "default"
+    while True:
+        sleep_for = 0.0
+        with _SHOPIFY_RATE_LIMIT_LOCK:
+            now = time.monotonic()
+            bucket = _SHOPIFY_RATE_LIMIT_BUCKETS.setdefault(bucket_key, {"tokens": float(burst), "updated_at": now})
+            elapsed = max(0.0, now - float(bucket.get("updated_at") or now))
+            tokens = min(float(burst), float(bucket.get("tokens") or 0.0) + (elapsed * rate_per_second))
+            if tokens >= 1.0:
+                bucket["tokens"] = tokens - 1.0
+                bucket["updated_at"] = now
+                return
+            bucket["tokens"] = tokens
+            bucket["updated_at"] = now
+            sleep_for = (1.0 - tokens) / rate_per_second
+        time.sleep(min(max(sleep_for, 0.05), 1.0))
 
 
 def set_shopify_duplicate_progress(**updates: Any) -> dict[str, Any]:
@@ -10456,6 +10513,15 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
     script_path = settings["shopify_dtb_script_path"] if route == "dtb" else settings["shopify_dtc_script_path"]
     module = load_external_script(script_path, f"shopify_export_{route}_{uuid.uuid4().hex}")
     apply_shopify_runtime_settings(module, route, settings)
+    request_rate, request_burst = shopify_api_rate_config(settings)
+    original_shopify_client = module.ShopifyClient
+
+    class RateLimitedShopifyClient(original_shopify_client):  # type: ignore[misc, valid-type]
+        def _request(self, method: str, url: str, json_body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+            shopify_wait_for_api_slot(getattr(self, "shop", "") or getattr(self, "name", "") or route, request_rate, request_burst)
+            return super()._request(method, url, json_body)
+
+    module.ShopifyClient = RateLimitedShopifyClient
     module.ODOO_URL = store.odoo_url
     module.ODOO_DB = store.odoo_db
     module.ODOO_USERNAME = store.odoo_user
@@ -10497,133 +10563,148 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
                 fulfilled = [order for order in active_existing if shopify_order_is_fulfilled(order)]
                 keep = fulfilled[0] if fulfilled else active_existing[0]
                 state.mark_order_synced(shop.name, src_order_key, clean_text(keep.get("id")) or None)
-                order_ids = ", ".join(f"#{order.get('id')}" for order in active_existing if order.get("id"))
-                raise RuntimeError(
-                    f"Shopify order already exists for {job['odoo_order_name']} in {shop.name}: {order_ids or len(active_existing)}. "
-                    "This job was marked synced to the existing order and was not pushed again."
-                )
+                return
         module.sync_one_order_to_dest(odoo, shop, state, str(job["odoo_order_name"]), rename_manager)
 
 
-def process_one_shopify_fulfilment_job() -> bool:
-    if not _SHOPIFY_QUEUE_LOCK.acquire(blocking=False):
+def process_one_shopify_fulfilment_job(worker_name: str = "") -> bool:
+    job = claim_shopify_fulfilment_job()
+    if not job:
         return False
-    try:
-        job = claim_shopify_fulfilment_job()
-        if not job:
-            return False
-        progress = shopify_fulfilment_progress()
-        if str(progress.get("status") or "") not in {"running", "queued"}:
-            set_shopify_fulfilment_progress(
-                status="running",
-                total=max(1, due_shopify_fulfilment_job_count() + 1),
-                processed=0,
-                started_at=utc_now(),
-                completed_at="",
-                error="",
-            )
+    progress = shopify_fulfilment_progress()
+    if str(progress.get("status") or "") not in {"running", "queued"}:
         set_shopify_fulfilment_progress(
             status="running",
-            current_order=str(job["odoo_order_name"] or ""),
-            current_route=str(job["route"] or "").upper(),
-            message=f"Syncing {job['odoo_order_name']} to Shopify {str(job['route'] or '').upper()}.",
-        )
-        try:
-            run_shopify_script_export(job)
-            with db() as conn:
-                conn.execute(
-                    "UPDATE shopify_fulfilment_jobs SET status='completed', last_error='', completed_at=?, updated_at=? WHERE id=?",
-                    (utc_now(), utc_now(), job["id"]),
-                )
-            progress = shopify_fulfilment_progress()
-            processed = int(progress.get("processed") or 0) + 1
-            set_shopify_fulfilment_progress(
-                processed=processed,
-                total=max(int(progress.get("total") or 0), processed),
-                message=f"Synced {job['odoo_order_name']} to Shopify.",
-                error="",
-            )
-        except Exception as exc:
-            retry_delay = min(3600, 60 * max(1, int(job["attempts"] or 1)))
-            next_run = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
-            next_status = "failed" if int(job["attempts"] or 0) < int(job["max_attempts"] or 5) else "dead"
-            error_text = str(exc)[:2000]
-            with db() as conn:
-                conn.execute(
-                    """
-                    UPDATE shopify_fulfilment_jobs
-                    SET status=?, last_error=?, next_run_at=?, updated_at=?
-                    WHERE id=?
-                    """,
-                    (next_status, error_text, next_run, utc_now(), job["id"]),
-                )
-            if not error_text.startswith("Shopify OAuth token"):
-                send_email_alert_async(
-                    f"Shopify fulfilment {next_status}: {job['odoo_order_name']}",
-                    f"Order: {job['odoo_order_name']}\nRoute: {job['route']}\nStatus: {next_status}\nError: {error_text}",
-                )
-            progress = shopify_fulfilment_progress()
-            processed = int(progress.get("processed") or 0) + 1
-            set_shopify_fulfilment_progress(
-                processed=processed,
-                total=max(int(progress.get("total") or 0), processed),
-                message=f"Shopify sync stopped on {job['odoo_order_name']}: {error_text}",
-                error=error_text,
-            )
-        return True
-    finally:
-        _SHOPIFY_QUEUE_LOCK.release()
-
-
-def shopify_fulfilment_worker() -> None:
-    progress = shopify_fulfilment_progress()
-    if str(progress.get("status") or "") != "running":
-        total = due_shopify_fulfilment_job_count()
-        set_shopify_fulfilment_progress(
-            status="running" if total else "idle",
-            total=total,
+            total=max(1, due_shopify_fulfilment_job_count() + 1),
             processed=0,
-            current_order="",
-            current_route="",
-            message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''}.",
-            started_at=utc_now() if total else "",
+            started_at=utc_now(),
             completed_at="",
             error="",
         )
-    while process_one_shopify_fulfilment_job():
-        time.sleep(1)
-    progress = shopify_fulfilment_progress()
-    if str(progress.get("status") or "") == "running":
-        processed = int(progress.get("processed") or 0)
-        total = max(int(progress.get("total") or 0), processed)
-        set_shopify_fulfilment_progress(
-            status="completed" if total else "idle",
-            total=total,
-            processed=processed,
-            current_order="",
-            current_route="",
-            completed_at=utc_now(),
-            message=(
-                f"Shopify fulfilment worker finished {processed} of {total} job{'s' if total != 1 else ''}."
-                if total else "No Shopify fulfilment jobs were ready."
-            ),
+    route = str(job["route"] or "").upper()
+    worker_label = f" {worker_name}" if worker_name else ""
+    set_shopify_fulfilment_progress(
+        status="running",
+        current_order=str(job["odoo_order_name"] or ""),
+        current_route=route,
+        message=f"Syncing {job['odoo_order_name']} to Shopify {route}{worker_label}.",
+    )
+    try:
+        run_shopify_script_export(job)
+        with db() as conn:
+            conn.execute(
+                "UPDATE shopify_fulfilment_jobs SET status='completed', last_error='', completed_at=?, updated_at=? WHERE id=?",
+                (utc_now(), utc_now(), job["id"]),
+            )
+        increment_shopify_fulfilment_progress(
+            message=f"Synced {job['odoo_order_name']} to Shopify.",
+            error="",
         )
+    except Exception as exc:
+        retry_delay = min(3600, 60 * max(1, int(job["attempts"] or 1)))
+        next_run = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
+        next_status = "failed" if int(job["attempts"] or 0) < int(job["max_attempts"] or 5) else "dead"
+        error_text = str(exc)[:2000]
+        with db() as conn:
+            conn.execute(
+                """
+                UPDATE shopify_fulfilment_jobs
+                SET status=?, last_error=?, next_run_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (next_status, error_text, next_run, utc_now(), job["id"]),
+            )
+        if not error_text.startswith("Shopify OAuth token"):
+            send_email_alert_async(
+                f"Shopify fulfilment {next_status}: {job['odoo_order_name']}",
+                f"Order: {job['odoo_order_name']}\nRoute: {job['route']}\nStatus: {next_status}\nError: {error_text}",
+            )
+        increment_shopify_fulfilment_progress(
+            message=f"Shopify sync stopped on {job['odoo_order_name']}: {error_text}",
+            error=error_text,
+        )
+    return True
+
+
+def shopify_fulfilment_worker() -> None:
+    try:
+        settings = get_service_settings()
+        concurrency = shopify_fulfilment_concurrency(settings)
+        progress = shopify_fulfilment_progress()
+        if str(progress.get("status") or "") != "running":
+            total = due_shopify_fulfilment_job_count()
+            set_shopify_fulfilment_progress(
+                status="running" if total else "idle",
+                total=total,
+                processed=0,
+                current_order="",
+                current_route="",
+                message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''} using {concurrency} concurrent push{'es' if concurrency != 1 else ''}.",
+                started_at=utc_now() if total else "",
+                completed_at="",
+                error="",
+            )
+        no_more_jobs = False
+        future_index = 0
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="shopify-fulfil") as executor:
+            futures: set[Any] = set()
+            while futures or not no_more_jobs:
+                while not no_more_jobs and len(futures) < concurrency:
+                    future_index += 1
+                    futures.add(executor.submit(process_one_shopify_fulfilment_job, f"worker {future_index}"))
+                if not futures:
+                    break
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        processed_job = bool(future.result())
+                    except Exception as exc:
+                        processed_job = True
+                        set_shopify_fulfilment_progress(error=str(exc), message=f"Shopify worker error: {exc}")
+                    if not processed_job:
+                        no_more_jobs = True
+        progress = shopify_fulfilment_progress()
+        if str(progress.get("status") or "") == "running":
+            processed = int(progress.get("processed") or 0)
+            total = max(int(progress.get("total") or 0), processed)
+            set_shopify_fulfilment_progress(
+                status="completed" if total else "idle",
+                total=total,
+                processed=processed,
+                current_order="",
+                current_route="",
+                completed_at=utc_now(),
+                message=(
+                    f"Shopify fulfilment worker finished {processed} of {total} job{'s' if total != 1 else ''}."
+                    if total else "No Shopify fulfilment jobs were ready."
+                ),
+            )
+    finally:
+        _SHOPIFY_WORKER_RUNNING_LOCK.release()
 
 
 def start_shopify_fulfilment_worker() -> dict[str, Any]:
     total = due_shopify_fulfilment_job_count()
+    settings = get_service_settings()
+    concurrency = shopify_fulfilment_concurrency(settings)
+    lock_acquired = False
+    if total:
+        lock_acquired = _SHOPIFY_WORKER_RUNNING_LOCK.acquire(blocking=False)
+        if not lock_acquired:
+            return set_shopify_fulfilment_progress(message="Shopify fulfilment worker is already running.")
     set_shopify_fulfilment_progress(
         status="running" if total else "idle",
         total=total,
         processed=0,
         current_order="",
         current_route="",
-        message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''}.",
+        message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''} using {concurrency} concurrent push{'es' if concurrency != 1 else ''}.",
         started_at=utc_now() if total else "",
         completed_at="",
         error="",
     )
-    threading.Thread(target=shopify_fulfilment_worker, daemon=True).start()
+    if lock_acquired:
+        threading.Thread(target=shopify_fulfilment_worker, daemon=True).start()
     return shopify_fulfilment_progress()
 
 
@@ -13300,7 +13381,7 @@ def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None, limit: int = 
 @app.post("/api/shopify/fulfilment/run")
 def api_shopify_fulfilment_run() -> dict[str, Any]:
     progress = start_shopify_fulfilment_worker()
-    return {"ok": True, "message": "Shopify fulfilment worker started. Jobs are claimed one at a time.", "progress": progress}
+    return {"ok": True, "message": "Shopify fulfilment worker started with concurrent Shopify-safe rate limiting.", "progress": progress}
 
 
 @app.post("/api/shopify/fulfilment/run-one")

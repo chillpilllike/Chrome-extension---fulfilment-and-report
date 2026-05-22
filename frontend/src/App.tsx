@@ -8473,6 +8473,9 @@ function SettingsPage({
             </SelectField>
             <TextField label="Generic Product Name" value={settings.shopify_generic_product_name || ""} onChange={(value) => setSetting("shopify_generic_product_name", value)} />
             <TextField label="Fulfilment Max Attempts" value={settings.shopify_job_max_attempts || "5"} onChange={(value) => setSetting("shopify_job_max_attempts", value)} />
+            <TextField label="Fulfilment Concurrency" value={settings.shopify_fulfilment_concurrency || "3"} onChange={(value) => setSetting("shopify_fulfilment_concurrency", value)} />
+            <TextField label="Shopify API Requests/sec" value={settings.shopify_admin_api_requests_per_second || "2"} onChange={(value) => setSetting("shopify_admin_api_requests_per_second", value)} />
+            <TextField label="Shopify API Burst" value={settings.shopify_admin_api_burst || "35"} onChange={(value) => setSetting("shopify_admin_api_burst", value)} />
             <TextField label="Tracking Default Days" value={settings.shopify_tracking_from_days || "7"} onChange={(value) => setSetting("shopify_tracking_from_days", value)} />
             <SelectField label="Tracking Validates Deliveries" value={settings.shopify_tracking_validate_deliveries || "true"} onChange={(value) => setSetting("shopify_tracking_validate_deliveries", value)}>
               <option value="true">Validate pickings</option>
@@ -8509,6 +8512,9 @@ function SettingsPage({
                 "shopify_product_rename_enabled",
                 "shopify_generic_product_name",
                 "shopify_job_max_attempts",
+                "shopify_fulfilment_concurrency",
+                "shopify_admin_api_requests_per_second",
+                "shopify_admin_api_burst",
                 "shopify_tracking_from_days",
                 "shopify_tracking_validate_deliveries",
                 "shopify_tracking_skip_done_pickings",

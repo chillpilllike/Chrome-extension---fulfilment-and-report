@@ -1302,8 +1302,12 @@ class ShopifyClient:
         return cid
 
     def create_product_with_variant(self, *, title: str, body_html: str | None, sku: str, price: str | None, barcode: str | None, image_b64: str | None) -> tuple[int, int]:
+        handle_seed = sku or title
+        handle_base = re.sub(r"[^a-z0-9]+", "-", (title or "product").lower()).strip("-") or "product"
+        handle_hash = hashlib.sha1(handle_seed.encode("utf-8", "ignore")).hexdigest()[:10]
         product = {
             "title": title,
+            "handle": f"{handle_base[:120].strip('-')}-{handle_hash}",
             "status": "active",
             "variants": [{"sku": sku, "inventory_management": None}],
         }
