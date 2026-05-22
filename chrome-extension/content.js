@@ -13,6 +13,11 @@ const DEFAULT_NEW_DELIVERY_ADDRESS = {
 
 let extensionContextAlive = true;
 let panelOrderStatusVersion = 0;
+let orderHistoryAnnotationScheduled = false;
+let orderHistoryAnnotationInFlight = false;
+const orderHistoryLookupCache = new Map();
+const orderHistorySyncInProgress = new Map();
+const orderHistorySyncedConfirmations = new Map();
 
 async function send(message) {
   if (!extensionContextAlive) return null;
@@ -29,7 +34,11 @@ async function send(message) {
 
 async function getActiveJob() {
   const data = await send({ type: "GET_ACTIVE_JOB" });
-  return data?.activeJob;
+  if (data?.activeJob) return data.activeJob;
+  if (!/amazon\.com$/i.test(location.hostname)) return null;
+  if (!isOrderHistoryPage() && !confirmationSaysPlaced()) return null;
+  const recovered = await send({ type: "RECOVER_SUBMITTED_JOB" });
+  return recovered?.activeJob || null;
 }
 
 async function setActiveJob(activeJob) {
@@ -272,6 +281,7 @@ function findVisibleTextTarget(texts, selectors = "a, button, input[type='submit
 
 function parsePriceFrom(element) {
   if (!element) return null;
+  if (isUnitPriceElement(element)) return null;
   const offscreen = element.querySelector(".a-offscreen")?.textContent || "";
   const offscreenPrice = priceFromText(offscreen);
   if (offscreenPrice) return offscreenPrice;
@@ -280,6 +290,19 @@ function parsePriceFrom(element) {
   const value = Number(`${whole.replace(/[^0-9]/g, "")}.${fraction.replace(/[^0-9]/g, "").slice(0, 2)}`);
   if (Number.isFinite(value) && value > 0) return value;
   return priceFromText(element.textContent || "");
+}
+
+function isUnitPriceElement(element) {
+  if (!element) return false;
+  if (element.closest(".aok-relative")) return true;
+  const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+  if (/\/\s*(?:count|ct|unit|each|oz|ounce|fl\s*oz|lb|pound|g|gram|mg|ml)\b/i.test(text)) return true;
+  for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
+    const nodeText = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+    if (nodeText.length > 80) break;
+    if (/\/\s*(?:count|ct|unit|each|oz|ounce|fl\s*oz|lb|pound|g|gram|mg|ml)\b/i.test(nodeText)) return true;
+  }
+  return false;
 }
 
 function priceCandidatesIn(root, selectors = [".a-price"]) {
@@ -453,6 +476,8 @@ function rememberProductDosage(activeJob, item = null) {
 
 function recipientName(activeJob) {
   const orderNames = Array.isArray(activeJob?.job?.order_names) ? activeJob.job.order_names : [];
+  const mixedAsin = isMixedAsinOrder(activeJob);
+  const recipientSuffix = String(activeJob?.job?.recipient_suffix || "").replace(/\s+/g, "").trim();
   const dosageByOrder = activeJob?.dosageByOrder && typeof activeJob.dosageByOrder === "object" ? activeJob.dosageByOrder : {};
   if (orderNames.length) {
     const parts = ["Nutricity"];
@@ -461,6 +486,7 @@ function recipientName(activeJob) {
       const name = String(orderName || "").trim();
       if (!name) continue;
       parts.push(name);
+      if (mixedAsin) continue;
       const dosages = Array.isArray(dosageByOrder[name]) ? dosageByOrder[name] : [];
       for (const dosage of dosages) {
         const normalized = String(dosage || "").replace(/\s+/g, "").trim();
@@ -470,19 +496,22 @@ function recipientName(activeJob) {
         }
       }
     }
+    if (mixedAsin) parts.push("Multi");
     const globalDosages = (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : [])
       .map((item) => String(item || "").replace(/\s+/g, "").trim())
       .filter(Boolean);
-    for (const dosage of globalDosages) {
+    for (const dosage of mixedAsin ? [] : globalDosages) {
       if (!assigned.has(dosage.toLowerCase())) parts.push(dosage);
     }
+    if (recipientSuffix) parts.push(recipientSuffix);
     return parts.join(" ").replace(/\s+/g, " ").trim();
   }
   const base = String(activeJob?.job?.recipient_name || "").replace(/\s+/g, " ").trim();
+  if (mixedAsin) return `${base} Multi${recipientSuffix ? ` ${recipientSuffix}` : ""}`.replace(/\s+/g, " ").trim();
   const dosages = (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : [])
     .map((item) => String(item || "").replace(/\s+/g, "").trim())
     .filter((dosage) => dosage && !base.toLowerCase().includes(dosage.toLowerCase()));
-  return [base, ...dosages].join(" ").trim();
+  return [base, ...dosages, recipientSuffix].filter(Boolean).join(" ").trim();
 }
 
 function priceFromText(text) {
@@ -492,17 +521,34 @@ function priceFromText(text) {
   return Number.isFinite(value) ? value : null;
 }
 
+function normalizedPackUnit(unit) {
+  const value = String(unit || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!value) return "";
+  if (/^(counts?|ct|capsules?|tablets?|softgels?|gummies?|packs?|pieces?|pcs)$/.test(value)) return "count";
+  if (/^(fl oz|fluid ounces?)$/.test(value)) return "fl oz";
+  if (/^(ounces?|oz)$/.test(value)) return "oz";
+  if (/^(pounds?|lbs?)$/.test(value)) return "lb";
+  if (/^(grams?|g)$/.test(value)) return "g";
+  if (/^(milligrams?|mg)$/.test(value)) return "mg";
+  if (/^(milliliters?|ml)$/.test(value)) return "ml";
+  if (/^(liters?|l)$/.test(value)) return "l";
+  return value;
+}
+
 function parseCountPack(text) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return null;
-  const countMatch = normalized.match(/\b(\d+(?:\.\d+)?)\s*(?:mini\s*)?counts?\b/i);
-  if (!countMatch) return null;
+  const countMatch = normalized.match(/\b(\d+(?:\.\d+)?)\s*(?:mini\s*)?(counts?|ct|capsules?|tablets?|softgels?|gummies?|packs?|pieces?|pcs)\b/i);
+  const amountMatch = normalized.match(/\b(\d+(?:\.\d+)?)\s*(fl\s*oz|fluid\s*ounces?|ounces?|oz|pounds?|lbs?|grams?|g|milligrams?|mg|milliliters?|ml|liters?|l)\b/i);
+  const sizeMatch = countMatch || amountMatch;
+  if (!sizeMatch) return null;
   const packMatch = normalized.match(/\bpack\s*of\s*(\d+(?:\.\d+)?)\b/i);
-  const count = Number(countMatch[1]);
+  const count = Number(sizeMatch[1]);
   const pack = packMatch ? Number(packMatch[1]) : 1;
   const units = count * pack;
   if (!Number.isFinite(units) || units <= 0) return null;
-  return { count, pack, units, label: normalized };
+  const unit = normalizedPackUnit(countMatch ? "count" : sizeMatch[2]);
+  return { count, pack, units, unit, label: normalized };
 }
 
 function itemCountPack(item) {
@@ -605,7 +651,7 @@ function variantSelectionNote(item, purchaseItem) {
   const orderedQuantity = Number(item.quantity || 1);
   const purchaseQuantity = Number(purchaseItem.quantity || 1);
   const totalUnits = purchaseItem.requested_total_units ? ` (${purchaseItem.requested_total_units} total count)` : "";
-  return `Cheaper Amazon variant found and used: ordered ${orderedQuantity} x ${originalLabel}${totalUnits}; purchased ${purchaseQuantity} x ${purchaseItem.selected_variant_label} (${purchaseItem.asin}) instead of ${item.asin}.`;
+  return `Equivalent Amazon pack variant found and used: ordered ${orderedQuantity} x ${originalLabel}${totalUnits}; purchased ${purchaseQuantity} x ${purchaseItem.selected_variant_label} (${purchaseItem.asin}) instead of ${item.asin}.`;
 }
 
 function chooseBestCountVariant(item, currentUnitPrice) {
@@ -630,6 +676,7 @@ function chooseBestCountVariant(item, currentUnitPrice) {
 
   const candidates = variants
     .map((variant) => {
+      if (ordered.unit && variant.unit && ordered.unit !== variant.unit) return null;
       const purchaseQuantity = requestedTotalUnits / variant.units;
       if (!Number.isInteger(purchaseQuantity) || purchaseQuantity < 1) return null;
       return {
@@ -640,12 +687,12 @@ function chooseBestCountVariant(item, currentUnitPrice) {
       };
     })
     .filter(Boolean)
-    .sort((a, b) => a.total - b.total || b.units - a.units);
+    .sort((a, b) => a.total - b.total || a.quantity - b.quantity || b.units - a.units);
   if (!candidates.length) return null;
 
   const currentTotal = Number(currentUnitPrice || 0) * requestedQuantity;
   const best = candidates[0];
-  if (currentTotal && best.total >= currentTotal - 0.01 && best.asin === currentAsin && best.quantity === requestedQuantity) {
+  if (best.asin === currentAsin && best.quantity === requestedQuantity) {
     return null;
   }
   if (currentTotal && best.total >= currentTotal - 0.01) return null;
@@ -666,7 +713,9 @@ async function selectCheapestCountVariant(activeJob, item, currentUnitPrice) {
   };
   await setActiveJob(activeJob);
   if (best.asin !== currentAsinFromUrl()) {
-    showPanel("Nutricity fulfilment", `Switching to ${best.label} to buy ${best.requested_total_units} total count for less.`, null, null);
+    const currentTotal = Number(currentUnitPrice || 0) * Math.max(1, Math.round(Number(item.quantity || 1)));
+    const savingText = currentTotal && best.total < currentTotal - 0.01 ? " for less" : "";
+    showPanel("Nutricity fulfilment", `Switching to ${best.label} to buy ${best.requested_total_units} total count${savingText}.`, null, null);
     if (best.target && visible(best.target)) {
       best.target.scrollIntoView({ block: "center", behavior: "smooth" });
       await sleep(500);
@@ -744,13 +793,13 @@ function checkoutLineItemTitle(groupView) {
 
 function checkoutLineItemQuantity(groupView) {
   const stepper = groupView?.querySelector?.("[name='stma-checkout-quantity-stepper'], [data-a-component='stepper']");
-  const value = Number(
-    stepper?.getAttribute?.("data-steppervalue") ||
-    stepper?.getAttribute?.("data-displaystring") ||
-    stepper?.querySelector?.("[data-a-selector='inner-value']")?.textContent ||
-    0,
-  );
-  return Number.isFinite(value) && value > 0 ? value : null;
+  const rawValue = stepper?.getAttribute?.("data-steppervalue")
+    ?? stepper?.getAttribute?.("data-displaystring")
+    ?? stepper?.querySelector?.("[data-a-selector='inner-value']")?.textContent
+    ?? (groupView?.innerText || groupView?.textContent || "").match(/Quantity:\s*(\d+)/i)?.[1]
+    ?? "";
+  const value = Number(String(rawValue).trim());
+  return Number.isFinite(value) ? value : null;
 }
 
 function checkoutLineItemLimitCandidate(activeJob, groupView) {
@@ -842,6 +891,31 @@ function cartLooksEmpty() {
 }
 
 function cartItemQuantity(item) {
+  const stepperValue = [
+    "[data-a-selector='inner-value']",
+    "[data-a-selector='value'] [data-a-selector='inner-value']",
+    "[data-action='a-stepper-spinbutton'] [data-a-selector='value']",
+    ".a-stepper [data-a-selector='value']",
+    ".a-stepper-value-live",
+  ]
+    .map((selector) => [...item.querySelectorAll(selector)].find(visible))
+    .find(Boolean);
+  if (stepperValue) {
+    const value = Number((stepperValue.innerText || stepperValue.textContent || "").replace(/[^\d.]/g, ""));
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  const quantityButton = [...item.querySelectorAll("button[aria-label*='quantity' i], button[aria-label*='Increase quantity' i], button[aria-label*='Decrease quantity' i]")]
+    .find((button) => visible(button) && /\b\d+\b/.test(button.getAttribute("aria-label") || ""));
+  if (quantityButton) {
+    const value = Number((quantityButton.getAttribute("aria-label") || "").match(/\b(\d+)\b/)?.[1]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  const prompt = [...item.querySelectorAll(".a-dropdown-prompt, [data-a-class*='quantity' i] .a-button-text")]
+    .find((node) => visible(node) && /^\s*\d+\s*$/.test(node.innerText || node.textContent || ""));
+  if (prompt) {
+    const value = Number((prompt.innerText || prompt.textContent || "").trim());
+    if (Number.isFinite(value) && value > 0) return value;
+  }
   const select = item.querySelector("select[name='quantity'], select[id*='quantity']");
   if (select?.value) {
     const value = Number(select.value);
@@ -859,9 +933,52 @@ function cartItemQuantity(item) {
 
 function cartActiveItems() {
   const activeCart = document.querySelector("#sc-active-cart");
-  if (!activeCart || !visible(activeCart)) return [];
-  return [...activeCart.querySelectorAll("[data-itemtype='active'], .sc-list-item, [data-asin], [data-name='Active Items'] [role='listitem']")]
-    .filter((item) => visible(item) && !/saved for later|sponsored/i.test(item.innerText || item.textContent || ""));
+  const activeRoots = [
+    activeCart,
+    document.querySelector("[data-name='Active Items']"),
+    document.querySelector("[aria-label='Shopping Cart']"),
+  ].filter((root) => root && visible(root));
+  const candidates = [];
+  for (const root of activeRoots) {
+    candidates.push(...root.querySelectorAll("[data-itemtype='active'], .sc-list-item, [data-asin], [data-name='Active Items'] [role='listitem']"));
+  }
+
+  // Amazon's newer cart can omit #sc-active-cart. In that layout, active cart
+  // rows are still anchored by visible Delete buttons and quantity controls.
+  for (const control of document.querySelectorAll("button[aria-label^='Delete '], input[aria-label^='Delete '], button[title^='Delete '], input[value='Delete']")) {
+    if (!visible(control)) continue;
+    let node = control;
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ");
+      const hasProductLink = Boolean(node.querySelector?.("a[href*='/dp/'], a[href*='/gp/product/']"));
+      const hasQuantityControl = Boolean(node.querySelector?.("select[name='quantity'], input[name='quantity'], button[aria-label*='quantity' i], [data-a-selector='inner-value']"));
+      if (hasProductLink && (hasQuantityControl || /in stock|size:/i.test(text))) {
+        candidates.push(node);
+        break;
+      }
+    }
+  }
+
+  const seen = new Set();
+  return candidates
+    .filter((item) => {
+      if (!item || !visible(item)) return false;
+      const text = (item.innerText || item.textContent || "").replace(/\s+/g, " ");
+      if (/saved for later|sponsored|discover more|buy it again/i.test(text)) return false;
+      if (!item.querySelector?.("a[href*='/dp/'], a[href*='/gp/product/']")) return false;
+      if (!item.querySelector?.("button[aria-label^='Delete '], input[aria-label^='Delete '], button[title^='Delete '], input[value='Delete'], [data-itemtype='active'], .sc-list-item")) return false;
+      if (seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
+function cartIsVisiblyEmpty() {
+  const emptyCart = document.querySelector("#sc-empty-cart");
+  const emptyHeading = [...document.querySelectorAll("h1, h2, h3")].find((element) => (
+    visible(element) && /your amazon cart is empty/i.test(element.innerText || element.textContent || "")
+  ));
+  return Boolean((emptyCart && visible(emptyCart)) || emptyHeading);
 }
 
 function addedItemMarkerKey(activeJob) {
@@ -947,14 +1064,56 @@ function expectedCartQuantities(activeJob) {
   return expected;
 }
 
+function smartWagonAddedCartState(activeJob, expected) {
+  const bodyText = (document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ");
+  const lower = bodyText.toLowerCase();
+  const onSmartWagon = /\/cart\/smart-wagon/i.test(location.pathname) || /[?&]ref_=sw_/i.test(location.href);
+  const added = lower.includes("added to cart");
+  const checkoutButton = findButtonByText(["proceed to checkout", "check out amazon cart"]);
+  if (!added || (!onSmartWagon && !checkoutButton)) return null;
+
+  const expectedTotal = Object.values(expected || {}).reduce((sum, quantity) => sum + Number(quantity || 0), 0);
+  const buttonText = (checkoutButton?.value || checkoutButton?.title || checkoutButton?.innerText || checkoutButton?.textContent || "").replace(/\s+/g, " ");
+  const countMatch =
+    buttonText.match(/\((\d+)\s+items?\)/i) ||
+    bodyText.match(/cart\s+subtotal\s*:\s*\$?[\d,.]+\s*\((\d+)\s+items?\)/i) ||
+    bodyText.match(/subtotal\s*\((\d+)\s+items?\)/i);
+  const cartCount = countMatch ? Number(countMatch[1]) : null;
+  if (Number.isFinite(cartCount) && expectedTotal && cartCount < expectedTotal) {
+    return {
+      ok: false,
+      message: `Amazon added-to-cart page shows ${cartCount} cart item(s), but expected ${expectedTotal}.`,
+      mismatches: Object.entries(expected || {}).map(([asin, quantity]) => ({ asin, expected: Number(quantity), actual: 0 })),
+    };
+  }
+  return {
+    ok: true,
+    warning: Number.isFinite(cartCount)
+      ? `Amazon added-to-cart page shows ${cartCount} item(s). Proceeding to checkout.`
+      : "Amazon added-to-cart page is visible. Proceeding to checkout.",
+  };
+}
+
 function verifyCartQuantities(activeJob) {
   const activeCart = document.querySelector("#sc-active-cart");
-  if (!activeCart || !visible(activeCart)) return { ok: true };
   const expected = expectedCartQuantities(activeJob);
   if (!Object.keys(expected).length) return { ok: true };
+  const items = cartActiveItems();
+  if ((!activeCart || !visible(activeCart)) && !items.length) {
+    const smartWagon = smartWagonAddedCartState(activeJob, expected);
+    if (smartWagon) return smartWagon;
+    if (cartIsVisiblyEmpty()) {
+      const details = Object.entries(expected).map(([asin, quantity]) => ({ asin, expected: Number(quantity), actual: 0 }));
+      return {
+        ok: false,
+        message: `Amazon cart is empty after Add to cart. ${details.map((item) => `${item.asin} expected ${item.expected}, cart has 0`).join("; ")}`,
+        mismatches: details,
+      };
+    }
+    return { ok: false, message: "Could not find Amazon active cart items after Add to cart.", mismatches: [] };
+  }
   const actual = {};
   const unknownItems = [];
-  const items = cartActiveItems();
   for (const item of items) {
     const asin = cartItemAsin(item);
     if (!asin) {
@@ -1120,6 +1279,45 @@ function unavailableMessage() {
     }
   }
   return "";
+}
+
+function availabilityPrice() {
+  const selectors = [
+    "#corePrice_feature_div .a-offscreen",
+    "#apex_desktop .a-price .a-offscreen",
+    ".a-price .a-offscreen",
+    "#priceblock_ourprice",
+    "#priceblock_dealprice",
+    "#price_inside_buybox",
+  ];
+  for (const selector of selectors) {
+    const element = [...document.querySelectorAll(selector)].find((node) => visible(node));
+    const text = (element?.innerText || element?.textContent || "").replace(/\s+/g, " ").trim();
+    const match = text.match(/(?:\$|USD\s*)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/i);
+    if (match) return Number(match[1].replace(/,/g, ""));
+  }
+  return 0;
+}
+
+function checkAsinAvailability(asin = "") {
+  const pageAsin = currentAsinFromUrl();
+  const unavailable = unavailableMessage();
+  const addToCart = [...document.querySelectorAll("#add-to-cart-button, input#add-to-cart-button, #submit.add-to-cart")].find((node) => visible(node) && !node.disabled);
+  const buyNow = [...document.querySelectorAll("#buy-now-button, input#buy-now-button")].find((node) => visible(node) && !node.disabled);
+  const availabilityText = [...document.querySelectorAll("#availability, #availabilityInsideBuyBox_feature_div")]
+    .map((node) => (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim())
+    .find(Boolean) || "";
+  const bodyText = (document.body?.innerText || "").toLowerCase();
+  const blockedText = /currently unavailable|temporarily out of stock|see all buying options|we don't know when or if this item will be back in stock|we do not know when or if this item will be back in stock/i.test(bodyText);
+  const inStock = Boolean(!unavailable && !blockedText && (addToCart || buyNow || /in stock/i.test(availabilityText)));
+  return {
+    ok: true,
+    asin: pageAsin || String(asin || "").trim().toUpperCase(),
+    in_stock: inStock,
+    message: inStock ? (availabilityText || "Amazon product controls are available.") : (unavailable || availabilityText || "Amazon did not show this ASIN as directly available."),
+    price: availabilityPrice(),
+    url: location.href,
+  };
 }
 
 function amazonProductPageErrorMessage() {
@@ -2103,6 +2301,39 @@ async function handleClearCart(activeJob) {
   location.href = `https://www.amazon.com/dp/${first.asin}`;
 }
 
+async function clearCartItems(reason = "Cleaning Amazon cart before starting the next order.") {
+  await waitForElement([
+    "#sc-active-cart",
+    "#sc-empty-cart",
+    "input[name='proceedToRetailCheckout']",
+    "#sc-buy-box-ptc-button input",
+    "[data-name='Active Items']",
+  ], 15000);
+  showPanel("Nutricity fulfilment", reason, null, null);
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const buttons = cartDeleteButtons();
+    if (!buttons.length) break;
+    showPanel("Nutricity fulfilment", `Cleaning Amazon cart item ${attempt + 1}. ${buttons.length} active delete link(s) found.`, null, null);
+    await clickElement(buttons[0], "cart delete button");
+    await waitForStableDom(800, 6000);
+  }
+}
+
+async function handleFailureCleanup(activeJob) {
+  if (!/\/cart/i.test(location.pathname)) {
+    showPanel("Nutricity fulfilment", "Order was moved to Missing ASINs. Opening cart cleanup before continuing.", null, null);
+    location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+    return;
+  }
+  await clearCartItems(activeJob.cleanupReason || "Order was moved to Missing ASINs. Cleaning cart before continuing.");
+  const result = await send({ type: "CLAIM_NEXT_IN_WINDOW" });
+  if (result?.next_job_started) {
+    showPanel("Nutricity fulfilment", result.message || `Started next ${result.next_group_key}.`, null, null);
+    return;
+  }
+  showPanel("Nutricity fulfilment", result?.message || "No more queued Chrome jobs found.", null, null);
+}
+
 async function handleProduct(activeJob) {
   const item = activeJob.job.items[activeJob.itemIndex];
   if (!item) return;
@@ -2166,7 +2397,7 @@ async function handleProduct(activeJob) {
   const mixedAsinAfterVariant = isMixedAsinOrder(activeJob);
   const selectionNote = variantSelectionNote(item, purchaseItem);
   if (selectionNote) {
-    showPanel("Cheaper variant found", `${selectionNote} Proceeding with this option.`, null, null);
+    showPanel("Pack variant found", `${selectionNote} Proceeding with this option.`, null, null);
     await sleep(1800);
   }
   const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
@@ -2284,6 +2515,15 @@ async function handleAddClicked(activeJob) {
     showPanel("Nutricity fulfilment", "Amazon add was clicked. Waiting before moving to the next step.", null, null);
     await sleep(waitMs);
   }
+  if (/\/cart/i.test(location.pathname)) {
+    const nextIndex = Number(activeJob.itemIndex || 0) + 1;
+    if (nextIndex >= (activeJob.job?.items || []).length) {
+      activeJob.stage = "cart";
+      await setActiveJob(activeJob);
+      await handleCart(activeJob);
+      return;
+    }
+  }
   await navigateToNext(activeJob);
 }
 
@@ -2399,6 +2639,9 @@ async function handleCart(activeJob) {
 }
 
 async function fillFullName(name) {
+  if (window.__nutricityFillingFullName) return false;
+  window.__nutricityFillingFullName = true;
+  try {
   const input = await waitUntil(() => (
     document.querySelector("input#address-ui-widgets-enterAddressFullName[name='address-ui-widgets-enterAddressFullName']")
     || findAddressNameInput()
@@ -2410,9 +2653,17 @@ async function fillFullName(name) {
   await sleep(500);
   await setInputValue(input, desired);
   await sleep(800);
-  const saved = input.value.replace(/\s+/g, " ").trim() === desired;
+  let saved = input.value.replace(/\s+/g, " ").trim() === desired;
+  if (!saved) {
+    await setInputValue(input, desired);
+    await sleep(500);
+    saved = input.value.replace(/\s+/g, " ").trim() === desired;
+  }
   input.blur();
   return saved;
+  } finally {
+    window.__nutricityFillingFullName = false;
+  }
 }
 
 async function setInputValue(input, value) {
@@ -2422,37 +2673,13 @@ async function setInputValue(input, value) {
   input.click?.();
   await sleep(100);
   input.select?.();
-  input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "a", code: "KeyA", ctrlKey: true, metaKey: true }));
-  input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "a", code: "KeyA", ctrlKey: true, metaKey: true }));
-  await sleep(50);
-  try {
-    document.execCommand("insertText", false, desired);
-    await sleep(150);
-    if (input.value === desired) {
-      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, composed: true, key: "Tab" }));
-      input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, composed: true, key: "Tab" }));
-      return;
-    }
-  } catch {
-    // Fall back to manual value/input events below.
-  }
-  input.select?.();
   setter ? setter.call(input, "") : (input.value = "");
   input.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
   input.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
   await sleep(50);
-  for (const char of desired) {
-    const key = char === " " ? " " : char;
-    input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, composed: true, key }));
-    input.dispatchEvent(new KeyboardEvent("keypress", { bubbles: true, composed: true, key }));
-    const nextValue = `${input.value || ""}${char}`;
-    setter ? setter.call(input, nextValue) : (input.value = nextValue);
-    input.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "insertText", data: char }));
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: char }));
-    input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, composed: true, key }));
-    await sleep(18);
-  }
+  input.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, composed: true, inputType: "insertText", data: desired }));
+  setter ? setter.call(input, desired) : (input.value = desired);
+  input.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: desired }));
   input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
   input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, composed: true, key: "Tab" }));
   input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, composed: true, key: "Tab" }));
@@ -2598,17 +2825,32 @@ function normalizedText(value) {
   return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function elementReadableText(element) {
+  if (!element) return "";
+  return [
+    element.innerText,
+    element.textContent,
+    element.getAttribute?.("aria-label"),
+    element.getAttribute?.("title"),
+    element.getAttribute?.("data-testid"),
+  ].filter(Boolean).join(" ");
+}
+
 function checkoutShowsRecipient(name) {
   const wanted = normalizedText(name);
   if (!wanted) return false;
-  const roots = [
-    ...document.querySelectorAll(
-      "[data-testid^='address-row-'], .address-row, [data-action='select_address_in_list'], [data-checkout-view-modal], #checkoutDisplayPage, #spc-orders, body",
-    ),
-  ];
+  const roots = [];
+  const deliveryHeading = document.querySelector("#deliver-to-customer-text");
+  if (deliveryHeading) roots.push(deliveryHeading.closest?.("a, .a-row, .a-section, div") || deliveryHeading);
+  const deliveryAddress = document.querySelector("#deliver-to-address-text");
+  if (deliveryAddress) roots.push(deliveryAddress.closest?.("a, .a-row, .a-section, div") || deliveryAddress);
+  for (const radio of [...document.querySelectorAll("input[type='radio']:checked")]) {
+    const row = radio.closest?.("[data-testid^='address-row-'], .address-row, .a-box, .a-row, div");
+    if (row) roots.push(row);
+  }
   for (const root of roots) {
     if (!root || root.closest?.("#nutricity-panel") || root.closest?.(".a-popover, .a-popover-preload")) continue;
-    const text = normalizedText(root.innerText || root.textContent);
+    const text = normalizedText(elementReadableText(root));
     if (text.includes(wanted)) return true;
   }
   return false;
@@ -2618,13 +2860,19 @@ function checkoutDeliveryRecipientText() {
   const direct = document.querySelector("#deliver-to-customer-text");
   const candidates = [
     direct,
-    ...document.querySelectorAll("h2, [id*='deliver-to'][id*='customer'], a[aria-label='Change delivery address']"),
+    document.querySelector("#deliver-to-address-text")?.closest?.(".a-row, .a-section, a, div"),
+    ...document.querySelectorAll("h2, [id*='deliver-to'][id*='customer'], a[aria-label='Change delivery address'], a[href*='/checkout/'][href*='/address']"),
   ].filter(Boolean);
   for (const element of candidates) {
     if (!visible(element)) continue;
-    const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+    const text = elementReadableText(element).replace(/\s+/g, " ").trim();
     if (/^delivering\s+to\s+/i.test(text)) return text.replace(/^delivering\s+to\s+/i, "").trim();
+    const embedded = text.match(/\bDelivering\s+to\s+(.+?)(?:\s+\d{3,}|\s+Edit delivery preferences|\s+Deliver to multiple addresses|\s+Change delivery address|$)/i);
+    if (embedded?.[1]) return embedded[1].trim();
   }
+  const bodyText = (document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ").trim();
+  const bodyMatch = bodyText.match(/\bDelivering\s+to\s+(.+?)(?:\s+\d{3,}|\s+Edit delivery preferences|\s+Deliver to multiple addresses|\s+Change delivery address|$)/i);
+  if (bodyMatch?.[1]) return bodyMatch[1].trim();
   return "";
 }
 
@@ -2833,11 +3081,6 @@ function findDeliverToThisAddressButton() {
   return direct || findButtonByText(["deliver to this address", "use this address"]);
 }
 
-function findPaymentRadio() {
-  return [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
-    .find((element) => visible(element) && !element.disabled);
-}
-
 function cardPreferenceList(value) {
   return String(value || "")
     .split(/[\s,;|]+/)
@@ -2846,7 +3089,40 @@ function cardPreferenceList(value) {
 }
 
 function paymentRowForRadio(radio) {
-  return radio?.closest?.(".a-box-inner, .a-fixed-left-grid, [data-pmts-component-id], .pmts-instrument-selector") || radio?.closest?.("label") || radio?.parentElement || radio;
+  if (!radio) return null;
+  const label = radio.closest?.("label");
+  const labelText = normalizedText(label?.innerText || label?.textContent || "");
+  if (labelText.match(/\bending\s+in\s+\d{4}\b/i)) return label;
+
+  let fallback = null;
+  let node = radio.parentElement;
+  for (let depth = 0; node && depth < 14; depth += 1, node = node.parentElement) {
+    const text = normalizedText(node.innerText || node.textContent || "");
+    const endings = text.match(/\bending\s+in\s+\d{4}\b/gi) || [];
+    if (endings.length === 1) return node;
+    if (!fallback && endings.length > 0) fallback = node;
+  }
+  return fallback || label || radio.parentElement || radio;
+}
+
+function paymentRowVisible(row) {
+  if (!row) return false;
+  if (visible(row)) return true;
+  return [...row.querySelectorAll?.("*") || []].some((element) => visible(element));
+}
+
+function paymentRadioVisible(radio) {
+  if (!radio || radio.disabled) return false;
+  if (visible(radio)) return true;
+  const row = paymentRowForRadio(radio);
+  if (!row) return false;
+  const text = normalizedText(row.innerText || row.textContent || "");
+  return Boolean(text.match(/\bending\s+in\s+\d{4}\b/i) && paymentRowVisible(row));
+}
+
+function findPaymentRadio() {
+  return [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
+    .find(paymentRadioVisible);
 }
 
 function paymentRowText(radio) {
@@ -2856,7 +3132,35 @@ function paymentRowText(radio) {
   return [labelledText, root?.innerText || root?.textContent || "", radio?.value || ""].join(" ");
 }
 
+function paymentRadioLocalText(radio) {
+  if (!radio) return "";
+  const pieces = [
+    radio.getAttribute?.("aria-label") || "",
+    radio.getAttribute?.("title") || "",
+    radio.value || "",
+  ];
+  const label = radio.closest?.("label");
+  if (label) pieces.push(label.innerText || label.textContent || "");
+  let node = radio.parentElement;
+  for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+    const text = normalizedText(node.innerText || node.textContent || "");
+    const endings = text.match(/\bending\s+in\s+\d{4}\b/gi) || [];
+    if (endings.length <= 1) pieces.push(text);
+    if (endings.length === 1) break;
+  }
+  return normalizedText(pieces.join(" "));
+}
+
+function paymentTextDigits(text) {
+  const value = String(text || "");
+  const directMatch = value.match(/(?:ending\s+in|card|visa|mastercard|amex|american\s+express|discover)[^\d]{0,40}(\d{4})\b/i);
+  return directMatch?.[1] || "";
+}
+
 function cardDigitsForPaymentRadio(radio) {
+  const localDigits = paymentTextDigits(paymentRadioLocalText(radio));
+  if (localDigits) return localDigits;
+
   const root = paymentRowForRadio(radio);
   const dataNumber = root?.querySelector?.("[data-number]")?.getAttribute("data-number");
   const text = paymentRowText(radio);
@@ -2880,51 +3184,150 @@ function findCheckoutPaymentPanel() {
 }
 
 function checkoutSelectedPaymentText() {
-  const panel = findCheckoutPaymentPanel();
-  const root = panel?.closest?.("#checkout-paymentOptionPanel, #selected-payment-methods-list-container, #payment-information")
-    || panel
-    || document.querySelector("#checkoutDisplayPage, #spc-orders, body");
-  if (!root) return "";
-  const heading = root.querySelector?.(
+  const visiblePaymentSummaries = [...document.querySelectorAll("h2, h3, a, span, div")]
+    .filter((element) => {
+      if (!visible(element) || element.closest?.("#nutricity-panel") || element.closest?.(".a-popover, .a-popover-preload")) return false;
+      const text = normalizedText(elementReadableText(element));
+      return /\bpaying\s+with\b/.test(text) || /\bending\s+in\s+\d{4}\b/.test(text);
+    })
+    .map((element) => ({
+      element,
+      text: elementReadableText(element).replace(/\s+/g, " ").trim(),
+    }))
+    .filter((item) => item.text.length <= 220 || /\bpaying\s+with\b/i.test(item.text));
+  const visiblePaymentSummary = visiblePaymentSummaries.sort((left, right) => left.text.length - right.text.length)[0];
+  if (visiblePaymentSummary) {
+    return visiblePaymentSummary.text;
+  }
+
+  const visibleSelectedRows = [...document.querySelectorAll(
+    "#selected-payment-methods-list-container *, #payment-information *, [id*='selected-payment'] *",
+  )]
+    .filter((element) => {
+      if (!visible(element) || element.closest?.("#nutricity-panel") || element.closest?.(".a-popover, .a-popover-preload")) return false;
+      const text = normalizedText(elementReadableText(element));
+      return /\b(?:visa|mastercard|american\s+express|amex|discover|card)\b.*\b\d{4}\b/.test(text);
+    })
+    .map((element) => elementReadableText(element).replace(/\s+/g, " ").trim())
+    .filter((text) => text.length <= 220);
+  if (visibleSelectedRows.length) return visibleSelectedRows.sort((left, right) => left.length - right.length)[0];
+
+  const heading = document.querySelector(
     [
       "#selected-payment-methods-list-container h2",
       "#payment-option-text-default",
       "[id^='payment-option-text'][data-testid]",
       ".selected-payment-method-no-art-description-heading",
-      "[class*='selected-payment']",
-      "[id*='selected-payment']",
     ].join(", "),
   );
-  return String(heading?.innerText || heading?.textContent || root.innerText || root.textContent || "").replace(/\s+/g, " ").trim();
+  if (heading && visible(heading)) {
+    const text = elementReadableText(heading).replace(/\s+/g, " ").trim();
+    if (/paying\s+with|ending\s+in\s+\d{4}|(?:visa|mastercard|american express|amex|discover|card)[^\d]{0,80}\d{4}/i.test(text)) return text;
+  }
+
+  const panel = findCheckoutPaymentPanel();
+  if (panel) {
+    const text = elementReadableText(panel).replace(/\s+/g, " ").trim();
+    if (text.length <= 350 && /paying\s+with|ending\s+in\s+\d{4}|(?:visa|mastercard|american express|amex|discover|card)[^\d]{0,80}\d{4}/i.test(text)) return text;
+  }
+  return "";
 }
 
 function checkoutSelectedCardDigits() {
   const text = checkoutSelectedPaymentText();
   const preferredPattern = text.match(/(?:ending\s+in|visa|mastercard|american\s+express|amex|discover|card|paying\s+with)[^\d]{0,80}(\d{4})\b/i);
   if (preferredPattern) return preferredPattern[1];
-  const fallback = text.match(/\b(\d{4})\b/);
-  return fallback?.[1] || "";
+  return "";
 }
 
 function checkoutPaymentConfirmed(preferences = []) {
   const placeOrder = findPlaceOrderButton();
-  if (placeOrder && !placeOrder.disabled) return true;
   const text = checkoutSelectedPaymentText();
-  if (!text) return false;
   const selectedDigits = checkoutSelectedCardDigits();
   if (preferences.length) return Boolean(selectedDigits && preferences.includes(selectedDigits));
+  if (placeOrder && !placeOrder.disabled) return true;
+  if (!text) return false;
   return /(?:payment method|paying with|ending in|visa|mastercard|american express|amex|discover|card)/i.test(text);
 }
 
+async function waitForPreferredCheckoutPayment(preferences = [], timeout = 8000) {
+  return waitUntil(() => {
+    const selectedDigits = checkoutSelectedCardDigits();
+    if (selectedDigits && (!preferences.length || preferences.includes(selectedDigits))) return selectedDigits;
+    if (!preferences.length && checkoutPaymentConfirmed(preferences)) return true;
+    return false;
+  }, timeout, 400);
+}
+
 function findPaymentRadioForPreferences(preferences = []) {
-  const radios = [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
-    .filter((element) => visible(element) && !element.disabled);
-  if (!radios.length) return null;
+  const allRadios = [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
+    .filter((radio) => radio && !radio.disabled);
+  const radios = allRadios.filter(paymentRadioVisible);
+  const searchRadios = radios.length ? radios : allRadios;
+  if (!searchRadios.length) return null;
   for (const preferred of preferences) {
-    const radio = radios.find((candidate) => cardDigitsForPaymentRadio(candidate) === preferred);
+    const radio = searchRadios.find((candidate) => {
+      const localText = paymentRadioLocalText(candidate);
+      return cardDigitsForPaymentRadio(candidate) === preferred
+        || localText.includes(`ending in ${preferred}`)
+        || new RegExp(`\\b${preferred}\\b`).test(localText);
+    });
     if (radio) return radio;
   }
   return radios.find((radio) => radio.checked) || radios[0];
+}
+
+function paymentRadioIsSelected(radio) {
+  if (!radio) return false;
+  if (radio.checked) return true;
+  const row = paymentRowForRadio(radio);
+  const text = normalizedText(row?.innerText || row?.textContent || "");
+  return /\bselected\b/i.test(text) && /\bending\s+in\s+\d{4}\b/i.test(text);
+}
+
+async function clickPaymentRadio(radio) {
+  const row = paymentRowForRadio(radio);
+  const rowText = normalizedText(row?.innerText || row?.textContent || "");
+  const preferredDigits = cardDigitsForPaymentRadio(radio);
+  const textTargets = preferredDigits
+    ? [...row?.querySelectorAll?.("span, div, label, input, button, a") || []].filter((element) => {
+      const text = normalizedText(element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
+      return text.includes(preferredDigits) || text.match(new RegExp(`ending\\s+in\\s+${preferredDigits}`, "i"));
+    })
+    : [];
+  const targets = [
+    radio.closest?.("label"),
+    row?.querySelector?.("label"),
+    ...textTargets,
+    row?.querySelector?.(".pmts-instrument-box, .a-box-inner, .a-radio, [role='radio']"),
+    row,
+    radio,
+  ].filter(Boolean);
+
+  for (const target of targets) {
+    const targetText = normalizedText(target.innerText || target.textContent || target.getAttribute?.("aria-label") || "");
+    if (preferredDigits && target !== radio && targetText && !targetText.includes(preferredDigits) && !rowText.includes(preferredDigits)) {
+      continue;
+    }
+    try {
+      await clickElement(target, "Payment method row");
+      await sleep(500);
+      if (paymentRadioIsSelected(radio)) return true;
+    } catch (err) {
+      // Try the next candidate; Amazon often hides the real radio and binds the row instead.
+    }
+  }
+
+  try {
+    radio.checked = true;
+    radio.dispatchEvent(new Event("input", { bubbles: true }));
+    radio.dispatchEvent(new Event("change", { bubbles: true }));
+    radio.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    await sleep(800);
+  } catch (err) {
+    // Ignore and let the caller decide whether manual checkout is needed.
+  }
+  return paymentRadioIsSelected(radio);
 }
 
 function findPaymentSelection(preferences = []) {
@@ -3109,23 +3512,27 @@ async function handlePaymentSelection(activeJob) {
     }
     const selectedDigits = cardDigitsForPaymentRadio(payment.radio);
     showPanel("Nutricity checkout", selectedDigits ? `Selecting card ending in ${selectedDigits}.` : "Selecting Amazon payment method.", null, null);
-    if (!payment.radio.checked) {
-      const target = payment.radio.closest?.("label") || payment.radio;
-      await clickElement(target, "Payment method radio");
-      if (!payment.radio.checked) {
-        payment.radio.checked = true;
-        payment.radio.dispatchEvent(new Event("input", { bubbles: true }));
-        payment.radio.dispatchEvent(new Event("change", { bubbles: true }));
-        await sleep(800);
-      }
+    if (!paymentRadioIsSelected(payment.radio)) {
+      await clickPaymentRadio(payment.radio);
+      await waitUntil(() => paymentRadioIsSelected(payment.radio), 3000, 250);
     }
     if (cardPreferences.length && selectedDigits && !cardPreferences.includes(selectedDigits)) {
       await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
+    if (cardPreferences.length && !paymentRadioIsSelected(payment.radio)) {
+      await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${cardPreferences.join(" or ")}.`);
+      return true;
+    }
     await clickElement(payment.continueButton, "Use this payment method button");
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences) || findPlaceOrderButton() || !findPaymentRadio(), 12000, 400);
+    await waitUntil(
+      () => checkoutPaymentConfirmed(cardPreferences)
+        || (!cardPreferences.length && findPlaceOrderButton())
+        || !findPaymentRadio(),
+      12000,
+      400,
+    );
     activeJob.stage = "checkout";
     await setActiveJob(activeJob);
     const confirmedDigits = checkoutSelectedCardDigits();
@@ -3158,11 +3565,17 @@ async function ensurePreferredCheckoutPayment(activeJob) {
     return true;
   }
   const paymentPanel = findCheckoutPaymentPanel();
-  if (!paymentPanel && !checkoutPaymentConfirmed(cardPreferences)) return true;
-
   const selectedDigits = checkoutSelectedCardDigits();
+  if (!paymentPanel && !selectedDigits && !findPlaceOrderButton() && !findChangePaymentButton()) return true;
+
   if (selectedDigits && cardPreferences.includes(selectedDigits)) {
     showPanel("Nutricity checkout", `Verified checkout card ending in ${selectedDigits}.`, null, null);
+    return true;
+  }
+
+  const settledDigits = await waitForPreferredCheckoutPayment(cardPreferences, 5000);
+  if (settledDigits && settledDigits !== true) {
+    showPanel("Nutricity checkout", `Verified checkout card ending in ${settledDigits}.`, null, null);
     return true;
   }
 
@@ -3173,7 +3586,30 @@ async function ensurePreferredCheckoutPayment(activeJob) {
     showPanel("Nutricity checkout", `Could not verify checkout card; opening payment selection for ${expected}.`, null, null);
   }
 
+  if (await waitUntil(findPaymentRadio, 10000, 400)) {
+    await handlePaymentSelection(activeJob);
+    if (activeJob.paused) return false;
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 15000, 400);
+    const confirmedDigits = checkoutSelectedCardDigits();
+    if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
+      showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
+      return true;
+    }
+    await pauseForManualCheckout(
+      activeJob,
+      confirmedDigits
+        ? `Amazon still shows card ending in ${confirmedDigits} after payment selection; expected ${expected}.`
+        : `Amazon did not confirm the selected card ending in ${expected}.`,
+    );
+    return false;
+  }
+
   if (!await openPaymentSelectionIfAvailable()) {
+    const lateDigits = await waitForPreferredCheckoutPayment(cardPreferences, 8000);
+    if (lateDigits && lateDigits !== true) {
+      showPanel("Nutricity checkout", `Verified checkout card ending in ${lateDigits}.`, null, null);
+      return true;
+    }
     await pauseForManualCheckout(activeJob, selectedDigits
       ? `Checkout shows card ending in ${selectedDigits}, but I could not find the Change payment method link to switch to ${expected}.`
       : `Could not verify the checkout card, and I could not find the Change payment method link to select ${expected}.`);
@@ -3181,7 +3617,20 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   }
   if (await waitUntil(findPaymentRadio, 10000, 400)) {
     await handlePaymentSelection(activeJob);
-    return !activeJob.paused;
+    if (activeJob.paused) return false;
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 15000, 400);
+    const confirmedDigits = checkoutSelectedCardDigits();
+    if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
+      showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
+      return true;
+    }
+    await pauseForManualCheckout(
+      activeJob,
+      confirmedDigits
+        ? `Amazon still shows card ending in ${confirmedDigits} after payment selection; expected ${expected}.`
+        : `Amazon did not confirm the selected card ending in ${expected}.`,
+    );
+    return false;
   }
   await pauseForManualCheckout(activeJob, `Opened payment selection, but Amazon did not show card choices for ${expected}.`);
   return false;
@@ -3319,7 +3768,18 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
     return false;
   }
   await clickUseAddressButton(useAddress);
-  await sleep(3000);
+  await waitUntil(
+    () => checkoutRecipientConfirmed(checkoutRecipient) || findPlaceOrderButton() || findPaymentSelection() || !findAddressNameInput(),
+    9000,
+    250,
+  );
+  if (checkoutRecipientConfirmed(checkoutRecipient)) {
+    return markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Verified edited delivery address. Continuing checkout.");
+  }
+  if (findPlaceOrderButton() && checkoutShowsRecipient(checkoutRecipient)) {
+    return markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Checkout address panel shows the edited recipient. Continuing checkout.");
+  }
+  await sleep(1000);
 
   const recipientAddressControl = await waitUntil(() => !findAddressNameInput() && recipientAddressSelectionControl(checkoutRecipient), 10000, 300);
   if (recipientAddressControl) {
@@ -3335,14 +3795,24 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
     }
     showPanel("Nutricity checkout", "Selecting edited delivery address.", null, null);
     await clickElement(deliverToThisAddress, "Deliver to this address button");
-    await sleep(2000);
+    await sleep(1200);
+    if (checkoutRecipientConfirmed(checkoutRecipient)) {
+      return markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Verified edited delivery address. Continuing checkout.");
+    }
   }
 
   showPanel("Nutricity checkout", "Waiting for checkout to update.", null, null);
   await waitUntil(
-    () => checkoutRecipientConfirmed(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton() || !findAddressNameInput(),
-    12000,
+    () =>
+      checkoutLimitPurchaseIssue(activeJob) ||
+      checkoutRecipientConfirmed(checkoutRecipient) ||
+      findPaymentSelection() ||
+      findPlaceOrderButton() ||
+      !findAddressNameInput(),
+    5000,
+    250,
   );
+  if (await handleCheckoutLimitPurchase(activeJob)) return true;
   if (checkoutRecipientConfirmed(checkoutRecipient)) {
     return markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Verified edited delivery address. Continuing checkout.");
   }
@@ -3351,7 +3821,8 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   activeJob.addressEditedRecipient = checkoutRecipient;
   activeJob.addressEditedAt = Date.now();
   await setActiveJob(activeJob);
-  return true;
+  await pauseForManualCheckout(activeJob, `Amazon did not confirm delivery address "${checkoutRecipient}" after saving.`);
+  return false;
 }
 
 async function saveNewDeliveryAddress(activeJob, checkoutRecipient) {
@@ -3381,12 +3852,19 @@ async function saveNewDeliveryAddress(activeJob, checkoutRecipient) {
   if (deliverToThisAddress) {
     showPanel("Nutricity checkout", "Selecting new delivery address.", null, null);
     await clickElement(deliverToThisAddress, "Deliver to this address button");
-    await sleep(2000);
+    await sleep(1200);
+    if (checkoutRecipientConfirmed(checkoutRecipient)) {
+      await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Verified new delivery address. Continuing checkout.");
+      activeJob.addressMode = "new";
+      await setActiveJob(activeJob);
+      return true;
+    }
   }
 
   await waitUntil(
     () => checkoutRecipientConfirmed(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton() || !findAddressNameInput(),
-    12000,
+    5000,
+    250,
   );
   if (checkoutRecipientConfirmed(checkoutRecipient)) {
     await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Verified new delivery address. Continuing checkout.");
@@ -3448,7 +3926,9 @@ async function handleCheckoutLimitPurchase(activeJob) {
   const item = issue.item;
   const asin = item?.asin || "";
   const requestedQuantity = Number(item?.quantity || 0) || null;
-  const availableQuantity = Number(issue.currentQuantity || 0) || 1;
+  const availableQuantity = Number.isFinite(Number(issue.currentQuantity))
+    ? Number(issue.currentQuantity)
+    : 0;
   const message = asin
     ? `${issue.message} ASIN ${asin}${issue.title ? ` (${issue.title})` : ""}.${requestedQuantity ? ` Customer ordered ${requestedQuantity}, Amazon checkout allows ${availableQuantity}.` : ""}`
     : `${issue.message}${issue.title ? ` ${issue.title}.` : ""}`;
@@ -3526,6 +4006,25 @@ async function handleCheckout(activeJob) {
   const extensionState = await getExtensionState();
   const shouldEditExistingAddress = extensionState.editExistingAddress !== false;
   showPanel("Nutricity checkout", `Using recipient name: ${checkoutRecipient}`, null, null);
+  const readyPlaceOrder = findPlaceOrderButton();
+  if (
+    readyPlaceOrder &&
+    !readyPlaceOrder.disabled &&
+    !findAddressNameInput() &&
+    checkoutRecipientConfirmed(checkoutRecipient) &&
+    checkoutPaymentConfirmed(cardPreferenceList(extensionState.cardLast4Preference))
+  ) {
+    activeJob.stage = "checkout";
+    activeJob.paused = false;
+    activeJob.pausedStage = null;
+    activeJob.editAddressClickedAt = null;
+    activeJob.addressEditedRecipient = checkoutRecipient;
+    activeJob.addressEditedAt = Date.now();
+    activeJob.addressVerifiedRecipient = checkoutRecipient;
+    activeJob.addressVerifiedAt = Date.now();
+    await setActiveJob(activeJob);
+    showPanel("Nutricity checkout", "Checkout is ready. Placing the order.", null, null);
+  }
   if (activeJob.stage === "editing_address") {
     if (!findAddressNameInput() && checkoutRecipientConfirmed(checkoutRecipient)) {
       await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Delivery address already shows ${checkoutRecipient}. Continuing checkout.`);
@@ -3621,6 +4120,12 @@ async function handleCheckout(activeJob) {
   if (activeJob.paused) return;
 
   if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
+  const deliverToThisAddress = findDeliverToThisAddressButton();
+  if (deliverToThisAddress && !findPaymentRadio() && !findPlaceOrderButton() && !findChangePaymentButton()) {
+    showPanel("Nutricity checkout", "Delivery address is selected. Continuing to payment review.", null, null);
+    await clickElement(deliverToThisAddress, "Deliver to this address button");
+    return;
+  }
   if (!await ensurePreferredCheckoutPayment(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
 
@@ -3634,6 +4139,25 @@ async function handleCheckout(activeJob) {
     ], 5000)
     || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
+    if (!checkoutDeliveryRecipientMatches(checkoutRecipient)) {
+      const deliveredTo = checkoutDeliveryRecipientText() || "unknown recipient";
+      await pauseForManualCheckout(
+        activeJob,
+        `Final checkout still shows delivery to "${deliveredTo}" instead of "${checkoutRecipient}".`,
+      );
+      return;
+    }
+    const finalCardPreferences = cardPreferenceList((await getExtensionState()).cardLast4Preference);
+    const finalDigits = checkoutSelectedCardDigits();
+    if (finalCardPreferences.length && (!finalDigits || !finalCardPreferences.includes(finalDigits))) {
+      await pauseForManualCheckout(
+        activeJob,
+        finalDigits
+          ? `Final checkout still shows card ending in ${finalDigits}; expected ${finalCardPreferences.join(" or ")}.`
+          : `Final checkout did not show the preferred card ending in ${finalCardPreferences.join(" or ")}.`,
+      );
+      return;
+    }
     const duplicateCheck = await send({ type: "CHECK_EXISTING_AMAZON_ORDER" });
     if (!duplicateCheck?.ok) {
       activeJob.paused = true;
@@ -3657,9 +4181,19 @@ async function handleCheckout(activeJob) {
       );
       return;
     }
+    const rememberedOrder = await findRememberedDuplicateOrder(activeJob);
+    if (rememberedOrder) {
+      showPanel(
+        "Amazon order already found",
+        `Order history already shows ${rememberedOrder.amazon_order_id} for ${activeJob.job.recipient_name}. Reporting that order instead of placing again.`,
+        null,
+        null,
+      );
+      await reportAmazonOrders(activeJob, [rememberedOrder]);
+      return;
+    }
     showPanel("Final step", "Clicking Place your order now.", null, null);
-    activeJob.stage = "complete_pending";
-    await setActiveJob(activeJob);
+    if (!await protectBeforeAmazonSubmit(activeJob, "checkout")) return;
     await clickElement(placeOrder, "Place your order button");
   } else {
     await pauseForManualCheckout(activeJob, "Could not find the payment or Place your order control.", "complete_pending");
@@ -3692,6 +4226,126 @@ function recentOrdersLink() {
   });
 }
 
+function orderHistoryUrl() {
+  return "https://www.amazon.com/gp/your-account/order-history?ref_=chk_spc_place_order_recovery";
+}
+
+function isOrderHistoryPage() {
+  return /\/(?:gp\/your-account\/order-history|gp\/css\/order-history)/i.test(location.pathname)
+    || Boolean(document.querySelector("#yourOrderHistorySection, #yoOrdersTabination"));
+}
+
+function isOrderDetailsPage() {
+  return /\/(?:your-orders\/order-details|gp\/your-account\/order-details)/i.test(location.pathname)
+    || Boolean(new URLSearchParams(location.search).get("orderID") && document.querySelector("#orderDetails"));
+}
+
+function submittedStage(activeJob) {
+  return ["complete_pending", "find_order_id", "reporting_complete"].includes(String(activeJob?.stage || ""));
+}
+
+function submittedOrPausedStage(activeJob) {
+  return submittedStage(activeJob) || ["complete_pending", "find_order_id", "reporting_complete"].includes(String(activeJob?.pausedStage || ""));
+}
+
+function amazonOrderSubmitErrorPage() {
+  const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
+  return /\/checkout\/.*\/place-order/i.test(location.pathname)
+    && (text.includes("something went wrong") || text.includes("please go back and try again"));
+}
+
+function amazonDuplicateOrderPage() {
+  const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
+  return /\/checkout\/.*\/duplicateOrder/i.test(location.pathname)
+    || (text.includes("this is a pending order") && text.includes("do you want to place the same order again"));
+}
+
+async function protectBeforeAmazonSubmit(activeJob, retryStage = "checkout") {
+  const result = await send({ type: "MARK_ORDER_SUBMITTED" });
+  if (!result?.ok) {
+    activeJob.paused = true;
+    activeJob.pausedStage = retryStage;
+    await setActiveJob(activeJob);
+    showPanel(
+      "Nutricity fulfilment paused",
+      result?.message || "Could not protect this order before clicking Amazon Place your order. Fulfilment is paused to prevent a duplicate order.",
+      "Retry",
+      () => continueAfterManualStep(activeJob, retryStage),
+    );
+    return false;
+  }
+  activeJob.amazonSubmittedAt = activeJob.amazonSubmittedAt || Date.now();
+  activeJob.stage = "complete_pending";
+  activeJob.paused = false;
+  activeJob.pausedStage = null;
+  await setActiveJob(activeJob);
+  return true;
+}
+
+async function handleAmazonDuplicateOrderPage(activeJob) {
+  if (activeJob.amazonDuplicateOrderConfirmed) {
+    await pauseForManualCheckout(
+      activeJob,
+      "Amazon is still showing the duplicate pending-order screen after it was already confirmed once.",
+      "complete_pending",
+    );
+    return;
+  }
+  const duplicatePageIsAfterCheckoutSubmit =
+    activeJob.stage === "complete_pending" ||
+    activeJob.stage === "checkout" ||
+    activeJob.pausedStage === "complete_pending" ||
+    activeJob.pausedStage === "checkout" ||
+    checkoutWasStarted(activeJob);
+  if (!duplicatePageIsAfterCheckoutSubmit) {
+    activeJob.paused = true;
+    activeJob.pausedStage = activeJob.stage || "checkout";
+    await setActiveJob(activeJob);
+    showPanel(
+      "Nutricity fulfilment paused",
+      "Amazon showed the duplicate pending-order screen before the final order stage. Review it manually before continuing.",
+      "I did it manually, continue",
+      () => continueAfterManualStep(activeJob, "complete_pending"),
+    );
+    return;
+  }
+  activeJob.paused = false;
+  activeJob.pausedStage = null;
+  const duplicateCheck = await send({ type: "CHECK_EXISTING_AMAZON_ORDER" });
+  if (duplicateCheck?.duplicate) {
+    const orders = (duplicateCheck.orders || []).map((item) => item.amazon_order_id).filter(Boolean).join(", ");
+    showPanel(
+      "Amazon order already exists",
+      `${orders || "An Amazon order"} is already saved in the app. Open the extension popup to review or clear it before continuing.`,
+      null,
+      null,
+    );
+    return;
+  }
+  const rememberedOrder = await findRememberedDuplicateOrder(activeJob);
+  if (rememberedOrder) {
+    showPanel(
+      "Amazon order already found",
+      `Order history already shows ${rememberedOrder.amazon_order_id} for ${activeJob.job.recipient_name}. Reporting that order instead of confirming the duplicate-order page.`,
+      null,
+      null,
+    );
+    await reportAmazonOrders(activeJob, [rememberedOrder]);
+    return;
+  }
+  const placeOrder = findButtonByText(["place your order"]);
+  if (!placeOrder || placeOrder.disabled) {
+    await pauseForManualCheckout(activeJob, "Amazon duplicate pending-order screen did not show a usable Place your order button.", "complete_pending");
+    return;
+  }
+  showPanel("Final step", "Amazon asked for duplicate-order confirmation. Clicking Place your order once.", null, null);
+  if (!await protectBeforeAmazonSubmit(activeJob, "complete_pending")) return;
+  activeJob.amazonDuplicateOrderConfirmed = true;
+  activeJob.stage = "complete_pending";
+  await setActiveJob(activeJob);
+  await clickElement(placeOrder, "duplicate-order Place your order button");
+}
+
 function orderDetailsUrl(orderId) {
   return `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(orderId)}`;
 }
@@ -3712,28 +4366,611 @@ function amazonSignedInAccountName() {
 }
 
 function extractRecentOrderId(activeJob) {
-  const recipient = String(activeJob.job.recipient_name || "").toLowerCase();
-  const names = (activeJob.job.order_names || []).map((name) => String(name).toLowerCase());
-  const cards = [...document.querySelectorAll("#orderCardHeader, .order-card, [id*='orderCard']")].filter(visible);
-  const candidates = cards.length ? cards : [...document.querySelectorAll("body")];
+  return extractRecentOrders(activeJob)[0]?.amazon_order_id || "";
+}
+
+function orderCardOrderId(card) {
+  const headerText = (card.querySelector("#orderCardHeader")?.innerText || card.innerText || card.textContent || "").replace(/\s+/g, " ");
+  const match = headerText.match(/\b\d{3}-\d{7}-\d{7}\b/);
+  return match ? match[0] : "";
+}
+
+function orderCardAsins(card) {
+  return orderCardItems(card).map((item) => item.asin);
+}
+
+function asinFromAmazonHref(href = "") {
+  const match = String(href || "").match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
+  return match ? match[1].toUpperCase() : "";
+}
+
+function orderCardItems(card) {
+  const quantitiesByAsin = {};
+  const itemRows = [...card.querySelectorAll("#itemDetail, .itemDetails")].filter((row) => row.querySelector("a[href*='/dp/'], a[href*='/gp/product/']"));
+  if (!itemRows.length) {
+    for (const link of card.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")) {
+      const asin = asinFromAmazonHref(link.href || link.getAttribute("href") || "");
+      if (asin && !quantitiesByAsin[asin]) quantitiesByAsin[asin] = 1;
+    }
+    return Object.entries(quantitiesByAsin).map(([asin, quantity]) => ({ asin, quantity }));
+  }
+  const rows = itemRows;
+  for (const row of rows) {
+    const link = row.matches?.("a[href*='/dp/'], a[href*='/gp/product/']")
+      ? row
+      : row.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
+    const asin = asinFromAmazonHref(link?.href || link?.getAttribute?.("href") || "");
+    if (!asin) continue;
+    const quantityText = row.matches?.("a[href*='/dp/'], a[href*='/gp/product/']")
+      ? ""
+      : (row.querySelector(".itemQuantity")?.textContent || "");
+    const quantity = Math.max(1, Math.round(Number((quantityText || "").match(/\d+/)?.[0] || 1)));
+    quantitiesByAsin[asin] = (quantitiesByAsin[asin] || 0) + quantity;
+  }
+  return Object.entries(quantitiesByAsin).map(([asin, quantity]) => ({ asin, quantity }));
+}
+
+function quantityFromText(text = "") {
+  const match = String(text || "").match(/\b(?:qty|quantity)\s*:?\s*(\d+)\b/i);
+  return Math.max(1, Math.round(Number(match?.[1] || 1)));
+}
+
+function orderDetailsPageOrderId() {
+  const fromUrl = String(new URLSearchParams(location.search).get("orderID") || "").trim();
+  if (/^\d{3}-\d{7}-\d{7}$/.test(fromUrl)) return fromUrl;
+  const text = (document.querySelector("#orderDetails")?.innerText || document.body?.innerText || "").replace(/\s+/g, " ");
+  return text.match(/\b\d{3}-\d{7}-\d{7}\b/)?.[0] || "";
+}
+
+function orderDetailsPageRoot() {
+  return document.querySelector("#orderDetails") || document.body;
+}
+
+function orderDetailsPageRecipient() {
+  const text = (orderDetailsPageRoot()?.innerText || "").replace(/\s+/g, " ").trim();
+  const refMatch = text.match(/\bNutricity\s+NC\d+(?:\s+[A-Za-z0-9]+){0,3}/i);
+  if (refMatch?.[0]) return refMatch[0].replace(/\s+/g, " ").trim();
+  const shipMatch = text.match(/\bShip to\s+(.+?)\s+\d{2,}/i);
+  return shipMatch?.[1]?.replace(/\s+/g, " ").trim() || "";
+}
+
+function orderDetailsPageStatus() {
+  const root = orderDetailsPageRoot();
+  const statuses = [...root.querySelectorAll("#shipment-top-row, [id*='shipment'] .a-size-medium, .a-size-medium .a-text-bold, .a-size-medium")]
+    .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter((text) => !/order details|order summary|invoice|payment method/i.test(text));
+  return statuses.find((text) => /arriv|deliver|ship|cancel/i.test(text)) || statuses[0] || "";
+}
+
+function orderDetailsPageDate() {
+  const text = (orderDetailsPageRoot()?.innerText || "").replace(/\s+/g, " ").trim();
+  return text.match(/Order placed\s+([A-Z][a-z]+ \d{1,2}, \d{4})/)?.[1] || "";
+}
+
+function orderDetailsPageItems() {
+  const root = orderDetailsPageRoot();
+  const quantitiesByAsin = {};
+  const purchasedLinks = [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]
+    .filter((link) => {
+      const href = String(link.href || link.getAttribute("href") || "");
+      return asinFromAmazonHref(href) && /ppx_hzod|ppx_yo_dt|fed_asin_title/i.test(href);
+    });
+  for (const link of purchasedLinks) {
+    const asin = asinFromAmazonHref(link.href || link.getAttribute("href") || "");
+    if (!asin) continue;
+    const row = link.closest(".a-row.a-spacing-top-base, .a-row, .a-section, li, div");
+    const quantity = quantityFromText(row?.innerText || row?.textContent || "");
+    quantitiesByAsin[asin] = Math.max(Number(quantitiesByAsin[asin] || 0), quantity);
+  }
+  return Object.entries(quantitiesByAsin).map(([asin, quantity]) => ({ asin, quantity }));
+}
+
+function orderDetailsPageDetails() {
+  const orderId = orderDetailsPageOrderId();
+  if (!orderId) return null;
+  const items = orderDetailsPageItems();
+  return {
+    amazon_order_id: orderId,
+    amazon_order_url: orderDetailsUrl(orderId),
+    recipient: orderDetailsPageRecipient(),
+    order_date: orderDetailsPageDate(),
+    status: orderDetailsPageStatus(),
+    asins: items.map((item) => item.asin),
+    items,
+    cancelled: /cancelled/i.test(orderDetailsPageStatus()),
+    captured_at: Date.now(),
+  };
+}
+
+function orderCardRecipient(card) {
+  const selectors = [
+    ".shipToTriggerTextTruncate .a-truncate-full",
+    ".shipToTriggerTextTruncate",
+    "[id^='a-popover-PreloadedContent_'] .a-text-bold",
+  ];
+  for (const selector of selectors) {
+    const text = [...card.querySelectorAll(selector)]
+      .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+      .find(Boolean);
+    if (text) return text;
+  }
+  return "";
+}
+
+function orderCardDate(card) {
+  const headerText = (card.querySelector("#orderCardHeader")?.innerText || "").replace(/\s+/g, " ").trim();
+  const match = headerText.match(/Order placed\s+([A-Z][a-z]+ \d{1,2}, \d{4})/);
+  return match?.[1] || "";
+}
+
+function orderCardStatus(card) {
+  const statuses = [...card.querySelectorAll("#orderCardDeliveryBox .a-size-medium .a-text-bold, #orderCardDeliveryBox .a-size-medium")]
+    .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return statuses[0] || "";
+}
+
+function isCancelledOrderCard(card) {
+  return /^cancelled$/i.test(orderCardStatus(card)) || /\bCancelled\b/.test(orderCardStatus(card));
+}
+
+function extractOrderHistoryOrders() {
+  const cards = [...document.querySelectorAll("#yourOrderHistorySection #orderCard, .order-card")]
+    .filter(visible);
+  const candidates = cards.length ? cards : [...document.querySelectorAll("#orderCard, .order-card")].filter(visible);
+  const seen = new Set();
+  const orders = [];
   for (const card of candidates) {
+    const orderId = orderCardOrderId(card);
+    if (!orderId || seen.has(orderId) || isCancelledOrderCard(card)) continue;
+    seen.add(orderId);
+    orders.push({
+      amazon_order_id: orderId,
+      amazon_order_url: orderDetailsUrl(orderId),
+      recipient: orderCardRecipient(card),
+      order_date: orderCardDate(card),
+      status: orderCardStatus(card),
+      asins: orderCardAsins(card),
+      items: orderCardItems(card),
+      captured_at: Date.now(),
+    });
+    if (orders.length >= 10) break;
+  }
+  return orders;
+}
+
+function visibleOrderHistoryCards() {
+  const cards = [...document.querySelectorAll("#yourOrderHistorySection #orderCard, .order-card")].filter(visible);
+  return cards.length ? cards : [...document.querySelectorAll("#orderCard, .order-card")].filter(visible);
+}
+
+function orderHistoryCardDetails(card) {
+  const orderId = orderCardOrderId(card);
+  if (!orderId) return null;
+  return {
+    amazon_order_id: orderId,
+    amazon_order_url: orderDetailsUrl(orderId),
+    recipient: orderCardRecipient(card),
+    order_date: orderCardDate(card),
+    status: orderCardStatus(card),
+    asins: orderCardAsins(card),
+    items: orderCardItems(card),
+    cancelled: isCancelledOrderCard(card),
+    captured_at: Date.now(),
+  };
+}
+
+function orderHistoryAnnotationContainer(card) {
+  if (card?.dataset?.nutricityAnnotationHost === "true") return card;
+  return card.querySelector("#orderCardHeader .a-box-inner") || card.querySelector("#orderCardHeader") || card;
+}
+
+function orderDetailsAnnotationHost() {
+  const root = orderDetailsPageRoot();
+  let anchor = root.querySelector(".nutricity-order-details-anchor");
+  if (!anchor) {
+    anchor = document.createElement("div");
+    anchor.className = "nutricity-order-details-anchor";
+    const detailsBox = root.querySelector("[data-component='shippingAddress']")?.closest(".a-box-inner")
+      || root.querySelector("[data-component='chargeSummary']")?.closest(".a-box-inner");
+    const header = [...root.querySelectorAll(".a-section, .a-row, .a-box")]
+      .find((node) => {
+        const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+        return /\bOrder placed\b/i.test(text) && /\bOrder #\b/i.test(text);
+      });
+    const target = detailsBox || header || root.firstElementChild;
+    if (target?.parentElement) {
+      target.parentElement.insertBefore(anchor, detailsBox ? target : target.nextSibling);
+    } else {
+      root.insertBefore(anchor, root.firstChild);
+    }
+  }
+  anchor.dataset.nutricityAnnotationHost = "true";
+  anchor.dataset.nutricityOrderDetailsHost = "true";
+  return anchor;
+}
+
+function renderOrderHistoryAnnotation(card, result) {
+  const existing = card.querySelector(".nutricity-order-history-annotation");
+  if (existing) existing.remove();
+  if (!result) return;
+  const orders = result.match?.orders || [];
+  const suggestions = result.suggestions || [];
+  const conflicts = result.conflicts || [];
+  const cancelled = result.cancelled === true;
+  if (cancelled && !orders.length) return;
+  if (!orders.length && !suggestions.length && !conflicts.length && !result.unmatched) return;
+  const syncedConfirmation = orderHistorySyncedConfirmations.get(result.orderId);
+  const detailsClass = card?.dataset?.nutricityOrderDetailsHost === "true" ? " is-order-details" : "";
+  if (syncedConfirmation && Date.now() - Number(syncedConfirmation.syncedAt || 0) < 30000) {
+    const marker = document.createElement("div");
+    marker.className = `nutricity-order-history-annotation is-synced${detailsClass}`;
+    const label = document.createElement("span");
+    label.className = "nutricity-order-history-label";
+    label.textContent = "Synced";
+    const text = document.createElement("span");
+    text.className = "nutricity-order-history-links";
+    text.textContent = syncedConfirmation.message || `Amazon ${result.orderId} synced`;
+    marker.append(label, text);
+    orderHistoryAnnotationContainer(card).appendChild(marker);
+    return;
+  }
+  const syncStartedAt = orderHistorySyncInProgress.get(result.orderId);
+  let syncInProgress = false;
+  if (syncStartedAt) {
+    syncInProgress = Date.now() - Number(syncStartedAt) < 120000;
+    if (!syncInProgress) orderHistorySyncInProgress.delete(result.orderId);
+  }
+  const marker = document.createElement("div");
+  marker.className = `nutricity-order-history-annotation ${cancelled && orders.length ? "is-cancelled-sync" : conflicts.length ? "is-conflict" : orders.length ? "is-match" : suggestions.length ? "is-suggestion" : "is-miss"}${detailsClass}`;
+  const label = document.createElement("span");
+  label.className = "nutricity-order-history-label";
+  label.textContent = cancelled && orders.length ? "Cancelled warning" : conflicts.length ? "Warning" : orders.length ? "Odoo order" : suggestions.length ? "Odoo order found" : "Not found in app";
+  marker.appendChild(label);
+  if (conflicts.length) {
+    const warning = document.createElement("span");
+    warning.className = "nutricity-order-history-warning";
+    const first = conflicts[0];
+    warning.textContent = `${first.odoo_order_name || "Odoo order"} ${first.asin || "ASIN"} already has Amazon ${first.existing_amazon_order_id}`;
+    marker.appendChild(warning);
+  }
+  if (orders.length) {
+    const links = document.createElement("span");
+    links.className = "nutricity-order-history-links";
+    if (cancelled) {
+      links.appendChild(document.createTextNode("Cancelled here but synced to Odoo order ID: "));
+    }
+    orders.slice(0, 4).forEach((order, index) => {
+      if (index) links.appendChild(document.createTextNode(", "));
+      const link = document.createElement("a");
+      link.href = order.odoo_order_url || "#";
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = order.odoo_order_name || `Odoo ${order.odoo_order_id}`;
+      links.appendChild(link);
+    });
+    if (orders.length > 4) {
+      links.appendChild(document.createTextNode(` +${orders.length - 4}`));
+    }
+    marker.appendChild(links);
+    appendOrderHistoryQuantitySummary(marker, orders);
+  } else if (suggestions.length) {
+    const links = document.createElement("span");
+    links.className = "nutricity-order-history-links";
+    suggestions.slice(0, 3).forEach((order, index) => {
+      if (index) links.appendChild(document.createTextNode(", "));
+      const link = document.createElement("a");
+      link.href = order.odoo_order_url || "#";
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = order.odoo_order_name || `Odoo ${order.odoo_order_id}`;
+      links.appendChild(link);
+    });
+    const existingIds = [...new Set(suggestions.map((order) => order.current_amazon_order_id).filter(Boolean))];
+    if (existingIds.length) {
+      links.appendChild(document.createTextNode(` currently ${existingIds.slice(0, 2).join(", ")}`));
+    }
+    marker.appendChild(links);
+    appendOrderHistoryQuantitySummary(marker, suggestions);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "nutricity-order-history-sync";
+    if (syncInProgress) {
+      button.classList.add("is-syncing");
+      button.disabled = true;
+      button.textContent = "Syncing...";
+    } else {
+      button.textContent = "Sync Amazon ID";
+    }
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (orderHistorySyncInProgress.has(result.orderId)) return;
+      orderHistorySyncInProgress.set(result.orderId, Date.now());
+      button.disabled = true;
+      button.classList.add("is-syncing");
+      button.textContent = "Syncing...";
+      let synced = null;
+      try {
+        synced = await syncSuggestedAmazonHistoryOrder(result);
+      } catch (error) {
+        synced = { ok: false, message: error?.message || String(error || "Could not sync this Amazon order.") };
+      }
+      if (synced?.ok && Number(synced.matched || 0) > 0) {
+        orderHistorySyncInProgress.delete(result.orderId);
+        button.classList.remove("is-syncing");
+        button.classList.add("is-synced");
+        button.disabled = true;
+        button.textContent = "Synced";
+        orderHistorySyncedConfirmations.set(result.orderId, {
+          syncedAt: Date.now(),
+          message: synced.message || `Synced ${result.orderId}`,
+        });
+        orderHistoryLookupCache.delete(result.orderId);
+        const annotation = button.closest(".nutricity-order-history-annotation");
+        if (annotation) annotation.classList.add("is-synced");
+      } else {
+        orderHistorySyncInProgress.delete(result.orderId);
+        button.classList.remove("is-syncing");
+        button.disabled = false;
+        button.textContent = "Sync failed";
+        button.title = synced?.message || "Could not sync this Amazon order.";
+      }
+    });
+    marker.appendChild(button);
+  } else if (!result.cancelled) {
+    const link = document.createElement("a");
+    link.className = "nutricity-order-history-not-found";
+    link.href = result.notFoundUrl || "#";
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.textContent = result.orderId;
+    marker.appendChild(link);
+  }
+  const container = orderHistoryAnnotationContainer(card);
+  container.appendChild(marker);
+}
+
+function compactQuantity(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "0";
+  return Number.isInteger(number) ? String(number) : String(Math.round(number * 100) / 100);
+}
+
+function appendOrderHistoryQuantitySummary(marker, orders = []) {
+  const checks = [];
+  for (const order of orders || []) {
+    for (const check of order.quantity_checks || []) {
+      checks.push({
+        orderName: order.odoo_order_name || "",
+        asin: check.asin || "",
+        expected: Number(check.expected || 0),
+        actual: Number(check.actual || 0),
+        matches: check.matches === true,
+      });
+    }
+  }
+  if (!checks.length) return;
+  const summary = document.createElement("span");
+  const mismatches = checks.filter((check) => !check.matches);
+  summary.className = `nutricity-order-history-quantity ${mismatches.length ? "is-warning" : "is-match"}`;
+  if (mismatches.length) {
+    summary.textContent = `Qty warning: ${mismatches
+      .slice(0, 3)
+      .map((check) => `${check.asin} expected ${compactQuantity(check.expected)}, Amazon ${compactQuantity(check.actual)}`)
+      .join("; ")}`;
+  } else {
+    summary.textContent = `Qty matches: ${checks
+      .slice(0, 4)
+      .map((check) => `${check.asin} x${compactQuantity(check.actual)}`)
+      .join(", ")}`;
+  }
+  marker.appendChild(summary);
+}
+
+async function syncSuggestedAmazonHistoryOrder(result) {
+  const suggestions = result.suggestions || [];
+  const orderNames = [...new Set(suggestions.map((order) => order.odoo_order_name).filter(Boolean))];
+  if (!result.orderId || !orderNames.length) return { ok: false, message: "No Odoo order suggestion is available." };
+  const amazonAsins = new Set((result.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
+  const matchingLineIds = [
+    ...new Set(
+      suggestions.flatMap((order) =>
+        (order.lines || [])
+          .filter((line) => !amazonAsins.size || amazonAsins.has(String(line.asin || "").toUpperCase()))
+          .map((line) => Number(line.id || 0))
+          .filter(Boolean),
+      ),
+    ),
+  ];
+  if (amazonAsins.size && !matchingLineIds.length) {
+    return { ok: false, message: "No matching Odoo line ASIN was found for this Amazon order card." };
+  }
+  return send({
+    type: "SYNC_AMAZON_HISTORY_ORDER",
+    order: {
+      amazon_order_id: result.orderId,
+      amazon_order_url: orderDetailsUrl(result.orderId),
+      recipient: result.recipient || "",
+      source_text: result.recipient || orderNames.join(" "),
+      order_names: orderNames,
+      line_ids: matchingLineIds,
+      store_id: suggestions.length === 1 ? suggestions[0].store_id : null,
+      replace_existing: true,
+    },
+  });
+}
+
+async function annotateAmazonOrderHistory() {
+  if (!extensionContextAlive || !/amazon\.com$/i.test(location.hostname) || (!isOrderHistoryPage() && !isOrderDetailsPage())) return;
+  const pairs = [];
+  const unknown = [];
+  const seen = new Set();
+  if (isOrderDetailsPage()) {
+    const details = orderDetailsPageDetails();
+    if (details?.amazon_order_id) {
+      seen.add(details.amazon_order_id);
+      pairs.push({ card: orderDetailsAnnotationHost(), details });
+    }
+  }
+  if (isOrderHistoryPage()) {
+    for (const card of visibleOrderHistoryCards()) {
+      const details = orderHistoryCardDetails(card);
+      if (!details || seen.has(details.amazon_order_id)) continue;
+      seen.add(details.amazon_order_id);
+      pairs.push({ card, details });
+    }
+  }
+  for (const { card, details } of pairs) {
+    const cached = orderHistoryLookupCache.get(details.amazon_order_id);
+    if (cached && Date.now() - Number(cached.cachedAt || 0) < 2 * 60 * 1000) {
+      renderOrderHistoryAnnotation(card, cached);
+    } else {
+      unknown.push(details);
+    }
+  }
+  if (!unknown.length || orderHistoryAnnotationInFlight) return;
+  orderHistoryAnnotationInFlight = true;
+  try {
+    const result = await send({ type: "LOOKUP_AMAZON_HISTORY_ORDERS", orders: unknown });
+    if (!result?.ok) return;
+    const matches = result.matches || {};
+    const suggestions = result.suggestions || {};
+    const conflicts = result.conflicts || {};
+    const unmatched = new Set(result.unmatched || []);
+    for (const details of unknown) {
+      const match = matches[details.amazon_order_id] || null;
+      const cached = {
+        orderId: details.amazon_order_id,
+        recipient: details.recipient,
+        match,
+        suggestions: suggestions[details.amazon_order_id] || [],
+        conflicts: conflicts[details.amazon_order_id] || [],
+        unmatched: unmatched.has(details.amazon_order_id),
+        asins: details.asins || [],
+        items: details.items || [],
+        cancelled: details.cancelled,
+        notFoundUrl: result.not_found_url || "",
+        cachedAt: Date.now(),
+      };
+      orderHistoryLookupCache.set(details.amazon_order_id, cached);
+    }
+    for (const { card, details } of pairs) {
+      renderOrderHistoryAnnotation(card, orderHistoryLookupCache.get(details.amazon_order_id));
+    }
+  } finally {
+    orderHistoryAnnotationInFlight = false;
+  }
+}
+
+function scheduleOrderHistoryAnnotation(delay = 350) {
+  if (orderHistoryAnnotationScheduled) return;
+  orderHistoryAnnotationScheduled = true;
+  setTimeout(() => {
+    orderHistoryAnnotationScheduled = false;
+    annotateAmazonOrderHistory().catch(() => {});
+  }, delay);
+}
+
+function activeJobOrderNames(activeJob) {
+  return (activeJob.job?.order_names || []).map((name) => String(name || "").trim()).filter(Boolean);
+}
+
+function activeJobAsins(activeJob) {
+  const asins = [];
+  for (const item of activeJob.job?.items || []) {
+    const requested = String(item.asin || "").toUpperCase();
+    const purchased = String(activeJob.pricing?.[requested]?.purchased_asin || "").toUpperCase();
+    if (requested) asins.push(requested);
+    if (purchased) asins.push(purchased);
+  }
+  return [...new Set(asins)];
+}
+
+function recentOrderMatchesActiveJob(order, activeJob) {
+  const haystack = `${order.recipient || ""} ${order.status || ""}`.toLowerCase();
+  const names = activeJobOrderNames(activeJob).map((name) => name.toLowerCase());
+  const recipient = String(activeJob.job?.recipient_name || "").toLowerCase();
+  const nameMatches = names.some((name) => name && haystack.includes(name)) || (recipient && haystack.includes(recipient));
+  if (!nameMatches) return false;
+  const cachedAsins = new Set((order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
+  const jobAsins = activeJobAsins(activeJob);
+  if (!cachedAsins.size || !jobAsins.length) return true;
+  if (jobAsins.some((asin) => cachedAsins.has(asin))) return true;
+  const activeItemCount = Array.isArray(activeJob.job?.items) ? activeJob.job.items.length : 0;
+  return submittedStage(activeJob) && activeItemCount <= 1;
+}
+
+async function findRememberedDuplicateOrder(activeJob) {
+  const result = await send({ type: "GET_RECENT_AMAZON_ORDERS" });
+  if (!result?.ok) return null;
+  const orders = (result.orders || []).filter((order) => recentOrderMatchesActiveJob(order, activeJob));
+  return orders[0] || null;
+}
+
+function extractRecentOrders(activeJob) {
+  const recipient = String(activeJob.job.recipient_name || "").toLowerCase();
+  const names = activeJobOrderNames(activeJob).map((name) => name.toLowerCase());
+  const historyOrders = extractOrderHistoryOrders();
+  const historyMatches = historyOrders.filter((order) => recentOrderMatchesActiveJob(order, activeJob));
+  if (historyMatches.length) return historyMatches;
+  if (isOrderHistoryPage()) return [];
+  const cards = [
+    ...document.querySelectorAll("#orderCardHeader, .order-card, [id*='orderCard'], .order, .a-box-group, .a-box"),
+  ]
+    .filter(visible)
+    .sort((a, b) => (a.innerText || a.textContent || "").length - (b.innerText || b.textContent || "").length);
+  const candidates = cards.length ? cards : [...document.querySelectorAll("body")];
+  const seen = new Set();
+  const orders = [];
+  for (const card of candidates) {
+    if (isCancelledOrderCard(card)) continue;
     const text = (card.innerText || card.textContent || "").replace(/\s+/g, " ");
     const lower = text.toLowerCase();
     const matchesRecipient = recipient && lower.includes(recipient);
     const matchesOrderName = names.some((name) => name && lower.includes(name));
     const orderMatch = text.match(/\b\d{3}-\d{7}-\d{7}\b/);
     if (orderMatch && (matchesRecipient || matchesOrderName || candidates.length === 1)) {
-      return orderMatch[0];
+      const orderId = orderMatch[0];
+      if (seen.has(orderId)) continue;
+      seen.add(orderId);
+      orders.push({
+        amazon_order_id: orderId,
+        amazon_order_url: orderDetailsUrl(orderId),
+        recipient: orderCardRecipient(card),
+        order_date: orderCardDate(card),
+        status: orderCardStatus(card),
+        asins: orderCardAsins(card),
+      });
     }
   }
-  return "";
+  return orders;
 }
 
 async function handleCompletion(activeJob) {
   await waitForElement(["body"], 8000);
+  if (isOrderHistoryPage()) {
+    await handleOrderHistory(activeJob);
+    return;
+  }
   const orderId = extractOrderId();
   if (orderId) {
     await reportAmazonOrder(activeJob, orderId);
+    return;
+  }
+  if (/\/cart|\/dp\/|\/gp\/product/i.test(location.pathname)) {
+    showPanel("Nutricity fulfilment", "Amazon submit already started. Opening order history to capture the order number.", null, null);
+    activeJob.stage = "find_order_id";
+    await setActiveJob(activeJob);
+    location.href = orderHistoryUrl();
+    return;
+  }
+  if (amazonOrderSubmitErrorPage()) {
+    showPanel("Nutricity fulfilment", "Amazon showed an error after order submit. Opening recent orders to verify whether the order was placed.", null, null);
+    activeJob.stage = "find_order_id";
+    await setActiveJob(activeJob);
+    location.href = orderHistoryUrl();
     return;
   }
   if (!confirmationSaysPlaced()) return;
@@ -3743,28 +4980,90 @@ async function handleCompletion(activeJob) {
     activeJob.stage = "find_order_id";
     await setActiveJob(activeJob);
     await clickElement(link, "Review recent orders link");
+    return;
   }
+  showPanel("Nutricity fulfilment", "Order placed. Opening order history to capture the Amazon order number.", null, null);
+  activeJob.stage = "find_order_id";
+  await setActiveJob(activeJob);
+  location.href = orderHistoryUrl();
 }
 
 async function handleOrderHistory(activeJob) {
+  if (!isOrderHistoryPage()) {
+    showPanel("Nutricity fulfilment", "Opening order history to capture the Amazon order number.", null, null);
+    activeJob.stage = "find_order_id";
+    await setActiveJob(activeJob);
+    location.href = orderHistoryUrl();
+    return;
+  }
   await waitForElement(["#orderCardHeader", ".order-card", "[id*='orderCard']", "body"], 12000);
-  const orderId = extractRecentOrderId(activeJob);
-  if (!orderId) {
+  const historyOrders = extractOrderHistoryOrders();
+  if (historyOrders.length) {
+    await send({ type: "REMEMBER_RECENT_AMAZON_ORDERS", orders: historyOrders });
+  }
+  const orders = extractRecentOrders(activeJob);
+  const rememberedOrder = orders.length ? null : await findRememberedDuplicateOrder(activeJob);
+  if (!orders.length && !rememberedOrder) {
     showPanel("Nutricity fulfilment", `Looking for recent Amazon order for ${activeJob.job.recipient_name}.`, null, null);
     return;
   }
-  await reportAmazonOrder(activeJob, orderId);
+  await reportAmazonOrders(activeJob, orders.length ? orders : [rememberedOrder]);
 }
 
 async function reportAmazonOrder(activeJob, orderId) {
-  showPanel("Nutricity fulfilment", `Found Amazon order ${orderId}. Reporting back to the app.`, null, null);
+  return reportAmazonOrders(activeJob, [{ amazon_order_id: orderId, amazon_order_url: orderDetailsUrl(orderId), asins: [] }]);
+}
+
+function buildOrderMappings(activeJob, orders) {
+  if (!Array.isArray(orders) || orders.length < 2) return [];
+  const items = activeJob.job?.items || [];
+  const mappings = [];
+  for (const item of items) {
+    const requestedAsin = String(item.asin || "").toUpperCase();
+    const purchasedAsin = String(activeJob.pricing?.[requestedAsin]?.purchased_asin || "").toUpperCase();
+    const itemAsins = [requestedAsin, purchasedAsin].filter(Boolean);
+    const order = orders.find((candidate) => itemAsins.some((asin) => (candidate.asins || []).includes(asin)));
+    if (!order) continue;
+    mappings.push({
+      asin: requestedAsin,
+      line_ids: item.line_ids || [],
+      amazon_order_id: order.amazon_order_id,
+      amazon_order_url: order.amazon_order_url || orderDetailsUrl(order.amazon_order_id),
+    });
+  }
+  return mappings;
+}
+
+async function reportAmazonOrders(activeJob, orders) {
+  const uniqueOrders = [];
+  const seen = new Set();
+  for (const order of orders || []) {
+    const orderId = String(order.amazon_order_id || "").trim();
+    if (!orderId || seen.has(orderId)) continue;
+    seen.add(orderId);
+    uniqueOrders.push({
+      amazon_order_id: orderId,
+      amazon_order_url: order.amazon_order_url || orderDetailsUrl(orderId),
+      asins: (order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean),
+    });
+  }
+  const orderId = uniqueOrders[0]?.amazon_order_id || "";
+  const orderLabel = uniqueOrders.map((order) => order.amazon_order_id).join(", ");
+  const orderMappings = buildOrderMappings(activeJob, uniqueOrders);
+  showPanel("Nutricity fulfilment", `Found Amazon order ${orderLabel || orderId}. Reporting back to the app.`, null, null);
   activeJob.stage = "reporting_complete";
-  activeJob.reportedOrderId = orderId;
+  activeJob.reportedOrderId = orderLabel || orderId;
   activeJob.reportAttemptedAt = Date.now();
   await setActiveJob(activeJob);
   let result = null;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
-    result = await send({ type: "COMPLETE_JOB", orderId, orderUrl: orderDetailsUrl(orderId), amazonAccountName: amazonSignedInAccountName() });
+    result = await send({
+      type: "COMPLETE_JOB",
+      orderId,
+      orderUrl: uniqueOrders[0]?.amazon_order_url || orderDetailsUrl(orderId),
+      orderMappings,
+      amazonAccountName: amazonSignedInAccountName(),
+    });
     if (result?.ok) break;
     const message = normalizedText(result?.message || "");
     const transient = /internal server error|pool|timeout|failed to fetch|network|temporarily/.test(message);
@@ -3780,7 +5079,7 @@ async function reportAmazonOrder(activeJob, orderId) {
     await setActiveJob(activeJob);
     showPanel(
       "Nutricity reporting needs attention",
-      `${message} Amazon order ${orderId} was found, but the app did not confirm completion.`,
+      `${message} Amazon order ${orderLabel || orderId} was found, but the app did not confirm completion.`,
       "Retry reporting",
       () => continueAfterManualStep(activeJob, "reporting_complete"),
     );
@@ -3794,6 +5093,20 @@ async function run() {
   if (!extensionContextAlive) return;
   const activeJob = await getActiveJob();
   if (!activeJob?.job || !/amazon\.com$/i.test(location.hostname)) return;
+  if (amazonDuplicateOrderPage()) {
+    try {
+      return await handleAmazonDuplicateOrderPage(activeJob);
+    } catch (error) {
+      showPanel("Nutricity fulfilment error", error.message || String(error), null, null);
+      return;
+    }
+  }
+  if (activeJob.paused && submittedOrPausedStage(activeJob)) {
+    activeJob.stage = activeJob.pausedStage || activeJob.stage || "find_order_id";
+    activeJob.paused = false;
+    activeJob.pausedStage = null;
+    await setActiveJob(activeJob);
+  }
   if (activeJob.paused) {
     showPanel(
       "Nutricity fulfilment paused",
@@ -3804,7 +5117,24 @@ async function run() {
     return;
   }
   try {
-    if (activeJob.stage === "reporting_complete") {
+    if (submittedStage(activeJob)) {
+      if (activeJob.stage === "reporting_complete") {
+        if (activeJob.reportedOrderId) {
+          await reportAmazonOrder(activeJob, activeJob.reportedOrderId);
+        } else {
+          showPanel("Nutricity fulfilment", "Reporting Amazon order back to the app.", null, null);
+        }
+      } else if (activeJob.stage === "complete_pending") {
+        await handleCompletion(activeJob);
+      } else {
+        activeJob.stage = "find_order_id";
+        await setActiveJob(activeJob);
+        await handleOrderHistory(activeJob);
+      }
+    } else if (/\/checkout/i.test(location.pathname) && await handleCheckoutLimitPurchase(activeJob)) return;
+    else if (activeJob.stage === "cleanup_after_failure") {
+      await handleFailureCleanup(activeJob);
+    } else if (activeJob.stage === "reporting_complete") {
       if (activeJob.reportedOrderId) {
         await reportAmazonOrder(activeJob, activeJob.reportedOrderId);
       } else {
@@ -3829,7 +5159,7 @@ async function run() {
       await setActiveJob(activeJob);
       await handleOrderHistory(activeJob);
     } else if (/\/cart/i.test(location.pathname)) {
-      if (activeJob.stage !== "clear_cart") {
+      if (!["clear_cart", "cleanup_after_failure"].includes(activeJob.stage)) {
         activeJob.stage = "cart";
       }
       await setActiveJob(activeJob);
@@ -3898,19 +5228,56 @@ async function run() {
 }
 
 async function runSafely() {
-  if (window.__nutricityRunning) return;
+  if (window.__nutricityRunning) {
+    if (Date.now() - Number(window.__nutricityRunningAt || 0) < 25000) return;
+    console.warn("Nutricity fulfilment: recovering from a stale content-script run.");
+  }
   window.__nutricityRunning = true;
+  window.__nutricityRunningAt = Date.now();
   try {
     await run();
   } finally {
     window.__nutricityRunning = false;
+    window.__nutricityRunningAt = 0;
   }
 }
 
 runSafely();
+scheduleOrderHistoryAnnotation(250);
 setInterval(runSafely, 5000);
-window.addEventListener("pageshow", () => setTimeout(runSafely, 250));
-window.addEventListener("focus", () => setTimeout(runSafely, 250));
+setInterval(() => scheduleOrderHistoryAnnotation(0), 3000);
+window.addEventListener("pageshow", () => {
+  setTimeout(runSafely, 250);
+  scheduleOrderHistoryAnnotation(250);
+});
+window.addEventListener("focus", () => {
+  setTimeout(runSafely, 250);
+  scheduleOrderHistoryAnnotation(250);
+});
+window.addEventListener("hashchange", () => scheduleOrderHistoryAnnotation(500));
+window.addEventListener("popstate", () => scheduleOrderHistoryAnnotation(500));
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) setTimeout(runSafely, 250);
+  if (!document.hidden) {
+    setTimeout(runSafely, 250);
+    scheduleOrderHistoryAnnotation(250);
+  }
+});
+if (document.body) {
+  const observer = new MutationObserver(() => scheduleOrderHistoryAnnotation(500));
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type !== "CHECK_ASIN_AVAILABILITY") return false;
+  try {
+    sendResponse(checkAsinAvailability(message.asin));
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      in_stock: false,
+      message: error.message || String(error),
+      url: location.href,
+    });
+  }
+  return true;
 });

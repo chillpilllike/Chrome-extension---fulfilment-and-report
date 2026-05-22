@@ -1,4 +1,14 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const completionLocks = new Set();
+let queueStatusInFlight = null;
+let lastReleaseMissingWindowJobsAt = 0;
+let releaseMissingWindowJobsInFlight = null;
+const recoverSubmittedJobsInFlight = new Map();
+let lastEmptyRecoverSubmittedJobAt = 0;
+let startNextJobInFlight = null;
+const claimNextJobInFlight = new Map();
+const MISSING_ASIN_ALARM = "nutricity-missing-asin-availability";
+const MISSING_ASIN_CHECK_PERIOD_MINUTES = 24 * 60;
 
 async function getSettings() {
   const data = await chrome.storage.local.get({
@@ -7,10 +17,16 @@ async function getSettings() {
     cardLast4Preference: "",
     editExistingAddress: true,
     fulfilAvailableMixedAsin: false,
+    splitMixedAsinOrders: true,
+    browserlessOrderMode: false,
     workerId: "",
     activeJob: null,
     activeJobsByWindow: {},
     controlWindowsById: {},
+    missingAsinAvailabilityLastRunAt: 0,
+    availabilityCheckInFlight: false,
+    recentAmazonOrders: [],
+    cachedQueueStatus: null,
     logs: [],
     logsByWindow: {},
   });
@@ -36,10 +52,14 @@ function messageWindowId(message = {}, sender = {}) {
 async function getWindowState(windowId) {
   const state = await getSettings();
   const key = String(windowId || "");
+  const windowJob = windowId ? state.activeJobsByWindow?.[key] || null : state.activeJob;
+  const fallbackSubmittedJob = windowId && !windowJob && orderSubmitStarted(state.activeJob)
+    ? state.activeJob
+    : null;
   return {
     ...state,
     targetWindowId: windowId || null,
-    activeJob: windowId ? state.activeJobsByWindow?.[key] || null : state.activeJob,
+    activeJob: windowJob || fallbackSubmittedJob,
     logs: windowId ? state.logsByWindow?.[key] || [] : state.logs,
   };
 }
@@ -50,7 +70,18 @@ async function setWindowJob(windowId, activeJob) {
   const key = String(windowId || "");
   if (windowId && activeJob) next[key] = activeJob;
   if (windowId && !activeJob) delete next[key];
-  await chrome.storage.local.set({ activeJobsByWindow: next, activeJob: activeJob || null });
+  await chrome.storage.local.set({ activeJobsByWindow: next, activeJob: activeJob || Object.values(next)[0] || null });
+}
+
+async function clearStoredJobGroup(groupKey) {
+  if (!groupKey) return;
+  const state = await getSettings();
+  const next = { ...(state.activeJobsByWindow || {}) };
+  for (const [windowKey, activeJob] of Object.entries(next)) {
+    if (activeJob?.job?.group_key === groupKey) delete next[windowKey];
+  }
+  const activeJob = state.activeJob?.job?.group_key === groupKey ? null : state.activeJob || null;
+  await chrome.storage.local.set({ activeJobsByWindow: next, activeJob: activeJob || Object.values(next)[0] || null });
 }
 
 async function setControlWindow(controlWindowId, targetWindowId) {
@@ -78,6 +109,90 @@ async function log(message, windowId = null) {
   await chrome.storage.local.set({ logsByWindow: next, logs: next[key] });
 }
 
+function normalizeRecentAmazonOrder(order = {}) {
+  const orderId = String(order.amazon_order_id || "").trim();
+  if (!/^\d{3}-\d{7}-\d{7}$/.test(orderId)) return null;
+  const items = (order.items || [])
+    .map((item) => ({
+      asin: String(item?.asin || "").trim().toUpperCase(),
+      quantity: Math.max(1, Math.round(Number(item?.quantity || 1))),
+    }))
+    .filter((item) => item.asin);
+  const asinQuantities = {};
+  for (const item of items) {
+    asinQuantities[item.asin] = (asinQuantities[item.asin] || 0) + item.quantity;
+  }
+  for (const asin of order.asins || []) {
+    const normalizedAsin = String(asin || "").trim().toUpperCase();
+    if (normalizedAsin && !asinQuantities[normalizedAsin]) asinQuantities[normalizedAsin] = 1;
+  }
+  return {
+    amazon_order_id: orderId,
+    amazon_order_url: order.amazon_order_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(orderId)}`,
+    recipient: String(order.recipient || "").replace(/\s+/g, " ").trim(),
+    order_date: String(order.order_date || "").replace(/\s+/g, " ").trim(),
+    status: String(order.status || "").replace(/\s+/g, " ").trim(),
+    asins: Object.keys(asinQuantities),
+    items,
+    asin_quantities: asinQuantities,
+    cancelled: order.cancelled === true,
+    captured_at: Number(order.captured_at || Date.now()),
+  };
+}
+
+async function rememberRecentAmazonOrders(orders = []) {
+  const incoming = (orders || []).map(normalizeRecentAmazonOrder).filter(Boolean);
+  if (!incoming.length) return { ok: true, remembered: 0, orders: [] };
+  const { recentAmazonOrders } = await getSettings();
+  const byId = new Map();
+  for (const order of [...incoming, ...(recentAmazonOrders || [])]) {
+    if (!order?.amazon_order_id || byId.has(order.amazon_order_id)) continue;
+    byId.set(order.amazon_order_id, normalizeRecentAmazonOrder(order));
+  }
+  const next = [...byId.values()].filter(Boolean).sort((a, b) => Number(b.captured_at || 0) - Number(a.captured_at || 0)).slice(0, 10);
+  await chrome.storage.local.set({ recentAmazonOrders: next });
+  return { ok: true, remembered: incoming.length, orders: next };
+}
+
+async function lookupAmazonHistoryOrders(orders = []) {
+  const normalized = (orders || []).map(normalizeRecentAmazonOrder).filter(Boolean);
+  if (!normalized.length) return { ok: true, matches: {}, unmatched: [], not_found_url: "/amazon-order-history-unmatched" };
+  const result = await api("/api/chrome/order-history/lookup", {
+    method: "POST",
+    body: JSON.stringify({ orders: normalized }),
+    timeoutMs: 12000,
+  });
+  const { apiBase } = await getSettings();
+  const base = normalizeApiBase(apiBase);
+  return { app_base_url: base, ...result, not_found_url: `${base}${result.not_found_url || "/amazon-order-history-unmatched"}` };
+}
+
+async function syncAmazonHistoryOrder(order = {}) {
+  const normalized = normalizeRecentAmazonOrder(order);
+  if (!normalized) return { ok: false, message: "Amazon order ID is not valid." };
+  const orderNames = (order.order_names || [])
+    .map((name) => String(name || "").trim())
+    .filter(Boolean);
+  const lineIds = (order.line_ids || [])
+    .map((lineId) => Number(lineId || 0))
+    .filter((lineId) => Number.isFinite(lineId) && lineId > 0);
+  const result = await api("/api/manual-amazon/match", {
+    method: "POST",
+    body: JSON.stringify({
+      amazon_order_id: normalized.amazon_order_id,
+      amazon_order_url: normalized.amazon_order_url,
+      amazon_account_name: order.amazon_account_name || "Chrome History Matcher",
+      order_names: orderNames,
+      line_ids: lineIds,
+      source_text: order.source_text || normalized.recipient || "",
+      store_id: order.store_id || null,
+      replace_existing: order.replace_existing === true,
+    }),
+    timeoutMs: 120000,
+  });
+  return result;
+}
+
 async function api(path, options = {}) {
   const { apiBase, adminToken } = await getSettings();
   const base = normalizeApiBase(apiBase);
@@ -96,36 +211,92 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+function connectionErrorMessage(error, base = "") {
+  const raw = String(error?.message || error || "Failed to fetch");
+  if (/failed to fetch|networkerror|load failed|abort/i.test(raw)) {
+    return `Could not reach the local app at ${base || DEFAULT_API_BASE}. Make sure the app is running on port 8000, then click Save and Check connection again.`;
+  }
+  return raw;
+}
+
 async function testConnection() {
   const { apiBase, adminToken } = await getSettings();
   const base = normalizeApiBase(apiBase);
-  const health = await fetch(`${base}/health`);
-  if (!health.ok) {
-    throw new Error(`Server health check failed: HTTP ${health.status}`);
-  }
-  const auth = await fetch(`${base}/api/settings/admin-access`, {
-    headers: adminToken ? { "X-Admin-Token": adminToken } : {},
-  });
-  if (!auth.ok) {
-    throw new Error((await auth.text()) || `Admin token check failed: HTTP ${auth.status}`);
+  try {
+    const health = await fetch(`${base}/health`);
+    if (!health.ok) {
+      throw new Error(`Server health check failed: HTTP ${health.status}`);
+    }
+    const auth = await fetch(`${base}/api/settings/admin-access`, {
+      headers: adminToken ? { "X-Admin-Token": adminToken } : {},
+    });
+    if (!auth.ok) {
+      throw new Error((await auth.text()) || `Admin token check failed: HTTP ${auth.status}`);
+    }
+  } catch (error) {
+    throw new Error(connectionErrorMessage(error, base));
   }
   return { ok: true, message: `Connected to ${base}. Admin token accepted.` };
 }
 
 async function getQueueStatus() {
   const workerId = await getWorkerId();
-  const payload = await api("/api/chrome/jobs?claim=false");
-  return { ok: true, jobs: payload.jobs || [], counts: payload.counts || [], workerId };
+  if (queueStatusInFlight) return queueStatusInFlight;
+  queueStatusInFlight = (async () => {
+  try {
+    const payload = await api("/api/chrome/jobs?claim=false&job_limit=12");
+    const snapshot = {
+      ok: true,
+      jobs: payload.jobs || [],
+      counts: payload.counts || [],
+      workerId,
+      cached_at: Date.now(),
+      stale: false,
+    };
+    await chrome.storage.local.set({ cachedQueueStatus: snapshot });
+    return snapshot;
+  } catch (error) {
+    const { cachedQueueStatus } = await getSettings();
+    if (cachedQueueStatus?.ok) {
+      return {
+        ...cachedQueueStatus,
+        workerId: cachedQueueStatus.workerId || workerId,
+        stale: true,
+        message: error.message || "Could not refresh queue; showing last loaded queue.",
+      };
+    }
+    throw error;
+  }
+  })();
+  try {
+    return await queueStatusInFlight;
+  } finally {
+    queueStatusInFlight = null;
+  }
+}
+
+async function getQueueJobsForActiveRefresh() {
+  const payload = await api("/api/chrome/jobs?claim=false&job_limit=80");
+  return payload.jobs || [];
 }
 
 async function refreshActiveJobFromQueue(windowId, force = false) {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job?.group_key) return activeJob;
+  if (activeJob.stage === "cleanup_after_failure") return activeJob;
+  if (orderSubmitStarted(activeJob)) return activeJob;
   if (!force && Date.now() - Number(activeJob.jobRefreshedAt || 0) < 30000) return activeJob;
   try {
-    const queue = await getQueueStatus();
-    const freshJob = (queue.jobs || []).find((job) => job.group_key === activeJob.job.group_key);
-    if (!freshJob) return activeJob;
+    const jobs = await getQueueJobsForActiveRefresh();
+    const freshJob = jobs.find((job) => job.group_key === activeJob.job.group_key);
+    if (!freshJob) {
+      await setWindowJob(windowId, null);
+      await addLog(
+        `Cleared stale active job ${activeJob.job.group_key}; it is no longer queued on the server.`,
+        "warn"
+      );
+      return null;
+    }
     const { activeJob: currentJob } = await getWindowState(windowId);
     const next = { ...(currentJob || activeJob), job: freshJob, jobRefreshedAt: Date.now() };
     await setWindowJob(windowId, next);
@@ -171,6 +342,36 @@ function activeJobFor(job, workerId, targetWindowId) {
   };
 }
 
+function jobWasSubmittedToAmazon(job) {
+  if (job?.submitted_to_amazon) return true;
+  if (["order_submitted", "reporting_complete"].includes(String(job?.amazon_status || ""))) return true;
+  return (job?.items || []).some((item) => ["order_submitted", "reporting_complete"].includes(String(item.amazon_status || "")));
+}
+
+function activeJobBlocksNext(activeJob) {
+  if (!activeJob?.job?.group_key) return false;
+  if (activeJob.stage === "cleanup_after_failure") return false;
+  return true;
+}
+
+async function blockingActiveJob(windowId = null) {
+  const state = await getSettings();
+  const jobs = Object.values(state.activeJobsByWindow || {}).filter(Boolean);
+  if (state.activeJob) jobs.push(state.activeJob);
+  const seen = new Set();
+  for (const job of jobs) {
+    const key = `${job?.targetWindowId || ""}:${job?.job?.group_key || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (activeJobBlocksNext(job)) return job;
+  }
+  if (windowId) {
+    const { activeJob } = await getWindowState(windowId);
+    if (activeJobBlocksNext(activeJob)) return activeJob;
+  }
+  return null;
+}
+
 async function navigateWindowToCart(windowId) {
   if (!windowId) return;
   const tabs = await chrome.tabs.query({ windowId });
@@ -179,6 +380,23 @@ async function navigateWindowToCart(windowId) {
     await chrome.tabs.update(tab.id, { url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
   }
   await chrome.windows.update(windowId, { focused: true });
+}
+
+async function navigateWindowToOrderHistory(windowId) {
+  const url = "https://www.amazon.com/gp/your-account/order-history?ref=ppx_pt2_dt_b_yo_link";
+  if (!windowId) {
+    const created = await chrome.windows.create({ url, type: "normal", focused: true });
+    return created?.id || null;
+  }
+  const tabs = await chrome.tabs.query({ windowId });
+  const tab = tabs.find((item) => item.active) || tabs[0];
+  if (tab?.id) {
+    await chrome.tabs.update(tab.id, { url, active: true });
+  } else {
+    await chrome.tabs.create({ windowId, url, active: true });
+  }
+  await chrome.windows.update(windowId, { focused: true });
+  return windowId;
 }
 
 async function windowIsIncognito(windowId) {
@@ -209,12 +427,33 @@ async function createAmazonWorkerWindow(incognito = false) {
 }
 
 async function startNextJob(sourceWindowId = null) {
+  if (startNextJobInFlight) return startNextJobInFlight;
+  startNextJobInFlight = (async () => {
+  await releaseMissingWindowJobs();
+  const blocking = await blockingActiveJob(sourceWindowId);
+  if (blocking) {
+    if (orderSubmitStarted(blocking)) {
+      await log(`Cannot start a new job; ${blocking.job.group_key} was already submitted and must be reported first.`, sourceWindowId);
+      const recovered = await recoverSubmittedJobInWindow(blocking.targetWindowId || sourceWindowId);
+      if (recovered?.activeJob) return recovered;
+      await clearStoredJobGroup(blocking.job.group_key);
+      await log(`Cleared closed submitted job ${blocking.job.group_key}; claiming the next queued order.`, sourceWindowId);
+    } else {
+      await log(`Cannot start a new job; ${blocking.job.group_key} is still active.`, sourceWindowId);
+      return { ok: false, active_job_running: true, message: `Finish or stop ${blocking.job.group_key} before starting the next queued order.` };
+    }
+  }
   const workerId = await getWorkerId();
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true`);
+  const { splitMixedAsinOrders } = await getSettings();
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=${splitMixedAsinOrders === true ? "true" : "false"}`);
   const job = payload.jobs?.[0];
   if (!job) {
     await log("No queued Chrome jobs found.");
     return { ok: false, message: "No queued Chrome jobs found." };
+  }
+  if (jobWasSubmittedToAmazon(job)) {
+    await log(`Recovered submitted ${job.group_key}; looking up Amazon order ID instead of opening a new cart.`, sourceWindowId);
+    return recoverSubmittedJobInWindow(sourceWindowId);
   }
   const incognito = await windowIsIncognito(sourceWindowId);
   let createdWindow;
@@ -244,34 +483,152 @@ async function startNextJob(sourceWindowId = null) {
   await setWindowJob(targetWindowId, activeJob);
   await log(`Started ${job.group_key} with ${job.items.length} item(s) in ${incognito ? "incognito" : "normal"} window.`, targetWindowId);
   return { ok: true, message: `Started ${job.group_key}.`, targetWindowId };
+  })();
+  try {
+    return await startNextJobInFlight;
+  } finally {
+    startNextJobInFlight = null;
+  }
+}
+
+async function startBrowserlessOrderRun(sourceWindowId = null) {
+  const workerId = await getWorkerId();
+  const { splitMixedAsinOrders } = await getSettings();
+  const result = await api("/api/chrome/browserless/run", {
+    method: "POST",
+    body: JSON.stringify({
+      worker_id: workerId,
+      ordering_engine: "rest",
+      split_mixed_asin: splitMixedAsinOrders === true,
+    }),
+    timeoutMs: 15000,
+  });
+  await log(result.message || "Started browserless background ordering.", sourceWindowId);
+  return result;
+}
+
+async function browserlessOrderStatus() {
+  return api("/api/chrome/browserless/status", { timeoutMs: 10000 });
 }
 
 async function claimNextJobInWindow(windowId) {
+  const claimKey = String(windowId || "global");
+  if (claimNextJobInFlight.has(claimKey)) return claimNextJobInFlight.get(claimKey);
+  const task = (async () => {
+  const { activeJob: currentJob } = await getWindowState(windowId);
+  if (activeJobBlocksNext(currentJob)) {
+    await log(`Kept ${currentJob.job.group_key}; current job is not closed yet.`, windowId);
+    return currentJob;
+  }
+  const blocking = await blockingActiveJob(windowId);
+  if (blocking) {
+    if (orderSubmitStarted(blocking)) {
+      const recovered = await recoverSubmittedJobInWindow(blocking.targetWindowId || windowId);
+      if (recovered?.activeJob) return recovered.activeJob;
+      await clearStoredJobGroup(blocking.job.group_key);
+      await log(`Cleared closed submitted job ${blocking.job.group_key}; claiming the next queued order.`, windowId);
+    } else {
+      await log(`Did not claim a new job because ${blocking.job.group_key} is still active.`, windowId);
+      return null;
+    }
+  }
   const workerId = await getWorkerId();
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true`);
+  const { splitMixedAsinOrders } = await getSettings();
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=${splitMixedAsinOrders === true ? "true" : "false"}`);
   const job = payload.jobs?.[0];
   if (!job) {
     await setWindowJob(windowId, null);
     await log("No more queued Chrome jobs found.", windowId);
     return null;
   }
+  if (jobWasSubmittedToAmazon(job)) {
+    const recovered = await recoverSubmittedJobInWindow(windowId);
+    return recovered.activeJob || null;
+  }
   const activeJob = activeJobFor(job, workerId, windowId);
   await setWindowJob(windowId, activeJob);
   await log(`Started next ${job.group_key} with ${job.items.length} item(s).`, windowId);
   await navigateWindowToCart(windowId);
   return activeJob;
+  })();
+  claimNextJobInFlight.set(claimKey, task);
+  try {
+    return await task;
+  } finally {
+    claimNextJobInFlight.delete(claimKey);
+  }
+}
+
+async function recoverSubmittedJobInWindow(windowId) {
+  const recoverKey = String(windowId || "global");
+  if (recoverSubmittedJobsInFlight.has(recoverKey)) {
+    return recoverSubmittedJobsInFlight.get(recoverKey);
+  }
+  if (Date.now() - lastEmptyRecoverSubmittedJobAt < 5000) {
+    const { activeJob } = await getWindowState(windowId);
+    if (!orderSubmitStarted(activeJob)) {
+      return { ok: true, recovered: false, activeJob: null };
+    }
+  }
+  const task = (async () => {
+  const workerId = await getWorkerId();
+  const result = await api(`/api/chrome/jobs/recover-submitted?worker_id=${encodeURIComponent(workerId)}`);
+  const job = result.job || null;
+  if (!job?.group_key) {
+    lastEmptyRecoverSubmittedJobAt = Date.now();
+    const { activeJob } = await getWindowState(windowId);
+    if (orderSubmitStarted(activeJob)) {
+      await clearStoredJobGroup(activeJob.job.group_key);
+    }
+    return { ok: true, recovered: false, activeJob: null };
+  }
+  const targetWindowId = await navigateWindowToOrderHistory(windowId);
+  const activeJob = {
+    ...activeJobFor(job, workerId, targetWindowId),
+    stage: "find_order_id",
+    cartCleared: true,
+    amazonSubmittedAt: Date.now(),
+    lastHeartbeatAt: Date.now(),
+  };
+  await setWindowJob(targetWindowId, activeJob);
+  await log(`Recovered submitted ${job.group_key}; opened order history to look up Amazon order ID.`, targetWindowId);
+  return { ok: true, recovered: true, activeJob, targetWindowId };
+  })();
+  recoverSubmittedJobsInFlight.set(recoverKey, task);
+  try {
+    return await task;
+  } finally {
+    recoverSubmittedJobsInFlight.delete(recoverKey);
+  }
+}
+
+async function cleanupCartBeforeNextJob(activeJob, windowId, reason = "") {
+  const cleanupJob = {
+    ...activeJob,
+    stage: "cleanup_after_failure",
+    cleanupAfterFailure: true,
+    cleanupReason: reason || "Cleaning Amazon cart before starting the next order.",
+    paused: false,
+  };
+  await setWindowJob(windowId, cleanupJob);
+  await log(`Cleaning cart after ${activeJob.job.group_key} before starting the next order.`, windowId);
+  await navigateWindowToCart(windowId);
 }
 
 async function stopJob(windowId) {
   const { activeJob } = await getWindowState(windowId);
   if (activeJob?.job?.group_key && activeJob?.workerId) {
-    try {
-      await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/release`, {
-        method: "POST",
-        body: JSON.stringify({ worker_id: activeJob.workerId }),
-      });
-    } catch (error) {
-      await log(`Could not release ${activeJob.job.group_key}: ${error.message}`, windowId);
+    if (orderSubmitStarted(activeJob)) {
+      await log(`Stopped local automation for ${activeJob.job.group_key}, but kept server submit lock because Amazon submit already started.`, windowId);
+    } else {
+      try {
+        await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/release`, {
+          method: "POST",
+          body: JSON.stringify({ worker_id: activeJob.workerId }),
+        });
+      } catch (error) {
+        await log(`Could not release ${activeJob.job.group_key}: ${error.message}`, windowId);
+      }
     }
   }
   await setWindowJob(windowId, null);
@@ -316,13 +673,31 @@ async function checkExistingAmazonOrder(windowId) {
   } catch (error) {
     await log(`Continuing duplicate check after heartbeat failed for ${activeJob.job.group_key}: ${error.message}`, windowId);
   }
-  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/duplicate-check`, {
-    method: "POST",
-    body: JSON.stringify({
-      worker_id: activeJob.workerId || "",
-      line_ids: activeJob.job.line_ids || [],
-    }),
-  });
+  let result;
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/duplicate-check`, {
+        method: "POST",
+        timeoutMs: attempt === 1 ? 45000 : 90000,
+        body: JSON.stringify({
+          worker_id: activeJob.workerId || "",
+          line_ids: activeJob.job.line_ids || [],
+        }),
+      });
+      break;
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || error || "");
+      const transientAbort = /abort|signal|timeout|network/i.test(message);
+      if (!transientAbort || attempt === 3) break;
+      await log(`Duplicate check retry ${attempt + 1} for ${activeJob.job.group_key} after transient error: ${message}`, windowId);
+      await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+    }
+  }
+  if (!result) {
+    throw lastError || new Error("Duplicate check failed.");
+  }
   activeJob.duplicateOrder = result.duplicate ? result : null;
   if (result.duplicate) {
     activeJob.paused = true;
@@ -355,6 +730,10 @@ async function resetDuplicateFulfilment(windowId) {
 
 async function releaseStoredJob(activeJob, windowId = null, label = "Chrome job") {
   if (!activeJob?.job?.group_key || !activeJob?.workerId) return false;
+  if (orderSubmitStarted(activeJob)) {
+    await log(`Kept ${activeJob.job.group_key} locked ${label}; Amazon submit already started.`, windowId);
+    return false;
+  }
   try {
     await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/release`, {
       method: "POST",
@@ -368,22 +747,63 @@ async function releaseStoredJob(activeJob, windowId = null, label = "Chrome job"
   }
 }
 
-async function releaseMissingWindowJobs() {
-  const state = await getSettings();
-  const activeJobsByWindow = { ...(state.activeJobsByWindow || {}) };
-  const windows = await chrome.windows.getAll({ windowTypes: ["normal", "popup"] });
-  const openWindowIds = new Set(windows.map((item) => String(item.id)));
-  let changed = false;
-  for (const [windowId, activeJob] of Object.entries(activeJobsByWindow)) {
-    if (openWindowIds.has(windowId)) continue;
-    const released = await releaseStoredJob(activeJob, Number(windowId) || null, "because its Chrome window is closed");
-    if (released) {
-      delete activeJobsByWindow[windowId];
-      changed = true;
-    }
+function orderSubmitStarted(activeJob) {
+  const stage = String(activeJob?.stage || "");
+  const pausedStage = String(activeJob?.pausedStage || "");
+  return Boolean(
+    activeJob?.amazonSubmittedAt ||
+      activeJob?.amazonDuplicateOrderConfirmed ||
+      ["complete_pending", "find_order_id", "reporting_complete"].includes(stage) ||
+      ["complete_pending", "find_order_id", "reporting_complete"].includes(pausedStage),
+  );
+}
+
+async function markAmazonSubmitted(windowId) {
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job?.group_key || !activeJob?.workerId) {
+    return { ok: false, message: "No active job to protect before Amazon submit." };
   }
-  if (changed) {
-    await chrome.storage.local.set({ activeJobsByWindow, activeJob: Object.values(activeJobsByWindow)[0] || null });
+  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/submitted`, {
+    method: "POST",
+    body: JSON.stringify({ worker_id: activeJob.workerId }),
+  });
+  const latest = (await getWindowState(windowId)).activeJob || activeJob;
+  latest.amazonSubmittedAt = latest.amazonSubmittedAt || Date.now();
+  latest.stage = "complete_pending";
+  latest.paused = false;
+  latest.pausedStage = null;
+  latest.lastHeartbeatAt = Date.now();
+  await setWindowJob(windowId, latest);
+  await log(`Protected ${latest.job.group_key} after Amazon submit started.`, windowId);
+  return result;
+}
+
+async function releaseMissingWindowJobs() {
+  if (releaseMissingWindowJobsInFlight) return releaseMissingWindowJobsInFlight;
+  if (Date.now() - lastReleaseMissingWindowJobsAt < 15000) return;
+  releaseMissingWindowJobsInFlight = (async () => {
+    lastReleaseMissingWindowJobsAt = Date.now();
+    const state = await getSettings();
+    const activeJobsByWindow = { ...(state.activeJobsByWindow || {}) };
+    const windows = await chrome.windows.getAll({ windowTypes: ["normal", "popup"] });
+    const openWindowIds = new Set(windows.map((item) => String(item.id)));
+    let changed = false;
+    for (const [windowId, activeJob] of Object.entries(activeJobsByWindow)) {
+      if (openWindowIds.has(windowId)) continue;
+      const released = await releaseStoredJob(activeJob, Number(windowId) || null, "because its Chrome window is closed");
+      if (released) {
+        delete activeJobsByWindow[windowId];
+        changed = true;
+      }
+    }
+    if (changed) {
+      await chrome.storage.local.set({ activeJobsByWindow, activeJob: Object.values(activeJobsByWindow)[0] || null });
+    }
+  })();
+  try {
+    await releaseMissingWindowJobsInFlight;
+  } finally {
+    releaseMissingWindowJobsInFlight = null;
   }
 }
 
@@ -452,25 +872,42 @@ async function togglePause(windowId) {
   return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
 
-async function completeJob(orderId, orderUrl, amazonAccountName, windowId) {
+async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = []) {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
-  await heartbeatJob(activeJob, windowId);
-  const body = {
-    amazon_order_id: orderId || "",
-    amazon_order_url: orderUrl || "",
-    amazon_account_name: amazonAccountName || "",
-    line_ids: activeJob.job.line_ids || [],
-    pricing_summary: Object.values(activeJob.pricing || {}),
-    worker_id: activeJob.workerId || "",
-  };
-  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/complete`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-  await log(`Completed ${activeJob.job.group_key} as ${result.amazon_order_id}.`, windowId);
-  const nextJob = await claimNextJobInWindow(windowId);
-  return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
+  const groupKey = activeJob.job.group_key;
+  const lockKey = `${windowId || "global"}:${groupKey}`;
+  if (completionLocks.has(lockKey)) {
+    await log(`Ignored duplicate completion report for ${groupKey}.`, windowId);
+    return { ok: true, duplicate_ignored: true, message: `Completion for ${groupKey} is already being reported.` };
+  }
+  completionLocks.add(lockKey);
+  try {
+    await heartbeatJob(activeJob, windowId);
+    const body = {
+      amazon_order_id: orderId || "",
+      amazon_order_url: orderUrl || "",
+      amazon_account_name: amazonAccountName || "",
+      line_ids: activeJob.job.line_ids || [],
+      order_mappings: orderMappings || [],
+      pricing_summary: Object.values(activeJob.pricing || {}),
+      worker_id: activeJob.workerId || "",
+    };
+    const result = await api(`/api/chrome/jobs/${encodeURIComponent(groupKey)}/complete`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    await log(`Completed ${groupKey} as ${result.amazon_order_id}.`, windowId);
+    const latest = await getWindowState(windowId);
+    if (latest.activeJob?.job?.group_key !== groupKey) {
+      return { ...result, next_job_started: false, next_group_key: "" };
+    }
+    await clearStoredJobGroup(groupKey);
+    const nextJob = await claimNextJobInWindow(windowId);
+    return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
+  } finally {
+    completionLocks.delete(lockKey);
+  }
 }
 
 async function failJob(message, details = {}, windowId) {
@@ -496,8 +933,8 @@ async function failJob(message, details = {}, windowId) {
     }),
   });
   await log(`Failed ${activeJob.job.group_key}: ${message}`, windowId);
-  const nextJob = await claimNextJobInWindow(windowId);
-  return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
+  await cleanupCartBeforeNextJob(activeJob, windowId, message);
+  return { ...result, next_job_started: false, cleanup_required: true, next_group_key: "" };
 }
 
 async function markLineMissing(message, details = {}, windowId) {
@@ -523,11 +960,10 @@ async function markLineMissing(message, details = {}, windowId) {
     }),
   });
   await log(`Partially marked missing in ${activeJob.job.group_key}: ${message}`, windowId);
-  let nextJob = null;
   if (result?.ok && Number(result.remaining_count || 0) === 0) {
-    nextJob = await claimNextJobInWindow(windowId);
+    await cleanupCartBeforeNextJob(activeJob, windowId, message);
   }
-  return { ...result, next_job_started: Boolean(nextJob), next_group_key: nextJob?.job?.group_key || "" };
+  return { ...result, next_job_started: false, cleanup_required: result?.ok && Number(result.remaining_count || 0) === 0, next_group_key: "" };
 }
 
 async function costlyJob(message, details = {}, windowId) {
@@ -553,9 +989,108 @@ async function costlyJob(message, details = {}, windowId) {
 
 async function clearFailedJobs() {
   const result = await api("/api/chrome/failed-jobs/clear", { method: "POST", body: JSON.stringify({}) });
-  await chrome.storage.local.set({ activeJob: null });
+  await chrome.storage.local.set({ activeJob: null, cachedQueueStatus: null });
   await log(result.message || `Cleared ${result.cleared || 0} failed Chrome job line(s).`);
   return result;
+}
+
+async function activeOrderingInProgress() {
+  const state = await getSettings();
+  if (state.activeJob?.job) return true;
+  return Object.values(state.activeJobsByWindow || {}).some((activeJob) => activeJob?.job);
+}
+
+async function setupAvailabilityAlarm() {
+  if (!chrome.alarms?.create) return;
+  await chrome.alarms.create(MISSING_ASIN_ALARM, {
+    delayInMinutes: 10,
+    periodInMinutes: MISSING_ASIN_CHECK_PERIOD_MINUTES,
+  });
+}
+
+function waitForTabComplete(tabId, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") finish();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab?.status === "complete") finish();
+    }).catch(() => finish());
+  });
+}
+
+async function checkAmazonAvailabilityCandidate(candidate) {
+  const amazonUrl = candidate.amazon_url || `https://www.amazon.com/dp/${encodeURIComponent(candidate.asin || "")}`;
+  const tab = await chrome.tabs.create({ url: amazonUrl, active: false });
+  try {
+    await waitForTabComplete(tab.id, 30000);
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    try {
+      return await chrome.tabs.sendMessage(tab.id, { type: "CHECK_ASIN_AVAILABILITY", asin: candidate.asin });
+    } catch (error) {
+      return {
+        ok: false,
+        in_stock: false,
+        message: `Could not inspect Amazon product page: ${error.message || error}`,
+        url: amazonUrl,
+      };
+    }
+  } finally {
+    if (tab?.id) chrome.tabs.remove(tab.id).catch(() => undefined);
+  }
+}
+
+async function runMissingAsinAvailabilityCheck(force = false) {
+  const state = await getSettings();
+  if (state.availabilityCheckInFlight) return { ok: false, message: "Availability check already running." };
+  if (!force && await activeOrderingInProgress()) return { ok: false, message: "Skipped because Chrome fulfilment is active." };
+  await chrome.storage.local.set({ availabilityCheckInFlight: true });
+  let checked = 0;
+  let backInStock = 0;
+  let queued = 0;
+  try {
+    const payload = await api("/api/chrome/missing-asin-checks?limit=40", { timeoutMs: 15000 });
+    const candidates = payload.candidates || [];
+    for (const candidate of candidates) {
+      if (!force && await activeOrderingInProgress()) {
+        await log("Paused missing ASIN availability check because a fulfilment job started.");
+        break;
+      }
+      const result = await checkAmazonAvailabilityCandidate(candidate);
+      checked += 1;
+      const report = await api("/api/chrome/missing-asin-checks/report", {
+        method: "POST",
+        body: JSON.stringify({
+          line_id: candidate.line_id,
+          asin: candidate.asin,
+          in_stock: Boolean(result?.in_stock),
+          message: result?.message || "",
+          price: result?.price || 0,
+          checked_url: result?.url || candidate.amazon_url || "",
+          checked_by: await getWorkerId(),
+        }),
+        timeoutMs: 20000,
+      });
+      if (result?.in_stock) backInStock += 1;
+      if (report?.queued) queued += Number(report.queued || 0);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+    await chrome.storage.local.set({ missingAsinAvailabilityLastRunAt: Date.now() });
+    await log(`Missing ASIN availability check complete: checked ${checked}, back in stock ${backInStock}, queued ${queued}.`);
+    return { ok: true, checked, back_in_stock: backInStock, queued };
+  } finally {
+    await chrome.storage.local.set({ availabilityCheckInFlight: false });
+  }
 }
 
 chrome.action.onClicked.addListener((tab) => {
@@ -564,10 +1099,17 @@ chrome.action.onClicked.addListener((tab) => {
 
 chrome.runtime.onStartup.addListener(() => {
   releaseAllStoredJobs().catch((error) => log(`Could not release previous Chrome session jobs: ${error.message}`));
+  setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  releaseMissingWindowJobs().catch((error) => log(`Could not clean up Chrome job locks: ${error.message}`));
+  releaseAllStoredJobs("after extension reload").catch((error) => log(`Could not clean up Chrome job locks: ${error.message}`));
+  setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== MISSING_ASIN_ALARM) return;
+  runMissingAsinAvailabilityCheck(false).catch((error) => log(`Missing ASIN availability check failed: ${error.message}`));
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
@@ -588,6 +1130,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
     if (message.type === "START_NEXT") return startNextJob(windowId);
+    if (message.type === "START_BROWSERLESS") return startBrowserlessOrderRun(windowId);
+    if (message.type === "GET_BROWSERLESS_STATUS") return browserlessOrderStatus();
     if (message.type === "REGISTER_CONTROL_WINDOW") {
       await setControlWindow(Number(message.controlWindowId || 0) || null, Number(message.targetWindowId || 0) || null);
       return { ok: true };
@@ -600,13 +1144,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "TOGGLE_PAUSE") return togglePause(windowId);
     if (message.type === "GET_STATE") {
       await releaseMissingWindowJobs();
-      await refreshActiveJobFromQueue(windowId, true);
+      await refreshActiveJobFromQueue(windowId);
       return getWindowState(windowId);
     }
     if (message.type === "GET_QUEUE_STATUS") {
       await releaseMissingWindowJobs();
       return getQueueStatus();
     }
+    if (message.type === "REMEMBER_RECENT_AMAZON_ORDERS") return rememberRecentAmazonOrders(message.orders || []);
+    if (message.type === "LOOKUP_AMAZON_HISTORY_ORDERS") return lookupAmazonHistoryOrders(message.orders || []);
+    if (message.type === "SYNC_AMAZON_HISTORY_ORDER") return syncAmazonHistoryOrder(message.order || {});
+    if (message.type === "GET_RECENT_AMAZON_ORDERS") {
+      const { recentAmazonOrders } = await getSettings();
+      return { ok: true, orders: recentAmazonOrders || [] };
+    }
+    if (message.type === "CLAIM_NEXT_IN_WINDOW") {
+      const nextJob = await claimNextJobInWindow(windowId);
+      return {
+        ok: true,
+        next_job_started: Boolean(nextJob),
+        next_group_key: nextJob?.job?.group_key || "",
+        message: nextJob ? `Started next ${nextJob.job.group_key}.` : "No more queued Chrome jobs found.",
+      };
+    }
+    if (message.type === "RECOVER_SUBMITTED_JOB") return recoverSubmittedJobInWindow(windowId);
+    if (message.type === "RUN_MISSING_ASIN_AVAILABILITY_CHECK") return runMissingAsinAvailabilityCheck(true);
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "GET_ACTIVE_JOB") {
       const { activeJob } = await getWindowState(windowId);
@@ -625,6 +1187,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await heartbeatJob(activeJob, windowId);
       return { ok: true };
     }
+    if (message.type === "MARK_ORDER_SUBMITTED") return markAmazonSubmitted(windowId);
     if (message.type === "SET_ACTIVE_JOB") {
       await setWindowJob(windowId, message.activeJob || null);
       return { ok: true };
@@ -636,10 +1199,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         cardLast4Preference: message.cardLast4Preference || "",
         editExistingAddress: message.editExistingAddress !== false,
         fulfilAvailableMixedAsin: message.fulfilAvailableMixedAsin === true,
+        splitMixedAsinOrders: message.splitMixedAsinOrders === true,
+        browserlessOrderMode: message.browserlessOrderMode === true,
       });
       return { ok: true };
     }
-    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId);
+    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || []);
     if (message.type === "MARK_LINE_MISSING") return markLineMissing(message.message || "Chrome extension line is missing.", message, windowId);
     if (message.type === "FAIL_JOB") return failJob(message.message || "Chrome extension job failed.", message, windowId);
     if (message.type === "COSTLY_JOB") return costlyJob(message.message || "Chrome extension job needs costly approval.", message, windowId);
@@ -647,6 +1212,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return { ok: false, message: "Unknown message." };
   })()
     .then((result) => sendResponse(result))
-    .catch((error) => sendResponse({ ok: false, message: error.message }));
+    .catch((error) => sendResponse({ ok: false, message: connectionErrorMessage(error) }));
   return true;
 });

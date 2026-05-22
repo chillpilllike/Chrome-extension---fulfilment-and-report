@@ -62,6 +62,7 @@ const KNOWN_APP_PAGES = new Set([
   "duplicate-tracking",
   "fulfilment-pending",
   "missing",
+  "back-in-stock",
   "partial-fulfilments",
   "bulk",
   "costly",
@@ -376,6 +377,30 @@ type CancelledOrderRow = OrderLine & {
   inventory_updated_at?: string
 }
 
+type BackInStockRow = {
+  id: number
+  order_line_id: number
+  store_id: number
+  asin: string
+  asin_url?: string
+  product_name: string
+  odoo_order_id: number
+  odoo_order_name: string
+  odoo_order_url?: string
+  status: string
+  availability_message: string
+  price?: number
+  checked_url: string
+  checked_by: string
+  queued_at: string
+  first_seen_at: string
+  last_checked_at: string
+  order_state?: string
+  amazon_group_key?: string
+  replacement_asin?: string
+  amazon_order_id?: string
+}
+
 type BulkGroup = {
   asin: string
   asin_url: string
@@ -397,6 +422,8 @@ type ChromeQueueJob = {
   group_key: string
   store_id?: number
   store_name?: string
+  amazon_status?: string
+  back_in_stock?: boolean
   order_names?: string[]
   recipient_name?: string
   items?: ChromeQueueItem[]
@@ -464,6 +491,7 @@ const defaultUiCopy: UiCopy = {
   "duplicate-tracking": { title: "Duplicate Tracking", description: "Review repeated tracking numbers before dispatch updates." },
   "fulfilment-pending": { title: "Pending Dispatch", description: "Find Amazon-delivered orders still pending in Odoo." },
   missing: { title: "Missing ASINs", description: "Resolve unavailable Amazon products and replacements." },
+  "back-in-stock": { title: "Back In Stock", description: "Review missing ASINs that the Chrome extension found available again." },
   "partial-fulfilments": { title: "Partial Fulfilments", description: "Review orders split between Amazon fulfilment and Missing ASINs." },
   bulk: { title: "Bulk Ordering", description: "Group compatible items before ordering." },
   costly: { title: "Cost Review", description: "Approve or replace items with unfavorable cost." },
@@ -1621,6 +1649,9 @@ function App() {
   const [missingRows, setMissingRows] = useState<OrderLine[]>([])
   const [missingPage, setMissingPage] = useState(1)
   const [missingTotal, setMissingTotal] = useState(0)
+  const [backInStockRows, setBackInStockRows] = useState<BackInStockRow[]>([])
+  const [backInStockPage, setBackInStockPage] = useState(1)
+  const [backInStockTotal, setBackInStockTotal] = useState(0)
   const [partialFulfilments, setPartialFulfilments] = useState<PartialFulfilment[]>([])
   const [partialFulfilmentsPage, setPartialFulfilmentsPage] = useState(1)
   const [partialFulfilmentsTotal, setPartialFulfilmentsTotal] = useState(0)
@@ -1996,6 +2027,16 @@ function App() {
       })
       .catch((error) => setModal({ ok: false, title: "Missing orders load failed", message: String(error) }))
   }, [page, storeId, missingPage])
+
+  useEffect(() => {
+    if (page !== "back-in-stock") return
+    api<{ rows: BackInStockRow[]; total: number }>(`/api/back-in-stock${pagedQuery(storeId, backInStockPage)}`)
+      .then((result) => {
+        setBackInStockRows(result.rows || [])
+        setBackInStockTotal(result.total || 0)
+      })
+      .catch((error) => setModal({ ok: false, title: "Back in stock load failed", message: String(error) }))
+  }, [page, storeId, backInStockPage])
 
   useEffect(() => {
     if (page !== "partial-fulfilments" && page !== "home") return
@@ -2579,6 +2620,7 @@ function App() {
         ["bulk", "Bulk Ordering", PackageCheck],
         ["shopify-fulfilment", "Shopify Fulfilment", StoreIcon],
         ["missing", "Missing ASINs", AlertCircle],
+        ["back-in-stock", "Back In Stock", CheckCircle2],
         ["partial-fulfilments", "Partial Fulfilments", AlertCircle],
         ["costly", "Cost Review", AlertCircle],
         ["fulfilment-pending", "Pending Dispatch", AlertCircle],
@@ -3494,6 +3536,19 @@ function App() {
               setMissingRows(result.rows)
               setMissingTotal(result.total || 0)
               await refresh()
+            }}
+          />
+        )}
+        {page === "back-in-stock" && (
+          <BackInStockPage
+            rows={backInStockRows}
+            page={backInStockPage}
+            total={backInStockTotal}
+            onPage={setBackInStockPage}
+            onRefresh={async () => {
+              const result = await api<{ rows: BackInStockRow[]; total: number }>(`/api/back-in-stock${pagedQuery(storeId, backInStockPage)}`)
+              setBackInStockRows(result.rows || [])
+              setBackInStockTotal(result.total || 0)
             }}
           />
         )}
@@ -5505,6 +5560,107 @@ function MissingPage({
   )
 }
 
+function BackInStockPage({
+  rows,
+  page,
+  total,
+  onPage,
+  onRefresh,
+}: {
+  rows: BackInStockRow[]
+  page: number
+  total: number
+  onPage: (page: number) => void
+  onRefresh: () => Promise<void>
+}) {
+  return (
+    <div className="grid gap-5">
+      <section className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">Back In Stock</h2>
+          <p className="text-sm text-muted-foreground">Missing ASINs the Chrome extension checked in the background and found available again.</p>
+        </div>
+        <Button variant="outline" onClick={onRefresh}>
+          <RefreshCw className="size-4" />
+          Refresh
+        </Button>
+      </section>
+      <div className="flex justify-end">
+        <PaginationControls page={page} total={total} onPage={onPage} />
+      </div>
+      <Card>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Odoo Order</TableHead>
+                <TableHead>ASIN</TableHead>
+                <TableHead>Product</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Price</TableHead>
+                <TableHead>Queue</TableHead>
+                <TableHead>Checked</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((row) => (
+                <TableRow
+                  key={row.id}
+                  className={row.status === "back_in_stock" || row.queued_at ? "bg-emerald-50" : row.status === "replacement_assigned" ? "bg-amber-50" : ""}
+                >
+                  <TableCell>
+                    {row.odoo_order_url ? (
+                      <a className="font-medium underline-offset-4 hover:underline" href={row.odoo_order_url} target="_blank">
+                        {row.odoo_order_name || row.odoo_order_id}
+                      </a>
+                    ) : (
+                      row.odoo_order_name || row.odoo_order_id || "-"
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.asin_url || `https://www.amazon.com/dp/${row.asin}`} target="_blank">
+                      {row.asin}
+                    </a>
+                  </TableCell>
+                  <TableCell className="max-w-[420px] truncate">{row.product_name || "-"}</TableCell>
+                  <TableCell>
+                    <div className="grid gap-1">
+                      <StatusBadge value={(row.status || "unknown").replaceAll("_", " ")} />
+                      {row.status === "replacement_assigned" ? (
+                        <span className="text-xs text-muted-foreground">Skipped because a replacement ASIN is assigned.</span>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                  <TableCell>{row.price ? formatMoney(row.price) : "-"}</TableCell>
+                  <TableCell>
+                    <div className="grid gap-1 text-sm">
+                      {row.queued_at ? <Badge variant="secondary">Queued for Chrome</Badge> : <span className="text-muted-foreground">Not queued</span>}
+                      {row.amazon_group_key ? <span className="font-mono text-xs text-muted-foreground">{row.amazon_group_key}</span> : null}
+                    </div>
+                  </TableCell>
+                  <TableCell className="max-w-[260px]">
+                    <div className="grid gap-1 text-xs text-muted-foreground">
+                      <span>{formatDateTime(row.last_checked_at)}</span>
+                      {row.availability_message ? <span className="truncate" title={row.availability_message}>{row.availability_message}</span> : null}
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+              {!rows.length && (
+                <TableRow>
+                  <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
+                    No back-in-stock ASINs reported yet.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
 function BulkPage({
   groups,
   storeId,
@@ -6661,7 +6817,7 @@ function ChromeQueuePage({
       <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
           <CardTitle>Chrome Jobs Queue</CardTitle>
-          <CardDescription>Locked Chrome extension jobs that may need a manual release.</CardDescription>
+          <CardDescription>Chrome extension jobs waiting for fulfilment or manual lock release.</CardDescription>
         </div>
         <div className="btn-list">
           <Badge variant={lockedCount ? "destructive" : "outline"}>{lockedCount.toLocaleString()} locked</Badge>
@@ -6686,9 +6842,14 @@ function ChromeQueuePage({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {lockedRows.map((job) => (
-              <TableRow key={job.group_key}>
-                <TableCell className="font-mono text-xs">{job.group_key}</TableCell>
+            {rows.map((job) => (
+              <TableRow key={job.group_key} className={job.back_in_stock ? "bg-emerald-50" : ""}>
+                <TableCell className="font-mono text-xs">
+                  <div className="grid gap-1">
+                    <span>{job.group_key}</span>
+                    {job.back_in_stock ? <Badge variant="secondary">Back in stock</Badge> : null}
+                  </div>
+                </TableCell>
                 <TableCell className="max-w-[220px]">
                   <div className="truncate">{(job.order_names || []).join(", ") || "-"}</div>
                 </TableCell>
@@ -6726,10 +6887,10 @@ function ChromeQueuePage({
                 </TableCell>
               </TableRow>
             ))}
-            {!lockedRows.length && (
+            {!rows.length && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">
-                  No locked Chrome jobs.
+                  No Chrome jobs waiting.
                 </TableCell>
               </TableRow>
             )}

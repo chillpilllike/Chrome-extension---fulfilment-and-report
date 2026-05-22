@@ -158,6 +158,7 @@ FRONTEND_SHELL_PATHS = {
     "/duplicate-tracking",
     "/fulfilment-pending",
     "/missing",
+    "/back-in-stock",
     "/partial-fulfilments",
     "/bulk",
     "/costly",
@@ -789,6 +790,25 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 processed_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS missing_asin_availability (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_line_id INTEGER NOT NULL REFERENCES order_lines(id) ON DELETE CASCADE,
+                store_id INTEGER NOT NULL,
+                asin TEXT NOT NULL,
+                product_name TEXT,
+                odoo_order_id INTEGER,
+                odoo_order_name TEXT,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                availability_message TEXT,
+                price REAL,
+                checked_url TEXT,
+                checked_by TEXT,
+                queued_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_checked_at TEXT NOT NULL,
+                UNIQUE(order_line_id, asin)
+            );
             """
         )
         for column, ddl in {
@@ -824,6 +844,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_shopify_export_customer_dest ON shopify_export_customer_map(dest_name, map_key)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_sync_order ON shopify_tracking_sync_log(odoo_db, odoo_order)",
             "CREATE INDEX IF NOT EXISTS idx_partial_fulfilments_store_status ON partial_fulfilments(store_id, status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_missing_asin_availability_store_status ON missing_asin_availability(store_id, status, last_checked_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_missing_asin_availability_line ON missing_asin_availability(order_line_id, asin)",
         ):
             conn.execute(index_sql)
         for column, ddl in {
@@ -5363,7 +5385,12 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
     group_key = str(group_rows[0]["amazon_group_key"])
     part_suffix = chrome_part_suffix(group_key)
     amazon_statuses = [clean_text(row.get("amazon_status")) for row in group_rows if clean_text(row.get("amazon_status"))]
-    amazon_status = "order_submitted" if "order_submitted" in amazon_statuses else ("reporting_complete" if "reporting_complete" in amazon_statuses else (amazon_statuses[0] if amazon_statuses else ""))
+    amazon_status = (
+        "order_submitted" if "order_submitted" in amazon_statuses else
+        "reporting_complete" if "reporting_complete" in amazon_statuses else
+        "back_in_stock" if "back_in_stock" in amazon_statuses else
+        (amazon_statuses[0] if amazon_statuses else "")
+    )
     return {
         "group_key": group_key,
         "store_id": group_rows[0]["store_id"],
@@ -5374,6 +5401,7 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
         "order_names": order_names,
         "recipient_name": chrome_recipient_name(order_names, part_suffix),
         "recipient_suffix": part_suffix,
+        "back_in_stock": "back_in_stock" in amazon_statuses,
         "line_ids": [row["id"] for row in group_rows],
         "claimed_by": group_rows[0].get("chrome_claimed_by") or "",
         "claim_expires_at": group_rows[0].get("chrome_claim_expires_at") or "",
@@ -10865,6 +10893,183 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
         row["asin_url"] = asin_product_url(row.get("asin") or "")
         row["replacement_asin_url"] = asin_product_url(row.get("replacement_asin") or "")
     return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": "postgres"}
+
+
+def missing_asin_check_candidates(limit: int = 40) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 40), 100))
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT order_lines.*
+            FROM order_lines
+            WHERE state='missing'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(replacement_asin, '') = ''
+              AND COALESCE(NULLIF(asin, ''), NULLIF(missing_asin, ''), '') != ''
+              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM order_lines AS sibling
+                  WHERE sibling.store_id=order_lines.store_id
+                    AND sibling.odoo_order_id=order_lines.odoo_order_id
+                    AND COALESCE(sibling.replacement_asin, '') != ''
+              )
+            ORDER BY COALESCE(updated_at, created_at) ASC, id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall())
+    candidates = []
+    for row in rows:
+        asin = normalize_asin(row.get("missing_asin") or row.get("asin") or "")
+        if not asin:
+            continue
+        candidates.append({
+            "line_id": row["id"],
+            "store_id": row["store_id"],
+            "odoo_order_id": row["odoo_order_id"],
+            "odoo_order_name": row["odoo_order_name"],
+            "asin": asin,
+            "product_name": row.get("product_name") or "",
+            "quantity": row.get("quantity") or 1,
+            "amazon_url": asin_product_url(asin),
+        })
+    return candidates
+
+
+def back_in_stock_rows(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    with db() as conn:
+        params: list[Any] = [store_id, store_id]
+        where = "WHERE (? IS NULL OR missing_asin_availability.store_id=?)"
+        total = int(conn.execute(f"SELECT COUNT(*) AS count FROM missing_asin_availability {where}", params).fetchone()["count"] or 0)
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT missing_asin_availability.*,
+                   order_lines.state AS order_state,
+                   order_lines.amazon_group_key,
+                   order_lines.replacement_asin,
+                   order_lines.amazon_order_id
+            FROM missing_asin_availability
+            LEFT JOIN order_lines ON order_lines.id=missing_asin_availability.order_line_id
+            {where}
+            ORDER BY missing_asin_availability.last_checked_at DESC, missing_asin_availability.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall())
+    stores = rows_to_dicts(list_stores())
+    stores_by_id = {store["id"]: store for store in stores}
+    for row in rows:
+        store = stores_by_id.get(row.get("store_id"))
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        row["asin_url"] = asin_product_url(row.get("asin") or "")
+    return rows, total
+
+
+@app.get("/api/back-in-stock")
+def api_back_in_stock(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    rows, total = back_in_stock_rows(store_id, page, per_page)
+    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total}
+
+
+@app.get("/api/chrome/missing-asin-checks")
+def api_chrome_missing_asin_checks(limit: int = 40) -> dict[str, Any]:
+    return {"ok": True, "candidates": missing_asin_check_candidates(limit)}
+
+
+@app.post("/api/chrome/missing-asin-checks/report")
+def api_chrome_missing_asin_report(payload: dict[str, Any]) -> dict[str, Any]:
+    line_id = int(payload.get("line_id") or 0)
+    asin = normalize_asin(payload.get("asin") or "")
+    in_stock = bool(payload.get("in_stock"))
+    status = "back_in_stock" if in_stock else "still_missing"
+    message = clean_text(payload.get("message"))
+    checked_url = clean_text(payload.get("checked_url")) or asin_product_url(asin)
+    checked_by = clean_text(payload.get("checked_by")) or "Chrome background"
+    price = float(payload.get("price") or 0) or None
+    if not line_id or not asin:
+        raise HTTPException(400, "line_id and asin are required.")
+    now = utc_now()
+    queued = 0
+    skipped_reason = ""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Order line not found.")
+        order_has_replacement = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM order_lines
+            WHERE store_id=? AND odoo_order_id=? AND COALESCE(replacement_asin, '') != ''
+            """,
+            (row["store_id"], row["odoo_order_id"]),
+        ).fetchone()["count"]
+        record_status = "replacement_assigned" if order_has_replacement else status
+        conn.execute(
+            """
+            INSERT INTO missing_asin_availability (
+                order_line_id, store_id, asin, product_name, odoo_order_id, odoo_order_name,
+                status, availability_message, price, checked_url, checked_by, queued_at, first_seen_at, last_checked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(order_line_id, asin) DO UPDATE SET
+                status=excluded.status,
+                availability_message=excluded.availability_message,
+                price=excluded.price,
+                checked_url=excluded.checked_url,
+                checked_by=excluded.checked_by,
+                last_checked_at=excluded.last_checked_at
+            """,
+            (
+                line_id,
+                row["store_id"],
+                asin,
+                row["product_name"],
+                row["odoo_order_id"],
+                row["odoo_order_name"],
+                record_status,
+                message,
+                price,
+                checked_url,
+                checked_by,
+                now,
+                now,
+            ),
+        )
+    if in_stock:
+        if order_has_replacement:
+            skipped_reason = "Replacement ASIN is already assigned on this Odoo order."
+        else:
+            queued, _cleared, _blocked, _account, _details = queue_chrome_order_groups_fast(
+                int(row["store_id"]),
+                line_ids=[line_id],
+                include_missing_asins=True,
+            )
+            if queued:
+                with db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE order_lines
+                        SET amazon_status='back_in_stock',
+                            fulfilment_note=CASE
+                              WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                              ELSE fulfilment_note || ' | ' || ?
+                            END,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        ("Back in stock; queued by Chrome availability check.", "Back in stock; queued by Chrome availability check.", utc_now(), line_id),
+                    )
+                    conn.execute(
+                        "UPDATE missing_asin_availability SET queued_at=? WHERE order_line_id=? AND asin=?",
+                        (utc_now(), line_id, asin),
+                    )
+                    updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+                    if updated:
+                        index_order_line(updated)
+            else:
+                skipped_reason = "Could not queue this line; it may already be queued, fulfilled, ignored, or blocked."
+    return {"ok": True, "status": record_status if in_stock else status, "queued": queued, "skipped_reason": skipped_reason}
 
 
 @app.get("/api/partial-fulfilments")

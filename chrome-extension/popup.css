@@ -190,6 +190,11 @@ button.danger {
   background: #fff7ed;
 }
 
+.queued-job.back-in-stock {
+  background: #ecfdf3;
+  border-left: 3px solid #16a34a;
+}
+
 .queued-job:last-child {
   border-bottom: 0;
 }
@@ -204,6 +209,16 @@ button.danger {
 .queued-job span {
   color: #475569;
   font-size: 12px;
+}
+
+.queued-job .queue-badge {
+  border-radius: 999px;
+  background: #dcfce7;
+  color: #166534;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  text-transform: uppercase;
 }
 
 .lock-icon {

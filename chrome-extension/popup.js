@@ -3,6 +3,8 @@ const adminToken = document.querySelector("#adminToken");
 const cardLast4Preference = document.querySelector("#cardLast4Preference");
 const editExistingAddress = document.querySelector("#editExistingAddress");
 const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAsin");
+const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
+const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
 const connectionNotice = document.querySelector("#connectionNotice");
 const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
@@ -32,6 +34,8 @@ function hydrateSettingsValues(settings = {}) {
   cardLast4Preference.value = settings.cardLast4Preference || "";
   editExistingAddress.checked = settings.editExistingAddress !== false;
   fulfilAvailableMixedAsin.checked = settings.fulfilAvailableMixedAsin === true;
+  splitMixedAsinOrders.checked = settings.splitMixedAsinOrders !== false;
+  browserlessOrderMode.checked = settings.browserlessOrderMode === true;
 }
 
 function hasSettingsPayload(state) {
@@ -40,7 +44,9 @@ function hasSettingsPayload(state) {
     Object.hasOwn(state, "adminToken") ||
     Object.hasOwn(state, "cardLast4Preference") ||
     Object.hasOwn(state, "editExistingAddress") ||
-    Object.hasOwn(state, "fulfilAvailableMixedAsin")
+    Object.hasOwn(state, "fulfilAvailableMixedAsin") ||
+    Object.hasOwn(state, "splitMixedAsinOrders") ||
+    Object.hasOwn(state, "browserlessOrderMode")
   ));
 }
 
@@ -51,8 +57,10 @@ function loadSavedSettings() {
     cardLast4Preference: "",
     editExistingAddress: true,
     fulfilAvailableMixedAsin: false,
+    splitMixedAsinOrders: true,
+    browserlessOrderMode: false,
   }, (settings) => {
-    if (chrome.runtime.lastError || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin].includes(document.activeElement)) return;
+    if (chrome.runtime.lastError || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].includes(document.activeElement)) return;
     hydrateSettingsValues(settings);
     settingsHydrated = true;
   });
@@ -68,7 +76,7 @@ function registerControlWindow() {
   });
 }
 
-[apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin].forEach((input) => {
+[apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].forEach((input) => {
   input.addEventListener("input", () => {
     settingsDirty = true;
   });
@@ -78,7 +86,7 @@ function registerControlWindow() {
 });
 
 function syncSettingsInputs(state) {
-  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin].includes(document.activeElement)) return;
+  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].includes(document.activeElement)) return;
   hydrateSettingsValues(state);
   settingsHydrated = true;
 }
@@ -190,9 +198,9 @@ function renderQueuedJobs(jobs, workerId = "") {
       ? `${isMine ? "Locked by this Chrome" : "Locked by another Chrome"}${job.claim_expires_at ? ` until ${new Date(job.claim_expires_at).toLocaleTimeString()}` : ""}`
       : "Ready";
     const row = document.createElement("div");
-    row.className = `queued-job${isLocked ? " locked" : ""}`;
+    row.className = `queued-job${isLocked ? " locked" : ""}${job.back_in_stock ? " back-in-stock" : ""}`;
     row.innerHTML = `
-      <strong>${isLocked ? `<span class="lock-icon" title="${lockText}" aria-label="${lockText}"></span>` : ""}${(job.order_names || []).join(", ") || job.group_key}</strong>
+      <strong>${isLocked ? `<span class="lock-icon" title="${lockText}" aria-label="${lockText}"></span>` : ""}${(job.order_names || []).join(", ") || job.group_key}${job.back_in_stock ? `<span class="queue-badge">Back in stock</span>` : ""}</strong>
       <span>${job.recipient_name || "No recipient"} · ${itemCount || 0} item(s)</span>
       <span>${asins || "No ASINs"}</span>
       <span class="lock-status">${lockText}${isLocked && !isMine ? ` · ${shortWorkerId(claimedBy)}` : ""}</span>
@@ -208,46 +216,83 @@ function queueCountDetails(counts = []) {
   return extras.length ? ` · ${extras.join(" · ")}` : "";
 }
 
+function submittedQueueCount(counts = [], fallback = 0) {
+  const submitted = (Array.isArray(counts) ? counts : []).find((item) => item.state === "submitted");
+  const count = Number(submitted?.count);
+  return Number.isFinite(count) ? count : fallback;
+}
+
+function renderQueueStatus(queue, state) {
+  renderQueuedJobs(queue.jobs || [], queue.workerId || state.workerId || "");
+  queueCount.textContent = `${submittedQueueCount(queue.counts || [], (queue.jobs || []).length)} waiting`;
+  queueCount.textContent += queueCountDetails(queue.counts || []);
+  if (queue.stale) {
+    queueCount.textContent += " · last loaded";
+  }
+}
+
 async function refresh() {
-  const state = await send({ type: "GET_STATE" });
-  if (state?.ok === false) {
-    setStatus(state.message || "Could not load extension state.");
+  if (refreshInFlight) {
+    refreshRequested = true;
     return;
   }
-  syncSettingsInputs(state);
-  const job = state.activeJob?.job;
-  pauseResume.textContent = state.activeJob?.paused ? "Resume" : "Pause";
-  pauseResume.disabled = !job;
-  skipJob.disabled = !job;
-  markMissing.disabled = !job;
-  setStatus(job ? `${state.activeJob.paused ? "Paused" : "Active"}: ${job.group_key} (${state.activeJob.stage})` : "No active job.");
-  renderDuplicateOrder(state.activeJob);
-  renderPricing(state.activeJob);
-  logsBox.innerHTML = "";
-  for (const line of state.logs || []) {
-    const item = document.createElement("li");
-    item.textContent = line;
-    logsBox.append(item);
-  }
+  refreshInFlight = true;
   try {
-    const queue = await send({ type: "GET_QUEUE_STATUS" });
-    if (!queue.ok) throw new Error(queue.message || "Could not load queue.");
-    renderQueuedJobs(queue.jobs || [], queue.workerId || state.workerId || "");
-    queueCount.textContent += queueCountDetails(queue.counts || []);
-  } catch (error) {
-    queueCount.textContent = "Not loaded";
-    queuedJobs.innerHTML = `<div class="empty-queue">${error.message || "Could not load queue. Check App URL, Admin token, then click Save."}</div>`;
+    const state = await send({ type: "GET_STATE" });
+    if (state?.ok === false) {
+      setStatus(state.message || "Could not load extension state.");
+      return;
+    }
+    syncSettingsInputs(state);
+    const job = state.activeJob?.job;
+    pauseResume.textContent = state.activeJob?.paused ? "Resume" : "Pause";
+    pauseResume.disabled = !job;
+    skipJob.disabled = !job;
+    markMissing.disabled = !job;
+    setStatus(job ? `${state.activeJob.paused ? "Paused" : "Active"}: ${job.group_key} (${state.activeJob.stage})` : "No active job.");
+    renderDuplicateOrder(state.activeJob);
+    renderPricing(state.activeJob);
+    if (browserlessOrderMode.checked && !job) {
+      try {
+        const browserless = await send({ type: "GET_BROWSERLESS_STATUS" });
+        const progress = browserless?.progress || {};
+        if (progress.message) setStatus(progress.message);
+      } catch {
+        // Queue status below will still show connection errors if the app is down.
+      }
+    }
+    logsBox.innerHTML = "";
+    for (const line of state.logs || []) {
+      const item = document.createElement("li");
+      item.textContent = line;
+      logsBox.append(item);
+    }
+    try {
+      const queue = await send({ type: "GET_QUEUE_STATUS" });
+      if (!queue.ok) throw new Error(queue.message || "Could not load queue.");
+      renderQueueStatus(queue, state);
+      if (queue.stale && queue.message) setStatus(queue.message);
+    } catch (error) {
+      queueCount.textContent = "Not loaded";
+      queuedJobs.innerHTML = `<div class="empty-queue">${error.message || "Could not load queue. Check App URL, Admin token, then click Save."}</div>`;
+    }
+  } finally {
+    refreshInFlight = false;
+    if (refreshRequested) {
+      refreshRequested = false;
+      setTimeout(refresh, 0);
+    }
   }
 }
 
 document.querySelector("#save").addEventListener("click", async () => {
-  const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked });
+  const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
   if (result.ok) settingsDirty = false;
   setStatus(result.ok ? "Saved." : result.message);
 });
 
 document.querySelector("#testConnection").addEventListener("click", async () => {
-  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked });
+  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
   settingsDirty = false;
   const result = await send({ type: "TEST_CONNECTION" });
   if (result.ok) {
@@ -259,9 +304,11 @@ document.querySelector("#testConnection").addEventListener("click", async () => 
 });
 
 document.querySelector("#start").addEventListener("click", async () => {
-  setStatus("Starting next queued order...");
+  setStatus(browserlessOrderMode.checked ? "Starting background order placement..." : "Starting next queued order...");
   try {
-    const result = await send({ type: "START_NEXT" });
+    await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
+    settingsDirty = false;
+    const result = await send({ type: browserlessOrderMode.checked ? "START_BROWSERLESS" : "START_NEXT" });
     if (result.targetWindowId) {
       targetWindowId = result.targetWindowId;
       registerControlWindow();
@@ -321,5 +368,7 @@ document.querySelector("#clearFailed").addEventListener("click", async () => {
 
 loadSavedSettings();
 registerControlWindow();
+let refreshInFlight = false;
+let refreshRequested = false;
 refresh();
-setInterval(refresh, 3000);
+setInterval(refresh, 5000);

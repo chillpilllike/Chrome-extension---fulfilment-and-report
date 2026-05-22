@@ -131,3 +131,171 @@
   outline-offset: 3px !important;
   background-color: rgba(245, 158, 11, 0.12) !important;
 }
+
+.nutricity-order-history-annotation {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 0 0;
+  border-top: 1px solid rgba(15, 23, 42, 0.12);
+  color: #172033;
+  font: 12px/1.35 Arial, sans-serif;
+  text-align: right;
+}
+
+.nutricity-order-details-anchor {
+  clear: both;
+  display: block;
+  margin: 10px 0 14px;
+  width: 100%;
+}
+
+.nutricity-order-history-annotation.is-order-details {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 6px;
+  background: #f8fafc;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  text-align: left;
+}
+
+.nutricity-order-history-annotation.is-order-details.is-match,
+.nutricity-order-history-annotation.is-order-details.is-synced {
+  border-color: rgba(22, 101, 52, 0.24);
+  background: #f0fdf4;
+}
+
+.nutricity-order-history-annotation.is-order-details.is-suggestion {
+  border-color: rgba(30, 64, 175, 0.22);
+  background: #eff6ff;
+}
+
+.nutricity-order-history-annotation.is-order-details.is-conflict,
+.nutricity-order-history-annotation.is-order-details.is-cancelled-sync {
+  border-color: rgba(194, 65, 12, 0.26);
+  background: #fff7ed;
+}
+
+.nutricity-order-history-label {
+  display: inline-block;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #dcfce7;
+  color: #14532d;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 7px;
+}
+
+.nutricity-order-history-annotation.is-miss .nutricity-order-history-label {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.nutricity-order-history-annotation.is-suggestion .nutricity-order-history-label {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.nutricity-order-history-annotation.is-conflict .nutricity-order-history-label {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.nutricity-order-history-annotation.is-cancelled-sync .nutricity-order-history-label {
+  background: #ffedd5;
+  color: #9a3412;
+}
+
+.nutricity-order-history-annotation.is-cancelled-sync {
+  color: #9a3412;
+}
+
+.nutricity-order-history-annotation.is-synced .nutricity-order-history-label {
+  background: #dcfce7;
+  color: #14532d;
+}
+
+.nutricity-order-history-annotation.is-synced {
+  color: #14532d;
+}
+
+.nutricity-order-history-links,
+.nutricity-order-history-not-found,
+.nutricity-order-history-warning {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nutricity-order-history-annotation.is-order-details .nutricity-order-history-links,
+.nutricity-order-history-annotation.is-order-details .nutricity-order-history-not-found,
+.nutricity-order-history-annotation.is-order-details .nutricity-order-history-warning {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.nutricity-order-history-warning {
+  color: #991b1b;
+  font-weight: 700;
+}
+
+.nutricity-order-history-quantity {
+  flex: 0 1 auto;
+  font-weight: 700;
+}
+
+.nutricity-order-history-quantity.is-match {
+  color: #166534;
+}
+
+.nutricity-order-history-quantity.is-warning {
+  color: #c2410c;
+}
+
+.nutricity-order-history-annotation a {
+  color: #1155cc !important;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.nutricity-order-history-annotation a:hover {
+  text-decoration: underline;
+}
+
+.nutricity-order-history-sync {
+  flex: 0 0 auto;
+  border: 1px solid #1d4ed8;
+  border-radius: 5px;
+  background: #1d4ed8;
+  color: #fff;
+  cursor: pointer;
+  font: 700 11px/1.2 Arial, sans-serif;
+  padding: 4px 7px;
+}
+
+.nutricity-order-history-sync:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.nutricity-order-history-sync.is-syncing {
+  border-color: #64748b;
+  background: #64748b;
+  cursor: wait;
+}
+
+.nutricity-order-history-sync.is-synced {
+  border-color: #15803d;
+  background: #16a34a;
+  color: #fff;
+  cursor: default;
+  opacity: 1;
+}
