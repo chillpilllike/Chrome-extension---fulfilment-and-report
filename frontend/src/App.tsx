@@ -1120,6 +1120,31 @@ function adminDownloadHref(path: string) {
   return `${path}${separator}admin_token=${encodeURIComponent(token)}`
 }
 
+function openExternalUrl(href?: string) {
+  if (!href) return
+  const opened = window.open(href, "_blank", "noopener,noreferrer")
+  if (!opened) window.location.assign(href)
+}
+
+function openExternalLink(event: MouseEvent<HTMLAnchorElement>, href?: string) {
+  event.preventDefault()
+  event.stopPropagation()
+  openExternalUrl(href)
+}
+
+function openExternalCell(event: MouseEvent<HTMLElement>, href?: string) {
+  if (!href) return
+  const target = event.target
+  if (target instanceof HTMLElement && target.closest("a,button,input,select,textarea")) return
+  openExternalUrl(href)
+}
+
+function openExternalCellKey(event: ReactKeyboardEvent<HTMLElement>, href?: string) {
+  if (!href || (event.key !== "Enter" && event.key !== " ")) return
+  event.preventDefault()
+  openExternalUrl(href)
+}
+
 function SelectField({
   label,
   value,
@@ -7555,9 +7580,15 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
               <TableBody>
                 {filteredDuplicateGroups.map((group) => (
                   <TableRow key={group.key}>
-                    <TableCell className="font-medium">
+                    <TableCell
+                      className={cn("font-medium", group.odoo_order_url && "cursor-pointer")}
+                      role={group.odoo_order_url ? "link" : undefined}
+                      tabIndex={group.odoo_order_url ? 0 : undefined}
+                      onClick={(event) => openExternalCell(event, group.odoo_order_url)}
+                      onKeyDown={(event) => openExternalCellKey(event, group.odoo_order_url)}
+                    >
                       {group.odoo_order_url ? (
-                        <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={group.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order">
+                        <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={group.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order" onClick={(event) => openExternalLink(event, group.odoo_order_url)}>
                           {group.odoo_order_name}
                           <ExternalLink className="size-3.5" />
                         </a>
@@ -7572,7 +7603,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                         {(group.orders || []).map((order) => (
                           <div key={`${group.key}-${order.id}`} className="flex flex-wrap items-center gap-2 text-sm">
                             {order.url ? (
-                              <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={order.url} target="_blank" rel="noreferrer" title="Open Shopify order">
+                              <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={order.url} target="_blank" rel="noreferrer" title="Open Shopify order" onClick={(event) => openExternalLink(event, order.url)}>
                                 {order.name || order.id}
                                 <ExternalLink className="size-3.5" />
                               </a>
@@ -7618,17 +7649,29 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
             <TableBody>
               {jobs.map((job) => (
                 <TableRow key={job.id}>
-                  <TableCell className="font-medium">
+                  <TableCell
+                    className={cn("font-medium", job.odoo_order_url && "cursor-pointer")}
+                    role={job.odoo_order_url ? "link" : undefined}
+                    tabIndex={job.odoo_order_url ? 0 : undefined}
+                    onClick={(event) => openExternalCell(event, job.odoo_order_url)}
+                    onKeyDown={(event) => openExternalCellKey(event, job.odoo_order_url)}
+                  >
                     {job.odoo_order_url ? (
-                      <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={job.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order">
+                      <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={job.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order" onClick={(event) => openExternalLink(event, job.odoo_order_url)}>
                         {job.odoo_order_name}
                         <ExternalLink className="size-3.5" />
                       </a>
                     ) : job.odoo_order_name}
                   </TableCell>
-                  <TableCell>
+                  <TableCell
+                    className={job.shopify_order_url ? "cursor-pointer" : undefined}
+                    role={job.shopify_order_url ? "link" : undefined}
+                    tabIndex={job.shopify_order_url ? 0 : undefined}
+                    onClick={(event) => openExternalCell(event, job.shopify_order_url)}
+                    onKeyDown={(event) => openExternalCellKey(event, job.shopify_order_url)}
+                  >
                     {job.shopify_order_url ? (
-                      <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={job.shopify_order_url} target="_blank" rel="noreferrer" title="Open Shopify order">
+                      <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={job.shopify_order_url} target="_blank" rel="noreferrer" title="Open Shopify order" onClick={(event) => openExternalLink(event, job.shopify_order_url)}>
                         #{job.shopify_order_id}
                         <ExternalLink className="size-3.5" />
                       </a>
@@ -8113,6 +8156,11 @@ function SettingsPage({
               <option value="true">Enabled</option>
               <option value="false">Disabled</option>
             </SelectField>
+            <SelectField label="Generic Product Names" value={settings.shopify_product_rename_enabled || "true"} onChange={(value) => setSetting("shopify_product_rename_enabled", value)}>
+              <option value="true">Use generic product name</option>
+              <option value="false">Use original product names</option>
+            </SelectField>
+            <TextField label="Generic Product Name" value={settings.shopify_generic_product_name || "Generic Product"} onChange={(value) => setSetting("shopify_generic_product_name", value)} />
             <TextField label="Fulfilment Max Attempts" value={settings.shopify_job_max_attempts || "5"} onChange={(value) => setSetting("shopify_job_max_attempts", value)} />
             <TextField label="Tracking Default Days" value={settings.shopify_tracking_from_days || "7"} onChange={(value) => setSetting("shopify_tracking_from_days", value)} />
             <SelectField label="Tracking Validates Deliveries" value={settings.shopify_tracking_validate_deliveries || "true"} onChange={(value) => setSetting("shopify_tracking_validate_deliveries", value)}>
@@ -8133,6 +8181,8 @@ function SettingsPage({
                 "shopify_tracking_client_secret",
                 "odoo_script_password",
                 "shopify_auto_enqueue_enabled",
+                "shopify_product_rename_enabled",
+                "shopify_generic_product_name",
                 "shopify_job_max_attempts",
                 "shopify_tracking_from_days",
                 "shopify_tracking_validate_deliveries",

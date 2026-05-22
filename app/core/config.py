@@ -62,6 +62,8 @@ DEFAULT_SERVICE_SETTINGS = {
     "odoo_script_password": "",
     "shopify_oauth_public_base_url": os.getenv("SHOPIFY_OAUTH_PUBLIC_BASE_URL", ""),
     "shopify_auto_enqueue_enabled": os.getenv("SHOPIFY_AUTO_ENQUEUE_ENABLED", "true"),
+    "shopify_product_rename_enabled": os.getenv("SHOPIFY_PRODUCT_RENAME_ENABLED", "true"),
+    "shopify_generic_product_name": os.getenv("SHOPIFY_GENERIC_PRODUCT_NAME", "Generic Product"),
     "shopify_job_max_attempts": os.getenv("SHOPIFY_JOB_MAX_ATTEMPTS", "5"),
     "shopify_tracking_from_days": os.getenv("SHOPIFY_TRACKING_FROM_DAYS", "7"),
     "shopify_tracking_validate_deliveries": os.getenv("SHOPIFY_TRACKING_VALIDATE_DELIVERIES", "true"),

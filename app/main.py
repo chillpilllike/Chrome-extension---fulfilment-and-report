@@ -9041,6 +9041,15 @@ def apply_shopify_runtime_settings(module: Any, route: str, settings: Optional[d
                 source["client_secret"] = client_secret
 
 
+def shopify_product_rename_manager(module: Any, settings: Optional[dict[str, str]] = None) -> Any:
+    settings = settings or get_service_settings()
+    enabled = str(settings.get("shopify_product_rename_enabled", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    generic_name = clean_text(settings.get("shopify_generic_product_name")) or "Generic Product"
+    if not enabled:
+        return module.ProductRenameManager(enabled=False, mode="none")
+    return module.ProductRenameManager(enabled=True, mode="all", global_name=generic_name)
+
+
 def shopify_script_config_summary() -> dict[str, Any]:
     settings = get_service_settings()
     dtc = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_dtc_script_path"], f"shopify_cfg_dtc_{uuid.uuid4().hex}")
@@ -9964,7 +9973,7 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
         )
     module.shopify_authorize_url = capture_authorize_url
     module.run_local_oauth_server = fail_interactive_oauth
-    rename_manager = module.ProductRenameManager(enabled=False, mode="none")
+    rename_manager = shopify_product_rename_manager(module, settings)
     state = module.StateDB(route)
     odoo = module.OdooClient(store.odoo_url, store.odoo_db, store.odoo_user, store.odoo_password)
     odoo.connect()
