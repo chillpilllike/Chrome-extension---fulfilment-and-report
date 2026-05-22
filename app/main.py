@@ -9051,6 +9051,22 @@ def apply_shopify_runtime_settings(module: Any, route: str, settings: Optional[d
     client_secret = settings.get(secret_key, "") if secret_key else ""
     if route in {"dtc", "dtb"}:
         for dest in getattr(module, "DESTS", []) or []:
+            prefix = f"shopify_{route}_"
+            mapping = {
+                "dest_name": "name",
+                "shop": "shop",
+                "client_id": "client_id",
+                "scopes": "scopes",
+                "redirect_uri": "redirect_uri",
+                "api_version": "api_version",
+            }
+            for setting_key, dest_key in mapping.items():
+                value = clean_text(settings.get(prefix + setting_key))
+                if value:
+                    dest[dest_key] = value
+            force_reauth = clean_text(settings.get(prefix + "force_reauth")).lower()
+            if force_reauth:
+                dest["force_reauth"] = force_reauth in {"1", "true", "yes", "on"}
             if client_secret:
                 dest["client_secret"] = client_secret
         return

@@ -8439,8 +8439,28 @@ function SettingsPage({
           </Alert>
           <div className="grid gap-3 md:grid-cols-2">
             <TextField label="OAuth Public Base URL" value={settings.shopify_oauth_public_base_url || ""} onChange={(value) => setSetting("shopify_oauth_public_base_url", value)} />
+            <TextField label="DTC Destination Name" value={settings.shopify_dtc_dest_name || ""} onChange={(value) => setSetting("shopify_dtc_dest_name", value)} />
+            <TextField label="DTC Shop Domain" value={settings.shopify_dtc_shop || ""} onChange={(value) => setSetting("shopify_dtc_shop", value)} />
+            <TextField label="DTC Client ID" value={settings.shopify_dtc_client_id || ""} onChange={(value) => setSetting("shopify_dtc_client_id", value)} />
             <TextField label="DTC Client Secret" type="password" value={settings.shopify_dtc_client_secret || ""} onChange={(value) => setSetting("shopify_dtc_client_secret", value)} />
+            <TextField label="DTC Scopes" value={settings.shopify_dtc_scopes || ""} onChange={(value) => setSetting("shopify_dtc_scopes", value)} />
+            <TextField label="DTC Redirect URI" value={settings.shopify_dtc_redirect_uri || ""} onChange={(value) => setSetting("shopify_dtc_redirect_uri", value)} />
+            <TextField label="DTC API Version" value={settings.shopify_dtc_api_version || ""} onChange={(value) => setSetting("shopify_dtc_api_version", value)} />
+            <SelectField label="DTC Force Reauth" value={settings.shopify_dtc_force_reauth || "false"} onChange={(value) => setSetting("shopify_dtc_force_reauth", value)}>
+              <option value="false">Use saved token</option>
+              <option value="true">Force OAuth every run</option>
+            </SelectField>
+            <TextField label="DTB Destination Name" value={settings.shopify_dtb_dest_name || ""} onChange={(value) => setSetting("shopify_dtb_dest_name", value)} />
+            <TextField label="DTB Shop Domain" value={settings.shopify_dtb_shop || ""} onChange={(value) => setSetting("shopify_dtb_shop", value)} />
+            <TextField label="DTB Client ID" value={settings.shopify_dtb_client_id || ""} onChange={(value) => setSetting("shopify_dtb_client_id", value)} />
             <TextField label="DTB Client Secret" type="password" value={settings.shopify_dtb_client_secret || ""} onChange={(value) => setSetting("shopify_dtb_client_secret", value)} />
+            <TextField label="DTB Scopes" value={settings.shopify_dtb_scopes || ""} onChange={(value) => setSetting("shopify_dtb_scopes", value)} />
+            <TextField label="DTB Redirect URI" value={settings.shopify_dtb_redirect_uri || ""} onChange={(value) => setSetting("shopify_dtb_redirect_uri", value)} />
+            <TextField label="DTB API Version" value={settings.shopify_dtb_api_version || ""} onChange={(value) => setSetting("shopify_dtb_api_version", value)} />
+            <SelectField label="DTB Force Reauth" value={settings.shopify_dtb_force_reauth || "false"} onChange={(value) => setSetting("shopify_dtb_force_reauth", value)}>
+              <option value="false">Use saved token</option>
+              <option value="true">Force OAuth every run</option>
+            </SelectField>
             <TextField label="Tracking Client Secret" type="password" value={settings.shopify_tracking_client_secret || ""} onChange={(value) => setSetting("shopify_tracking_client_secret", value)} />
             <TextField label="Odoo Script Password" type="password" value={settings.odoo_script_password || ""} onChange={(value) => setSetting("odoo_script_password", value)} />
             <SelectField label="Auto Queue After Amazon Order" value={settings.shopify_auto_enqueue_enabled || "true"} onChange={(value) => setSetting("shopify_auto_enqueue_enabled", value)}>
@@ -8467,8 +8487,22 @@ function SettingsPage({
             <Button
               onClick={() => saveSettingsGroup("Shopify Scripts", [
                 "shopify_oauth_public_base_url",
+                "shopify_dtc_dest_name",
+                "shopify_dtc_shop",
+                "shopify_dtc_client_id",
                 "shopify_dtc_client_secret",
+                "shopify_dtc_scopes",
+                "shopify_dtc_redirect_uri",
+                "shopify_dtc_api_version",
+                "shopify_dtc_force_reauth",
+                "shopify_dtb_dest_name",
+                "shopify_dtb_shop",
+                "shopify_dtb_client_id",
                 "shopify_dtb_client_secret",
+                "shopify_dtb_scopes",
+                "shopify_dtb_redirect_uri",
+                "shopify_dtb_api_version",
+                "shopify_dtb_force_reauth",
                 "shopify_tracking_client_secret",
                 "odoo_script_password",
                 "shopify_auto_enqueue_enabled",
