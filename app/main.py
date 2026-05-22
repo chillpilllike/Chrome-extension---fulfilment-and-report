@@ -10043,6 +10043,38 @@ def synced_shopify_product_repair_targets(store_id: Optional[int] = None, limit:
     return rows_to_dicts(rows)
 
 
+SHOPIFY_FAST_EXPORT_AFTER_DATE = "2026-05-19"
+SHOPIFY_FAST_EXPORT_EXCEPTIONS = {"NC09263", "NC08137", "NC07875"}
+
+
+def shopify_job_order_date(job: dict[str, Any]) -> str:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(odoo_order_date) AS odoo_order_date
+            FROM order_lines
+            WHERE store_id=?
+              AND odoo_order_id=?
+              AND odoo_order_name=?
+              AND COALESCE(odoo_order_date, '') != ''
+            """,
+            (job.get("store_id"), job.get("odoo_order_id"), job.get("odoo_order_name")),
+        ).fetchone()
+    return clean_text(row["odoo_order_date"] if row else "").split(" ")[0].split("T")[0]
+
+
+def shopify_should_check_existing_order(job: dict[str, Any]) -> bool:
+    order_name = clean_text(job.get("odoo_order_name")).upper()
+    if order_name in SHOPIFY_FAST_EXPORT_EXCEPTIONS:
+        return True
+    order_date = shopify_job_order_date(job)
+    if not order_date:
+        return True
+    if order_date == SHOPIFY_FAST_EXPORT_AFTER_DATE:
+        return True
+    return order_date <= SHOPIFY_FAST_EXPORT_AFTER_DATE
+
+
 def shopify_order_line_variants(module: Any, shop: Any, order_id: Any) -> list[dict[str, Any]]:
     order_id_text = clean_text(order_id)
     if not order_id_text:
@@ -10458,17 +10490,18 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
         raise RuntimeError(f"No Shopify destination configured in {script_path}")
     for shop in shops:
         src_order_key = f"{store.odoo_db}:{job['odoo_order_name']}"
-        existing_orders = shopify_orders_by_name(shop, str(job["odoo_order_name"]), limit=10)
-        active_existing = [order for order in existing_orders if not order.get("cancelled_at")]
-        if active_existing:
-            fulfilled = [order for order in active_existing if shopify_order_is_fulfilled(order)]
-            keep = fulfilled[0] if fulfilled else active_existing[0]
-            state.mark_order_synced(shop.name, src_order_key, clean_text(keep.get("id")) or None)
-            order_ids = ", ".join(f"#{order.get('id')}" for order in active_existing if order.get("id"))
-            raise RuntimeError(
-                f"Shopify order already exists for {job['odoo_order_name']} in {shop.name}: {order_ids or len(active_existing)}. "
-                "This job was marked synced to the existing order and was not pushed again."
-            )
+        if shopify_should_check_existing_order(job):
+            existing_orders = shopify_orders_by_name(shop, str(job["odoo_order_name"]), limit=10)
+            active_existing = [order for order in existing_orders if not order.get("cancelled_at")]
+            if active_existing:
+                fulfilled = [order for order in active_existing if shopify_order_is_fulfilled(order)]
+                keep = fulfilled[0] if fulfilled else active_existing[0]
+                state.mark_order_synced(shop.name, src_order_key, clean_text(keep.get("id")) or None)
+                order_ids = ", ".join(f"#{order.get('id')}" for order in active_existing if order.get("id"))
+                raise RuntimeError(
+                    f"Shopify order already exists for {job['odoo_order_name']} in {shop.name}: {order_ids or len(active_existing)}. "
+                    "This job was marked synced to the existing order and was not pushed again."
+                )
         module.sync_one_order_to_dest(odoo, shop, state, str(job["odoo_order_name"]), rename_manager)
 
 
