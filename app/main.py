@@ -8346,6 +8346,39 @@ def profit_loss_data(
     }
 
 
+def profit_loss_order_names_from_typesense(
+    store_id: Optional[int],
+    period: str,
+    month: str,
+    start: str,
+    end: str,
+    q: str,
+) -> list[str]:
+    settings = get_service_settings()
+    if not typesense_enabled(settings):
+        raise HTTPException(400, "Typesense is disabled. Enable Typesense before loading Profit / Loss.")
+    start_dt, end_dt, _resolved_month = date_range_from_params(period, month, start, end)
+    filters = [
+        f"order_date_ts:>={int(start_dt.timestamp())}",
+        f"order_date_ts:<={int(end_dt.timestamp())}",
+    ]
+    if store_id:
+        filters.append(f"store_id:={int(store_id)}")
+    ids = typesense_order_line_ids_for_filter(" && ".join(filters), limit=50000, query=q.strip() or "*")
+    if not ids:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT odoo_order_name
+            FROM order_lines
+            WHERE id = ANY(?::int[])
+            """,
+            (ids,),
+        ).fetchall()
+    return [str(row["odoo_order_name"]) for row in rows if clean_text(row["odoo_order_name"])]
+
+
 def upload_shipping_records(filename: str, data: bytes, month: str, default_fulfilment_fee: float) -> dict[str, Any]:
     _, _, resolved_month = month_bounds(month)
     records = load_tabular_upload(filename, data, resolved_month)
@@ -10394,6 +10427,15 @@ def typesense_order_line_ids_for_filter(filter_by: str, limit: int = 50000, quer
             params=params,
             timeout=8,
         )
+        if response.status_code >= 400 and "infix" in response.text.lower():
+            retry_params = dict(params)
+            retry_params.pop("infix", None)
+            response = requests.get(
+                f"{typesense_base(settings)}/collections/order_lines/documents/search",
+                headers=typesense_headers(settings),
+                params=retry_params,
+                timeout=8,
+            )
         if response.status_code >= 400:
             raise RuntimeError(f"Typesense search failed for order_lines: HTTP {response.status_code}: {response.text[:500]}")
         payload = response.json()
@@ -11503,21 +11545,12 @@ def api_profit_loss(
     per_page: int = 100,
 ) -> dict[str, Any]:
     candidate_order_names: Optional[list[str]] = None
-    if q.strip():
-        try:
-            filters = f"store_id:={int(store_id)}" if store_id else ""
-            ids = typesense_order_line_ids_for_filter(filters, limit=50000, query=q)
-            if ids:
-                with db() as conn:
-                    rows = conn.execute(
-                        "SELECT DISTINCT odoo_order_name FROM order_lines WHERE id = ANY(?::int[])",
-                        (ids,),
-                    ).fetchall()
-                candidate_order_names = [str(row["odoo_order_name"]) for row in rows]
-            else:
-                candidate_order_names = []
-        except Exception:
-            candidate_order_names = None
+    try:
+        candidate_order_names = profit_loss_order_names_from_typesense(store_id, period, month, start, end, q)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Profit/Loss Typesense filter failed: {exc}") from exc
     return profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names)
 
 
