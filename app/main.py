@@ -9662,6 +9662,7 @@ def shopify_orders_by_name(shop: Any, order_name: str, limit: int = 20) -> list[
           createdAt
           cancelledAt
           displayFinancialStatus
+          displayFulfillmentStatus
         }
       }
     }
@@ -9682,10 +9683,52 @@ def shopify_orders_by_name(shop: Any, order_name: str, limit: int = 20) -> list[
             "created_at": clean_text(node.get("createdAt")),
             "cancelled_at": clean_text(node.get("cancelledAt")),
             "financial_status": clean_text(node.get("displayFinancialStatus")),
+            "fulfillment_status": clean_text(node.get("displayFulfillmentStatus")),
             "url": shopify_admin_order_url(shop.shop, legacy_id),
         })
     matching.sort(key=lambda row: row.get("created_at") or "")
     return matching
+
+
+def shopify_order_by_id(shop: Any, order_id: Any) -> dict[str, Any] | None:
+    legacy_id = clean_text(order_id)
+    if not legacy_id:
+        return None
+    query = """
+    query($id: ID!) {
+      node(id: $id) {
+        ... on Order {
+          id
+          legacyResourceId
+          name
+          createdAt
+          cancelledAt
+          displayFinancialStatus
+          displayFulfillmentStatus
+        }
+      }
+    }
+    """
+    data = shop.graphql(query, {"id": f"gid://shopify/Order/{legacy_id}"})
+    node = data.get("node") or {}
+    if not node:
+        return None
+    returned_legacy_id = clean_text(node.get("legacyResourceId")) or legacy_id
+    return {
+        "id": returned_legacy_id,
+        "gid": clean_text(node.get("id")),
+        "name": clean_text(node.get("name")),
+        "created_at": clean_text(node.get("createdAt")),
+        "cancelled_at": clean_text(node.get("cancelledAt")),
+        "financial_status": clean_text(node.get("displayFinancialStatus")),
+        "fulfillment_status": clean_text(node.get("displayFulfillmentStatus")),
+        "url": shopify_admin_order_url(shop.shop, returned_legacy_id),
+    }
+
+
+def shopify_order_is_fulfilled(order: dict[str, Any]) -> bool:
+    status = clean_text(order.get("fulfillment_status")).upper().replace(" ", "_")
+    return status in {"FULFILLED", "PARTIALLY_FULFILLED", "PARTIAL"}
 
 
 def pushed_shopify_order_targets(store_id: Optional[int] = None) -> list[dict[str, str]]:
@@ -9693,12 +9736,16 @@ def pushed_shopify_order_targets(store_id: Optional[int] = None) -> list[dict[st
         params: list[Any] = [store_id, store_id]
         rows = conn.execute(
             """
-            SELECT DISTINCT route, odoo_order_name
+            SELECT DISTINCT shopify_fulfilment_jobs.route,
+                   shopify_fulfilment_jobs.odoo_order_name,
+                   shopify_fulfilment_jobs.odoo_order_id,
+                   stores.odoo_url AS odoo_url
             FROM shopify_fulfilment_jobs
-            WHERE (? IS NULL OR store_id=?)
-              AND COALESCE(odoo_order_name, '') != ''
-              AND route IN ('dtc', 'dtb')
-            ORDER BY route, odoo_order_name
+            LEFT JOIN stores ON stores.id=shopify_fulfilment_jobs.store_id
+            WHERE (? IS NULL OR shopify_fulfilment_jobs.store_id=?)
+              AND COALESCE(shopify_fulfilment_jobs.odoo_order_name, '') != ''
+              AND shopify_fulfilment_jobs.route IN ('dtc', 'dtb')
+            ORDER BY shopify_fulfilment_jobs.route, shopify_fulfilment_jobs.odoo_order_name
             """,
             params,
         ).fetchall()
@@ -9714,14 +9761,19 @@ def pushed_shopify_order_targets(store_id: Optional[int] = None) -> list[dict[st
     for row in rows:
         route = clean_text(row["route"]).lower()
         order_name = clean_text(row["odoo_order_name"])
+        odoo_url = clean_text(row["odoo_url"]) if "odoo_url" in row.keys() else ""
         if route and order_name:
-            targets[(route, order_name)] = {"route": route, "odoo_order_name": order_name}
+            targets[(route, order_name)] = {
+                "route": route,
+                "odoo_order_name": order_name,
+                "odoo_order_url": odoo_order_admin_url({"odoo_url": odoo_url}, row["odoo_order_id"]) if odoo_url else "",
+            }
     for row in map_rows:
         route = clean_text(row["route"]).lower()
         src_order_key = clean_text(row["src_order_key"])
         order_name = src_order_key.split(":", 1)[1] if ":" in src_order_key else src_order_key
         if route and order_name:
-            targets[(route, order_name)] = {"route": route, "odoo_order_name": order_name}
+            targets.setdefault((route, order_name), {"route": route, "odoo_order_name": order_name, "odoo_order_url": ""})
     return list(targets.values())
 
 
@@ -9756,14 +9808,22 @@ def scan_shopify_duplicate_orders(store_id: Optional[int] = None) -> None:
                     active_orders = [order for order in orders if not order.get("cancelled_at")]
                     if len(active_orders) <= 1:
                         continue
-                    keep_id = active_orders[0].get("id")
+                    fulfilled_orders = [order for order in active_orders if shopify_order_is_fulfilled(order)]
+                    keep_id = (fulfilled_orders[0] if fulfilled_orders else active_orders[0]).get("id")
                     duplicate_orders = []
+                    cancellable_count = 0
                     for order in active_orders:
+                        is_keep = order.get("id") == keep_id
+                        is_fulfilled = shopify_order_is_fulfilled(order)
+                        is_cancellable_duplicate = not is_keep and not is_fulfilled
+                        if is_cancellable_duplicate:
+                            cancellable_count += 1
                         duplicate_orders.append({
                             **order,
-                            "keep": order.get("id") == keep_id,
-                            "duplicate": order.get("id") != keep_id,
-                            "cancel_status": "keep" if order.get("id") == keep_id else "pending",
+                            "keep": is_keep,
+                            "duplicate": is_cancellable_duplicate,
+                            "protected": bool(is_fulfilled and not is_keep),
+                            "cancel_status": "keep" if is_keep else "protected_fulfilled" if is_fulfilled else "pending",
                             "cancel_error": "",
                         })
                     row = {
@@ -9772,7 +9832,8 @@ def scan_shopify_duplicate_orders(store_id: Optional[int] = None) -> None:
                         "dest_name": client.name,
                         "shop": client.shop,
                         "odoo_order_name": order_name,
-                        "duplicate_count": max(0, len(active_orders) - 1),
+                        "odoo_order_url": target.get("odoo_order_url") or "",
+                        "duplicate_count": cancellable_count,
                         "orders": duplicate_orders,
                     }
                     duplicates_found += int(row["duplicate_count"])
@@ -9840,6 +9901,19 @@ def cancel_scanned_shopify_duplicates() -> dict[str, Any]:
             if not order.get("duplicate") or order.get("cancel_status") == "cancelled":
                 continue
             try:
+                latest_order = shopify_order_by_id(client, order.get("id"))
+                if latest_order:
+                    order.update(latest_order)
+                if shopify_order_is_fulfilled(order):
+                    order["duplicate"] = False
+                    order["protected"] = True
+                    order["cancel_status"] = "protected_fulfilled"
+                    order["cancel_error"] = ""
+                    continue
+                if order.get("cancelled_at"):
+                    order["cancel_status"] = "cancelled"
+                    order["cancel_error"] = ""
+                    continue
                 client.cancel_order(int(order["id"]), restock=False, refund=False, reason="other")
                 order["cancel_status"] = "cancelled"
                 order["cancelled_at"] = utc_now()

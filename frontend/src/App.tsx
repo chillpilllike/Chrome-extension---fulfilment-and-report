@@ -673,9 +673,11 @@ type ShopifyDuplicateOrder = {
   created_at: string
   cancelled_at?: string
   financial_status?: string
+  fulfillment_status?: string
   url?: string
   keep?: boolean
   duplicate?: boolean
+  protected?: boolean
   cancel_status?: string
   cancel_error?: string
 }
@@ -686,6 +688,7 @@ type ShopifyDuplicateGroup = {
   dest_name: string
   shop: string
   odoo_order_name: string
+  odoo_order_url?: string
   duplicate_count: number
   orders: ShopifyDuplicateOrder[]
   error?: string
@@ -7488,7 +7491,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
         <CardHeader className="gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <CardTitle>Duplicate Finder</CardTitle>
-            <CardDescription>Scan pushed Shopify orders by Odoo order number and cancel duplicate Shopify orders while keeping the oldest active order.</CardDescription>
+            <CardDescription>Scan pushed Shopify orders by Odoo order number and cancel only duplicate Shopify orders that are not fulfilled.</CardDescription>
           </div>
           <div className="btn-list">
             <SelectField className="w-[190px]" label="Filter" value={duplicateFilter} onChange={setDuplicateFilter}>
@@ -7540,7 +7543,13 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
               <TableBody>
                 {filteredDuplicateGroups.map((group) => (
                   <TableRow key={group.key}>
-                    <TableCell className="font-medium">{group.odoo_order_name}</TableCell>
+                    <TableCell className="font-medium">
+                      {group.odoo_order_url ? (
+                        <a className="text-primary underline-offset-4 hover:underline" href={group.odoo_order_url} target="_blank" rel="noreferrer">
+                          {group.odoo_order_name}
+                        </a>
+                      ) : group.odoo_order_name}
+                    </TableCell>
                     <TableCell>
                       <div>{group.dest_name || group.route?.toUpperCase()}</div>
                       <div className="text-xs text-muted-foreground">{group.shop}</div>
@@ -7556,9 +7565,10 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                             ) : (
                               <span>{order.name || order.id}</span>
                             )}
-                            <Badge variant={order.keep ? "secondary" : order.cancel_status === "cancelled" ? "outline" : "destructive"}>
-                              {order.keep ? "Keep" : order.cancel_status === "cancelled" ? "Cancelled" : "Duplicate"}
+                            <Badge variant={order.keep || order.protected || order.cancel_status === "protected_fulfilled" ? "secondary" : order.cancel_status === "cancelled" ? "outline" : "destructive"}>
+                              {order.keep ? "Keep" : order.protected || order.cancel_status === "protected_fulfilled" ? "Fulfilled protected" : order.cancel_status === "cancelled" ? "Cancelled" : "Duplicate"}
                             </Badge>
+                            {order.fulfillment_status ? <span className="text-xs text-muted-foreground">{order.fulfillment_status}</span> : null}
                             <span className="text-xs text-muted-foreground">{order.created_at ? formatDateTime(order.created_at) : ""}</span>
                             {order.cancel_error ? <span className="text-xs text-destructive">{order.cancel_error}</span> : null}
                           </div>
@@ -7604,7 +7614,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                   <TableCell>
                     {job.shopify_order_url ? (
                       <a className="text-primary underline-offset-4 hover:underline" href={job.shopify_order_url} target="_blank" rel="noreferrer">
-                        {job.odoo_order_name}
+                        #{job.shopify_order_id}
                       </a>
                     ) : job.shopify_order_id ? (
                       <span className="font-mono text-xs">{job.shopify_order_id}</span>
