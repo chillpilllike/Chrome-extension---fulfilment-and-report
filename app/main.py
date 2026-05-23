@@ -2013,7 +2013,14 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                 asin = normalize_asin(row.get("asin"))
                 if asin:
                     ordered_at = clean_text(row.get("ordered_at"))
-                    suggestion["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row.get("quantity") or 1), "ordered_at": ordered_at})
+                    current_amazon_order_id = clean_text(row.get("current_amazon_order_id"))
+                    suggestion["lines"].append({
+                        "id": row["id"],
+                        "asin": asin,
+                        "quantity": float(row.get("quantity") or 1),
+                        "ordered_at": ordered_at,
+                        "current_amazon_order_id": current_amazon_order_id,
+                    })
                     if ordered_at and ordered_at not in suggestion["ordered_at_values"]:
                         suggestion["ordered_at_values"].append(ordered_at)
                     if asin not in suggestion["asins"]:
@@ -3070,7 +3077,11 @@ def chrome_fail_is_partial_quantity(payload: ChromeJobFailPayload, message: str)
     if payload.requested_quantity is not None and (payload.fulfilled_quantity is not None or payload.available_quantity is not None):
         available = payload.fulfilled_quantity if payload.fulfilled_quantity is not None else payload.available_quantity
         try:
-            return float(available) < float(payload.requested_quantity)
+            available_number = float(available)
+            requested_number = float(payload.requested_quantity)
+            if available_number <= 0 and code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}:
+                return False
+            return available_number < requested_number
         except (TypeError, ValueError):
             if code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}:
                 return True
@@ -5793,6 +5804,11 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
         "recipient_suffix": part_suffix,
         "back_in_stock": "back_in_stock" in amazon_statuses,
         "line_ids": [row["id"] for row in group_rows],
+        "cancelled_amazon_order_ids": sorted({
+            clean_text(row.get("amazon_cancelled_order_id"))
+            for row in group_rows
+            if clean_text(row.get("amazon_cancelled_order_id"))
+        }),
         "claimed_by": group_rows[0].get("chrome_claimed_by") or "",
         "claim_expires_at": group_rows[0].get("chrome_claim_expires_at") or "",
         "items": [
@@ -14948,6 +14964,78 @@ def api_chrome_job_post_submit_unplaced(group_key: str, payload: ChromeJobFailPa
     }
 
 
+@app.post("/api/chrome/jobs/{group_key}/submit-uncertain")
+def api_chrome_job_submit_uncertain(group_key: str, payload: ChromeJobFailPayload) -> dict[str, Any]:
+    group_key = clean_text(group_key)
+    message = clean_error_message(
+        payload.message
+        or "Amazon Place Order was submitted, but no matching Amazon order appeared in order history. Marked as Chrome error instead of Missing."
+    )
+    if not group_key:
+        raise HTTPException(400, "group_key is required")
+    with db() as conn:
+        ensure_chrome_job_owner(conn, group_key, payload.worker_id)
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_status, '')=?
+            """,
+            (group_key, CHROME_ORDER_SUBMITTED_STATUS),
+        ).fetchall())
+        if not rows:
+            raise HTTPException(409, "Chrome job is not in a protected submitted state without an Amazon order ID.")
+        eligible_ids = {int(row["id"]) for row in rows}
+        if payload.line_ids:
+            line_ids = {int(value) for value in payload.line_ids if int(value or 0) > 0}
+            eligible_ids = eligible_ids.intersection(line_ids)
+        if not eligible_ids:
+            raise HTTPException(404, "No matching submitted Chrome line could be marked as uncertain.")
+        placeholders = ",".join("?" for _ in eligible_ids)
+        now = utc_now()
+        conn.execute(
+            f"""
+            UPDATE order_lines
+            SET state='error',
+                amazon_status='chrome_error',
+                last_error=?,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                updated_at=?
+            WHERE id IN ({placeholders})
+            """,
+            [message, now, *sorted(eligible_ids)],
+        )
+        conn.execute(
+            """
+            UPDATE amazon_attempts
+            SET status='error', error=?
+            WHERE external_id=? AND mode='chrome'
+            """,
+            (message, group_key),
+        )
+        updated_rows = rows_to_dicts(conn.execute(
+            f"SELECT * FROM order_lines WHERE id IN ({placeholders})",
+            sorted(eligible_ids),
+        ).fetchall())
+    for updated in updated_rows:
+        index_order_line(updated)
+    send_email_alert_async(
+        f"Chrome submit uncertain: {group_key}",
+        f"Amazon Place Order was submitted, but no matching Amazon order was found.\nGroup: {group_key}\nWorker: {payload.worker_id}\nError: {message}",
+    )
+    return {
+        "ok": True,
+        "message": f"Marked {len(updated_rows)} submitted Chrome line(s) as Chrome error because no Amazon order ID could be found.",
+        "moved": len(updated_rows),
+    }
+
+
 @app.post("/api/chrome/jobs/{group_key}/preflight-missing")
 def api_chrome_job_preflight_missing(group_key: str, payload: dict[str, Any]) -> dict[str, Any]:
     group_key = clean_text(group_key)
@@ -14999,7 +15087,8 @@ def api_chrome_job_duplicate_check(group_key: str, payload: ChromeJobResetPayloa
             return {"ok": True, "duplicate": False, "orders": []}
         duplicate_rows = conn.execute(
             f"""
-            SELECT id, store_id, odoo_order_id, odoo_order_name, amazon_order_id, amazon_order_url
+            SELECT id, store_id, odoo_order_id, odoo_order_name, amazon_order_id,
+                   amazon_order_url, amazon_cancelled_order_id
             FROM order_lines
             WHERE id IN ({placeholders})
               AND COALESCE(amazon_order_id, '') != ''
@@ -15012,6 +15101,8 @@ def api_chrome_job_duplicate_check(group_key: str, payload: ChromeJobResetPayloa
     for row in duplicate_rows:
         amazon_order_id = clean_text(row["amazon_order_id"])
         if not amazon_order_id:
+            continue
+        if amazon_order_id == clean_text(row.get("amazon_cancelled_order_id")):
             continue
         key = f"{row['store_id']}:{row['odoo_order_id']}:{amazon_order_id}"
         if key in seen:
@@ -15284,6 +15375,8 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
     amazon_order_id = clean_text(payload.amazon_order_id) or f"CHROME-{uuid.uuid4().hex[:10]}"
     amazon_order_url = clean_text(payload.amazon_order_url)
     chrome_account_name = clean_text(payload.amazon_account_name) or "Chrome Extension"
+    amazon_order_placed_at = parse_amazon_order_placed_date(payload.order_date)
+    ordered_at = amazon_order_placed_at or utc_now()
     pricing_by_asin: dict[str, dict[str, Any]] = {}
     for item in payload.pricing_summary or []:
         asin = normalize_asin(str(item.get("asin") or ""))
@@ -15323,7 +15416,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
             FROM order_lines
             WHERE amazon_group_key=?
               AND order_engine='chrome'
-              AND state='submitted'
+              AND (state='submitted' OR COALESCE(amazon_status, '') IN ('submitted', 'order_submitted', 'reporting_complete'))
               AND COALESCE(amazon_order_id, '') = ''
               {line_filter}
             """,
@@ -15376,6 +15469,16 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
         for row in rows:
             pricing = pricing_by_asin.get(str(row["asin"] or "").upper(), {})
             row_asin = normalize_asin(str(row["asin"] or ""))
+            purchased_asin = normalize_asin(str(pricing.get("purchased_asin") or ""))
+            replacement_applies = bool(purchased_asin and row_asin and purchased_asin != row_asin)
+            replacement_product_name = clean_text(
+                str(
+                    pricing.get("purchased_product_name")
+                    or pricing.get("selected_variant_label")
+                    or f"Replacement ASIN {purchased_asin}"
+                )
+            )
+            replacement_note = clean_text(str(pricing.get("fulfilment_note") or ""))
             row_order = order_by_line_id.get(int(row["id"])) or order_by_asin.get(row_asin) or {}
             row_amazon_order_id = row_order.get("amazon_order_id") or amazon_order_id
             row_amazon_order_url = row_order.get("amazon_order_url") or amazon_order_url
@@ -15396,6 +15499,13 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     amazon_total_price=?,
                     chrome_profit_total=?,
                     fulfilment_note=?,
+                    original_asin=CASE WHEN ? THEN COALESCE(NULLIF(original_asin, ''), asin) ELSE original_asin END,
+                    replacement_asin=CASE WHEN ? THEN ? ELSE replacement_asin END,
+                    replacement_product_name=CASE WHEN ? THEN ? ELSE replacement_product_name END,
+                    replacement_note=CASE WHEN ? THEN ? ELSE replacement_note END,
+                    replacement_assigned_at=CASE WHEN ? THEN ? ELSE replacement_assigned_at END,
+                    asin=CASE WHEN ? THEN ? ELSE asin END,
+                    product_name=CASE WHEN ? THEN ? ELSE product_name END,
                     amazon_account_name=?,
                     amazon_status='ordered',
                     state='ordered',
@@ -15403,7 +15513,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     chrome_claimed_at=NULL,
                     chrome_claim_expires_at=NULL,
                     last_error=NULL,
-                    ordered_at=COALESCE(ordered_at, ?),
+                    ordered_at=?,
                     updated_at=?
                 WHERE id=?
                 """,
@@ -15416,8 +15526,21 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     amazon_total or None,
                     profit_total,
                     fulfilment_note or None,
-                    chrome_account_name,
+                    replacement_applies,
+                    replacement_applies,
+                    purchased_asin,
+                    replacement_applies,
+                    replacement_product_name,
+                    replacement_applies,
+                    replacement_note or f"Chrome selected equivalent Amazon pack variant {purchased_asin}.",
+                    replacement_applies,
                     utc_now(),
+                    replacement_applies,
+                    purchased_asin,
+                    replacement_applies,
+                    replacement_product_name,
+                    chrome_account_name,
+                    ordered_at,
                     utc_now(),
                     row["id"],
                 ),
@@ -15440,6 +15563,9 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                             "amazon_total_price": amazon_total,
                             "chrome_profit_total": profit_total,
                             "fulfilment_note": fulfilment_note,
+                            "replacement_asin": purchased_asin if replacement_applies else "",
+                            "replacement_product_name": replacement_product_name if replacement_applies else "",
+                            "replacement_note": replacement_note if replacement_applies else "",
                             "amazon_account_name": chrome_account_name,
                         }
                     ),
@@ -15488,7 +15614,17 @@ def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[s
                 f"Chrome could not assign the required quantity.\nGroup: {group_key}\nWorker: {payload.worker_id}\nError: {linked_message}",
             )
             return {"ok": True, "message": f"Moved {count} Chrome line(s) to Missing because less quantity was available."}
-    if missing_asin:
+    zero_quantity_partial = False
+    if (
+        failure_code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}
+        and payload.requested_quantity is not None
+        and (payload.fulfilled_quantity is not None or payload.available_quantity is not None)
+    ):
+        try:
+            zero_quantity_partial = float(payload.fulfilled_quantity if payload.fulfilled_quantity is not None else payload.available_quantity or 0) <= 0
+        except (TypeError, ValueError):
+            zero_quantity_partial = False
+    if missing_asin and not zero_quantity_partial:
         linked_message = message if failure_code == "limit_purchase" else f"ASIN {missing_asin} is missing or unavailable on Amazon. Skipped fulfilment for this Odoo order."
         count = mark_chrome_group_missing(group_key, linked_message, missing_asin, payload.missing_line_id)
         if count:
@@ -15502,7 +15638,13 @@ def api_chrome_job_fail(group_key: str, payload: ChromeJobFailPayload) -> dict[s
         cursor = conn.execute(
             f"""
             UPDATE order_lines
-            SET state='error', amazon_status='chrome_error', last_error=?, updated_at=?
+            SET state='error',
+                amazon_status='chrome_error',
+                last_error=?,
+                updated_at=?,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL
             WHERE amazon_group_key=?
               AND order_engine='chrome'
               {line_filter}

@@ -1,6 +1,15 @@
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const rawSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function sleep(ms, options = {}) {
+  const pauseAware = options.pauseAware !== false;
+  const deadline = Date.now() + Math.max(0, Number(ms || 0));
+  do {
+    if (pauseAware) await waitIfPaused();
+    await rawSleep(Math.min(250, Math.max(0, deadline - Date.now())));
+  } while (Date.now() < deadline);
+}
 const ACTION_DELAY = 1800;
 const PAGE_READY_TIMEOUT = 12000;
+window.__nutricityContentLoaded = true;
 const DEFAULT_NEW_DELIVERY_ADDRESS = {
   countryCode: "US",
   phoneNumber: "9176818556",
@@ -26,6 +35,18 @@ async function send(message) {
   } catch (error) {
     if (/Extension context invalidated/i.test(String(error?.message || error))) {
       extensionContextAlive = false;
+      const key = "nutricity-extension-context-reload-at";
+      const lastReloadAt = Number(sessionStorage.getItem(key) || 0);
+      if (Date.now() - lastReloadAt > 10000) {
+        sessionStorage.setItem(key, String(Date.now()));
+        showPanel(
+          "Nutricity fulfilment",
+          "The Chrome extension context reset while this Amazon page was open. Reloading the page so fulfilment can recover the active order.",
+          null,
+          null,
+        );
+        setTimeout(() => location.reload(), 1200);
+      }
       return null;
     }
     throw error;
@@ -36,13 +57,94 @@ async function getActiveJob() {
   const data = await send({ type: "GET_ACTIVE_JOB" });
   if (data?.activeJob) return data.activeJob;
   if (!/amazon\.com$/i.test(location.hostname)) return null;
-  if (!isOrderHistoryPage() && !confirmationSaysPlaced()) return null;
   const recovered = await send({ type: "RECOVER_SUBMITTED_JOB" });
   return recovered?.activeJob || null;
 }
 
-async function setActiveJob(activeJob) {
-  await send({ type: "SET_ACTIVE_JOB", activeJob });
+const STAGE_PROGRESS = {
+  clear_cart: 5,
+  cleanup_after_failure: 5,
+  product: 10,
+  add_clicked: 20,
+  cart: 30,
+  subscribe_checkout: 35,
+  checkout: 40,
+  editing_address: 45,
+  complete_pending: 60,
+  find_order_id: 70,
+  reporting_complete: 80,
+};
+
+function stageProgress(stage) {
+  return STAGE_PROGRESS[String(stage || "")] || 0;
+}
+
+async function setActiveJob(activeJob, options = {}) {
+  let next = activeJob;
+  let latest = null;
+  if (activeJob?.job?.group_key && options.allowUnpause !== true) {
+    latest = await getActiveJob();
+    if (latest?.job?.group_key === activeJob.job.group_key && latest.paused && !activeJob.paused) {
+      next = {
+        ...activeJob,
+        paused: true,
+        pausedStage: latest.pausedStage || activeJob.pausedStage || activeJob.stage || "product",
+      };
+    }
+  }
+  if (activeJob?.job?.group_key && options.allowStageRegression !== true) {
+    latest = latest || await getActiveJob();
+    if (latest?.job?.group_key && latest.job.group_key !== activeJob.job.group_key) {
+      showPanel(
+        "Nutricity fulfilment",
+        `Ignored stale page update from ${activeJob.job.group_key}; current order is ${latest.job.group_key}.`,
+        null,
+        null,
+      );
+      return { ok: false, stale: true };
+    }
+    if (latest?.job?.group_key === activeJob.job.group_key) {
+      const latestIndex = Number(latest.itemIndex || 0);
+      const nextIndex = Number(activeJob.itemIndex || 0);
+      const latestProgress = stageProgress(latest.stage);
+      const nextProgress = stageProgress(next.stage);
+      const latestSubmitted = submittedStage(latest);
+      const nextSubmitted = submittedStage(next);
+      if (
+        latestIndex >= nextIndex
+        && latestProgress > nextProgress
+        && !(latestSubmitted && nextSubmitted)
+      ) {
+        next = {
+          ...latest,
+          paused: next.paused || latest.paused || false,
+          pausedStage: next.pausedStage || latest.pausedStage || null,
+        };
+      }
+      if (latest.pricing && Object.keys(latest.pricing).length && (!next.pricing || !Object.keys(next.pricing).length)) {
+        next = { ...next, pricing: latest.pricing };
+      }
+      if (latest.productDosages?.length && !next.productDosages?.length) {
+        next = { ...next, productDosages: latest.productDosages };
+      }
+      if (latest.dosageByOrder && Object.keys(latest.dosageByOrder).length && (!next.dosageByOrder || !Object.keys(next.dosageByOrder).length)) {
+        next = { ...next, dosageByOrder: latest.dosageByOrder };
+      }
+    }
+  }
+  if (activeJob?.job?.group_key) {
+    latest = latest || await getActiveJob();
+    if (latest?.job?.group_key && latest.job.group_key !== activeJob.job.group_key) {
+      showPanel(
+        "Nutricity fulfilment",
+        `Ignored stale page update from ${activeJob.job.group_key}; current order is ${latest.job.group_key}.`,
+        null,
+        null,
+      );
+      return { ok: false, stale: true };
+    }
+  }
+  return send({ type: "SET_ACTIVE_JOB", activeJob: next });
 }
 
 async function getExtensionState() {
@@ -64,7 +166,7 @@ async function waitIfPaused() {
       "I did it manually, continue",
       () => continueAfterManualStep(activeJob),
     );
-    await sleep(1000);
+    await rawSleep(1000);
   }
 }
 
@@ -173,6 +275,25 @@ function showPanel(title, message, actionText, action) {
     button.textContent = actionText;
     button.addEventListener("click", action);
     panel.append(button);
+  }
+}
+
+async function keepPanelAlive() {
+  if (!extensionContextAlive || !/amazon\.com$/i.test(location.hostname)) return;
+  const activeJob = await getActiveJob();
+  if (!activeJob?.job) return;
+  if (!document.querySelector("#nutricity-panel")) {
+    showPanel(
+      activeJob.paused ? "Nutricity fulfilment paused" : "Nutricity fulfilment",
+      activeJob.paused
+        ? "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually."
+        : `Working on ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}.`,
+      activeJob.paused ? "I did it manually, continue" : null,
+      activeJob.paused ? () => continueAfterManualStep(activeJob) : null,
+    );
+  } else {
+    updatePanelPauseButton();
+    updatePanelOrderStatus();
   }
 }
 
@@ -305,11 +426,31 @@ function isUnitPriceElement(element) {
   return false;
 }
 
+function isCouponOrSavingsPriceElement(element) {
+  if (!element) return false;
+  if (element.closest([
+    "#couponFeature",
+    "#coupon_feature_div",
+    "#promoPriceBlockMessage_feature_div",
+    "#promoPriceBlockMessage",
+    "[id*='coupon'][id*='Feature']",
+    "[id*='coupon'][id*='feature']",
+    "[data-csa-c-owner='PromotionsDiscovery']",
+    ".promoPriceBlockMessage",
+  ].join(", "))) return true;
+  for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
+    const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (text.length > 220) break;
+    if (/\b(coupon|promo|promotion|saving|savings|save)\b/.test(text) && !/\b(one-time purchase|subscribe\s*&\s*save)\b/.test(text)) return true;
+  }
+  return false;
+}
+
 function priceCandidatesIn(root, selectors = [".a-price"]) {
   if (!root) return null;
   const prices = selectors
     .flatMap((selector) => [...root.querySelectorAll(selector)])
-    .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !element.closest(".aok-hidden"))
+    .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !element.closest(".aok-hidden") && !isCouponOrSavingsPriceElement(element))
     .map(parsePriceFrom)
     .filter((value) => Number(value) > 0);
   return prices;
@@ -319,7 +460,7 @@ function priceCandidateElementsIn(root, selectors = [".a-price"]) {
   if (!root) return [];
   return selectors
     .flatMap((selector) => [...root.querySelectorAll(selector)])
-    .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !element.closest(".aok-hidden"));
+    .filter((element, index, all) => all.indexOf(element) === index && visible(element) && !element.closest(".aok-hidden") && !isCouponOrSavingsPriceElement(element));
 }
 
 function firstPriceIn(root) {
@@ -486,7 +627,7 @@ function recipientName(activeJob) {
       const name = String(orderName || "").trim();
       if (!name) continue;
       parts.push(name);
-      if (mixedAsin) continue;
+      if (mixedAsin || recipientSuffix) continue;
       const dosages = Array.isArray(dosageByOrder[name]) ? dosageByOrder[name] : [];
       for (const dosage of dosages) {
         const normalized = String(dosage || "").replace(/\s+/g, "").trim();
@@ -497,7 +638,7 @@ function recipientName(activeJob) {
       }
     }
     if (mixedAsin) parts.push("Multi");
-    const globalDosages = (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : [])
+    const globalDosages = (recipientSuffix ? [] : (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : []))
       .map((item) => String(item || "").replace(/\s+/g, "").trim())
       .filter(Boolean);
     for (const dosage of mixedAsin ? [] : globalDosages) {
@@ -508,6 +649,7 @@ function recipientName(activeJob) {
   }
   const base = String(activeJob?.job?.recipient_name || "").replace(/\s+/g, " ").trim();
   if (mixedAsin) return `${base} Multi${recipientSuffix ? ` ${recipientSuffix}` : ""}`.replace(/\s+/g, " ").trim();
+  if (recipientSuffix) return [base, recipientSuffix].filter(Boolean).join(" ").trim();
   const dosages = (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : [])
     .map((item) => String(item || "").replace(/\s+/g, "").trim())
     .filter((dosage) => dosage && !base.toLowerCase().includes(dosage.toLowerCase()));
@@ -734,12 +876,17 @@ async function recordAmazonPrice(activeJob, item, unitPrice, source = "product",
   if (!unitPrice) return activeJob;
   activeJob.pricing = activeJob.pricing || {};
   const quantity = Number(purchaseItem.quantity || item.quantity || 1);
+  const currentPageAsin = currentAsinFromUrl();
+  const purchasedAsin = purchaseItem.asin && purchaseItem.asin !== item.asin
+    ? purchaseItem.asin
+    : (currentPageAsin || purchaseItem.asin || item.asin);
   const storeUnit = Number(item.store_unit_price || 0);
   const storeTotal = Number(item.store_total_price || storeUnit * Number(item.quantity || 1) || 0);
   const amazonTotal = unitPrice * quantity;
   activeJob.pricing[item.asin] = {
     asin: item.asin,
-    purchased_asin: purchaseItem.asin || item.asin,
+    purchased_asin: purchasedAsin,
+    purchased_product_name: productTitleText() || purchaseItem.product_name || item.product_name || "",
     quantity,
     ordered_quantity: Number(item.quantity || 1),
     selected_variant_label: purchaseItem.selected_variant_label || "",
@@ -800,6 +947,41 @@ function checkoutLineItemQuantity(groupView) {
     ?? "";
   const value = Number(String(rawValue).trim());
   return Number.isFinite(value) ? value : null;
+}
+
+function expectedCheckoutUnitCount(activeJob) {
+  const quantities = Object.values(expectedCartQuantities(activeJob) || {});
+  return quantities.reduce((sum, quantity) => sum + Number(quantity || 0), 0);
+}
+
+function checkoutSummaryUnitCount() {
+  const groups = checkoutLineItemGroups(document);
+  if (groups.length > 1) {
+    return groups.reduce((sum, group) => sum + (checkoutLineItemQuantity(group) || 1), 0);
+  }
+  return null;
+}
+
+async function ensureCheckoutOnlyExpectedUnits(activeJob) {
+  const expected = expectedCheckoutUnitCount(activeJob);
+  const groups = checkoutLineItemGroups(document);
+  const expectedLines = Math.max(1, (activeJob.job?.items || []).length);
+  const actual = groups.length > expectedLines ? checkoutSummaryUnitCount() : null;
+  if (!expected || !Number.isFinite(actual) || actual <= expected) return true;
+  const expectedAsins = Object.keys(expectedCartQuantities(activeJob) || {}).join(", ");
+  const message = `Amazon checkout shows ${actual} item unit(s), but this queued part only expects ${expected}${expectedAsins ? ` (${expectedAsins})` : ""}. The order was stopped before Place Order so mixed-ASIN split parts cannot be combined.`;
+  showPanel("Checkout quantity mismatch", message, null, null);
+  await send({
+    type: "FAIL_JOB",
+    message,
+    missingAsin: "",
+    missingLineId: null,
+    failureCode: "cart_quantity_mismatch",
+    requestedQuantity: expected,
+    fulfilledQuantity: actual,
+    availableQuantity: actual,
+  });
+  return false;
 }
 
 function checkoutLineItemLimitCandidate(activeJob, groupView) {
@@ -864,21 +1046,44 @@ function checkoutLimitPurchaseIssue(activeJob) {
 
 function cartDeleteButtons() {
   const activeCart = document.querySelector("#sc-active-cart");
-  if (!activeCart || !visible(activeCart)) return [];
-  const activeItems = [...activeCart.querySelectorAll("[data-itemtype='active'], .sc-list-item[data-asin]")].filter(visible);
+  const deleteSelector = [
+    "input[data-action*='delete' i]",
+    "button[data-action*='delete' i]",
+    "input[name*='delete-active' i]",
+    "button[name*='delete-active' i]",
+    "input[name*='delete' i]",
+    "button[name*='delete' i]",
+    "button[aria-label*='Delete' i]",
+    "input[aria-label*='Delete' i]",
+    "button[title*='Delete' i]",
+    "input[value*='Delete' i]",
+    "button[value*='Delete' i]",
+  ].join(", ");
+  const isDeleteControl = (button) => {
+    if (!button || !visible(button)) return false;
+    const label = normalizedText([
+      button.getAttribute?.("aria-label"),
+      button.getAttribute?.("title"),
+      button.getAttribute?.("value"),
+      button.getAttribute?.("name"),
+      button.getAttribute?.("data-action"),
+      button.innerText,
+      button.textContent,
+    ].filter(Boolean).join(" "));
+    return /\bdelete\b/i.test(label) && !/save for later|saved for later|share/i.test(label);
+  };
+  const activeItems = cartActiveItems();
   const buttons = activeItems
-    .map((item) =>
-      item.querySelector(
-        "input[data-action='delete-active'][data-feature-id='item-delete-button'], input[name^='submit.delete-active.'][value='Delete']",
-      ),
-    )
-    .filter((button) => button && visible(button));
+    .flatMap((item) => [...item.querySelectorAll(deleteSelector)].filter(isDeleteControl));
   if (buttons.length) return [...new Set(buttons)];
+  if (!activeCart || !visible(activeCart)) {
+    return [
+      ...document.querySelectorAll(deleteSelector),
+    ].filter((button) => isDeleteControl(button) && button.closest?.("[data-name='Active Items'], [aria-label='Shopping Cart'], [data-itemtype='active'], .sc-list-item"));
+  }
   return [
-    ...activeCart.querySelectorAll(
-      "input[data-action='delete-active'][data-feature-id='item-delete-button'], input[name^='submit.delete-active.'][value='Delete']",
-    ),
-  ].filter(visible);
+    ...activeCart.querySelectorAll(deleteSelector),
+  ].filter(isDeleteControl);
 }
 
 function cartLooksEmpty() {
@@ -940,12 +1145,12 @@ function cartActiveItems() {
   ].filter((root) => root && visible(root));
   const candidates = [];
   for (const root of activeRoots) {
-    candidates.push(...root.querySelectorAll("[data-itemtype='active'], .sc-list-item, [data-asin], [data-name='Active Items'] [role='listitem']"));
+    candidates.push(...root.querySelectorAll("[data-itemtype='active'], .sc-list-item, [data-name='Active Items'] [role='listitem']"));
   }
 
   // Amazon's newer cart can omit #sc-active-cart. In that layout, active cart
   // rows are still anchored by visible Delete buttons and quantity controls.
-  for (const control of document.querySelectorAll("button[aria-label^='Delete '], input[aria-label^='Delete '], button[title^='Delete '], input[value='Delete']")) {
+  for (const control of document.querySelectorAll("button[aria-label*='Delete' i], input[aria-label*='Delete' i], button[title*='Delete' i], input[value*='Delete' i], button[value*='Delete' i], button[data-action*='delete' i], input[data-action*='delete' i], button[name*='delete' i], input[name*='delete' i]")) {
     if (!visible(control)) continue;
     let node = control;
     for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
@@ -966,7 +1171,7 @@ function cartActiveItems() {
       const text = (item.innerText || item.textContent || "").replace(/\s+/g, " ");
       if (/saved for later|sponsored|discover more|buy it again/i.test(text)) return false;
       if (!item.querySelector?.("a[href*='/dp/'], a[href*='/gp/product/']")) return false;
-      if (!item.querySelector?.("button[aria-label^='Delete '], input[aria-label^='Delete '], button[title^='Delete '], input[value='Delete'], [data-itemtype='active'], .sc-list-item")) return false;
+      if (!item.querySelector?.("button[aria-label*='Delete' i], input[aria-label*='Delete' i], button[title*='Delete' i], input[value*='Delete' i], button[value*='Delete' i], button[data-action*='delete' i], input[data-action*='delete' i], button[name*='delete' i], input[name*='delete' i], [data-itemtype='active'], .sc-list-item")) return false;
       if (seen.has(item)) return false;
       seen.add(item);
       return true;
@@ -1028,8 +1233,8 @@ function canClearCart(activeJob) {
   return (
     activeJob?.stage === "clear_cart" &&
     !activeJob.cartCleared &&
-    !itemWasAdded(activeJob) &&
-    !checkoutWasStarted(activeJob) &&
+    !activeJob.addClickedAt &&
+    !activeJob.checkoutStartedAt &&
     Number(activeJob.itemIndex || 0) === 0
   );
 }
@@ -1103,7 +1308,12 @@ function verifyCartQuantities(activeJob) {
     const smartWagon = smartWagonAddedCartState(activeJob, expected);
     if (smartWagon) return smartWagon;
     if (cartIsVisiblyEmpty()) {
-      const details = Object.entries(expected).map(([asin, quantity]) => ({ asin, expected: Number(quantity), actual: 0 }));
+      const details = Object.entries(expected).map(([asin, quantity]) => ({
+        asin,
+        expected: Number(quantity),
+        actual: 0,
+        mismatch_type: "missing_from_cart",
+      }));
       return {
         ok: false,
         message: `Amazon cart is empty after Add to cart. ${details.map((item) => `${item.asin} expected ${item.expected}, cart has 0`).join("; ")}`,
@@ -1128,7 +1338,16 @@ function verifyCartQuantities(activeJob) {
   }
   const mismatches = Object.entries(expected).filter(([asin, quantity]) => Number(actual[asin] || 0) !== Number(quantity));
   if (!mismatches.length) return { ok: true };
-  const details = mismatches.map(([asin, quantity]) => ({ asin, expected: Number(quantity), actual: Number(actual[asin] || 0) }));
+  const details = mismatches.map(([asin, quantity]) => {
+    const expectedQuantity = Number(quantity);
+    const actualQuantity = Number(actual[asin] || 0);
+    return {
+      asin,
+      expected: expectedQuantity,
+      actual: actualQuantity,
+      mismatch_type: actualQuantity > expectedQuantity ? "over" : "under",
+    };
+  });
   const message = mismatches
     .map(([asin, quantity]) => `${asin} expected ${quantity}, cart has ${actual[asin] || 0}`)
     .join("; ");
@@ -1254,6 +1473,15 @@ async function clipVisibleCoupons(context = "regular") {
 }
 
 function unavailableMessage() {
+  const bodyText = (document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ").trim();
+  const loweredBody = bodyText.toLowerCase();
+  if (
+    loweredBody.includes("not available to business prime") ||
+    loweredBody.includes("isn't available to business prime") ||
+    loweredBody.includes("is not available to business prime")
+  ) {
+    return "Amazon shows an offer, but it is not available to Business Prime and has no direct Add to cart option for this account.";
+  }
   const allBuyingOptions = [...document.querySelectorAll(
     "a[href*='/gp/offer-listing/'], a[href*='/offer-listing/'], a[title='See All Buying Options'], a.a-button-text",
   )].find((element) => {
@@ -1308,13 +1536,17 @@ function checkAsinAvailability(asin = "") {
     .map((node) => (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim())
     .find(Boolean) || "";
   const bodyText = (document.body?.innerText || "").toLowerCase();
-  const blockedText = /currently unavailable|temporarily out of stock|see all buying options|we don't know when or if this item will be back in stock|we do not know when or if this item will be back in stock/i.test(bodyText);
-  const inStock = Boolean(!unavailable && !blockedText && (addToCart || buyNow || /in stock/i.test(availabilityText)));
+  const blockedText = /currently unavailable|temporarily out of stock|see all buying options|not available to business prime|isn't available to business prime|we don't know when or if this item will be back in stock|we do not know when or if this item will be back in stock/i.test(bodyText);
+  const directlyOrderable = Boolean(addToCart || buyNow);
+  const inStock = Boolean(!unavailable && !blockedText && directlyOrderable);
+  const notDirectlyOrderableMessage = /in stock/i.test(`${availabilityText} ${bodyText}`)
+    ? "Amazon shows this ASIN as in stock, but no direct Add to cart or Buy Now control is available for this Business account."
+    : "Amazon did not show this ASIN as directly available.";
   return {
     ok: true,
     asin: pageAsin || String(asin || "").trim().toUpperCase(),
     in_stock: inStock,
-    message: inStock ? (availabilityText || "Amazon product controls are available.") : (unavailable || availabilityText || "Amazon did not show this ASIN as directly available."),
+    message: inStock ? (availabilityText || "Amazon product controls are available.") : (unavailable || availabilityText || notDirectlyOrderableMessage),
     price: availabilityPrice(),
     url: location.href,
   };
@@ -1382,9 +1614,19 @@ async function continueAfterPartialMissing(activeJob, item, purchaseItem, messag
     availableQuantity: details.availableQuantity ?? null,
   });
   if (!result?.ok) return false;
+  if (result.next_job_started) {
+    showPanel("Missing ASINs", `${message} ${result.message || "Order moved to Missing ASINs."} Started next order ${result.next_group_key}.`, null, null);
+    return true;
+  }
   const remainingItems = removeMissingItemFromActiveJob(activeJob, item, purchaseItem);
   if (!remainingItems.length) {
+    activeJob.stage = "cleanup_after_failure";
+    activeJob.cleanupAfterFailure = true;
+    activeJob.cleanupReason = message || "Order was moved to Missing ASINs. Cleaning cart before continuing.";
+    activeJob.paused = false;
+    await setActiveJob(activeJob);
     showPanel("Missing ASINs", `${message} ${result.message || "Order moved to Missing ASINs."}`, null, null);
+    location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
     return true;
   }
   if (activeJob.itemIndex < remainingItems.length) {
@@ -1421,10 +1663,45 @@ async function failCurrentItemAsMissing(activeJob, item, purchaseItem, message, 
     availableQuantity: details.availableQuantity ?? null,
   });
   if (result?.ok) {
+    if (result.cleanup_required) {
+      activeJob.stage = "cleanup_after_failure";
+      activeJob.cleanupAfterFailure = true;
+      activeJob.cleanupReason = message || "Order was moved to Missing ASINs. Cleaning cart before continuing.";
+      activeJob.paused = false;
+      await setActiveJob(activeJob);
+      location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+    }
     showPanel("Missing ASINs", `${message} ${result.message || "Order moved to Missing ASINs."}`, null, null);
     return true;
   }
   throw new Error(result?.message || "The app did not confirm the Missing ASIN report.");
+}
+
+async function failCurrentJobAsChromeError(activeJob, message, failureCode = "chrome_error", details = {}) {
+  showPanel("Chrome fulfilment needs review", message, null, null);
+  const result = await send({
+    type: "FAIL_JOB",
+    message,
+    missingAsin: "",
+    missingLineId: null,
+    failureCode,
+    requestedQuantity: details.requestedQuantity ?? null,
+    fulfilledQuantity: details.fulfilledQuantity ?? null,
+    availableQuantity: details.availableQuantity ?? null,
+  });
+  if (result?.ok) {
+    if (result.cleanup_required) {
+      activeJob.stage = "cleanup_after_failure";
+      activeJob.cleanupAfterFailure = true;
+      activeJob.cleanupReason = message || "Chrome fulfilment failed. Cleaning cart before continuing.";
+      activeJob.paused = false;
+      await setActiveJob(activeJob);
+      location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+    }
+    showPanel("Chrome fulfilment error", `${message} ${result.message || "Order moved to Chrome error for review."}`, null, null);
+    return true;
+  }
+  throw new Error(result?.message || "The app did not confirm the Chrome error report.");
 }
 
 async function applyAdditionalSavings(context = "regular") {
@@ -1491,20 +1768,53 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     error.requestedQuantity = requestedQuantity;
     throw error;
   }
-  const subscribeButton = document.querySelector("#rcx-subscribe-submit-button-announce, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input, button[value='snsText']") || findButtonByText(["subscribe"]);
-  if (subscribeButton) {
-    if (activeJob) {
-      activeJob.stage = "subscribe_checkout";
-      activeJob.addClickedAt = Date.now();
-      activeJob.subscribeAndSave = true;
-      markCheckoutStarted(activeJob);
-      markItemAdded(activeJob);
-      await setActiveJob(activeJob);
+  const subscribeButtons = findSubscribeSubmitTargets();
+  if (subscribeButtons.length) {
+    for (const subscribeButton of subscribeButtons) {
+      if (activeJob) {
+        activeJob.stage = "subscribe_checkout";
+        activeJob.addClickedAt = Date.now();
+        activeJob.subscribeAndSave = true;
+        markCheckoutStarted(activeJob);
+        markItemAdded(activeJob);
+        await setActiveJob(activeJob);
+      }
+      showPanel("Subscribe & Save", "Clicking the Subscribe button.", null, null);
+      await clickElement(subscribeButton, "Subscribe button");
+      dispatchAmazonClickSequence(subscribeButton);
+      dispatchClickAtElementCenter(subscribeButton);
+      const advanced = await waitUntil(() => /\/checkout/i.test(location.pathname), 2500, 250);
+      if (advanced || /\/checkout/i.test(location.pathname)) return true;
     }
-    await clickElement(subscribeButton, "Subscribe button");
     return true;
   }
   return false;
+}
+
+function findSubscribeSubmitTargets() {
+  const selectors = [
+    "#rcx-subscribe-submit-button input",
+    "#rcx-subscribe-submit-button button",
+    "#rcx-subscribe-submit-button span.a-button-text",
+    "#rcx-subscribe-submit-button span.a-button",
+    "#rcx-subscribe-submit-button-announce",
+    "button[value='snsText']",
+    "input[value='Subscribe']",
+    "button[aria-label*='Subscribe' i]",
+    "span.a-button:has(input[value='Subscribe'])",
+  ];
+  const targets = selectors.flatMap((selector) => {
+    try {
+      return [...document.querySelectorAll(selector)];
+    } catch {
+      return [];
+    }
+  });
+  const textTarget = findButtonByText(["subscribe"]);
+  if (textTarget) targets.push(textTarget);
+  return [...new Set(targets)]
+    .map((target) => target.closest?.("span.a-button, button, input") || target)
+    .filter((target, index, all) => target && all.indexOf(target) === index && visible(target) && !target.disabled);
 }
 
 async function activateSubscribeAndSaveOption() {
@@ -2292,6 +2602,10 @@ async function handleClearCart(activeJob) {
     await clickElement(buttons[0], "cart delete button");
     await waitForStableDom(800, 6000);
   }
+  await sleep(1200);
+  if (cartActiveItems().length && !cartIsVisiblyEmpty()) {
+    throw new Error("Amazon cart cleanup did not remove the existing cart item(s). Fulfilment stopped before adding this order, so the customer quantity cannot be doubled.");
+  }
 
   activeJob.stage = "product";
   activeJob.itemIndex = 0;
@@ -2302,6 +2616,11 @@ async function handleClearCart(activeJob) {
 }
 
 async function clearCartItems(reason = "Cleaning Amazon cart before starting the next order.") {
+  if (/\/cart\/smart-wagon/i.test(location.pathname)) {
+    showPanel("Nutricity fulfilment", "Opening full Amazon cart before cleanup.", null, null);
+    location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+    return;
+  }
   await waitForElement([
     "#sc-active-cart",
     "#sc-empty-cart",
@@ -2325,8 +2644,17 @@ async function handleFailureCleanup(activeJob) {
     location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
     return;
   }
+  if (/\/cart\/smart-wagon/i.test(location.pathname)) {
+    showPanel("Nutricity fulfilment", "Opening full Amazon cart before continuing cleanup.", null, null);
+    location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+    return;
+  }
   await clearCartItems(activeJob.cleanupReason || "Order was moved to Missing ASINs. Cleaning cart before continuing.");
-  const result = await send({ type: "CLAIM_NEXT_IN_WINDOW" });
+  let result = await send({ type: "FINISH_CLEANUP_AND_CLAIM_NEXT" });
+  if (!result?.next_job_started) {
+    await sleep(1200);
+    result = await send({ type: "FINISH_CLEANUP_AND_CLAIM_NEXT" });
+  }
   if (result?.next_job_started) {
     showPanel("Nutricity fulfilment", result.message || `Started next ${result.next_group_key}.`, null, null);
     return;
@@ -2338,6 +2666,37 @@ async function handleProduct(activeJob) {
   const item = activeJob.job.items[activeJob.itemIndex];
   if (!item) return;
   const expectedItem = selectedVariantItem(activeJob, item);
+  if (!/\/(?:dp|gp\/product)\//i.test(location.pathname)) {
+    if (/\/checkout/i.test(location.pathname)) {
+      activeJob.stage = "checkout";
+      await setActiveJob(activeJob);
+      await handleCheckout(activeJob);
+      return;
+    }
+    if (/\/cart/i.test(location.pathname)) {
+      if (cartIsVisiblyEmpty()) {
+        const attempts = Number(activeJob.emptyCartProductRetryCount || 0);
+        if (attempts < 1) {
+          activeJob.emptyCartProductRetryCount = attempts + 1;
+          activeJob.stage = "product";
+          await setActiveJob(activeJob, { allowStageRegression: true });
+          showPanel("Nutricity fulfilment", `Amazon returned to an empty cart after trying ${expectedItem.asin}. Retrying the product page once before reporting anything.`, null, null);
+          location.href = `https://www.amazon.com/dp/${expectedItem.asin}?th=1`;
+          return;
+        }
+        await pauseForManualCheckout(
+          activeJob,
+          `Amazon returned to an empty cart after trying ASIN ${expectedItem.asin}. The product page was reachable, so this was not marked Missing.`,
+          "product",
+        );
+        return;
+      }
+      activeJob.stage = "cart";
+      await setActiveJob(activeJob);
+      await handleCart(activeJob);
+      return;
+    }
+  }
   const pageError = amazonProductPageErrorMessage();
   if (pageError) {
     await failCurrentItemAsMissing(activeJob, item, expectedItem, `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${pageError}`);
@@ -2352,12 +2711,20 @@ async function handleProduct(activeJob) {
     "#apex_desktop .a-price",
   ], 18000);
   const delayedPageError = amazonProductPageErrorMessage();
-  if (!productReady || delayedPageError) {
+  if (delayedPageError) {
     await failCurrentItemAsMissing(
       activeJob,
       item,
       expectedItem,
-      `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${delayedPageError || "Amazon did not load product controls for this ASIN."}`,
+      `ASIN ${expectedItem.asin} is missing or unavailable on Amazon. ${delayedPageError}`,
+    );
+    return;
+  }
+  if (!productReady) {
+    await failCurrentJobAsChromeError(
+      activeJob,
+      `Amazon product page for ASIN ${expectedItem.asin} did not expose product controls after waiting. This may be a page timing, bot-check, modal, or parser issue, so the order was not marked Missing.`,
+      "product_controls_unavailable",
     );
     return;
   }
@@ -2546,8 +2913,46 @@ async function handleSubscribeCheckout(activeJob) {
 }
 
 async function handleCart(activeJob) {
+  if (/\/cart\/smart-wagon/i.test(location.pathname)) {
+    showPanel("Nutricity fulfilment", "Opening full Amazon cart before verifying this order.", null, null);
+    location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+    return;
+  }
   await waitForElement(["#sc-active-cart", "input[name='proceedToRetailCheckout']", "#sc-buy-box-ptc-button input"], 15000);
+  if (cartIsVisiblyEmpty() && activeJob.cartCleared && activeJob.stage === "cart" && !activeJob.addClickedAt && !activeJob.subscribeAndSave) {
+    const first = activeJob.job?.items?.[Number(activeJob.itemIndex || 0)] || activeJob.job?.items?.[0] || null;
+    const asin = String(first?.asin || "").toUpperCase();
+    if (asin) {
+      activeJob.stage = "product";
+      activeJob.startedAfterEmptyCart = true;
+      await setActiveJob(activeJob);
+      showPanel("Nutricity fulfilment", `Cart is empty before adding ${asin}. Opening the product page instead of treating it as missing.`, null, null);
+      location.href = `https://www.amazon.com/dp/${asin}`;
+      return;
+    }
+  }
   if (activeJob.subscribeAndSave || activeJob.stage === "subscribe_checkout") {
+    if (cartIsVisiblyEmpty()) {
+      const item = activeJob.job?.items?.[Number(activeJob.itemIndex || 0)] || activeJob.job?.items?.[0] || null;
+      const purchaseItem = item ? selectedVariantItem(activeJob, item) : item;
+      const asin = purchaseItem?.asin || item?.asin || "unknown";
+      const attempts = Number(activeJob.emptySubscribeCartRetryCount || 0);
+      if (attempts < 1 && asin !== "unknown") {
+        activeJob.emptySubscribeCartRetryCount = attempts + 1;
+        activeJob.stage = "product";
+        activeJob.subscribeAndSave = false;
+        await setActiveJob(activeJob, { allowStageRegression: true });
+        showPanel("Nutricity fulfilment", `Subscribe & Save returned to an empty cart for ASIN ${asin}. Retrying the product page once before reporting anything.`, null, null);
+        location.href = `https://www.amazon.com/dp/${asin}?th=1`;
+        return;
+      }
+      await pauseForManualCheckout(
+        activeJob,
+        `Subscribe & Save returned to an empty Amazon cart for ASIN ${asin}. The product page was reachable, so this was not marked Missing.`,
+        "product",
+      );
+      return;
+    }
     activeJob.stage = "checkout";
     await setActiveJob(activeJob);
     showPanel("Nutricity fulfilment", "Subscribe & Save is already in checkout flow. Not clearing cart.", null, null);
@@ -2567,6 +2972,51 @@ async function handleCart(activeJob) {
   if (!cartCheck.ok) {
     const mismatch = (cartCheck.mismatches || [])[0];
     const missingAsin = mismatch?.asin || "";
+    if (mismatch?.mismatch_type === "missing_from_cart") {
+      const message = `Amazon cart stayed empty after Add to cart for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart showed 0. This may be a cart timing or parser issue, so the order was paused as an error instead of moved to Missing ASINs.`;
+      showPanel("Cart verification needs review", message, null, null);
+      await send({
+        type: "FAIL_JOB",
+        message,
+        missingAsin: "",
+        missingLineId: null,
+        failureCode: "cart_verification_failed",
+        requestedQuantity: mismatch.expected,
+        fulfilledQuantity: 0,
+        availableQuantity: null,
+      });
+      return;
+    }
+    if (mismatch && Number(mismatch.actual || 0) <= 0) {
+      const message = `Could not verify ASIN ${missingAsin} in the Amazon cart after Add to cart. Customer ordered ${mismatch.expected}, Amazon cart showed ${mismatch.actual}. This may be a cart timing or parser issue, so the order was paused as an error instead of moved to Missing ASINs.`;
+      showPanel("Cart verification needs review", message, null, null);
+      await send({
+        type: "FAIL_JOB",
+        message,
+        missingAsin: "",
+        missingLineId: null,
+        failureCode: "cart_verification_failed",
+        requestedQuantity: mismatch.expected,
+        fulfilledQuantity: mismatch.actual,
+        availableQuantity: null,
+      });
+      return;
+    }
+    if (mismatch?.mismatch_type === "over" || Number(mismatch?.actual || 0) > Number(mismatch?.expected || 0)) {
+      const message = `Amazon cart has too many units for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}. Cart will be cleaned before the next job.`;
+      showPanel("Cart quantity mismatch", message, null, null);
+      await send({
+        type: "FAIL_JOB",
+        message,
+        missingAsin: "",
+        missingLineId: null,
+        failureCode: "cart_quantity_mismatch",
+        requestedQuantity: mismatch.expected,
+        fulfilledQuantity: mismatch.actual,
+        availableQuantity: mismatch.actual,
+      });
+      return;
+    }
     const message = mismatch
       ? `Could not add the desired quantity for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart has ${mismatch.actual}.`
       : `Could not verify the desired Amazon cart quantities. ${cartCheck.message}`;
@@ -2704,6 +3154,34 @@ function rowIsNutricityAddress(row) {
   return dataName.includes("nutricity") || visibleName.includes("nutricity") || rowText.includes("nutricity");
 }
 
+function warehouseAddressTokens() {
+  const address = DEFAULT_NEW_DELIVERY_ADDRESS;
+  return [
+    address.addressLine1,
+    address.postalCode,
+    String(address.postalCode || "").split("-")[0],
+  ].map(normalizedText).filter(Boolean);
+}
+
+function rowMatchesWarehouseAddress(row) {
+  if (!row) return false;
+  const data = addressDataForRow(row);
+  const rowText = normalizedText([
+    row.innerText,
+    row.textContent,
+    data.addressLine1,
+    data.addressLine2,
+    data.city,
+    data.stateOrRegion,
+    data.postalCode,
+  ].filter(Boolean).join(" "));
+  return warehouseAddressTokens().some((token) => rowText.includes(token));
+}
+
+function rowIsSafeNutricityAddress(row) {
+  return rowIsNutricityAddress(row) && rowMatchesWarehouseAddress(row);
+}
+
 function checkoutAddressRows() {
   const selectorRows = [...document.querySelectorAll(
     [
@@ -2729,14 +3207,36 @@ function checkoutAddressRows() {
   return [...new Set([...selectorRows, ...radioRows])].filter(visible);
 }
 
+function selectedCheckoutAddressRow() {
+  const checked = [...document.querySelectorAll("input[type='radio']:checked")]
+    .map((radio) => {
+      let row = radio.closest("[data-testid='address-row-radio'], [data-testid='address-row-section'], [data-testid^='address-row-'], .address-row-section, .address-row, [data-action='select_address_in_list']");
+      if (row) return row;
+      row = radio.closest("label, .a-row, .a-section, div");
+      for (let index = 0; row && index < 6; index += 1) {
+        const text = normalizedText(row.innerText || row.textContent || "");
+        if (text.includes("edit address") || text.includes("delivery preferences") || text.includes("united states")) return row;
+        row = row.parentElement;
+      }
+      return radio.closest("label") || radio.parentElement;
+    })
+    .find((row) => row && visible(row));
+  return checked || null;
+}
+
 function nutricityAddressRow() {
-  return checkoutAddressRows().find(rowIsNutricityAddress) || null;
+  const selectedRow = selectedCheckoutAddressRow();
+  if (rowIsSafeNutricityAddress(selectedRow)) return selectedRow;
+  return checkoutAddressRows().find(rowIsSafeNutricityAddress) || null;
 }
 
 function addressRowForRecipient(name) {
   const wanted = normalizedText(name);
   if (!wanted) return null;
-  return checkoutAddressRows().find((row) => normalizedText(row.innerText || row.textContent).includes(wanted)) || null;
+  return checkoutAddressRows().find((row) => {
+    const text = normalizedText(row.innerText || row.textContent);
+    return text.includes(wanted) && rowMatchesWarehouseAddress(row);
+  }) || null;
 }
 
 function addressSelectionControl(row) {
@@ -2784,15 +3284,19 @@ function findEditAddressTrigger() {
     const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
     return visible(element) && (modalData.includes("editAddressModal") || text.includes("edit address"));
   });
+  const selectedRow = selectedCheckoutAddressRow();
+  const selectedRowTrigger = triggers.find((element) => selectedRow && rowIsSafeNutricityAddress(selectedRow) && selectedRow.contains(element));
+  if (selectedRowTrigger) return selectedRowTrigger.querySelector("a, button, span") || selectedRowTrigger;
+
   const nutricityRowTrigger = triggers.find((element) => {
     const row = element.closest("[data-testid='address-row-radio'], [data-testid='address-row-section'], [data-testid^='address-row-'], .address-row-section, .address-row, [data-action='select_address_in_list']");
-    return rowIsNutricityAddress(row);
+    return rowIsSafeNutricityAddress(row);
   });
   if (nutricityRowTrigger) return nutricityRowTrigger.querySelector("a, button, span") || nutricityRowTrigger;
 
   const preferred = triggers.find((element) => {
     const row = element.closest("[data-testid='address-row-radio'], [data-testid='address-row-section'], [data-testid^='address-row-'], .address-row-section, .address-row, [data-action='select_address_in_list']");
-    return rowIsNutricityAddress(row);
+    return rowIsSafeNutricityAddress(row);
   });
   const selected = preferred || triggers[1] || triggers[0];
   if (selected) return selected.querySelector("a, button, span") || selected;
@@ -2825,6 +3329,10 @@ function normalizedText(value) {
   return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function compactMatchText(value) {
+  return normalizedText(value).replace(/[^a-z0-9]/g, "");
+}
+
 function elementReadableText(element) {
   if (!element) return "";
   return [
@@ -2851,9 +3359,40 @@ function checkoutShowsRecipient(name) {
   for (const root of roots) {
     if (!root || root.closest?.("#nutricity-panel") || root.closest?.(".a-popover, .a-popover-preload")) continue;
     const text = normalizedText(elementReadableText(root));
-    if (text.includes(wanted)) return true;
+    if (text.includes(wanted) && rowMatchesWarehouseAddress(root)) return true;
   }
   return false;
+}
+
+function currentCheckoutDeliveryText() {
+  const roots = [
+    document.querySelector("#deliver-to-address-text"),
+    document.querySelector("#deliver-to-address-text")?.closest?.("a, .a-row, .a-section, div"),
+    document.querySelector("#deliver-to-customer-text")?.closest?.("a, .a-row, .a-section, div"),
+    ...document.querySelectorAll(
+      [
+        "a[aria-label*='Delivering to' i]",
+        "a[aria-label*='delivery address' i]",
+        "a[href*='shipaddressselect']",
+        "a[href*='ChangeDelivery']",
+      ].join(", "),
+    ),
+  ].filter(Boolean);
+  return roots
+    .filter((root) => root && visible(root) && !root.closest?.("#nutricity-panel") && !root.closest?.(".a-popover, .a-popover-preload"))
+    .map(elementReadableText)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function checkoutShowsWarehouseAddress() {
+  const bodyDeliveryMatch = (document.body?.innerText || document.body?.textContent || "")
+    .replace(/\s+/g, " ")
+    .match(/\bDelivering\s+to\s+.{0,240}/i);
+  const text = normalizedText([currentCheckoutDeliveryText(), bodyDeliveryMatch?.[0] || ""].join(" "));
+  const tokens = warehouseAddressTokens();
+  return tokens.some((token) => text.includes(token));
 }
 
 function checkoutDeliveryRecipientText() {
@@ -2887,7 +3426,13 @@ function checkoutDeliveryRecipientMatches(name) {
 }
 
 function checkoutRecipientConfirmed(name) {
-  return checkoutDeliveryRecipientMatches(name) || checkoutShowsRecipient(name);
+  if ((checkoutDeliveryRecipientMatches(name) && checkoutShowsWarehouseAddress()) || checkoutShowsRecipient(name)) return true;
+  const wanted = normalizedText(name);
+  if (!wanted) return false;
+  const visibleDeliveryText = normalizedText(currentCheckoutDeliveryText());
+  if (!visibleDeliveryText.includes(wanted)) return false;
+  const tokens = warehouseAddressTokens();
+  return tokens.some((token) => visibleDeliveryText.includes(token));
 }
 
 async function markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, message = "Verified delivery address. Continuing checkout.") {
@@ -2920,6 +3465,11 @@ function findChangeDeliveryAddressButton() {
     return visible(element) && !element.disabled && (
       element.getAttribute?.("data-csa-c-slot-id") === "checkout-change-shipaddressselect" ||
       element.getAttribute?.("data-topage") === "shipaddressselect" ||
+      (href.includes("/checkout/") && href.includes("/address") && (
+        href.includes("changedelivery") ||
+        href.includes("shipaddressselect") ||
+        href.includes("editdeliveryaddress")
+      )) ||
       text === "change delivery address" ||
       text === "change" && href.includes("/checkout/") && href.includes("/address")
     );
@@ -3337,6 +3887,43 @@ function findPaymentSelection(preferences = []) {
   const paymentRoot = paymentRowForRadio(radio)?.closest?.(
     "form, [data-testid*='pay'], [data-csa-c-slot-id*='payselect'], [data-pmts-component-id], .pmts-portal-component, body",
   ) || document;
+  const visiblePaymentContinueButtons = () => [...document.querySelectorAll(
+    [
+      "span.a-button",
+      "button",
+      "input[type='submit']",
+      "input[type='button']",
+      "input[data-csa-c-slot-id*='continue-payselect']",
+      "button[data-csa-c-slot-id*='continue-payselect']",
+      "input[data-testid='bottom-continue-button'][data-csa-c-slot-id*='payselect']",
+      "input[data-testid='secondary-continue-button'][data-csa-c-slot-id*='payselect']",
+      "button[data-testid='bottom-continue-button'][data-csa-c-slot-id*='payselect']",
+      "button[data-testid='secondary-continue-button'][data-csa-c-slot-id*='payselect']",
+      "input[name='ppw-widgetEvent:SetPaymentPlanSelectContinueEvent']",
+      "input[name='ppw-widgetEvent:SetPaymentPlanContinueEvent']",
+      "input[aria-labelledby*='continue']",
+    ].join(", "),
+  )]
+    .filter((element) => {
+      if (!visible(element) || element.disabled) return false;
+      const text = normalizedText(element.value || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
+      const slot = normalizedText(element.getAttribute?.("data-csa-c-slot-id") || "");
+      const name = normalizedText(element.getAttribute?.("name") || "");
+      return text.includes("use this payment method") ||
+        text.includes("use this card") ||
+        text === "continue" ||
+        text.includes("continue") ||
+        slot.includes("continue-payselect") ||
+        name.includes("setpaymentplanselectcontinueevent") ||
+        name.includes("setpaymentplancontinueevent");
+    });
+
+  const textContinue = visiblePaymentContinueButtons().find((element) => {
+    const text = normalizedText(element.value || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
+    return text.includes("use this payment method") || text.includes("use this card") || text.includes("continue");
+  });
+  if (textContinue) return { radio, continueButton: textContinue };
+
   const exactContinue = [...document.querySelectorAll(
     [
       "input[data-csa-c-slot-id*='continue-payselect']",
@@ -3353,7 +3940,7 @@ function findPaymentSelection(preferences = []) {
     .find((element) => visible(element) && !element.disabled);
   if (exactContinue) return { radio, continueButton: exactContinue };
 
-  const continueButton = [...paymentRoot.querySelectorAll("input[type='submit'], input[type='button'], button, span.a-button")].find((element) => {
+  const continueButton = [...paymentRoot.querySelectorAll("span.a-button, button, input[type='submit'], input[type='button']")].find((element) => {
     const text = normalizedText(element.value || element.innerText || element.textContent);
     return visible(element) && !element.disabled && (
       text.includes("use this payment method") ||
@@ -3363,6 +3950,22 @@ function findPaymentSelection(preferences = []) {
     );
   });
   return radio && continueButton ? { radio, continueButton } : null;
+}
+
+function alternatePaymentContinueButtons(primary = null) {
+  return [...document.querySelectorAll(
+    "span.a-button, button, input[type='submit'], input[type='button'], input[data-csa-c-slot-id*='continue-payselect']",
+  )]
+    .filter((element) => {
+      if (!visible(element) || element.disabled || element === primary) return false;
+      const text = normalizedText(element.value || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
+      const slot = normalizedText(element.getAttribute?.("data-csa-c-slot-id") || "");
+      return text.includes("use this payment method") ||
+        text.includes("use this card") ||
+        text === "continue" ||
+        text.includes("continue") ||
+        slot.includes("continue-payselect");
+    });
 }
 
 function findChangePaymentButton() {
@@ -3526,13 +4129,27 @@ async function handlePaymentSelection(activeJob) {
     }
     await clickElement(payment.continueButton, "Use this payment method button");
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
-    await waitUntil(
+    let advanced = await waitUntil(
       () => checkoutPaymentConfirmed(cardPreferences)
         || (!cardPreferences.length && findPlaceOrderButton())
         || !findPaymentRadio(),
       12000,
       400,
     );
+    if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
+      const alternate = alternatePaymentContinueButtons(payment.continueButton)[0];
+      if (alternate) {
+        showPanel("Nutricity checkout", "Retrying Amazon payment continue button.", null, null);
+        await clickElement(alternate, "alternate Use this payment method button");
+        advanced = await waitUntil(
+          () => checkoutPaymentConfirmed(cardPreferences)
+            || (!cardPreferences.length && findPlaceOrderButton())
+            || !findPaymentRadio(),
+          12000,
+          400,
+        );
+      }
+    }
     activeJob.stage = "checkout";
     await setActiveJob(activeJob);
     const confirmedDigits = checkoutSelectedCardDigits();
@@ -3547,11 +4164,11 @@ async function handlePaymentSelection(activeJob) {
 }
 
 async function openPaymentSelectionIfAvailable() {
-  const changePayment = await waitUntil(findChangePaymentButton, 6000, 400);
+  const changePayment = findChangePaymentButton() || await waitUntil(findChangePaymentButton, 2500, 250);
   if (!changePayment) return false;
   showPanel("Nutricity checkout", "Opening payment method selection.", null, null);
   await clickElement(changePayment, "Change payment method button");
-  await sleep(2000);
+  await sleep(900);
   return true;
 }
 
@@ -3573,10 +4190,12 @@ async function ensurePreferredCheckoutPayment(activeJob) {
     return true;
   }
 
-  const settledDigits = await waitForPreferredCheckoutPayment(cardPreferences, 5000);
-  if (settledDigits && settledDigits !== true) {
-    showPanel("Nutricity checkout", `Verified checkout card ending in ${settledDigits}.`, null, null);
-    return true;
+  if (!selectedDigits) {
+    const settledDigits = await waitForPreferredCheckoutPayment(cardPreferences, 2000);
+    if (settledDigits && settledDigits !== true) {
+      showPanel("Nutricity checkout", `Verified checkout card ending in ${settledDigits}.`, null, null);
+      return true;
+    }
   }
 
   const expected = cardPreferences.join(" or ");
@@ -3586,10 +4205,10 @@ async function ensurePreferredCheckoutPayment(activeJob) {
     showPanel("Nutricity checkout", `Could not verify checkout card; opening payment selection for ${expected}.`, null, null);
   }
 
-  if (await waitUntil(findPaymentRadio, 10000, 400)) {
+  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 3000, 250)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 15000, 400);
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 8000, 300);
     const confirmedDigits = checkoutSelectedCardDigits();
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
@@ -3605,7 +4224,7 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   }
 
   if (!await openPaymentSelectionIfAvailable()) {
-    const lateDigits = await waitForPreferredCheckoutPayment(cardPreferences, 8000);
+    const lateDigits = await waitForPreferredCheckoutPayment(cardPreferences, 2500);
     if (lateDigits && lateDigits !== true) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${lateDigits}.`, null, null);
       return true;
@@ -3615,10 +4234,10 @@ async function ensurePreferredCheckoutPayment(activeJob) {
       : `Could not verify the checkout card, and I could not find the Change payment method link to select ${expected}.`);
     return false;
   }
-  if (await waitUntil(findPaymentRadio, 10000, 400)) {
+  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 5000, 300)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 15000, 400);
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 8000, 300);
     const confirmedDigits = checkoutSelectedCardDigits();
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
@@ -3737,7 +4356,7 @@ async function continueAfterManualStep(activeJob, nextStage = "") {
     markItemAdded(next);
   }
   next.stage = targetStage;
-  await setActiveJob(next);
+  await setActiveJob(next, { allowUnpause: true });
   showPanel("Nutricity fulfilment", `Manual step done. Continuing ${targetStage}.`, null, null);
   setTimeout(runSafely, 250);
 }
@@ -3883,8 +4502,18 @@ async function saveNewDeliveryAddress(activeJob, checkoutRecipient) {
 
 async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
   const deliveredTo = checkoutDeliveryRecipientText();
-  if (!deliveredTo) return true;
-  if (checkoutDeliveryRecipientMatches(checkoutRecipient)) {
+  const placeOrderVisible = Boolean(findPlaceOrderButton());
+  if (!deliveredTo) {
+    if (placeOrderVisible || !checkoutShowsWarehouseAddress()) {
+      await pauseForManualCheckout(
+        activeJob,
+        `Could not verify the Nutricity warehouse delivery address before placing ${checkoutRecipient}.`,
+      );
+      return false;
+    }
+    return true;
+  }
+  if (checkoutDeliveryRecipientMatches(checkoutRecipient) && checkoutShowsWarehouseAddress()) {
     activeJob.addressVerifiedRecipient = checkoutRecipient;
     activeJob.addressVerifiedAt = Date.now();
     activeJob.addressVerifyAttempts = 0;
@@ -3899,7 +4528,9 @@ async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
   if (attempts > 2) {
     await pauseForManualCheckout(
       activeJob,
-      `Delivery name still shows "${deliveredTo}" instead of "${checkoutRecipient}".`,
+      checkoutDeliveryRecipientMatches(checkoutRecipient)
+        ? `Delivery address for "${deliveredTo}" is not the Nutricity warehouse address ${DEFAULT_NEW_DELIVERY_ADDRESS.addressLine1}.`
+        : `Delivery name still shows "${deliveredTo}" instead of "${checkoutRecipient}".`,
     );
     return false;
   }
@@ -3912,7 +4543,7 @@ async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
     );
     return false;
   }
-  showPanel("Nutricity checkout", `Delivery name shows ${deliveredTo}. Reopening address edit.`, null, null);
+  showPanel("Nutricity checkout", `Delivery address shows ${deliveredTo}. Reopening address edit.`, null, null);
   activeJob.stage = "editing_address";
   activeJob.editAddressClickedAt = Date.now();
   await setActiveJob(activeJob);
@@ -4082,8 +4713,13 @@ async function handleCheckout(activeJob) {
           return;
         }
       } else {
+        await sleep(750);
+        if (checkoutRecipientConfirmed(checkoutRecipient)) {
+          await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Delivery address shows ${checkoutRecipient}. Continuing checkout.`);
+        } else {
         await pauseForManualCheckout(activeJob, "Could not find the Change delivery address or Edit address link for the Nutricity address.");
         return;
+        }
       }
     } else {
       const addressEditor = await openNewDeliveryAddressFormIfAvailable(activeJob);
@@ -4122,6 +4758,25 @@ async function handleCheckout(activeJob) {
   if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
   const deliverToThisAddress = findDeliverToThisAddressButton();
   if (deliverToThisAddress && !findPaymentRadio() && !findPlaceOrderButton() && !findChangePaymentButton()) {
+    const recipientRow = addressRowForRecipient(checkoutRecipient);
+    const selectedRow = selectedCheckoutAddressRow();
+    if (recipientRow && selectedRow !== recipientRow && !recipientRow.contains(selectedRow)) {
+      const recipientControl = addressSelectionControl(recipientRow);
+      if (recipientControl) {
+        showPanel("Nutricity checkout", "Selecting the recipient delivery address before continuing.", null, null);
+        await clickElement(recipientControl, "Recipient address row");
+        await sleep(900);
+      }
+    }
+    const selectedAfterClick = selectedCheckoutAddressRow();
+    if (recipientRow && selectedAfterClick !== recipientRow && !recipientRow.contains(selectedAfterClick)) {
+      await pauseForManualCheckout(activeJob, `Could not select delivery address "${checkoutRecipient}" before continuing.`);
+      return;
+    }
+    if (!recipientRow && selectedAfterClick && !rowIsSafeNutricityAddress(selectedAfterClick)) {
+      await pauseForManualCheckout(activeJob, `Could not find delivery address "${checkoutRecipient}" before continuing.`);
+      return;
+    }
     showPanel("Nutricity checkout", "Delivery address is selected. Continuing to payment review.", null, null);
     await clickElement(deliverToThisAddress, "Deliver to this address button");
     return;
@@ -4147,6 +4802,13 @@ async function handleCheckout(activeJob) {
       );
       return;
     }
+    if (!checkoutShowsWarehouseAddress()) {
+      await pauseForManualCheckout(
+        activeJob,
+        `Final checkout does not show the Nutricity warehouse address ${DEFAULT_NEW_DELIVERY_ADDRESS.addressLine1}.`,
+      );
+      return;
+    }
     const finalCardPreferences = cardPreferenceList((await getExtensionState()).cardLast4Preference);
     const finalDigits = checkoutSelectedCardDigits();
     if (finalCardPreferences.length && (!finalDigits || !finalCardPreferences.includes(finalDigits))) {
@@ -4158,6 +4820,7 @@ async function handleCheckout(activeJob) {
       );
       return;
     }
+    if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
     const duplicateCheck = await send({ type: "CHECK_EXISTING_AMAZON_ORDER" });
     if (!duplicateCheck?.ok) {
       activeJob.paused = true;
@@ -4193,6 +4856,8 @@ async function handleCheckout(activeJob) {
       return;
     }
     showPanel("Final step", "Clicking Place your order now.", null, null);
+    activeJob.placeOrderClickStartedAt = Date.now();
+    await setActiveJob(activeJob);
     if (!await protectBeforeAmazonSubmit(activeJob, "checkout")) return;
     await clickElement(placeOrder, "Place your order button");
   } else {
@@ -4248,10 +4913,40 @@ function submittedOrPausedStage(activeJob) {
   return submittedStage(activeJob) || ["complete_pending", "find_order_id", "reporting_complete"].includes(String(activeJob?.pausedStage || ""));
 }
 
+function activeJobWasSubmittedToAmazon(activeJob) {
+  const job = activeJob?.job || {};
+  if (job.submitted_to_amazon || ["order_submitted", "reporting_complete"].includes(String(job.amazon_status || ""))) return true;
+  return (job.items || []).some((item) => ["order_submitted", "reporting_complete"].includes(String(item.amazon_status || "")));
+}
+
 function amazonOrderSubmitErrorPage() {
   const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
+  const title = normalizedText(document.title || "");
   return /\/checkout\/.*\/place-order/i.test(location.pathname)
-    && (text.includes("something went wrong") || text.includes("please go back and try again"));
+    && (
+      title.includes("500") ||
+      title.includes("error occurred") ||
+      text.includes("500") ||
+      text.includes("an error occurred") ||
+      text.includes("something went wrong") ||
+      text.includes("please go back and try again")
+    );
+}
+
+function amazonPostSubmitUnplacedIssue() {
+  if (!/\/checkout\/.*\/place-order/i.test(location.pathname)) return "";
+  const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
+  if (!text) return "";
+  if (
+    text.includes("you cannot buy this item because it's out of stock")
+    || text.includes("you cannot buy this item because it is out of stock")
+    || (text.includes("out of stock") && text.includes("another seller might have a comparable offer"))
+    || text.includes("item is no longer available")
+    || text.includes("this item is no longer available")
+  ) {
+    return "Amazon showed the item is out of stock after Place Order. No Amazon order was placed.";
+  }
+  return "";
 }
 
 function amazonDuplicateOrderPage() {
@@ -4655,6 +5350,7 @@ function renderOrderHistoryAnnotation(card, result) {
     }
     marker.appendChild(links);
     appendOrderHistoryQuantitySummary(marker, orders);
+    appendOrderHistoryDateRepair(marker, result, orders, syncInProgress);
   } else if (suggestions.length) {
     const links = document.createElement("span");
     links.className = "nutricity-order-history-links";
@@ -4667,7 +5363,12 @@ function renderOrderHistoryAnnotation(card, result) {
       link.textContent = order.odoo_order_name || `Odoo ${order.odoo_order_id}`;
       links.appendChild(link);
     });
-    const existingIds = [...new Set(suggestions.map((order) => order.current_amazon_order_id).filter(Boolean))];
+    const resultAsins = new Set((result.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
+    const existingIds = [...new Set(suggestions
+      .flatMap((order) => (order.lines || [])
+        .filter((line) => !resultAsins.size || resultAsins.has(String(line.asin || "").toUpperCase()))
+        .map((line) => line.current_amazon_order_id)
+        .filter(Boolean)))];
     if (existingIds.length) {
       links.appendChild(document.createTextNode(` currently ${existingIds.slice(0, 2).join(", ")}`));
     }
@@ -4769,6 +5470,76 @@ function appendOrderHistoryQuantitySummary(marker, orders = []) {
   marker.appendChild(summary);
 }
 
+function orderDateMismatches(orders = []) {
+  return (orders || []).flatMap((order) =>
+    (order.order_date_checks || [])
+      .filter((check) => check && check.matches === false)
+      .map((check) => ({
+        orderName: order.odoo_order_name || "",
+        lineId: Number(check.line_id || 0),
+        asin: check.asin || "",
+        amazonDate: check.amazon_order_date || "",
+        appDate: check.app_ordered_date || "",
+      })),
+  );
+}
+
+function appendOrderHistoryDateRepair(marker, result, orders = [], syncInProgress = false) {
+  const mismatches = orderDateMismatches(orders);
+  if (!mismatches.length) return;
+  const warning = document.createElement("span");
+  warning.className = "nutricity-order-history-warning";
+  warning.textContent = `Date mismatch: Amazon ${mismatches[0].amazonDate || result.orderDate || "order date"}, app ${mismatches[0].appDate || "stored date"}`;
+  marker.appendChild(warning);
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "nutricity-order-history-sync";
+  if (syncInProgress) {
+    button.classList.add("is-syncing");
+    button.disabled = true;
+    button.textContent = "Syncing...";
+  } else {
+    button.textContent = "Sync date";
+  }
+  button.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (orderHistorySyncInProgress.has(result.orderId)) return;
+    orderHistorySyncInProgress.set(result.orderId, Date.now());
+    button.disabled = true;
+    button.classList.add("is-syncing");
+    button.textContent = "Syncing...";
+    let synced = null;
+    try {
+      synced = await syncMatchedAmazonHistoryDate(result);
+    } catch (error) {
+      synced = { ok: false, message: error?.message || String(error || "Could not sync this Amazon order date.") };
+    }
+    if (synced?.ok && Number(synced.matched || 0) > 0) {
+      orderHistorySyncInProgress.delete(result.orderId);
+      button.classList.remove("is-syncing");
+      button.classList.add("is-synced");
+      button.disabled = true;
+      button.textContent = "Date synced";
+      orderHistorySyncedConfirmations.set(result.orderId, {
+        syncedAt: Date.now(),
+        message: synced.message || `Synced date for ${result.orderId}`,
+      });
+      orderHistoryLookupCache.delete(result.orderId);
+      const annotation = button.closest(".nutricity-order-history-annotation");
+      if (annotation) annotation.classList.add("is-synced");
+    } else {
+      orderHistorySyncInProgress.delete(result.orderId);
+      button.classList.remove("is-syncing");
+      button.disabled = false;
+      button.textContent = "Sync failed";
+      button.title = synced?.message || "Could not sync this Amazon order date.";
+    }
+  });
+  marker.appendChild(button);
+}
+
 async function syncSuggestedAmazonHistoryOrder(result) {
   const suggestions = result.suggestions || [];
   const orderNames = [...new Set(suggestions.map((order) => order.odoo_order_name).filter(Boolean))];
@@ -4792,11 +5563,33 @@ async function syncSuggestedAmazonHistoryOrder(result) {
     order: {
       amazon_order_id: result.orderId,
       amazon_order_url: orderDetailsUrl(result.orderId),
+      order_date: result.orderDate || "",
       recipient: result.recipient || "",
       source_text: result.recipient || orderNames.join(" "),
       order_names: orderNames,
       line_ids: matchingLineIds,
       store_id: suggestions.length === 1 ? suggestions[0].store_id : null,
+      replace_existing: true,
+    },
+  });
+}
+
+async function syncMatchedAmazonHistoryDate(result) {
+  const orders = result.match?.orders || [];
+  const orderNames = [...new Set(orders.map((order) => order.odoo_order_name).filter(Boolean))];
+  const lineIds = [...new Set(orders.flatMap((order) => order.line_ids || []).map(Number).filter(Boolean))];
+  if (!result.orderId || !orderNames.length || !lineIds.length) return { ok: false, message: "No matched app lines are available for date sync." };
+  return send({
+    type: "SYNC_AMAZON_HISTORY_ORDER",
+    order: {
+      amazon_order_id: result.orderId,
+      amazon_order_url: orderDetailsUrl(result.orderId),
+      order_date: result.orderDate || "",
+      recipient: result.recipient || "",
+      source_text: result.recipient || orderNames.join(" "),
+      order_names: orderNames,
+      line_ids: lineIds,
+      store_id: orders.length === 1 ? orders[0].store_id : null,
       replace_existing: true,
     },
   });
@@ -4848,6 +5641,7 @@ async function annotateAmazonOrderHistory() {
         suggestions: suggestions[details.amazon_order_id] || [],
         conflicts: conflicts[details.amazon_order_id] || [],
         unmatched: unmatched.has(details.amazon_order_id),
+        orderDate: details.order_date || "",
         asins: details.asins || [],
         items: details.items || [],
         cancelled: details.cancelled,
@@ -4889,17 +5683,42 @@ function activeJobAsins(activeJob) {
 }
 
 function recentOrderMatchesActiveJob(order, activeJob) {
+  if (order?.cancelled === true) return false;
+  const orderId = String(order?.amazon_order_id || "").trim();
+  const cancelledOrderIds = new Set([
+    ...(activeJob?.job?.cancelled_amazon_order_ids || []),
+    ...(activeJob?.job?.items || []).flatMap((item) => item.cancelled_amazon_order_ids || []),
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+  if (orderId && cancelledOrderIds.has(orderId)) return false;
   const haystack = `${order.recipient || ""} ${order.status || ""}`.toLowerCase();
+  const compactHaystack = compactMatchText(haystack);
   const names = activeJobOrderNames(activeJob).map((name) => name.toLowerCase());
+  const compactNames = names.map(compactMatchText).filter(Boolean);
   const recipient = String(activeJob.job?.recipient_name || "").toLowerCase();
-  const nameMatches = names.some((name) => name && haystack.includes(name)) || (recipient && haystack.includes(recipient));
+  const fullRecipient = recipientName(activeJob).toLowerCase();
+  const recipientSuffix = String(activeJob?.job?.recipient_suffix || "").replace(/\s+/g, "").trim();
+  if (
+    recipientSuffix
+    && fullRecipient
+    && !haystack.includes(fullRecipient)
+    && !compactHaystack.includes(compactMatchText(fullRecipient))
+  ) return false;
+  const nameMatches = names.some((name) => name && (haystack.includes(name) || compactHaystack.includes(compactMatchText(name))))
+    || (recipient && (haystack.includes(recipient) || compactHaystack.includes(compactMatchText(recipient))));
   if (!nameMatches) return false;
+  const exactOrderNameMatch = compactNames.some((name) => name.length >= 5 && compactHaystack.includes(name));
   const cachedAsins = new Set((order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
   const jobAsins = activeJobAsins(activeJob);
   if (!cachedAsins.size || !jobAsins.length) return true;
-  if (jobAsins.some((asin) => cachedAsins.has(asin))) return true;
-  const activeItemCount = Array.isArray(activeJob.job?.items) ? activeJob.job.items.length : 0;
-  return submittedStage(activeJob) && activeItemCount <= 1;
+  if (recipientSuffix) {
+    const jobAsinSet = new Set(jobAsins);
+    const extraAsins = [...cachedAsins].filter((asin) => !jobAsinSet.has(asin));
+    if (extraAsins.length) return false;
+  }
+  if (exactOrderNameMatch && (activeJob.job?.items || []).length === 1 && cachedAsins.size > 1) {
+    return true;
+  }
+  return jobAsins.some((asin) => cachedAsins.has(asin));
 }
 
 async function findRememberedDuplicateOrder(activeJob) {
@@ -4911,11 +5730,12 @@ async function findRememberedDuplicateOrder(activeJob) {
 
 function extractRecentOrders(activeJob) {
   const recipient = String(activeJob.job.recipient_name || "").toLowerCase();
+  const compactRecipient = compactMatchText(recipient);
   const names = activeJobOrderNames(activeJob).map((name) => name.toLowerCase());
+  const compactNames = names.map(compactMatchText).filter(Boolean);
   const historyOrders = extractOrderHistoryOrders();
   const historyMatches = historyOrders.filter((order) => recentOrderMatchesActiveJob(order, activeJob));
   if (historyMatches.length) return historyMatches;
-  if (isOrderHistoryPage()) return [];
   const cards = [
     ...document.querySelectorAll("#orderCardHeader, .order-card, [id*='orderCard'], .order, .a-box-group, .a-box"),
   ]
@@ -4928,8 +5748,10 @@ function extractRecentOrders(activeJob) {
     if (isCancelledOrderCard(card)) continue;
     const text = (card.innerText || card.textContent || "").replace(/\s+/g, " ");
     const lower = text.toLowerCase();
-    const matchesRecipient = recipient && lower.includes(recipient);
-    const matchesOrderName = names.some((name) => name && lower.includes(name));
+    const compactLower = compactMatchText(lower);
+    const matchesRecipient = recipient && (lower.includes(recipient) || compactLower.includes(compactRecipient));
+    const matchesOrderName = names.some((name) => name && lower.includes(name))
+      || compactNames.some((name) => name && compactLower.includes(name));
     const orderMatch = text.match(/\b\d{3}-\d{7}-\d{7}\b/);
     if (orderMatch && (matchesRecipient || matchesOrderName || candidates.length === 1)) {
       const orderId = orderMatch[0];
@@ -4992,10 +5814,13 @@ async function handleOrderHistory(activeJob) {
   if (!isOrderHistoryPage()) {
     showPanel("Nutricity fulfilment", "Opening order history to capture the Amazon order number.", null, null);
     activeJob.stage = "find_order_id";
+    activeJob.orderHistoryLookupStartedAt = activeJob.orderHistoryLookupStartedAt || Date.now();
     await setActiveJob(activeJob);
     location.href = orderHistoryUrl();
     return;
   }
+  activeJob.orderHistoryLookupStartedAt = activeJob.orderHistoryLookupStartedAt || Date.now();
+  await setActiveJob(activeJob);
   await waitForElement(["#orderCardHeader", ".order-card", "[id*='orderCard']", "body"], 12000);
   const historyOrders = extractOrderHistoryOrders();
   if (historyOrders.length) {
@@ -5004,10 +5829,36 @@ async function handleOrderHistory(activeJob) {
   const orders = extractRecentOrders(activeJob);
   const rememberedOrder = orders.length ? null : await findRememberedDuplicateOrder(activeJob);
   if (!orders.length && !rememberedOrder) {
+    const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
+    if (lookupAge > 120000) {
+      const message = `Amazon Place Order was submitted for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}, but no matching Amazon order appeared in order history after ${Math.round(lookupAge / 1000)} seconds. Marking as Chrome error instead of Missing so it can be reviewed without blocking the queue.`;
+      const result = await send({
+        type: "SUBMIT_UNCERTAIN",
+        message,
+        failureCode: "submitted_order_not_found",
+      });
+      showPanel("Chrome fulfilment needs review", result?.message || message, null, null);
+      return;
+    }
     showPanel("Nutricity fulfilment", `Looking for recent Amazon order for ${activeJob.job.recipient_name}.`, null, null);
     return;
   }
   await reportAmazonOrders(activeJob, orders.length ? orders : [rememberedOrder]);
+}
+
+async function reportPostSubmitUnplaced(activeJob, message) {
+  const item = activeJob.job?.items?.[Number(activeJob.itemIndex || 0)] || activeJob.job?.items?.[0] || null;
+  const purchased = item ? selectedVariantItem(activeJob, item) : null;
+  const missingAsin = String(purchased?.asin || item?.asin || "").toUpperCase();
+  const result = await send({
+    type: "POST_SUBMIT_UNPLACED",
+    message,
+    missingAsin,
+    missingLineId: item ? itemPrimaryLineId(item) : null,
+    failureCode: "post_submit_out_of_stock",
+  });
+  showPanel("Missing ASINs", result?.message || message, null, null);
+  return result;
 }
 
 async function reportAmazonOrder(activeJob, orderId) {
@@ -5015,14 +5866,21 @@ async function reportAmazonOrder(activeJob, orderId) {
 }
 
 function buildOrderMappings(activeJob, orders) {
-  if (!Array.isArray(orders) || orders.length < 2) return [];
+  if (!Array.isArray(orders) || !orders.length) return [];
   const items = activeJob.job?.items || [];
   const mappings = [];
+  const singleOrder = orders.length === 1 ? orders[0] : null;
   for (const item of items) {
     const requestedAsin = String(item.asin || "").toUpperCase();
     const purchasedAsin = String(activeJob.pricing?.[requestedAsin]?.purchased_asin || "").toUpperCase();
     const itemAsins = [requestedAsin, purchasedAsin].filter(Boolean);
-    const order = orders.find((candidate) => itemAsins.some((asin) => (candidate.asins || []).includes(asin)));
+    let order = orders.find((candidate) => {
+      const candidateAsins = (candidate.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean);
+      return candidateAsins.length && itemAsins.some((asin) => candidateAsins.includes(asin));
+    });
+    if (!order && singleOrder) {
+      order = singleOrder;
+    }
     if (!order) continue;
     mappings.push({
       asin: requestedAsin,
@@ -5032,6 +5890,23 @@ function buildOrderMappings(activeJob, orders) {
     });
   }
   return mappings;
+}
+
+function requiresAsinMappedReporting(activeJob, orders) {
+  const items = activeJob.job?.items || [];
+  const expectedLineIds = new Set(items.flatMap((item) => item.line_ids || []).map(Number).filter(Boolean));
+  const ordersWithAsins = (orders || []).filter((order) => (order.asins || []).length);
+  return expectedLineIds.size > 1 && ordersWithAsins.length > 0;
+}
+
+function unmappedReportingLineIds(activeJob, orderMappings) {
+  const expectedLineIds = new Set((activeJob.job?.items || []).flatMap((item) => item.line_ids || []).map(Number).filter(Boolean));
+  for (const mapping of orderMappings || []) {
+    for (const lineId of mapping.line_ids || []) {
+      expectedLineIds.delete(Number(lineId || 0));
+    }
+  }
+  return [...expectedLineIds].filter(Boolean);
 }
 
 async function reportAmazonOrders(activeJob, orders) {
@@ -5044,69 +5919,104 @@ async function reportAmazonOrders(activeJob, orders) {
     uniqueOrders.push({
       amazon_order_id: orderId,
       amazon_order_url: order.amazon_order_url || orderDetailsUrl(orderId),
+      order_date: order.order_date || "",
       asins: (order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean),
     });
   }
   const orderId = uniqueOrders[0]?.amazon_order_id || "";
   const orderLabel = uniqueOrders.map((order) => order.amazon_order_id).join(", ");
   const orderMappings = buildOrderMappings(activeJob, uniqueOrders);
+  if (requiresAsinMappedReporting(activeJob, uniqueOrders)) {
+    const unmappedLineIds = unmappedReportingLineIds(activeJob, orderMappings);
+    if (unmappedLineIds.length) {
+      const expectedAsins = activeJobAsins(activeJob).join(", ");
+      const foundAsins = [...new Set(uniqueOrders.flatMap((order) => order.asins || []))].join(", ");
+      const message = `Amazon order ${orderLabel || orderId} was found, but ASINs did not map to every app line. Expected ${expectedAsins || "app ASINs"}, found ${foundAsins || "no Amazon ASINs"}.`;
+      activeJob.paused = true;
+      activeJob.pausedStage = "reporting_complete";
+      activeJob.reportError = message;
+      await setActiveJob(activeJob);
+      showPanel(
+        "Nutricity reporting needs attention",
+        `${message} Reporting paused so the wrong Amazon order number is not written to unrelated rows.`,
+        "Retry reporting",
+        () => continueAfterManualStep(activeJob, "reporting_complete"),
+      );
+      return false;
+    }
+  }
+  const reportKey = `${activeJob.job?.group_key || "job"}:${orderLabel || orderId}`;
+  window.__nutricityOrderReportLocks = window.__nutricityOrderReportLocks || {};
+  window.__nutricityOrderReportCompleted = window.__nutricityOrderReportCompleted || {};
+  const now = Date.now();
+  if (window.__nutricityOrderReportCompleted[reportKey] && now - window.__nutricityOrderReportCompleted[reportKey] < 120000) {
+    showPanel("Nutricity fulfilment", `Amazon order ${orderLabel || orderId} was already reported. Waiting for the next queued order.`, null, null);
+    return true;
+  }
+  if (window.__nutricityOrderReportLocks[reportKey] && now - window.__nutricityOrderReportLocks[reportKey] < 60000) {
+    showPanel("Nutricity fulfilment", `Amazon order ${orderLabel || orderId} is already being reported. Waiting for the app response.`, null, null);
+    return false;
+  }
+  window.__nutricityOrderReportLocks[reportKey] = now;
   showPanel("Nutricity fulfilment", `Found Amazon order ${orderLabel || orderId}. Reporting back to the app.`, null, null);
   activeJob.stage = "reporting_complete";
   activeJob.reportedOrderId = orderLabel || orderId;
   activeJob.reportAttemptedAt = Date.now();
   await setActiveJob(activeJob);
   let result = null;
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    result = await send({
-      type: "COMPLETE_JOB",
-      orderId,
-      orderUrl: uniqueOrders[0]?.amazon_order_url || orderDetailsUrl(orderId),
-      orderMappings,
-      amazonAccountName: amazonSignedInAccountName(),
-    });
-    if (result?.ok) break;
-    const message = normalizedText(result?.message || "");
-    const transient = /internal server error|pool|timeout|failed to fetch|network|temporarily/.test(message);
-    if (!transient || attempt === 4) break;
-    showPanel("Nutricity fulfilment", `The app was busy reporting ${orderId}. Retrying ${attempt + 1}/4.`, null, null);
-    await sleep(1500 * attempt);
+  try {
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      result = await send({
+        type: "COMPLETE_JOB",
+        orderId,
+        orderUrl: uniqueOrders[0]?.amazon_order_url || orderDetailsUrl(orderId),
+        orderDate: uniqueOrders[0]?.order_date || "",
+        orderMappings,
+        amazonAccountName: amazonSignedInAccountName(),
+      });
+      if (result?.ok) break;
+      const message = normalizedText(result?.message || "");
+      const transient = /internal server error|pool|timeout|failed to fetch|network|temporarily/.test(message);
+      if (!transient || attempt === 4) break;
+      showPanel("Nutricity fulfilment", `The app was busy reporting ${orderId}. Retrying ${attempt + 1}/4.`, null, null);
+      await sleep(1500 * attempt);
+    }
+    if (!result?.ok) {
+      const message = result?.message || "Could not report Amazon order back to the app.";
+      activeJob.paused = true;
+      activeJob.pausedStage = "reporting_complete";
+      activeJob.reportError = message;
+      await setActiveJob(activeJob);
+      showPanel(
+        "Nutricity reporting needs attention",
+        `${message} Amazon order ${orderLabel || orderId} was found, but the app did not confirm completion.`,
+        "Retry reporting",
+        () => continueAfterManualStep(activeJob, "reporting_complete"),
+      );
+      delete window.__nutricityOrderReportLocks[reportKey];
+      return false;
+    }
+    window.__nutricityOrderReportCompleted[reportKey] = Date.now();
+    for (const order of uniqueOrders) {
+      orderHistoryLookupCache.delete(order.amazon_order_id);
+      orderHistorySyncedConfirmations.set(order.amazon_order_id, {
+        syncedAt: Date.now(),
+        message: result.message || `Reported Amazon order ${order.amazon_order_id}.`,
+      });
+    }
+    showPanel("Nutricity fulfilment", result.message || `Reported Amazon order ${orderId}.`, null, null);
+    return true;
+  } finally {
+    if (!window.__nutricityOrderReportCompleted[reportKey]) {
+      delete window.__nutricityOrderReportLocks[reportKey];
+    }
   }
-  if (!result?.ok) {
-    const message = result?.message || "Could not report Amazon order back to the app.";
-    activeJob.paused = true;
-    activeJob.pausedStage = "reporting_complete";
-    activeJob.reportError = message;
-    await setActiveJob(activeJob);
-    showPanel(
-      "Nutricity reporting needs attention",
-      `${message} Amazon order ${orderLabel || orderId} was found, but the app did not confirm completion.`,
-      "Retry reporting",
-      () => continueAfterManualStep(activeJob, "reporting_complete"),
-    );
-    return false;
-  }
-  showPanel("Nutricity fulfilment", result.message || `Reported Amazon order ${orderId}.`, null, null);
-  return true;
 }
 
 async function run() {
   if (!extensionContextAlive) return;
   const activeJob = await getActiveJob();
   if (!activeJob?.job || !/amazon\.com$/i.test(location.hostname)) return;
-  if (amazonDuplicateOrderPage()) {
-    try {
-      return await handleAmazonDuplicateOrderPage(activeJob);
-    } catch (error) {
-      showPanel("Nutricity fulfilment error", error.message || String(error), null, null);
-      return;
-    }
-  }
-  if (activeJob.paused && submittedOrPausedStage(activeJob)) {
-    activeJob.stage = activeJob.pausedStage || activeJob.stage || "find_order_id";
-    activeJob.paused = false;
-    activeJob.pausedStage = null;
-    await setActiveJob(activeJob);
-  }
   if (activeJob.paused) {
     showPanel(
       "Nutricity fulfilment paused",
@@ -5116,14 +6026,74 @@ async function run() {
     );
     return;
   }
+  if (amazonDuplicateOrderPage()) {
+    try {
+      return await handleAmazonDuplicateOrderPage(activeJob);
+    } catch (error) {
+      showPanel("Nutricity fulfilment error", error.message || String(error), null, null);
+      return;
+    }
+  }
+  const postSubmitUnplaced = amazonPostSubmitUnplacedIssue();
+  if (postSubmitUnplaced && submittedOrPausedStage(activeJob)) {
+    await reportPostSubmitUnplaced(activeJob, postSubmitUnplaced);
+    return;
+  }
+  if (
+    /\/checkout/i.test(location.pathname)
+    && findPlaceOrderButton()
+    && activeJob.placeOrderClickStartedAt
+    && Date.now() - Number(activeJob.placeOrderClickStartedAt || 0) < 45000
+  ) {
+    showPanel("Final step", "Place Order click is in progress. Waiting for Amazon confirmation.", null, null);
+    return;
+  }
+  if (activeJobWasSubmittedToAmazon(activeJob)) {
+    activeJob.stage = activeJob.stage === "reporting_complete" ? "reporting_complete" : "find_order_id";
+    activeJob.amazonSubmittedAt = activeJob.amazonSubmittedAt || Date.now();
+    await setActiveJob(activeJob);
+    await handleOrderHistory(activeJob);
+    return;
+  }
+  if (/\/checkout/i.test(location.pathname) && findPlaceOrderButton() && !submittedStage(activeJob)) {
+    activeJob.stage = "checkout";
+    await setActiveJob(activeJob);
+    const checkoutRecipient = recipientName(activeJob);
+    if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
+    if (!await ensurePreferredCheckoutPayment(activeJob)) return;
+    if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
+    await handleCheckout(activeJob);
+    return;
+  }
+  showPanel(
+    "Nutricity fulfilment",
+    `Working on ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}.`,
+    null,
+    null,
+  );
   try {
+    if (amazonOrderSubmitErrorPage() && submittedOrPausedStage(activeJob)) {
+      showPanel("Nutricity fulfilment", "Amazon showed an error after order submit. Opening recent orders to verify whether the order was placed.", null, null);
+      activeJob.stage = "find_order_id";
+      await setActiveJob(activeJob);
+      location.href = orderHistoryUrl();
+      return;
+    }
+    const postSubmitIssue = amazonPostSubmitUnplacedIssue();
+    if (postSubmitIssue && submittedOrPausedStage(activeJob)) {
+      await reportPostSubmitUnplaced(activeJob, postSubmitIssue);
+      return;
+    }
+    if (activeJobWasSubmittedToAmazon(activeJob)) {
+      activeJob.stage = activeJob.stage === "reporting_complete" ? "reporting_complete" : "find_order_id";
+      activeJob.amazonSubmittedAt = activeJob.amazonSubmittedAt || Date.now();
+      await setActiveJob(activeJob);
+      await handleOrderHistory(activeJob);
+      return;
+    }
     if (submittedStage(activeJob)) {
       if (activeJob.stage === "reporting_complete") {
-        if (activeJob.reportedOrderId) {
-          await reportAmazonOrder(activeJob, activeJob.reportedOrderId);
-        } else {
-          showPanel("Nutricity fulfilment", "Reporting Amazon order back to the app.", null, null);
-        }
+        showPanel("Nutricity fulfilment", "Amazon order was reported. Waiting for the extension to start the next queued order.", null, null);
       } else if (activeJob.stage === "complete_pending") {
         await handleCompletion(activeJob);
       } else {
@@ -5135,12 +6105,16 @@ async function run() {
     else if (activeJob.stage === "cleanup_after_failure") {
       await handleFailureCleanup(activeJob);
     } else if (activeJob.stage === "reporting_complete") {
-      if (activeJob.reportedOrderId) {
-        await reportAmazonOrder(activeJob, activeJob.reportedOrderId);
-      } else {
-        showPanel("Nutricity fulfilment", "Reporting Amazon order back to the app.", null, null);
-      }
+      showPanel("Nutricity fulfilment", "Amazon order was reported. Waiting for the extension to start the next queued order.", null, null);
     } else if (activeJob.stage === "duplicate_order") {
+      const duplicateCheck = await send({ type: "CHECK_EXISTING_AMAZON_ORDER" });
+      if (duplicateCheck?.ok && !duplicateCheck.duplicate) {
+        activeJob.stage = "checkout";
+        activeJob.duplicateOrder = null;
+        await setActiveJob(activeJob);
+        await handleCheckout(activeJob);
+        return;
+      }
       const orders = (activeJob.duplicateOrder?.orders || []).map((item) => item.amazon_order_id).filter(Boolean).join(", ");
       showPanel(
         "Amazon order already exists",
@@ -5159,6 +6133,18 @@ async function run() {
       await setActiveJob(activeJob);
       await handleOrderHistory(activeJob);
     } else if (/\/cart/i.test(location.pathname)) {
+      if (checkoutWasStarted(activeJob) && !["clear_cart", "cleanup_after_failure"].includes(activeJob.stage)) {
+        const message = `Amazon returned to the cart after checkout had already started for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}. The extension stopped this job as a Chrome error instead of marking it Missing so the next order cannot inherit a stale cart page.`;
+        showPanel("Checkout returned to cart", message, null, null);
+        await send({
+          type: "FAIL_JOB",
+          message,
+          missingAsin: "",
+          missingLineId: null,
+          failureCode: "cart_after_checkout",
+        });
+        return;
+      }
       if (!["clear_cart", "cleanup_after_failure"].includes(activeJob.stage)) {
         activeJob.stage = "cart";
       }
@@ -5245,6 +6231,7 @@ async function runSafely() {
 runSafely();
 scheduleOrderHistoryAnnotation(250);
 setInterval(runSafely, 5000);
+setInterval(() => keepPanelAlive().catch(() => undefined), 1000);
 setInterval(() => scheduleOrderHistoryAnnotation(0), 3000);
 window.addEventListener("pageshow", () => {
   setTimeout(runSafely, 250);

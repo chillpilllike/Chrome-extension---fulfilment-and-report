@@ -9,6 +9,8 @@ let startNextJobInFlight = null;
 const claimNextJobInFlight = new Map();
 const MISSING_ASIN_ALARM = "nutricity-missing-asin-availability";
 const MISSING_ASIN_CHECK_PERIOD_MINUTES = 24 * 60;
+const BROWSERLESS_SWITCH_POLL_MS = 2000;
+const BROWSERLESS_SWITCH_TIMEOUT_MS = 10 * 60 * 1000;
 
 async function getSettings() {
   const data = await chrome.storage.local.get({
@@ -28,6 +30,8 @@ async function getSettings() {
     recentAmazonOrders: [],
     cachedQueueStatus: null,
     orderProgress: null,
+    fulfilmentActivity: { last: null },
+    forceStop: { active: false, stoppedAt: 0, reason: "" },
     logs: [],
     logsByWindow: {},
   });
@@ -66,10 +70,28 @@ async function getWindowState(windowId) {
 }
 
 async function setWindowJob(windowId, activeJob) {
-  const { activeJobsByWindow } = await getSettings();
+  if (activeJob && await forceStopActive()) return;
+  const state = await getSettings();
+  const { activeJobsByWindow } = state;
   const next = { ...(activeJobsByWindow || {}) };
   const key = String(windowId || "");
-  if (windowId && activeJob) next[key] = activeJob;
+  const current = windowId ? next[key] || null : state.activeJob || null;
+  const sameGroup = current?.job?.group_key && activeJob?.job?.group_key === current.job.group_key;
+  if (sameGroup && orderSubmitStarted(current) && !orderSubmitStarted(activeJob)) {
+    return;
+  }
+  if (windowId && activeJob) {
+    for (const [otherKey, otherJob] of Object.entries(next)) {
+      if (otherKey === key || otherJob?.job?.group_key !== activeJob.job?.group_key) continue;
+      if (orderSubmitStarted(otherJob) && !orderSubmitStarted(activeJob)) {
+        await log(`Ignored duplicate active window ${key} for ${activeJob.job.group_key}; window ${otherKey} has already submitted.`, windowId);
+        return;
+      }
+      delete next[otherKey];
+      await log(`Cleared duplicate active window ${otherKey} for ${activeJob.job.group_key}; keeping ${key}.`, windowId);
+    }
+    next[key] = activeJob;
+  }
   if (windowId && !activeJob) delete next[key];
   await chrome.storage.local.set({ activeJobsByWindow: next, activeJob: activeJob || Object.values(next)[0] || null });
 }
@@ -110,6 +132,52 @@ async function log(message, windowId = null) {
   await chrome.storage.local.set({ logsByWindow: next, logs: next[key] });
 }
 
+function jobLabel(job = {}) {
+  const names = (job.order_names || []).map((name) => String(name || "").trim()).filter(Boolean);
+  return names.join(", ") || job.group_key || "Unknown order";
+}
+
+function jobAsinSummary(job = {}) {
+  return (job.items || []).map((item) => item.asin).filter(Boolean).join(", ");
+}
+
+function shortReason(value = "", fallback = "") {
+  const text = String(value || fallback || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
+
+async function recordLastProcessed(activeJobOrJob, status, reason = "", extra = {}) {
+  const job = activeJobOrJob?.job || activeJobOrJob || {};
+  const entry = {
+    group_key: job.group_key || "",
+    label: jobLabel(job),
+    asins: jobAsinSummary(job),
+    status: status || "processed",
+    reason: shortReason(reason),
+    stage: activeJobOrJob?.stage || "",
+    at: Date.now(),
+    ...extra,
+  };
+  await chrome.storage.local.set({ fulfilmentActivity: { last: entry } });
+  return entry;
+}
+
+async function setForceStop(active, reason = "") {
+  const forceStop = {
+    active: active === true,
+    stoppedAt: active === true ? Date.now() : 0,
+    reason: active === true ? shortReason(reason, "Force stopped by popup.") : "",
+  };
+  await chrome.storage.local.set({ forceStop });
+  return forceStop;
+}
+
+async function forceStopActive() {
+  const { forceStop } = await getSettings();
+  return forceStop?.active === true;
+}
+
 async function setOrderProgress(progress) {
   await chrome.storage.local.set({ orderProgress: progress });
   return progress;
@@ -128,6 +196,10 @@ async function startOrderProgress(total = 0, message = "") {
 }
 
 async function incrementOrderProgress(message = "") {
+  if (await forceStopActive()) {
+    const { orderProgress } = await getSettings();
+    return orderProgress || {};
+  }
   const { orderProgress } = await getSettings();
   const current = orderProgress || {};
   const processed = Math.max(0, Math.round(Number(current.processed || 0))) + 1;
@@ -232,6 +304,7 @@ async function syncAmazonHistoryOrder(order = {}) {
       amazon_order_id: normalized.amazon_order_id,
       amazon_order_url: normalized.amazon_order_url,
       amazon_account_name: order.amazon_account_name || "Chrome History Matcher",
+      order_date: normalized.order_date || order.order_date || "",
       order_names: orderNames,
       line_ids: lineIds,
       source_text: order.source_text || normalized.recipient || "",
@@ -273,16 +346,8 @@ async function testConnection() {
   const { apiBase, adminToken } = await getSettings();
   const base = normalizeApiBase(apiBase);
   try {
-    const health = await fetch(`${base}/health`);
-    if (!health.ok) {
-      throw new Error(`Server health check failed: HTTP ${health.status}`);
-    }
-    const auth = await fetch(`${base}/api/settings/admin-access`, {
-      headers: adminToken ? { "X-Admin-Token": adminToken } : {},
-    });
-    if (!auth.ok) {
-      throw new Error((await auth.text()) || `Admin token check failed: HTTP ${auth.status}`);
-    }
+    await api("/health", { timeoutMs: 8000 });
+    await api("/api/settings/admin-access", { timeoutMs: 8000, headers: adminToken ? { "X-Admin-Token": adminToken } : {} });
   } catch (error) {
     throw new Error(connectionErrorMessage(error, base));
   }
@@ -299,6 +364,7 @@ async function getQueueStatus() {
       ok: true,
       jobs: payload.jobs || [],
       counts: payload.counts || [],
+      job_count: Number(payload.job_count || 0),
       workerId,
       cached_at: Date.now(),
       stale: false,
@@ -333,22 +399,53 @@ async function getQueueJobsForActiveRefresh() {
 async function refreshActiveJobFromQueue(windowId, force = false) {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job?.group_key) return activeJob;
-  if (activeJob.stage === "cleanup_after_failure") return activeJob;
-  if (orderSubmitStarted(activeJob)) return activeJob;
+  if (activeJob.stage === "cleanup_after_failure" || activeJob.cleanupAfterFailure) return activeJob;
+  if (orderSubmitStarted(activeJob) && activeJob.stage !== "reporting_complete") {
+    try {
+      await heartbeatJob(activeJob, windowId);
+      return (await getWindowState(windowId)).activeJob || activeJob;
+    } catch (error) {
+      const message = String(error.message || "");
+      if (/lock is no longer owned|no longer active/i.test(message)) {
+        await clearStoredJobGroup(activeJob.job.group_key);
+        await log(
+          `Cleared stale submitted active job ${activeJob.job.group_key}; the server lock is no longer active: ${message}`,
+          windowId,
+        );
+        return null;
+      }
+      return activeJob;
+    }
+  }
   if (!force && Date.now() - Number(activeJob.jobRefreshedAt || 0) < 30000) return activeJob;
   try {
     const jobs = await getQueueJobsForActiveRefresh();
     const freshJob = jobs.find((job) => job.group_key === activeJob.job.group_key);
     if (!freshJob) {
-      await setWindowJob(windowId, null);
-      await addLog(
-        `Cleared stale active job ${activeJob.job.group_key}; it is no longer queued on the server.`,
-        "warn"
-      );
-      return null;
+      try {
+        await heartbeatJob(activeJob, windowId);
+        return (await getWindowState(windowId)).activeJob || activeJob;
+      } catch (error) {
+        const message = String(error.message || "");
+        if (!/lock is no longer owned|no longer active/i.test(message)) {
+          await log(`Kept ${activeJob.job.group_key} active after heartbeat refresh failed: ${message}`, windowId);
+          return activeJob;
+        }
+        await setWindowJob(windowId, null);
+        await log(
+          `Cleared stale active job ${activeJob.job.group_key}; the server lock is no longer active: ${message}`,
+          windowId,
+        );
+        return null;
+      }
     }
     const { activeJob: currentJob } = await getWindowState(windowId);
     const next = { ...(currentJob || activeJob), job: freshJob, jobRefreshedAt: Date.now() };
+    if (jobWasSubmittedToAmazon(freshJob)) {
+      next.stage = next.stage === "reporting_complete" ? "reporting_complete" : "find_order_id";
+      next.amazonSubmittedAt = next.amazonSubmittedAt || Date.now();
+      if (!next.paused) next.pausedStage = null;
+    }
     await setWindowJob(windowId, next);
     return next;
   } catch {
@@ -401,7 +498,21 @@ function jobWasSubmittedToAmazon(job) {
 function activeJobBlocksNext(activeJob) {
   if (!activeJob?.job?.group_key) return false;
   if (activeJob.stage === "cleanup_after_failure") return false;
+  if (
+    activeJob.stage === "reporting_complete" &&
+    activeJob.reportedOrderId &&
+    /lock is no longer owned|no longer active/i.test(String(activeJob.reportError || ""))
+  ) {
+    return false;
+  }
   return true;
+}
+
+function isLateCompletedJobUpdate(currentJob, incomingJob) {
+  if (!incomingJob?.job?.group_key) return false;
+  if (incomingJob.stage !== "reporting_complete") return false;
+  if (currentJob?.job?.group_key === incomingJob.job.group_key) return false;
+  return Boolean(incomingJob.reportedOrderId || incomingJob.reportAttemptedAt);
 }
 
 async function blockingActiveJob(windowId = null) {
@@ -414,9 +525,11 @@ async function blockingActiveJob(windowId = null) {
     if (seen.has(key)) continue;
     seen.add(key);
     if (activeJobBlocksNext(job)) return job;
+    const refreshed = await refreshActiveJobFromQueue(job.targetWindowId || windowId || null, true);
+    if (activeJobBlocksNext(refreshed)) return refreshed;
   }
   if (windowId) {
-    const { activeJob } = await getWindowState(windowId);
+    const activeJob = await refreshActiveJobFromQueue(windowId, true);
     if (activeJobBlocksNext(activeJob)) return activeJob;
   }
   return null;
@@ -428,6 +541,20 @@ async function navigateWindowToCart(windowId) {
   const tab = tabs.find((item) => item.active) || tabs[0];
   if (tab?.id) {
     await chrome.tabs.update(tab.id, { url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
+  }
+  await chrome.windows.update(windowId, { focused: true });
+}
+
+async function navigateWindowToProduct(windowId, asin) {
+  const normalizedAsin = String(asin || "").trim().toUpperCase();
+  if (!windowId || !normalizedAsin) return;
+  const url = `https://www.amazon.com/dp/${encodeURIComponent(normalizedAsin)}`;
+  const tabs = await chrome.tabs.query({ windowId });
+  const tab = tabs.find((item) => item.active) || tabs[0];
+  if (tab?.id) {
+    await chrome.tabs.update(tab.id, { url, active: true });
+  } else {
+    await chrome.tabs.create({ windowId, url, active: true });
   }
   await chrome.windows.update(windowId, { focused: true });
 }
@@ -476,37 +603,108 @@ async function createAmazonWorkerWindow(incognito = false) {
   return createdTab.windowId ? await chrome.windows.get(createdTab.windowId) : null;
 }
 
+async function contentScriptLoaded(tabId) {
+  if (!chrome.scripting?.executeScript || !tabId) return true;
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => Boolean(window.__nutricityContentLoaded),
+    });
+    return Boolean(result?.[0]?.result);
+  } catch {
+    return true;
+  }
+}
+
+async function injectContentScript(tabId) {
+  if (!chrome.scripting?.executeScript || !tabId) return false;
+  if (await contentScriptLoaded(tabId)) return false;
+  try {
+    if (chrome.scripting.insertCSS) {
+      await chrome.scripting.insertCSS({ target: { tabId }, files: ["content.css"] }).catch(() => undefined);
+    }
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    return true;
+  } catch (error) {
+    await log(`Could not inject Nutricity content script into Amazon tab ${tabId}: ${error.message}`);
+    return false;
+  }
+}
+
+async function ensureContentScriptsInAmazonTabs(label = "extension recovery") {
+  if (!chrome.tabs?.query) return;
+  const tabs = await chrome.tabs.query({ url: ["https://www.amazon.com/*", "https://amazon.com/*"] });
+  let injected = 0;
+  for (const tab of tabs) {
+    if (await injectContentScript(tab.id)) injected += 1;
+  }
+  if (injected) await log(`Recovered Nutricity content script in ${injected} Amazon tab(s) after ${label}.`);
+}
+
 async function startNextJob(sourceWindowId = null) {
   if (startNextJobInFlight) return startNextJobInFlight;
   startNextJobInFlight = (async () => {
+  await setForceStop(false);
   await releaseMissingWindowJobs();
+  try {
+    await testConnection();
+  } catch (error) {
+    const message = error.message || "Could not reach the local fulfilment app.";
+    await log(`Cannot start queued order: ${message}`, sourceWindowId);
+    await setOrderProgress({
+      running: false,
+      total: 0,
+      processed: 0,
+      message,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    return { ok: false, message };
+  }
   const browserless = await browserlessOrderStatus().catch(() => null);
   if (browserless?.progress?.running === true) {
-    const message = browserless.progress.message || "Browserless ordering is already running. Wait for it to finish before starting visible Chrome ordering.";
-    await log(message, sourceWindowId);
-    return { ok: false, browserless_running: true, message };
+    await stopBrowserlessOrderRun(sourceWindowId);
+    const stopped = await waitForBrowserlessOrderStop(sourceWindowId);
+    if (!stopped) {
+      const message = "Browserless ordering is still finishing the current job. Visible Chrome ordering will not start until it reports.";
+      await log(message, sourceWindowId);
+      return { ok: false, browserless_running: true, message };
+    }
+    await log("Browserless ordering stopped; starting the next queued order in Chrome UI mode.", sourceWindowId);
   }
+  const submittedRecovery = await recoverSubmittedJobInWindow(sourceWindowId);
+  if (submittedRecovery?.activeJob) return submittedRecovery;
   const blocking = await blockingActiveJob(sourceWindowId);
   if (blocking) {
     if (orderSubmitStarted(blocking)) {
       await log(`Cannot start a new job; ${blocking.job.group_key} was already submitted and must be reported first.`, sourceWindowId);
       const recovered = await recoverSubmittedJobInWindow(blocking.targetWindowId || sourceWindowId);
       if (recovered?.activeJob) return recovered;
-      await clearStoredJobGroup(blocking.job.group_key);
-      await log(`Cleared closed submitted job ${blocking.job.group_key}; claiming the next queued order.`, sourceWindowId);
+      return {
+        ok: false,
+        active_job_running: true,
+        submitted_pending: true,
+        message: `${blocking.job.group_key} was already submitted to Amazon and must be reported before starting another order.`,
+      };
     } else {
       await log(`Cannot start a new job; ${blocking.job.group_key} is still active.`, sourceWindowId);
       return { ok: false, active_job_running: true, message: `Finish or stop ${blocking.job.group_key} before starting the next queued order.` };
     }
   }
   const workerId = await getWorkerId();
-  const { splitMixedAsinOrders } = await getSettings();
+  const { splitMixedAsinOrders, fulfilAvailableMixedAsin } = await getSettings();
   try {
     const queueBefore = await api("/api/chrome/jobs?claim=false&job_limit=1");
     await startOrderProgress(Number(queueBefore.job_count || queueBefore.jobs?.length || 0), "Visible Chrome order run started.");
   } catch {
     await startOrderProgress(0, "Visible Chrome order run started.");
   }
+  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId);
+  if (!preflight.ok) {
+    await updateOrderProgressTotal(0, preflight.message || "Split-order preflight failed.");
+    return { ok: false, message: preflight.message || "Split-order preflight failed." };
+  }
+  if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; did not claim a queued order." };
   const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=${splitMixedAsinOrders === true ? "true" : "false"}`);
   const job = payload.jobs?.[0];
   if (!job) {
@@ -555,6 +753,7 @@ async function startNextJob(sourceWindowId = null) {
 }
 
 async function startBrowserlessOrderRun(sourceWindowId = null) {
+  await setForceStop(false);
   await releaseMissingWindowJobs();
   const blocking = await blockingActiveJob(sourceWindowId);
   if (blocking) {
@@ -605,16 +804,71 @@ async function browserlessOrderStatus() {
   return result;
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForBrowserlessOrderStop(sourceWindowId = null, timeoutMs = BROWSERLESS_SWITCH_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await browserlessOrderStatus().catch((error) => ({ error }));
+    const progress = result?.progress || {};
+    if (progress.running !== true) return true;
+    await setOrderProgress({
+      running: true,
+      total: Number(progress.total || 0),
+      processed: Number(progress.processed || 0),
+      message: progress.stop_requested
+        ? "Stopping browserless ordering after the current job is reported. Chrome UI mode will start next."
+        : "Waiting for browserless ordering to stop before opening Chrome UI mode.",
+      startedAt: progress.started_at || Date.now(),
+      updatedAt: progress.updated_at || Date.now(),
+      source: "browserless",
+    });
+    await delay(BROWSERLESS_SWITCH_POLL_MS);
+  }
+  await log("Timed out waiting for browserless ordering to stop.", sourceWindowId);
+  return false;
+}
+
+async function stopBrowserlessOrderRun(sourceWindowId = null) {
+  const result = await api("/api/chrome/browserless/stop", {
+    method: "POST",
+    timeoutMs: 10000,
+  });
+  const progress = result?.progress || {};
+  await setOrderProgress({
+    running: progress.running === true,
+    total: Number(progress.total || 0),
+    processed: Number(progress.processed || 0),
+    message: progress.message || result.message || "Browserless ordering stopped.",
+    startedAt: progress.started_at || Date.now(),
+    updatedAt: progress.updated_at || Date.now(),
+    source: "browserless",
+  });
+  await log(result.message || "Browserless ordering stop requested.", sourceWindowId);
+  return result;
+}
+
 async function claimNextJobInWindow(windowId) {
   const claimKey = String(windowId || "global");
   if (claimNextJobInFlight.has(claimKey)) return claimNextJobInFlight.get(claimKey);
   const task = (async () => {
+  if (await forceStopActive()) {
+    await log("Force stop is active; did not claim another queued order.", windowId);
+    return null;
+  }
   const browserless = await browserlessOrderStatus().catch(() => null);
   if (browserless?.progress?.running === true) {
     await log(browserless.progress.message || "Browserless ordering is running; did not claim another visible Chrome job.", windowId);
     return null;
   }
+  const submittedRecovery = await recoverSubmittedJobInWindow(windowId);
+  if (submittedRecovery?.activeJob) return submittedRecovery.activeJob;
   const { activeJob: currentJob } = await getWindowState(windowId);
+  if (currentJob?.stage === "cleanup_after_failure" || currentJob?.cleanupAfterFailure) {
+    await setWindowJob(windowId, null);
+  }
   if (activeJobBlocksNext(currentJob)) {
     await log(`Kept ${currentJob.job.group_key}; current job is not closed yet.`, windowId);
     return currentJob;
@@ -624,15 +878,21 @@ async function claimNextJobInWindow(windowId) {
     if (orderSubmitStarted(blocking)) {
       const recovered = await recoverSubmittedJobInWindow(blocking.targetWindowId || windowId);
       if (recovered?.activeJob) return recovered.activeJob;
-      await clearStoredJobGroup(blocking.job.group_key);
-      await log(`Cleared closed submitted job ${blocking.job.group_key}; claiming the next queued order.`, windowId);
+      await log(`Did not claim a new job because submitted ${blocking.job.group_key} still needs order-history reporting.`, windowId);
+      return null;
     } else {
       await log(`Did not claim a new job because ${blocking.job.group_key} is still active.`, windowId);
       return null;
     }
   }
   const workerId = await getWorkerId();
-  const { splitMixedAsinOrders } = await getSettings();
+  const { splitMixedAsinOrders, fulfilAvailableMixedAsin } = await getSettings();
+  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, windowId);
+  if (!preflight.ok) {
+    await log(preflight.message || "Split-order preflight failed.", windowId);
+    return null;
+  }
+  if (await forceStopActive()) return null;
   const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=${splitMixedAsinOrders === true ? "true" : "false"}`);
   const job = payload.jobs?.[0];
   if (!job) {
@@ -645,8 +905,9 @@ async function claimNextJobInWindow(windowId) {
     return recovered.activeJob || null;
   }
   const activeJob = activeJobFor(job, workerId, windowId);
+  activeJob.startedAfterPreviousJob = true;
   await setWindowJob(windowId, activeJob);
-  await log(`Started next ${job.group_key} with ${job.items.length} item(s).`, windowId);
+  await log(`Started next ${job.group_key} with ${job.items.length} item(s); clearing Amazon cart before product add.`, windowId);
   await navigateWindowToCart(windowId);
   return activeJob;
   })();
@@ -656,6 +917,20 @@ async function claimNextJobInWindow(windowId) {
   } finally {
     claimNextJobInFlight.delete(claimKey);
   }
+}
+
+async function finishCleanupAndClaimNext(windowId) {
+  const { activeJob } = await getWindowState(windowId);
+  if (activeJob?.stage === "cleanup_after_failure" || activeJob?.cleanupAfterFailure) {
+    await setWindowJob(windowId, null);
+  }
+  const nextJob = await claimNextJobInWindow(windowId);
+  return {
+    ok: true,
+    next_job_started: Boolean(nextJob),
+    next_group_key: nextJob?.job?.group_key || "",
+    message: nextJob ? `Started next ${nextJob.job.group_key}.` : "No more queued Chrome jobs found.",
+  };
 }
 
 async function recoverSubmittedJobInWindow(windowId) {
@@ -677,7 +952,19 @@ async function recoverSubmittedJobInWindow(windowId) {
     lastEmptyRecoverSubmittedJobAt = Date.now();
     const { activeJob } = await getWindowState(windowId);
     if (orderSubmitStarted(activeJob)) {
-      await clearStoredJobGroup(activeJob.job.group_key);
+      try {
+        await heartbeatJob(activeJob, windowId);
+        await log(`Kept submitted ${activeJob.job.group_key} active; server recovery did not return a submitted job yet.`, windowId);
+      } catch (error) {
+        const message = String(error.message || "");
+        if (/lock is no longer owned|no longer active/i.test(message)) {
+          await clearStoredJobGroup(activeJob.job.group_key);
+          await log(`Cleared stale submitted ${activeJob.job.group_key}; server recovery and heartbeat both say it is no longer active: ${message}`, windowId);
+          return { ok: true, recovered: false, activeJob: null };
+        }
+        await log(`Kept submitted ${activeJob.job.group_key} active; could not confirm server lock state: ${message}`, windowId);
+      }
+      return { ok: true, recovered: false, activeJob };
     }
     return { ok: true, recovered: false, activeJob: null };
   }
@@ -715,7 +1002,20 @@ async function cleanupCartBeforeNextJob(activeJob, windowId, reason = "") {
 }
 
 async function stopJob(windowId) {
-  const { activeJob } = await getWindowState(windowId);
+  const state = await getWindowState(windowId);
+  const globalState = await getSettings();
+  let { activeJob } = state;
+  let targetWindowId = windowId;
+  if (!activeJob?.job && globalState.activeJob?.job) {
+    activeJob = globalState.activeJob;
+    targetWindowId = activeJob.targetWindowId || windowId || null;
+  }
+  if (!activeJob?.job) {
+    const browserless = await browserlessOrderStatus().catch(() => null);
+    if (browserless?.progress?.running === true) {
+      return stopBrowserlessOrderRun(targetWindowId);
+    }
+  }
   if (activeJob?.job?.group_key && activeJob?.workerId) {
     if (orderSubmitStarted(activeJob)) {
       await log(`Stopped local automation for ${activeJob.job.group_key}, but kept server submit lock because Amazon submit already started.`, windowId);
@@ -726,14 +1026,79 @@ async function stopJob(windowId) {
           body: JSON.stringify({ worker_id: activeJob.workerId }),
         });
       } catch (error) {
-        await log(`Could not release ${activeJob.job.group_key}: ${error.message}`, windowId);
+        await log(`Could not release ${activeJob.job.group_key}: ${error.message}`, targetWindowId);
       }
     }
   }
-  await setWindowJob(windowId, null);
+  if (activeJob?.job) {
+    await recordLastProcessed(activeJob, "stopped", "Stopped manually from the popup.");
+  }
+  await setWindowJob(targetWindowId, null);
   await releaseMissingWindowJobs();
-  await log("Stopped active job.", windowId);
+  await log("Stopped active job.", targetWindowId);
   return { ok: true, message: "Stopped active job." };
+}
+
+async function forceStopAll(windowId = null) {
+  const state = await getSettings();
+  await setForceStop(true, "Force stopped from the popup.");
+  const activeEntries = [];
+  const seen = new Set();
+  for (const [key, activeJob] of Object.entries(state.activeJobsByWindow || {})) {
+    if (!activeJob?.job?.group_key) continue;
+    const id = `${activeJob.job.group_key}:${activeJob.workerId || ""}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    activeEntries.push({ windowId: Number(key) || null, activeJob });
+  }
+  if (state.activeJob?.job?.group_key) {
+    const id = `${state.activeJob.job.group_key}:${state.activeJob.workerId || ""}`;
+    if (!seen.has(id)) activeEntries.push({ windowId: state.activeJob.targetWindowId || windowId || null, activeJob: state.activeJob });
+  }
+
+  for (const { activeJob } of activeEntries) {
+    await recordLastProcessed(activeJob, "force stopped", "Force stopped from the popup before the extension could continue.");
+    try {
+      await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/force-release`, {
+        method: "POST",
+        timeoutMs: 8000,
+      });
+    } catch (error) {
+      await log(`Force stop could not release ${activeJob.job.group_key}: ${error.message}`, windowId);
+    }
+  }
+
+  try {
+    const browserless = await browserlessOrderStatus().catch(() => null);
+    if (browserless?.progress?.running === true) await stopBrowserlessOrderRun(windowId);
+  } catch (error) {
+    await log(`Force stop could not stop browserless ordering: ${error.message}`, windowId);
+  }
+
+  await chrome.storage.local.set({
+    activeJob: null,
+    activeJobsByWindow: {},
+    orderProgress: {
+      running: false,
+      total: Number(state.orderProgress?.total || 0),
+      processed: Number(state.orderProgress?.processed || 0),
+      message: "Force stopped. Order queue was not cleared; no further extension progress will be made until Start is clicked.",
+      startedAt: state.orderProgress?.startedAt || Date.now(),
+      updatedAt: Date.now(),
+    },
+  });
+
+  for (const { windowId: activeWindowId } of activeEntries) {
+    if (!activeWindowId) continue;
+    try {
+      await chrome.windows.remove(activeWindowId);
+    } catch {
+      // The window may already be gone; force stop still cleared extension state.
+    }
+  }
+
+  await log("Force stopped all fulfilment activity.", windowId);
+  return { ok: true, force_stopped: true, stopped_jobs: activeEntries.length, message: `Force stopped ${activeEntries.length} active job(s). Order queue was not cleared. Click Start next queued order to allow processing again.` };
 }
 
 async function skipJob(windowId) {
@@ -742,6 +1107,7 @@ async function skipJob(windowId) {
   const groupKey = activeJob.job.group_key;
   const released = await releaseStoredJob(activeJob, windowId, "after manual skip");
   if (!released) return { ok: false, message: `Could not release ${groupKey} to skip it.` };
+  await recordLastProcessed(activeJob, "skipped", "Skipped manually from the popup.");
   await incrementOrderProgress(`Processed ${groupKey}: skipped.`);
   const nextJob = await claimNextJobInWindow(windowId);
   return {
@@ -831,7 +1197,17 @@ async function resetDuplicateFulfilment(windowId) {
 async function releaseStoredJob(activeJob, windowId = null, label = "Chrome job") {
   if (!activeJob?.job?.group_key || !activeJob?.workerId) return false;
   if (orderSubmitStarted(activeJob)) {
-    await log(`Kept ${activeJob.job.group_key} locked ${label}; Amazon submit already started.`, windowId);
+    try {
+      await heartbeatJob(activeJob, windowId);
+      await log(`Kept ${activeJob.job.group_key} locked ${label}; Amazon submit already started.`, windowId);
+    } catch (error) {
+      const message = String(error.message || "");
+      if (/lock is no longer owned|no longer active/i.test(message)) {
+        await log(`Released stale submitted ${activeJob.job.group_key} ${label}; server lock is no longer active: ${message}`, windowId);
+        return true;
+      }
+      await log(`Kept ${activeJob.job.group_key} locked ${label}; could not confirm submitted lock state: ${message}`, windowId);
+    }
     return false;
   }
   try {
@@ -851,7 +1227,8 @@ function orderSubmitStarted(activeJob) {
   const stage = String(activeJob?.stage || "");
   const pausedStage = String(activeJob?.pausedStage || "");
   return Boolean(
-    activeJob?.amazonSubmittedAt ||
+    jobWasSubmittedToAmazon(activeJob?.job) ||
+      activeJob?.amazonSubmittedAt ||
       activeJob?.amazonDuplicateOrderConfirmed ||
       ["complete_pending", "find_order_id", "reporting_complete"].includes(stage) ||
       ["complete_pending", "find_order_id", "reporting_complete"].includes(pausedStage),
@@ -972,7 +1349,10 @@ async function togglePause(windowId) {
   return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
 
-async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = []) {
+async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = [], orderDate = "") {
+  if (await forceStopActive()) {
+    return { ok: false, stopped: true, message: "Force stop is active; ignored late order completion report." };
+  }
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
   const groupKey = activeJob.job.group_key;
@@ -983,24 +1363,52 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
   }
   completionLocks.add(lockKey);
   try {
-    await heartbeatJob(activeJob, windowId);
     const body = {
       amazon_order_id: orderId || "",
       amazon_order_url: orderUrl || "",
       amazon_account_name: amazonAccountName || "",
+      order_date: orderDate || "",
       line_ids: activeJob.job.line_ids || [],
       order_mappings: orderMappings || [],
       pricing_summary: Object.values(activeJob.pricing || {}),
       worker_id: activeJob.workerId || "",
     };
-    const result = await api(`/api/chrome/jobs/${encodeURIComponent(groupKey)}/complete`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
+    try {
+      await heartbeatJob(activeJob, windowId);
+    } catch (error) {
+      if (!/lock is no longer owned|no longer active/i.test(String(error.message || "")) || !orderId) throw error;
+      await log(`Chrome job lock for ${groupKey} was released before completion; reporting found Amazon order ${orderId} anyway.`, windowId);
+    }
+    let result;
+    try {
+      result = await api(`/api/chrome/jobs/${encodeURIComponent(groupKey)}/complete`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      if (/lock is no longer owned|no longer active/i.test(String(error.message || "")) && orderId) {
+        await log(`Treating late completion for ${groupKey} as already reported after released lock.`, windowId);
+        await recordLastProcessed(activeJob, "placed", `Placed ${orderId}.`, { amazon_order_id: orderId });
+        await clearStoredJobGroup(groupKey);
+        const nextJob = await claimNextJobInWindow(windowId);
+        return {
+          ok: true,
+          already_reported: true,
+          amazon_order_id: orderId,
+          message: `Order ${orderId} was already reported; continuing queue.`,
+          next_job_started: Boolean(nextJob),
+          next_group_key: nextJob?.job?.group_key || "",
+        };
+      }
+      throw error;
+    }
     await log(`Completed ${groupKey} as ${result.amazon_order_id}.`, windowId);
+    await recordLastProcessed(activeJob, "placed", result.amazon_order_id ? `Placed ${result.amazon_order_id}.` : "Placed on Amazon.", {
+      amazon_order_id: result.amazon_order_id || orderId || "",
+    });
     await incrementOrderProgress(`Processed ${groupKey}: ordered.`);
     const latest = await getWindowState(windowId);
-    if (latest.activeJob?.job?.group_key !== groupKey) {
+    if (latest.activeJob?.job && latest.activeJob.job.group_key !== groupKey) {
       return { ...result, next_job_started: false, next_group_key: "" };
     }
     await clearStoredJobGroup(groupKey);
@@ -1012,8 +1420,20 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
 }
 
 async function failJob(message, details = {}, windowId) {
+  if (await forceStopActive()) {
+    return { ok: false, stopped: true, message: "Force stop is active; ignored late failure report." };
+  }
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
+  if (orderSubmitStarted(activeJob) || jobWasSubmittedToAmazon(activeJob.job)) {
+    await log(`Ignored failure report for submitted ${activeJob.job.group_key}; reopening order history instead.`, windowId);
+    await recoverSubmittedJobInWindow(activeJob.targetWindowId || windowId);
+    return {
+      ok: false,
+      submitted_pending: true,
+      message: `${activeJob.job.group_key} was already submitted to Amazon; ignored late failure and reopened order history for reporting.`,
+    };
+  }
   try {
     await heartbeatJob(activeJob, windowId);
   } catch (error) {
@@ -1034,14 +1454,87 @@ async function failJob(message, details = {}, windowId) {
     }),
   });
   await log(`Failed ${activeJob.job.group_key}: ${message}`, windowId);
+  const failureCode = String(details.failureCode || "").toLowerCase();
+  const status = failureCode.includes("missing") || failureCode.includes("unavailable") || result?.state === "missing"
+    ? "missing"
+    : "failed";
+  await recordLastProcessed(activeJob, status, message);
   await incrementOrderProgress(`Processed ${activeJob.job.group_key}: failed or missing.`);
   await cleanupCartBeforeNextJob(activeJob, windowId, message);
   return { ...result, next_job_started: false, cleanup_required: true, next_group_key: "" };
 }
 
-async function markLineMissing(message, details = {}, windowId) {
+async function postSubmitUnplaced(message, details = {}, windowId) {
+  if (await forceStopActive()) {
+    return { ok: false, stopped: true, message: "Force stop is active; ignored post-submit unavailable report." };
+  }
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
+  try {
+    await heartbeatJob(activeJob, windowId);
+  } catch (error) {
+    await log(`Continuing post-submit unavailable report after heartbeat failed for ${activeJob.job.group_key}: ${error.message}`, windowId);
+  }
+  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/post-submit-unplaced`, {
+    method: "POST",
+    body: JSON.stringify({
+      message,
+      line_ids: activeJob.job.line_ids || [],
+      missing_asin: details.missingAsin || "",
+      missing_line_id: details.missingLineId || null,
+      failure_code: details.failureCode || "post_submit_unplaced",
+      worker_id: activeJob.workerId || "",
+    }),
+  });
+  await log(`Post-submit unavailable for ${activeJob.job.group_key}: ${message}`, windowId);
+  await recordLastProcessed(activeJob, "missing", result?.message || message);
+  await incrementOrderProgress(`Processed ${activeJob.job.group_key}: post-submit unavailable.`);
+  await cleanupCartBeforeNextJob(activeJob, windowId, result?.message || message);
+  return { ...result, next_job_started: false, cleanup_required: true, next_group_key: "" };
+}
+
+async function submitUncertain(message, details = {}, windowId) {
+  if (await forceStopActive()) {
+    return { ok: false, stopped: true, message: "Force stop is active; ignored submitted-order uncertainty report." };
+  }
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job) return { ok: false, message: "No active job." };
+  try {
+    await heartbeatJob(activeJob, windowId);
+  } catch (error) {
+    await log(`Continuing submitted-order uncertainty report after heartbeat failed for ${activeJob.job.group_key}: ${error.message}`, windowId);
+  }
+  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/submit-uncertain`, {
+    method: "POST",
+    body: JSON.stringify({
+      message,
+      line_ids: activeJob.job.line_ids || [],
+      failure_code: details.failureCode || "submitted_order_not_found",
+      worker_id: activeJob.workerId || "",
+    }),
+  });
+  await log(`Submit uncertain for ${activeJob.job.group_key}: ${message}`, windowId);
+  await recordLastProcessed(activeJob, "chrome_error", result?.message || message);
+  await incrementOrderProgress(`Processed ${activeJob.job.group_key}: submitted order not found.`);
+  await cleanupCartBeforeNextJob(activeJob, windowId, result?.message || message);
+  return { ...result, next_job_started: false, cleanup_required: true, next_group_key: "" };
+}
+
+async function markLineMissing(message, details = {}, windowId) {
+  if (await forceStopActive()) {
+    return { ok: false, stopped: true, message: "Force stop is active; ignored late missing-line report." };
+  }
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job) return { ok: false, message: "No active job." };
+  if (orderSubmitStarted(activeJob) || jobWasSubmittedToAmazon(activeJob.job)) {
+    await log(`Ignored missing-line report for submitted ${activeJob.job.group_key}; reopening order history instead.`, windowId);
+    await recoverSubmittedJobInWindow(activeJob.targetWindowId || windowId);
+    return {
+      ok: false,
+      submitted_pending: true,
+      message: `${activeJob.job.group_key} was already submitted to Amazon; ignored late missing report and reopened order history for reporting.`,
+    };
+  }
   try {
     await heartbeatJob(activeJob, windowId);
   } catch (error) {
@@ -1063,15 +1556,36 @@ async function markLineMissing(message, details = {}, windowId) {
   });
   await log(`Partially marked missing in ${activeJob.job.group_key}: ${message}`, windowId);
   if (result?.ok && Number(result.remaining_count || 0) === 0) {
+    await recordLastProcessed(activeJob, "missing", message);
     await incrementOrderProgress(`Processed ${activeJob.job.group_key}: missing.`);
-    await cleanupCartBeforeNextJob(activeJob, windowId, message);
+    await setWindowJob(windowId, null);
+    await navigateWindowToCart(windowId);
+    const nextJob = await claimNextJobInWindow(windowId);
+    return {
+      ...result,
+      next_job_started: Boolean(nextJob),
+      cleanup_required: false,
+      next_group_key: nextJob?.job?.group_key || "",
+    };
   }
   return { ...result, next_job_started: false, cleanup_required: result?.ok && Number(result.remaining_count || 0) === 0, next_group_key: "" };
 }
 
 async function costlyJob(message, details = {}, windowId) {
+  if (await forceStopActive()) {
+    return { ok: false, stopped: true, message: "Force stop is active; ignored late costly-review report." };
+  }
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
+  if (orderSubmitStarted(activeJob) || jobWasSubmittedToAmazon(activeJob.job)) {
+    await log(`Ignored costly-review report for submitted ${activeJob.job.group_key}; reopening order history instead.`, windowId);
+    await recoverSubmittedJobInWindow(activeJob.targetWindowId || windowId);
+    return {
+      ok: false,
+      submitted_pending: true,
+      message: `${activeJob.job.group_key} was already submitted to Amazon; ignored late costly-review report and reopened order history for reporting.`,
+    };
+  }
   await heartbeatJob(activeJob, windowId);
   const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/costly`, {
     method: "POST",
@@ -1087,6 +1601,7 @@ async function costlyJob(message, details = {}, windowId) {
   });
   await setWindowJob(windowId, null);
   await log(`Costly review ${activeJob.job.group_key}: ${message}`, windowId);
+  await recordLastProcessed(activeJob, "costly", message);
   await incrementOrderProgress(`Processed ${activeJob.job.group_key}: costly review.`);
   return result;
 }
@@ -1095,6 +1610,27 @@ async function clearFailedJobs() {
   const result = await api("/api/chrome/failed-jobs/clear", { method: "POST", body: JSON.stringify({}) });
   await chrome.storage.local.set({ activeJob: null, cachedQueueStatus: null });
   await log(result.message || `Cleared ${result.cleared || 0} failed Chrome job line(s).`);
+  return result;
+}
+
+async function forceClearQueue(windowId = null) {
+  await forceStopAll(windowId);
+  const result = await api("/api/chrome/queue/force-clear", { method: "POST", body: JSON.stringify({}) });
+  await chrome.storage.local.set({
+    activeJob: null,
+    activeJobsByWindow: {},
+    cachedQueueStatus: null,
+    controlWindowsById: {},
+    orderProgress: {
+      running: false,
+      total: 0,
+      processed: 0,
+      message: result.message || "Chrome order queue force cleared.",
+      updatedAt: Date.now(),
+      source: "force-clear",
+    },
+  });
+  await log(result.message || `Force cleared ${result.cleared || 0} Chrome queue line(s).`, windowId);
   return result;
 }
 
@@ -1154,6 +1690,130 @@ async function checkAmazonAvailabilityCandidate(candidate) {
   }
 }
 
+function uniquePreflightCandidates(job = {}) {
+  const seen = new Set();
+  return (job.items || [])
+    .map((item) => ({
+      asin: String(item.asin || "").trim().toUpperCase(),
+      line_id: item.line_id || item.line_ids?.[0] || null,
+      product_name: item.product_name || "",
+      amazon_url: item.amazon_url || "",
+      quantity: Number(item.quantity || 1),
+    }))
+    .filter((item) => {
+      if (!item.asin || seen.has(item.asin)) return false;
+      seen.add(item.asin);
+      return true;
+    });
+}
+
+function splitPartInfo(groupKey = "") {
+  const match = String(groupKey || "").match(/^(.*)-part(\d+)of(\d+)$/i);
+  if (!match) return null;
+  return {
+    base: match[1],
+    index: Number(match[2] || 0),
+    total: Number(match[3] || 0),
+  };
+}
+
+function sameSplitOrder(left = {}, right = {}) {
+  const leftInfo = splitPartInfo(left.group_key);
+  const rightInfo = splitPartInfo(right.group_key);
+  if (leftInfo?.base && rightInfo?.base) return leftInfo.base === rightInfo.base;
+  const leftNames = (left.order_names || []).join("|");
+  const rightNames = (right.order_names || []).join("|");
+  return Boolean(leftNames && leftNames === rightNames);
+}
+
+function preflightCandidatesFromJobs(jobs = []) {
+  const seen = new Set();
+  const candidates = [];
+  for (const job of jobs) {
+    for (const candidate of uniquePreflightCandidates(job)) {
+      if (seen.has(candidate.asin)) continue;
+      seen.add(candidate.asin);
+      candidates.push({ ...candidate, group_key: job.group_key, order_names: job.order_names || [] });
+    }
+  }
+  return candidates;
+}
+
+async function preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId = null) {
+  if (splitMixedAsinOrders !== true) return { ok: true };
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; split-order preflight stopped." };
+    const snapshot = await api(`/api/chrome/jobs?claim=false&job_limit=${fulfilAvailableMixedAsin === true ? 1 : 250}`, { timeoutMs: 15000 });
+    const job = snapshot.jobs?.[0] || null;
+    if (!job) return { ok: true, empty: true };
+    const partInfo = splitPartInfo(job.group_key);
+    const jobsToCheck = fulfilAvailableMixedAsin === true
+      ? [job]
+      : (snapshot.jobs || []).filter((candidateJob) => sameSplitOrder(job, candidateJob));
+    const candidates = preflightCandidatesFromJobs(jobsToCheck.length ? jobsToCheck : [job]);
+    if (candidates.length <= 1) return { ok: true };
+    if (job.claimed_by) return { ok: true };
+
+    await log(`Preflight checking ${candidates.length} ASIN(s) before ${partInfo ? `split order ${partInfo.base}` : `splitting ${job.group_key}`}.`, sourceWindowId);
+    const results = [];
+    for (const candidate of candidates) {
+      const result = await checkAmazonAvailabilityCandidate(candidate);
+      results.push({ candidate, result });
+      if (result?.ok === false) {
+        const message = `Could not preflight ${candidate.asin} before splitting ${job.group_key}: ${result.message || "Amazon page could not be inspected."}`;
+        await log(message, sourceWindowId);
+        return { ok: false, message };
+      }
+      if (result?.in_stock !== true) break;
+    }
+
+    const unavailable = results.find((entry) => entry.result?.in_stock !== true);
+    if (!unavailable) {
+      await log(`Preflight passed for ${job.group_key}; all ASINs are available before split ordering.`, sourceWindowId);
+      return { ok: true };
+    }
+
+    const candidate = unavailable.candidate;
+    const result = unavailable.result || {};
+    const targetLabel = partInfo ? `split order ${partInfo.base}` : job.group_key;
+    const message = `Preflight blocked ${targetLabel}: ASIN ${candidate.asin} is not available on Amazon. ${result.message || ""}`.trim();
+    if (fulfilAvailableMixedAsin !== true) {
+      const blockedMessage = `${message} Checkout was not started because Process available items in mixed-ASIN orders is off.`;
+      for (const blockedJob of jobsToCheck.length ? jobsToCheck : [job]) {
+        await api(`/api/chrome/jobs/${encodeURIComponent(blockedJob.group_key)}/preflight-missing`, {
+          method: "POST",
+          body: JSON.stringify({
+            message: blockedMessage,
+            missing_asin: candidate.asin,
+            missing_line_id: candidate.group_key === blockedJob.group_key ? candidate.line_id || null : null,
+            checked_url: result.url || candidate.amazon_url || "",
+          }),
+          timeoutMs: 20000,
+        });
+      }
+      await log(`${blockedMessage} Moved ${jobsToCheck.length || 1} split part(s) to Missing ASINs and continuing queue.`, sourceWindowId);
+      await recordLastProcessed(job, "missing", blockedMessage);
+      await incrementOrderProgress(`Processed ${targetLabel}: missing.`);
+      continue;
+    }
+    const response = await api(`/api/chrome/jobs/${encodeURIComponent(candidate.group_key || job.group_key)}/missing-line`, {
+      method: "POST",
+      body: JSON.stringify({
+        worker_id: workerId,
+        message,
+        missing_asin: candidate.asin,
+        missing_line_id: candidate.line_id || null,
+        checked_url: result.url || candidate.amazon_url || "",
+      }),
+      timeoutMs: 20000,
+    });
+    await log(response.message || message, sourceWindowId);
+    await recordLastProcessed(job, "missing", message);
+    await incrementOrderProgress(`Processed ${job.group_key}: preflight missing.`);
+  }
+  return { ok: false, message: "Stopped after too many split-order preflight failures. Please review the queue." };
+}
+
 async function runMissingAsinAvailabilityCheck(force = false) {
   const state = await getSettings();
   if (state.availabilityCheckInFlight) return { ok: false, message: "Availability check already running." };
@@ -1203,11 +1863,12 @@ chrome.action.onClicked.addListener((tab) => {
 
 chrome.runtime.onStartup.addListener(() => {
   releaseAllStoredJobs().catch((error) => log(`Could not release previous Chrome session jobs: ${error.message}`));
+  ensureContentScriptsInAmazonTabs("Chrome startup").catch((error) => log(`Could not recover Amazon tabs after startup: ${error.message}`));
   setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  releaseAllStoredJobs("after extension reload").catch((error) => log(`Could not clean up Chrome job locks: ${error.message}`));
+  ensureContentScriptsInAmazonTabs("extension reload").catch((error) => log(`Could not recover Amazon tabs after extension reload: ${error.message}`));
   setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
 });
 
@@ -1233,6 +1894,12 @@ chrome.windows.onRemoved.addListener((windowId) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
+    if (message.type === "FORCE_STOP_ALL") return forceStopAll(windowId);
+    if (message.type === "FORCE_CLEAR_QUEUE") return forceClearQueue(windowId);
+    if (message.type === "CLEAR_FORCE_STOP") {
+      await setForceStop(false);
+      return { ok: true };
+    }
     if (message.type === "START_NEXT") return startNextJob(windowId);
     if (message.type === "START_BROWSERLESS") return startBrowserlessOrderRun(windowId);
     if (message.type === "GET_BROWSERLESS_STATUS") return browserlessOrderStatus();
@@ -1249,6 +1916,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "GET_STATE") {
       await releaseMissingWindowJobs();
       await refreshActiveJobFromQueue(windowId);
+      const { activeJob } = await getWindowState(windowId);
+      if (!await forceStopActive() && (!activeJob?.job || !orderSubmitStarted(activeJob))) {
+        const recovered = await recoverSubmittedJobInWindow(windowId);
+        if (recovered?.activeJob) return getWindowState(recovered.targetWindowId || windowId);
+      }
       return getWindowState(windowId);
     }
     if (message.type === "GET_QUEUE_STATUS") {
@@ -1271,29 +1943,71 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         message: nextJob ? `Started next ${nextJob.job.group_key}.` : "No more queued Chrome jobs found.",
       };
     }
+    if (message.type === "FINISH_CLEANUP_AND_CLAIM_NEXT") return finishCleanupAndClaimNext(windowId);
     if (message.type === "RECOVER_SUBMITTED_JOB") return recoverSubmittedJobInWindow(windowId);
     if (message.type === "RUN_MISSING_ASIN_AVAILABILITY_CHECK") return runMissingAsinAvailabilityCheck(true);
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "GET_ACTIVE_JOB") {
-      const { activeJob } = await getWindowState(windowId);
+      if (await forceStopActive()) return { ok: true, activeJob: null, forceStopped: true };
+      let { activeJob } = await getWindowState(windowId);
+      if (!activeJob?.job && windowId) {
+        const state = await getSettings();
+        const globalJob = state.activeJob?.job?.group_key ? state.activeJob : null;
+        const groupAlreadyAttached = globalJob?.job?.group_key && Object.values(state.activeJobsByWindow || {}).some((job) => (
+          job?.job?.group_key === globalJob.job.group_key
+        ));
+        if (globalJob?.job && !groupAlreadyAttached) {
+          globalJob.targetWindowId = windowId;
+          await setWindowJob(windowId, globalJob);
+          activeJob = globalJob;
+          await log(`Reattached ${globalJob.job.group_key} to Amazon window ${windowId}.`, windowId);
+        }
+      }
+      if (!activeJob?.job || !orderSubmitStarted(activeJob)) {
+        const recovered = await recoverSubmittedJobInWindow(windowId);
+        if (recovered?.activeJob) {
+          activeJob = recovered.activeJob;
+          return { ok: true, activeJob };
+        }
+      }
       if (activeJob?.job && activeJob?.workerId && Date.now() - Number(activeJob.lastHeartbeatAt || 0) > 5 * 60 * 1000) {
         try {
           await heartbeatJob(activeJob, windowId);
         } catch (error) {
-          await log(`Chrome job lock heartbeat failed: ${error.message}`, windowId);
+          const message = String(error.message || "");
+          if (/lock is no longer owned|no longer active/i.test(message)) {
+            await clearStoredJobGroup(activeJob.job.group_key);
+            await log(
+              `Cleared stale active job ${activeJob.job.group_key}; heartbeat says the server lock is no longer active: ${message}`,
+              windowId,
+            );
+            return { ok: true, activeJob: null };
+          }
+          await log(`Chrome job lock heartbeat failed: ${message}`, windowId);
         }
       }
       return { ok: true, activeJob: (await getWindowState(windowId)).activeJob };
     }
     if (message.type === "HEARTBEAT_JOB") {
+      if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active." };
       const { activeJob } = await getWindowState(windowId);
       if (!activeJob?.job) return { ok: false, message: "No active job." };
       await heartbeatJob(activeJob, windowId);
       return { ok: true };
     }
-    if (message.type === "MARK_ORDER_SUBMITTED") return markAmazonSubmitted(windowId);
+    if (message.type === "MARK_ORDER_SUBMITTED") {
+      if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; ignored submit marker." };
+      return markAmazonSubmitted(windowId);
+    }
     if (message.type === "SET_ACTIVE_JOB") {
-      await setWindowJob(windowId, message.activeJob || null);
+      if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; ignored active job update." };
+      const incomingJob = message.activeJob || null;
+      const { activeJob: currentJob } = await getWindowState(windowId);
+      if (isLateCompletedJobUpdate(currentJob, incomingJob)) {
+        await log(`Ignored late completed-state update for ${incomingJob.job.group_key}.`, windowId);
+        return { ok: true, ignored_late_completed_update: true };
+      }
+      await setWindowJob(windowId, incomingJob);
       return { ok: true };
     }
     if (message.type === "SET_API_BASE") {
@@ -1308,8 +2022,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return { ok: true };
     }
-    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || []);
+    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "");
     if (message.type === "MARK_LINE_MISSING") return markLineMissing(message.message || "Chrome extension line is missing.", message, windowId);
+    if (message.type === "POST_SUBMIT_UNPLACED") return postSubmitUnplaced(message.message || "Amazon did not place the order after submit.", message, windowId);
+    if (message.type === "SUBMIT_UNCERTAIN") return submitUncertain(message.message || "Amazon Place Order was submitted, but no matching Amazon order ID was found.", message, windowId);
     if (message.type === "FAIL_JOB") return failJob(message.message || "Chrome extension job failed.", message, windowId);
     if (message.type === "COSTLY_JOB") return costlyJob(message.message || "Chrome extension job needs costly approval.", message, windowId);
     if (message.type === "CLEAR_FAILED_JOBS") return clearFailedJobs();

@@ -16,17 +16,26 @@ const pricingTotal = document.querySelector("#pricingTotal");
 const pauseResume = document.querySelector("#pauseResume");
 const skipJob = document.querySelector("#skipJob");
 const markMissing = document.querySelector("#markMissing");
+const forceStop = document.querySelector("#forceStop");
+const forceClearQueue = document.querySelector("#forceClearQueue");
 const queuedJobs = document.querySelector("#queuedJobs");
 const queueCount = document.querySelector("#queueCount");
 const duplicateOrderAlert = document.querySelector("#duplicateOrderAlert");
 const duplicateOrderRows = document.querySelector("#duplicateOrderRows");
 const resetDuplicateFulfilment = document.querySelector("#resetDuplicateFulfilment");
+const lastOrderProcessed = document.querySelector("#lastOrderProcessed");
+const lastOrderReason = document.querySelector("#lastOrderReason");
+const currentOrderProcessing = document.querySelector("#currentOrderProcessing");
+const currentOrderStage = document.querySelector("#currentOrderStage");
+const nextOrderProcessing = document.querySelector("#nextOrderProcessing");
+const nextOrderStage = document.querySelector("#nextOrderStage");
 
 function send(message) {
   return chrome.runtime.sendMessage({ ...message, targetWindowId });
 }
 
-let targetWindowId = Number(new URLSearchParams(location.search).get("targetWindowId") || 0) || null;
+const popupParams = new URLSearchParams(location.search);
+let targetWindowId = Number(popupParams.get("targetWindowId") || 0) || null;
 let controlWindowId = null;
 let settingsDirty = false;
 let settingsHydrated = false;
@@ -212,6 +221,47 @@ function renderQueuedJobs(jobs, workerId = "") {
   }
 }
 
+function orderLabelFromJob(job = {}) {
+  const orderNames = (job.order_names || []).map((name) => String(name || "").trim()).filter(Boolean);
+  return orderNames.join(", ") || job.group_key || "Unknown order";
+}
+
+function orderAsins(job = {}) {
+  return (job.items || []).map((item) => item.asin).filter(Boolean).join(", ");
+}
+
+function activityReason(text = "", fallback = "") {
+  const cleaned = String(text || fallback || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  return cleaned.length > 140 ? `${cleaned.slice(0, 137)}...` : cleaned;
+}
+
+function renderActivitySummary(state = {}, queue = null) {
+  const last = state.fulfilmentActivity?.last || null;
+  const current = state.activeJob?.job || null;
+  const currentGroupKey = current?.group_key || "";
+  const next = (queue?.jobs || []).find((job) => job?.group_key && job.group_key !== currentGroupKey && !job.claimed_by)
+    || (queue?.jobs || []).find((job) => job?.group_key && job.group_key !== currentGroupKey)
+    || null;
+
+  lastOrderProcessed.textContent = last?.label || "None";
+  lastOrderReason.textContent = last
+    ? `${last.status || "processed"}${last.reason ? ` · ${activityReason(last.reason)}` : ""}`
+    : "No processed order yet.";
+
+  currentOrderProcessing.textContent = current ? orderLabelFromJob(current) : "None";
+  currentOrderStage.textContent = current
+    ? `${state.activeJob?.paused ? "Paused" : "Working"} · ${state.activeJob?.stage || "active"}${orderAsins(current) ? ` · ${orderAsins(current)}` : ""}`
+    : state.forceStop?.active
+      ? "Force stopped. No active order will continue."
+      : "No active order.";
+
+  nextOrderProcessing.textContent = next ? orderLabelFromJob(next) : "None";
+  nextOrderStage.textContent = next
+    ? `${next.claimed_by ? "Locked" : "Ready"}${orderAsins(next) ? ` · ${orderAsins(next)}` : ""}`
+    : "No queued order loaded.";
+}
+
 function queueCountDetails(counts = []) {
   const extras = (Array.isArray(counts) ? counts : [])
     .filter((item) => item.state !== "submitted" && Number(item.count || 0) > 0)
@@ -238,8 +288,12 @@ function renderQueueStatus(queue, state) {
 
 function renderOrderProgress(progress = {}, queue = null, activeJob = null) {
   const processed = Math.max(0, Math.round(Number(progress.processed || 0)));
-  const queuedJobs = Number(queue?.job_count ?? queue?.jobs?.length ?? 0);
-  const total = Math.max(processed, Math.round(Number(progress.total || 0)), processed + (Number.isFinite(queuedJobs) ? queuedJobs : 0));
+  const jobCount = Number(queue?.job_count);
+  const queuedJobs = Number.isFinite(jobCount)
+    ? jobCount
+    : submittedQueueCount(queue?.counts || [], queue?.jobs?.length || 0);
+  const liveTotal = Number.isFinite(queuedJobs) ? processed + queuedJobs + (activeJob?.job ? 1 : 0) : 0;
+  const total = Math.max(processed, liveTotal || Math.round(Number(progress.total || 0)));
   const percent = total ? Math.min(100, Math.round((processed / total) * 100)) : 0;
   const activeLabel = activeJob?.job?.group_key ? `Active: ${activeJob.job.group_key}` : "";
   const detail = progress.message || activeLabel || (total ? "Order run in progress." : "No order run started.");
@@ -266,11 +320,12 @@ async function refresh() {
     pauseResume.disabled = !job;
     skipJob.disabled = !job;
     markMissing.disabled = !job;
+    forceStop.disabled = false;
     setStatus(job ? `${state.activeJob.paused ? "Paused" : "Active"}: ${job.group_key} (${state.activeJob.stage})` : "No active job.");
     renderDuplicateOrder(state.activeJob);
     renderPricing(state.activeJob);
     let browserlessProgress = null;
-    if (browserlessOrderMode.checked && !job) {
+    if ((browserlessOrderMode.checked || state.orderProgress?.source === "browserless") && !job) {
       try {
         const browserless = await send({ type: "GET_BROWSERLESS_STATUS" });
         const progress = browserless?.progress || {};
@@ -290,10 +345,12 @@ async function refresh() {
       const queue = await send({ type: "GET_QUEUE_STATUS" });
       if (!queue.ok) throw new Error(queue.message || "Could not load queue.");
       renderQueueStatus(queue, state);
+      renderActivitySummary(state, queue);
       renderOrderProgress(browserlessProgress || state.orderProgress || {}, queue, state.activeJob);
       if (queue.stale && queue.message) setStatus(queue.message);
     } catch (error) {
       queueCount.textContent = "Not loaded";
+      renderActivitySummary(state, null);
       renderOrderProgress(browserlessProgress || state.orderProgress || {}, null, state.activeJob);
       queuedJobs.innerHTML = `<div class="empty-queue">${error.message || "Could not load queue. Check App URL, Admin token, then click Save."}</div>`;
     }
@@ -329,6 +386,7 @@ document.querySelector("#start").addEventListener("click", async () => {
   try {
     await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
     settingsDirty = false;
+    await send({ type: "CLEAR_FORCE_STOP" });
     const result = await send({ type: browserlessOrderMode.checked ? "START_BROWSERLESS" : "START_NEXT" });
     if (result.targetWindowId) {
       targetWindowId = result.targetWindowId;
@@ -343,6 +401,27 @@ document.querySelector("#start").addEventListener("click", async () => {
 document.querySelector("#stop").addEventListener("click", async () => {
   const result = await send({ type: "STOP_JOB" });
   setStatus(result.message);
+});
+
+forceStop.addEventListener("click", async () => {
+  const confirmed = confirm("Force stop all Chrome fulfilment now? This immediately stops local processing, closes worker windows, releases active locks where safe, and ignores late reports. It does not clear or delete the order queue.");
+  if (!confirmed) return;
+  forceStop.disabled = true;
+  setStatus("Force stopping all fulfilment activity...");
+  const result = await send({ type: "FORCE_STOP_ALL" });
+  setStatus(result.message || (result.ok ? "Force stopped." : "Could not force stop."));
+  await refresh();
+});
+
+forceClearQueue.addEventListener("click", async () => {
+  const confirmed = confirm("Force clear the Chrome order queue now? This stops local processing and removes all unsubmitted Chrome queue jobs from the queue. Amazon-submitted jobs waiting for order-number reporting are preserved.");
+  if (!confirmed) return;
+  forceClearQueue.disabled = true;
+  setStatus("Force clearing Chrome order queue...");
+  const result = await send({ type: "FORCE_CLEAR_QUEUE" });
+  setStatus(result.message || (result.ok ? "Chrome order queue cleared." : "Could not clear Chrome order queue."));
+  forceClearQueue.disabled = false;
+  await refresh();
 });
 
 pauseResume.addEventListener("click", async () => {
@@ -393,3 +472,39 @@ let refreshInFlight = false;
 let refreshRequested = false;
 refresh();
 setInterval(refresh, 5000);
+
+async function runPopupRecoveryAction() {
+  const action = popupParams.get("action");
+  if (!action) return;
+  if (action === "stop-start") {
+    const lockKey = "popupRecoveryAction";
+    const lock = await chrome.storage.local.get({ [lockKey]: null });
+    const recent = lock[lockKey] || {};
+    const sameAction = recent.action === action;
+    if (sameAction && Date.now() - Number(recent.startedAt || 0) < 60000) {
+      setStatus("Recovery action is already running in another popup.");
+      history.replaceState(null, "", location.pathname);
+      return;
+    }
+    await chrome.storage.local.set({ [lockKey]: { action, startedAt: Date.now() } });
+    setStatus("Stopping stale active job and starting the next queued order...");
+    try {
+      await send({ type: "STOP_JOB" }).catch(() => null);
+      await send({ type: "CLEAR_FORCE_STOP" }).catch(() => null);
+      const result = await send({ type: "START_NEXT" });
+      if (result?.targetWindowId) {
+        targetWindowId = result.targetWindowId;
+        registerControlWindow();
+      }
+      setStatus(result?.message || (result?.ok ? "Started." : "Could not start."));
+      await refresh();
+    } finally {
+      history.replaceState(null, "", location.pathname);
+      await chrome.storage.local.remove(lockKey);
+    }
+  }
+}
+
+setTimeout(() => {
+  runPopupRecoveryAction().catch((error) => setStatus(error?.message || "Popup recovery action failed."));
+}, 500);

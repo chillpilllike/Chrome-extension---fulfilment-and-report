@@ -44,6 +44,8 @@
         <button id="skipJob" class="secondary">Skip</button>
         <button id="markMissing" class="warning">Missing</button>
         <button id="stop" class="secondary">Stop</button>
+        <button id="forceStop" class="danger">Force stop</button>
+        <button id="forceClearQueue" class="danger">Force clear queue</button>
         <button id="clearFailed" class="danger">Clear stale queue</button>
       </div>
       <section id="connectionNotice" class="connection-notice" hidden></section>
@@ -53,6 +55,23 @@
         <button id="resetDuplicateFulfilment" class="danger">Clear app order and continue</button>
       </section>
       <section id="status"></section>
+      <section class="activity-summary" aria-label="Order activity">
+        <div class="activity-row">
+          <span>Last</span>
+          <strong id="lastOrderProcessed">None</strong>
+          <em id="lastOrderReason">No processed order yet.</em>
+        </div>
+        <div class="activity-row">
+          <span>Current</span>
+          <strong id="currentOrderProcessing">None</strong>
+          <em id="currentOrderStage">No active order.</em>
+        </div>
+        <div class="activity-row">
+          <span>Next</span>
+          <strong id="nextOrderProcessing">None</strong>
+          <em id="nextOrderStage">No queued order loaded.</em>
+        </div>
+      </section>
       <section class="order-progress" aria-label="Order progress">
         <div class="order-progress-header">
           <strong id="orderProgressTitle">Order progress</strong>

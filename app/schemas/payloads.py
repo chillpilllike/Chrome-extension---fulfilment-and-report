@@ -77,6 +77,7 @@ class ChromeJobCompletePayload(BaseModel):
     amazon_order_id: str = ""
     amazon_order_url: str = ""
     amazon_account_name: str = ""
+    order_date: str = ""
     line_ids: list[int] = []
     order_mappings: list[dict[str, Any]] = []
     pricing_summary: list[dict[str, Any]] = []
