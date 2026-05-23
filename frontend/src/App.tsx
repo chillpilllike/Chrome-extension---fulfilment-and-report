@@ -1932,6 +1932,7 @@ function App() {
   const [ordersPage, setOrdersPage] = useState(1)
   const [ordersTotal, setOrdersTotal] = useState(() => initialDashboard?.total || 0)
   const [ordersLoading, setOrdersLoading] = useState(false)
+  const [ordersTransitioning, setOrdersTransitioning] = useState(false)
   const [missingRows, setMissingRows] = useState<OrderLine[]>([])
   const [missingPage, setMissingPage] = useState(1)
   const [missingTotal, setMissingTotal] = useState(0)
@@ -2206,6 +2207,7 @@ function App() {
     ordersInFlightKeyRef.current = cacheKey
     setOrdersPage(nextPage)
     setOrdersLoading(true)
+    setOrdersTransitioning(true)
     const cachedPage = ordersPageCacheRef.current.get(cacheKey)
     if (cachedPage && Date.now() - cachedPage.cachedAt < 30_000) {
       setOrderRows(cachedPage.rows)
@@ -2232,6 +2234,7 @@ function App() {
     } finally {
       if (requestSeq === ordersRequestSeqRef.current) {
         setOrdersLoading(false)
+        setOrdersTransitioning(false)
         if (ordersAbortRef.current === controller) ordersAbortRef.current = null
         if (ordersInFlightKeyRef.current === cacheKey) ordersInFlightKeyRef.current = ""
       }
@@ -2643,8 +2646,9 @@ function App() {
     }
   }, [page, storeId, ordersPage, shopifyStatusForceSync?.status])
   const filteredRows = useMemo(() => {
+    if (ordersTransitioning) return []
     return rows
-  }, [rows])
+  }, [rows, ordersTransitioning])
   const sortedRows = filteredRows
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
   const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "store" ? "store_name" : column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
@@ -3842,6 +3846,12 @@ function App() {
                 )}
               </CardHeader>
               <CardContent className="p-0">
+                <div className="orders-table-wrap">
+                  {ordersTransitioning && (
+                    <div className="orders-table-loader" role="status" aria-live="polite" aria-label="Loading orders">
+                      <div className="spinner-border text-primary" role="status"></div>
+                    </div>
+                  )}
                 <Table className="table-fixed">
                   <TableHeader>
                     <TableRow>
@@ -3870,7 +3880,7 @@ function App() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {sortedRows.length ? sortedRows.map((row) => (
+                    {!ordersTransitioning && sortedRows.length ? sortedRows.map((row) => (
                       <TableRow
                         key={row.id}
                         onClick={(event) => {
@@ -3923,10 +3933,13 @@ function App() {
                           </TableCell>
                         ))}
                       </TableRow>
-                    )) : ordersLoading ? (
+                    )) : ordersLoading || ordersTransitioning ? (
                       <TableRow>
                         <TableCell colSpan={visibleOrderColumns.length + 1} className="h-32 text-center text-muted-foreground">
-                          Loading orders...
+                          <span className="inline-flex items-center gap-2">
+                            <span className="spinner-border spinner-border-sm text-primary" role="status"></span>
+                            Loading orders...
+                          </span>
                         </TableCell>
                       </TableRow>
                     ) : (
@@ -3938,6 +3951,7 @@ function App() {
                     )}
                   </TableBody>
                 </Table>
+                </div>
               </CardContent>
             </Card>
             {selected.length ? (

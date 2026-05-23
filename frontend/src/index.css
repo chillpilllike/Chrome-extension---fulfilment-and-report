@@ -596,6 +596,23 @@
     background: #e7facd;
 }
 
+.tabler-admin-shell .orders-table-wrap {
+    position: relative;
+    min-height: 11rem;
+}
+
+.tabler-admin-shell .orders-table-loader {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 11rem;
+    background: rgba(255, 255, 255, .72);
+    pointer-events: none;
+}
+
 .tabler-admin-shell .list-group {
     display: grid;
     gap: 0;
