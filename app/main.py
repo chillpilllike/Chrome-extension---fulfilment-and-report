@@ -168,9 +168,22 @@ _SHOPIFY_DUPLICATE_SCAN_PROGRESS: dict[str, Any] = {
     "completed_at": "",
     "error": "",
 }
+_SHOPIFY_ORDER_STATUS_CACHE_READY = False
+_SHOPIFY_ORDER_STATUS_CACHE_LOCK = threading.Lock()
 
 
 def ensure_shopify_order_status_cache_table() -> None:
+    global _SHOPIFY_ORDER_STATUS_CACHE_READY
+    if _SHOPIFY_ORDER_STATUS_CACHE_READY:
+        return
+    with _SHOPIFY_ORDER_STATUS_CACHE_LOCK:
+        if _SHOPIFY_ORDER_STATUS_CACHE_READY:
+            return
+        _ensure_shopify_order_status_cache_table()
+        _SHOPIFY_ORDER_STATUS_CACHE_READY = True
+
+
+def _ensure_shopify_order_status_cache_table() -> None:
     with db() as conn:
         conn.execute(
             """
@@ -197,6 +210,7 @@ def ensure_shopify_order_status_cache_table() -> None:
             conn.execute("ALTER TABLE shopify_order_status_cache ADD COLUMN fulfillment_at TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_shopify_order_status_order ON shopify_order_status_cache(store_id, odoo_order_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_shopify_order_status_fulfillment ON shopify_order_status_cache(store_id, fulfillment_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shopify_order_status_upper_order ON shopify_order_status_cache(store_id, UPPER(odoo_order_name), fulfillment_status, synced_at DESC)")
 _SHOPIFY_DUPLICATE_SCAN_RESULTS: list[dict[str, Any]] = []
 _SHOPIFY_ORDER_STATUS_FORCE_SYNC_LOCK = threading.Lock()
 _SHOPIFY_ORDER_STATUS_FORCE_SYNC_PROGRESS: dict[str, Any] = {
@@ -10494,7 +10508,7 @@ def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], f
                     continue
 
 
-def attach_shopify_status_to_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any] = None) -> list[dict[str, Any]]:
     if not rows:
         return rows
     store_ids = sorted({int(row["store_id"]) for row in rows if row.get("store_id")})
@@ -10502,8 +10516,8 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]]) -> list[dict[str, 
     if not store_ids or not order_names:
         return rows
     ensure_shopify_order_status_cache_table()
-    with db() as conn:
-        cached_rows = conn.execute(
+    def fetch_cached_status(active_conn: Any) -> list[dict[str, Any]]:
+        return active_conn.execute(
             f"""
             SELECT DISTINCT ON (store_id, UPPER(odoo_order_name))
                    *
@@ -10516,6 +10530,11 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]]) -> list[dict[str, 
             """,
             (store_ids, order_names),
         ).fetchall()
+    if conn is not None:
+        cached_rows = fetch_cached_status(conn)
+    else:
+        with db() as status_conn:
+            cached_rows = fetch_cached_status(status_conn)
     status_by_key = {
         (int(row["store_id"]), clean_text(row["odoo_order_name"]).upper()): dict(row)
         for row in cached_rows
@@ -12201,101 +12220,27 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
 
 def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
-    order_by_sql = order_group_sort_sql(sort_by, sort_dir)
+    order_by_sql = order_sort_sql(sort_by, sort_dir)
+    store_clause = "WHERE (? IS NULL OR store_id=?) AND odoo_order_id IS NOT NULL"
     with db() as conn:
-        payload = conn.execute(
+        rows = conn.execute(
             f"""
-            WITH order_groups AS (
-                SELECT {order_group_select_sql(sort_by)}
-                FROM order_lines
-                WHERE (? IS NULL OR store_id=?)
-                  AND odoo_order_id IS NOT NULL
-                GROUP BY store_id, odoo_order_id
-            ),
-            page_orders AS (
-                SELECT *,
-                       ROW_NUMBER() OVER (ORDER BY {order_by_sql}) AS sort_order
-                FROM order_groups
-                ORDER BY {order_by_sql}
-                LIMIT ? OFFSET ?
-            ),
-            page_rows AS (
-                SELECT {qualified_order_line_page_select("order_lines")},
-                       page_orders.sort_order AS sort_order
-                FROM order_lines
-                JOIN page_orders
-                  ON page_orders.store_id=order_lines.store_id
-                 AND page_orders.odoo_order_id=order_lines.odoo_order_id
-            ),
-            page_asins AS (
-                SELECT DISTINCT store_id, asin
-                FROM page_rows
-                WHERE COALESCE(asin, '') != ''
-            ),
-            duplicate_counts AS (
-                SELECT duplicate_lines.store_id,
-                       duplicate_lines.asin,
-                       COUNT(*) AS duplicate_asin_count
-                FROM order_lines AS duplicate_lines
-                JOIN page_asins
-                  ON page_asins.store_id = duplicate_lines.store_id
-                 AND page_asins.asin = duplicate_lines.asin
-                WHERE COALESCE(duplicate_lines.amazon_order_id, '') = ''
-                  AND COALESCE(duplicate_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-                GROUP BY duplicate_lines.store_id, duplicate_lines.asin
-            ),
-            inventory_counts AS (
-                SELECT inventory_items.store_id,
-                       inventory_items.asin,
-                       SUM(inventory_items.quantity) AS inventory_quantity
-                FROM inventory_items
-                JOIN page_asins
-                  ON page_asins.store_id = inventory_items.store_id
-                 AND page_asins.asin = inventory_items.asin
-                WHERE inventory_items.status = 'available'
-                GROUP BY inventory_items.store_id, inventory_items.asin
-            ),
-            order_asin_counts AS (
-                SELECT same_order_lines.store_id,
-                       same_order_lines.odoo_order_id,
-                       COUNT(DISTINCT same_order_lines.asin) AS odoo_order_distinct_asin_count
-                FROM order_lines AS same_order_lines
-                JOIN page_orders
-                  ON page_orders.store_id = same_order_lines.store_id
-                 AND page_orders.odoo_order_id = same_order_lines.odoo_order_id
-                WHERE COALESCE(same_order_lines.asin, '') != ''
-                  AND COALESCE(same_order_lines.amazon_order_id, '') = ''
-                  AND same_order_lines.state != 'missing'
-                  AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-                GROUP BY same_order_lines.store_id, same_order_lines.odoo_order_id
-            ),
-            line_rows AS (
-                SELECT page_rows.*,
-                       COALESCE(duplicate_counts.duplicate_asin_count, 0) AS duplicate_asin_count,
-                       COALESCE(inventory_counts.inventory_quantity, 0) AS inventory_quantity,
-                       COALESCE(order_asin_counts.odoo_order_distinct_asin_count, 0) AS odoo_order_distinct_asin_count
-                FROM page_rows
-                LEFT JOIN duplicate_counts
-                  ON duplicate_counts.store_id = page_rows.store_id
-                 AND duplicate_counts.asin = page_rows.asin
-                LEFT JOIN inventory_counts
-                  ON inventory_counts.store_id = page_rows.store_id
-                 AND inventory_counts.asin = page_rows.asin
-                LEFT JOIN order_asin_counts
-                  ON order_asin_counts.store_id = page_rows.store_id
-                 AND order_asin_counts.odoo_order_id = page_rows.odoo_order_id
-            )
-            SELECT
-                (SELECT COALESCE(JSON_AGG(TO_JSONB(line_rows) - 'sort_order' ORDER BY sort_order, odoo_order_id DESC, id ASC), '[]'::json) FROM line_rows) AS rows,
-                (SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) FROM order_lines WHERE (? IS NULL OR store_id=?) AND odoo_order_id IS NOT NULL) AS total
+            {order_line_search_select_sql(store_clause)}
+            ORDER BY {order_by_sql}
+            LIMIT ? OFFSET ?
             """,
-            (store_id, store_id, per_page, offset, store_id, store_id),
+            (store_id, store_id, per_page, offset),
+        ).fetchall()
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total FROM order_lines {store_clause}",
+            (store_id, store_id),
         ).fetchone()
+        row_dicts = hydrate_order_line_rows(rows, conn=conn)
     return {
-        "rows": hydrate_order_line_rows(payload.get("rows") or []),
+        "rows": row_dicts,
         "page": page,
         "per_page": per_page,
-        "total": int(payload.get("total") or 0),
+        "total": int(total_row["total"] if total_row else 0),
     }
 
 
@@ -12321,12 +12266,12 @@ ORDER_LINE_SEARCH_COLUMNS = (
 )
 
 
-def hydrate_order_line_rows(rows: list[dict[str, Any]], stores: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+def hydrate_order_line_rows(rows: list[dict[str, Any]], stores: Optional[list[dict[str, Any]]] = None, conn: Optional[Any] = None) -> list[dict[str, Any]]:
     row_dicts = rows_to_dicts(rows)
     stores = stores or rows_to_dicts(list_stores())
     stores_by_id = {store["id"]: store for store in stores}
     row_dicts = backfill_missing_order_dates(row_dicts)
-    attach_shopify_status_to_rows(row_dicts)
+    attach_shopify_status_to_rows(row_dicts, conn)
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
         row["store_name"] = store.get("name") if store else ""

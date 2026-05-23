@@ -575,7 +575,11 @@ function cachedDashboardData() {
   try {
     const parsed = JSON.parse(window.localStorage.getItem(DASHBOARD_CACHE_STORAGE_KEY) || "null")
     if (!parsed || Date.now() - Number(parsed.savedAt || 0) > DASHBOARD_CACHE_MAX_AGE_MS) return null
-    return parsed.data as DashboardData
+    const data = parsed.data as DashboardData
+    if (Number(data?.page || 1) !== 1) {
+      return { ...data, rows: [], page: 1 }
+    }
+    return data
   } catch {
     return null
   }
@@ -584,7 +588,9 @@ function cachedDashboardData() {
 function saveDashboardCache(data: DashboardData) {
   if (typeof window === "undefined" || !savedAdminToken()) return
   try {
-    window.localStorage.setItem(DASHBOARD_CACHE_STORAGE_KEY, JSON.stringify({ savedAt: Date.now(), data }))
+    const page = Number(data?.page || 1)
+    const cacheData = page === 1 ? data : { ...data, rows: [], page: 1 }
+    window.localStorage.setItem(DASHBOARD_CACHE_STORAGE_KEY, JSON.stringify({ savedAt: Date.now(), data: cacheData }))
   } catch {
     // Ignore quota failures; the live API remains the source of truth.
   }
@@ -597,6 +603,7 @@ function notifyAdminAuthRequired() {
 }
 
 const PAGE_SIZE = 100
+const ORDERS_PAGE_SIZE = 20
 const DUPLICATE_ASIN_PAGE_SIZE = 12
 
 const orderConditionOptions = [
@@ -1884,6 +1891,7 @@ function App() {
   const ordersSelectionAnchor = useRef<number | null>(null)
   const ordersShiftKeyDown = useRef(false)
   const initialDashboardRefreshDone = useRef(false)
+  const initialDashboardRefreshStarted = useRef(false)
   const [storeId, setStoreId] = useState(() => String(initialDashboard?.current_store_id || ""))
   const [addressId, setAddressId] = useState(() => String(initialDashboard?.addresses.find((address) => address.is_default)?.id || initialDashboard?.addresses[0]?.id || ""))
   const [amazonAccountId, setAmazonAccountId] = useState(() => String(initialDashboard?.amazon_accounts.find((account) => account.is_default)?.id || initialDashboard?.amazon_accounts[0]?.id || ""))
@@ -1893,6 +1901,7 @@ function App() {
   const [pullStoreIds, setPullStoreIds] = useState<string[]>(savedPullStoreIds)
   const [pullOrderNames, setPullOrderNames] = useState("")
   const [search, setSearch] = useState("")
+  const [ordersQuery, setOrdersQuery] = useState("")
   const [orderCondition, setOrderCondition] = useState("all")
   const [selected, setSelected] = useState<number[]>([])
   const [ordersSelectAll, setOrdersSelectAll] = useState(false)
@@ -1933,15 +1942,35 @@ function App() {
   const [editingCopyKey, setEditingCopyKey] = useState<string | null>(null)
   const shopifyStatusSyncKeyRef = useRef("")
   const ordersRequestSeqRef = useRef(0)
+  const dashboardRequestSeqRef = useRef(0)
+  const ordersAbortRef = useRef<AbortController | null>(null)
+  const ordersInFlightKeyRef = useRef("")
+  const ordersPageCacheRef = useRef<Map<string, { rows: OrderLine[]; page: number; per_page: number; total: number; cachedAt: number }>>(new Map())
+  const ordersPageRef = useRef(ordersPage)
   const shopifyStatusCompletedRefreshRef = useRef("")
+  const shopifyStatusForceSyncPollRef = useRef(false)
 
   function pagedQuery(nextStoreId: string, nextPage = 1, extra?: Record<string, string | number>) {
     const query = new URLSearchParams()
     if (nextStoreId) query.set("store_id", nextStoreId)
     query.set("page", String(nextPage))
-    query.set("per_page", String(PAGE_SIZE))
-    Object.entries(extra || {}).forEach(([key, value]) => query.set(key, String(value)))
+    query.set("per_page", String(extra?.per_page || PAGE_SIZE))
+    Object.entries(extra || {}).forEach(([key, value]) => {
+      if (key !== "per_page") query.set(key, String(value))
+    })
     return `?${query.toString()}`
+  }
+
+  function ordersCacheKey(nextStoreId = storeId, nextPage = ordersPage, term = ordersQuery.trim()) {
+    return JSON.stringify({
+      store: nextStoreId || "",
+      page: nextPage,
+      q: term,
+      condition: orderCondition,
+      sort: sortKey,
+      direction: sortDirection,
+      perPage: ORDERS_PAGE_SIZE,
+    })
   }
 
   function resetPagination() {
@@ -1974,6 +2003,7 @@ function App() {
 
   function updateOrdersSearch(value: string) {
     ordersRequestSeqRef.current += 1
+    ordersAbortRef.current?.abort()
     setSearch(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
@@ -1982,6 +2012,7 @@ function App() {
 
   function updateOrderCondition(value: string) {
     ordersRequestSeqRef.current += 1
+    ordersAbortRef.current?.abort()
     setOrderCondition(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
@@ -1990,16 +2021,14 @@ function App() {
 
   function updateStoreView(value: string) {
     ordersRequestSeqRef.current += 1
+    ordersAbortRef.current?.abort()
     setStoreId(value)
     resetPagination()
-    refreshOrdersPage(value, 1).catch((error) => {
-      if (error instanceof AdminAuthError) return
-      setModal({ ok: false, title: "Orders load failed", message: String(error) })
-    })
   }
 
   function updateSortKey(value: SortKey) {
     ordersRequestSeqRef.current += 1
+    ordersAbortRef.current?.abort()
     setSortKey(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
@@ -2008,18 +2037,33 @@ function App() {
 
   function updateSortDirection(value: SortDirection) {
     ordersRequestSeqRef.current += 1
+    ordersAbortRef.current?.abort()
     setSortDirection(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
     setSelected([])
   }
 
-  function applyDashboardData(next: DashboardData, nextPage = ordersPage) {
-    setData(next)
-    setOrderRows(next.rows || [])
-    saveDashboardCache(next)
-    setOrdersPage(next.page || nextPage)
-    setOrdersTotal(next.total || 0)
+  useEffect(() => {
+    ordersPageRef.current = ordersPage
+  }, [ordersPage])
+
+  function applyDashboardData(next: DashboardData, nextPage = ordersPage, options: { updateOrders?: boolean } = {}) {
+    const updateOrders = options.updateOrders !== false
+    if (updateOrders) {
+      setData(next)
+      setOrderRows(next.rows || [])
+      saveDashboardCache(next)
+      setOrdersPage(next.page || nextPage)
+      setOrdersTotal(next.total || 0)
+    } else {
+      setData((current) => ({
+        ...next,
+        rows: current?.rows || orderRows,
+        page: ordersPageRef.current,
+        total: current?.total || next.total || 0,
+      }))
+    }
     const resolvedStore = String(next.current_store_id || "")
     setStoreId(resolvedStore)
     setAddressId((current) => current || String(next.addresses.find((address) => address.is_default)?.id || next.addresses[0]?.id || ""))
@@ -2036,43 +2080,77 @@ function App() {
   }
 
   async function refresh(nextStoreId = storeId, nextPage = ordersPage) {
-    const requestSeq = ++ordersRequestSeqRef.current
-    const query = pagedQuery(nextStoreId, nextPage, { sort_by: sortKey, sort_dir: sortDirection })
+    const requestSeq = ++dashboardRequestSeqRef.current
+    const query = pagedQuery(nextStoreId, nextPage, { per_page: ORDERS_PAGE_SIZE, sort_by: sortKey, sort_dir: sortDirection })
     const next = await api<DashboardData>(`/api/dashboard${query}`)
-    if (requestSeq !== ordersRequestSeqRef.current) return
-    applyDashboardData(next, nextPage)
+    if (requestSeq !== dashboardRequestSeqRef.current) return
+    applyDashboardData(next, nextPage, { updateOrders: page !== "orders" || ordersPageRef.current === nextPage })
+  }
+
+  async function fetchOrdersPageData(nextStoreId: string, nextPage: number, term: string, signal?: AbortSignal) {
+    const hasCondition = orderCondition !== "all"
+    if (term || hasCondition) {
+      return api<DashboardData>(
+        `/api/search${pagedQuery(nextStoreId, nextPage, { per_page: ORDERS_PAGE_SIZE, condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}&q=${encodeURIComponent(term)}`,
+        signal ? { signal } : {},
+      )
+    }
+    return api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(
+      `/api/orders${pagedQuery(nextStoreId, nextPage, { per_page: ORDERS_PAGE_SIZE, condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}`,
+      signal ? { signal } : {},
+    )
+  }
+
+  function cacheOrdersPage(cacheKey: string, result: { rows?: OrderLine[]; page?: number; per_page?: number; total?: number }, fallbackPage: number) {
+    ordersPageCacheRef.current.set(cacheKey, {
+      rows: result.rows || [],
+      page: result.page || fallbackPage,
+      per_page: result.per_page || ORDERS_PAGE_SIZE,
+      total: result.total || 0,
+      cachedAt: Date.now(),
+    })
   }
 
   async function refreshOrdersPage(nextStoreId = storeId, nextPage = ordersPage) {
+    const term = ordersQuery.trim()
+    const cacheKey = ordersCacheKey(nextStoreId, nextPage, term)
+    if (ordersInFlightKeyRef.current === cacheKey) return
     const requestSeq = ++ordersRequestSeqRef.current
+    ordersAbortRef.current?.abort()
+    const controller = new AbortController()
+    ordersAbortRef.current = controller
+    ordersInFlightKeyRef.current = cacheKey
+    setOrdersPage(nextPage)
     setOrdersLoading(true)
-    const term = search.trim()
-    const hasCondition = orderCondition !== "all"
+    const cachedPage = ordersPageCacheRef.current.get(cacheKey)
+    if (cachedPage && Date.now() - cachedPage.cachedAt < 30_000) {
+      setOrderRows(cachedPage.rows)
+      setOrdersPage(cachedPage.page || nextPage)
+      setOrdersTotal(cachedPage.total || 0)
+      setData((current) => {
+        if (!current) return current
+        return { ...current, rows: cachedPage.rows, page: cachedPage.page || nextPage, per_page: cachedPage.per_page, total: cachedPage.total }
+      })
+    }
     try {
-      if (term || hasCondition) {
-        const result = await api<DashboardData>(
-          `/api/search${pagedQuery(nextStoreId, nextPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}&q=${encodeURIComponent(term)}`,
-        )
-        if (requestSeq !== ordersRequestSeqRef.current) return
-        setOrderRows(result.rows || [])
-        setOrdersPage(result.page || nextPage)
-        setOrdersTotal(result.total || 0)
-        return
-      }
-      const result = await api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(
-        `/api/orders${pagedQuery(nextStoreId, nextPage, { condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}`,
-      )
+      const result = await fetchOrdersPageData(nextStoreId, nextPage, term, controller.signal)
       if (requestSeq !== ordersRequestSeqRef.current) return
       setOrderRows(result.rows || [])
+      setOrdersPage(result.page || nextPage)
+      setOrdersTotal(result.total || 0)
+      cacheOrdersPage(cacheKey, result, nextPage)
       setData((current) => {
         if (!current) return current
         const next = { ...current, rows: result.rows, page: result.page || nextPage, per_page: result.per_page, total: result.total }
         saveDashboardCache(next)
         return next
       })
-      setOrdersTotal(result.total || 0)
     } finally {
-      if (requestSeq === ordersRequestSeqRef.current) setOrdersLoading(false)
+      if (requestSeq === ordersRequestSeqRef.current) {
+        setOrdersLoading(false)
+        if (ordersAbortRef.current === controller) ordersAbortRef.current = null
+        if (ordersInFlightKeyRef.current === cacheKey) ordersInFlightKeyRef.current = ""
+      }
     }
   }
 
@@ -2089,6 +2167,7 @@ function App() {
         body: JSON.stringify({ store_id: Number(storeId), batch_size: 25, pause_seconds: 1 }),
       })
       setShopifyStatusForceSync(result.progress)
+      shopifyStatusForceSyncPollRef.current = result.progress?.status === "running"
       setModal({ ok: result.ok, title: "Shopify Status Sync", message: result.message || "Shopify status sync started." })
     } catch (error) {
       setModal({ ok: false, title: "Shopify Status Sync", message: String(error) })
@@ -2123,7 +2202,7 @@ function App() {
     setAdminAuthError("")
     setModal(null)
     try {
-      const next = await apiWithAdminToken<DashboardData>(`/api/dashboard${pagedQuery(storeId, ordersPage, { sort_by: sortKey, sort_dir: sortDirection })}`, nextToken)
+      const next = await apiWithAdminToken<DashboardData>(`/api/dashboard${pagedQuery(storeId, ordersPage, { per_page: ORDERS_PAGE_SIZE, sort_by: sortKey, sort_dir: sortDirection })}`, nextToken)
       window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY)
       window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY)
       if (remember) {
@@ -2189,23 +2268,33 @@ function App() {
   }, [page])
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setOrdersQuery(search.trim()), 250)
+    return () => window.clearTimeout(timer)
+  }, [search])
+
+  useEffect(() => {
     if (!savedAdminToken()) {
       setAdminTokenSaved(false)
       return
     }
-    const load = !initialDashboardRefreshDone.current
-      ? refresh(storeId, ordersPage).finally(() => {
-        initialDashboardRefreshDone.current = true
-      })
+    const load = !initialDashboardRefreshStarted.current
+      ? (() => {
+        initialDashboardRefreshStarted.current = true
+        return refresh(storeId, 1).finally(() => {
+          initialDashboardRefreshDone.current = true
+        })
+      })()
       : page === "orders" && data
         ? refreshOrdersPage(storeId, ordersPage)
         : Promise.resolve()
     load.catch((error) => {
+      if (!initialDashboardRefreshDone.current) initialDashboardRefreshStarted.current = false
+      if ((error as { name?: string })?.name === "AbortError") return
       if (error instanceof AdminAuthError) return
       setModal({ ok: false, title: "Unable to load app", message: String(error) })
     })
     if (!initialDashboardRefreshDone.current) loadUiCopy().catch(() => undefined)
-  }, [page, ordersPage, sortKey, sortDirection, storeId, search, orderCondition])
+  }, [page, ordersPage, sortKey, sortDirection, storeId, ordersQuery, orderCondition])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2421,17 +2510,25 @@ function App() {
     const syncKey = `${storeId}:${orderNames.join(",")}`
     if (shopifyStatusSyncKeyRef.current === syncKey) return
     shopifyStatusSyncKeyRef.current = syncKey
-    api<{ ok: boolean; synced: number }>("/api/shopify/orders/status/sync", {
-      method: "POST",
-      body: JSON.stringify({ store_id: Number(storeId), order_names: orderNames }),
-    })
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      api<{ ok: boolean; synced: number }>("/api/shopify/orders/status/sync", {
+        method: "POST",
+        signal: controller.signal,
+        body: JSON.stringify({ store_id: Number(storeId), order_names: orderNames }),
+      })
       .then((result) => {
-        if (result.synced) refreshOrdersPage(storeId, ordersPage)
+        if (result.synced) ordersPageCacheRef.current.clear()
       })
       .catch(() => {
         // Shopify status is auxiliary on the Orders table; keep the page usable if OAuth is missing.
       })
-  }, [page, storeId, rows, ordersPage])
+    }, 1200)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [page, storeId, rows])
   useEffect(() => {
     if (page !== "orders") return
     let active = true
@@ -2439,28 +2536,31 @@ function App() {
       try {
         const result = await api<{ ok: boolean; progress: ShopifyOrderStatusForceSyncProgress }>("/api/shopify/orders/status/force-sync")
         if (!active) return
+        const wasForceSyncPolling = shopifyStatusForceSyncPollRef.current
         setShopifyStatusForceSync(result.progress)
+        shopifyStatusForceSyncPollRef.current = result.progress?.status === "running"
         if (result.progress?.status === "completed") {
           const completedKey = `${result.progress.completed_at || ""}:${result.progress.processed || 0}:${result.progress.total || 0}`
           if (shopifyStatusCompletedRefreshRef.current === completedKey) return
           shopifyStatusCompletedRefreshRef.current = completedKey
-          refreshOrdersPage(storeId, ordersPage).catch(() => undefined)
+          if (wasForceSyncPolling) refreshOrdersPage(storeId, ordersPage).catch(() => undefined)
         }
       } catch {
         // Background progress is informational only.
       }
     }
     load()
-    const timer = window.setInterval(load, 5000)
+    const timer = window.setInterval(() => {
+      if (shopifyStatusForceSyncPollRef.current || shopifyStatusForceSync?.status === "running") load()
+    }, 5000)
     return () => {
       active = false
       window.clearInterval(timer)
     }
-  }, [page, storeId, ordersPage])
+  }, [page, storeId, ordersPage, shopifyStatusForceSync?.status])
   const filteredRows = useMemo(() => {
-    if (ordersLoading) return []
     return rows
-  }, [ordersLoading, rows])
+  }, [rows])
   const sortedRows = filteredRows
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
   const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "store" ? "store_name" : column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
@@ -3590,7 +3690,7 @@ function App() {
                     </div>
                   </div>
                 )}
-                <PaginationControls page={ordersPage} total={ordersTotal} onPage={setOrdersPage} disabled={Boolean(busy) || ordersLoading} label="orders" />
+                <PaginationControls page={ordersPage} total={ordersTotal} perPage={ORDERS_PAGE_SIZE} onPage={setOrdersPage} disabled={Boolean(busy)} label="rows" />
                 {selectedClubName && <p className="text-sm text-muted-foreground">Clubbed recipient: {selectedClubName}</p>}
                 {orderingEngine === "cxml" && (
                   <label className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -3702,13 +3802,7 @@ function App() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {ordersLoading ? (
-                      <TableRow>
-                        <TableCell colSpan={visibleOrderColumns.length + 1} className="h-32 text-center text-muted-foreground">
-                          Loading orders...
-                        </TableCell>
-                      </TableRow>
-                    ) : sortedRows.length ? sortedRows.map((row) => (
+                    {sortedRows.length ? sortedRows.map((row) => (
                       <TableRow
                         key={row.id}
                         onClick={(event) => {
@@ -3759,7 +3853,13 @@ function App() {
                           </TableCell>
                         ))}
                       </TableRow>
-                    )) : (
+                    )) : ordersLoading ? (
+                      <TableRow>
+                        <TableCell colSpan={visibleOrderColumns.length + 1} className="h-32 text-center text-muted-foreground">
+                          Loading orders...
+                        </TableCell>
+                      </TableRow>
+                    ) : (
                       <TableRow>
                         <TableCell colSpan={visibleOrderColumns.length + 1} className="h-32 text-center text-muted-foreground">
                           No orders match this view.
