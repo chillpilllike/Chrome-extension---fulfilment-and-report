@@ -4653,7 +4653,7 @@ async function handleCheckout(activeJob) {
     activeJob.addressEditedAt = Date.now();
     activeJob.addressVerifiedRecipient = checkoutRecipient;
     activeJob.addressVerifiedAt = Date.now();
-    await setActiveJob(activeJob);
+    await setActiveJob(activeJob, { allowUnpause: true, allowStageRegression: true });
     showPanel("Nutricity checkout", "Checkout is ready. Placing the order.", null, null);
   }
   if (activeJob.stage === "editing_address") {
@@ -6064,11 +6064,47 @@ async function reportAmazonOrders(activeJob, orders) {
   }
 }
 
+async function autoResumeResolvedCheckoutPause(activeJob) {
+  if (!/\/checkout/i.test(location.pathname)) return false;
+  const pausedStage = String(activeJob?.pausedStage || activeJob?.stage || "");
+  if (!["checkout", "editing_address"].includes(pausedStage)) return false;
+  const checkoutRecipient = recipientName(activeJob);
+  const extensionState = await getExtensionState();
+  const placeOrder = findPlaceOrderButton();
+  if (
+    placeOrder &&
+    !placeOrder.disabled &&
+    !findAddressNameInput() &&
+    checkoutRecipientConfirmed(checkoutRecipient) &&
+    checkoutPaymentConfirmed(cardPreferenceList(extensionState.cardLast4Preference))
+  ) {
+    const next = {
+      ...activeJob,
+      stage: "checkout",
+      paused: false,
+      pausedStage: null,
+      editAddressClickedAt: null,
+      addressEditedRecipient: checkoutRecipient,
+      addressEditedAt: Date.now(),
+      addressVerifiedRecipient: checkoutRecipient,
+      addressVerifiedAt: Date.now(),
+    };
+    await setActiveJob(next, { allowUnpause: true, allowStageRegression: true });
+    showPanel("Nutricity checkout", "Checkout is ready. Resuming placement.", null, null);
+    return true;
+  }
+  return false;
+}
+
 async function run() {
   if (!extensionContextAlive) return;
   const activeJob = await getActiveJob();
   if (!activeJob?.job || !/amazon\.com$/i.test(location.hostname)) return;
   if (activeJob.paused) {
+    if (await autoResumeResolvedCheckoutPause(activeJob)) {
+      setTimeout(runSafely, 250);
+      return;
+    }
     showPanel(
       "Nutricity fulfilment paused",
       "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",

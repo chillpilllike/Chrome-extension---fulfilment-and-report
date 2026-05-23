@@ -35,6 +35,11 @@ async function resolveTargetWindowId() {
   targetWindowId = tabs[0]?.windowId || targetWindowId;
 }
 
+async function ensureTargetWindowId() {
+  if (!targetWindowId) await resolveTargetWindowId();
+  return targetWindowId;
+}
+
 function send(message) {
   return chrome.runtime.sendMessage({ ...message, targetWindowId });
 }
@@ -54,6 +59,20 @@ function progressText(progress = {}) {
   const total = Number(progress.total || 0);
   const current = progress.current_batch ? ` · batch ${progress.current_batch}` : "";
   return `${progress.message || "Headless ePost status loaded."} ${processed}/${total} batch(es) processed${current}`;
+}
+
+function errorMessage(error) {
+  return String(error?.message || error || "Unexpected extension error.");
+}
+
+async function runAction(label, action) {
+  setStatus(label);
+  try {
+    await ensureTargetWindowId();
+    await action();
+  } catch (error) {
+    setStatus(errorMessage(error));
+  }
 }
 
 async function refresh() {
@@ -79,29 +98,46 @@ async function refresh() {
   }
 }
 
-document.querySelector("#save").addEventListener("click", async () => {
-  const result = await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1), headlessEpostMode: headlessEpostMode.checked });
-  if (result.ok) settingsDirty = false;
-  setStatus(result.ok ? "Saved." : result.message);
+document.querySelector("#save").addEventListener("click", () => {
+  runAction("Saving settings...", async () => {
+    const result = await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1), headlessEpostMode: headlessEpostMode.checked });
+    if (result.ok) settingsDirty = false;
+    setStatus(result.ok ? "Saved." : result.message);
+  });
 });
 
-document.querySelector("#testConnection").addEventListener("click", async () => {
-  await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1), headlessEpostMode: headlessEpostMode.checked });
-  settingsDirty = false;
-  const result = await send({ type: "TEST_CONNECTION" });
-  setStatus(result.message || (result.ok ? "Connection ok." : "Connection failed."));
+document.querySelector("#testConnection").addEventListener("click", () => {
+  runAction("Checking connection...", async () => {
+    await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1), headlessEpostMode: headlessEpostMode.checked });
+    settingsDirty = false;
+    const result = await send({ type: "TEST_CONNECTION" });
+    setStatus(result.message || (result.ok ? "Connection ok." : "Connection failed."));
+  });
 });
 
-document.querySelector("#start").addEventListener("click", async () => {
-  await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1), headlessEpostMode: headlessEpostMode.checked });
-  settingsDirty = false;
-  const result = await send({ type: headlessEpostMode.checked ? "START_HEADLESS_EPOST" : "START_EPOST" });
-  setStatus(result.message || (result.ok ? "Started." : "Could not start."));
+document.querySelector("#openHeadlessSession")?.addEventListener("click", () => {
+  runAction("Opening headless session...", async () => {
+    await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1), headlessEpostMode: headlessEpostMode.checked });
+    settingsDirty = false;
+    const result = await send({ type: "OPEN_HEADLESS_SESSION" });
+    setStatus(result.message || (result.ok ? "Opened headless session." : "Could not open headless session."));
+  });
 });
 
-document.querySelector("#stop").addEventListener("click", async () => {
-  const result = await send({ type: headlessEpostMode.checked ? "STOP_HEADLESS_EPOST" : "STOP_EPOST" });
-  setStatus(result.message || "Stopped.");
+document.querySelector("#start").addEventListener("click", () => {
+  runAction(headlessEpostMode.checked ? "Starting headless ePost..." : "Starting visible ePost...", async () => {
+    await send({ type: "SET_SETTINGS", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), intervalDays: Number(intervalDays.value || 1), headlessEpostMode: headlessEpostMode.checked });
+    settingsDirty = false;
+    const result = await send({ type: headlessEpostMode.checked ? "START_HEADLESS_EPOST" : "START_EPOST" });
+    setStatus(result.message || (result.ok ? "Started." : "Could not start."));
+  });
+});
+
+document.querySelector("#stop").addEventListener("click", () => {
+  runAction("Stopping ePost...", async () => {
+    const result = await send({ type: headlessEpostMode.checked ? "STOP_HEADLESS_EPOST" : "STOP_EPOST" });
+    setStatus(result.message || "Stopped.");
+  });
 });
 
 updateModeNotice();

@@ -209,7 +209,9 @@ async function run() {
     if (!data.amazonOrderId) return;
     showPanel("Nutricity tracking", `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`);
     const response = await send({ type: "ORDER_PACKAGES", ...data });
-    if (response && response.ok === false) {
+    if (response?.ignored) {
+      showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
+    } else if (response && response.ok === false) {
       showPanel("Nutricity tracking", responseError(response, "Could not send package links to the app."));
     }
     return;
@@ -219,7 +221,9 @@ async function run() {
     if (!data.amazonOrderId) return;
     showPanel("Nutricity tracking", `Capturing tracking for ${data.amazonOrderId}: ${data.package.status}.`);
     const response = await send({ type: "PACKAGE_TRACKING", ...data });
-    if (response?.ok) {
+    if (response?.ignored) {
+      showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
+    } else if (response?.ok) {
       const recovered = response.recovered ? " Recovered from a stale queue and posted directly." : "";
       showPanel("Nutricity tracking", `Synced tracking for ${data.amazonOrderId}: ${data.package.status}.${recovered}`);
     } else {

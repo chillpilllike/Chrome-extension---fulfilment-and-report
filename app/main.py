@@ -7464,17 +7464,48 @@ def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page
     return rows, total, page, per_page
 
 
-def tracking_rows(store_id: Optional[int] = None, status: str = "active") -> list[dict[str, Any]]:
+def tracking_rows(store_id: Optional[int] = None, status: str = "active", q: str = "") -> list[dict[str, Any]]:
     status = clean_text(status).lower() or "active"
+    search = clean_text(q)
     if status == "cancelled":
         where_status = "COALESCE(amazon_cancelled_at, '') != ''"
+        order_sql = "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC"
+    elif status == "delivered":
+        where_status = """
+            COALESCE(amazon_order_id, '') != ''
+            AND (
+                state = 'delivered'
+                OR tracking_status = 'Delivered'
+                OR LOWER(COALESCE(tracking_status, '')) = 'delivered'
+            )
+        """
         order_sql = "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC"
     elif status in {"recent", "checked"}:
         where_status = "COALESCE(amazon_order_id, '') != '' AND COALESCE(tracking_checked_at, '') != ''"
         order_sql = "tracking_checked_at DESC, ordered_at DESC, updated_at DESC"
+    elif status == "all":
+        where_status = "COALESCE(amazon_order_id, '') != ''"
+        order_sql = "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC"
     else:
         where_status = "COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')"
         order_sql = "tracking_checked_at IS NULL DESC, tracking_checked_at ASC, ordered_at DESC, updated_at DESC"
+    search_clause = ""
+    params: list[Any] = []
+    if search:
+        search_clause = """
+              AND LOWER(
+                COALESCE(amazon_order_id, '') || ' ' ||
+                COALESCE(amazon_cancelled_order_id, '') || ' ' ||
+                COALESCE(odoo_order_name, '') || ' ' ||
+                COALESCE(CAST(odoo_order_id AS TEXT), '') || ' ' ||
+                COALESCE(CAST(odoo_line_id AS TEXT), '') || ' ' ||
+                COALESCE(tracking_payload, '') || ' ' ||
+                COALESCE(tracking_status, '') || ' ' ||
+                COALESCE(asin, '') || ' ' ||
+                COALESCE(product_name, '')
+              ) LIKE ?
+        """
+        params.append(f"%{search.lower()}%")
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -7483,9 +7514,10 @@ def tracking_rows(store_id: Optional[int] = None, status: str = "active") -> lis
             WHERE {where_status}
               AND COALESCE(order_engine, '') != 'third_party'
               AND (? IS NULL OR store_id=?)
+              {search_clause}
             ORDER BY {order_sql}
             """,
-            (store_id, store_id),
+            (store_id, store_id, *params),
         ).fetchall()
     data = rows_to_dicts(rows)
     stores_by_id = {store["id"]: store for store in list_stores()}
@@ -7550,13 +7582,14 @@ def delivered_unfulfilled_rows(store_id: Optional[int] = None) -> list[dict[str,
 
 def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2) -> int:
     days = max(1, min(30, int(days or 2)))
+    store_id = int(store_id) if store_id else None
     stores = {int(store["id"]): store for store in list_stores()}
     with db() as conn:
         local_rows = conn.execute(
             """
             SELECT *
             FROM order_lines
-            WHERE COALESCE(odoo_order_id, '') != ''
+            WHERE odoo_order_id IS NOT NULL
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               AND (? IS NULL OR store_id=?)
             ORDER BY updated_at DESC
@@ -14721,6 +14754,54 @@ def chrome_browserless_headless() -> bool:
     return env_bool("CHROME_BROWSERLESS_HEADLESS", True)
 
 
+def open_chrome_browserless_profile(start_url: str = "") -> dict[str, Any]:
+    executable = chrome_browserless_executable()
+    if not executable:
+        raise HTTPException(500, "Google Chrome executable was not found.")
+    profile_dir = chrome_browserless_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    launch_url = clean_text(start_url) or "https://www.amazon.com/gp/css/order-history?ref_=nav_orders_first"
+    if sys.platform == "darwin":
+        subprocess.Popen([
+            "open",
+            "-na",
+            "Google Chrome",
+            "--args",
+            f"--user-data-dir={profile_dir}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            launch_url,
+        ])
+    else:
+        subprocess.Popen([
+            executable,
+            f"--user-data-dir={profile_dir}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            launch_url,
+        ])
+    return {
+        "ok": True,
+        "message": "Opened the shared headless Chrome profile. Sign in there, set the right delivery location, then close that window before starting any headless run.",
+        "profile_dir": str(profile_dir),
+        "url": launch_url,
+    }
+
+
+def chrome_browserless_error_message(exc: Exception, task_label: str = "Headless Chrome") -> str:
+    raw = str(exc)
+    if "SingletonLock" in raw or "ProcessSingleton" in raw or "profile directory" in raw:
+        return (
+            f"{task_label} could not start because the shared headless Chrome session window is still open. "
+            "Close the visible headless Chrome window, then start the headless run again."
+        )
+    if raw:
+        return raw
+    return f"{task_label} stopped unexpectedly."
+
+
 def chrome_browserless_available() -> tuple[bool, str]:
     if importlib.util.find_spec("playwright") is None:
         return False, "Python Playwright is not installed. Run: .venv/bin/python -m pip install -r requirements.txt"
@@ -15083,12 +15164,109 @@ def chrome_browserless_preflight_session(page: Any) -> None:
         }
         """
     )
+    issues = []
     if state.get("captcha"):
-        raise RuntimeError("Browserless Chrome profile is blocked by an Amazon captcha. Open the browserless profile manually and clear it before starting background ordering.")
+        issues.append("Amazon captcha is present")
     if state.get("signedOut"):
-        raise RuntimeError("Browserless Chrome profile is not signed into Amazon. No orders were claimed. Sign into Amazon in the browserless profile first.")
+        issues.append("profile is not signed into Amazon")
     if state.get("nonUsDelivery"):
-        raise RuntimeError("Browserless Chrome profile is using an India delivery location, so Amazon hides US buybox controls. No orders were claimed. Set the browserless Amazon profile to a US delivery address before starting background ordering.")
+        issues.append("delivery location is set to India instead of a US address")
+    if issues:
+        raise RuntimeError(
+            "Browserless Chrome profile is not ready: "
+            + "; ".join(issues)
+            + ". No orders were claimed. Open the browserless profile, sign into Amazon, clear any captcha, and set delivery to a US address before starting headless tracking."
+        )
+
+
+def chrome_browserless_readiness() -> dict[str, Any]:
+    from playwright.sync_api import sync_playwright
+
+    available, unavailable_reason = chrome_browserless_available()
+    if not available:
+        return {"ok": False, "ready": False, "message": unavailable_reason, "error": unavailable_reason}
+    executable = chrome_browserless_executable()
+    profile_dir = chrome_browserless_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+
+    def page_state(page: Any) -> dict[str, Any]:
+        return page.evaluate(
+            """
+            () => {
+              const text = String(document.body?.innerText || document.body?.textContent || '').replace(/\\s+/g, ' ').trim();
+              const head = text.slice(0, 2500);
+              const navLine = Array.from(document.querySelectorAll('#nav-link-accountList, #nav-global-location-popover-link, #glow-ingress-line1, #glow-ingress-line2'))
+                .map((el) => String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim())
+                .filter(Boolean)
+                .join(' | ');
+              return {
+                url: location.href,
+                title: document.title,
+                nav_line: navLine,
+                signed_out: /hello,? sign in|sign in new customer|\\/ap\\/signin/i.test(head) || /\\/ap\\/signin/i.test(location.href),
+                captcha: /captcha|enter the characters you see below/i.test(head),
+                non_us_delivery: /deliver to india|ship to india|showing you items that ship to india/i.test(head),
+                head,
+              };
+            }
+            """
+        )
+
+    try:
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                headless=chrome_browserless_headless(),
+                executable_path=executable,
+                args=launch_args,
+                viewport={"width": 1440, "height": 1100},
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto("https://www.amazon.com/gp/css/order-history?ref_=nav_orders_first", wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                orders_state = page_state(page)
+                page.goto("https://www.amazon.com/cart?ref_=sw_gtc", wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+                cart_state = page_state(page)
+                cookies = context.cookies("https://www.amazon.com")
+                cookie_names = {clean_text(cookie.get("name")) for cookie in cookies}
+                auth_cookie_names = sorted(cookie_names.intersection({"x-main", "at-main", "sess-at-main"}))
+            finally:
+                context.close()
+    except Exception as exc:
+        friendly_error = chrome_browserless_error_message(exc, "Headless readiness check")
+        return {"ok": False, "ready": False, "message": friendly_error, "error": friendly_error, "profile_dir": str(profile_dir)}
+
+    issues = []
+    if orders_state.get("signed_out"):
+        issues.append("Amazon Your Orders redirects to sign-in")
+    if cart_state.get("signed_out"):
+        issues.append("Amazon cart shows signed out")
+    if cart_state.get("non_us_delivery"):
+        issues.append("delivery location is India, not a US address")
+    if orders_state.get("captcha") or cart_state.get("captcha"):
+        issues.append("Amazon captcha is present")
+    if not auth_cookie_names:
+        issues.append("signed-in Amazon auth cookies are missing")
+    ready = not issues
+    message = "Headless Chrome profile is ready for Amazon tracking." if ready else "Headless Chrome profile is not ready: " + "; ".join(issues) + "."
+    return {
+        "ok": ready,
+        "ready": ready,
+        "message": message,
+        "profile_dir": str(profile_dir),
+        "orders": orders_state,
+        "cart": cart_state,
+        "auth_cookies_present": auth_cookie_names,
+    }
 
 
 def run_chrome_browserless_payload(payload: ChromeBrowserlessRunPayload) -> None:
@@ -15218,6 +15396,7 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
                 message=final_message,
             )
         except Exception as exc:
+            friendly_error = chrome_browserless_error_message(exc, "Browserless Chrome ordering")
             if "active_job" in locals():
                 chrome_browserless_release_job(locals().get("active_job"), "browserless worker error")
             set_chrome_browserless_progress(
@@ -15225,8 +15404,8 @@ def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
                 stop_requested=False,
                 current_order="",
                 completed_at=utc_now(),
-                error=str(exc),
-                message=f"Browserless Chrome ordering stopped: {exc}",
+                error=friendly_error,
+                message=friendly_error,
             )
     finally:
         try:
@@ -15329,6 +15508,11 @@ def api_chrome_browserless_status() -> dict[str, Any]:
 @app.get("/api/chrome/browserless/progress")
 def api_chrome_browserless_progress() -> dict[str, Any]:
     return api_chrome_browserless_status()
+
+
+@app.post("/api/chrome/browserless/open-session")
+def api_chrome_browserless_open_session() -> dict[str, Any]:
+    return open_chrome_browserless_profile()
 
 
 def set_tracking_browserless_progress(**updates: Any) -> dict[str, Any]:
@@ -15620,8 +15804,9 @@ def tracking_browserless_worker(payload: ChromeTrackingBrowserlessRunPayload) ->
                 message=final_message,
             )
         except Exception as exc:
+            friendly_error = chrome_browserless_error_message(exc, "Headless tracking")
             failed = int(_TRACKING_BROWSERLESS_PROGRESS.get("failed") or 0)
-            no_order_claimed = "no orders were claimed" in str(exc).lower()
+            no_order_claimed = "no orders were claimed" in friendly_error.lower() or "shared headless chrome session window is still open" in friendly_error.lower()
             if not no_order_claimed and int(_TRACKING_BROWSERLESS_PROGRESS.get("processed") or 0) < int(_TRACKING_BROWSERLESS_PROGRESS.get("total") or 0):
                 failed += 1
             set_tracking_browserless_progress(
@@ -15630,8 +15815,8 @@ def tracking_browserless_worker(payload: ChromeTrackingBrowserlessRunPayload) ->
                 current_order="",
                 completed_at=utc_now(),
                 failed=failed,
-                error=str(exc),
-                message=f"Headless tracking stopped: {exc}",
+                error=friendly_error,
+                message=friendly_error,
             )
     finally:
         try:
@@ -15707,9 +15892,19 @@ def api_tracking_browserless_stop() -> dict[str, Any]:
     return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
 
 
+@app.post("/api/tracking/browserless/open-signin")
+def api_tracking_browserless_open_signin() -> dict[str, Any]:
+    return open_chrome_browserless_profile()
+
+
 @app.get("/api/tracking/browserless/status")
 def api_tracking_browserless_status() -> dict[str, Any]:
     return {"ok": True, "progress": dict(_TRACKING_BROWSERLESS_PROGRESS)}
+
+
+@app.get("/api/tracking/browserless/readiness")
+def api_tracking_browserless_readiness() -> dict[str, Any]:
+    return chrome_browserless_readiness()
 
 
 def set_epost_browserless_progress(**updates: Any) -> dict[str, Any]:
@@ -15912,13 +16107,14 @@ def epost_browserless_worker(payload: EpostBrowserlessRunPayload) -> None:
                 message=final_message,
             )
         except Exception as exc:
+            friendly_error = chrome_browserless_error_message(exc, "Headless ePost")
             set_epost_browserless_progress(
                 running=False,
                 stop_requested=False,
                 current_batch="",
                 completed_at=utc_now(),
-                error=str(exc),
-                message=f"Headless ePost stopped: {exc}",
+                error=friendly_error,
+                message=friendly_error,
             )
     finally:
         try:
@@ -16432,6 +16628,8 @@ def api_chrome_job_reset_fulfilment(group_key: str, payload: ChromeJobResetPaylo
         if not rows:
             raise HTTPException(404, "Chrome job lines not found.")
         tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in rows}
+        # Resetting fulfilment must not remove replacement ASIN decisions.
+        # Those fields are only changed by the manual replacement action on the orders page.
         cursor = conn.execute(
             f"""
             UPDATE order_lines
@@ -16479,7 +16677,7 @@ def api_chrome_job_reset_fulfilment(group_key: str, payload: ChromeJobResetPaylo
     return {
         "ok": True,
         "reset": cursor.rowcount,
-        "message": f"Cleared existing Amazon order from {cursor.rowcount} Chrome line(s). You can continue fulfilment.",
+        "message": f"Cleared existing Amazon order from {cursor.rowcount} Chrome line(s). Replacement ASINs were preserved. You can continue fulfilment.",
     }
 
 
@@ -16993,8 +17191,8 @@ def api_chrome_job_costly(group_key: str, payload: ChromeJobCostlyPayload) -> di
 
 
 @app.get("/api/tracking/orders")
-def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "active") -> dict[str, Any]:
-    rows = tracking_rows(store_id, status)
+def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "active", q: str = "") -> dict[str, Any]:
+    rows = tracking_rows(store_id, status, q)
     grouped: dict[str, dict[str, Any]] = {}
     for row in rows:
         order_id = str(row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or "")
@@ -17972,10 +18170,11 @@ def api_duplicate_tracking(store_id: Optional[int] = None, q: str = "", page: in
 @app.post("/api/epost/sync")
 def api_epost_sync(payload: EpostSyncPayload) -> dict[str, Any]:
     days = max(1, min(30, int(payload.days or 2)))
-    synced = sync_epost_tracking_from_odoo(payload.store_id, days)
+    store_id = int(payload.store_id) if payload.store_id else None
+    synced = sync_epost_tracking_from_odoo(store_id, days)
     if synced:
         start_typesense_reindex_job()
-    rows, total, page, per_page = paged_epost_tracking_rows(payload.store_id, 1, 100, "all")
+    rows, total, page, per_page = paged_epost_tracking_rows(store_id, 1, 100, "all")
     return {
         "ok": True,
         "synced": synced,
@@ -18280,6 +18479,8 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             [payload.store_id, *selected_ids],
         ).fetchall()
         tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in selected_rows}
+        # Resetting fulfilment must not remove replacement ASIN decisions.
+        # Those fields are only changed by the manual replacement action on the orders page.
         cursor = conn.execute(
             f"""
             UPDATE order_lines
@@ -18329,7 +18530,7 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
         index_order_line(updated)
     threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
     data = dashboard_data(payload.store_id)
-    data["message"] = f"Reset {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} to fresh pulled status."
+    data["message"] = f"Reset {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} to fresh pulled status. Replacement ASINs were preserved."
     return data
 
 

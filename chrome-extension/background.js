@@ -805,6 +805,16 @@ async function browserlessOrderStatus() {
   return result;
 }
 
+async function openBrowserlessSession() {
+  const result = await api("/api/chrome/browserless/open-session", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 10000,
+  });
+  await log(result.message || "Opened shared headless Chrome session.");
+  return result;
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1742,7 +1752,8 @@ function preflightCandidatesFromJobs(jobs = []) {
 
 async function preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId = null) {
   if (splitMixedAsinOrders !== true) return { ok: true };
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  const blockedGroups = new Set();
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; split-order preflight stopped." };
     const snapshot = await api(`/api/chrome/jobs?claim=false&job_limit=${fulfilAvailableMixedAsin === true ? 1 : 250}`, { timeoutMs: 15000 });
     const job = snapshot.jobs?.[0] || null;
@@ -1778,6 +1789,14 @@ async function preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAva
     const result = unavailable.result || {};
     const targetLabel = partInfo ? `split order ${partInfo.base}` : job.group_key;
     const message = `Preflight blocked ${targetLabel}: ASIN ${candidate.asin} is not available on Amazon. ${result.message || ""}`.trim();
+    const blockedKey = `${targetLabel}:${candidate.asin}`;
+    if (blockedGroups.has(blockedKey)) {
+      return {
+        ok: false,
+        message: `Stopped split-order preflight because ${targetLabel} kept returning after being moved to Missing ASINs. Please review ${candidate.asin}.`,
+      };
+    }
+    blockedGroups.add(blockedKey);
     if (fulfilAvailableMixedAsin !== true) {
       const blockedMessage = `${message} Checkout was not started because Process available items in mixed-ASIN orders is off.`;
       for (const blockedJob of jobsToCheck.length ? jobsToCheck : [job]) {
@@ -1812,7 +1831,7 @@ async function preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAva
     await recordLastProcessed(job, "missing", message);
     await incrementOrderProgress(`Processed ${job.group_key}: preflight missing.`);
   }
-  return { ok: false, message: "Stopped after too many split-order preflight failures. Please review the queue." };
+  return { ok: false, message: "Stopped after 100 split-order preflight blocks. Please review the queue for repeated unavailable ASINs." };
 }
 
 async function runMissingAsinAvailabilityCheck(force = false) {
@@ -1904,6 +1923,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "START_NEXT") return startNextJob(windowId);
     if (message.type === "START_BROWSERLESS") return startBrowserlessOrderRun(windowId);
     if (message.type === "GET_BROWSERLESS_STATUS") return browserlessOrderStatus();
+    if (message.type === "OPEN_BROWSERLESS_SESSION") return openBrowserlessSession();
     if (message.type === "REGISTER_CONTROL_WINDOW") {
       await setControlWindow(Number(message.controlWindowId || 0) || null, Number(message.targetWindowId || 0) || null);
       return { ok: true };

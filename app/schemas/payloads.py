@@ -190,7 +190,7 @@ class EpostTrackingUpdatePayload(BaseModel):
 
 
 class EpostSyncPayload(BaseModel):
-    store_id: int
+    store_id: Optional[int] = None
     days: int = 2
 
 

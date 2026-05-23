@@ -93,6 +93,21 @@ document.querySelector("#testConnection").addEventListener("click", async () => 
   setStatus(result.message || (result.ok ? "Connection ok." : "Connection failed."));
 });
 
+document.querySelector("#openHeadlessSignin").addEventListener("click", async () => {
+  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), headlessTrackingMode: headlessTrackingMode.checked });
+  settingsDirty = false;
+  const result = await send({ type: "OPEN_HEADLESS_SIGNIN" });
+  setStatus(result.message || (result.ok ? "Opened headless sign-in." : "Could not open headless sign-in."));
+});
+
+document.querySelector("#checkHeadlessSignin").addEventListener("click", async () => {
+  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), headlessTrackingMode: headlessTrackingMode.checked });
+  settingsDirty = false;
+  setStatus("Checking headless Amazon session...");
+  const result = await send({ type: "CHECK_HEADLESS_TRACKING_READINESS" });
+  setStatus(result.message || (result.ready ? "Headless Amazon session is ready." : "Headless Amazon session is not ready."));
+});
+
 document.querySelector("#start").addEventListener("click", async () => {
   await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), headlessTrackingMode: headlessTrackingMode.checked });
   settingsDirty = false;

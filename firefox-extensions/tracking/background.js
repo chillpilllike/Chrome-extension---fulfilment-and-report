@@ -189,11 +189,35 @@ async function headlessTrackingStatus() {
   return api("/api/tracking/browserless/status", { timeoutMs: 10000 });
 }
 
+async function headlessTrackingReadiness() {
+  return api("/api/tracking/browserless/readiness", { timeoutMs: 30000 });
+}
+
+async function openHeadlessSignin() {
+  const result = await api("/api/tracking/browserless/open-signin", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 10000,
+  });
+  await log(result.message || "Opened headless Chrome sign-in window.");
+  return result;
+}
+
 async function handleOrderPackages(message, windowId) {
-  const { tracking } = await getWindowState(windowId);
-  if (!tracking.running) return { ok: false };
+  const { tracking, headlessTrackingMode } = await getWindowState(windowId);
+  if (!tracking.running) {
+    if (headlessTrackingMode) {
+      return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
+    }
+    return { ok: false, message: "Normal tracking is not running. Press Start Tracking from the extension popup." };
+  }
   const order = tracking.orders[tracking.index];
-  if (!order || order.amazon_order_id !== message.amazonOrderId) return { ok: false };
+  if (!order || order.amazon_order_id !== message.amazonOrderId) {
+    if (headlessTrackingMode) {
+      return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
+    }
+    return { ok: false, message: "This Amazon page does not match the active tracking order." };
+  }
   if (message.orderCancelled) {
     await api("/api/tracking/update", {
       method: "POST",
@@ -263,10 +287,18 @@ async function handleOrderPackages(message, windowId) {
 }
 
 async function handlePackageTracking(message, windowId) {
-  const { tracking } = await getWindowState(windowId);
+  const { tracking, headlessTrackingMode } = await getWindowState(windowId);
+  if (!tracking.running && headlessTrackingMode) {
+    return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
+  }
   if (!tracking.running) return postStandalonePackageTracking(message, windowId);
   const order = tracking.orders[tracking.index];
-  if (!order || order.amazon_order_id !== message.amazonOrderId) return postStandalonePackageTracking(message, windowId);
+  if (!order || order.amazon_order_id !== message.amazonOrderId) {
+    if (headlessTrackingMode) {
+      return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
+    }
+    return postStandalonePackageTracking(message, windowId);
+  }
   const queuedPackage = tracking.packages[tracking.packageIndex] || {};
   const pagePackage = message.package || {};
   const packageData = { ...queuedPackage, ...pagePackage };
@@ -351,6 +383,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "START_HEADLESS_TRACKING") return startHeadlessTracking();
     if (message.type === "STOP_HEADLESS_TRACKING") return stopHeadlessTracking();
     if (message.type === "GET_HEADLESS_TRACKING_STATUS") return headlessTrackingStatus();
+    if (message.type === "CHECK_HEADLESS_TRACKING_READINESS") return headlessTrackingReadiness();
+    if (message.type === "OPEN_HEADLESS_SIGNIN") return openHeadlessSignin();
     if (message.type === "ORDER_PACKAGES") return handleOrderPackages(message, windowId);
     if (message.type === "PACKAGE_TRACKING") return handlePackageTracking(message, windowId);
     return { ok: false, message: "Unknown message." };

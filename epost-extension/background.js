@@ -102,13 +102,17 @@ function chunk(items, size) {
 
 async function openTracker(windowId) {
   const url = `${TRACKER_URL}?nutricityBatch=${Date.now()}`;
-  const query = windowId ? { active: true, windowId } : { active: true, currentWindow: true };
-  const tabs = await chrome.tabs.query(query);
-  if (tabs[0]?.id) {
-    await chrome.tabs.update(tabs[0].id, { url, active: true });
-  } else {
-    await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
+  try {
+    const query = windowId ? { active: true, windowId } : { active: true, currentWindow: true };
+    const tabs = await chrome.tabs.query(query);
+    if (tabs[0]?.id) {
+      await chrome.tabs.update(tabs[0].id, { url, active: true });
+      return;
+    }
+  } catch (error) {
+    await log(`Could not reuse active tab: ${error.message}`, windowId);
   }
+  await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
 }
 
 async function scheduleAlarm(days) {
@@ -120,21 +124,28 @@ async function scheduleAlarm(days) {
 async function startEpost(windowId = null) {
   const state = await getState();
   if (state.headlessEpostMode) return startHeadlessEpost();
-  await scheduleAlarm(state.intervalDays);
-  const payload = await api(`/api/epost/due?days=${encodeURIComponent(state.intervalDays || 1)}`);
-  const rows = payload.rows || [];
-  const batches = chunk(rows.map((row) => row.tracking_code).filter(Boolean), 25);
-  const epostRun = { running: true, batches, batchIndex: 0, submittedBatchIndex: null };
-  if (!batches.length) {
-    epostRun.running = false;
+  await log("Starting visible ePost tracking.", windowId);
+  try {
+    await scheduleAlarm(state.intervalDays);
+    const payload = await api(`/api/epost/due?days=${encodeURIComponent(state.intervalDays || 1)}`);
+    const rows = payload.rows || [];
+    const batches = chunk(rows.map((row) => row.tracking_code).filter(Boolean), 25);
+    const epostRun = { running: true, batches, batchIndex: 0, submittedBatchIndex: null };
+    if (!batches.length) {
+      epostRun.running = false;
+      await saveEpostRun(epostRun, windowId);
+      await log("No ePost tracking codes are due.", windowId);
+      return { ok: false, message: "No ePost tracking codes are due." };
+    }
     await saveEpostRun(epostRun, windowId);
-    await log("No ePost tracking codes are due.", windowId);
-    return { ok: false, message: "No ePost tracking codes are due." };
+    await log(`Loaded ${rows.length} due ePost code(s) in ${batches.length} batch(es).`, windowId);
+    await openTracker(windowId);
+    await log("Opened ePost portal for visible tracking.", windowId);
+    return { ok: true, message: `Tracking ${rows.length} ePost code(s).` };
+  } catch (error) {
+    await log(`Visible ePost tracking failed to start: ${error.message}`, windowId);
+    throw error;
   }
-  await saveEpostRun(epostRun, windowId);
-  await log(`Loaded ${rows.length} due ePost code(s) in ${batches.length} batch(es).`, windowId);
-  await openTracker(windowId);
-  return { ok: true, message: `Tracking ${rows.length} ePost code(s).` };
 }
 
 async function stopEpost(windowId) {
@@ -170,6 +181,16 @@ async function stopHeadlessEpost() {
 
 async function headlessEpostStatus() {
   return api("/api/epost/browserless/status", { timeoutMs: 10000 });
+}
+
+async function openHeadlessSession() {
+  const result = await api("/api/chrome/browserless/open-session", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 10000,
+  });
+  await log(result.message || "Opened shared headless Chrome session.");
+  return result;
 }
 
 async function handlePortalReady(windowId) {
@@ -261,6 +282,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "START_HEADLESS_EPOST") return startHeadlessEpost();
     if (message.type === "STOP_HEADLESS_EPOST") return stopHeadlessEpost();
     if (message.type === "GET_HEADLESS_EPOST_STATUS") return headlessEpostStatus();
+    if (message.type === "OPEN_HEADLESS_SESSION") return openHeadlessSession();
     if (message.type === "PORTAL_READY") return handlePortalReady(windowId);
     if (message.type === "BATCH_SUBMITTED") return handleBatchSubmitted(message, windowId);
     if (message.type === "EPOST_RESULTS") return handleResults(message, windowId);

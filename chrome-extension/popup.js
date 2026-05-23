@@ -408,6 +408,13 @@ document.querySelector("#testConnection").addEventListener("click", async () => 
   setStatus(result.message || (result.ok ? "Connection ok." : "Connection failed."));
 });
 
+document.querySelector("#openHeadlessSession").addEventListener("click", async () => {
+  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
+  settingsDirty = false;
+  const result = await send({ type: "OPEN_BROWSERLESS_SESSION" });
+  setStatus(result.message || (result.ok ? "Opened headless session." : "Could not open headless session."));
+});
+
 document.querySelector("#start").addEventListener("click", async () => {
   setStatus(browserlessOrderMode.checked ? "Starting background order placement..." : "Starting next queued order...");
   try {

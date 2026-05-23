@@ -3078,7 +3078,7 @@ function App() {
               Reset selected fulfilment?
             </DialogTitle>
             <DialogDescription>
-              This will clear Amazon order IDs, Chrome job state, tracking, pricing, and errors for {selected.length.toLocaleString()} selected line{selected.length === 1 ? "" : "s"}. Was this intentional?
+              This will clear Amazon order IDs, Chrome job state, tracking, pricing, and errors for {selected.length.toLocaleString()} selected line{selected.length === 1 ? "" : "s"}. Replacement ASINs are kept and must be removed manually from the orders page.
             </DialogDescription>
           </DialogHeader>
           <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
@@ -4471,6 +4471,7 @@ function TrackingPage({
   const [localTotal, setLocalTotal] = useState(total)
   const [loading, setLoading] = useState(false)
   const [statusFilter, setStatusFilter] = useState("active")
+  const [queryText, setQueryText] = useState("")
   const selectionAnchor = useRef<string | null>(null)
 
   async function refreshTracking() {
@@ -4481,6 +4482,7 @@ function TrackingPage({
       query.set("page", String(page))
       query.set("per_page", String(PAGE_SIZE))
       query.set("status", statusFilter)
+      if (queryText.trim()) query.set("q", queryText.trim())
       const result = await api<{ ok: boolean; orders: TrackingOrder[]; total: number }>(`/api/tracking/orders?${query.toString()}`)
       setOrders(result.orders || [])
       setLocalTotal(result.total || 0)
@@ -4493,7 +4495,7 @@ function TrackingPage({
 
   useEffect(() => {
     refreshTracking()
-  }, [storeId, page, statusFilter])
+  }, [storeId, page, statusFilter, queryText])
 
   useEffect(() => setLocalTotal(total), [total])
 
@@ -4504,11 +4506,19 @@ function TrackingPage({
           <CardTitle>Package Tracking</CardTitle>
           <CardDescription>Chrome tracking extension updates package status, carrier, tracking ID, and latest scan until delivered.</CardDescription>
         </div>
-        <div className="flex items-end gap-2">
+        <div className="flex flex-col gap-2 md:min-w-[540px] md:flex-row md:items-end">
+          <SearchBox
+            className="w-full md:flex-1"
+            value={queryText}
+            onChange={(value) => { setQueryText(value); onPage(1) }}
+            placeholder="Search tracking code, Amazon order, Odoo order..."
+          />
           <SelectField className="w-44" label="Filter" value={statusFilter} onChange={(value) => { setStatusFilter(value); onPage(1) }}>
             <option value="active">Active</option>
             <option value="recent">Recently checked</option>
+            <option value="delivered">Delivered</option>
             <option value="cancelled">Cancelled</option>
+            <option value="all">All</option>
           </SelectField>
           <Button variant="outline" onClick={refreshTracking} disabled={loading}>
             <RefreshCw className="size-4" />
