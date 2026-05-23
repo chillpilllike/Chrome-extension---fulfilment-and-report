@@ -25,6 +25,7 @@ let panelOrderStatusVersion = 0;
 let orderHistoryAnnotationScheduled = false;
 let orderHistoryAnnotationInFlight = false;
 const orderHistoryLookupCache = new Map();
+const orderHistoryOdooDirectInFlight = new Set();
 const orderHistorySyncInProgress = new Map();
 const orderHistorySyncedConfirmations = new Map();
 
@@ -5287,15 +5288,15 @@ function orderDetailsAnnotationHost() {
 }
 
 function renderOrderHistoryAnnotation(card, result) {
-  const existing = card.querySelector(".nutricity-order-history-annotation");
-  if (existing) existing.remove();
+  for (const existing of card.querySelectorAll(".nutricity-order-history-annotation")) existing.remove();
   if (!result) return;
   const orders = result.match?.orders || [];
   const suggestions = result.suggestions || [];
   const conflicts = result.conflicts || [];
+  const directOdoo = result.odooDirect || [];
   const cancelled = result.cancelled === true;
   if (cancelled && !orders.length) return;
-  if (!orders.length && !suggestions.length && !conflicts.length && !result.unmatched) return;
+  if (!orders.length && !suggestions.length && !conflicts.length && !directOdoo.length && !result.unmatched) return;
   const syncedConfirmation = orderHistorySyncedConfirmations.get(result.orderId);
   const detailsClass = card?.dataset?.nutricityOrderDetailsHost === "true" ? " is-order-details" : "";
   if (syncedConfirmation && Date.now() - Number(syncedConfirmation.syncedAt || 0) < 30000) {
@@ -5433,6 +5434,7 @@ function renderOrderHistoryAnnotation(card, result) {
   }
   const container = orderHistoryAnnotationContainer(card);
   container.appendChild(marker);
+  appendDirectOdooHistoryRows(container, directOdoo, detailsClass);
 }
 
 function compactQuantity(value) {
@@ -5519,6 +5521,61 @@ function appendOrderHistoryQuantitySummary(marker, orders = []) {
       .join(", ")}`;
   }
   marker.appendChild(summary);
+}
+
+function appendDirectOdooHistoryRows(container, directOdoo = [], detailsClass = "") {
+  const rows = (directOdoo || []).filter(Boolean);
+  if (!rows.length) return;
+  for (const order of rows.slice(0, 4)) {
+    const checks = order.quantity_checks || [];
+    const warnings = checks.filter((check) => !check.matches);
+    const marker = document.createElement("div");
+    marker.className = `nutricity-order-history-annotation nutricity-order-history-direct ${order.error || !order.found || warnings.length ? "is-conflict" : "is-match"}${detailsClass}`;
+
+    const label = document.createElement("span");
+    label.className = "nutricity-order-history-label";
+    label.textContent = "Odoo direct";
+    marker.appendChild(label);
+
+    const links = document.createElement("span");
+    links.className = "nutricity-order-history-links";
+    if (order.odoo_order_url) {
+      const link = document.createElement("a");
+      link.href = order.odoo_order_url;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = order.odoo_order_name || `Odoo ${order.odoo_order_id || ""}`.trim();
+      links.appendChild(link);
+      links.appendChild(orderHistoryCopyButton(order.odoo_order_name || order.odoo_order_id || ""));
+    } else {
+      links.textContent = order.odoo_order_name || "Odoo order";
+    }
+    if (order.store_name) {
+      links.appendChild(document.createTextNode(` (${order.store_name})`));
+    }
+    marker.appendChild(links);
+
+    if (order.error) {
+      const warning = document.createElement("span");
+      warning.className = "nutricity-order-history-warning";
+      warning.textContent = `Direct check failed: ${order.error}`;
+      marker.appendChild(warning);
+    } else if (!order.found) {
+      const warning = document.createElement("span");
+      warning.className = "nutricity-order-history-warning";
+      warning.textContent = "Not found directly in Odoo";
+      marker.appendChild(warning);
+    } else {
+      appendOrderHistoryQuantitySummary(marker, [order]);
+      if (!checks.length) {
+        const warning = document.createElement("span");
+        warning.className = "nutricity-order-history-warning";
+        warning.textContent = "No ASIN lines found directly in Odoo";
+        marker.appendChild(warning);
+      }
+    }
+    container.appendChild(marker);
+  }
 }
 
 function orderDateMismatches(orders = []) {
@@ -5646,10 +5703,38 @@ async function syncMatchedAmazonHistoryDate(result) {
   });
 }
 
+async function annotateAmazonOrderHistoryDirectOdoo(pairs = []) {
+  const pending = pairs
+    .filter(({ details }) => {
+      const orderId = details?.amazon_order_id || "";
+      if (!orderId || orderHistoryOdooDirectInFlight.has(orderId)) return false;
+      const cached = orderHistoryLookupCache.get(orderId);
+      return cached && !cached.odooDirectLoaded;
+    });
+  if (!pending.length) return;
+  for (const { card, details } of pending) {
+    const orderId = details.amazon_order_id;
+    orderHistoryOdooDirectInFlight.add(orderId);
+    try {
+      const result = await send({ type: "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT", orders: [details] });
+      const cached = orderHistoryLookupCache.get(orderId);
+      if (!cached) continue;
+      cached.odooDirect = result?.ok ? (result.odoo_direct || {})[orderId] || [] : [];
+      cached.odooDirectLoaded = true;
+      cached.cachedAt = Date.now();
+      orderHistoryLookupCache.set(orderId, cached);
+      renderOrderHistoryAnnotation(card, cached);
+    } finally {
+      orderHistoryOdooDirectInFlight.delete(orderId);
+    }
+  }
+}
+
 async function annotateAmazonOrderHistory() {
   if (!extensionContextAlive || !/amazon\.com$/i.test(location.hostname) || (!isOrderHistoryPage() && !isOrderDetailsPage())) return;
   const pairs = [];
   const unknown = [];
+  const directCandidates = [];
   const seen = new Set();
   if (isOrderDetailsPage()) {
     const details = orderDetailsPageDetails();
@@ -5670,11 +5755,16 @@ async function annotateAmazonOrderHistory() {
     const cached = orderHistoryLookupCache.get(details.amazon_order_id);
     if (cached && Date.now() - Number(cached.cachedAt || 0) < 2 * 60 * 1000) {
       renderOrderHistoryAnnotation(card, cached);
+      if (!cached.odooDirectLoaded) directCandidates.push({ card, details });
     } else {
       unknown.push(details);
     }
   }
-  if (!unknown.length || orderHistoryAnnotationInFlight) return;
+  if (!unknown.length) {
+    annotateAmazonOrderHistoryDirectOdoo(directCandidates).catch(() => {});
+    return;
+  }
+  if (orderHistoryAnnotationInFlight) return;
   orderHistoryAnnotationInFlight = true;
   try {
     const result = await send({ type: "LOOKUP_AMAZON_HISTORY_ORDERS", orders: unknown });
@@ -5691,6 +5781,8 @@ async function annotateAmazonOrderHistory() {
         match,
         suggestions: suggestions[details.amazon_order_id] || [],
         conflicts: conflicts[details.amazon_order_id] || [],
+        odooDirect: [],
+        odooDirectLoaded: false,
         unmatched: unmatched.has(details.amazon_order_id),
         orderDate: details.order_date || "",
         asins: details.asins || [],
@@ -5704,6 +5796,7 @@ async function annotateAmazonOrderHistory() {
     for (const { card, details } of pairs) {
       renderOrderHistoryAnnotation(card, orderHistoryLookupCache.get(details.amazon_order_id));
     }
+    annotateAmazonOrderHistoryDirectOdoo(pairs).catch(() => {});
   } finally {
     orderHistoryAnnotationInFlight = false;
   }

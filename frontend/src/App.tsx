@@ -10,6 +10,7 @@ import {
   IconChevronLeft as ChevronLeft,
   IconChevronRight as ChevronRight,
   IconColumns3 as Columns3,
+  IconCopy as Copy,
   IconDatabase as Database,
   IconDownload as Download,
   IconEdit as Edit,
@@ -188,6 +189,7 @@ type OrderLine = {
   quantity: number
   state: string
   odoo_status_label: string
+  amazon_status?: string
   amazon_order_id: string
   amazon_order_url: string
   shopify_order_id?: string
@@ -1382,12 +1384,94 @@ function StatusBadge({ value }: { value?: string }) {
   return <Badge variant="outline">{status}</Badge>
 }
 
+function copyPlainText(value: string) {
+  const text = String(value || "").trim()
+  if (!text || typeof navigator === "undefined") return Promise.resolve(false)
+  return navigator.clipboard.writeText(text).then(() => true).catch(() => false)
+}
+
+function OdooOrderRef({
+  name,
+  url = "",
+  className = "",
+  linkClassName = "",
+}: {
+  name?: string | number
+  url?: string
+  className?: string
+  linkClassName?: string
+}) {
+  const [copied, setCopied] = useState(false)
+  const text = String(name || "").trim()
+  if (!text) return <span className="text-muted-foreground">-</span>
+  const content = url ? (
+    <a className={cn("min-w-0 truncate text-primary underline-offset-4 hover:underline", linkClassName)} href={url} target="_blank" rel="noreferrer">
+      {text}
+    </a>
+  ) : (
+    <span className={cn("min-w-0 truncate", linkClassName)}>{text}</span>
+  )
+  return (
+    <span className={cn("inline-flex max-w-full items-center gap-1.5", className)}>
+      {content}
+      <button
+        type="button"
+        className={cn(
+          "inline-flex size-6 flex-none items-center justify-center rounded border bg-background transition-colors",
+          copied ? "border-emerald-500 text-emerald-700" : "border-primary/25 text-primary hover:border-primary hover:bg-primary/10",
+        )}
+        title={`Copy ${text}`}
+        aria-label={`Copy ${text}`}
+        onClick={async (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          const ok = await copyPlainText(text)
+          setCopied(ok)
+          window.setTimeout(() => setCopied(false), 1200)
+        }}
+      >
+        <Copy className="size-3.5" />
+      </button>
+    </span>
+  )
+}
+
+function OdooOrderRefs({ names, className = "" }: { names?: Array<string | number>; className?: string }) {
+  const cleanNames = (names || []).map((name) => String(name || "").trim()).filter(Boolean)
+  if (!cleanNames.length) return <span className="text-muted-foreground">No Odoo order linked</span>
+  return (
+    <div className={cn("flex flex-wrap gap-1.5", className)}>
+      {cleanNames.map((name) => <OdooOrderRef key={name} name={name} />)}
+    </div>
+  )
+}
+
 function isLimitPurchaseLine(row: OrderLine) {
   return /limit purchase|limited purchase quantity|business has reached/i.test(`${row.last_error || ""} ${row.fulfilment_note || ""}`)
 }
 
 function isPartialQuantityLine(row: OrderLine) {
   return /less quantity|partial quantity|customer ordered|maximum allowable|only allows|did not allow the full quantity|could add only/i.test(`${row.last_error || ""} ${row.fulfilment_note || ""}`)
+}
+
+function isMissingOrderLine(row: OrderLine) {
+  const hasCurrentAmazonOrder = Boolean(row.amazon_order_id)
+  const fulfilmentState = String(row.state || "").toLowerCase()
+  if (hasCurrentAmazonOrder && ["ordered", "dispatched", "delivered"].includes(fulfilmentState)) return false
+  return (
+    row.state === "missing" ||
+    row.amazon_status === "missing" ||
+    Boolean(row.missing_asin) ||
+    /missing|unavailable on amazon|did not load product controls|out of stock/i.test(`${row.last_error || ""} ${row.fulfilment_note || ""}`)
+  )
+}
+
+function isAmazonDeliveredLine(row: OrderLine) {
+  return row.state === "delivered" || String(row.tracking_status || "").toLowerCase() === "delivered"
+}
+
+function isCurrentAmazonCancelledLine(row: OrderLine) {
+  return Boolean(row.amazon_cancelled_at && !row.amazon_order_id)
 }
 
 function ErrorTooltip({ value, className = "" }: { value?: string; className?: string }) {
@@ -2880,23 +2964,7 @@ function App() {
       case "store":
         return row.store_name ? <Badge variant="outline">{row.store_name}</Badge> : <span className="text-muted-foreground">-</span>
       case "odoo_order":
-        return row.odoo_order_url ? (
-          <a
-            className={`${row.state === "missing" ? "text-destructive" : "text-primary"} underline-offset-4 hover:underline`}
-            href={row.odoo_order_url}
-            target="_blank"
-            onDoubleClick={(event) => {
-              event.preventDefault()
-              copyText(row.odoo_order_name, "Odoo order number")
-            }}
-          >
-            {row.odoo_order_name}
-          </a>
-        ) : (
-          <button className="font-medium" type="button" onDoubleClick={() => copyText(row.odoo_order_name, "Odoo order number")}>
-            {row.odoo_order_name}
-          </button>
-        )
+        return <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName={row.state === "missing" ? "text-destructive" : ""} />
       case "product":
         return (
           <Tooltip>
@@ -3818,10 +3886,12 @@ function App() {
                               : "",
                             isLimitPurchaseLine(row)
                             ? "bg-[#f5f0ff]"
-                            : row.amazon_cancelled_at
+                            : isCurrentAmazonCancelledLine(row)
                             ? "bg-red-50"
-                            : row.state === "missing"
-                            ? "bg-orange-50"
+                            : isMissingOrderLine(row)
+                            ? "order-row-missing"
+                            : isAmazonDeliveredLine(row)
+                            ? ""
                             : ["cancelled", "refunded"].includes(row.odoo_status_label)
                             ? "bg-destructive/5"
                             : Number(row.odoo_order_distinct_asin_count || 0) > 1
@@ -4682,9 +4752,7 @@ function TrackingPage({
                   <TableCell>
                     <div className="grid gap-1">
                       {order.lines.slice(0, 4).map((line) => (
-                        <a key={line.id} className="text-primary underline-offset-4 hover:underline" href={line.odoo_order_url} target="_blank">
-                          {line.odoo_order_name}
-                        </a>
+                        <OdooOrderRef key={line.id} name={line.odoo_order_name} url={line.odoo_order_url} />
                       ))}
                     </div>
                   </TableCell>
@@ -4795,7 +4863,7 @@ function PaymentFailedPage({
                 <TableCell className="max-w-[260px]">
                   <div className="flex flex-wrap gap-1">
                     {(row.odoo_order_names || []).map((name) => (
-                      <Badge key={name} variant="secondary">{name}</Badge>
+                      <OdooOrderRef key={name} name={name} />
                     ))}
                   </div>
                 </TableCell>
@@ -4935,7 +5003,7 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
                     <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
                       {row.amazon_order_id}
                     </a>
-                    <span className="text-xs text-muted-foreground">{row.odoo_order_names}</span>
+                    <OdooOrderRefs names={String(row.odoo_order_names || "").split(/\s*,\s*/)} className="text-xs text-muted-foreground" />
                   </div>
                 </TableCell>
                 <TableCell><StatusBadge value={row.tracking_status || "Unknown"} /></TableCell>
@@ -5073,9 +5141,7 @@ function FulfilmentPendingPage({
                     </TableCell>
                     <TableCell>{row.store_name}</TableCell>
                     <TableCell>
-                      <a className="font-medium text-primary underline-offset-4 hover:underline" href={row.odoo_order_url} target="_blank">
-                        {row.odoo_order_name}
-                      </a>
+                      <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName="font-medium" />
                       <div className="text-xs text-muted-foreground">
                         {row.odoo_sale_state || "state unknown"} / {row.odoo_invoice_status || "invoice unknown"}
                       </div>
@@ -5292,9 +5358,7 @@ function EpostTrackingPage({
                 </TableCell>
                 <TableCell>{row.store_name}</TableCell>
                 <TableCell>
-                  <a className="text-primary underline-offset-4 hover:underline" href={row.odoo_order_url} target="_blank">
-                    {row.odoo_order_name}
-                  </a>
+                  <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} />
                   <div className="text-xs text-muted-foreground">{row.picking_name}</div>
                 </TableCell>
                 <TableCell>
@@ -5519,7 +5583,7 @@ function DuplicateTrackingPage({
                   <TableCell className="min-w-[220px]">
                     <div className="grid gap-1">
                       {row.odoo_order_names.map((order) => (
-                        <span key={order} className="font-medium">{order}</span>
+                        <OdooOrderRef key={order} name={order} linkClassName="font-medium" />
                       ))}
                       {!row.odoo_order_names.length && <span className="text-muted-foreground">No Odoo order linked</span>}
                       {!!row.amazon_order_ids.length && <span className="text-xs text-muted-foreground">Amazon {row.amazon_order_ids.join(", ")}</span>}
@@ -5690,7 +5754,7 @@ function InventoryPage({
                   <TableCell className="max-w-[360px] truncate">{item.product_name}</TableCell>
                   <TableCell>
                     <Badge variant="outline">{item.source_type || "amazon_cancelled"}</Badge>
-                    <div className="text-xs text-muted-foreground">{item.source_odoo_order_name || item.notes || ""}</div>
+                    {item.source_odoo_order_name ? <OdooOrderRef name={item.source_odoo_order_name} className="text-xs text-muted-foreground" /> : <div className="text-xs text-muted-foreground">{item.notes || ""}</div>}
                   </TableCell>
                   <TableCell>
                     {item.amazon_order_id ? <a className="font-mono text-xs text-primary underline-offset-4 hover:underline" href={item.amazon_order_url} target="_blank">{item.amazon_order_id}</a> : <span className="text-muted-foreground">Manual</span>}
@@ -5783,9 +5847,7 @@ function CancelledOrdersPage({
               {rows.map((row) => (
                 <TableRow key={row.id}>
                   <TableCell>
-                    {row.odoo_order_url ? (
-                      <a className="font-semibold text-primary underline-offset-4 hover:underline" href={row.odoo_order_url} target="_blank">{row.odoo_order_name}</a>
-                    ) : row.odoo_order_name}
+                    <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName="font-semibold" />
                   </TableCell>
                   <TableCell>
                     <a className="font-mono text-xs text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">{row.amazon_order_id}</a>
@@ -5884,7 +5946,7 @@ function PartialFulfilmentsPage({
                 {rows.map((row) => (
                   <TableRow key={row.id}>
                     <TableCell>
-                      <div className="font-medium">{row.odoo_order_name}</div>
+                      <OdooOrderRef name={row.odoo_order_name} linkClassName="font-medium" />
                       <div className="text-xs text-muted-foreground">{row.amazon_group_key || "No Chrome group key"}</div>
                     </TableCell>
                     <TableCell>
@@ -6192,13 +6254,7 @@ function BackInStockPage({
                   className={row.status === "back_in_stock" ? "bg-emerald-50" : row.queued_at ? "bg-blue-50" : row.status === "replacement_assigned" ? "bg-amber-50" : row.status === "odoo_cancelled" || row.status === "odoo_refunded" ? "bg-red-50" : ""}
                 >
                   <TableCell>
-                    {row.odoo_order_url ? (
-                      <a className="font-medium underline-offset-4 hover:underline" href={row.odoo_order_url} target="_blank">
-                        {row.odoo_order_name || row.odoo_order_id}
-                      </a>
-                    ) : (
-                      row.odoo_order_name || row.odoo_order_id || "-"
-                    )}
+                    <OdooOrderRef name={row.odoo_order_name || row.odoo_order_id} url={row.odoo_order_url} linkClassName="font-medium" />
                   </TableCell>
                   <TableCell>
                     <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.asin_url || `https://www.amazon.com/dp/${row.asin}`} target="_blank">
@@ -6395,7 +6451,7 @@ function BulkPage({
                     <a className="text-primary underline-offset-4 hover:underline" href={group.asin_url} target="_blank">{group.asin}</a>
                   </TableCell>
                   <TableCell>{group.quantity}</TableCell>
-                  <TableCell>{group.order_names.join(", ")}</TableCell>
+                  <TableCell><OdooOrderRefs names={group.order_names} /></TableCell>
                   <TableCell className="max-w-[520px] truncate">{group.product_names.join(" / ")}</TableCell>
                   <TableCell>{group.has_missing_order ? <Badge variant="destructive">missing review</Badge> : <Badge variant="secondary">ready</Badge>}</TableCell>
                   <TableCell className="text-right">
@@ -6504,7 +6560,7 @@ function CostlyPage({
                       }}
                     />
                   </TableCell>
-                  <TableCell>{row.odoo_order_url ? <a className="text-primary underline-offset-4 hover:underline" href={row.odoo_order_url} target="_blank">{row.odoo_order_name}</a> : row.odoo_order_name}</TableCell>
+                  <TableCell><OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} /></TableCell>
                   <TableCell className="font-mono"><a className="text-primary underline-offset-4 hover:underline" href={row.asin_url || `https://www.amazon.com/dp/${row.asin}`} target="_blank">{row.asin}</a></TableCell>
                   <TableCell className="max-w-[420px] truncate">{row.product_name}</TableCell>
                   <TableCell className="text-destructive">{Number(row.cost_review_loss || 0).toFixed(2)}</TableCell>
@@ -6847,7 +6903,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
             <TableBody>
               {(data?.orders || []).map((row) => (
                 <TableRow key={`${row.odoo_order_id}-${row.odoo_order_name}`}>
-                  <TableCell className="font-medium">{row.odoo_order_name}</TableCell>
+                  <TableCell><OdooOrderRef name={row.odoo_order_name} linkClassName="font-medium" /></TableCell>
                   <TableCell>{formatDateTime(row.order_date)}</TableCell>
                   <TableCell>{formatMoney(row.odoo_order_value)}</TableCell>
                   <TableCell>{formatMoney(row.collected_delivery)}</TableCell>
@@ -6997,7 +7053,7 @@ function AccountingPage({ storeId, onResult }: { storeId: string; onResult: (mod
             <TableBody>
               {data.documents.map((doc) => (
                 <TableRow key={doc.id}>
-                  <TableCell className="font-medium">{doc.odoo_order_name}</TableCell>
+                  <TableCell><OdooOrderRef name={doc.odoo_order_name} linkClassName="font-medium" /></TableCell>
                   <TableCell><StatusBadge value={doc.document_type} /></TableCell>
                   <TableCell><Badge variant={doc.tax_region === "india" ? "destructive" : "secondary"}>{doc.tax_region === "india" ? "India GST" : "International"}</Badge></TableCell>
                   <TableCell>{doc.country_code}</TableCell>
@@ -7623,7 +7679,7 @@ function ChromeQueuePage({
                   </div>
                 </TableCell>
                 <TableCell className="max-w-[220px]">
-                  <div className="truncate">{(job.order_names || []).join(", ") || "-"}</div>
+                  <OdooOrderRefs names={job.order_names || []} />
                 </TableCell>
                 <TableCell>{job.recipient_name || "-"}</TableCell>
                 <TableCell className="max-w-[320px]">
@@ -8144,7 +8200,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                 <TableBody>
                   {productRepairLogs.map((log, index) => (
                     <TableRow key={`${log.odoo_order_name}-${log.shopify_order_id}-${index}`}>
-                      <TableCell className="font-medium">{log.odoo_order_name}</TableCell>
+                      <TableCell><OdooOrderRef name={log.odoo_order_name} linkClassName="font-medium" /></TableCell>
                       <TableCell>
                         {log.shopify_order_url ? (
                           <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={log.shopify_order_url} target="_blank" rel="noreferrer" title="Open Shopify order" onClick={(event) => openExternalLink(event, log.shopify_order_url)}>
@@ -8255,11 +8311,8 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                       onKeyDown={(event) => openExternalCellKey(event, group.odoo_order_url)}
                     >
                       {group.odoo_order_url ? (
-                        <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={group.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order" onClick={(event) => openExternalLink(event, group.odoo_order_url)}>
-                          {group.odoo_order_name}
-                          <ExternalLink className="size-3.5" />
-                        </a>
-                      ) : group.odoo_order_name}
+                        <OdooOrderRef name={group.odoo_order_name} url={group.odoo_order_url} linkClassName="font-medium" />
+                      ) : <OdooOrderRef name={group.odoo_order_name} linkClassName="font-medium" />}
                     </TableCell>
                     <TableCell>
                       <div>{group.dest_name || group.route?.toUpperCase()}</div>
@@ -8324,11 +8377,8 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                     onKeyDown={(event) => openExternalCellKey(event, job.odoo_order_url)}
                   >
                     {job.odoo_order_url ? (
-                      <a className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline" href={job.odoo_order_url} target="_blank" rel="noreferrer" title="Open Odoo order" onClick={(event) => openExternalLink(event, job.odoo_order_url)}>
-                        {job.odoo_order_name}
-                        <ExternalLink className="size-3.5" />
-                      </a>
-                    ) : job.odoo_order_name}
+                      <OdooOrderRef name={job.odoo_order_name} url={job.odoo_order_url} linkClassName="font-medium" />
+                    ) : <OdooOrderRef name={job.odoo_order_name} linkClassName="font-medium" />}
                   </TableCell>
                   <TableCell
                     className={job.shopify_order_url ? "cursor-pointer" : undefined}

@@ -289,6 +289,16 @@ async function lookupAmazonHistoryOrders(orders = []) {
   return { app_base_url: base, ...result, not_found_url: `${base}${result.not_found_url || "/amazon-order-history-unmatched"}` };
 }
 
+async function lookupAmazonHistoryOdooDirect(orders = []) {
+  const normalized = (orders || []).map(normalizeRecentAmazonOrder).filter(Boolean);
+  if (!normalized.length) return { ok: true, odoo_direct: {} };
+  return api("/api/chrome/order-history/odoo-direct", {
+    method: "POST",
+    body: JSON.stringify({ orders: normalized }),
+    timeoutMs: 18000,
+  });
+}
+
 async function syncAmazonHistoryOrder(order = {}) {
   const normalized = normalizeRecentAmazonOrder(order);
   if (!normalized) return { ok: false, message: "Amazon order ID is not valid." };
@@ -1950,6 +1960,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === "REMEMBER_RECENT_AMAZON_ORDERS") return rememberRecentAmazonOrders(message.orders || []);
     if (message.type === "LOOKUP_AMAZON_HISTORY_ORDERS") return lookupAmazonHistoryOrders(message.orders || []);
+    if (message.type === "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT") return lookupAmazonHistoryOdooDirect(message.orders || []);
     if (message.type === "SYNC_AMAZON_HISTORY_ORDER") return syncAmazonHistoryOrder(message.order || {});
     if (message.type === "GET_RECENT_AMAZON_ORDERS") {
       const { recentAmazonOrders } = await getSettings();

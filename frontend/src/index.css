@@ -580,6 +580,14 @@
     background: #f8fafc;
 }
 
+.tabler-admin-shell tr.order-row-missing > * {
+    background: #fff1f2;
+}
+
+.tabler-admin-shell tr.order-row-missing:hover > * {
+    background: #ffe4e6;
+}
+
 .tabler-admin-shell tr.bg-parrot-green-lt > * {
     background: #effddd;
 }

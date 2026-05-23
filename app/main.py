@@ -2134,6 +2134,152 @@ def amazon_history_apply_order_date_checks(records: list[dict[str, Any]], *group
                 candidate["amazon_order_placed_at"] = amazon_placed_at
 
 
+def amazon_history_direct_odoo_order(
+    store: Store,
+    order_name: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    clean_order_name = clean_text(order_name).upper()
+    result: dict[str, Any] = {
+        "store_id": store.id,
+        "store_name": store.name,
+        "odoo_order_name": clean_order_name,
+        "odoo_order_url": "",
+        "lines": [],
+        "asins": [],
+        "asin_quantities": {},
+        "quantity_checks": [],
+        "quantity_matches": False,
+        "found": False,
+        "error": "",
+    }
+    if not clean_order_name:
+        return result
+    odoo = OdooClient(store)
+    order_fields = odoo.existing_fields("sale.order", ["id", "name", "order_line", "note", "state", "invoice_status", "date_order"])
+    orders = odoo.search_read("sale.order", [("name", "=", clean_order_name)], order_fields, limit=1)
+    if not orders:
+        return result
+    order = orders[0]
+    result.update({
+        "found": True,
+        "odoo_order_id": order.get("id"),
+        "odoo_order_name": order.get("name") or clean_order_name,
+        "odoo_order_url": odoo.order_url(int(order.get("id") or 0)) if order.get("id") else "",
+        "odoo_order_state": order.get("state") or "",
+        "odoo_invoice_status": order.get("invoice_status") or "",
+        "odoo_order_date": order.get("date_order") or "",
+    })
+    line_ids = [int(line_id) for line_id in (order.get("order_line") or []) if int(line_id or 0) > 0]
+    if not line_ids:
+        return result
+    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"])
+    lines = odoo.read("sale.order.line", line_ids, line_fields)
+    product_ids = sorted({int(line["product_id"][0]) for line in lines if line.get("product_id")})
+    product_fields = odoo.existing_fields("product.product", ["id", "default_code", "product_tmpl_id", "detailed_type", "type"])
+    products = {int(product["id"]): product for product in odoo.read("product.product", product_ids, product_fields)} if product_ids else {}
+    tmpl_ids = sorted({int(product["product_tmpl_id"][0]) for product in products.values() if product.get("product_tmpl_id")})
+    tmpl_fields = odoo.existing_fields("product.template", ["id", "default_code", "description", "detailed_type", "type"])
+    templates = {int(template["id"]): template for template in odoo.read("product.template", tmpl_ids, tmpl_fields)} if tmpl_ids else {}
+    asin_quantities: dict[str, float] = {}
+    direct_lines: list[dict[str, Any]] = []
+    for line in lines:
+        product_id = int(line["product_id"][0]) if line.get("product_id") else None
+        product = products.get(product_id or 0, {})
+        tmpl_id = int(product["product_tmpl_id"][0]) if product.get("product_tmpl_id") else None
+        tmpl = templates.get(tmpl_id or 0, {})
+        if should_skip_order_line(line, product, tmpl) or is_order_adjustment_line(line, product, tmpl):
+            continue
+        default_code = product.get("default_code") or tmpl.get("default_code") or ""
+        note = strip_html(tmpl.get("description") or "")
+        asin = normalize_asin(decode_asin_reference(default_code) or extract_asin_from_notes(note, line.get("name") or "", order.get("note") or ""))
+        if not asin:
+            continue
+        quantity = float(line.get("product_uom_qty") or 1)
+        asin_quantities[asin] = float(asin_quantities.get(asin) or 0) + quantity
+        direct_lines.append({
+            "id": line.get("id"),
+            "asin": asin,
+            "quantity": quantity,
+            "name": line.get("name") or "",
+        })
+    actual_by_asin = {
+        normalize_asin(asin): float(quantity or 0)
+        for asin, quantity in (record.get("asin_quantities") or {}).items()
+        if normalize_asin(asin)
+    }
+    checks: list[dict[str, Any]] = []
+    for asin in sorted({normalize_asin(value) for value in asin_quantities.keys() if normalize_asin(value)}):
+        expected = float(asin_quantities.get(asin) or 0)
+        actual = float(actual_by_asin.get(asin) or 0)
+        checks.append({
+            "asin": asin,
+            "expected": expected,
+            "actual": actual,
+            "matches": abs(expected - actual) < 0.0001,
+        })
+    result["lines"] = direct_lines
+    result["asins"] = sorted(asin_quantities.keys())
+    result["asin_quantities"] = asin_quantities
+    result["quantity_checks"] = checks
+    result["quantity_matches"] = bool(checks) and all(check["matches"] for check in checks)
+    return result
+
+
+def amazon_history_direct_odoo_matches(
+    conn: Any,
+    records: list[dict[str, Any]],
+    matches: dict[str, dict[str, Any]],
+    suggestions: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    direct: dict[str, list[dict[str, Any]]] = {}
+    store_cache: dict[int, Store] = {}
+    for record in records:
+        amazon_order_id = record.get("amazon_order_id")
+        if not amazon_order_id or record.get("cancelled"):
+            continue
+        local_candidates = list((matches.get(amazon_order_id) or {}).get("orders") or [])
+        local_candidates.extend(suggestions.get(amazon_order_id) or [])
+        targets = sorted({
+            (int(candidate.get("store_id") or 0), clean_text(candidate.get("odoo_order_name")).upper())
+            for candidate in local_candidates
+            if int(candidate.get("store_id") or 0) > 0 and clean_text(candidate.get("odoo_order_name"))
+        })
+        if not targets:
+            refs = list(dict.fromkeys(match.group(0).upper() for match in ORDER_REF_RE.finditer(record.get("recipient") or "")))
+            if not refs:
+                continue
+            rows = rows_to_dicts(conn.execute(
+                f"""
+                SELECT DISTINCT store_id, odoo_order_name
+                FROM order_lines
+                WHERE UPPER(odoo_order_name) IN ({','.join('?' for _ in refs)})
+                ORDER BY store_id, odoo_order_name
+                LIMIT 8
+                """,
+                refs,
+            ).fetchall())
+            targets = [(int(row["store_id"]), clean_text(row["odoo_order_name"]).upper()) for row in rows]
+        for store_id, order_name in targets[:8]:
+            try:
+                store = store_cache.get(store_id)
+                if store is None:
+                    store = get_store(store_id)
+                    store_cache[store_id] = store
+                direct.setdefault(amazon_order_id, []).append(amazon_history_direct_odoo_order(store, order_name, record))
+            except Exception as exc:
+                direct.setdefault(amazon_order_id, []).append({
+                    "store_id": store_id,
+                    "store_name": store_cache.get(store_id).name if store_id in store_cache else "",
+                    "odoo_order_name": order_name,
+                    "found": False,
+                    "error": clean_text(str(exc))[:240],
+                    "quantity_checks": [],
+                    "quantity_matches": False,
+                })
+    return direct
+
+
 def amazon_history_asin_conflicts(
     conn: Any,
     records: list[dict[str, Any]],
@@ -4328,7 +4474,7 @@ def backfill_cxml_order_references() -> int:
             replacement = str(response.get("amazon_order_id") or extract_cxml_order_reference(text, row["amazon_order_id"]))
             if replacement and replacement != row["amazon_order_id"] and not replacement.startswith("cxml-"):
                 conn.execute(
-                    "UPDATE order_lines SET amazon_order_id=?, state='ordered', amazon_status='ordered', ordered_at=COALESCE(ordered_at, ?), updated_at=? WHERE id=?",
+                    "UPDATE order_lines SET amazon_order_id=?, state='ordered', amazon_status='ordered', missing_asin=NULL, last_error=NULL, ordered_at=COALESCE(ordered_at, ?), updated_at=? WHERE id=?",
                     (replacement, utc_now(), utc_now(), line_id),
                 )
                 updated_count += 1
@@ -9370,7 +9516,7 @@ def check_deliveries(store_id: int) -> tuple[int, int]:
                         status,
                         json.dumps(tracking_payloads, default=str)[:4000],
                         utc_now(),
-                        "dispatched" if delivered_flag else "ordered",
+                        "delivered" if delivered_flag else "ordered",
                         utc_now(),
                         row["id"],
                     ),
@@ -14611,6 +14757,19 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
     }
 
 
+@app.post("/api/chrome/order-history/odoo-direct")
+def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) -> dict[str, Any]:
+    records = amazon_history_lookup_records(payload)
+    if not records:
+        return {"ok": True, "odoo_direct": {}}
+    order_ids = [record["amazon_order_id"] for record in records if record["amazon_order_id"]]
+    with db() as conn:
+        matches = amazon_history_matches(conn, order_ids)
+        suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
+        direct_odoo = amazon_history_direct_odoo_matches(conn, records, matches, suggestions)
+    return {"ok": True, "odoo_direct": direct_odoo}
+
+
 @app.get("/api/chrome/order-history/unmatched")
 def api_chrome_order_history_unmatched(limit: int = 250) -> dict[str, Any]:
     limit = max(1, min(1000, int(limit or 250)))
@@ -15025,6 +15184,9 @@ class ChromeBrowserlessSession:
             payload = AmazonHistoryLookupPayload(orders=message.get("orders") or [])
             result = api_chrome_order_history_lookup(payload)
             return {"app_base_url": "http://127.0.0.1:8000", **result, "not_found_url": f"http://127.0.0.1:8000{result.get('not_found_url') or '/amazon-order-history-unmatched'}"}
+        if message_type == "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT":
+            payload = AmazonHistoryLookupPayload(orders=message.get("orders") or [])
+            return api_chrome_order_history_odoo_direct(payload)
         if message_type == "SYNC_AMAZON_HISTORY_ORDER":
             order = message.get("order") or {}
             normalized = AmazonHistoryOrderPayload(**order)
@@ -16938,6 +17100,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     chrome_claimed_by=NULL,
                     chrome_claimed_at=NULL,
                     chrome_claim_expires_at=NULL,
+                    missing_asin=NULL,
                     last_error=NULL,
                     ordered_at=?,
                     updated_at=?
@@ -17186,6 +17349,67 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
             (amazon_order_id,),
         ).fetchall()
         if not rows:
+            historical_rows = []
+            if payload.order_cancelled:
+                historical_rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM order_lines
+                    WHERE amazon_cancelled_order_id=?
+                       OR (amazon_order_id=? AND (state='delivered' OR LOWER(COALESCE(tracking_status, ''))='delivered'))
+                    """,
+                    (amazon_order_id, amazon_order_id),
+                ).fetchall()
+            if historical_rows:
+                now = utc_now()
+                cancellation_message = clean_text(payload.cancellation_message) or "This order has been cancelled."
+                for row in historical_rows:
+                    current_order_id = clean_text(row["amazon_order_id"])
+                    existing_cancelled_order_id = clean_text(row["amazon_cancelled_order_id"])
+                    should_store_cancelled_id = current_order_id != amazon_order_id
+                    note = (
+                        f"Older Amazon order {amazon_order_id} is cancelled; current fulfilment remains {current_order_id or existing_cancelled_order_id}."
+                        if should_store_cancelled_id
+                        else f"Ignored cancellation signal for delivered Amazon order {amazon_order_id}; current fulfilment remains delivered."
+                    )
+                    conn.execute(
+                        """
+                        UPDATE order_lines
+                        SET amazon_cancelled_order_id=?,
+                            tracking_checked_at=COALESCE(NULLIF(tracking_checked_at, ''), ?),
+                            tracking_payload=CASE
+                              WHEN COALESCE(tracking_payload, '') = '' THEN ?
+                              ELSE tracking_payload
+                            END,
+                            fulfilment_note=CASE
+                              WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                              WHEN fulfilment_note LIKE ? THEN fulfilment_note
+                              ELSE fulfilment_note || ' | ' || ?
+                            END,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            existing_cancelled_order_id or (amazon_order_id if should_store_cancelled_id else ""),
+                            now,
+                            json.dumps({"ignored_cancelled_order": amazon_order_id, "message": cancellation_message}, default=str)[:4000],
+                            note,
+                            f"%Older Amazon order {amazon_order_id} is cancelled%",
+                            note,
+                            now,
+                            row["id"],
+                        ),
+                    )
+                    updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+                    if updated_row:
+                        index_order_line(updated_row)
+                return {
+                    "ok": True,
+                    "updated": 0,
+                    "ignored": True,
+                    "tracking_status": "Older Amazon cancellation ignored",
+                    "message": f"Ignored cancelled historical Amazon order {amazon_order_id}; current/latest fulfilment was kept.",
+                }
             raise HTTPException(404, "Tracked Amazon order not found")
         if payload.order_cancelled:
             tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in rows}
@@ -17528,6 +17752,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                             order_engine='chrome',
                             amazon_status='ordered',
                             state='ordered',
+                            missing_asin=NULL,
                             last_error=NULL,
                             ordered_at=?,
                             updated_at=?
@@ -17554,6 +17779,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                     order_engine='chrome',
                     amazon_status='ordered',
                     state='ordered',
+                    missing_asin=NULL,
                     last_error=NULL,
                     ordered_at=?,
                     updated_at=?
