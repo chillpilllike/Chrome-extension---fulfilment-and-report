@@ -2,11 +2,13 @@
 const chrome = globalThis.browser || globalThis.chrome;
 
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 
 async function getState() {
   return chrome.storage.local.get({
     apiBase: DEFAULT_API_BASE,
     adminToken: "",
+    headlessTrackingMode: false,
     tracking: { running: false, orders: [], index: 0, packages: [], packageIndex: 0 },
     trackingByWindow: {},
     logs: [],
@@ -53,25 +55,59 @@ async function log(message, windowId = null) {
 
 async function api(path, options = {}) {
   const { apiBase, adminToken } = await getState();
-  const response = await fetch(`${apiBase}${path}`, {
-    headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...(options.headers || {}) },
-    ...options,
-  });
-  if (!response.ok) {
-    throw new Error((await response.text()) || response.statusText);
+  const base = normalizeApiBase(apiBase);
+  const requestPath = String(path || "").startsWith("/") ? path : `/${path}`;
+  const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, headers = {}, retries = 1, ...fetchOptions } = options;
+  let lastError = null;
+  for (let attempt = 0; attempt <= Number(retries || 0); attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Number(timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS));
+    try {
+      const response = await fetch(`${base}${requestPath}`, {
+        ...fetchOptions,
+        headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...headers },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error((await response.text()) || response.statusText);
+      }
+      return response.json();
+    } catch (error) {
+      lastError = error;
+      if (!isConnectionError(error) || attempt >= Number(retries || 0)) break;
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    } finally {
+      clearTimeout(timeout);
+    }
   }
-  return response.json();
+  throw new Error(connectionErrorMessage(lastError, base));
+}
+
+function normalizeApiBase(apiBase) {
+  return String(apiBase || DEFAULT_API_BASE).trim().replace(/\/+$/, "") || DEFAULT_API_BASE;
+}
+
+function connectionErrorMessage(error, base = "") {
+  const raw = String(error?.message || error || "Failed to fetch");
+  if (isConnectionError(error)) {
+    return `Could not reach the local app at ${base || DEFAULT_API_BASE}. Make sure it is running on port 8000, then save and check the connection again.`;
+  }
+  return raw;
+}
+
+function isConnectionError(error) {
+  return /failed to fetch|networkerror|load failed|abort|could not reach/i.test(String(error?.message || error || ""));
 }
 
 async function testConnection() {
   const { apiBase, adminToken } = await getState();
-  const base = String(apiBase || DEFAULT_API_BASE).replace(/\/+$/, "");
-  const health = await fetch(`${base}/health`);
-  if (!health.ok) throw new Error(`Server health check failed: HTTP ${health.status}`);
-  const auth = await fetch(`${base}/api/settings/admin-access`, {
-    headers: adminToken ? { "X-Admin-Token": adminToken } : {},
-  });
-  if (!auth.ok) throw new Error((await auth.text()) || `Admin token check failed: HTTP ${auth.status}`);
+  const base = normalizeApiBase(apiBase);
+  try {
+    await api("/health", { timeoutMs: 8000 });
+    await api("/api/settings/admin-access", { timeoutMs: 8000, headers: adminToken ? { "X-Admin-Token": adminToken } : {} });
+  } catch (error) {
+    throw new Error(connectionErrorMessage(error, base));
+  }
   return { ok: true, message: `Connected to ${base}. Admin token accepted.` };
 }
 
@@ -107,6 +143,8 @@ async function openCurrentOrder(windowId) {
 }
 
 async function startTracking(windowId) {
+  const { headlessTrackingMode } = await getState();
+  if (headlessTrackingMode) return startHeadlessTracking();
   const payload = await api("/api/tracking/orders");
   const orders = (payload.orders || []).filter((order) => String(order.tracking_status || "").toLowerCase() !== "delivered");
   const tracking = { running: true, orders, index: 0, packages: [], packageIndex: 0 };
@@ -118,11 +156,37 @@ async function startTracking(windowId) {
 }
 
 async function stopTracking(windowId) {
+  const { headlessTrackingMode } = await getState();
+  if (headlessTrackingMode) return stopHeadlessTracking();
   const { tracking } = await getWindowState(windowId);
   tracking.running = false;
   await saveTracking(tracking, windowId);
   await log("Tracking stopped.", windowId);
   return { ok: true, message: "Stopped." };
+}
+
+async function startHeadlessTracking() {
+  const result = await api("/api/tracking/browserless/run", {
+    method: "POST",
+    body: JSON.stringify({ worker_id: `tracking-extension-${chrome.runtime.id || "local"}` }),
+    timeoutMs: 10000,
+  });
+  await log(result.message || "Headless tracking started.");
+  return result;
+}
+
+async function stopHeadlessTracking() {
+  const result = await api("/api/tracking/browserless/stop", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 10000,
+  });
+  await log(result.message || "Headless tracking stop requested.");
+  return result;
+}
+
+async function headlessTrackingStatus() {
+  return api("/api/tracking/browserless/status", { timeoutMs: 10000 });
 }
 
 async function handleOrderPackages(message, windowId) {
@@ -200,10 +264,15 @@ async function handleOrderPackages(message, windowId) {
 
 async function handlePackageTracking(message, windowId) {
   const { tracking } = await getWindowState(windowId);
-  if (!tracking.running) return { ok: false };
+  if (!tracking.running) return postStandalonePackageTracking(message, windowId);
   const order = tracking.orders[tracking.index];
-  if (!order || order.amazon_order_id !== message.amazonOrderId) return { ok: false };
-  const packageData = { ...(tracking.packages[tracking.packageIndex] || {}), ...(message.package || {}) };
+  if (!order || order.amazon_order_id !== message.amazonOrderId) return postStandalonePackageTracking(message, windowId);
+  const queuedPackage = tracking.packages[tracking.packageIndex] || {};
+  const pagePackage = message.package || {};
+  const packageData = { ...queuedPackage, ...pagePackage };
+  if (Array.isArray(queuedPackage.asins) && queuedPackage.asins.length) {
+    packageData.asins = queuedPackage.asins;
+  }
   if (message.paymentRevisionNeeded) {
     packageData.payment_revision_needed = true;
     packageData.payment_revision_url = message.paymentRevisionUrl || "";
@@ -237,17 +306,51 @@ async function handlePackageTracking(message, windowId) {
   return { ok: true };
 }
 
+async function postStandalonePackageTracking(message, windowId) {
+  const amazonOrderId = String(message.amazonOrderId || "").trim();
+  const packageData = message.package || {};
+  if (!amazonOrderId || !Object.keys(packageData).length) {
+    return { ok: false, message: "No active tracking run matched this Amazon package page." };
+  }
+  const payloadPackage = { ...packageData, tracking_url: packageData.tracking_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(amazonOrderId)}` };
+  if (message.paymentRevisionNeeded) {
+    payloadPackage.payment_revision_needed = true;
+    payloadPackage.payment_revision_url = message.paymentRevisionUrl || "";
+    payloadPackage.page_text = message.pageText || "";
+  }
+  await api("/api/tracking/update", {
+    method: "POST",
+    body: JSON.stringify({
+      amazon_order_id: amazonOrderId,
+      amazon_order_url: `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(amazonOrderId)}`,
+      packages: [payloadPackage],
+      payment_revision_needed: Boolean(payloadPackage.payment_revision_needed),
+      payment_revision_url: payloadPackage.payment_revision_url || "",
+      page_text: payloadPackage.page_text || "",
+    }),
+  });
+  await log(`Posted standalone tracking update for ${amazonOrderId}; recovered from a stale extension queue.`, windowId);
+  return { ok: true, recovered: true, message: `Posted standalone tracking update for ${amazonOrderId}.` };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
     if (message.type === "GET_STATE") return getWindowState(windowId);
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "SET_API_BASE") {
-      await chrome.storage.local.set({ apiBase: message.apiBase || DEFAULT_API_BASE, adminToken: message.adminToken || "" });
+      await chrome.storage.local.set({
+        apiBase: normalizeApiBase(message.apiBase),
+        adminToken: message.adminToken || "",
+        headlessTrackingMode: message.headlessTrackingMode === true,
+      });
       return { ok: true };
     }
     if (message.type === "START_TRACKING") return startTracking(windowId);
     if (message.type === "STOP_TRACKING") return stopTracking(windowId);
+    if (message.type === "START_HEADLESS_TRACKING") return startHeadlessTracking();
+    if (message.type === "STOP_HEADLESS_TRACKING") return stopHeadlessTracking();
+    if (message.type === "GET_HEADLESS_TRACKING_STATUS") return headlessTrackingStatus();
     if (message.type === "ORDER_PACKAGES") return handleOrderPackages(message, windowId);
     if (message.type === "PACKAGE_TRACKING") return handlePackageTracking(message, windowId);
     return { ok: false, message: "Unknown message." };

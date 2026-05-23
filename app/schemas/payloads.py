@@ -167,9 +167,22 @@ class ChromeJobResetPayload(BaseModel):
 class ChromeBrowserlessRunPayload(BaseModel):
     worker_id: str = ""
     store_id: Optional[int] = None
-    ordering_engine: str = "rest"
+    ordering_engine: str = "chrome_browserless"
     split_mixed_asin: bool = False
     max_jobs: int = 0
+
+
+class ChromeTrackingBrowserlessRunPayload(BaseModel):
+    worker_id: str = ""
+    store_id: Optional[int] = None
+    max_orders: int = 0
+
+
+class EpostBrowserlessRunPayload(BaseModel):
+    worker_id: str = ""
+    store_id: Optional[int] = None
+    interval_days: int = 1
+    max_batches: int = 0
 
 
 class EpostTrackingUpdatePayload(BaseModel):

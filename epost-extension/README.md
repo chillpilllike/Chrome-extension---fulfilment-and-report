@@ -18,3 +18,9 @@
 4. Click **Track due codes**.
 
 The extension submits up to 25 tracking codes at a time to `portal.epgshipping.com`, captures status, last update date/time, destination, AWB, details, and updates the local app. Codes stop being tracked once status contains `Delivered`.
+
+## Background/headless mode
+
+Enable **Run ePost in background/headless Chrome** before clicking **Track due codes** to run the same extraction pipeline through the local app's Playwright Chrome runner. This mode injects the same `content.js` parser used by normal Chrome mode, so parser fixes and portal workflow improvements are shared between both modes.
+
+The local app must be running and Python Playwright must be installed from `requirements.txt`. The runner uses the shared Chrome background profile at `data/chrome-headless-profile` unless `CHROME_BROWSERLESS_PROFILE_DIR` or `CHROME_HEADLESS_USER_DATA_DIR` is set.

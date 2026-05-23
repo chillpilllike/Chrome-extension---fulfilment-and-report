@@ -1,4 +1,5 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const TRACKER_URL = "https://portal.epgshipping.com/ParcelTracker/HomePageTracker";
 
 async function getState() {
@@ -6,6 +7,7 @@ async function getState() {
     apiBase: DEFAULT_API_BASE,
     adminToken: "",
     intervalDays: 1,
+    headlessEpostMode: false,
     epostRun: { running: false, batches: [], batchIndex: 0 },
     epostRunByWindow: {},
     logs: [],
@@ -50,12 +52,30 @@ async function log(message, windowId = null) {
   await chrome.storage.local.set({ logsByWindow: next, logs: next[key] });
 }
 
+function normalizeApiBase(apiBase) {
+  return String(apiBase || DEFAULT_API_BASE).trim().replace(/\/+$/, "") || DEFAULT_API_BASE;
+}
+
+function connectionErrorMessage(error, base = "") {
+  const raw = String(error?.message || error || "Failed to fetch");
+  if (/failed to fetch|networkerror|load failed|abort/i.test(raw)) {
+    return `Could not reach the local app at ${base || DEFAULT_API_BASE}. Make sure it is running on port 8000, then save and check the connection again.`;
+  }
+  return raw;
+}
+
 async function api(path, options = {}) {
   const { apiBase, adminToken } = await getState();
-  const response = await fetch(`${apiBase}${path}`, {
-    headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...(options.headers || {}) },
-    ...options,
-  });
+  const base = normalizeApiBase(apiBase);
+  const requestPath = String(path || "").startsWith("/") ? path : `/${path}`;
+  const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, headers = {}, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS));
+  const response = await fetch(`${base}${requestPath}`, {
+    ...fetchOptions,
+    headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...headers },
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
   if (!response.ok) {
     throw new Error((await response.text()) || response.statusText);
   }
@@ -64,13 +84,13 @@ async function api(path, options = {}) {
 
 async function testConnection() {
   const { apiBase, adminToken } = await getState();
-  const base = String(apiBase || DEFAULT_API_BASE).replace(/\/+$/, "");
-  const health = await fetch(`${base}/health`);
-  if (!health.ok) throw new Error(`Server health check failed: HTTP ${health.status}`);
-  const auth = await fetch(`${base}/api/settings/admin-access`, {
-    headers: adminToken ? { "X-Admin-Token": adminToken } : {},
-  });
-  if (!auth.ok) throw new Error((await auth.text()) || `Admin token check failed: HTTP ${auth.status}`);
+  const base = normalizeApiBase(apiBase);
+  try {
+    await api("/health", { timeoutMs: 8000 });
+    await api("/api/settings/admin-access", { timeoutMs: 8000, headers: adminToken ? { "X-Admin-Token": adminToken } : {} });
+  } catch (error) {
+    throw new Error(connectionErrorMessage(error, base));
+  }
   return { ok: true, message: `Connected to ${base}. Admin token accepted.` };
 }
 
@@ -99,6 +119,7 @@ async function scheduleAlarm(days) {
 
 async function startEpost(windowId = null) {
   const state = await getState();
+  if (state.headlessEpostMode) return startHeadlessEpost();
   await scheduleAlarm(state.intervalDays);
   const payload = await api(`/api/epost/due?days=${encodeURIComponent(state.intervalDays || 1)}`);
   const rows = payload.rows || [];
@@ -117,11 +138,38 @@ async function startEpost(windowId = null) {
 }
 
 async function stopEpost(windowId) {
+  const { headlessEpostMode } = await getState();
+  if (headlessEpostMode) return stopHeadlessEpost();
   const { epostRun } = await getWindowState(windowId);
   epostRun.running = false;
   await saveEpostRun(epostRun, windowId);
   await log("ePost tracking stopped.", windowId);
   return { ok: true, message: "Stopped." };
+}
+
+async function startHeadlessEpost() {
+  const { intervalDays } = await getState();
+  const result = await api("/api/epost/browserless/run", {
+    method: "POST",
+    body: JSON.stringify({ worker_id: `epost-extension-${chrome.runtime.id || "local"}`, interval_days: Math.max(1, Math.min(30, Number(intervalDays || 1))) }),
+    timeoutMs: 10000,
+  });
+  await log(result.message || "Headless ePost started.");
+  return result;
+}
+
+async function stopHeadlessEpost() {
+  const result = await api("/api/epost/browserless/stop", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 10000,
+  });
+  await log(result.message || "Headless ePost stop requested.");
+  return result;
+}
+
+async function headlessEpostStatus() {
+  return api("/api/epost/browserless/status", { timeoutMs: 10000 });
 }
 
 async function handlePortalReady(windowId) {
@@ -200,15 +248,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "SET_SETTINGS") {
       await chrome.storage.local.set({
-        apiBase: message.apiBase || DEFAULT_API_BASE,
+        apiBase: normalizeApiBase(message.apiBase),
         adminToken: message.adminToken || "",
         intervalDays: Math.max(1, Math.min(30, Number(message.intervalDays || 1))),
+        headlessEpostMode: message.headlessEpostMode === true,
       });
       await scheduleAlarm(message.intervalDays);
       return { ok: true };
     }
     if (message.type === "START_EPOST") return startEpost(windowId);
     if (message.type === "STOP_EPOST") return stopEpost(windowId);
+    if (message.type === "START_HEADLESS_EPOST") return startHeadlessEpost();
+    if (message.type === "STOP_HEADLESS_EPOST") return stopHeadlessEpost();
+    if (message.type === "GET_HEADLESS_EPOST_STATUS") return headlessEpostStatus();
     if (message.type === "PORTAL_READY") return handlePortalReady(windowId);
     if (message.type === "BATCH_SUBMITTED") return handleBatchSubmitted(message, windowId);
     if (message.type === "EPOST_RESULTS") return handleResults(message, windowId);

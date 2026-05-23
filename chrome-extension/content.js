@@ -5344,6 +5344,7 @@ function renderOrderHistoryAnnotation(card, result) {
       link.rel = "noreferrer";
       link.textContent = order.odoo_order_name || `Odoo ${order.odoo_order_id}`;
       links.appendChild(link);
+      links.appendChild(orderHistoryCopyButton(order.odoo_order_name || order.odoo_order_id || ""));
     });
     if (orders.length > 4) {
       links.appendChild(document.createTextNode(` +${orders.length - 4}`));
@@ -5362,6 +5363,7 @@ function renderOrderHistoryAnnotation(card, result) {
       link.rel = "noreferrer";
       link.textContent = order.odoo_order_name || `Odoo ${order.odoo_order_id}`;
       links.appendChild(link);
+      links.appendChild(orderHistoryCopyButton(order.odoo_order_name || order.odoo_order_id || ""));
     });
     const resultAsins = new Set((result.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
     const existingIds = [...new Set(suggestions
@@ -5437,6 +5439,55 @@ function compactQuantity(value) {
   const number = Number(value || 0);
   if (!Number.isFinite(number)) return "0";
   return Number.isInteger(number) ? String(number) : String(Math.round(number * 100) / 100);
+}
+
+async function copyOrderHistoryText(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const input = document.createElement("textarea");
+    input.value = text;
+    input.setAttribute("readonly", "readonly");
+    input.style.position = "fixed";
+    input.style.left = "-9999px";
+    input.style.top = "0";
+    document.body.appendChild(input);
+    input.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch (error) {
+      copied = false;
+    }
+    input.remove();
+    return copied;
+  }
+}
+
+function orderHistoryCopyButton(value) {
+  const text = String(value || "").trim();
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "nutricity-order-history-copy";
+  button.setAttribute("aria-label", text ? `Copy ${text}` : "Copy Odoo order ID");
+  button.title = text ? `Copy ${text}` : "Copy Odoo order ID";
+  button.disabled = !text;
+  button.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!text) return;
+    const copied = await copyOrderHistoryText(text);
+    button.classList.toggle("is-copied", copied);
+    button.title = copied ? `Copied ${text}` : `Could not copy ${text}`;
+    window.setTimeout(() => {
+      button.classList.remove("is-copied");
+      button.title = `Copy ${text}`;
+    }, 1200);
+  });
+  return button;
 }
 
 function appendOrderHistoryQuantitySummary(marker, orders = []) {

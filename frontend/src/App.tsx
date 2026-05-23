@@ -161,6 +161,8 @@ type AmazonAccount = {
 
 type OrderLine = {
   id: number
+  store_id: number
+  store_name?: string
   odoo_order_id?: number
   odoo_order_name: string
   odoo_order_date: string
@@ -973,6 +975,7 @@ type AccountingData = {
 }
 
 type OrderColumnKey =
+  | "store"
   | "odoo_order"
   | "odoo_order_date"
   | "destination_country"
@@ -1030,6 +1033,7 @@ type OrderColumn = {
 const ORDER_TABLE_STORAGE_KEY = "fulfilment.orderTable.columns.v1"
 
 const defaultOrderColumns: OrderColumn[] = [
+  { key: "store", label: "Store", width: "w-36" },
   { key: "odoo_order", label: "Odoo Order", width: "w-32", sortable: "odoo_order_name" },
   { key: "odoo_order_date", label: "Order Date", width: "w-44", sortable: "odoo_order_date" },
   { key: "destination_country", label: "Country", width: "w-36", sortable: "destination_country" },
@@ -1213,8 +1217,7 @@ function adminDownloadHref(path: string) {
 
 function openExternalUrl(href?: string) {
   if (!href) return
-  const opened = window.open(href, "_blank", "noopener,noreferrer")
-  if (!opened) window.location.assign(href)
+  window.open(href, "_blank", "noopener,noreferrer")
 }
 
 function openExternalLink(event: MouseEvent<HTMLAnchorElement>, href?: string) {
@@ -1888,6 +1891,7 @@ function App() {
   const [days, setDays] = useState(() => savedPullSetting(PULL_DAYS_STORAGE_KEY, "7"))
   const [limit, setLimit] = useState(() => savedPullSetting(PULL_LIMIT_STORAGE_KEY, "0"))
   const [pullStoreIds, setPullStoreIds] = useState<string[]>(savedPullStoreIds)
+  const [pullOrderNames, setPullOrderNames] = useState("")
   const [search, setSearch] = useState("")
   const [orderCondition, setOrderCondition] = useState("all")
   const [selected, setSelected] = useState<number[]>([])
@@ -1982,6 +1986,16 @@ function App() {
     setOrdersPage(1)
     setOrdersSelectAll(false)
     setSelected([])
+  }
+
+  function updateStoreView(value: string) {
+    ordersRequestSeqRef.current += 1
+    setStoreId(value)
+    resetPagination()
+    refreshOrdersPage(value, 1).catch((error) => {
+      if (error instanceof AdminAuthError) return
+      setModal({ ok: false, title: "Orders load failed", message: String(error) })
+    })
   }
 
   function updateSortKey(value: SortKey) {
@@ -2183,7 +2197,7 @@ function App() {
       ? refresh(storeId, ordersPage).finally(() => {
         initialDashboardRefreshDone.current = true
       })
-      : page === "orders" && storeId && data
+      : page === "orders" && data
         ? refreshOrdersPage(storeId, ordersPage)
         : Promise.resolve()
     load.catch((error) => {
@@ -2449,8 +2463,11 @@ function App() {
   }, [ordersLoading, rows])
   const sortedRows = filteredRows
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
-  const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
+  const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "store" ? "store_name" : column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
   const selectedRows = rows.filter((row) => selected.includes(row.id))
+  const selectedStoreIds = Array.from(new Set(selectedRows.map((row) => Number(row.store_id || 0)).filter(Boolean)))
+  const selectedActionStoreId = selected.length > 0 && selectedRows.length === selected.length && selectedStoreIds.length === 1 ? selectedStoreIds[0] : null
+  const canRunSelectedStoreAction = Boolean(selected.length && selectedActionStoreId)
   const selectedClubName = selectedRows.length
     ? `Nutricity ${Array.from(new Set(selectedRows.map((row) => row.odoo_order_name))).join(" ")}`
     : ""
@@ -2490,12 +2507,26 @@ function App() {
     selectOrderRow(row, shiftKey, !selected.includes(row.id))
   }
 
+  function selectedStoreIdForAction(title: string) {
+    if (selectedActionStoreId) return selectedActionStoreId
+    setModal({
+      ok: false,
+      title,
+      message: selected.length
+        ? "Select order lines from one store only. Store-specific actions use the selected rows' store, not the global filter."
+        : "Select at least one order line.",
+    })
+    return null
+  }
+
   function placeSelectedOrders() {
+    const actionStoreId = selectedStoreIdForAction("Place Selected")
+    if (!actionStoreId) return
     return runAction("Place Selected", () =>
       api<DashboardData>("/api/place", {
         method: "POST",
         body: JSON.stringify({
-          store_id: Number(storeId),
+          store_id: actionStoreId,
           address_id: Number(addressId),
           amazon_account_id: Number(amazonAccountId),
           line_ids: selected,
@@ -2508,11 +2539,13 @@ function App() {
   }
 
   function clubPlaceSelectedOrders() {
+    const actionStoreId = selectedStoreIdForAction("Club Place Selected")
+    if (!actionStoreId) return
     return runAction("Club Place Selected", () =>
       api<DashboardData>("/api/place", {
         method: "POST",
         body: JSON.stringify({
-          store_id: Number(storeId),
+          store_id: actionStoreId,
           address_id: Number(addressId),
           amazon_account_id: Number(amazonAccountId),
           line_ids: selected,
@@ -2567,33 +2600,40 @@ function App() {
 
   function resetSelectedOrders() {
     if (!selected.length || busy) return
+    if (!selectedStoreIdForAction("Reset Selected")) return
     setResetFulfilmentConfirmOpen(true)
   }
 
   function confirmResetSelectedOrders() {
+    const actionStoreId = selectedStoreIdForAction("Reset Selected")
+    if (!actionStoreId) return
     setResetFulfilmentConfirmOpen(false)
     return runAction("Reset Selected", () =>
       api<DashboardData>("/api/lines/reset-fulfilment", {
         method: "POST",
-        body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
+        body: JSON.stringify({ store_id: actionStoreId, line_ids: selected }),
       }),
     )
   }
 
   function ignoreSelectedOrders() {
+    const actionStoreId = selectedStoreIdForAction("Mark Do Not Process")
+    if (!actionStoreId) return
     return runAction("Mark Do Not Process", () =>
       api<DashboardData>("/api/lines/ignore", {
         method: "POST",
-        body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
+        body: JSON.stringify({ store_id: actionStoreId, line_ids: selected }),
       }),
     )
   }
 
   function deleteSelectedOrders() {
+    const actionStoreId = selectedStoreIdForAction("Delete Selected Lines")
+    if (!actionStoreId) return
     return runAction("Delete Selected Lines", () =>
       api<DashboardData>("/api/lines/delete", {
         method: "POST",
-        body: JSON.stringify({ store_id: Number(storeId), line_ids: selected }),
+        body: JSON.stringify({ store_id: actionStoreId, line_ids: selected }),
       }),
     )
   }
@@ -2639,6 +2679,32 @@ function App() {
       setSelected([])
       setPage("pull-jobs")
       setModal({ ok: result.ok ?? true, title, message: result.message || "Started background pull jobs." })
+    } catch (error) {
+      setModal({ ok: false, title, message: String(error) })
+    } finally {
+      setBusy("")
+    }
+  }
+
+  async function runPullOrderNames() {
+    const title = "Pull Odoo Orders"
+    const orderRefs = Array.from(new Set((pullOrderNames.match(/\bNC\d+\b/gi) || []).map((value) => value.toUpperCase())))
+    if (!storeId) {
+      setModal({ ok: false, title, message: "Select a store first." })
+      return
+    }
+    if (!orderRefs.length) {
+      setModal({ ok: false, title, message: "Enter at least one Odoo order number, for example NC10216." })
+      return
+    }
+    try {
+      setBusy(title)
+      const result = await api<{ ok?: boolean; message?: string; pulled?: number }>("/api/pull/order-names", {
+        method: "POST",
+        body: JSON.stringify({ store_id: Number(storeId), order_names: orderRefs }),
+      })
+      await refreshCurrentOrdersPage()
+      setModal({ ok: result.ok ?? true, title, message: result.message || "Pulled requested Odoo orders." })
     } catch (error) {
       setModal({ ok: false, title, message: String(error) })
     } finally {
@@ -2711,6 +2777,8 @@ function App() {
 
   function renderOrderCell(row: OrderLine, column: OrderColumn) {
     switch (column.key) {
+      case "store":
+        return row.store_name ? <Badge variant="outline">{row.store_name}</Badge> : <span className="text-muted-foreground">-</span>
       case "odoo_order":
         return row.odoo_order_url ? (
           <a
@@ -2951,13 +3019,15 @@ function App() {
         open={manualFulfilmentOpen}
         selectedCount={selected.length}
         onClose={() => setManualFulfilmentOpen(false)}
-        onSubmit={async (payload) => {
-          await runAction("Manual Fulfilment", () =>
-            api<DashboardData>("/api/lines/manual-fulfilment", {
-              method: "POST",
-              body: JSON.stringify({ store_id: Number(storeId), line_ids: selected, ...payload }),
-            }),
-          )
+	        onSubmit={async (payload) => {
+	          const actionStoreId = selectedStoreIdForAction("Manual Fulfilment")
+	          if (!actionStoreId) return
+	          await runAction("Manual Fulfilment", () =>
+	            api<DashboardData>("/api/lines/manual-fulfilment", {
+	              method: "POST",
+	              body: JSON.stringify({ store_id: actionStoreId, line_ids: selected, ...payload }),
+	            }),
+	          )
           setManualFulfilmentOpen(false)
           setSelected([])
         }}
@@ -3220,7 +3290,20 @@ function App() {
                       Save Pull Defaults
                     </Button>
                     </div>
-                    <SelectField className="max-w-md" label="Store view" value={storeId} onChange={(value) => { resetPagination(); refresh(value, 1) }}>
+                    <div className="grid gap-3 lg:grid-cols-[minmax(280px,1fr)_auto] lg:items-end">
+                      <TextField
+                        label="Pull specific Odoo orders"
+                        value={pullOrderNames}
+                        onChange={setPullOrderNames}
+                        placeholder="NC10216, NC10212 or one per line"
+                      />
+                      <Button variant="outline" onClick={runPullOrderNames} disabled={!storeId || Boolean(busy)}>
+                        <RefreshCw className="size-4" />
+                        Pull These Orders
+                      </Button>
+                    </div>
+                    <SelectField className="max-w-md" label="Store filter" value={storeId} onChange={updateStoreView}>
+                      <option value="">All stores</option>
                       {stores.map((store) => (
                         <option key={store.id} value={store.id}>
                           {store.name}
@@ -3434,58 +3517,58 @@ function App() {
                       <RefreshCw className="size-4" />
                       Force Sync Shopify
                     </Button>
-                    <Button
-                      variant="outline"
-                      disabled={!selected.length || Boolean(busy)}
-                      onClick={placeSelectedOrders}
-                    >
+	                    <Button
+	                      variant="outline"
+	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      onClick={placeSelectedOrders}
+	                    >
                       Place Selected
                     </Button>
-                    <Button
-                      variant="outline"
-                      disabled={!selected.length || Boolean(busy)}
-                      onClick={() => setManualFulfilmentOpen(true)}
-                    >
+	                    <Button
+	                      variant="outline"
+	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      onClick={() => setManualFulfilmentOpen(true)}
+	                    >
                       <CheckCircle2 className="size-4" />
                       Manually Fulfilled
                     </Button>
-                    <Button
-                      variant="outline"
-                      disabled={selected.length !== 1 || Boolean(busy)}
-                      onClick={() => {
+	                    <Button
+	                      variant="outline"
+	                      disabled={!canRunSelectedStoreAction || selected.length !== 1 || Boolean(busy)}
+	                      onClick={() => {
                         const line = rows.find((row) => row.id === selected[0])
                         if (line) setEditingReplacement(line)
                       }}
                     >
                       Replace ASIN
                     </Button>
-                    <Button
-                      disabled={!selected.length || Boolean(busy)}
-                      onClick={clubPlaceSelectedOrders}
-                    >
+	                    <Button
+	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      onClick={clubPlaceSelectedOrders}
+	                    >
                       Club Place
                     </Button>
-                    <Button
-                      variant="outline"
-                      disabled={!selected.length || Boolean(busy)}
-                      onClick={ignoreSelectedOrders}
-                    >
+	                    <Button
+	                      variant="outline"
+	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      onClick={ignoreSelectedOrders}
+	                    >
                       <AlertCircle className="size-4" />
                       Do Not Process
                     </Button>
-                    <Button
-                      variant="outline"
-                      disabled={!selected.length || Boolean(busy)}
-                      onClick={resetSelectedOrders}
-                    >
+	                    <Button
+	                      variant="outline"
+	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      onClick={resetSelectedOrders}
+	                    >
                       <RefreshCw className="size-4" />
                       Reset Selected
                     </Button>
-                    <Button
-                      variant="destructive"
-                      disabled={!selected.length || Boolean(busy)}
-                      onClick={deleteSelectedOrders}
-                    >
+	                    <Button
+	                      variant="destructive"
+	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      onClick={deleteSelectedOrders}
+	                    >
                       <Trash2 className="size-4" />
                       Delete
                     </Button>
@@ -3697,28 +3780,28 @@ function App() {
                       {selectedClubName ? <span className="hidden max-w-xl truncate text-sm text-muted-foreground lg:block">{selectedClubName}</span> : null}
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <Button variant="outline" disabled={Boolean(busy)} onClick={placeSelectedOrders}>
+	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={placeSelectedOrders}>
                         Place Selected
                       </Button>
-                      <Button variant="outline" disabled={Boolean(busy)} onClick={() => setManualFulfilmentOpen(true)}>
+	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={() => setManualFulfilmentOpen(true)}>
                         <CheckCircle2 className="size-4" />
                         Manually Fulfilled
                       </Button>
-                      <Button disabled={Boolean(busy)} onClick={clubPlaceSelectedOrders}>
+	                      <Button disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={clubPlaceSelectedOrders}>
                         Club Place
                       </Button>
-                      <Button variant="outline" disabled={Boolean(busy)} onClick={ignoreSelectedOrders}>
+	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={ignoreSelectedOrders}>
                         <AlertCircle className="size-4" />
                         Do Not Process
                       </Button>
-                      <Button variant="outline" disabled={Boolean(busy)} onClick={resetSelectedOrders}>
+	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={resetSelectedOrders}>
                         <RefreshCw className="size-4" />
                         Reset
                       </Button>
                       <Button variant="ghost" disabled={Boolean(busy)} onClick={() => { setOrdersSelectAll(false); setSelected([]) }}>
                         Clear
                       </Button>
-                      <Button variant="destructive" disabled={Boolean(busy)} onClick={deleteSelectedOrders}>
+	                      <Button variant="destructive" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={deleteSelectedOrders}>
                         <Trash2 className="size-4" />
                         Delete
                       </Button>
@@ -4424,6 +4507,7 @@ function TrackingPage({
         <div className="flex items-end gap-2">
           <SelectField className="w-44" label="Filter" value={statusFilter} onChange={(value) => { setStatusFilter(value); onPage(1) }}>
             <option value="active">Active</option>
+            <option value="recent">Recently checked</option>
             <option value="cancelled">Cancelled</option>
           </SelectField>
           <Button variant="outline" onClick={refreshTracking} disabled={loading}>
@@ -7680,9 +7764,23 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     }
   }
   async function retryJob(jobId: string) {
-    const result = await api<{ ok: boolean; message: string }>(`/api/shopify/fulfilment/jobs/${jobId}/retry`, { method: "POST" })
-    await load()
-    onResult({ ok: result.ok, title: "Retry Shopify Job", message: result.message })
+    setBusy(`Retry-${jobId}`)
+    setProgress({
+      status: "running",
+      total: Math.max(1, progressTotal || 1),
+      processed: progressProcessed,
+      message: "Starting Shopify sync for this order.",
+    })
+    try {
+      await saveProductTitleSettings(false)
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(`/api/shopify/fulfilment/jobs/${jobId}/retry`, { method: "POST" })
+      if (result.progress) setProgress(result.progress)
+      await load()
+      window.setTimeout(() => load().catch(() => undefined), 1500)
+      onResult({ ok: result.ok, title: "Shopify Sync Started", message: result.message })
+    } finally {
+      setBusy("")
+    }
   }
   async function clearCompletedJobs() {
     const confirmed = window.confirm("Clear completed Shopify fulfilment jobs from the displayed history? Queued, running, failed, and dead jobs will stay visible.")
@@ -8151,10 +8249,10 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                     <div className="flex flex-wrap gap-2">
                       {["amazon_placed", "queued", "failed", "dead"].includes(job.status) ? (
                         <Button size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => retryJob(job.id)}>
-                          {["amazon_placed", "queued"].includes(job.status) ? "Sync Now" : "Retry"}
+                          {busy === `Retry-${job.id}` ? "Syncing..." : ["amazon_placed", "queued"].includes(job.status) ? "Sync Now" : "Retry"}
                         </Button>
                       ) : null}
-                      {job.shopify_order_id ? (
+                      {job.shopify_order_id && ["completed", "failed", "dead"].includes(job.status) ? (
                         <Button size="sm" variant="warning" disabled={Boolean(busy)} onClick={() => repushJob(job)}>
                           {busy === `Repush-${job.id}` ? "Repushing..." : "Repush"}
                         </Button>
@@ -9429,11 +9527,11 @@ function SettingsTable<T extends { id: number }>({
   )
 }
 
-function TextField({ label, value, onChange, type = "text" }: { label: string; value: string; onChange: (value: string) => void; type?: string }) {
+function TextField({ label, value, onChange, type = "text", placeholder = "" }: { label: string; value: string; onChange: (value: string) => void; type?: string; placeholder?: string }) {
   return (
     <div className="grid gap-1.5">
       <Label>{label}</Label>
-      <Input type={type} value={value || ""} onChange={(event) => onChange(event.target.value)} />
+      <Input type={type} value={value || ""} placeholder={placeholder} onChange={(event) => onChange(event.target.value)} />
     </div>
   )
 }

@@ -6,6 +6,7 @@ const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAs
 const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
 const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
 const connectionNotice = document.querySelector("#connectionNotice");
+const modeNotice = document.querySelector("#modeNotice");
 const statusBox = document.querySelector("#status");
 const orderProgressCounter = document.querySelector("#orderProgressCounter");
 const orderProgressBar = document.querySelector("#orderProgressBar");
@@ -39,6 +40,7 @@ let targetWindowId = Number(popupParams.get("targetWindowId") || 0) || null;
 let controlWindowId = null;
 let settingsDirty = false;
 let settingsHydrated = false;
+let settingsHydratePromise = null;
 
 function hydrateSettingsValues(settings = {}) {
   apiBase.value = settings.apiBase || "http://127.0.0.1:8000";
@@ -48,6 +50,7 @@ function hydrateSettingsValues(settings = {}) {
   fulfilAvailableMixedAsin.checked = settings.fulfilAvailableMixedAsin === true;
   splitMixedAsinOrders.checked = settings.splitMixedAsinOrders !== false;
   browserlessOrderMode.checked = settings.browserlessOrderMode === true;
+  updateModeNotice();
 }
 
 function hasSettingsPayload(state) {
@@ -63,19 +66,29 @@ function hasSettingsPayload(state) {
 }
 
 function loadSavedSettings() {
-  chrome.storage.local.get({
-    apiBase: "http://127.0.0.1:8000",
-    adminToken: "",
-    cardLast4Preference: "",
-    editExistingAddress: true,
-    fulfilAvailableMixedAsin: false,
-    splitMixedAsinOrders: true,
-    browserlessOrderMode: false,
-  }, (settings) => {
-    if (chrome.runtime.lastError || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].includes(document.activeElement)) return;
-    hydrateSettingsValues(settings);
-    settingsHydrated = true;
+  settingsHydratePromise = new Promise((resolve) => {
+    chrome.storage.local.get({
+      apiBase: "http://127.0.0.1:8000",
+      adminToken: "",
+      cardLast4Preference: "",
+      editExistingAddress: true,
+      fulfilAvailableMixedAsin: false,
+      splitMixedAsinOrders: true,
+      browserlessOrderMode: false,
+    }, (settings) => {
+      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].includes(document.activeElement)) {
+        hydrateSettingsValues(settings);
+        settingsHydrated = true;
+      }
+      resolve(settings);
+    });
   });
+  return settingsHydratePromise;
+}
+
+async function waitForSettingsHydration() {
+  if (settingsHydrated || settingsDirty) return;
+  if (settingsHydratePromise) await settingsHydratePromise;
 }
 
 function registerControlWindow() {
@@ -96,6 +109,19 @@ function registerControlWindow() {
     settingsDirty = true;
   });
 });
+
+function updateModeNotice() {
+  if (!modeNotice) return;
+  if (browserlessOrderMode.checked) {
+    modeNotice.hidden = false;
+    modeNotice.textContent = "Background/headless mode is selected. Start will use the separate backend Chrome runner and will not use the Amazon API.";
+  } else {
+    modeNotice.hidden = false;
+    modeNotice.textContent = "Visible Chrome mode is selected. Start will open an Amazon worker window and use the proven extension pipeline.";
+  }
+}
+
+browserlessOrderMode.addEventListener("change", updateModeNotice);
 
 function syncSettingsInputs(state) {
   if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].includes(document.activeElement)) return;
@@ -317,6 +343,7 @@ async function refresh() {
     syncSettingsInputs(state);
     const job = state.activeJob?.job;
     pauseResume.textContent = state.activeJob?.paused ? "Resume" : "Pause";
+    updateModeNotice();
     pauseResume.disabled = !job;
     skipJob.disabled = !job;
     markMissing.disabled = !job;
@@ -476,6 +503,7 @@ setInterval(refresh, 5000);
 async function runPopupRecoveryAction() {
   const action = popupParams.get("action");
   if (!action) return;
+  await waitForSettingsHydration();
   if (action === "stop-start") {
     const lockKey = "popupRecoveryAction";
     const lock = await chrome.storage.local.get({ [lockKey]: null });
@@ -491,7 +519,7 @@ async function runPopupRecoveryAction() {
     try {
       await send({ type: "STOP_JOB" }).catch(() => null);
       await send({ type: "CLEAR_FORCE_STOP" }).catch(() => null);
-      const result = await send({ type: "START_NEXT" });
+      const result = await send({ type: browserlessOrderMode.checked ? "START_BROWSERLESS" : "START_NEXT" });
       if (result?.targetWindowId) {
         targetWindowId = result.targetWindowId;
         registerControlWindow();

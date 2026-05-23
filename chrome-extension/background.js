@@ -762,12 +762,13 @@ async function startBrowserlessOrderRun(sourceWindowId = null) {
     return { ok: false, active_job_running: true, message };
   }
   const workerId = await getWorkerId();
+  const browserlessWorkerId = workerId.startsWith("browserless-") ? workerId : `browserless-${workerId}`;
   const { splitMixedAsinOrders } = await getSettings();
   const result = await api("/api/chrome/browserless/run", {
     method: "POST",
     body: JSON.stringify({
-      worker_id: workerId,
-      ordering_engine: "rest",
+      worker_id: browserlessWorkerId,
+      ordering_engine: "chrome_browserless",
       split_mixed_asin: splitMixedAsinOrders === true,
     }),
     timeoutMs: 15000,

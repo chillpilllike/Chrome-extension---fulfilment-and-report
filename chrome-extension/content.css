@@ -270,6 +270,56 @@
   text-decoration: underline;
 }
 
+.nutricity-order-history-copy {
+  position: relative;
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  margin: 0 0 0 4px;
+  padding: 0;
+  vertical-align: -3px;
+  border: 1px solid rgba(37, 99, 235, 0.3);
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.nutricity-order-history-copy::before,
+.nutricity-order-history-copy::after {
+  content: "";
+  position: absolute;
+  width: 7px;
+  height: 8px;
+  border: 1.5px solid #1d4ed8;
+  border-radius: 2px;
+  background: #fff;
+}
+
+.nutricity-order-history-copy::before {
+  left: 4px;
+  top: 3px;
+}
+
+.nutricity-order-history-copy::after {
+  left: 7px;
+  top: 5px;
+}
+
+.nutricity-order-history-copy:hover {
+  border-color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.nutricity-order-history-copy.is-copied {
+  border-color: #16a34a;
+  background: #dcfce7;
+}
+
+.nutricity-order-history-copy.is-copied::before,
+.nutricity-order-history-copy.is-copied::after {
+  border-color: #15803d;
+}
+
 .nutricity-order-history-sync {
   flex: 0 0 auto;
   border: 1px solid #1d4ed8;

@@ -32,6 +32,27 @@ input {
   font: inherit;
 }
 
+.checkbox-row {
+  grid-template-columns: 18px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.checkbox-row input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+.mode-notice {
+  border: 1px solid #dbeafe;
+  border-radius: 6px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  padding: 8px;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;

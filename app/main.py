@@ -54,6 +54,7 @@ from app.schemas import (
     ChromeJobCompletePayload,
     ChromeJobCostlyPayload,
     ChromeBrowserlessRunPayload,
+    ChromeTrackingBrowserlessRunPayload,
     ChromeJobFailPayload,
     ChromeJobHeartbeatPayload,
     ChromeJobResetPayload,
@@ -61,6 +62,7 @@ from app.schemas import (
     CostlyApprovalPayload,
     DeleteLinesPayload,
     EnginePayload,
+    EpostBrowserlessRunPayload,
     ExportCreatePayload,
     EpostSyncPayload,
     EpostTrackingUpdatePayload,
@@ -237,6 +239,36 @@ _CHROME_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "placed": 0,
     "failed": 0,
     "message": "Browserless Chrome ordering has not run yet.",
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "error": "",
+}
+_TRACKING_BROWSERLESS_LOCK = threading.Lock()
+_TRACKING_BROWSERLESS_PROGRESS: dict[str, Any] = {
+    "running": False,
+    "stop_requested": False,
+    "total": 0,
+    "processed": 0,
+    "updated": 0,
+    "failed": 0,
+    "current_order": "",
+    "message": "Headless Amazon tracking has not run yet.",
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "error": "",
+}
+_EPOST_BROWSERLESS_LOCK = threading.Lock()
+_EPOST_BROWSERLESS_PROGRESS: dict[str, Any] = {
+    "running": False,
+    "stop_requested": False,
+    "total": 0,
+    "processed": 0,
+    "updated": 0,
+    "failed": 0,
+    "current_batch": "",
+    "message": "Headless ePost tracking has not run yet.",
     "started_at": "",
     "updated_at": "",
     "completed_at": "",
@@ -2709,6 +2741,30 @@ def selected_line_reasons(store_id: int, line_ids: Optional[list[int]] = None) -
     return reasons[:8]
 
 
+def validate_line_ids_for_store(conn: Any, store_id: int, line_ids: Optional[list[int]], action: str = "This action") -> list[int]:
+    selected_ids = sorted({int(line_id) for line_id in (line_ids or []) if int(line_id or 0) > 0})
+    if not selected_ids:
+        return []
+    placeholders = ",".join("?" for _ in selected_ids)
+    rows = rows_to_dicts(conn.execute(
+        f"SELECT id, store_id, odoo_order_name FROM order_lines WHERE id IN ({placeholders})",
+        selected_ids,
+    ).fetchall())
+    found_ids = {int(row["id"]) for row in rows}
+    missing_ids = [line_id for line_id in selected_ids if line_id not in found_ids]
+    if missing_ids:
+        raise HTTPException(404, f"{action} includes {len(missing_ids)} order line(s) that no longer exist. Refresh and try again.")
+    wrong_store_rows = [row for row in rows if int(row["store_id"]) != int(store_id)]
+    if wrong_store_rows:
+        order_refs = sorted({clean_text(row.get("odoo_order_name")) for row in wrong_store_rows if clean_text(row.get("odoo_order_name"))})
+        suffix = f" Affected order(s): {', '.join(order_refs[:8])}." if order_refs else ""
+        raise HTTPException(
+            400,
+            f"{action} includes order line(s) from another store. Select one store's rows or use that store filter before running the action.{suffix}",
+        )
+    return selected_ids
+
+
 def clean_error_message(message: str) -> str:
     text = str(message or "").strip()
     if not text:
@@ -4049,6 +4105,58 @@ def fetch_odoo_lines(
     return inserted_records
 
 
+def fetch_odoo_orders_by_names(store: Store, order_names: list[str]) -> int:
+    normalized_names = [
+        clean_text(match.group(0)).upper()
+        for value in order_names
+        for match in ORDER_REF_RE.finditer(str(value or ""))
+    ]
+    normalized_names = list(dict.fromkeys(normalized_names))
+    if not normalized_names:
+        raise HTTPException(400, "Enter at least one Odoo order number, for example NC10216.")
+    print(f"[pull-by-order] store={store.id} orders={','.join(normalized_names)} connecting to Odoo", flush=True)
+    odoo = OdooClient(store)
+    domain: list[Any] = [("name", "in", normalized_names)]
+    if store.website_id:
+        domain.append(("website_id", "=", store.website_id))
+    order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "currency_id", "date_order", "partner_shipping_id", "partner_invoice_id", "partner_id"])
+    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
+    product_fields = odoo.existing_fields("product.product", ["id", "product_tmpl_id", "default_code", "detailed_type", "type"])
+    tmpl_fields = odoo.existing_fields("product.template", ["id", "description", "default_code", "detailed_type", "type"])
+    invoice_fields = odoo.existing_fields("account.move", ["id", "move_type", "state", "payment_state", "amount_total_signed"])
+    orders = odoo.search_read("sale.order", domain, order_fields, limit=len(normalized_names), order="date_order desc, id desc")
+    found_names = {clean_text(order.get("name")).upper() for order in orders}
+    missing_names = [name for name in normalized_names if name not in found_names]
+    if missing_names:
+        print(f"[pull-by-order] store={store.id} not found: {','.join(missing_names)}", flush=True)
+    if not orders:
+        return 0
+    enrich_orders_with_destination_countries(odoo, orders)
+    inserted = process_odoo_order_batch(
+        store,
+        odoo,
+        orders,
+        line_fields,
+        product_fields,
+        tmpl_fields,
+        invoice_fields,
+        get_service_settings(),
+    )
+    print(f"[pull-by-order] store={store.id} fetched={len(orders)} inserted={inserted}", flush=True)
+    return inserted
+
+
+def fetch_odoo_orders_by_names_exclusive(store: Store, order_names: list[str], wait: bool = True) -> Optional[int]:
+    acquired = _PULL_EXECUTION_LOCK.acquire(blocking=wait)
+    if not acquired:
+        print(f"[pull-by-order] store={store.id} skipped because another Odoo pull is already running", flush=True)
+        return None
+    try:
+        return fetch_odoo_orders_by_names(store, order_names)
+    finally:
+        _PULL_EXECUTION_LOCK.release()
+
+
 def fetch_odoo_lines_exclusive(
     store: Store,
     days: int,
@@ -4161,7 +4269,9 @@ def manual_amazon_match_followups(
         except Exception as exc:
             print(f"Manual Amazon match line followup failed for {row.get('id')}: {exc}", flush=True)
     try:
-        enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+        queued = enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+        if queued:
+            start_shopify_fulfilment_worker()
     except Exception as exc:
         print(f"Manual Amazon match Shopify enqueue failed: {exc}", flush=True)
     try:
@@ -6995,6 +7105,8 @@ def place_orders(
 ) -> tuple[int, int]:
     store = get_store(store_id)
     amazon_account = get_amazon_account(amazon_account_id)
+    if clean_text(ordering_engine).lower() == "chrome_browserless":
+        raise RuntimeError("Chrome browserless order placement is not implemented yet. Use normal Chrome UI mode for now.")
     ordering_engine = normalize_ordering_engine(ordering_engine)
     amazon = AmazonBusinessClient(amazon_account)
     fulfilment_address = get_address(address_id)
@@ -7356,8 +7468,13 @@ def tracking_rows(store_id: Optional[int] = None, status: str = "active") -> lis
     status = clean_text(status).lower() or "active"
     if status == "cancelled":
         where_status = "COALESCE(amazon_cancelled_at, '') != ''"
+        order_sql = "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC"
+    elif status in {"recent", "checked"}:
+        where_status = "COALESCE(amazon_order_id, '') != '' AND COALESCE(tracking_checked_at, '') != ''"
+        order_sql = "tracking_checked_at DESC, ordered_at DESC, updated_at DESC"
     else:
         where_status = "COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')"
+        order_sql = "tracking_checked_at IS NULL DESC, tracking_checked_at ASC, ordered_at DESC, updated_at DESC"
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -7366,7 +7483,7 @@ def tracking_rows(store_id: Optional[int] = None, status: str = "active") -> lis
             WHERE {where_status}
               AND COALESCE(order_engine, '') != 'third_party'
               AND (? IS NULL OR store_id=?)
-            ORDER BY tracking_checked_at IS NULL DESC, tracking_checked_at ASC, ordered_at DESC, updated_at DESC
+            ORDER BY {order_sql}
             """,
             (store_id, store_id),
         ).fetchall()
@@ -9927,7 +10044,7 @@ def due_shopify_fulfilment_job_count() -> int:
             """
             SELECT COUNT(*) AS count
             FROM shopify_fulfilment_jobs
-            WHERE status IN ('queued', 'failed')
+            WHERE status IN ('amazon_placed', 'queued', 'failed')
               AND attempts < max_attempts
               AND (next_run_at IS NULL OR next_run_at='' OR next_run_at <= ?)
             """,
@@ -12019,6 +12136,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     attach_shopify_status_to_rows(row_dicts)
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
+        row["store_name"] = store.get("name") if store else ""
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         country_code, country_name, country_display = destination_country_from_row(row)
         row["destination_country_code"] = country_code
@@ -12178,6 +12296,7 @@ def hydrate_order_line_rows(rows: list[dict[str, Any]], stores: Optional[list[di
     attach_shopify_status_to_rows(row_dicts)
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
+        row["store_name"] = store.get("name") if store else ""
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         country_code, country_name, country_display = destination_country_from_row(row)
         row["destination_country_code"] = country_code
@@ -13819,6 +13938,35 @@ def api_pull_orders(payload: PullPayload) -> dict[str, Any]:
     return {"ok": True, "message": message, "jobs": jobs, "defer_refresh": True}
 
 
+@app.post("/api/pull/order-names")
+def api_pull_order_names(payload: dict[str, Any]) -> dict[str, Any]:
+    store_id = int(payload.get("store_id") or 0)
+    if not store_id:
+        raise HTTPException(400, "Store is required.")
+    raw_values = payload.get("order_names") or payload.get("order_refs") or payload.get("orders") or payload.get("source_text") or ""
+    if isinstance(raw_values, str):
+        order_names = [raw_values]
+    elif isinstance(raw_values, list):
+        order_names = [str(value or "") for value in raw_values]
+    else:
+        order_names = [str(raw_values or "")]
+    inserted = fetch_odoo_orders_by_names_exclusive(get_store(store_id), order_names, wait=False)
+    if inserted is None:
+        return {
+            "ok": False,
+            "message": "Another Odoo pull is already running. Try targeted pull again after it completes.",
+            "defer_refresh": True,
+        }
+    refs = list(dict.fromkeys(match.group(0).upper() for value in order_names for match in ORDER_REF_RE.finditer(value)))
+    start_typesense_reindex_job()
+    return {
+        "ok": True,
+        "message": f"Pulled {len(refs)} requested Odoo order{'s' if len(refs) != 1 else ''}; saved {int(inserted or 0)} order-line record{'s' if int(inserted or 0) != 1 else ''}.",
+        "pulled": int(inserted or 0),
+        "order_names": refs,
+    }
+
+
 @app.get("/api/pull/jobs")
 def api_pull_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
@@ -13913,6 +14061,9 @@ def api_pull_defaults() -> dict[str, Any]:
 
 @app.post("/api/place")
 def api_place(payload: PlacePayload) -> dict[str, Any]:
+    if payload.line_ids:
+        with db() as conn:
+            payload.line_ids = validate_line_ids_for_store(conn, payload.store_id, payload.line_ids, "Place selected")
     ordering_engine = normalize_ordering_engine(payload.ordering_engine or get_default_ordering_engine())
     if ordering_engine == "chrome":
         selected_count = len(payload.line_ids or [])
@@ -14272,7 +14423,11 @@ def api_shopify_fulfilment_retry(job_id: str) -> dict[str, Any]:
             (utc_now(), utc_now(), job_id),
         )
     start_shopify_fulfilment_worker()
-    return {"ok": True, "message": f"Started sync for {cursor.rowcount} Shopify fulfilment job(s)."}
+    return {
+        "ok": True,
+        "message": f"Started sync for {cursor.rowcount} Shopify fulfilment job(s).",
+        "progress": shopify_fulfilment_progress(),
+    }
 
 
 @app.post("/api/shopify/fulfilment/jobs/{job_id}/repush")
@@ -14547,167 +14702,607 @@ def active_visible_chrome_job_count(store_id: Optional[int] = None) -> int:
         ).fetchone()["count"] or 0)
 
 
+def chrome_browserless_profile_dir() -> Path:
+    configured = clean_text(os.getenv("CHROME_BROWSERLESS_PROFILE_DIR") or os.getenv("CHROME_HEADLESS_USER_DATA_DIR"))
+    return Path(configured).expanduser() if configured else BASE_DIR / "data" / "chrome-headless-profile"
+
+
+def chrome_browserless_executable() -> Optional[str]:
+    configured = clean_text(os.getenv("CHROME_BROWSERLESS_EXECUTABLE") or os.getenv("CHROME_HEADLESS_EXECUTABLE"))
+    if configured:
+        return configured
+    mac_chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if mac_chrome.exists():
+        return str(mac_chrome)
+    return None
+
+
+def chrome_browserless_headless() -> bool:
+    return env_bool("CHROME_BROWSERLESS_HEADLESS", True)
+
+
+def chrome_browserless_available() -> tuple[bool, str]:
+    if importlib.util.find_spec("playwright") is None:
+        return False, "Python Playwright is not installed. Run: .venv/bin/python -m pip install -r requirements.txt"
+    return True, ""
+
+
+def chrome_browserless_active_job_for(job: dict[str, Any], worker_id: str) -> dict[str, Any]:
+    return {
+        "job": job,
+        "itemIndex": 0,
+        "stage": "clear_cart",
+        "cartCleared": False,
+        "paused": False,
+        "promoAcknowledged": {},
+        "pricing": {},
+        "workerId": worker_id,
+        "startedAt": int(time.time() * 1000),
+        "targetWindowId": 0,
+        "browserless": True,
+    }
+
+
+def chrome_browserless_job_submitted(active_job: Optional[dict[str, Any]]) -> bool:
+    if not active_job:
+        return False
+    stage = clean_text(active_job.get("stage"))
+    paused_stage = clean_text(active_job.get("pausedStage"))
+    job = active_job.get("job") or {}
+    if active_job.get("amazonSubmittedAt"):
+        return True
+    if job.get("submitted_to_amazon"):
+        return True
+    if clean_text(job.get("amazon_status")) in {"order_submitted", "reporting_complete"}:
+        return True
+    return stage in {"complete_pending", "find_order_id", "reporting_complete"} or paused_stage in {"complete_pending", "find_order_id", "reporting_complete"}
+
+
+def chrome_browserless_release_job(active_job: Optional[dict[str, Any]], reason: str = "") -> None:
+    if not active_job:
+        return
+    job = active_job.get("job") or {}
+    group_key = clean_text(job.get("group_key"))
+    worker_id = clean_text(active_job.get("workerId"))
+    if not group_key or not worker_id or chrome_browserless_job_submitted(active_job):
+        return
+    try:
+        api_chrome_job_release(group_key, ChromeJobHeartbeatPayload(worker_id=worker_id))
+    except Exception as exc:
+        print(f"Browserless Chrome could not release {group_key} after {reason}: {exc}", flush=True)
+
+
+def chrome_browserless_complete_from_message(active_job: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    job = active_job.get("job") or {}
+    result = api_chrome_job_complete(
+        clean_text(job.get("group_key")),
+        ChromeJobCompletePayload(
+            amazon_order_id=clean_text(message.get("orderId")),
+            amazon_order_url=clean_text(message.get("orderUrl")),
+            amazon_account_name=clean_text(message.get("amazonAccountName")) or clean_text(job.get("amazon_account_name")) or "Chrome Browserless",
+            order_date=clean_text(message.get("orderDate")),
+            line_ids=[int(value) for value in job.get("line_ids") or [] if int(value or 0) > 0],
+            order_mappings=message.get("orderMappings") or [],
+            pricing_summary=list((active_job.get("pricing") or {}).values()),
+            worker_id=clean_text(active_job.get("workerId")),
+        ),
+    )
+    return {**result, "next_job_started": False, "next_group_key": ""}
+
+
+def chrome_browserless_unsafe_missing_message(message: dict[str, Any]) -> bool:
+    failure_code = clean_text(message.get("failureCode")).lower().replace("-", "_").replace(" ", "_")
+    text = clean_text(message.get("message")).lower()
+    return bool(
+        failure_code in {"partial_quantity", "less_quantity", "quantity_unavailable", "insufficient_quantity", "low_stock"}
+        or "could not set quantity" in text
+        or "quantity issue" in text
+    )
+
+
+class ChromeBrowserlessSession:
+    def __init__(self, worker_id: str, store_id: Optional[int], split_mixed_asin: bool) -> None:
+        self.worker_id = worker_id
+        self.store_id = store_id
+        self.split_mixed_asin = split_mixed_asin
+        self.active_job: Optional[dict[str, Any]] = None
+        self.terminal_status = ""
+        self.terminal_message = ""
+        self.recent_orders: list[dict[str, Any]] = []
+
+    def should_stop(self) -> bool:
+        return bool(_CHROME_BROWSERLESS_PROGRESS.get("stop_requested"))
+
+    def claim_next(self) -> Optional[dict[str, Any]]:
+        job = claim_next_chrome_job(
+            self.store_id,
+            self.worker_id,
+            resume_existing=True,
+            split_mixed_asin=self.split_mixed_asin,
+        )
+        self.active_job = chrome_browserless_active_job_for(job, self.worker_id) if job else None
+        self.terminal_status = ""
+        self.terminal_message = ""
+        return self.active_job
+
+    def heartbeat(self) -> None:
+        if not self.active_job:
+            return
+        job = self.active_job.get("job") or {}
+        api_chrome_job_heartbeat(clean_text(job.get("group_key")), ChromeJobHeartbeatPayload(worker_id=self.worker_id))
+        self.active_job["lastHeartbeatAt"] = int(time.time() * 1000)
+
+    def handle_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        message_type = clean_text(message.get("type"))
+        if self.should_stop() and message_type not in {"GET_ACTIVE_JOB", "GET_STATE", "HEARTBEAT_JOB"}:
+            return {"ok": False, "stopped": True, "message": "Browserless stop requested."}
+        if message_type == "GET_ACTIVE_JOB":
+            return {"ok": True, "activeJob": self.active_job}
+        if message_type == "GET_STATE":
+            return {"ok": True, "activeJob": self.active_job, "logs": [], "browserless": True}
+        if message_type == "RECOVER_SUBMITTED_JOB":
+            if self.active_job:
+                return {"ok": True, "recovered": False, "activeJob": self.active_job}
+            recovered = claim_next_chrome_job(self.store_id, self.worker_id, resume_existing=True, split_mixed_asin=False)
+            if recovered and recovered.get("submitted_to_amazon"):
+                self.active_job = chrome_browserless_active_job_for(recovered, self.worker_id)
+                self.active_job["stage"] = "find_order_id"
+                self.active_job["cartCleared"] = True
+                self.active_job["amazonSubmittedAt"] = int(time.time() * 1000)
+                return {"ok": True, "recovered": True, "activeJob": self.active_job}
+            return {"ok": True, "recovered": False, "activeJob": None}
+        if message_type == "SET_ACTIVE_JOB":
+            incoming = message.get("activeJob") or None
+            if incoming and self.active_job and (incoming.get("job") or {}).get("group_key") != (self.active_job.get("job") or {}).get("group_key"):
+                return {"ok": False, "stale": True}
+            self.active_job = incoming
+            return {"ok": True}
+        if not self.active_job:
+            return {"ok": False, "message": "No active browserless Chrome job."}
+        job = self.active_job.get("job") or {}
+        group_key = clean_text(job.get("group_key"))
+        line_ids = [int(value) for value in job.get("line_ids") or [] if int(value or 0) > 0]
+        if message_type == "HEARTBEAT_JOB":
+            self.heartbeat()
+            return {"ok": True}
+        if message_type == "MARK_ORDER_SUBMITTED":
+            result = api_chrome_job_submitted(group_key, ChromeJobHeartbeatPayload(worker_id=self.worker_id))
+            self.active_job["amazonSubmittedAt"] = self.active_job.get("amazonSubmittedAt") or int(time.time() * 1000)
+            self.active_job["stage"] = "complete_pending"
+            return result
+        if message_type == "CHECK_EXISTING_AMAZON_ORDER":
+            return api_chrome_job_duplicate_check(group_key, ChromeJobResetPayload(worker_id=self.worker_id, line_ids=line_ids))
+        if message_type == "RESET_DUPLICATE_FULFILMENT":
+            return api_chrome_job_reset_fulfilment(group_key, ChromeJobResetPayload(worker_id=self.worker_id, line_ids=line_ids))
+        if message_type == "COMPLETE_JOB":
+            result = chrome_browserless_complete_from_message(self.active_job, message)
+            self.terminal_status = "placed"
+            self.terminal_message = result.get("message") or result.get("amazon_order_id") or "Chrome browserless job completed."
+            return result
+        if message_type == "FAIL_JOB":
+            if chrome_browserless_unsafe_missing_message(message):
+                diagnostic = (
+                    clean_text(message.get("message"))
+                    or "Browserless Chrome could not prove quantity controls were usable."
+                )
+                chrome_browserless_release_job(self.active_job, "browserless quantity-control diagnostic")
+                self.terminal_status = "diagnostic"
+                self.terminal_message = (
+                    f"Browserless Chrome stopped before marking Missing: {diagnostic} "
+                    "The job was released back to the queue for visible Chrome or a later browserless retry."
+                )
+                set_chrome_browserless_progress(stop_requested=True, message=self.terminal_message)
+                return {"ok": True, "browserless_diagnostic": True, "message": self.terminal_message, "next_job_started": False}
+            result = api_chrome_job_fail(
+                group_key,
+                ChromeJobFailPayload(
+                    message=clean_text(message.get("message")) or "Chrome browserless job failed.",
+                    line_ids=line_ids,
+                    missing_asin=clean_text(message.get("missingAsin")),
+                    missing_line_id=parse_optional_int(message.get("missingLineId")),
+                    failure_code=clean_text(message.get("failureCode")),
+                    requested_quantity=message.get("requestedQuantity"),
+                    fulfilled_quantity=message.get("fulfilledQuantity"),
+                    available_quantity=message.get("availableQuantity"),
+                    worker_id=self.worker_id,
+                ),
+            )
+            self.terminal_status = "failed"
+            self.terminal_message = result.get("message") or clean_text(message.get("message")) or "Chrome browserless job failed."
+            return {**result, "next_job_started": False, "cleanup_required": True, "next_group_key": ""}
+        if message_type == "MARK_LINE_MISSING":
+            if chrome_browserless_unsafe_missing_message(message):
+                diagnostic = (
+                    clean_text(message.get("message"))
+                    or "Browserless Chrome could not prove quantity controls were usable."
+                )
+                chrome_browserless_release_job(self.active_job, "browserless quantity-control diagnostic")
+                self.terminal_status = "diagnostic"
+                self.terminal_message = (
+                    f"Browserless Chrome stopped before marking Missing: {diagnostic} "
+                    "The job was released back to the queue for visible Chrome or a later browserless retry."
+                )
+                set_chrome_browserless_progress(stop_requested=True, message=self.terminal_message)
+                return {"ok": True, "browserless_diagnostic": True, "message": self.terminal_message, "remaining_count": len(line_ids), "next_job_started": False}
+            result = api_chrome_job_missing_line(
+                group_key,
+                ChromeJobFailPayload(
+                    message=clean_text(message.get("message")) or "Chrome browserless line is missing.",
+                    line_ids=line_ids,
+                    missing_asin=clean_text(message.get("missingAsin")),
+                    missing_line_id=parse_optional_int(message.get("missingLineId")),
+                    failure_code=clean_text(message.get("failureCode")),
+                    requested_quantity=message.get("requestedQuantity"),
+                    fulfilled_quantity=message.get("fulfilledQuantity"),
+                    available_quantity=message.get("availableQuantity"),
+                    worker_id=self.worker_id,
+                ),
+            )
+            if int(result.get("remaining_count") or 0) <= 0:
+                self.terminal_status = "missing"
+                self.terminal_message = result.get("message") or "Chrome browserless line moved to Missing."
+            return {**result, "next_job_started": False, "next_group_key": ""}
+        if message_type == "COSTLY_JOB":
+            result = api_chrome_job_costly(
+                group_key,
+                ChromeJobCostlyPayload(
+                    message=clean_text(message.get("message")),
+                    line_ids=line_ids,
+                    costly_asin=clean_text(message.get("costlyAsin")),
+                    costly_line_id=parse_optional_int(message.get("costlyLineId")),
+                    store_total_price=float(message.get("storeTotalPrice") or 0),
+                    amazon_total_price=float(message.get("amazonTotalPrice") or 0),
+                    worker_id=self.worker_id,
+                ),
+            )
+            self.terminal_status = "costly"
+            self.terminal_message = result.get("message") or "Chrome browserless job moved to Costly review."
+            return result
+        if message_type == "POST_SUBMIT_UNPLACED":
+            result = api_chrome_job_post_submit_unplaced(
+                group_key,
+                ChromeJobFailPayload(
+                    message=clean_text(message.get("message")) or "Amazon did not place the order after submit.",
+                    line_ids=line_ids,
+                    missing_asin=clean_text(message.get("missingAsin")),
+                    missing_line_id=parse_optional_int(message.get("missingLineId")),
+                    failure_code=clean_text(message.get("failureCode")) or "post_submit_unplaced",
+                    worker_id=self.worker_id,
+                ),
+            )
+            self.terminal_status = "missing"
+            self.terminal_message = result.get("message") or "Amazon did not place the order after submit."
+            return {**result, "next_job_started": False, "cleanup_required": True, "next_group_key": ""}
+        if message_type == "SUBMIT_UNCERTAIN":
+            result = api_chrome_job_submit_uncertain(
+                group_key,
+                ChromeJobFailPayload(
+                    message=clean_text(message.get("message")) or "Amazon Place Order was submitted, but no matching Amazon order ID was found.",
+                    line_ids=line_ids,
+                    failure_code=clean_text(message.get("failureCode")) or "submitted_order_not_found",
+                    worker_id=self.worker_id,
+                ),
+            )
+            self.terminal_status = "chrome_error"
+            self.terminal_message = result.get("message") or "Submitted Amazon order could not be matched."
+            return {**result, "next_job_started": False, "cleanup_required": True, "next_group_key": ""}
+        if message_type == "FINISH_CLEANUP_AND_CLAIM_NEXT":
+            self.terminal_status = self.terminal_status or "cleaned"
+            self.terminal_message = self.terminal_message or "Browserless cleanup finished."
+            return {"ok": True, "next_job_started": False, "next_group_key": "", "message": "Browserless cleanup finished."}
+        if message_type == "REMEMBER_RECENT_AMAZON_ORDERS":
+            self.recent_orders = (message.get("orders") or [])[:10]
+            return {"ok": True, "remembered": len(self.recent_orders), "orders": self.recent_orders}
+        if message_type == "GET_RECENT_AMAZON_ORDERS":
+            return {"ok": True, "orders": self.recent_orders}
+        if message_type == "LOOKUP_AMAZON_HISTORY_ORDERS":
+            payload = AmazonHistoryLookupPayload(orders=message.get("orders") or [])
+            result = api_chrome_order_history_lookup(payload)
+            return {"app_base_url": "http://127.0.0.1:8000", **result, "not_found_url": f"http://127.0.0.1:8000{result.get('not_found_url') or '/amazon-order-history-unmatched'}"}
+        if message_type == "SYNC_AMAZON_HISTORY_ORDER":
+            order = message.get("order") or {}
+            normalized = AmazonHistoryOrderPayload(**order)
+            result = api_manual_amazon_match(
+                ManualAmazonOrderMatchPayload(
+                    amazon_order_id=normalized.amazon_order_id,
+                    amazon_order_url=normalized.amazon_order_url,
+                    amazon_account_name=clean_text(order.get("amazon_account_name")) or "Chrome Browserless History Matcher",
+                    order_date=normalized.order_date,
+                    order_names=[clean_text(value) for value in order.get("order_names") or [] if clean_text(value)],
+                    line_ids=[int(value) for value in order.get("line_ids") or [] if int(value or 0) > 0],
+                    source_text=clean_text(order.get("source_text")) or normalized.recipient,
+                    store_id=parse_optional_int(order.get("store_id")),
+                    replace_existing=order.get("replace_existing") is True,
+                )
+            )
+            return result
+        return {"ok": False, "message": f"Unknown browserless message: {message_type}"}
+
+
+def run_chrome_browserless_job(session: ChromeBrowserlessSession, page: Any, content_js: Path, content_css: Path) -> str:
+    active_job = session.active_job or session.claim_next()
+    if not active_job:
+        return "empty"
+    group_key = clean_text((active_job.get("job") or {}).get("group_key")) or "queued job"
+    set_chrome_browserless_progress(current_order=group_key, message=f"Browserless Chrome processing {group_key}.")
+    page.goto("https://www.amazon.com/cart?ref_=sw_gtc", wait_until="domcontentloaded", timeout=60000)
+    deadline = time.monotonic() + int(os.getenv("CHROME_BROWSERLESS_JOB_TIMEOUT_SECONDS", "900") or "900")
+    last_heartbeat = 0.0
+    last_url = ""
+    while time.monotonic() < deadline:
+        if session.terminal_status:
+            return session.terminal_status
+        if session.should_stop():
+            chrome_browserless_release_job(session.active_job, "stop request")
+            return "stopped"
+        if time.monotonic() - last_heartbeat > 45:
+            try:
+                session.heartbeat()
+            except Exception as exc:
+                print(f"Browserless Chrome heartbeat failed for {group_key}: {exc}", flush=True)
+            last_heartbeat = time.monotonic()
+        try:
+            if "amazon.com" not in page.url:
+                page.goto("https://www.amazon.com/cart?ref_=sw_gtc", wait_until="domcontentloaded", timeout=60000)
+            if "/ap/signin" in page.url or "signin" in page.url.lower():
+                raise RuntimeError("Amazon sign-in is required in the browserless Chrome profile.")
+            loaded = page.evaluate("Boolean(window.__nutricityContentLoaded)")
+            if not loaded:
+                if content_css.exists():
+                    page.add_style_tag(path=str(content_css))
+                page.add_script_tag(path=str(content_js))
+            page.wait_for_timeout(5000)
+            if session.terminal_status:
+                return session.terminal_status
+            current_url = page.url
+            if current_url == last_url:
+                page.evaluate("window.__nutricityRunning = false; if (typeof runSafely === 'function') runSafely();")
+            last_url = current_url
+        except Exception as exc:
+            message = str(exc)
+            if "sign-in is required" in message:
+                chrome_browserless_release_job(session.active_job, "Amazon sign-in required")
+                raise
+            page.wait_for_timeout(2500)
+    chrome_browserless_release_job(session.active_job, "timeout")
+    raise RuntimeError(f"Timed out while browserless Chrome processed {group_key}.")
+
+
+def chrome_browserless_preflight_session(page: Any) -> None:
+    page.goto("https://www.amazon.com/cart?ref_=sw_gtc", wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(5000)
+    state = page.evaluate(
+        """
+        () => {
+          const text = String(document.body?.innerText || document.body?.textContent || '').replace(/\\s+/g, ' ').trim();
+          const head = text.slice(0, 2500);
+          const signedOut = /hello,? sign in|sign in new customer|\\/ap\\/signin/i.test(head) || /\\/ap\\/signin/i.test(location.href);
+          const captcha = /captcha|enter the characters you see below/i.test(head);
+          const nonUsDelivery = /deliver to india|ship to india|showing you items that ship to india/i.test(head);
+          return { url: location.href, title: document.title, signedOut, captcha, nonUsDelivery, head };
+        }
+        """
+    )
+    if state.get("captcha"):
+        raise RuntimeError("Browserless Chrome profile is blocked by an Amazon captcha. Open the browserless profile manually and clear it before starting background ordering.")
+    if state.get("signedOut"):
+        raise RuntimeError("Browserless Chrome profile is not signed into Amazon. No orders were claimed. Sign into Amazon in the browserless profile first.")
+    if state.get("nonUsDelivery"):
+        raise RuntimeError("Browserless Chrome profile is using an India delivery location, so Amazon hides US buybox controls. No orders were claimed. Set the browserless Amazon profile to a US delivery address before starting background ordering.")
+
+
+def run_chrome_browserless_payload(payload: ChromeBrowserlessRunPayload) -> None:
+    from playwright.sync_api import sync_playwright
+
+    worker_id = clean_text(payload.worker_id)[:120] or f"browserless-{uuid.uuid4().hex[:12]}"
+    profile_dir = chrome_browserless_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    content_js = BASE_DIR / "chrome-extension" / "content.js"
+    content_css = BASE_DIR / "chrome-extension" / "content.css"
+    session = ChromeBrowserlessSession(worker_id, payload.store_id, payload.split_mixed_asin)
+    executable = chrome_browserless_executable()
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=chrome_browserless_headless(),
+            executable_path=executable,
+            args=launch_args,
+            viewport={"width": 1440, "height": 1100},
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
+        def bridge(message: Any) -> dict[str, Any]:
+            try:
+                if not isinstance(message, dict):
+                    return {"ok": False, "message": "Browserless bridge expected an object message."}
+                return session.handle_message(message)
+            except HTTPException as exc:
+                return {"ok": False, "message": str(exc.detail or exc)}
+            except Exception as exc:
+                return {"ok": False, "message": str(exc)}
+
+        page.expose_function("__nutricityHeadlessSend", bridge)
+        context.add_init_script(
+            """
+            (() => {
+              const listeners = [];
+              window.chrome = window.chrome || {};
+              window.chrome.runtime = window.chrome.runtime || {};
+              window.chrome.runtime.sendMessage = (message) => window.__nutricityHeadlessSend(message || {});
+              window.chrome.runtime.onMessage = {
+                addListener(listener) { listeners.push(listener); },
+                removeListener(listener) {
+                  const index = listeners.indexOf(listener);
+                  if (index >= 0) listeners.splice(index, 1);
+                },
+              };
+              window.__nutricityBrowserlessListeners = listeners;
+            })();
+            """
+        )
+
+        processed_limit = int(payload.max_jobs or 0)
+        try:
+            chrome_browserless_preflight_session(page)
+            while not session.should_stop():
+                if processed_limit and int(_CHROME_BROWSERLESS_PROGRESS.get("processed") or 0) >= processed_limit:
+                    break
+                active_job = session.claim_next()
+                if not active_job:
+                    set_chrome_browserless_progress(message="No queued Chrome jobs found for browserless mode.")
+                    break
+                status = run_chrome_browserless_job(session, page, content_js, content_css)
+                if status == "stopped":
+                    set_chrome_browserless_progress(
+                        message=session.terminal_message or "Browserless Chrome ordering stopped by request.",
+                    )
+                    break
+                placed = int(_CHROME_BROWSERLESS_PROGRESS.get("placed") or 0)
+                failed = int(_CHROME_BROWSERLESS_PROGRESS.get("failed") or 0)
+                if status == "placed":
+                    placed += 1
+                elif status != "empty":
+                    failed += 1
+                set_chrome_browserless_progress(
+                    processed=int(_CHROME_BROWSERLESS_PROGRESS.get("processed") or 0) + 1,
+                    placed=placed,
+                    failed=failed,
+                    current_order="",
+                    message=session.terminal_message or f"Browserless Chrome processed {status}.",
+                )
+                session.active_job = None
+                page.goto("https://www.amazon.com/cart?ref_=sw_gtc", wait_until="domcontentloaded", timeout=60000)
+        finally:
+            context.close()
+
+
 def chrome_browserless_worker(payload: ChromeBrowserlessRunPayload) -> None:
     worker_id = clean_text(payload.worker_id)[:120] or f"browserless-{uuid.uuid4().hex[:12]}"
-    ordering_engine = normalize_ordering_engine(payload.ordering_engine or "rest")
-    if ordering_engine == "chrome":
-        ordering_engine = "rest"
-    max_jobs = max(0, int(payload.max_jobs or 0))
-    initial_total = chrome_queue_snapshot(payload.store_id, limit=1).get("job_count", 0)
-    if max_jobs:
-        initial_total = min(int(initial_total or 0), max_jobs)
-    processed = 0
-    placed_total = 0
-    failed_total = 0
+    ordering_engine = clean_text(payload.ordering_engine).lower() or "chrome_browserless"
     try:
-        set_chrome_browserless_progress(
-            running=True,
-            stop_requested=False,
-            total=initial_total,
-            processed=0,
-            placed=0,
-            failed=0,
-            error="",
-            completed_at="",
-            started_at=utc_now(),
-            message=f"Browserless Chrome ordering started with {ordering_engine.upper()} engine.",
-        )
-        while True:
-            if _CHROME_BROWSERLESS_PROGRESS.get("stop_requested"):
-                break
-            if max_jobs and processed >= max_jobs:
-                break
-            job = claim_next_chrome_job(
-                payload.store_id,
-                worker_id,
-                resume_existing=True,
-                split_mixed_asin=payload.split_mixed_asin,
-            )
-            if not job:
-                break
-            group_key = clean_text(job.get("group_key"))
-            line_ids = [int(line_id) for line_id in job.get("line_ids") or [] if int(line_id or 0) > 0]
-            if not group_key or not line_ids:
-                break
+        if ordering_engine != "chrome_browserless":
             set_chrome_browserless_progress(
-                processed=processed,
-                total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed + 1),
-                placed=placed_total,
-                failed=failed_total,
-                message=f"Placing {group_key} in browserless mode.",
+                running=False,
+                stop_requested=False,
+                completed_at=utc_now(),
+                error="Browserless mode must use Chrome browserless automation, not Amazon API.",
+                message="Browserless mode refused to use Amazon API. No orders were claimed.",
             )
-            address_id = chrome_job_attempt_address_id(group_key)
-            try:
-                placed, failed = place_orders(
-                    int(job["store_id"]),
-                    address_id=address_id,
-                    amazon_account_id=int(job["amazon_account_id"] or 0) or None,
-                    line_ids=line_ids,
-                    club=False,
-                    ordering_engine=ordering_engine,
-                    allow_missing_spaid=True,
-                )
-                processed += 1
-                placed_total += int(placed or 0)
-                failed_total += int(failed or 0)
-                set_chrome_browserless_progress(
-                    processed=processed,
-                    total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed),
-                    placed=placed_total,
-                    failed=failed_total,
-                    message=f"Browserless placed {placed} line(s), failed/skipped {failed} for {group_key}.",
-                )
-                if _CHROME_BROWSERLESS_PROGRESS.get("stop_requested"):
-                    break
-            except Exception as exc:
-                processed += 1
-                failed_total += len(line_ids)
-                with db() as conn:
-                    conn.execute(
-                        """
-                        UPDATE order_lines
-                        SET state='error',
-                            amazon_status='chrome_browserless_error',
-                            last_error=?,
-                            chrome_claimed_by=NULL,
-                            chrome_claimed_at=NULL,
-                            chrome_claim_expires_at=NULL,
-                            updated_at=?
-                        WHERE amazon_group_key=? AND order_engine='chrome'
-                        """,
-                        (clean_error_message(str(exc)), utc_now(), group_key),
-                    )
-                set_chrome_browserless_progress(
-                    processed=processed,
-                    total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed),
-                    placed=placed_total,
-                    failed=failed_total,
-                    message=f"Browserless failed {group_key}: {exc}",
-                    error=str(exc),
-                )
-                if _CHROME_BROWSERLESS_PROGRESS.get("stop_requested"):
-                    break
-        stopped = bool(_CHROME_BROWSERLESS_PROGRESS.get("stop_requested"))
-        set_chrome_browserless_progress(
-            running=False,
-            stop_requested=False,
-            processed=processed,
-            total=max(int(_CHROME_BROWSERLESS_PROGRESS.get("total") or 0), processed),
-            placed=placed_total,
-            failed=failed_total,
-            completed_at=utc_now(),
-            message=(
-                f"Browserless ordering stopped after {processed} job(s)."
-                if stopped
-                else f"Browserless ordering finished: {processed} job(s), {placed_total} line(s) placed, {failed_total} failed/skipped."
-            ),
-        )
-    except Exception as exc:
-        set_chrome_browserless_progress(
-            running=False,
-            stop_requested=False,
-            completed_at=utc_now(),
-            error=str(exc),
-            message=f"Browserless ordering stopped: {exc}",
-        )
+            return
+        available, unavailable_reason = chrome_browserless_available()
+        if not available:
+            set_chrome_browserless_progress(
+                running=False,
+                stop_requested=False,
+                completed_at=utc_now(),
+                error=unavailable_reason,
+                message="Chrome browserless mode could not start. No orders were claimed.",
+            )
+            return
+        try:
+            run_chrome_browserless_payload(ChromeBrowserlessRunPayload(**{**payload.model_dump(), "worker_id": worker_id}))
+            final_message = clean_text(_CHROME_BROWSERLESS_PROGRESS.get("message")) or "Browserless Chrome ordering finished."
+            set_chrome_browserless_progress(
+                running=False,
+                stop_requested=False,
+                current_order="",
+                completed_at=utc_now(),
+                error="",
+                message=final_message,
+            )
+        except Exception as exc:
+            if "active_job" in locals():
+                chrome_browserless_release_job(locals().get("active_job"), "browserless worker error")
+            set_chrome_browserless_progress(
+                running=False,
+                stop_requested=False,
+                current_order="",
+                completed_at=utc_now(),
+                error=str(exc),
+                message=f"Browserless Chrome ordering stopped: {exc}",
+            )
     finally:
-        _CHROME_BROWSERLESS_LOCK.release()
+        try:
+            _CHROME_BROWSERLESS_LOCK.release()
+        except RuntimeError:
+            pass
 
 
 @app.post("/api/chrome/browserless/run")
 def api_chrome_browserless_run(payload: ChromeBrowserlessRunPayload) -> dict[str, Any]:
-    if not _CHROME_BROWSERLESS_LOCK.acquire(blocking=False):
-        return {
-            "ok": True,
-            "running": True,
-            "message": _CHROME_BROWSERLESS_PROGRESS.get("message") or "Browserless ordering is already running.",
-            "progress": dict(_CHROME_BROWSERLESS_PROGRESS),
-        }
-    active_count = active_visible_chrome_job_count(payload.store_id)
-    if active_count:
-        _CHROME_BROWSERLESS_LOCK.release()
+    ordering_engine = clean_text(payload.ordering_engine).lower() or "chrome_browserless"
+    if _TRACKING_BROWSERLESS_PROGRESS.get("running") or _EPOST_BROWSERLESS_PROGRESS.get("running"):
+        progress = set_chrome_browserless_progress(
+            running=False,
+            message="Browserless ordering cannot start while another background tracking task is using the Chrome profile.",
+        )
+        return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
+    if ordering_engine != "chrome_browserless":
+        progress = set_chrome_browserless_progress(
+            running=False,
+            stop_requested=False,
+            completed_at=utc_now(),
+            error="Browserless mode must use Chrome browserless automation, not Amazon API.",
+            message="Browserless mode refused to use Amazon API. No orders were claimed.",
+        )
         return {
             "ok": False,
             "running": False,
-            "message": f"Cannot start browserless ordering because {active_count} Chrome job{'s are' if active_count != 1 else ' is'} already active. Report or stop the active job first.",
-            "progress": dict(_CHROME_BROWSERLESS_PROGRESS),
+            "message": progress["message"],
+            "progress": progress,
         }
-    max_jobs = max(0, int(payload.max_jobs or 0))
-    total = int(chrome_queue_snapshot(payload.store_id, limit=1).get("job_count") or 0)
-    if max_jobs:
-        total = min(total, max_jobs)
+    if not _CHROME_BROWSERLESS_LOCK.acquire(blocking=False):
+        progress = set_chrome_browserless_progress(
+            running=True,
+            message=clean_text(_CHROME_BROWSERLESS_PROGRESS.get("message")) or "Browserless Chrome ordering is already running.",
+        )
+        return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
+    available, unavailable_reason = chrome_browserless_available()
+    if not available:
+        try:
+            _CHROME_BROWSERLESS_LOCK.release()
+        except RuntimeError:
+            pass
+        progress = set_chrome_browserless_progress(
+            running=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            placed=0,
+            failed=0,
+            completed_at=utc_now(),
+            error=unavailable_reason,
+            message="Chrome browserless mode could not start. No orders were claimed.",
+        )
+        return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
+    snapshot = chrome_queue_snapshot(payload.store_id, limit=1)
     progress = set_chrome_browserless_progress(
         running=True,
         stop_requested=False,
-        total=total,
+        total=int(snapshot.get("job_count") or 0),
         processed=0,
-        message="Browserless ordering queued.",
+        placed=0,
+        failed=0,
+        current_order="",
         started_at=utc_now(),
         completed_at="",
         error="",
+        message="Browserless Chrome ordering started.",
     )
     threading.Thread(target=chrome_browserless_worker, args=(payload,), daemon=True).start()
-    return {"ok": True, "running": True, "message": "Browserless ordering started.", "progress": progress}
+    return {
+        "ok": True,
+        "running": True,
+        "message": progress["message"],
+        "progress": progress,
+    }
 
 
 @app.post("/api/chrome/browserless/stop")
@@ -14729,6 +15324,692 @@ def api_chrome_browserless_stop() -> dict[str, Any]:
 @app.get("/api/chrome/browserless/status")
 def api_chrome_browserless_status() -> dict[str, Any]:
     return {"ok": True, "progress": dict(_CHROME_BROWSERLESS_PROGRESS)}
+
+
+@app.get("/api/chrome/browserless/progress")
+def api_chrome_browserless_progress() -> dict[str, Any]:
+    return api_chrome_browserless_status()
+
+
+def set_tracking_browserless_progress(**updates: Any) -> dict[str, Any]:
+    _TRACKING_BROWSERLESS_PROGRESS.update(updates)
+    _TRACKING_BROWSERLESS_PROGRESS["updated_at"] = utc_now()
+    return dict(_TRACKING_BROWSERLESS_PROGRESS)
+
+
+def tracking_browserless_order_url(order: dict[str, Any]) -> str:
+    order_id = clean_text(order.get("amazon_order_id"))
+    return clean_text(order.get("amazon_order_url")) or order_line_amazon_url(order_id)
+
+
+class TrackingBrowserlessSession:
+    def __init__(self, worker_id: str, store_id: Optional[int], max_orders: int) -> None:
+        self.worker_id = worker_id
+        self.store_id = store_id
+        self.max_orders = max(0, int(max_orders or 0))
+        self.orders: list[dict[str, Any]] = []
+        self.index = 0
+        self.packages: list[dict[str, Any]] = []
+        self.package_index = 0
+        self.next_url = ""
+        self.order_complete = False
+        self.last_message = ""
+
+    def should_stop(self) -> bool:
+        return bool(_TRACKING_BROWSERLESS_PROGRESS.get("stop_requested"))
+
+    def load_orders(self) -> list[dict[str, Any]]:
+        payload = api_tracking_orders(self.store_id, page=1, per_page=1000, status="active")
+        orders = [
+            order for order in payload.get("orders") or []
+            if clean_text(order.get("tracking_status")).lower() != "delivered"
+        ]
+        if self.max_orders:
+            orders = orders[: self.max_orders]
+        self.orders = orders
+        return orders
+
+    def current_order(self) -> Optional[dict[str, Any]]:
+        if self.index >= len(self.orders):
+            return None
+        return self.orders[self.index]
+
+    def start_current_order(self) -> Optional[dict[str, Any]]:
+        order = self.current_order()
+        if not order:
+            self.next_url = ""
+            return None
+        self.packages = []
+        self.package_index = 0
+        self.order_complete = False
+        self.last_message = ""
+        self.next_url = tracking_browserless_order_url(order)
+        set_tracking_browserless_progress(
+            current_order=clean_text(order.get("amazon_order_id")),
+            message=f"Headless tracking opened Amazon order {clean_text(order.get('amazon_order_id'))}.",
+        )
+        return order
+
+    def finish_current_order(self, message: str = "") -> None:
+        self.index += 1
+        self.order_complete = True
+        self.next_url = ""
+        self.last_message = message
+
+    def handle_order_packages(self, message: dict[str, Any]) -> dict[str, Any]:
+        order = self.current_order()
+        if not order:
+            return {"ok": False, "message": "No active headless tracking order."}
+        order_id = clean_text(order.get("amazon_order_id"))
+        if clean_text(message.get("amazonOrderId")) != order_id:
+            return {"ok": False, "message": "Amazon order id did not match active tracking order."}
+        if message.get("orderCancelled"):
+            result = api_tracking_update(
+                ChromeTrackingUpdatePayload(
+                    amazon_order_id=order_id,
+                    amazon_order_url=tracking_browserless_order_url(order),
+                    packages=message.get("packages") or [],
+                    order_cancelled=True,
+                    cancellation_message=clean_text(message.get("cancellationMessage")) or "This order has been cancelled.",
+                    page_text=clean_text(message.get("pageText")),
+                )
+            )
+            self.finish_current_order(result.get("tracking_status") or "Amazon cancelled")
+            return result
+        if message.get("paymentRevisionNeeded"):
+            result = api_tracking_update(
+                ChromeTrackingUpdatePayload(
+                    amazon_order_id=order_id,
+                    amazon_order_url=tracking_browserless_order_url(order),
+                    packages=message.get("packages") or [],
+                    payment_revision_needed=True,
+                    payment_revision_url=clean_text(message.get("paymentRevisionUrl")),
+                    page_text=clean_text(message.get("pageText")),
+                )
+            )
+            self.finish_current_order(result.get("tracking_status") or "Payment revision needed")
+            return result
+        self.packages = list(message.get("packages") or [])
+        self.package_index = 0
+        if not self.packages:
+            result = api_tracking_update(
+                ChromeTrackingUpdatePayload(
+                    amazon_order_id=order_id,
+                    amazon_order_url=tracking_browserless_order_url(order),
+                    packages=[{
+                        "status": clean_text(message.get("orderStatus")) or "Unknown",
+                        "promise": clean_text(message.get("promise")),
+                        "tracking_url": tracking_browserless_order_url(order),
+                        "asins": [],
+                    }],
+                )
+            )
+            self.finish_current_order(result.get("tracking_status") or "Order-page status saved")
+            return result
+        self.next_url = clean_text(self.packages[0].get("tracking_url"))
+        self.last_message = f"Found {len(self.packages)} package link(s)."
+        return {"ok": True, "message": self.last_message}
+
+    def handle_package_tracking(self, message: dict[str, Any]) -> dict[str, Any]:
+        order = self.current_order()
+        if not order:
+            return {"ok": False, "message": "No active headless tracking order."}
+        order_id = clean_text(order.get("amazon_order_id"))
+        if clean_text(message.get("amazonOrderId")) != order_id:
+            return {"ok": False, "message": "Amazon tracking page did not match active order."}
+        package_data = {
+            **(self.packages[self.package_index] if self.package_index < len(self.packages) else {}),
+            **(message.get("package") or {}),
+        }
+        if message.get("paymentRevisionNeeded"):
+            package_data["payment_revision_needed"] = True
+            package_data["payment_revision_url"] = clean_text(message.get("paymentRevisionUrl"))
+            package_data["page_text"] = clean_text(message.get("pageText"))
+        if self.package_index < len(self.packages):
+            self.packages[self.package_index] = package_data
+        else:
+            self.packages.append(package_data)
+        self.package_index += 1
+        if self.package_index < len(self.packages):
+            self.next_url = clean_text(self.packages[self.package_index].get("tracking_url"))
+            self.last_message = f"Captured package {self.package_index}/{len(self.packages)}."
+            return {"ok": True, "message": self.last_message}
+        result = api_tracking_update(
+            ChromeTrackingUpdatePayload(
+                amazon_order_id=order_id,
+                amazon_order_url=tracking_browserless_order_url(order),
+                packages=self.packages,
+                payment_revision_needed=any(bool(pkg.get("payment_revision_needed")) for pkg in self.packages),
+                payment_revision_url=next((clean_text(pkg.get("payment_revision_url")) for pkg in self.packages if clean_text(pkg.get("payment_revision_url"))), ""),
+                page_text=next((clean_text(pkg.get("page_text")) for pkg in self.packages if clean_text(pkg.get("page_text"))), ""),
+            )
+        )
+        self.finish_current_order(result.get("tracking_status") or "Tracking update posted")
+        return result
+
+    def handle_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        message_type = clean_text(message.get("type"))
+        if self.should_stop():
+            return {"ok": False, "stopped": True, "message": "Headless tracking stop requested."}
+        if message_type == "ORDER_PACKAGES":
+            return self.handle_order_packages(message)
+        if message_type == "PACKAGE_TRACKING":
+            return self.handle_package_tracking(message)
+        return {"ok": False, "message": f"Unknown headless tracking message: {message_type}"}
+
+
+def run_tracking_browserless_order(session: TrackingBrowserlessSession, page: Any, content_js: Path, content_css: Path) -> str:
+    order = session.start_current_order()
+    if not order:
+        return "empty"
+    order_id = clean_text(order.get("amazon_order_id"))
+    deadline = time.monotonic() + int(os.getenv("TRACKING_BROWSERLESS_ORDER_TIMEOUT_SECONDS", "300") or "300")
+    last_url = ""
+    injected_url = ""
+    while time.monotonic() < deadline:
+        if session.should_stop():
+            return "stopped"
+        if session.order_complete:
+            return "updated"
+        target_url = session.next_url
+        if target_url and target_url != last_url:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            last_url = target_url
+            injected_url = ""
+        if "/ap/signin" in page.url or "signin" in page.url.lower():
+            raise RuntimeError("Amazon sign-in is required in the headless Chrome profile.")
+        if page.url != injected_url:
+            if content_css.exists():
+                page.add_style_tag(path=str(content_css))
+            page.add_script_tag(path=str(content_js))
+            injected_url = page.url
+        page.wait_for_timeout(3000)
+    raise RuntimeError(f"Timed out while headless tracking processed {order_id}.")
+
+
+def run_tracking_browserless_payload(payload: ChromeTrackingBrowserlessRunPayload) -> None:
+    from playwright.sync_api import sync_playwright
+
+    worker_id = clean_text(payload.worker_id)[:120] or f"tracking-headless-{uuid.uuid4().hex[:12]}"
+    profile_dir = chrome_browserless_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    content_js = BASE_DIR / "tracking-extension" / "content.js"
+    content_css = BASE_DIR / "tracking-extension" / "content.css"
+    session = TrackingBrowserlessSession(worker_id, payload.store_id, payload.max_orders)
+    executable = chrome_browserless_executable()
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=chrome_browserless_headless(),
+            executable_path=executable,
+            args=launch_args,
+            viewport={"width": 1440, "height": 1100},
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
+        def bridge(message: Any) -> dict[str, Any]:
+            try:
+                if not isinstance(message, dict):
+                    return {"ok": False, "message": "Headless tracking bridge expected an object message."}
+                return session.handle_message(message)
+            except HTTPException as exc:
+                return {"ok": False, "message": str(exc.detail or exc)}
+            except Exception as exc:
+                return {"ok": False, "message": str(exc)}
+
+        page.expose_function("__nutricityHeadlessTrackingSend", bridge)
+        context.add_init_script(
+            """
+            (() => {
+              window.chrome = window.chrome || {};
+              window.chrome.runtime = window.chrome.runtime || {};
+              window.chrome.runtime.sendMessage = (message) => window.__nutricityHeadlessTrackingSend(message || {});
+            })();
+            """
+        )
+        try:
+            chrome_browserless_preflight_session(page)
+            orders = session.load_orders()
+            set_tracking_browserless_progress(total=len(orders), message=f"Headless tracking loaded {len(orders)} Amazon order(s).")
+            while session.current_order() and not session.should_stop():
+                status = run_tracking_browserless_order(session, page, content_js, content_css)
+                if status == "stopped":
+                    set_tracking_browserless_progress(message="Headless tracking stopped by request.")
+                    break
+                processed = int(_TRACKING_BROWSERLESS_PROGRESS.get("processed") or 0) + 1
+                updated = int(_TRACKING_BROWSERLESS_PROGRESS.get("updated") or 0) + (1 if status == "updated" else 0)
+                set_tracking_browserless_progress(
+                    processed=processed,
+                    updated=updated,
+                    current_order="",
+                    message=session.last_message or "Headless tracking updated an Amazon order.",
+                )
+        finally:
+            context.close()
+
+
+def tracking_browserless_worker(payload: ChromeTrackingBrowserlessRunPayload) -> None:
+    worker_id = clean_text(payload.worker_id)[:120] or f"tracking-headless-{uuid.uuid4().hex[:12]}"
+    try:
+        available, unavailable_reason = chrome_browserless_available()
+        if not available:
+            set_tracking_browserless_progress(
+                running=False,
+                stop_requested=False,
+                completed_at=utc_now(),
+                error=unavailable_reason,
+                message="Headless tracking could not start.",
+            )
+            return
+        try:
+            run_tracking_browserless_payload(ChromeTrackingBrowserlessRunPayload(**{**payload.model_dump(), "worker_id": worker_id}))
+            final_message = clean_text(_TRACKING_BROWSERLESS_PROGRESS.get("message")) or "Headless tracking finished."
+            set_tracking_browserless_progress(
+                running=False,
+                stop_requested=False,
+                current_order="",
+                completed_at=utc_now(),
+                error="",
+                message=final_message,
+            )
+        except Exception as exc:
+            failed = int(_TRACKING_BROWSERLESS_PROGRESS.get("failed") or 0)
+            no_order_claimed = "no orders were claimed" in str(exc).lower()
+            if not no_order_claimed and int(_TRACKING_BROWSERLESS_PROGRESS.get("processed") or 0) < int(_TRACKING_BROWSERLESS_PROGRESS.get("total") or 0):
+                failed += 1
+            set_tracking_browserless_progress(
+                running=False,
+                stop_requested=False,
+                current_order="",
+                completed_at=utc_now(),
+                failed=failed,
+                error=str(exc),
+                message=f"Headless tracking stopped: {exc}",
+            )
+    finally:
+        try:
+            _TRACKING_BROWSERLESS_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+@app.post("/api/tracking/browserless/run")
+def api_tracking_browserless_run(payload: ChromeTrackingBrowserlessRunPayload) -> dict[str, Any]:
+    if _CHROME_BROWSERLESS_PROGRESS.get("running") or _EPOST_BROWSERLESS_PROGRESS.get("running"):
+        progress = set_tracking_browserless_progress(
+            running=False,
+            message="Headless tracking cannot start while another background Chrome task is using the Chrome profile.",
+        )
+        return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
+    if not _TRACKING_BROWSERLESS_LOCK.acquire(blocking=False):
+        progress = set_tracking_browserless_progress(
+            running=True,
+            message=clean_text(_TRACKING_BROWSERLESS_PROGRESS.get("message")) or "Headless tracking is already running.",
+        )
+        return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
+    available, unavailable_reason = chrome_browserless_available()
+    if not available:
+        try:
+            _TRACKING_BROWSERLESS_LOCK.release()
+        except RuntimeError:
+            pass
+        progress = set_tracking_browserless_progress(
+            running=False,
+            stop_requested=False,
+            completed_at=utc_now(),
+            error=unavailable_reason,
+            message="Headless tracking could not start.",
+        )
+        return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
+    orders = [
+        order for order in api_tracking_orders(payload.store_id, page=1, per_page=1000, status="active").get("orders") or []
+        if clean_text(order.get("tracking_status")).lower() != "delivered"
+    ]
+    if payload.max_orders:
+        orders = orders[: max(0, int(payload.max_orders or 0))]
+    progress = set_tracking_browserless_progress(
+        running=True,
+        stop_requested=False,
+        total=len(orders),
+        processed=0,
+        updated=0,
+        failed=0,
+        current_order="",
+        started_at=utc_now(),
+        completed_at="",
+        error="",
+        message="Headless tracking started.",
+    )
+    threading.Thread(target=tracking_browserless_worker, args=(payload,), daemon=True).start()
+    return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
+
+
+@app.post("/api/tracking/browserless/stop")
+def api_tracking_browserless_stop() -> dict[str, Any]:
+    if not _TRACKING_BROWSERLESS_PROGRESS.get("running"):
+        progress = set_tracking_browserless_progress(
+            running=False,
+            stop_requested=False,
+            message="Headless tracking is not running.",
+        )
+        return {"ok": True, "running": False, "message": progress["message"], "progress": progress}
+    progress = set_tracking_browserless_progress(
+        stop_requested=True,
+        message="Stopping headless tracking after the current Amazon page.",
+    )
+    return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
+
+
+@app.get("/api/tracking/browserless/status")
+def api_tracking_browserless_status() -> dict[str, Any]:
+    return {"ok": True, "progress": dict(_TRACKING_BROWSERLESS_PROGRESS)}
+
+
+def set_epost_browserless_progress(**updates: Any) -> dict[str, Any]:
+    _EPOST_BROWSERLESS_PROGRESS.update(updates)
+    _EPOST_BROWSERLESS_PROGRESS["updated_at"] = utc_now()
+    return dict(_EPOST_BROWSERLESS_PROGRESS)
+
+
+def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: int = 0) -> list[list[str]]:
+    rows = due_epost_tracking_rows(max(1, int(days or 1)), store_id)
+    codes = [clean_text(row.get("tracking_code")).upper() for row in rows if clean_text(row.get("tracking_code"))]
+    batches = [codes[index:index + 25] for index in range(0, len(codes), 25)]
+    return batches[: max_batches] if max_batches else batches
+
+
+class EpostBrowserlessSession:
+    def __init__(self, worker_id: str, store_id: Optional[int], interval_days: int, max_batches: int) -> None:
+        self.worker_id = worker_id
+        self.store_id = store_id
+        self.interval_days = max(1, int(interval_days or 1))
+        self.max_batches = max(0, int(max_batches or 0))
+        self.batches: list[list[str]] = []
+        self.batch_index = 0
+        self.submitted_batch_index: Optional[int] = None
+        self.batch_complete = False
+        self.last_message = ""
+
+    def should_stop(self) -> bool:
+        return bool(_EPOST_BROWSERLESS_PROGRESS.get("stop_requested"))
+
+    def load_batches(self) -> list[list[str]]:
+        self.batches = epost_browserless_batches(self.interval_days, self.store_id, self.max_batches)
+        return self.batches
+
+    def current_codes(self) -> list[str]:
+        if self.batch_index >= len(self.batches):
+            return []
+        return self.batches[self.batch_index]
+
+    def start_current_batch(self) -> list[str]:
+        codes = self.current_codes()
+        self.batch_complete = False
+        self.submitted_batch_index = None
+        set_epost_browserless_progress(
+            current_batch=f"{self.batch_index + 1}/{len(self.batches)}" if codes else "",
+            message=f"Headless ePost opened batch {self.batch_index + 1}/{len(self.batches)}.",
+        )
+        return codes
+
+    def handle_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        message_type = clean_text(message.get("type"))
+        if self.should_stop():
+            return {"ok": False, "stopped": True, "message": "Headless ePost stop requested."}
+        if message_type == "PORTAL_READY":
+            codes = self.current_codes()
+            if not codes:
+                return {"ok": False, "message": "No active headless ePost batch."}
+            submitted = self.submitted_batch_index is not None
+            return {
+                "ok": True,
+                "codes": codes,
+                "batchIndex": self.submitted_batch_index if submitted else self.batch_index,
+                "submitted": submitted,
+            }
+        if message_type == "BATCH_SUBMITTED":
+            incoming_index = int(message.get("batchIndex") if message.get("batchIndex") is not None else -1)
+            if incoming_index != self.batch_index:
+                return {"ok": False, "stale": True, "message": "Ignored stale headless ePost batch submit."}
+            self.submitted_batch_index = incoming_index
+            self.last_message = f"Submitted ePost batch {incoming_index + 1}/{len(self.batches)}."
+            return {"ok": True}
+        if message_type == "EPOST_RESULTS":
+            incoming_index = int(message.get("batchIndex") if message.get("batchIndex") is not None else self.batch_index)
+            expected_index = self.submitted_batch_index if self.submitted_batch_index is not None else self.batch_index
+            if incoming_index != expected_index:
+                return {"ok": False, "stale": True, "message": "Ignored stale headless ePost results."}
+            result = api_epost_update(EpostTrackingUpdatePayload(results=message.get("results") or []))
+            self.batch_index = expected_index + 1
+            self.submitted_batch_index = None
+            self.batch_complete = True
+            updated = int(result.get("updated") or 0)
+            self.last_message = f"Headless ePost posted {updated} result(s)."
+            return {**result, "ok": True, "done": self.batch_index >= len(self.batches)}
+        return {"ok": False, "message": f"Unknown headless ePost message: {message_type}"}
+
+
+def run_epost_browserless_batch(session: EpostBrowserlessSession, page: Any, content_js: Path, content_css: Path) -> str:
+    codes = session.start_current_batch()
+    if not codes:
+        return "empty"
+    deadline = time.monotonic() + int(os.getenv("EPOST_BROWSERLESS_BATCH_TIMEOUT_SECONDS", "120") or "120")
+    page.goto(f"https://portal.epgshipping.com/ParcelTracker/HomePageTracker?nutricityBatch={int(time.time() * 1000)}", wait_until="domcontentloaded", timeout=60000)
+    injected_url = ""
+    while time.monotonic() < deadline:
+        if session.should_stop():
+            return "stopped"
+        if session.batch_complete:
+            return "updated"
+        if "portal.epgshipping.com" not in page.url:
+            page.goto("https://portal.epgshipping.com/ParcelTracker/HomePageTracker", wait_until="domcontentloaded", timeout=60000)
+            injected_url = ""
+        if page.url != injected_url:
+            if content_css.exists():
+                page.add_style_tag(path=str(content_css))
+            page.add_script_tag(path=str(content_js))
+            injected_url = page.url
+        page.wait_for_timeout(2000)
+    raise RuntimeError(f"Timed out while headless ePost processed batch {session.batch_index + 1}.")
+
+
+def run_epost_browserless_payload(payload: EpostBrowserlessRunPayload) -> None:
+    from playwright.sync_api import sync_playwright
+
+    worker_id = clean_text(payload.worker_id)[:120] or f"epost-headless-{uuid.uuid4().hex[:12]}"
+    profile_dir = chrome_browserless_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    content_js = BASE_DIR / "epost-extension" / "content.js"
+    content_css = BASE_DIR / "epost-extension" / "content.css"
+    session = EpostBrowserlessSession(worker_id, payload.store_id, payload.interval_days, payload.max_batches)
+    executable = chrome_browserless_executable()
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=chrome_browserless_headless(),
+            executable_path=executable,
+            args=launch_args,
+            viewport={"width": 1440, "height": 1100},
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
+        def bridge(message: Any) -> dict[str, Any]:
+            try:
+                if not isinstance(message, dict):
+                    return {"ok": False, "message": "Headless ePost bridge expected an object message."}
+                return session.handle_message(message)
+            except HTTPException as exc:
+                return {"ok": False, "message": str(exc.detail or exc)}
+            except Exception as exc:
+                return {"ok": False, "message": str(exc)}
+
+        page.expose_function("__nutricityHeadlessEpostSend", bridge)
+        context.add_init_script(
+            """
+            (() => {
+              window.chrome = window.chrome || {};
+              window.chrome.runtime = window.chrome.runtime || {};
+              window.chrome.runtime.sendMessage = (message) => window.__nutricityHeadlessEpostSend(message || {});
+            })();
+            """
+        )
+        try:
+            batches = session.load_batches()
+            set_epost_browserless_progress(total=len(batches), message=f"Headless ePost loaded {len(batches)} batch(es).")
+            while session.current_codes() and not session.should_stop():
+                status = run_epost_browserless_batch(session, page, content_js, content_css)
+                if status == "stopped":
+                    set_epost_browserless_progress(message="Headless ePost stopped by request.")
+                    break
+                processed = int(_EPOST_BROWSERLESS_PROGRESS.get("processed") or 0) + 1
+                updated = int(_EPOST_BROWSERLESS_PROGRESS.get("updated") or 0) + (1 if status == "updated" else 0)
+                set_epost_browserless_progress(
+                    processed=processed,
+                    updated=updated,
+                    current_batch="",
+                    message=session.last_message or "Headless ePost updated a batch.",
+                )
+        finally:
+            context.close()
+
+
+def epost_browserless_worker(payload: EpostBrowserlessRunPayload) -> None:
+    worker_id = clean_text(payload.worker_id)[:120] or f"epost-headless-{uuid.uuid4().hex[:12]}"
+    try:
+        available, unavailable_reason = chrome_browserless_available()
+        if not available:
+            set_epost_browserless_progress(
+                running=False,
+                stop_requested=False,
+                completed_at=utc_now(),
+                error=unavailable_reason,
+                message="Headless ePost could not start.",
+            )
+            return
+        try:
+            run_epost_browserless_payload(EpostBrowserlessRunPayload(**{**payload.model_dump(), "worker_id": worker_id}))
+            final_message = clean_text(_EPOST_BROWSERLESS_PROGRESS.get("message")) or "Headless ePost finished."
+            set_epost_browserless_progress(
+                running=False,
+                stop_requested=False,
+                current_batch="",
+                completed_at=utc_now(),
+                error="",
+                message=final_message,
+            )
+        except Exception as exc:
+            set_epost_browserless_progress(
+                running=False,
+                stop_requested=False,
+                current_batch="",
+                completed_at=utc_now(),
+                error=str(exc),
+                message=f"Headless ePost stopped: {exc}",
+            )
+    finally:
+        try:
+            _EPOST_BROWSERLESS_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+@app.post("/api/epost/browserless/run")
+def api_epost_browserless_run(payload: EpostBrowserlessRunPayload) -> dict[str, Any]:
+    if _CHROME_BROWSERLESS_PROGRESS.get("running") or _TRACKING_BROWSERLESS_PROGRESS.get("running"):
+        progress = set_epost_browserless_progress(
+            running=False,
+            message="Headless ePost cannot start while another background Chrome task is using the Chrome profile.",
+        )
+        return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
+    if not _EPOST_BROWSERLESS_LOCK.acquire(blocking=False):
+        progress = set_epost_browserless_progress(
+            running=True,
+            message=clean_text(_EPOST_BROWSERLESS_PROGRESS.get("message")) or "Headless ePost is already running.",
+        )
+        return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
+    available, unavailable_reason = chrome_browserless_available()
+    if not available:
+        try:
+            _EPOST_BROWSERLESS_LOCK.release()
+        except RuntimeError:
+            pass
+        progress = set_epost_browserless_progress(
+            running=False,
+            stop_requested=False,
+            completed_at=utc_now(),
+            error=unavailable_reason,
+            message="Headless ePost could not start.",
+        )
+        return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
+    batches = epost_browserless_batches(payload.interval_days, payload.store_id, payload.max_batches)
+    if not batches:
+        try:
+            _EPOST_BROWSERLESS_LOCK.release()
+        except RuntimeError:
+            pass
+        progress = set_epost_browserless_progress(
+            running=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            updated=0,
+            failed=0,
+            current_batch="",
+            completed_at=utc_now(),
+            error="",
+            message="No ePost tracking codes are due.",
+        )
+        return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
+    progress = set_epost_browserless_progress(
+        running=True,
+        stop_requested=False,
+        total=len(batches),
+        processed=0,
+        updated=0,
+        failed=0,
+        current_batch="",
+        started_at=utc_now(),
+        completed_at="",
+        error="",
+        message="Headless ePost started.",
+    )
+    threading.Thread(target=epost_browserless_worker, args=(payload,), daemon=True).start()
+    return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
+
+
+@app.post("/api/epost/browserless/stop")
+def api_epost_browserless_stop() -> dict[str, Any]:
+    if not _EPOST_BROWSERLESS_PROGRESS.get("running"):
+        progress = set_epost_browserless_progress(
+            running=False,
+            stop_requested=False,
+            message="Headless ePost is not running.",
+        )
+        return {"ok": True, "running": False, "message": progress["message"], "progress": progress}
+    progress = set_epost_browserless_progress(
+        stop_requested=True,
+        message="Stopping headless ePost after the current batch.",
+    )
+    return {"ok": True, "running": True, "message": progress["message"], "progress": progress}
+
+
+@app.get("/api/epost/browserless/status")
+def api_epost_browserless_status() -> dict[str, Any]:
+    return {"ok": True, "progress": dict(_EPOST_BROWSERLESS_PROGRESS)}
 
 
 @app.get("/api/chrome/jobs")
@@ -15335,7 +16616,9 @@ def chrome_complete_followups(
     chrome_account_name: str,
 ) -> None:
     try:
-        enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+        queued = enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+        if queued:
+            start_shopify_fulfilment_worker()
     except Exception as exc:
         print(f"Chrome complete Shopify enqueue failed: {exc}", flush=True)
     try:
@@ -15884,9 +17167,14 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
             return {"ok": True, "updated": len(rows), "tracking_status": "Payment revision needed", "payment_revision_needed": True}
         updated = 0
         updated_rows_for_index = []
+        package_asins_present = any(package.get("asins") for package in packages)
+        unmatched_rows: list[Any] = []
         for row in rows:
             line_packages = [package for package in packages if package_matches_line(package, row)]
             if not line_packages:
+                if package_asins_present:
+                    unmatched_rows.append(row)
+                    continue
                 line_packages = packages
             line_status = tracking_status_from_packages(line_packages)
             line_delivered = line_status == "Delivered" and line_packages and all(
@@ -15920,6 +17208,34 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
             if line_delivered:
                 if updated_row:
                     ensure_inventory_for_line(updated_row)
+        if package_asins_present and not updated and unmatched_rows:
+            now = utc_now()
+            message = "Tracking package ASINs did not match this order line. Review the Amazon package manually."
+            for row in unmatched_rows:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+                        tracking_status='ASIN mismatch',
+                        tracking_payload=?,
+                        tracking_checked_at=?,
+                        last_error=?,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        clean_text(payload.amazon_order_url),
+                        json.dumps(packages, default=str)[:4000],
+                        now,
+                        message,
+                        now,
+                        row["id"],
+                    ),
+                )
+                updated += 1
+                updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+                if updated_row:
+                    updated_rows_for_index.append(updated_row)
     for updated_row in updated_rows_for_index:
         index_order_line(updated_row)
     if delivered_flag:
@@ -16143,7 +17459,8 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(400, "Enter an Amazon order ID, third-party order number, or URL.")
     if third_party and total_cost <= 0:
         raise HTTPException(400, "Enter the third-party order cost for profit/loss.")
-    selected_ids = sorted(set(line_ids))
+    with db() as conn:
+        selected_ids = validate_line_ids_for_store(conn, store_id, line_ids, "Manual fulfilment")
     placeholders = ",".join("?" for _ in selected_ids)
     now = utc_now()
     updated_for_shopify: list[dict[str, Any]] = []
@@ -16885,13 +18202,15 @@ def api_delivery_check(payload: StoreActionPayload) -> dict[str, Any]:
 @app.post("/api/lines/delete")
 def api_delete_lines(payload: DeleteLinesPayload) -> dict[str, Any]:
     if payload.line_ids:
-        placeholders = ",".join("?" for _ in payload.line_ids)
+        with db() as conn:
+            selected_ids = validate_line_ids_for_store(conn, payload.store_id, payload.line_ids, "Delete selected lines")
+        placeholders = ",".join("?" for _ in selected_ids)
         with db() as conn:
             conn.execute(
                 f"DELETE FROM order_lines WHERE store_id = ? AND id IN ({placeholders})",
-                [payload.store_id, *payload.line_ids],
+                [payload.store_id, *selected_ids],
             )
-        for line_id in payload.line_ids:
+        for line_id in selected_ids:
             delete_order_line_index(int(line_id))
     data = dashboard_data(payload.store_id)
     data["message"] = f"Deleted {len(payload.line_ids)} selected line{'s' if len(payload.line_ids) != 1 else ''}."
@@ -16905,9 +18224,10 @@ def api_ignore_lines(payload: DeleteLinesPayload) -> dict[str, Any]:
     selected_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
     if not selected_ids:
         raise HTTPException(400, "Select at least one order line to mark do not process.")
-    placeholders = ",".join("?" for _ in selected_ids)
     now = utc_now()
     with db() as conn:
+        selected_ids = validate_line_ids_for_store(conn, payload.store_id, selected_ids, "Mark do not process")
+        placeholders = ",".join("?" for _ in selected_ids)
         cursor = conn.execute(
             f"""
             UPDATE order_lines
@@ -16951,12 +18271,13 @@ def api_ignore_lines(payload: DeleteLinesPayload) -> dict[str, Any]:
 def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
     if not payload.line_ids:
         raise HTTPException(400, "Select at least one order line to reset.")
-    placeholders = ",".join("?" for _ in payload.line_ids)
     now = utc_now()
     with db() as conn:
+        selected_ids = validate_line_ids_for_store(conn, payload.store_id, payload.line_ids, "Reset selected")
+        placeholders = ",".join("?" for _ in selected_ids)
         selected_rows = conn.execute(
             f"SELECT store_id, odoo_order_id FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
-            [payload.store_id, *payload.line_ids],
+            [payload.store_id, *selected_ids],
         ).fetchall()
         tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in selected_rows}
         cursor = conn.execute(
@@ -16988,7 +18309,7 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             WHERE store_id=?
               AND id IN ({placeholders})
             """,
-            [now, payload.store_id, *payload.line_ids],
+            [now, payload.store_id, *selected_ids],
         )
         conn.execute(
             f"""
@@ -16998,11 +18319,11 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
               AND mode IN ('chrome', 'rest', 'cxml')
               AND status IN ('queued', 'submitted', 'ok', 'error', 'costly', 'missing', 'ignored')
             """,
-            payload.line_ids,
+            selected_ids,
         )
         updated_rows = conn.execute(
             f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
-            [payload.store_id, *payload.line_ids],
+            [payload.store_id, *selected_ids],
         ).fetchall()
     for updated in updated_rows:
         index_order_line(updated)

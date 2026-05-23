@@ -34,6 +34,11 @@ function showPanel(title, message) {
   panel.querySelector("div").textContent = message;
 }
 
+function responseError(response, fallback) {
+  if (!response) return "Extension background is not responding. Reload the Nutricity Tracking extension and start tracking again.";
+  return response.message || fallback;
+}
+
 async function waitForPageReady() {
   const started = Date.now();
   while (document.readyState !== "complete" && Date.now() - started < 25000) {
@@ -44,7 +49,12 @@ async function waitForPageReady() {
 
 function currentOrderId() {
   const url = new URL(location.href);
-  return url.searchParams.get("orderID") || url.searchParams.get("orderId") || "";
+  const fromQuery = url.searchParams.get("orderID") || url.searchParams.get("orderId");
+  if (fromQuery) return fromQuery;
+  const fromHref = location.href.match(/\b\d{3}-\d{7}-\d{7}\b/);
+  if (fromHref) return fromHref[0];
+  const fromPage = clean(document.querySelector("#orderDetails, .order-date-invoice-item, body")?.textContent || "").match(/\b\d{3}-\d{7}-\d{7}\b/);
+  return fromPage ? fromPage[0] : "";
 }
 
 function absoluteUrl(href) {
@@ -87,7 +97,13 @@ function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
   const paymentRevision = parsePaymentRevision();
   const cancellation = parseOrderCancellation();
-  const links = [...document.querySelectorAll("a[href*='ship-track'][href*='orderId=']")];
+  const links = [...document.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track']")]
+    .filter((link) => {
+      const text = clean(link.textContent);
+      const href = link.getAttribute("href") || "";
+      const url = new URL(href, location.origin);
+      return url.searchParams.get("orderID") || url.searchParams.get("orderId") || /track package|tracking/i.test(text);
+    });
   const packages = [];
   const seen = new Set();
   for (const link of links) {
@@ -174,6 +190,7 @@ async function parseTrackingPage() {
   const events = parseEvents();
   const carrierInfo = parseCarrierAndTrackingId();
   const status = parseStatus();
+  const deliveryCard = document.querySelector(".delivery-card, .pt-delivery-card-wrapper, #primaryStatus, #tracking-events-container") || document.body;
   const pkg = {
     ...carrierInfo,
     status,
@@ -181,7 +198,7 @@ async function parseTrackingPage() {
     latest_event: events[0] || null,
     events: events.slice(0, 20),
     tracking_url: location.href,
-    asins: asinsFrom(document.body),
+    asins: asinsFrom(deliveryCard),
   };
   return { amazonOrderId, package: pkg, ...paymentRevision };
 }
@@ -194,14 +211,23 @@ async function run() {
     const data = parseOrderDetails();
     if (!data.amazonOrderId) return;
     showPanel("Nutricity tracking", `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`);
-    await send({ type: "ORDER_PACKAGES", ...data });
+    const response = await send({ type: "ORDER_PACKAGES", ...data });
+    if (response && response.ok === false) {
+      showPanel("Nutricity tracking", responseError(response, "Could not send package links to the app."));
+    }
     return;
   }
   if (/ship-track/i.test(location.href)) {
     const data = await parseTrackingPage();
     if (!data.amazonOrderId) return;
-    showPanel("Nutricity tracking", `Captured tracking for ${data.amazonOrderId}: ${data.package.status}.`);
-    await send({ type: "PACKAGE_TRACKING", ...data });
+    showPanel("Nutricity tracking", `Capturing tracking for ${data.amazonOrderId}: ${data.package.status}.`);
+    const response = await send({ type: "PACKAGE_TRACKING", ...data });
+    if (response?.ok) {
+      const recovered = response.recovered ? " Recovered from a stale queue and posted directly." : "";
+      showPanel("Nutricity tracking", `Synced tracking for ${data.amazonOrderId}: ${data.package.status}.${recovered}`);
+    } else {
+      showPanel("Nutricity tracking", responseError(response, "Captured the page, but could not post tracking to the app."));
+    }
   }
 }
 
