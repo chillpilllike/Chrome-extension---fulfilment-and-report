@@ -2229,14 +2229,13 @@ def amazon_history_direct_odoo_order(
     return result
 
 
-def amazon_history_direct_odoo_matches(
+def amazon_history_direct_odoo_targets(
     conn: Any,
     records: list[dict[str, Any]],
     matches: dict[str, dict[str, Any]],
     suggestions: dict[str, list[dict[str, Any]]],
-) -> dict[str, list[dict[str, Any]]]:
-    direct: dict[str, list[dict[str, Any]]] = {}
-    store_cache: dict[int, Store] = {}
+) -> dict[str, list[tuple[int, str]]]:
+    targets_by_order: dict[str, list[tuple[int, str]]] = {}
     for record in records:
         amazon_order_id = record.get("amazon_order_id")
         if not amazon_order_id or record.get("cancelled"):
@@ -2263,6 +2262,20 @@ def amazon_history_direct_odoo_matches(
                 refs,
             ).fetchall())
             targets = [(int(row["store_id"]), clean_text(row["odoo_order_name"]).upper()) for row in rows]
+        if targets:
+            targets_by_order[amazon_order_id] = targets[:8]
+    return targets_by_order
+
+
+def amazon_history_direct_odoo_matches_from_targets(
+    records: list[dict[str, Any]],
+    targets_by_order: dict[str, list[tuple[int, str]]],
+) -> dict[str, list[dict[str, Any]]]:
+    direct: dict[str, list[dict[str, Any]]] = {}
+    store_cache: dict[int, Store] = {}
+    records_by_order = {record.get("amazon_order_id"): record for record in records if record.get("amazon_order_id")}
+    for amazon_order_id, targets in targets_by_order.items():
+        record = records_by_order.get(amazon_order_id) or {}
         for store_id, order_name in targets[:8]:
             try:
                 store = store_cache.get(store_id)
@@ -2281,6 +2294,16 @@ def amazon_history_direct_odoo_matches(
                     "quantity_matches": False,
                 })
     return direct
+
+
+def amazon_history_direct_odoo_matches(
+    conn: Any,
+    records: list[dict[str, Any]],
+    matches: dict[str, dict[str, Any]],
+    suggestions: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    targets = amazon_history_direct_odoo_targets(conn, records, matches, suggestions)
+    return amazon_history_direct_odoo_matches_from_targets(records, targets)
 
 
 def amazon_history_asin_conflicts(
@@ -14810,13 +14833,25 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
     if not records:
         return {"ok": True, "matches": {}, "unmatched": [], "not_found_url": "/amazon-order-history-unmatched"}
     order_ids = [record["amazon_order_id"] for record in records if record["amazon_order_id"]]
-    with db() as conn:
-        matches = amazon_history_matches(conn, order_ids)
-        suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
-        conflicts = amazon_history_asin_conflicts(conn, records, matches, suggestions)
-        amazon_history_apply_quantity_checks(records, matches, suggestions)
-        amazon_history_apply_order_date_checks(records, matches, suggestions)
-        unmatched = upsert_amazon_history_unmatched(conn, records, set(matches.keys()))
+    last_db_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with db() as conn:
+                matches = amazon_history_matches(conn, order_ids)
+                suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
+                conflicts = amazon_history_asin_conflicts(conn, records, matches, suggestions)
+                amazon_history_apply_quantity_checks(records, matches, suggestions)
+                amazon_history_apply_order_date_checks(records, matches, suggestions)
+                unmatched = upsert_amazon_history_unmatched(conn, records, set(matches.keys()))
+            break
+        except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
+            last_db_error = exc
+            db_session.close_pool()
+            if attempt:
+                raise
+            time.sleep(0.2)
+    else:
+        raise last_db_error or RuntimeError("Amazon order-history lookup failed.")
     for record in records:
         match = matches.get(record["amazon_order_id"])
         if match:
@@ -14845,7 +14880,8 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
     with db() as conn:
         matches = amazon_history_matches(conn, order_ids)
         suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
-        direct_odoo = amazon_history_direct_odoo_matches(conn, records, matches, suggestions)
+        targets = amazon_history_direct_odoo_targets(conn, records, matches, suggestions)
+    direct_odoo = amazon_history_direct_odoo_matches_from_targets(records, targets)
     return {"ok": True, "odoo_direct": direct_odoo}
 
 

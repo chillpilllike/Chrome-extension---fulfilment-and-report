@@ -1166,7 +1166,7 @@ function cartActiveItems() {
   }
 
   const seen = new Set();
-  return candidates
+  const filtered = candidates
     .filter((item) => {
       if (!item || !visible(item)) return false;
       const text = (item.innerText || item.textContent || "").replace(/\s+/g, " ");
@@ -1177,6 +1177,14 @@ function cartActiveItems() {
       seen.add(item);
       return true;
     });
+  return filtered.filter((item) => {
+    const asin = cartItemAsin(item);
+    return !filtered.some((other) => {
+      if (other === item || !item.contains(other)) return false;
+      const otherAsin = cartItemAsin(other);
+      return !asin || !otherAsin || asin === otherAsin;
+    });
+  });
 }
 
 function cartIsVisiblyEmpty() {
@@ -2732,7 +2740,30 @@ async function handleProduct(activeJob) {
   const asin = currentAsinFromUrl();
   showPanel("Nutricity fulfilment", `Adding ${expectedItem.asin} for ${recipientName(activeJob)}.`, null, null);
   if (asin && asin !== expectedItem.asin) {
-    location.href = `https://www.amazon.com/dp/${expectedItem.asin}`;
+    const redirectAttempts = activeJob.asinRedirectAttempts && typeof activeJob.asinRedirectAttempts === "object"
+      ? activeJob.asinRedirectAttempts
+      : {};
+    const key = `${expectedItem.asin}:${asin}`;
+    const attempts = Number(redirectAttempts[key] || 0) + 1;
+    activeJob.asinRedirectAttempts = { ...redirectAttempts, [key]: attempts };
+    await setActiveJob(activeJob);
+    if (attempts <= 1) {
+      showPanel(
+        "Nutricity fulfilment",
+        `Amazon opened ASIN ${asin} while ${expectedItem.asin} was requested. Retrying the requested product page once.`,
+        null,
+        null,
+      );
+      location.href = `https://www.amazon.com/dp/${expectedItem.asin}?th=1`;
+      return;
+    }
+    await failCurrentItemAsMissing(
+      activeJob,
+      item,
+      expectedItem,
+      `ASIN ${expectedItem.asin} redirects to Amazon ASIN ${asin}, so the requested ASIN could not be safely ordered.`,
+      "asin_redirect_mismatch",
+    );
     return;
   }
   rememberProductDosage(activeJob, item);
@@ -5211,10 +5242,34 @@ function isCancelledOrderCard(card) {
   return /^cancelled$/i.test(orderCardStatus(card)) || /\bCancelled\b/.test(orderCardStatus(card));
 }
 
-function extractOrderHistoryOrders() {
-  const cards = [...document.querySelectorAll("#yourOrderHistorySection #orderCard, .order-card")]
+function orderHistoryCardCandidates() {
+  const exact = [...document.querySelectorAll("#yourOrderHistorySection #orderCard, #orderCard, .order-card")]
     .filter(visible);
-  const candidates = cards.length ? cards : [...document.querySelectorAll("#orderCard, .order-card")].filter(visible);
+  if (exact.length) return exact;
+  const headers = [...document.querySelectorAll("#yourOrderHistorySection #orderCardHeader, #orderCardHeader, [id*='orderCardHeader']")]
+    .filter(visible);
+  const cards = [];
+  const seen = new Set();
+  for (const header of headers) {
+    let card = header.closest(".a-box-group, .order-card, [class*='order-card'], [id*='orderCard']");
+    let parent = card || header.parentElement;
+    for (let depth = 0; parent && depth < 5; depth += 1, parent = parent.parentElement) {
+      const text = (parent.innerText || parent.textContent || "").replace(/\s+/g, " ");
+      if (/\bOrder placed\b/i.test(text) && /\b\d{3}-\d{7}-\d{7}\b/.test(text) && /\b(?:Arriving|Delivered|Cancelled|Buy it again)\b/i.test(text)) {
+        card = parent;
+      }
+    }
+    card = card || header;
+    if (!seen.has(card) && visible(card)) {
+      seen.add(card);
+      cards.push(card);
+    }
+  }
+  return cards;
+}
+
+function extractOrderHistoryOrders() {
+  const candidates = orderHistoryCardCandidates();
   const seen = new Set();
   const orders = [];
   for (const card of candidates) {
@@ -5237,8 +5292,7 @@ function extractOrderHistoryOrders() {
 }
 
 function visibleOrderHistoryCards() {
-  const cards = [...document.querySelectorAll("#yourOrderHistorySection #orderCard, .order-card")].filter(visible);
-  return cards.length ? cards : [...document.querySelectorAll("#orderCard, .order-card")].filter(visible);
+  return orderHistoryCardCandidates();
 }
 
 function orderHistoryCardDetails(card) {
@@ -5578,6 +5632,61 @@ function appendDirectOdooHistoryRows(container, directOdoo = [], detailsClass = 
   }
 }
 
+function directOdooRowsForOrder(result, orderId) {
+  if (!result?.ok) return null;
+  const direct = result.odoo_direct || result.odooDirect || {};
+  if (Array.isArray(direct)) return direct;
+  if (!direct || typeof direct !== "object") return undefined;
+  const keys = [orderId, String(orderId || "").trim()].filter(Boolean);
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(direct, key)) {
+      return Array.isArray(direct[key]) ? direct[key] : [];
+    }
+  }
+  return undefined;
+}
+
+function orderHistoryHasDirectOdooTarget(result) {
+  return Boolean(
+    (result?.match?.orders || []).length
+    || (result?.suggestions || []).length
+    || (result?.conflicts || []).length
+  );
+}
+
+async function lookupDirectOdooForHistoryOrder(card, details) {
+  const orderId = details?.amazon_order_id || "";
+  if (!orderId) return;
+  try {
+    const result = await send({ type: "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT", orders: [details] });
+    const directRows = directOdooRowsForOrder(result, orderId);
+    const cached = orderHistoryLookupCache.get(orderId);
+    if (!cached) return;
+    if (directRows === null || (directRows === undefined && orderHistoryHasDirectOdooTarget(cached))) {
+      cached.odooDirectLoaded = false;
+    } else {
+      cached.odooDirect = Array.isArray(directRows) ? directRows : [];
+      cached.odooDirectLoaded = true;
+      cached.cachedAt = Date.now();
+    }
+    orderHistoryLookupCache.set(orderId, cached);
+    try {
+      renderOrderHistoryAnnotation(card, cached);
+    } catch (_) {
+      cached.odooDirectLoaded = false;
+      orderHistoryLookupCache.set(orderId, cached);
+    }
+  } catch (_) {
+    const cached = orderHistoryLookupCache.get(orderId);
+    if (cached) {
+      cached.odooDirectLoaded = false;
+      orderHistoryLookupCache.set(orderId, cached);
+    }
+  } finally {
+    orderHistoryOdooDirectInFlight.delete(orderId);
+  }
+}
+
 function orderDateMismatches(orders = []) {
   return (orders || []).flatMap((order) =>
     (order.order_date_checks || [])
@@ -5712,22 +5821,20 @@ async function annotateAmazonOrderHistoryDirectOdoo(pairs = []) {
       return cached && !cached.odooDirectLoaded;
     });
   if (!pending.length) return;
-  for (const { card, details } of pending) {
-    const orderId = details.amazon_order_id;
-    orderHistoryOdooDirectInFlight.add(orderId);
-    try {
-      const result = await send({ type: "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT", orders: [details] });
-      const cached = orderHistoryLookupCache.get(orderId);
-      if (!cached) continue;
-      cached.odooDirect = result?.ok ? (result.odoo_direct || {})[orderId] || [] : [];
-      cached.odooDirectLoaded = true;
-      cached.cachedAt = Date.now();
-      orderHistoryLookupCache.set(orderId, cached);
-      renderOrderHistoryAnnotation(card, cached);
-    } finally {
-      orderHistoryOdooDirectInFlight.delete(orderId);
-    }
+  const queue = pending.slice(0, 12);
+  for (const { details } of queue) {
+    orderHistoryOdooDirectInFlight.add(details.amazon_order_id);
   }
+  const workerCount = Math.min(3, queue.length);
+  let index = 0;
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (index < queue.length) {
+      const current = queue[index];
+      index += 1;
+      await lookupDirectOdooForHistoryOrder(current.card, current.details);
+    }
+  });
+  await Promise.all(workers);
 }
 
 async function annotateAmazonOrderHistory() {
@@ -5772,17 +5879,23 @@ async function annotateAmazonOrderHistory() {
     const matches = result.matches || {};
     const suggestions = result.suggestions || {};
     const conflicts = result.conflicts || {};
+    const directRows = result.odoo_direct || result.odooDirect || {};
+    const directLookupFailed = Boolean(result.odoo_direct_error || result.odooDirectError);
     const unmatched = new Set(result.unmatched || []);
     for (const details of unknown) {
+      const directForOrder = directOdooRowsForOrder({ ok: true, odoo_direct: directRows }, details.amazon_order_id);
       const match = matches[details.amazon_order_id] || null;
+      const orderSuggestions = suggestions[details.amazon_order_id] || [];
+      const orderConflicts = conflicts[details.amazon_order_id] || [];
+      const hasDirectTarget = Boolean((match?.orders || []).length || orderSuggestions.length || orderConflicts.length);
       const cached = {
         orderId: details.amazon_order_id,
         recipient: details.recipient,
         match,
-        suggestions: suggestions[details.amazon_order_id] || [],
-        conflicts: conflicts[details.amazon_order_id] || [],
-        odooDirect: [],
-        odooDirectLoaded: false,
+        suggestions: orderSuggestions,
+        conflicts: orderConflicts,
+        odooDirect: Array.isArray(directForOrder) ? directForOrder : [],
+        odooDirectLoaded: !directLookupFailed && (Array.isArray(directForOrder) || !hasDirectTarget),
         unmatched: unmatched.has(details.amazon_order_id),
         orderDate: details.order_date || "",
         asins: details.asins || [],
@@ -5793,10 +5906,18 @@ async function annotateAmazonOrderHistory() {
       };
       orderHistoryLookupCache.set(details.amazon_order_id, cached);
     }
-    for (const { card, details } of pairs) {
-      renderOrderHistoryAnnotation(card, orderHistoryLookupCache.get(details.amazon_order_id));
-    }
     annotateAmazonOrderHistoryDirectOdoo(pairs).catch(() => {});
+    for (const { card, details } of pairs) {
+      try {
+        renderOrderHistoryAnnotation(card, orderHistoryLookupCache.get(details.amazon_order_id));
+      } catch (_) {
+        const cached = orderHistoryLookupCache.get(details.amazon_order_id);
+        if (cached) {
+          cached.cachedAt = 0;
+          orderHistoryLookupCache.set(details.amazon_order_id, cached);
+        }
+      }
+    }
   } finally {
     orderHistoryAnnotationInFlight = false;
   }

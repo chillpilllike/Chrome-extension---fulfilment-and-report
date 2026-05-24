@@ -20,6 +20,20 @@ _pool: Optional[pool.ThreadedConnectionPool] = None
 _pool_lock = threading.Lock()
 
 
+def _close_pool_unlocked() -> None:
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.closeall()
+        finally:
+            _pool = None
+
+
+def _reset_pool() -> None:
+    with _pool_lock:
+        _close_pool_unlocked()
+
+
 def _translate_placeholders(sql: str) -> str:
     out: list[str] = []
     in_single = False
@@ -121,23 +135,26 @@ class PostgresConnection:
             )
             return cls(raw, pooled=False)
         global _pool
-        if _pool is None:
-            with _pool_lock:
-                if _pool is None:
-                    max_connections = int(os.getenv("POSTGRES_POOL_MAX", "30"))
-                    _pool = pool.ThreadedConnectionPool(
-                        1,
-                        max_connections,
-                        POSTGRES_URL,
-                        connect_timeout=connect_timeout,
-                        options=f"-c statement_timeout={statement_timeout_ms} -c idle_in_transaction_session_timeout={statement_timeout_ms}",
-                    )
         last_error: Exception | None = None
-        for attempt in range(int(os.getenv("POSTGRES_POOL_RETRIES", "5"))):
+        retry_count = max(1, int(os.getenv("POSTGRES_POOL_RETRIES", "5")))
+        for attempt in range(retry_count):
             try:
+                if _pool is None:
+                    with _pool_lock:
+                        if _pool is None:
+                            max_connections = int(os.getenv("POSTGRES_POOL_MAX", "30"))
+                            _pool = pool.ThreadedConnectionPool(
+                                1,
+                                max_connections,
+                                POSTGRES_URL,
+                                connect_timeout=connect_timeout,
+                                options=f"-c statement_timeout={statement_timeout_ms} -c idle_in_transaction_session_timeout={statement_timeout_ms}",
+                            )
                 return cls(_pool.getconn(), pooled=True)
-            except pool.PoolError as error:
+            except (pool.PoolError, psycopg2.OperationalError, psycopg2.InterfaceError) as error:
                 last_error = error
+                if isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+                    _reset_pool()
                 time.sleep(0.2 * (attempt + 1))
         raise last_error or RuntimeError("Could not get a PostgreSQL connection from the pool.")
 
@@ -180,17 +197,32 @@ class PostgresConnection:
             self.execute(statement)
 
     def commit(self) -> None:
-        self._raw.commit()
+        try:
+            self._raw.commit()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            _reset_pool()
+            raise
 
     def rollback(self) -> None:
-        self._raw.rollback()
+        try:
+            self._raw.rollback()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            _reset_pool()
 
     def close(self) -> None:
         global _pool
-        if self._pooled and _pool is not None:
-            _pool.putconn(self._raw)
-        else:
+        if self._pooled:
+            if _pool is not None:
+                try:
+                    _pool.putconn(self._raw, close=getattr(self._raw, "closed", 0) != 0)
+                    return
+                except (pool.PoolError, psycopg2.OperationalError, psycopg2.InterfaceError):
+                    _reset_pool()
+            return
+        try:
             self._raw.close()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            pass
 
 
 @contextmanager
@@ -207,8 +239,5 @@ def db() -> Iterable[PostgresConnection]:
 
 
 def close_pool() -> None:
-    global _pool
     with _pool_lock:
-        if _pool is not None:
-            _pool.closeall()
-            _pool = None
+        _close_pool_unlocked()

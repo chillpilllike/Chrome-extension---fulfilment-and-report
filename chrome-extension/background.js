@@ -279,14 +279,27 @@ async function rememberRecentAmazonOrders(orders = []) {
 async function lookupAmazonHistoryOrders(orders = []) {
   const normalized = (orders || []).map(normalizeRecentAmazonOrder).filter(Boolean);
   if (!normalized.length) return { ok: true, matches: {}, unmatched: [], not_found_url: "/amazon-order-history-unmatched" };
-  const result = await api("/api/chrome/order-history/lookup", {
-    method: "POST",
-    body: JSON.stringify({ orders: normalized }),
-    timeoutMs: 12000,
-  });
+  const [result, directResult] = await Promise.all([
+    api("/api/chrome/order-history/lookup", {
+      method: "POST",
+      body: JSON.stringify({ orders: normalized }),
+      timeoutMs: 12000,
+    }),
+    api("/api/chrome/order-history/odoo-direct", {
+      method: "POST",
+      body: JSON.stringify({ orders: normalized }),
+      timeoutMs: 18000,
+    }).catch((error) => ({ ok: false, error: error?.message || String(error || "Direct Odoo lookup failed.") })),
+  ]);
   const { apiBase } = await getSettings();
   const base = normalizeApiBase(apiBase);
-  return { app_base_url: base, ...result, not_found_url: `${base}${result.not_found_url || "/amazon-order-history-unmatched"}` };
+  return {
+    app_base_url: base,
+    ...result,
+    odoo_direct: directResult?.odoo_direct || directResult?.odooDirect || {},
+    odoo_direct_error: directResult?.ok === false ? directResult.error || "Direct Odoo lookup failed." : "",
+    not_found_url: `${base}${result.not_found_url || "/amazon-order-history-unmatched"}`,
+  };
 }
 
 async function lookupAmazonHistoryOdooDirect(orders = []) {
@@ -450,6 +463,14 @@ async function refreshActiveJobFromQueue(windowId, force = false) {
       }
     }
     const { activeJob: currentJob } = await getWindowState(windowId);
+    if (activeJobServerLockReleased(currentJob || activeJob, freshJob)) {
+      await clearStoredJobGroup(activeJob.job.group_key);
+      await log(
+        `Cleared stale active job ${activeJob.job.group_key}; the server queue no longer has a lock for this worker.`,
+        windowId,
+      );
+      return null;
+    }
     const next = { ...(currentJob || activeJob), job: freshJob, jobRefreshedAt: Date.now() };
     if (jobWasSubmittedToAmazon(freshJob)) {
       next.stage = next.stage === "reporting_complete" ? "reporting_complete" : "find_order_id";
@@ -518,6 +539,14 @@ function activeJobBlocksNext(activeJob) {
   return true;
 }
 
+function activeJobServerLockReleased(activeJob, freshJob) {
+  if (!activeJob?.job?.group_key || !freshJob?.group_key) return false;
+  if (orderSubmitStarted(activeJob) || jobWasSubmittedToAmazon(freshJob)) return false;
+  const claimedBy = String(freshJob.claimed_by || "").trim();
+  if (!claimedBy) return true;
+  return Boolean(activeJob.workerId && claimedBy !== activeJob.workerId);
+}
+
 function isLateCompletedJobUpdate(currentJob, incomingJob) {
   if (!incomingJob?.job?.group_key) return false;
   if (incomingJob.stage !== "reporting_complete") return false;
@@ -534,7 +563,6 @@ async function blockingActiveJob(windowId = null) {
     const key = `${job?.targetWindowId || ""}:${job?.job?.group_key || ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (activeJobBlocksNext(job)) return job;
     const refreshed = await refreshActiveJobFromQueue(job.targetWindowId || windowId || null, true);
     if (activeJobBlocksNext(refreshed)) return refreshed;
   }
@@ -643,7 +671,7 @@ async function injectContentScript(tabId) {
 
 async function ensureContentScriptsInAmazonTabs(label = "extension recovery") {
   if (!chrome.tabs?.query) return;
-  const tabs = await chrome.tabs.query({ url: ["https://www.amazon.com/*", "https://amazon.com/*"] });
+  const tabs = await chrome.tabs.query({ url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"] });
   let injected = 0;
   for (const tab of tabs) {
     if (await injectContentScript(tab.id)) injected += 1;
@@ -1256,10 +1284,48 @@ function orderSubmitStarted(activeJob) {
   );
 }
 
+function submittedWindowForGroup(state, groupKey, windowId) {
+  const expectedWindow = String(windowId || "");
+  for (const [key, activeJob] of Object.entries(state.activeJobsByWindow || {})) {
+    if (key === expectedWindow) continue;
+    if (activeJob?.job?.group_key === groupKey && orderSubmitStarted(activeJob)) return key;
+  }
+  const globalJob = state.activeJob || null;
+  if (
+    globalJob?.job?.group_key === groupKey &&
+    orderSubmitStarted(globalJob) &&
+    String(globalJob.targetWindowId || "") !== expectedWindow
+  ) {
+    return String(globalJob.targetWindowId || "global");
+  }
+  return "";
+}
+
 async function markAmazonSubmitted(windowId) {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job?.group_key || !activeJob?.workerId) {
     return { ok: false, message: "No active job to protect before Amazon submit." };
+  }
+  if (orderSubmitStarted(activeJob)) {
+    await log(`Blocked repeat Place Order click for ${activeJob.job.group_key}; this Chrome window already protected the submit.`, windowId);
+    return {
+      ok: false,
+      duplicate_submit_blocked: true,
+      message: `${activeJob.job.group_key} is already protected for Amazon submit. Fulfilment paused before a repeat Place Order click.`,
+    };
+  }
+  const state = await getSettings();
+  const submittedWindow = submittedWindowForGroup(state, activeJob.job.group_key, windowId);
+  if (submittedWindow) {
+    await log(
+      `Blocked duplicate Place Order click for ${activeJob.job.group_key}; window ${submittedWindow} already protected this Amazon submit.`,
+      windowId,
+    );
+    return {
+      ok: false,
+      duplicate_submit_blocked: true,
+      message: `${activeJob.job.group_key} is already protected in another Chrome window. Fulfilment paused before a duplicate Place Order click.`,
+    };
   }
   const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/submitted`, {
     method: "POST",
