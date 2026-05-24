@@ -484,6 +484,7 @@ const PULL_LIMIT_STORAGE_KEY = "pull_orders_limit"
 const PULL_STORE_IDS_STORAGE_KEY = "pull_orders_store_ids"
 const DASHBOARD_CACHE_STORAGE_KEY = "fulfilment.dashboard.cache.v1"
 const DASHBOARD_CACHE_MAX_AGE_MS = 10 * 60 * 1000
+const PROFIT_LOSS_PERIOD_STORAGE_KEY = "profit_loss_period"
 
 const defaultUiCopy: UiCopy = {
   app_header: {
@@ -560,6 +561,12 @@ function savedAdminToken() {
 
 function savedPullSetting(key: string, fallback: string) {
   return typeof window !== "undefined" ? window.localStorage.getItem(key) || fallback : fallback
+}
+
+function savedProfitLossPeriod() {
+  if (typeof window === "undefined") return "monthly"
+  const saved = window.localStorage.getItem(PROFIT_LOSS_PERIOD_STORAGE_KEY) || ""
+  return ["daily", "weekly", "monthly"].includes(saved) ? saved : "monthly"
 }
 
 function savedPullStoreIds() {
@@ -1960,6 +1967,7 @@ function App() {
   const [bulkTotal, setBulkTotal] = useState(0)
   const [bulkDays, setBulkDays] = useState("2")
   const [activeBulkDays, setActiveBulkDays] = useState(2)
+  const [profitLossPeriod, setProfitLossPeriod] = useState(savedProfitLossPeriod)
   const [chromeQueueJobs, setChromeQueueJobs] = useState<ChromeQueueJob[]>([])
   const [chromeQueueCounts, setChromeQueueCounts] = useState<ChromeQueueCount[]>([])
   const [duplicateAsins, setDuplicateAsins] = useState<DuplicateAsin[]>([])
@@ -2418,6 +2426,10 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(PULL_STORE_IDS_STORAGE_KEY, JSON.stringify(pullStoreIds))
   }, [pullStoreIds])
+
+  useEffect(() => {
+    window.localStorage.setItem(PROFIT_LOSS_PERIOD_STORAGE_KEY, profitLossPeriod)
+  }, [profitLossPeriod])
 
   useEffect(() => {
     if (!openNavGroup) return
@@ -3121,6 +3133,7 @@ function App() {
   const currentPageCopy = copyFor(page)
   const headerCopy = copyFor("app_header")
   const pageTitle = currentPageCopy.title || "Dashboard"
+  const profitLossPeriodLabel = profitLossPeriod.charAt(0).toUpperCase() + profitLossPeriod.slice(1)
   const HeaderIcon = uiIconComponents[(headerCopy.icon || "package") as keyof typeof uiIconComponents] || PackageCheck
   const navGroups = [
     {
@@ -3370,6 +3383,9 @@ function App() {
                 </Button>
               </div>
               {currentPageCopy.description && <p className="mt-1 text-sm text-muted-foreground">{currentPageCopy.description}</p>}
+              {page === "profit-loss" && (
+                <p className="mt-1 text-sm font-medium text-primary">Current view: {profitLossPeriodLabel}</p>
+              )}
             </div>
             <div className="page-actions">
               {storeId && <span className="badge bg-blue-lt text-blue">{stores.find((store) => String(store.id) === storeId)?.name || "Store selected"}</span>}
@@ -4241,7 +4257,7 @@ function App() {
           />
         )}
         {page === "profit-loss" && (
-          <ProfitLossPage stores={stores} storeId={storeId} onResult={setModal} />
+          <ProfitLossPage stores={stores} storeId={storeId} period={profitLossPeriod} onPeriod={setProfitLossPeriod} onResult={setModal} />
         )}
         {page === "accounting" && (
           <AccountingPage storeId={storeId} onResult={setModal} />
@@ -6590,9 +6606,19 @@ function CostlyPage({
   )
 }
 
-function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: string; onResult: (modal: ModalState) => void }) {
+function ProfitLossPage({
+  storeId,
+  period,
+  onPeriod,
+  onResult,
+}: {
+  stores: Store[]
+  storeId: string
+  period: string
+  onPeriod: (period: string) => void
+  onResult: (modal: ModalState) => void
+}) {
   const [data, setData] = useState<ProfitLossData | null>(null)
-  const [period, setPeriod] = useState("monthly")
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7))
   const [day, setDay] = useState(new Date().toISOString().slice(0, 10))
   const [weekStart, setWeekStart] = useState(() => {
@@ -6752,7 +6778,7 @@ function ProfitLossPage({ storeId, onResult }: { stores: Store[]; storeId: strin
           <CardTitle>Profit / Loss Controls</CardTitle>
         </CardHeader>
         <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_1fr_auto] lg:items-end">
-          <SelectField label="View" value={period} onChange={(value) => { setPeriod(value); setPage(1) }}>
+          <SelectField label="View" value={period} onChange={(value) => { onPeriod(value); setPage(1) }}>
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
             <option value="monthly">Monthly</option>
