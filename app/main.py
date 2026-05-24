@@ -6519,7 +6519,12 @@ def ensure_chrome_job_owner(conn: Any, group_key: str, worker_id: str) -> None:
         raise HTTPException(409, "Chrome job is locked by another extension instance.")
 
 
-def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Optional[list[int]]) -> Optional[list[int]]:
+def expand_line_ids_to_full_chrome_orders(
+    conn: Any,
+    store_id: int,
+    line_ids: Optional[list[int]],
+    include_missing_asins: bool = False,
+) -> Optional[list[int]]:
     if not line_ids:
         return line_ids
     selected_ids = sorted({int(line_id) for line_id in line_ids if int(line_id or 0) > 0})
@@ -6547,13 +6552,14 @@ def expand_line_ids_to_full_chrome_orders(conn: Any, store_id: int, line_ids: Op
           AND asin IS NOT NULL AND asin != ''
           AND COALESCE(amazon_order_id, '') = ''
           AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory', 'ignored')
+          AND (? = 1 OR state != 'missing')
           AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
         ORDER BY odoo_order_id DESC, id ASC
         """,
-        [store_id, *order_ids],
+        [store_id, *order_ids, 1 if include_missing_asins else 0],
     ).fetchall()
     expanded_ids = sorted({int(row["id"]) for row in sibling_rows})
-    return expanded_ids or selected_ids
+    return expanded_ids
 
 
 def block_selected_orders_with_existing_amazon_orders(conn: Any, store_id: int, line_ids: Optional[list[int]]) -> tuple[Optional[list[int]], int]:
@@ -6791,13 +6797,16 @@ def queue_chrome_order_groups_fast(
         if not address:
             raise HTTPException(400, "Add a fulfilment address before placing Amazon orders.")
 
-        line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
+        line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids, include_missing_asins)
         line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
         if line_ids is not None and not line_ids:
             return 0, int(cleared_cursor.rowcount or 0), blocked, account, []
         if line_ids or include_missing_asins:
             placeholders = ",".join("?" for _ in (line_ids or []))
-            missing_state_filter = "AND state IN ('missing', 'error')" if line_ids else "AND state='missing'"
+            if include_missing_asins:
+                missing_state_filter = "AND state IN ('missing', 'error')" if line_ids else "AND state='missing'"
+            else:
+                missing_state_filter = "AND state='error'"
             missing_line_filter = f"AND id IN ({placeholders})" if line_ids else ""
             conn.execute(
                 f"""
@@ -7311,7 +7320,7 @@ def place_orders(
     failed = 0
     with db() as conn:
         if ordering_engine == "chrome":
-            line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids)
+            line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids, include_missing_asins)
         line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
         failed += blocked
         if line_ids is not None and not line_ids:

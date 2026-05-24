@@ -3244,7 +3244,7 @@ function App() {
             </div>
             <label className="flex w-fit cursor-pointer items-center gap-2 text-sm">
               <Checkbox checked={resendMissingAsins} onCheckedChange={(checked) => setResendMissingAsins(Boolean(checked))} />
-              Retry missing/out-of-stock ASINs too
+              <span className="ml-2">Retry missing/out-of-stock ASINs too</span>
             </label>
           </div>
           <DialogFooter>
@@ -3790,7 +3790,7 @@ function App() {
                 )}
                 <label className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Checkbox checked={resendMissingAsins} onCheckedChange={(checked) => setResendMissingAsins(Boolean(checked))} />
-                  Resend missing/out-of-stock ASINs
+                  <span className="ml-2">Resend missing/out-of-stock ASINs</span>
                 </label>
                 <ExportControls
                   view="orders"
