@@ -126,6 +126,9 @@ _sync_thread_started = False
 _TYPESENSE_INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="typesense-index")
 _TYPESENSE_COLLECTION_CACHE: dict[str, float] = {}
 _TYPESENSE_COLLECTION_CACHE_LOCK = threading.Lock()
+_PROFIT_LOSS_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_PROFIT_LOSS_CACHE_LOCK = threading.Lock()
+PROFIT_LOSS_CACHE_TTL_SECONDS = 90
 TYPESENSE_SCHEMA_VERSION = "3"
 PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/assets", "/static", "/health", "/favicon")
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
@@ -4769,6 +4772,17 @@ def normalize_converted_profit_columns(store_id: Optional[int], start_text: str,
               AND COALESCE(NULLIF(odoo_order_date, ''), NULLIF(raw_json::jsonb -> 'order' ->> 'date_order', ''), NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at) BETWEEN ? AND ?
               AND store_total_native IS NOT NULL
               AND COALESCE(store_currency_rate_to_usd, 0) > 0
+              AND (
+                store_total_price IS DISTINCT FROM (store_total_native * store_currency_rate_to_usd)
+                OR (
+                    COALESCE(quantity, 0) != 0
+                    AND store_unit_price IS DISTINCT FROM ((store_total_native * store_currency_rate_to_usd) / quantity)
+                )
+                OR (
+                    amazon_total_price IS NOT NULL
+                    AND chrome_profit_total IS DISTINCT FROM ((store_total_native * store_currency_rate_to_usd) - amazon_total_price)
+                )
+              )
             """,
             (utc_now(), store_id, store_id, start_text, end_text),
         )
@@ -8970,8 +8984,14 @@ def profit_loss_data(
     per_page: int = 100,
     candidate_order_names: Optional[list[str]] = None,
     amazon_ordered_only: bool = False,
+    profit_scope: str = "all",
 ) -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
+    profit_scope = clean_text(profit_scope).lower() or "all"
+    if amazon_ordered_only and profit_scope == "all":
+        profit_scope = "ordered"
+    if profit_scope not in {"all", "ordered", "not_ordered"}:
+        profit_scope = "all"
     start_dt, end_dt, resolved_month = date_range_from_params(period, month, start, end)
     start_text = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_text = end_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -8984,16 +9004,23 @@ def profit_loss_data(
         else:
             candidate_clause = " AND line_orders.odoo_order_name = ANY(?::text[])"
             candidate_params.append(candidate_order_names)
-    normalize_converted_profit_columns(store_id, start_text, end_text)
     with db() as conn:
         rows = conn.execute(
             f"""
-            WITH line_orders AS (
+            WITH filtered_lines AS (
+                SELECT
+                    *,
+                    COALESCE(NULLIF(odoo_order_date, ''), NULLIF(raw_json::jsonb -> 'order' ->> 'date_order', ''), NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at) AS profit_order_date
+                FROM order_lines
+                WHERE (? IS NULL OR store_id=?)
+                  AND COALESCE(NULLIF(odoo_order_date, ''), NULLIF(raw_json::jsonb -> 'order' ->> 'date_order', ''), NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at) BETWEEN ? AND ?
+            ),
+            line_orders AS (
                 SELECT
                     store_id,
                     odoo_order_id,
                     odoo_order_name,
-                    MIN(COALESCE(NULLIF(odoo_order_date, ''), NULLIF(raw_json::jsonb -> 'order' ->> 'date_order', ''), NULLIF(ordered_at, ''), NULLIF(pulled_at, ''), created_at)) AS order_date,
+                    MIN(profit_order_date) AS order_date,
                     SUM(
                         CASE
                             WHEN store_total_native IS NOT NULL AND COALESCE(store_currency_rate_to_usd, 0) > 0
@@ -9007,9 +9034,7 @@ def profit_loss_data(
                     STRING_AGG(DISTINCT amazon_order_id, ',') AS amazon_order_ids,
                     STRING_AGG(DISTINCT amazon_account_name, ',') AS amazon_accounts,
                     COUNT(*) AS line_count
-                FROM order_lines
-                WHERE (? IS NULL OR store_id=?)
-                  AND (? = 0 OR COALESCE(amazon_order_id, '') != '')
+                FROM filtered_lines
                 GROUP BY store_id, odoo_order_id, odoo_order_name
             ),
             shipping AS (
@@ -9030,12 +9055,11 @@ def profit_loss_data(
                 COALESCE(shipping.package_count, 0) AS package_count
             FROM line_orders
             LEFT JOIN shipping ON shipping.odoo_order_name = line_orders.odoo_order_name
-            WHERE line_orders.order_date BETWEEN ? AND ?
-              AND (? IS NULL OR line_orders.odoo_order_name LIKE ? OR line_orders.amazon_order_ids LIKE ?)
+            WHERE (? IS NULL OR line_orders.odoo_order_name LIKE ? OR line_orders.amazon_order_ids LIKE ?)
               {candidate_clause}
             ORDER BY line_orders.order_date DESC, line_orders.odoo_order_id DESC
             """,
-            (store_id, store_id, 1 if amazon_ordered_only else 0, start_text, end_text, search, search, search, *candidate_params),
+            (store_id, store_id, start_text, end_text, search, search, search, *candidate_params),
         ).fetchall()
         imports = conn.execute("SELECT * FROM shipping_imports ORDER BY created_at DESC LIMIT 12").fetchall()
     order_rows = rows_to_dicts(rows)
@@ -9043,11 +9067,31 @@ def profit_loss_data(
         row["gross_profit"] = round(float(row["odoo_order_value"] or 0) - float(row["amazon_order_value"] or 0), 2)
         row["net_profit"] = round(row["gross_profit"] - float(row["shipping_fee"] or 0) - float(row["fulfilment_fee"] or 0), 2)
         row["margin_percent"] = round((row["net_profit"] / float(row["odoo_order_value"] or 1)) * 100, 2) if float(row["odoo_order_value"] or 0) else 0
+        row["collected_payment_total"] = round(
+            float(row.get("odoo_order_value") or 0)
+            + float(row.get("collected_delivery") or 0)
+            + float(row.get("order_discounts") or 0),
+            2,
+        )
+    all_order_rows = order_rows
+    amazon_ordered_rows = [row for row in all_order_rows if clean_text(row.get("amazon_order_ids"))]
+    not_amazon_ordered_rows = [row for row in all_order_rows if not clean_text(row.get("amazon_order_ids"))]
+    if profit_scope == "ordered":
+        order_rows = amazon_ordered_rows
+    elif profit_scope == "not_ordered":
+        order_rows = not_amazon_ordered_rows
     summary = {
+        "profit_scope": profit_scope,
         "orders": len(order_rows),
         "odoo_order_value": round(sum(float(row["odoo_order_value"] or 0) for row in order_rows), 2),
         "collected_delivery": round(sum(float(row.get("collected_delivery") or 0) for row in order_rows), 2),
         "order_discounts": round(sum(float(row.get("order_discounts") or 0) for row in order_rows), 2),
+        "collected_payment_total": round(sum(float(row.get("collected_payment_total") or 0) for row in order_rows), 2),
+        "amazon_ordered_orders": len(amazon_ordered_rows),
+        "not_amazon_ordered_orders": len(not_amazon_ordered_rows),
+        "not_amazon_ordered_lines": int(sum(int(row.get("line_count") or 0) for row in not_amazon_ordered_rows)),
+        "not_amazon_ordered_value": round(sum(float(row.get("odoo_order_value") or 0) for row in not_amazon_ordered_rows), 2),
+        "not_amazon_ordered_collected": round(sum(float(row.get("collected_payment_total") or 0) for row in not_amazon_ordered_rows), 2),
         "amazon_order_value": round(sum(float(row["amazon_order_value"] or 0) for row in order_rows), 2),
         "gross_profit": round(sum(float(row["gross_profit"] or 0) for row in order_rows), 2),
         "shipping_fee": round(sum(float(row["shipping_fee"] or 0) for row in order_rows), 2),
@@ -9127,6 +9171,11 @@ def profit_loss_data(
         "month": resolved_month,
         "search_engine": "typesense" if candidate_order_names is not None else "postgres",
     }
+
+
+def clear_profit_loss_cache() -> None:
+    with _PROFIT_LOSS_CACHE_LOCK:
+        _PROFIT_LOSS_CACHE.clear()
 
 
 def profit_loss_order_names_from_typesense(
@@ -9216,6 +9265,7 @@ def upload_shipping_records(filename: str, data: bytes, month: str, default_fulf
             (inserted, matched, max(0, inserted - matched), import_id),
         )
     if inserted:
+        clear_profit_loss_cache()
         start_typesense_reindex_job()
     return {"ok": True, "message": f"Imported {inserted} shipping rows. Matched {matched}, unmatched {max(0, inserted - matched)}.", "import_id": import_id}
 
@@ -13735,17 +13785,41 @@ def api_profit_loss(
     end: str = "",
     q: str = "",
     amazon_ordered_only: bool = False,
+    profit_scope: str = "all",
     page: int = 1,
     per_page: int = 100,
 ) -> dict[str, Any]:
+    cache_key = (
+        store_id or 0,
+        clean_text(period).lower() or "monthly",
+        clean_text(month),
+        clean_text(start),
+        clean_text(end),
+        clean_text(q),
+        bool(amazon_ordered_only),
+        clean_text(profit_scope).lower() or "all",
+        int(page or 1),
+        int(per_page or 100),
+    )
+    now = time.monotonic()
+    with _PROFIT_LOSS_CACHE_LOCK:
+        cached = _PROFIT_LOSS_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return json.loads(json.dumps(cached[1], default=str))
     candidate_order_names: Optional[list[str]] = None
-    try:
-        candidate_order_names = profit_loss_order_names_from_typesense(store_id, period, month, start, end, q, amazon_ordered_only)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(500, f"Profit/Loss Typesense filter failed: {exc}") from exc
-    return profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names, amazon_ordered_only)
+    if q.strip():
+        try:
+            candidate_order_names = profit_loss_order_names_from_typesense(store_id, period, month, start, end, q)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"Profit/Loss Typesense filter failed: {exc}") from exc
+    result = profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names, amazon_ordered_only, profit_scope)
+    with _PROFIT_LOSS_CACHE_LOCK:
+        if len(_PROFIT_LOSS_CACHE) > 256:
+            _PROFIT_LOSS_CACHE.clear()
+        _PROFIT_LOSS_CACHE[cache_key] = (now + PROFIT_LOSS_CACHE_TTL_SECONDS, json.loads(json.dumps(result, default=str)))
+    return result
 
 
 @app.post("/api/profit-loss/manual-costs")
@@ -13784,6 +13858,7 @@ def api_profit_loss_manual_cost_save(payload: dict[str, Any]) -> dict[str, Any]:
                 """,
                 (store_id, month, label, amount, note, now, now),
             ).fetchone()
+    clear_profit_loss_cache()
     return {"ok": True, "message": "Manual monthly cost saved.", "cost": dict(row) if row else None}
 
 
@@ -13793,6 +13868,7 @@ def api_profit_loss_manual_cost_delete(cost_id: int) -> dict[str, Any]:
         cursor = conn.execute("DELETE FROM profit_loss_manual_costs WHERE id=?", (cost_id,))
     if cursor.rowcount <= 0:
         raise HTTPException(404, "Manual cost not found.")
+    clear_profit_loss_cache()
     return {"ok": True, "message": "Manual monthly cost removed."}
 
 

@@ -485,6 +485,8 @@ const PULL_STORE_IDS_STORAGE_KEY = "pull_orders_store_ids"
 const DASHBOARD_CACHE_STORAGE_KEY = "fulfilment.dashboard.cache.v1"
 const DASHBOARD_CACHE_MAX_AGE_MS = 10 * 60 * 1000
 const PROFIT_LOSS_PERIOD_STORAGE_KEY = "profit_loss_period"
+const PROFIT_LOSS_CACHE_PREFIX = "profit_loss.cache."
+const PROFIT_LOSS_CACHE_MAX_AGE_MS = 5 * 60 * 1000
 
 const defaultUiCopy: UiCopy = {
   app_header: {
@@ -6619,6 +6621,8 @@ function ProfitLossPage({
   onResult: (modal: ModalState) => void
 }) {
   const [data, setData] = useState<ProfitLossData | null>(null)
+  const [loading, setLoading] = useState(false)
+  const loadSeqRef = useRef(0)
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7))
   const [day, setDay] = useState(new Date().toISOString().slice(0, 10))
   const [weekStart, setWeekStart] = useState(() => {
@@ -6628,7 +6632,7 @@ function ProfitLossPage({
     return now.toISOString().slice(0, 10)
   })
   const [query, setQuery] = useState("")
-  const [amazonOrderedOnly, setAmazonOrderedOnly] = useState(false)
+  const [profitScope, setProfitScope] = useState("all")
   const [page, setPage] = useState(1)
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
@@ -6639,6 +6643,9 @@ function ProfitLossPage({
   const [manualCostNote, setManualCostNote] = useState("")
 
   async function load(nextPage = page) {
+    const requestSeq = loadSeqRef.current + 1
+    loadSeqRef.current = requestSeq
+    setLoading(true)
     const params = new URLSearchParams({ period, q: query })
     if (period === "monthly") {
       params.set("month", month)
@@ -6648,17 +6655,42 @@ function ProfitLossPage({
       params.set("start", day)
     }
     if (storeId) params.set("store_id", storeId)
-    if (amazonOrderedOnly) params.set("amazon_ordered_only", "true")
+    params.set("profit_scope", profitScope)
     params.set("page", String(nextPage))
     params.set("per_page", String(PAGE_SIZE))
-    const next = await api<ProfitLossData>(`/api/profit-loss?${params.toString()}`)
-    setData(next)
-    setPage(next.page || nextPage)
+    const cacheKey = `${PROFIT_LOSS_CACHE_PREFIX}${params.toString()}`
+    let usedCachedData = false
+    if (typeof window !== "undefined" && !data) {
+      try {
+        const cached = JSON.parse(window.localStorage.getItem(cacheKey) || "null")
+        if (cached?.data && Date.now() - Number(cached.savedAt || 0) < PROFIT_LOSS_CACHE_MAX_AGE_MS) {
+          setData(cached.data)
+          setPage(cached.data.page || nextPage)
+          setLoading(false)
+          usedCachedData = true
+        }
+      } catch {
+        usedCachedData = false
+      }
+    }
+    try {
+      const next = await api<ProfitLossData>(`/api/profit-loss?${params.toString()}`)
+      if (requestSeq !== loadSeqRef.current) return
+      setData(next)
+      setPage(next.page || nextPage)
+      try {
+        window.localStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), data: next }))
+      } catch {
+        // Ignore storage quota/private-mode failures; the live API result is already rendered.
+      }
+    } finally {
+      if (requestSeq === loadSeqRef.current || usedCachedData) setLoading(false)
+    }
   }
 
   useEffect(() => {
     load().catch((error) => onResult({ ok: false, title: "Profit/Loss load failed", message: String(error) }))
-  }, [storeId, period, month, day, weekStart, amazonOrderedOnly, page])
+  }, [storeId, period, month, day, weekStart, profitScope, page])
 
   async function uploadShipping() {
     if (!file) return
@@ -6754,22 +6786,34 @@ function ProfitLossPage({
   }, [period, month, day, weekStart, manualCostId])
 
   const summary = data?.summary || {}
+  const showInitialLoading = loading && !data
+  const notAmazonOrderedOrders = Number(summary.not_amazon_ordered_orders || 0)
+  const notAmazonOrderedLines = Number(summary.not_amazon_ordered_lines || 0)
   return (
     <div className="grid gap-3">
       <section className="grid gap-3 xl:grid-cols-4 2xl:grid-cols-7">
         {[
           ["Sales", formatMoney(Number(summary.odoo_order_value || 0))],
+          ["Collected Payments", formatMoney(Number(summary.collected_payment_total || 0))],
           ["Delivery Collected", formatMoney(Number(summary.collected_delivery || 0))],
           ["Discounts", formatMoney(Number(summary.order_discounts || 0))],
           ["Amazon Cost", formatMoney(Number(summary.amazon_order_value || 0))],
+          [
+            "Not Ordered on Amazon",
+            `${notAmazonOrderedOrders.toLocaleString()} order${notAmazonOrderedOrders === 1 ? "" : "s"}`,
+            `${notAmazonOrderedLines.toLocaleString()} line${notAmazonOrderedLines === 1 ? "" : "s"} · ${formatMoney(Number(summary.not_amazon_ordered_collected || 0))} collected`,
+          ],
           ["Shipping + Fulfilment", formatMoney(Number(summary.shipping_fee || 0) + Number(summary.fulfilment_fee || 0))],
           ["Manual Costs", formatMoney(Number(summary.manual_costs_total || 0))],
           ["Net Profit", formatMoney(Number(summary.net_profit || 0))],
-        ].map(([label, value]) => (
+        ].map(([label, value, detail]) => (
           <Card key={label}>
             <CardContent>
               <div className="text-secondary text-xs font-bold uppercase">{label}</div>
-              <div className="mt-2 text-2xl font-semibold">{value}</div>
+              <div className="mt-2 text-2xl font-semibold">
+                {showInitialLoading ? <span className="spinner-border spinner-border-sm text-primary" role="status"></span> : value}
+              </div>
+              {!showInitialLoading && detail ? <div className="mt-1 text-xs text-muted-foreground">{detail}</div> : null}
             </CardContent>
           </Card>
         ))}
@@ -6778,8 +6822,14 @@ function ProfitLossPage({
       <Card>
         <CardHeader>
           <CardTitle>Profit / Loss Controls</CardTitle>
+          {loading && (
+            <CardDescription className="inline-flex items-center gap-2">
+              <span className="spinner-border spinner-border-sm text-primary" role="status"></span>
+              Loading Profit / Loss...
+            </CardDescription>
+          )}
         </CardHeader>
-        <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_minmax(220px,1fr)_1fr_auto] lg:items-end">
+        <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_220px_1fr_auto] lg:items-end">
           <SelectField label="View" value={period} onChange={(value) => { onPeriod(value); setPage(1) }}>
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
@@ -6795,10 +6845,11 @@ function ProfitLossPage({
               <Input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setPage(1) }} />
             )}
           </div>
-          <label className="flex min-h-10 items-center gap-2 text-sm font-medium">
-            <Checkbox checked={amazonOrderedOnly} onCheckedChange={(checked) => { setAmazonOrderedOnly(Boolean(checked)); setPage(1) }} />
-            <span>Only Amazon ordered</span>
-          </label>
+          <SelectField label="Net Profit Includes" value={profitScope} onChange={(value) => { setProfitScope(value); setPage(1) }}>
+            <option value="all">All orders</option>
+            <option value="ordered">Ordered on Amazon</option>
+            <option value="not_ordered">Not ordered on Amazon</option>
+          </SelectField>
           <div>
             <Label>Search</Label>
             <SearchBox value={query} onChange={setQuery} placeholder="Odoo order or Amazon order" />
@@ -6895,7 +6946,13 @@ function ProfitLossPage({
             <Table>
               <TableHeader><TableRow><TableHead>Period</TableHead><TableHead>Orders</TableHead><TableHead>Manual Costs</TableHead><TableHead>Net Profit</TableHead></TableRow></TableHeader>
               <TableBody>
-                {(data?.period_rows || []).map((row) => (
+                {showInitialLoading ? (
+                  <TableRow>
+                    <TableCell colSpan={4} className="py-8 text-center text-muted-foreground">
+                      <span className="inline-flex items-center gap-2"><span className="spinner-border spinner-border-sm text-primary" role="status"></span>Loading Profit / Loss...</span>
+                    </TableCell>
+                  </TableRow>
+                ) : (data?.period_rows || []).map((row) => (
                   <TableRow key={String(row.period)}>
                     <TableCell>{row.period}</TableCell>
                     <TableCell>{row.orders}</TableCell>
@@ -6947,7 +7004,13 @@ function ProfitLossPage({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {(data?.orders || []).map((row) => (
+              {showInitialLoading ? (
+                <TableRow>
+                  <TableCell colSpan={11} className="py-8 text-center text-muted-foreground">
+                    <span className="inline-flex items-center gap-2"><span className="spinner-border spinner-border-sm text-primary" role="status"></span>Loading Profit / Loss...</span>
+                  </TableCell>
+                </TableRow>
+              ) : (data?.orders || []).map((row) => (
                 <TableRow key={`${row.odoo_order_id}-${row.odoo_order_name}`}>
                   <TableCell><OdooOrderRef name={row.odoo_order_name} linkClassName="font-medium" /></TableCell>
                   <TableCell>{formatDateTime(row.order_date)}</TableCell>
