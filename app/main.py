@@ -12334,7 +12334,6 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                   ON page_orders.store_id = same_order_lines.store_id
                  AND page_orders.odoo_order_id = same_order_lines.odoo_order_id
                 WHERE COALESCE(same_order_lines.asin, '') != ''
-                  AND COALESCE(same_order_lines.amazon_order_id, '') = ''
                   AND same_order_lines.state != 'missing'
                   AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
                 GROUP BY same_order_lines.store_id, same_order_lines.odoo_order_id
@@ -12509,7 +12508,6 @@ def order_line_search_select_sql(where_sql: str) -> str:
                    WHERE same_order_lines.store_id = order_lines.store_id
                      AND same_order_lines.odoo_order_id = order_lines.odoo_order_id
                      AND COALESCE(same_order_lines.asin, '') != ''
-                     AND COALESCE(same_order_lines.amazon_order_id, '') = ''
                      AND same_order_lines.state != 'missing'
                      AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
                ), 0) AS odoo_order_distinct_asin_count
