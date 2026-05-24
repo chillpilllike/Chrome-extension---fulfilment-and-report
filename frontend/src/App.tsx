@@ -6628,6 +6628,7 @@ function ProfitLossPage({
     return now.toISOString().slice(0, 10)
   })
   const [query, setQuery] = useState("")
+  const [amazonOrderedOnly, setAmazonOrderedOnly] = useState(false)
   const [page, setPage] = useState(1)
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
@@ -6647,6 +6648,7 @@ function ProfitLossPage({
       params.set("start", day)
     }
     if (storeId) params.set("store_id", storeId)
+    if (amazonOrderedOnly) params.set("amazon_ordered_only", "true")
     params.set("page", String(nextPage))
     params.set("per_page", String(PAGE_SIZE))
     const next = await api<ProfitLossData>(`/api/profit-loss?${params.toString()}`)
@@ -6656,7 +6658,7 @@ function ProfitLossPage({
 
   useEffect(() => {
     load().catch((error) => onResult({ ok: false, title: "Profit/Loss load failed", message: String(error) }))
-  }, [storeId, period, month, day, weekStart, page])
+  }, [storeId, period, month, day, weekStart, amazonOrderedOnly, page])
 
   async function uploadShipping() {
     if (!file) return
@@ -6777,7 +6779,7 @@ function ProfitLossPage({
         <CardHeader>
           <CardTitle>Profit / Loss Controls</CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_1fr_auto] lg:items-end">
+        <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_minmax(220px,1fr)_1fr_auto] lg:items-end">
           <SelectField label="View" value={period} onChange={(value) => { onPeriod(value); setPage(1) }}>
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
@@ -6793,6 +6795,10 @@ function ProfitLossPage({
               <Input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setPage(1) }} />
             )}
           </div>
+          <label className="flex min-h-10 items-center gap-2 text-sm font-medium">
+            <Checkbox checked={amazonOrderedOnly} onCheckedChange={(checked) => { setAmazonOrderedOnly(Boolean(checked)); setPage(1) }} />
+            <span>Only Amazon ordered</span>
+          </label>
           <div>
             <Label>Search</Label>
             <SearchBox value={query} onChange={setQuery} placeholder="Odoo order or Amazon order" />

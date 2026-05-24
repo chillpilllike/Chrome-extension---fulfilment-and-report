@@ -8969,6 +8969,7 @@ def profit_loss_data(
     page: int = 1,
     per_page: int = 100,
     candidate_order_names: Optional[list[str]] = None,
+    amazon_ordered_only: bool = False,
 ) -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
     start_dt, end_dt, resolved_month = date_range_from_params(period, month, start, end)
@@ -9008,6 +9009,7 @@ def profit_loss_data(
                     COUNT(*) AS line_count
                 FROM order_lines
                 WHERE (? IS NULL OR store_id=?)
+                  AND (? = 0 OR COALESCE(amazon_order_id, '') != '')
                 GROUP BY store_id, odoo_order_id, odoo_order_name
             ),
             shipping AS (
@@ -9033,7 +9035,7 @@ def profit_loss_data(
               {candidate_clause}
             ORDER BY line_orders.order_date DESC, line_orders.odoo_order_id DESC
             """,
-            (store_id, store_id, start_text, end_text, search, search, search, *candidate_params),
+            (store_id, store_id, 1 if amazon_ordered_only else 0, start_text, end_text, search, search, search, *candidate_params),
         ).fetchall()
         imports = conn.execute("SELECT * FROM shipping_imports ORDER BY created_at DESC LIMIT 12").fetchall()
     order_rows = rows_to_dicts(rows)
@@ -9134,6 +9136,7 @@ def profit_loss_order_names_from_typesense(
     start: str,
     end: str,
     q: str,
+    amazon_ordered_only: bool = False,
 ) -> list[str]:
     settings = get_service_settings()
     if not typesense_enabled(settings):
@@ -9154,8 +9157,9 @@ def profit_loss_order_names_from_typesense(
             SELECT DISTINCT odoo_order_name
             FROM order_lines
             WHERE id = ANY(?::int[])
+              AND (? = 0 OR COALESCE(amazon_order_id, '') != '')
             """,
-            (ids,),
+            (ids, 1 if amazon_ordered_only else 0),
         ).fetchall()
     return [str(row["odoo_order_name"]) for row in rows if clean_text(row["odoo_order_name"])]
 
@@ -13730,17 +13734,18 @@ def api_profit_loss(
     start: str = "",
     end: str = "",
     q: str = "",
+    amazon_ordered_only: bool = False,
     page: int = 1,
     per_page: int = 100,
 ) -> dict[str, Any]:
     candidate_order_names: Optional[list[str]] = None
     try:
-        candidate_order_names = profit_loss_order_names_from_typesense(store_id, period, month, start, end, q)
+        candidate_order_names = profit_loss_order_names_from_typesense(store_id, period, month, start, end, q, amazon_ordered_only)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(500, f"Profit/Loss Typesense filter failed: {exc}") from exc
-    return profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names)
+    return profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names, amazon_ordered_only)
 
 
 @app.post("/api/profit-loss/manual-costs")
