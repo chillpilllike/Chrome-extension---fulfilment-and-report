@@ -450,6 +450,8 @@ def admin_access_bridge_response(request: Request) -> HTMLResponse:
 async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     token = effective_admin_access_token()
     path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
     allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
     if token and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
         if not request_has_admin_access(request):
@@ -1062,6 +1064,7 @@ def init_db() -> None:
             "ordered_at": "ALTER TABLE order_lines ADD COLUMN ordered_at TEXT",
             "missing_asin": "ALTER TABLE order_lines ADD COLUMN missing_asin TEXT",
             "original_asin": "ALTER TABLE order_lines ADD COLUMN original_asin TEXT",
+            "original_product_name": "ALTER TABLE order_lines ADD COLUMN original_product_name TEXT",
             "replacement_asin": "ALTER TABLE order_lines ADD COLUMN replacement_asin TEXT",
             "replacement_product_name": "ALTER TABLE order_lines ADD COLUMN replacement_product_name TEXT",
             "replacement_note": "ALTER TABLE order_lines ADD COLUMN replacement_note TEXT",
@@ -1250,6 +1253,8 @@ _ODOO_FIELDS_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 _ODOO_FIELDS_CACHE_LOCK = threading.Lock()
 _ODOO_UID_CACHE: dict[tuple[str, str, str, str], int] = {}
 _ODOO_UID_CACHE_LOCK = threading.Lock()
+_AMAZON_HISTORY_ODOO_DIRECT_CACHE: dict[tuple[int, str, str, str], tuple[float, dict[str, Any]]] = {}
+_AMAZON_HISTORY_ODOO_DIRECT_CACHE_LOCK = threading.Lock()
 _PULL_EXECUTION_LOCK = threading.Lock()
 ODOO_XMLRPC_TIMEOUT_SECONDS = max(5, int(os.getenv("ODOO_XMLRPC_TIMEOUT_SECONDS", "45")))
 PULL_JOB_STALE_MINUTES = max(3, int(os.getenv("PULL_JOB_STALE_MINUTES", "5")))
@@ -1787,6 +1792,50 @@ class AmazonBusinessClient:
         return payload
 
 
+def odoo_field_fallbacks(fields: list[str]) -> list[list[str]]:
+    candidates = [fields]
+    if "detailed_type" in fields:
+        candidates.append([field for field in fields if field != "detailed_type"])
+    if "type" in fields:
+        candidates.append([field for field in fields if field != "type"])
+    if "detailed_type" in fields and "type" in fields:
+        candidates.append([field for field in fields if field not in {"detailed_type", "type"}])
+    unique: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for candidate in candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def odoo_search_read_fast(odoo: OdooClient, model: str, domain: list[Any], fields: list[str], limit: int = 0) -> list[dict[str, Any]]:
+    last_error: Exception | None = None
+    for candidate in odoo_field_fallbacks(fields):
+        try:
+            return odoo.search_read(model, domain, candidate, limit=limit)
+        except Exception as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    return []
+
+
+def odoo_read_fast(odoo: OdooClient, model: str, ids: list[int], fields: list[str]) -> list[dict[str, Any]]:
+    if not ids:
+        return []
+    last_error: Exception | None = None
+    for candidate in odoo_field_fallbacks(fields):
+        try:
+            return odoo.read(model, ids, candidate)
+        except Exception as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    return []
+
+
 def get_store(store_id: int) -> Store:
     now = time.monotonic()
     with _STORE_CACHE_LOCK:
@@ -1947,6 +1996,7 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
                order_lines.odoo_order_id,
                order_lines.odoo_order_name,
                order_lines.asin,
+               order_lines.replacement_asin,
                order_lines.quantity,
                order_lines.state,
                order_lines.ordered_at,
@@ -1989,14 +2039,32 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
         asin = normalize_asin(row["asin"])
         if asin:
             ordered_at = clean_text(row["ordered_at"])
-            order["lines"].append({"id": row["id"], "asin": asin, "quantity": float(row["quantity"] or 1), "ordered_at": ordered_at})
+            replacement_asin = normalize_asin(row["replacement_asin"] if "replacement_asin" in row.keys() else "")
+            order["lines"].append({
+                "id": row["id"],
+                "asin": asin,
+                "replacement_asin": replacement_asin,
+                "quantity": float(row["quantity"] or 1),
+                "ordered_at": ordered_at,
+            })
             if ordered_at and ordered_at not in order["ordered_at_values"]:
                 order["ordered_at_values"].append(ordered_at)
             if asin not in order["asins"]:
                 order["asins"].append(asin)
+            if replacement_asin and replacement_asin not in order["asins"]:
+                order["asins"].append(replacement_asin)
             order.setdefault("asin_quantities", {})
             order["asin_quantities"][asin] = float(order["asin_quantities"].get(asin) or 0) + float(row["quantity"] or 1)
     return matches
+
+
+def amazon_history_order_refs_from_text(value: Any) -> list[str]:
+    text = clean_text(value).upper()
+    refs = list(dict.fromkeys(match.group(0).upper() for match in ORDER_REF_RE.finditer(text)))
+    # Amazon sometimes compacts fulfilment labels into e.g. NC104194Pack.
+    # Keep the Odoo order ref distinct from the pack-size suffix.
+    refs.extend(match.group(1).upper() for match in re.finditer(r"\b(NC\d{5})(?=\d+\s*PACK\b)", text, re.IGNORECASE))
+    return list(dict.fromkeys(refs))
 
 
 def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], matched_ids: set[str]) -> dict[str, list[dict[str, Any]]]:
@@ -2005,7 +2073,7 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
         order_id = record["amazon_order_id"]
         if not order_id or order_id in matched_ids or record.get("cancelled"):
             continue
-        refs = list(dict.fromkeys(match.group(0).upper() for match in ORDER_REF_RE.finditer(record.get("recipient") or "")))
+        refs = amazon_history_order_refs_from_text(record.get("recipient") or "")
         if refs:
             refs_by_order[order_id] = refs
     all_refs = sorted({ref for refs in refs_by_order.values() for ref in refs})
@@ -2018,6 +2086,7 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                order_lines.odoo_order_id,
                order_lines.odoo_order_name,
                order_lines.asin,
+               order_lines.replacement_asin,
                order_lines.quantity,
                order_lines.state,
                order_lines.ordered_at,
@@ -2074,8 +2143,14 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                         suggestion["ordered_at_values"].append(ordered_at)
                     if asin not in suggestion["asins"]:
                         suggestion["asins"].append(asin)
+                    replacement_asin = normalize_asin(row.get("replacement_asin") if "replacement_asin" in row.keys() else "")
+                    if replacement_asin and replacement_asin not in suggestion["asins"]:
+                        suggestion["asins"].append(replacement_asin)
                     suggestion.setdefault("asin_quantities", {})
                     suggestion["asin_quantities"][asin] = float(suggestion["asin_quantities"].get(asin) or 0) + float(row.get("quantity") or 1)
+                    if replacement_asin:
+                        suggestion["replacement_asin"] = replacement_asin
+                        suggestion["lines"][-1]["replacement_asin"] = replacement_asin
         if grouped:
             suggestions[amazon_order_id] = list(grouped.values())
     return suggestions
@@ -2159,8 +2234,8 @@ def amazon_history_direct_odoo_order(
     if not clean_order_name:
         return result
     odoo = OdooClient(store)
-    order_fields = odoo.existing_fields("sale.order", ["id", "name", "order_line", "note", "state", "invoice_status", "date_order"])
-    orders = odoo.search_read("sale.order", [("name", "=", clean_order_name)], order_fields, limit=1)
+    order_fields = ["id", "name", "order_line", "note", "state", "invoice_status", "date_order"]
+    orders = odoo_search_read_fast(odoo, "sale.order", [("name", "=", clean_order_name)], order_fields, limit=1)
     if not orders:
         return result
     order = orders[0]
@@ -2176,14 +2251,14 @@ def amazon_history_direct_odoo_order(
     line_ids = [int(line_id) for line_id in (order.get("order_line") or []) if int(line_id or 0) > 0]
     if not line_ids:
         return result
-    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"])
-    lines = odoo.read("sale.order.line", line_ids, line_fields)
+    line_fields = ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"]
+    lines = odoo_read_fast(odoo, "sale.order.line", line_ids, line_fields)
     product_ids = sorted({int(line["product_id"][0]) for line in lines if line.get("product_id")})
-    product_fields = odoo.existing_fields("product.product", ["id", "default_code", "product_tmpl_id", "detailed_type", "type"])
-    products = {int(product["id"]): product for product in odoo.read("product.product", product_ids, product_fields)} if product_ids else {}
+    product_fields = ["id", "default_code", "product_tmpl_id", "detailed_type", "type"]
+    products = {int(product["id"]): product for product in odoo_read_fast(odoo, "product.product", product_ids, product_fields)} if product_ids else {}
     tmpl_ids = sorted({int(product["product_tmpl_id"][0]) for product in products.values() if product.get("product_tmpl_id")})
-    tmpl_fields = odoo.existing_fields("product.template", ["id", "default_code", "description", "detailed_type", "type"])
-    templates = {int(template["id"]): template for template in odoo.read("product.template", tmpl_ids, tmpl_fields)} if tmpl_ids else {}
+    tmpl_fields = ["id", "default_code", "description", "detailed_type", "type"]
+    templates = {int(template["id"]): template for template in odoo_read_fast(odoo, "product.template", tmpl_ids, tmpl_fields)} if tmpl_ids else {}
     asin_quantities: dict[str, float] = {}
     direct_lines: list[dict[str, Any]] = []
     for line in lines:
@@ -2229,6 +2304,228 @@ def amazon_history_direct_odoo_order(
     return result
 
 
+def amazon_history_direct_odoo_result_from_rows(
+    store: Store,
+    order_name: str,
+    record: dict[str, Any],
+    order: dict[str, Any] | None,
+    lines: list[dict[str, Any]],
+    products: dict[int, dict[str, Any]],
+    templates: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    clean_order_name = clean_text(order_name).upper()
+    result: dict[str, Any] = {
+        "store_id": store.id,
+        "store_name": store.name,
+        "odoo_order_name": clean_order_name,
+        "odoo_order_url": "",
+        "lines": [],
+        "asins": [],
+        "asin_quantities": {},
+        "quantity_checks": [],
+        "quantity_matches": False,
+        "found": False,
+        "error": "",
+    }
+    if not clean_order_name or not order:
+        return result
+    result.update({
+        "found": True,
+        "odoo_order_id": order.get("id"),
+        "odoo_order_name": order.get("name") or clean_order_name,
+        "odoo_order_url": f"{store.odoo_url}/web#id={int(order.get('id') or 0)}&model=sale.order&view_type=form" if order.get("id") else "",
+        "odoo_order_state": order.get("state") or "",
+        "odoo_invoice_status": order.get("invoice_status") or "",
+        "odoo_order_date": order.get("date_order") or "",
+    })
+    asin_quantities: dict[str, float] = {}
+    direct_lines: list[dict[str, Any]] = []
+    for line in lines:
+        product_id = int(line["product_id"][0]) if line.get("product_id") else None
+        product = products.get(product_id or 0, {})
+        tmpl_id = int(product["product_tmpl_id"][0]) if product.get("product_tmpl_id") else None
+        tmpl = templates.get(tmpl_id or 0, {})
+        if should_skip_order_line(line, product, tmpl) or is_order_adjustment_line(line, product, tmpl):
+            continue
+        default_code = product.get("default_code") or tmpl.get("default_code") or ""
+        note = strip_html(tmpl.get("description") or "")
+        asin = normalize_asin(decode_asin_reference(default_code) or extract_asin_from_notes(note, line.get("name") or "", order.get("note") or ""))
+        if not asin:
+            continue
+        quantity = float(line.get("product_uom_qty") or 1)
+        asin_quantities[asin] = float(asin_quantities.get(asin) or 0) + quantity
+        direct_lines.append({
+            "id": line.get("id"),
+            "asin": asin,
+            "quantity": quantity,
+            "name": line.get("name") or "",
+        })
+    actual_by_asin = {
+        normalize_asin(asin): float(quantity or 0)
+        for asin, quantity in (record.get("asin_quantities") or {}).items()
+        if normalize_asin(asin)
+    }
+    checks: list[dict[str, Any]] = []
+    for asin in sorted({normalize_asin(value) for value in asin_quantities.keys() if normalize_asin(value)}):
+        expected = float(asin_quantities.get(asin) or 0)
+        actual = float(actual_by_asin.get(asin) or 0)
+        checks.append({
+            "asin": asin,
+            "expected": expected,
+            "actual": actual,
+            "matches": abs(expected - actual) < 0.0001,
+        })
+    result["lines"] = direct_lines
+    result["asins"] = sorted(asin_quantities.keys())
+    result["asin_quantities"] = asin_quantities
+    result["quantity_checks"] = checks
+    result["quantity_matches"] = bool(checks) and all(check["matches"] for check in checks)
+    return result
+
+
+def amazon_history_odoo_rpc_concurrency(settings: Optional[dict[str, Any]] = None) -> int:
+    settings = settings or get_service_settings()
+    try:
+        value = int(float(settings.get("amazon_history_odoo_rpc_concurrency") or 10))
+    except Exception:
+        value = 10
+    return max(1, min(25, value))
+
+
+def amazon_history_odoo_rpc_cache_ttl_seconds(settings: Optional[dict[str, Any]] = None) -> int:
+    settings = settings or get_service_settings()
+    try:
+        minutes = int(float(settings.get("amazon_history_odoo_rpc_cache_minutes") or 60))
+    except Exception:
+        minutes = 60
+    return max(0, min(24 * 60, minutes)) * 60
+
+
+def amazon_history_odoo_direct_cache_key(store_id: int, order_name: str, record: dict[str, Any]) -> tuple[int, str, str, str]:
+    asin_quantities = {
+        normalize_asin(asin): float(quantity or 0)
+        for asin, quantity in (record.get("asin_quantities") or {}).items()
+        if normalize_asin(asin)
+    }
+    quantity_key = json.dumps(asin_quantities, sort_keys=True, separators=(",", ":"))
+    return (
+        int(store_id or 0),
+        clean_text(order_name).upper(),
+        clean_text(record.get("amazon_order_id")),
+        quantity_key,
+    )
+
+
+def amazon_history_odoo_direct_cache_get(store_id: int, order_name: str, record: dict[str, Any]) -> dict[str, Any] | None:
+    key = amazon_history_odoo_direct_cache_key(store_id, order_name, record)
+    now = time.monotonic()
+    with _AMAZON_HISTORY_ODOO_DIRECT_CACHE_LOCK:
+        cached = _AMAZON_HISTORY_ODOO_DIRECT_CACHE.get(key)
+        if cached and cached[0] > now:
+            return json.loads(json.dumps(cached[1], default=str))
+        if cached:
+            _AMAZON_HISTORY_ODOO_DIRECT_CACHE.pop(key, None)
+    return None
+
+
+def amazon_history_odoo_direct_cache_set(store_id: int, order_name: str, record: dict[str, Any], row: dict[str, Any], ttl_seconds: int) -> None:
+    if ttl_seconds <= 0:
+        return
+    key = amazon_history_odoo_direct_cache_key(store_id, order_name, record)
+    with _AMAZON_HISTORY_ODOO_DIRECT_CACHE_LOCK:
+        _AMAZON_HISTORY_ODOO_DIRECT_CACHE[key] = (time.monotonic() + ttl_seconds, json.loads(json.dumps(row, default=str)))
+
+
+def clear_amazon_history_odoo_direct_cache() -> int:
+    with _AMAZON_HISTORY_ODOO_DIRECT_CACHE_LOCK:
+        count = len(_AMAZON_HISTORY_ODOO_DIRECT_CACHE)
+        _AMAZON_HISTORY_ODOO_DIRECT_CACHE.clear()
+    return count
+
+
+def amazon_history_odoo_direct_cache_status() -> dict[str, Any]:
+    now = time.monotonic()
+    with _AMAZON_HISTORY_ODOO_DIRECT_CACHE_LOCK:
+        expired = [key for key, (expires_at, _) in _AMAZON_HISTORY_ODOO_DIRECT_CACHE.items() if expires_at <= now]
+        for key in expired:
+            _AMAZON_HISTORY_ODOO_DIRECT_CACHE.pop(key, None)
+        return {"entries": len(_AMAZON_HISTORY_ODOO_DIRECT_CACHE)}
+
+
+def amazon_history_direct_odoo_batch_for_store(
+    store: Store,
+    tasks: list[tuple[str, str, dict[str, Any]]],
+    cache_ttl_seconds: int,
+) -> list[tuple[str, dict[str, Any]]]:
+    if not tasks:
+        return []
+    cached_results: list[tuple[str, dict[str, Any]]] = []
+    misses: list[tuple[str, str, dict[str, Any]]] = []
+    for amazon_order_id, order_name, record in tasks:
+        cached = amazon_history_odoo_direct_cache_get(store.id, order_name, record)
+        if cached is not None:
+            cached_results.append((amazon_order_id, cached))
+        else:
+            misses.append((amazon_order_id, order_name, record))
+    if not misses:
+        return cached_results
+    odoo = OdooClient(store)
+    order_names = sorted({clean_text(order_name).upper() for _, order_name, _ in misses if clean_text(order_name)})
+    if not order_names:
+        missing_results = []
+        for amazon_order_id, order_name, record in misses:
+            row = amazon_history_direct_odoo_result_from_rows(store, order_name, record, None, [], {}, {})
+            amazon_history_odoo_direct_cache_set(store.id, order_name, record, row, cache_ttl_seconds)
+            missing_results.append((amazon_order_id, row))
+        return cached_results + missing_results
+    order_fields = ["id", "name", "order_line", "note", "state", "invoice_status", "date_order"]
+    orders = odoo_search_read_fast(odoo, "sale.order", [("name", "in", order_names)], order_fields, limit=len(order_names))
+    orders_by_name = {clean_text(order.get("name")).upper(): order for order in orders}
+    line_ids = sorted({
+        int(line_id)
+        for order in orders
+        for line_id in (order.get("order_line") or [])
+        if int(line_id or 0) > 0
+    })
+    line_fields = ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"]
+    lines = odoo_read_fast(odoo, "sale.order.line", line_ids, line_fields) if line_ids else []
+    lines_by_id = {int(line["id"]): line for line in lines if line.get("id")}
+    product_ids = sorted({int(line["product_id"][0]) for line in lines if line.get("product_id")})
+    product_fields = ["id", "default_code", "product_tmpl_id", "detailed_type", "type"]
+    products = {int(product["id"]): product for product in odoo_read_fast(odoo, "product.product", product_ids, product_fields)} if product_ids else {}
+    tmpl_ids = sorted({int(product["product_tmpl_id"][0]) for product in products.values() if product.get("product_tmpl_id")})
+    tmpl_fields = ["id", "default_code", "description", "detailed_type", "type"]
+    templates = {int(template["id"]): template for template in odoo_read_fast(odoo, "product.template", tmpl_ids, tmpl_fields)} if tmpl_ids else {}
+
+    results: list[tuple[str, dict[str, Any]]] = []
+    for amazon_order_id, order_name, record in misses:
+        clean_order_name = clean_text(order_name).upper()
+        order = orders_by_name.get(clean_order_name)
+        order_lines = [
+            lines_by_id[int(line_id)]
+            for line_id in ((order or {}).get("order_line") or [])
+            if int(line_id or 0) in lines_by_id
+        ]
+        row = amazon_history_direct_odoo_result_from_rows(store, clean_order_name, record, order, order_lines, products, templates)
+        amazon_history_odoo_direct_cache_set(store.id, clean_order_name, record, row, cache_ttl_seconds)
+        results.append((amazon_order_id, row))
+    return cached_results + results
+
+
+def amazon_history_direct_odoo_order_cached(
+    store: Store,
+    order_name: str,
+    record: dict[str, Any],
+    cache_ttl_seconds: int,
+) -> dict[str, Any]:
+    cached = amazon_history_odoo_direct_cache_get(store.id, order_name, record)
+    if cached is not None:
+        return cached
+    row = amazon_history_direct_odoo_order(store, order_name, record)
+    amazon_history_odoo_direct_cache_set(store.id, order_name, record, row, cache_ttl_seconds)
+    return row
+
+
 def amazon_history_direct_odoo_targets(
     conn: Any,
     records: list[dict[str, Any]],
@@ -2248,7 +2545,7 @@ def amazon_history_direct_odoo_targets(
             if int(candidate.get("store_id") or 0) > 0 and clean_text(candidate.get("odoo_order_name"))
         })
         if not targets:
-            refs = list(dict.fromkeys(match.group(0).upper() for match in ORDER_REF_RE.finditer(record.get("recipient") or "")))
+            refs = amazon_history_order_refs_from_text(record.get("recipient") or "")
             if not refs:
                 continue
             rows = rows_to_dicts(conn.execute(
@@ -2271,28 +2568,64 @@ def amazon_history_direct_odoo_matches_from_targets(
     records: list[dict[str, Any]],
     targets_by_order: dict[str, list[tuple[int, str]]],
 ) -> dict[str, list[dict[str, Any]]]:
-    direct: dict[str, list[dict[str, Any]]] = {}
-    store_cache: dict[int, Store] = {}
+    settings = get_service_settings()
+    cache_ttl_seconds = amazon_history_odoo_rpc_cache_ttl_seconds(settings)
+    concurrency = amazon_history_odoo_rpc_concurrency(settings)
     records_by_order = {record.get("amazon_order_id"): record for record in records if record.get("amazon_order_id")}
+    store_batches: dict[int, dict[str, Any]] = {}
+    direct: dict[str, list[dict[str, Any]]] = {}
     for amazon_order_id, targets in targets_by_order.items():
         record = records_by_order.get(amazon_order_id) or {}
         for store_id, order_name in targets[:8]:
             try:
-                store = store_cache.get(store_id)
-                if store is None:
-                    store = get_store(store_id)
-                    store_cache[store_id] = store
-                direct.setdefault(amazon_order_id, []).append(amazon_history_direct_odoo_order(store, order_name, record))
+                batch = store_batches.get(store_id)
+                if batch is None:
+                    batch = {"store": get_store(store_id), "tasks": []}
+                    store_batches[store_id] = batch
+                batch["tasks"].append((amazon_order_id, order_name, record))
             except Exception as exc:
                 direct.setdefault(amazon_order_id, []).append({
                     "store_id": store_id,
-                    "store_name": store_cache.get(store_id).name if store_id in store_cache else "",
-                    "odoo_order_name": order_name,
+                    "store_name": "",
+                    "odoo_order_name": clean_text(order_name).upper(),
                     "found": False,
                     "error": clean_text(str(exc))[:240],
                     "quantity_checks": [],
                     "quantity_matches": False,
                 })
+    if not store_batches:
+        return direct
+
+    def fetch_store_batch(batch: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        store = batch["store"]
+        tasks = batch["tasks"]
+        try:
+            return amazon_history_direct_odoo_batch_for_store(store, tasks, cache_ttl_seconds)
+        except Exception:
+            rows: list[tuple[str, dict[str, Any]]] = []
+            for amazon_order_id, order_name, record in tasks:
+                try:
+                    rows.append((amazon_order_id, amazon_history_direct_odoo_order_cached(store, order_name, record, cache_ttl_seconds)))
+                except Exception as exc:
+                    rows.append((amazon_order_id, {
+                        "store_id": store.id,
+                        "store_name": store.name,
+                        "odoo_order_name": clean_text(order_name).upper(),
+                        "found": False,
+                        "error": clean_text(str(exc))[:240],
+                        "quantity_checks": [],
+                        "quantity_matches": False,
+                    }))
+            return rows
+
+    batches = list(store_batches.values())
+    if not batches:
+        return {}
+    workers = min(concurrency, len(batches))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="amazon-history-odoo") as executor:
+        for rows in executor.map(fetch_store_batch, batches):
+            for amazon_order_id, row in rows:
+                direct.setdefault(amazon_order_id, []).append(row)
     return direct
 
 
@@ -2661,7 +2994,7 @@ ORDER_LINE_PAGE_SELECT = """
     amazon_status, tracking_status, tracking_checked_at, amazon_cancelled_at,
     amazon_cancelled_order_id, chrome_claimed_by, chrome_claimed_at, chrome_claim_expires_at,
     last_error, missing_asin, original_asin, replacement_asin, replacement_product_name,
-    replacement_note, replacement_assigned_at, cost_approved_at, cost_review_loss,
+    replacement_note, replacement_assigned_at, original_product_name, cost_approved_at, cost_review_loss,
     source_line_count, pulled_at, ordered_at, created_at, updated_at,
     CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_code' ELSE '' END AS destination_country_code,
     CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_name' ELSE '' END AS destination_country_name
@@ -2680,7 +3013,7 @@ ORDER_LINE_PAGE_COLUMNS = (
     "amazon_status", "tracking_status", "tracking_checked_at", "amazon_cancelled_at",
     "amazon_cancelled_order_id", "chrome_claimed_by", "chrome_claimed_at", "chrome_claim_expires_at",
     "last_error", "missing_asin", "original_asin", "replacement_asin", "replacement_product_name",
-    "replacement_note", "replacement_assigned_at", "cost_approved_at", "cost_review_loss",
+    "replacement_note", "replacement_assigned_at", "original_product_name", "cost_approved_at", "cost_review_loss",
     "source_line_count", "pulled_at", "ordered_at", "created_at", "updated_at",
 )
 
@@ -12854,6 +13187,17 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
     return {"ok": True, "message": "Service settings saved.", "settings": response}
 
 
+@app.post("/api/settings/odoo-rpc-cache/clear")
+def api_clear_odoo_rpc_cache() -> dict[str, Any]:
+    count = clear_amazon_history_odoo_direct_cache()
+    return {"ok": True, "message": f"Cleared {count} cached Odoo RPC direct lookup result(s).", "entries": 0}
+
+
+@app.get("/api/settings/odoo-rpc-cache")
+def api_odoo_rpc_cache_status() -> dict[str, Any]:
+    return {"ok": True, **amazon_history_odoo_direct_cache_status()}
+
+
 @app.get("/api/settings/ui-copy")
 def api_ui_copy() -> dict[str, Any]:
     return {"ok": True, "copy": get_ui_copy()}
@@ -13637,6 +13981,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
             """
             UPDATE order_lines
             SET original_asin=COALESCE(NULLIF(original_asin, ''), asin),
+                original_product_name=COALESCE(NULLIF(original_product_name, ''), product_name),
                 replacement_asin=?,
                 replacement_product_name=?,
                 replacement_note=?,
@@ -13680,6 +14025,61 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if updated:
         index_order_line(updated)
     return {"ok": True, "message": f"Replacement {replacement_asin} assigned and marked ready to queue.", "row": row_to_dict(updated)}
+
+
+def original_product_name_for_line(store_id: int, row: Any) -> str:
+    stored = clean_text(row["original_product_name"] if "original_product_name" in row.keys() else "")
+    if stored:
+        return stored
+    try:
+        store = get_store(store_id)
+        odoo_line_id = int(row["odoo_line_id"] or 0)
+        if not odoo_line_id:
+            return ""
+        lines = OdooClient(store).read("sale.order.line", [odoo_line_id], ["name"])
+        return clean_text(lines[0].get("name") if lines else "")
+    except Exception:
+        return ""
+
+
+@app.post("/api/lines/{line_id}/replacement/reset")
+def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    store_id = int(payload.get("store_id") or 0)
+    if not store_id:
+        raise HTTPException(400, "Store is required.")
+    now = utc_now()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, store_id)).fetchone()
+        if not row:
+            raise HTTPException(404, "Order line not found.")
+        original_asin = normalize_asin(row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"])
+        if not original_asin:
+            raise HTTPException(400, "Could not find the original ASIN for this line.")
+        original_product_name = original_product_name_for_line(store_id, row) or clean_text(row["product_name"] or "")
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET asin=?,
+                product_name=?,
+                replacement_asin=NULL,
+                replacement_product_name=NULL,
+                replacement_note=NULL,
+                replacement_assigned_at=NULL,
+                original_asin=NULL,
+                original_product_name=NULL,
+                missing_asin=NULL,
+                last_error=NULL,
+                amazon_status=CASE WHEN COALESCE(amazon_order_id, '') = '' THEN NULL ELSE amazon_status END,
+                state=CASE WHEN COALESCE(amazon_order_id, '') = '' THEN 'pulled' ELSE state END,
+                updated_at=?
+            WHERE id=? AND store_id=?
+            """,
+            (original_asin, original_product_name, now, line_id, store_id),
+        )
+        updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+    if updated:
+        index_order_line(updated)
+    return {"ok": True, "message": f"Replacement ASIN reset to original {original_asin}.", "row": row_to_dict(updated)}
 
 
 @app.post("/api/missing/lines/{line_id}/replacement")
@@ -14851,6 +15251,7 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
                 conflicts = amazon_history_asin_conflicts(conn, records, matches, suggestions)
                 amazon_history_apply_quantity_checks(records, matches, suggestions)
                 amazon_history_apply_order_date_checks(records, matches, suggestions)
+                direct_targets = amazon_history_direct_odoo_targets(conn, records, matches, suggestions)
                 unmatched = upsert_amazon_history_unmatched(conn, records, set(matches.keys()))
             break
         except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
@@ -14875,6 +15276,7 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
         "matches": matches,
         "suggestions": suggestions,
         "conflicts": conflicts,
+        "direct_targets": sum(len(targets) for targets in direct_targets.values()),
         "unmatched": unmatched,
         "not_found_url": "/amazon-order-history-unmatched",
     }
@@ -14886,10 +15288,22 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
     if not records:
         return {"ok": True, "odoo_direct": {}}
     order_ids = [record["amazon_order_id"] for record in records if record["amazon_order_id"]]
-    with db() as conn:
-        matches = amazon_history_matches(conn, order_ids)
-        suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
-        targets = amazon_history_direct_odoo_targets(conn, records, matches, suggestions)
+    last_db_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with db() as conn:
+                matches = amazon_history_matches(conn, order_ids)
+                suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
+                targets = amazon_history_direct_odoo_targets(conn, records, matches, suggestions)
+            break
+        except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
+            last_db_error = exc
+            db_session.close_pool()
+            if attempt:
+                raise
+            time.sleep(0.2)
+    else:
+        raise last_db_error or RuntimeError("Amazon order-history direct Odoo lookup failed.")
     direct_odoo = amazon_history_direct_odoo_matches_from_targets(records, targets)
     return {"ok": True, "odoo_direct": direct_odoo}
 
@@ -17135,23 +17549,129 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
             params,
         ).fetchall()
         if not rows:
-            existing = conn.execute(
+            completed_params: list[Any] = [group_key]
+            completed_line_filter = ""
+            if payload.line_ids:
+                completed_line_filter = f" AND id IN ({','.join('?' for _ in payload.line_ids)})"
+                completed_params.extend(payload.line_ids)
+            completed_rows = conn.execute(
                 """
-                SELECT amazon_order_id
+                SELECT *
                 FROM order_lines
                 WHERE amazon_group_key=?
                   AND order_engine='chrome'
                   AND COALESCE(amazon_order_id, '') != ''
+                  """ + completed_line_filter + """
                 ORDER BY ordered_at DESC, updated_at DESC
-                LIMIT 1
                 """,
-                (group_key,),
-            ).fetchone()
-            if existing:
+                completed_params,
+            ).fetchall()
+            if completed_rows:
+                completed_dicts = [dict(row) for row in completed_rows]
+                existing_ids = sorted({
+                    clean_text(str(row.get("amazon_order_id") or ""))
+                    for row in completed_dicts
+                    if clean_text(str(row.get("amazon_order_id") or ""))
+                })
+                incoming_is_real_order = re.fullmatch(r"\d{3}-\d{7}-\d{7}", amazon_order_id) is not None
+                if incoming_is_real_order and amazon_order_id not in existing_ids:
+                    completed_asins = sorted({
+                        normalize_asin(str(row.get("asin") or ""))
+                        for row in completed_dicts
+                        if normalize_asin(str(row.get("asin") or ""))
+                    })
+                    if len(completed_dicts) > 1 and len(completed_asins) > 1 and not payload.order_mappings:
+                        raise HTTPException(
+                            409,
+                            f"Refused to replace already-recorded Amazon order {', '.join(existing_ids) or 'UNKNOWN'} with {amazon_order_id} for multi-ASIN Chrome job {group_key} because no ASIN-to-order mapping was provided.",
+                        )
+                    if payload.order_mappings and len(completed_dicts) > 1:
+                        unmapped_completed = [
+                            row
+                            for row in completed_dicts
+                            if int(row["id"]) not in mapped_line_ids and normalize_asin(str(row.get("asin") or "")) not in mapped_asins
+                        ]
+                        if unmapped_completed:
+                            expected = ", ".join(
+                                f"{row['odoo_order_name']} line {row['id']} ASIN {normalize_asin(str(row.get('asin') or '')) or 'UNKNOWN'}"
+                                for row in unmapped_completed[:5]
+                            )
+                            raise HTTPException(
+                                409,
+                                f"Refused to replace already-recorded Amazon order {', '.join(existing_ids) or 'UNKNOWN'} with {amazon_order_id} because ASIN mapping did not cover every line in multi-line Chrome job {group_key}. Unmapped: {expected}.",
+                            )
+                    updated_for_shopify: list[dict[str, Any]] = []
+                    now = utc_now()
+                    for row in completed_dicts:
+                        row_asin = normalize_asin(str(row.get("asin") or ""))
+                        row_order = order_by_line_id.get(int(row["id"])) or order_by_asin.get(row_asin) or {}
+                        row_amazon_order_id = row_order.get("amazon_order_id") or amazon_order_id
+                        row_amazon_order_url = row_order.get("amazon_order_url") or amazon_order_url or order_line_amazon_url(row_amazon_order_id)
+                        conn.execute(
+                            """
+                            UPDATE order_lines
+                            SET amazon_order_id=?,
+                                amazon_order_url=?,
+                                amazon_account_name=?,
+                                amazon_status='ordered',
+                                state='ordered',
+                                chrome_claimed_by=NULL,
+                                chrome_claimed_at=NULL,
+                                chrome_claim_expires_at=NULL,
+                                last_error=NULL,
+                                ordered_at=?,
+                                updated_at=?
+                            WHERE id=?
+                            """,
+                            (
+                                row_amazon_order_id,
+                                row_amazon_order_url,
+                                chrome_account_name,
+                                ordered_at,
+                                now,
+                                row["id"],
+                            ),
+                        )
+                        updated = conn.execute("SELECT * FROM order_lines WHERE id = ?", (row["id"],)).fetchone()
+                        if updated:
+                            updated_dict = dict(updated)
+                            updated_for_shopify.append(updated_dict)
+                            index_order_line(updated_dict)
+                    conn.execute(
+                        """
+                        UPDATE amazon_attempts
+                        SET response_json=?, status='ok', error=NULL
+                        WHERE external_id=? AND mode='chrome'
+                        """,
+                        (
+                            json.dumps(
+                                {
+                                    "amazon_order_id": amazon_order_id,
+                                    "amazon_order_url": amazon_order_url or order_line_amazon_url(amazon_order_id),
+                                    "previous_amazon_order_ids": existing_ids,
+                                    "corrected_completed_order": True,
+                                    "amazon_account_name": chrome_account_name,
+                                }
+                            ),
+                            group_key,
+                        ),
+                    )
+                    try:
+                        for store_id in sorted({int(row["store_id"]) for row in updated_for_shopify}):
+                            write_report(store_id)
+                    except Exception as exc:
+                        print(f"Chrome complete report refresh after correction failed: {exc}", flush=True)
+                    return {
+                        "ok": True,
+                        "message": f"Chrome job {group_key} corrected from Amazon {', '.join(existing_ids) or 'UNKNOWN'} to {amazon_order_id}.",
+                        "amazon_order_id": amazon_order_id,
+                        "previous_amazon_order_ids": existing_ids,
+                        "corrected_completed": True,
+                    }
                 return {
                     "ok": True,
                     "message": f"Chrome job {group_key} was already marked ordered.",
-                    "amazon_order_id": existing["amazon_order_id"],
+                    "amazon_order_id": existing_ids[0] if existing_ids else "",
                     "already_completed": True,
                 }
             raise HTTPException(404, "Chrome job not found")
@@ -17212,6 +17732,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     chrome_profit_total=?,
                     fulfilment_note=?,
                     original_asin=CASE WHEN ? THEN COALESCE(NULLIF(original_asin, ''), asin) ELSE original_asin END,
+                    original_product_name=CASE WHEN ? THEN COALESCE(NULLIF(original_product_name, ''), product_name) ELSE original_product_name END,
                     replacement_asin=CASE WHEN ? THEN ? ELSE replacement_asin END,
                     replacement_product_name=CASE WHEN ? THEN ? ELSE replacement_product_name END,
                     replacement_note=CASE WHEN ? THEN ? ELSE replacement_note END,
@@ -17239,6 +17760,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     amazon_total or None,
                     profit_total,
                     fulfilment_note or None,
+                    replacement_applies,
                     replacement_applies,
                     replacement_applies,
                     purchased_asin,

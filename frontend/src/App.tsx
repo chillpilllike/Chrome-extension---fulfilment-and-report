@@ -177,6 +177,7 @@ type OrderLine = {
   missing_asin?: string
   missing_asin_url?: string
   original_asin?: string
+  original_product_name?: string
   replacement_asin?: string
   replacement_product_name?: string
   replacement_note?: string
@@ -2041,6 +2042,7 @@ function App() {
   const ordersAbortRef = useRef<AbortController | null>(null)
   const ordersInFlightKeyRef = useRef("")
   const ordersPageCacheRef = useRef<Map<string, { rows: OrderLine[]; page: number; per_page: number; total: number; cachedAt: number }>>(new Map())
+  const selectedOrderRowsRef = useRef<Map<number, OrderLine>>(new Map())
   const ordersPageRef = useRef(ordersPage)
   const shopifyStatusCompletedRefreshRef = useRef("")
   const shopifyStatusForceSyncPollRef = useRef(false)
@@ -2666,7 +2668,14 @@ function App() {
   const sortedRows = filteredRows
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
   const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "store" ? "store_name" : column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
-  const selectedRows = rows.filter((row) => selected.includes(row.id))
+  rows.forEach((row) => {
+    if (selected.includes(row.id)) selectedOrderRowsRef.current.set(row.id, row)
+  })
+  if (!selected.length && selectedOrderRowsRef.current.size) selectedOrderRowsRef.current.clear()
+  const currentRowsById = useMemo(() => new Map(rows.map((row) => [row.id, row])), [rows])
+  const selectedRows = selected
+    .map((id) => currentRowsById.get(id) || selectedOrderRowsRef.current.get(id))
+    .filter((row): row is OrderLine => Boolean(row))
   const selectedStoreIds = Array.from(new Set(selectedRows.map((row) => Number(row.store_id || 0)).filter(Boolean)))
   const selectedActionStoreId = selected.length > 0 && selectedRows.length === selected.length && selectedStoreIds.length === 1 ? selectedStoreIds[0] : null
   const canRunSelectedStoreAction = Boolean(selected.length && selectedActionStoreId)
@@ -2681,12 +2690,17 @@ function App() {
 
   function selectOrderRow(row: OrderLine, shiftKey: boolean, checked?: boolean) {
     setOrdersSelectAll(false)
+    selectedOrderRowsRef.current.set(row.id, row)
     const visibleIds = sortedRows.map((item) => item.id)
     const previousAnchor = ordersSelectionAnchor.current
     setSelected((current) => {
       const anchor = previousAnchor ?? current[current.length - 1] ?? null
       const shouldCheck = checked ?? !current.includes(row.id)
       const next = rangeSelection(visibleIds, current, row.id, shouldCheck, shiftKey, anchor)
+      sortedRows.forEach((item) => {
+        if (next.includes(item.id)) selectedOrderRowsRef.current.set(item.id, item)
+        else if (visibleIds.includes(item.id)) selectedOrderRowsRef.current.delete(item.id)
+      })
       if (!next.length) ordersSelectionAnchor.current = null
       return next
     })
@@ -3879,6 +3893,10 @@ function App() {
                           onCheckedChange={(checked) => {
                             setOrdersSelectAll(false)
                             const pageIds = filteredRows.map((row) => row.id)
+                            filteredRows.forEach((row) => {
+                              if (checked) selectedOrderRowsRef.current.set(row.id, row)
+                              else selectedOrderRowsRef.current.delete(row.id)
+                            })
                             setSelected((current) => checked ? Array.from(new Set([...current, ...pageIds])) : current.filter((id) => !pageIds.includes(id)))
                           }}
                         />
@@ -4280,9 +4298,9 @@ function App() {
               const result = await api<{ rows: OrderLine[]; total: number }>(`/api/missing${pagedQuery(storeId, missingPage)}`)
               setMissingRows(result.rows)
               setMissingTotal(result.total || 0)
-              await refresh()
-              setModal({ ok: true, title: "Replacement Assigned", message })
-            }}
+	              await refresh()
+	              setModal({ ok: true, title: message.toLowerCase().includes("reset") ? "Replacement Reset" : "Replacement Assigned", message })
+	            }}
             onResult={setModal}
           />
         )}
@@ -7464,6 +7482,8 @@ function ReplacementDialog({
 }) {
   const [asin, setAsin] = useState("")
   const [note, setNote] = useState("")
+  const [saving, setSaving] = useState(false)
+  const [resetting, setResetting] = useState(false)
   useEffect(() => {
     setAsin(line.replacement_asin || "")
     setNote(line.replacement_note || "")
@@ -7479,11 +7499,35 @@ function ReplacementDialog({
           <TextField label="Replacement ASIN" value={asin} onChange={(value) => setAsin(value.toUpperCase())} />
           <TextField label="Internal note" value={note} onChange={setNote} />
         </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
+        <DialogFooter className="gap-2 sm:justify-between">
           <Button
+            variant="outline"
+            disabled={!line.replacement_asin || saving || resetting}
             onClick={async () => {
               try {
+                setResetting(true)
+                const result = await api<{ ok: boolean; message: string }>(`/api/lines/${line.id}/replacement/reset`, {
+                  method: "POST",
+                  body: JSON.stringify({ store_id: storeId }),
+                })
+                await onSaved(result.message)
+              } catch (error) {
+                onResult({ ok: false, title: "Replacement Reset Failed", message: String(error) })
+              } finally {
+                setResetting(false)
+              }
+            }}
+          >
+            <RefreshCw className="size-4" />
+            {resetting ? "Resetting" : "Reset Replacement"}
+          </Button>
+          <div className="flex gap-2">
+          <Button variant="outline" disabled={saving || resetting} onClick={onClose}>Cancel</Button>
+          <Button
+            disabled={saving || resetting}
+            onClick={async () => {
+              try {
+                setSaving(true)
                 const result = await api<{ ok: boolean; message: string }>(`/api/lines/${line.id}/replacement`, {
                   method: "POST",
                   body: JSON.stringify({ store_id: storeId, asin, note }),
@@ -7491,11 +7535,14 @@ function ReplacementDialog({
                 await onSaved(result.message)
               } catch (error) {
                 onResult({ ok: false, title: "Replacement Save Failed", message: String(error) })
+              } finally {
+                setSaving(false)
               }
             }}
           >
-            Save Replacement
+            {saving ? "Saving" : "Save Replacement"}
           </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -8758,6 +8805,7 @@ function SettingsPage({
   const [selectedBackupKey, setSelectedBackupKey] = useState("")
   const [backupBusy, setBackupBusy] = useState("")
   const [backupProgress, setBackupProgress] = useState<BackupProgress | null>(null)
+  const [odooRpcCacheEntries, setOdooRpcCacheEntries] = useState(0)
   const [adminCode, setAdminCode] = useState("")
   const [adminCodeConfirm, setAdminCodeConfirm] = useState("")
   useEffect(() => {
@@ -8770,6 +8818,7 @@ function SettingsPage({
     loadReindexProgress()
     loadBackupProgress()
     loadBackups()
+    loadOdooRpcCacheStatus()
   }, [])
 
   useEffect(() => {
@@ -8813,6 +8862,14 @@ function SettingsPage({
       setSelectedBackupKey((current) => current && result.backups?.some((backup) => backup.key === current) ? current : "")
     } catch {
       setBackups([])
+    }
+  }
+  async function loadOdooRpcCacheStatus() {
+    try {
+      const result = await api<{ ok: boolean; entries: number }>("/api/settings/odoo-rpc-cache")
+      setOdooRpcCacheEntries(Number(result.entries || 0))
+    } catch {
+      setOdooRpcCacheEntries(0)
     }
   }
 
@@ -8904,6 +8961,16 @@ function SettingsPage({
     const result = await api<{ ok: boolean; message: string }>("/api/settings/amazon-otp/sync", { method: "POST" })
     onResult({ ok: result.ok, title: "Amazon OTP Email Sync", message: result.message })
   }
+  async function clearOdooRpcCache() {
+    setSavingServices("Clear Odoo RPC Cache")
+    try {
+      const result = await api<{ ok: boolean; message: string; entries: number }>("/api/settings/odoo-rpc-cache/clear", { method: "POST" })
+      setOdooRpcCacheEntries(Number(result.entries || 0))
+      onResult({ ok: result.ok, title: "Odoo RPC Cache", message: result.message })
+    } finally {
+      setSavingServices("")
+    }
+  }
   async function saveAdminCode() {
     const nextCode = adminCode.trim()
     if (nextCode.length < 4) {
@@ -8970,6 +9037,40 @@ function SettingsPage({
         onChanged={onChanged}
         onResult={onResult}
       />
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <RefreshCw className="size-4 text-muted-foreground" />
+            <CardTitle>Amazon Order History Odoo RPC</CardTitle>
+          </div>
+          <CardDescription>Controls the direct Odoo verification shown by the Chrome extension on Amazon order history pages.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <TextField label="Parallel Odoo RPC Workers" value={settings.amazon_history_odoo_rpc_concurrency || "10"} onChange={(value) => setSetting("amazon_history_odoo_rpc_concurrency", value)} />
+            <TextField label="Odoo RPC Cache Minutes" value={settings.amazon_history_odoo_rpc_cache_minutes || "60"} onChange={(value) => setSetting("amazon_history_odoo_rpc_cache_minutes", value)} />
+          </div>
+          <div className="card-actions btn-list justify-between">
+            <p className="text-sm text-muted-foreground">Cached direct lookup results: {odooRpcCacheEntries}</p>
+            <div className="btn-list">
+              <Button
+                onClick={() => saveSettingsGroup("Odoo RPC", [
+                  "amazon_history_odoo_rpc_concurrency",
+                  "amazon_history_odoo_rpc_cache_minutes",
+                ])}
+                disabled={savingServices === "Odoo RPC"}
+              >
+                {savingServices === "Odoo RPC" ? "Saving..." : "Save Odoo RPC"}
+              </Button>
+              <Button variant="outline" onClick={loadOdooRpcCacheStatus}>Refresh Cache Count</Button>
+              <Button variant="destructive" onClick={clearOdooRpcCache} disabled={savingServices === "Clear Odoo RPC Cache"}>
+                {savingServices === "Clear Odoo RPC Cache" ? "Clearing..." : "Clear Odoo RPC Cache"}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

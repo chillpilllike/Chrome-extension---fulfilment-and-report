@@ -30,6 +30,9 @@ const currentOrderProcessing = document.querySelector("#currentOrderProcessing")
 const currentOrderStage = document.querySelector("#currentOrderStage");
 const nextOrderProcessing = document.querySelector("#nextOrderProcessing");
 const nextOrderStage = document.querySelector("#nextOrderStage");
+const diagnosticCount = document.querySelector("#diagnosticCount");
+const exportDiagnostics = document.querySelector("#exportDiagnostics");
+const clearDiagnostics = document.querySelector("#clearDiagnostics");
 
 function send(message) {
   return chrome.runtime.sendMessage({ ...message, targetWindowId });
@@ -328,6 +331,40 @@ function renderOrderProgress(progress = {}, queue = null, activeJob = null) {
   orderProgressDetail.textContent = detail;
 }
 
+function renderDiagnosticCount(diagnosticSessions = {}) {
+  const sessions = Array.isArray(diagnosticSessions.sessions) ? diagnosticSessions.sessions : [];
+  diagnosticCount.textContent = `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
+}
+
+function formatDiagnosticExport(diagnosticSessions = {}) {
+  const sessions = Array.isArray(diagnosticSessions.sessions) ? diagnosticSessions.sessions : [];
+  const lines = [
+    "Nutricity Fulfilment Diagnostics",
+    `Exported: ${new Date().toISOString()}`,
+    `Sessions: ${sessions.length}`,
+    "",
+  ];
+  for (const session of sessions) {
+    lines.push("=".repeat(80));
+    lines.push(`Session: ${session.id || "unknown"}`);
+    lines.push(`Group: ${session.groupKey || ""}`);
+    lines.push(`Orders: ${(session.orderNames || []).join(", ")}`);
+    lines.push(`Window: ${session.windowId || ""}`);
+    lines.push(`Started: ${session.startedAt ? new Date(session.startedAt).toISOString() : ""}`);
+    lines.push(`Updated: ${session.updatedAt ? new Date(session.updatedAt).toISOString() : ""}`);
+    lines.push("");
+    for (const entry of session.entries || []) {
+      lines.push(`[${entry.time || new Date(entry.at || Date.now()).toISOString()}] ${entry.level || "info"} ${entry.source || ""}`);
+      lines.push(`Message: ${entry.message || ""}`);
+      if (entry.url || entry.page?.url) lines.push(`URL: ${entry.url || entry.page.url}`);
+      if (entry.job) lines.push(`Job: ${JSON.stringify(entry.job)}`);
+      if (entry.details) lines.push(`Details: ${JSON.stringify(entry.details)}`);
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
 async function refresh() {
   if (refreshInFlight) {
     refreshRequested = true;
@@ -351,6 +388,7 @@ async function refresh() {
     setStatus(job ? `${state.activeJob.paused ? "Paused" : "Active"}: ${job.group_key} (${state.activeJob.stage})` : "No active job.");
     renderDuplicateOrder(state.activeJob);
     renderPricing(state.activeJob);
+    renderDiagnosticCount(state.diagnosticSessions || {});
     let browserlessProgress = null;
     if ((browserlessOrderMode.checked || state.orderProgress?.source === "browserless") && !job) {
       try {
@@ -374,6 +412,7 @@ async function refresh() {
       renderQueueStatus(queue, state);
       renderActivitySummary(state, queue);
       renderOrderProgress(browserlessProgress || state.orderProgress || {}, queue, state.activeJob);
+      if (queue.message && /Connected to app/i.test(queue.message)) setConnectionNotice(queue.message, true);
       if (queue.stale && queue.message) setStatus(queue.message);
     } catch (error) {
       queueCount.textContent = "Not loaded";
@@ -500,12 +539,39 @@ document.querySelector("#clearFailed").addEventListener("click", async () => {
   setStatus(result.message || (result.ok ? "Stale queue cleared." : "Could not clear stale queue."));
 });
 
+exportDiagnostics.addEventListener("click", async () => {
+  const result = await send({ type: "GET_DIAGNOSTIC_LOGS" });
+  if (!result?.ok) {
+    setStatus(result?.message || "Could not load diagnostic logs.");
+    return;
+  }
+  const text = formatDiagnosticExport(result.diagnosticSessions || {});
+  const blobUrl = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = `nutricity-fulfilment-diagnostics-${stamp}.txt`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+  setStatus("Diagnostic logs exported.");
+});
+
+clearDiagnostics.addEventListener("click", async () => {
+  const confirmed = confirm("Clear all saved diagnostic logs from this extension?");
+  if (!confirmed) return;
+  const result = await send({ type: "CLEAR_DIAGNOSTIC_LOGS" });
+  setStatus(result?.message || (result?.ok ? "Diagnostic logs cleared." : "Could not clear diagnostic logs."));
+  await refresh();
+});
+
 loadSavedSettings();
 registerControlWindow();
 let refreshInFlight = false;
 let refreshRequested = false;
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh, 10000);
 
 async function runPopupRecoveryAction() {
   const action = popupParams.get("action");

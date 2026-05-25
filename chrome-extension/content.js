@@ -1,3 +1,31 @@
+(() => {
+const CONTENT_SCRIPT_BUILD = "2026-05-25-order-history-card-asin-filter-v18";
+if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
+if (typeof window.__nutricityContentCleanup === "function") {
+  try {
+    window.__nutricityContentCleanup();
+  } catch (_) {
+    // Continue loading this build even if an older content-script cleanup failed.
+  }
+}
+window.__nutricityContentLoaded = CONTENT_SCRIPT_BUILD;
+const contentCleanupFns = [];
+function registerContentCleanup(cleanup) {
+  if (typeof cleanup === "function") contentCleanupFns.push(cleanup);
+}
+window.__nutricityContentCleanup = () => {
+  while (contentCleanupFns.length) {
+    try {
+      contentCleanupFns.pop()();
+    } catch (_) {
+      // Best-effort teardown between unpacked-extension reloads.
+    }
+  }
+  if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) {
+    window.__nutricityContentLoaded = false;
+  }
+};
+
 const rawSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function sleep(ms, options = {}) {
   const pauseAware = options.pauseAware !== false;
@@ -7,9 +35,8 @@ async function sleep(ms, options = {}) {
     await rawSleep(Math.min(250, Math.max(0, deadline - Date.now())));
   } while (Date.now() < deadline);
 }
-const ACTION_DELAY = 1800;
+const ACTION_DELAY = 900;
 const PAGE_READY_TIMEOUT = 12000;
-window.__nutricityContentLoaded = true;
 const DEFAULT_NEW_DELIVERY_ADDRESS = {
   countryCode: "US",
   phoneNumber: "9176818556",
@@ -24,10 +51,95 @@ let extensionContextAlive = true;
 let panelOrderStatusVersion = 0;
 let orderHistoryAnnotationScheduled = false;
 let orderHistoryAnnotationInFlight = false;
+let orderHistoryAnnotationInFlightAt = 0;
+let orderHistoryLastAnnotatedAt = 0;
+let orderHistoryScrollTimer = null;
 const orderHistoryLookupCache = new Map();
 const orderHistoryOdooDirectInFlight = new Set();
 const orderHistorySyncInProgress = new Map();
 const orderHistorySyncedConfirmations = new Map();
+let fulfilmentForceStopped = false;
+let runIntervalId = null;
+let panelIntervalId = null;
+let historyIntervalId = null;
+let lastNoActiveJobCheckAt = 0;
+const MAX_ORDER_HISTORY_CARDS_PER_PASS = 12;
+const IDLE_ACTIVE_JOB_POLL_MS = 30000;
+
+const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
+
+function normalizeContentApiBase(value) {
+  return String(value || DEFAULT_API_BASE).trim().replace(/\/+$/, "") || DEFAULT_API_BASE;
+}
+
+async function getContentApiSettings() {
+  try {
+    return await chrome.storage.local.get({ apiBase: DEFAULT_API_BASE, adminToken: "" });
+  } catch (_) {
+    return { apiBase: DEFAULT_API_BASE, adminToken: "" };
+  }
+}
+
+async function contentApi(path, options = {}) {
+  const { apiBase, adminToken } = await getContentApiSettings();
+  const base = normalizeContentApiBase(apiBase);
+  const requestPath = String(path || "").startsWith("/") ? path : `/${path}`;
+  const { timeoutMs = 45000, ...fetchOptions } = options;
+  const isLocalApi = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(base);
+  const authTokens = [
+    adminToken,
+    isLocalApi && adminToken !== LOCAL_ADMIN_TOKEN_FALLBACK ? LOCAL_ADMIN_TOKEN_FALLBACK : "",
+  ].filter(Boolean);
+  let response = null;
+  for (let index = 0; index < Math.max(1, authTokens.length); index += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Number(timeoutMs || 45000));
+    response = await fetch(`${base}${requestPath}`, {
+      headers: {
+        "Content-Type": "application/json",
+        ...(authTokens[index] ? { "X-Admin-Token": authTokens[index] } : {}),
+        ...(fetchOptions.headers || {}),
+      },
+      signal: controller.signal,
+      ...fetchOptions,
+    }).finally(() => clearTimeout(timeout));
+    if (response.ok || response.status !== 401 || index === authTokens.length - 1) break;
+  }
+  if (!response.ok) {
+    throw new Error((await response.text()) || response.statusText);
+  }
+  return response.json();
+}
+
+async function lookupAmazonHistoryOrdersFromContent(orders = []) {
+  const normalized = (orders || []).filter((order) => order?.amazon_order_id);
+  if (!normalized.length) return { ok: true, matches: {}, unmatched: [], not_found_url: "/amazon-order-history-unmatched" };
+  const result = await contentApi("/api/chrome/order-history/lookup", {
+    method: "POST",
+    body: JSON.stringify({ orders: normalized }),
+    timeoutMs: 25000,
+  });
+  const { apiBase } = await getContentApiSettings();
+  const base = normalizeContentApiBase(apiBase);
+  return {
+    app_base_url: base,
+    ...result,
+    odoo_direct: result?.odoo_direct || result?.odooDirect || {},
+    odoo_direct_error: result?.odoo_direct_error || result?.odooDirectError || "",
+    not_found_url: `${base}${result.not_found_url || "/amazon-order-history-unmatched"}`,
+  };
+}
+
+async function lookupAmazonHistoryOdooDirectFromContent(orders = []) {
+  const normalized = (orders || []).filter((order) => order?.amazon_order_id);
+  if (!normalized.length) return { ok: true, odoo_direct: {} };
+  return contentApi("/api/chrome/order-history/odoo-direct", {
+    method: "POST",
+    body: JSON.stringify({ orders: normalized }),
+    timeoutMs: 45000,
+  });
+}
 
 async function send(message) {
   if (!extensionContextAlive) return null;
@@ -36,6 +148,7 @@ async function send(message) {
   } catch (error) {
     if (/Extension context invalidated/i.test(String(error?.message || error))) {
       extensionContextAlive = false;
+      window.__nutricityContentLoaded = false;
       const key = "nutricity-extension-context-reload-at";
       const lastReloadAt = Number(sessionStorage.getItem(key) || 0);
       if (Date.now() - lastReloadAt > 10000) {
@@ -54,12 +167,59 @@ async function send(message) {
   }
 }
 
+async function sendWithTimeout(message, timeoutMs = 20000) {
+  let timeoutId = null;
+  try {
+    return await Promise.race([
+      send(message),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => resolve({ ok: false, message: "Chrome extension background request timed out." }), timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    return { ok: false, message: error?.message || String(error || "Chrome extension background request failed.") };
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 async function getActiveJob() {
   const data = await send({ type: "GET_ACTIVE_JOB" });
+  if (data?.forceStopped || data?.stopped) {
+    stopContentAutomation("Force stop is active.");
+    return null;
+  }
   if (data?.activeJob) return data.activeJob;
   if (!/amazon\.com$/i.test(location.hostname)) return null;
   const recovered = await send({ type: "RECOVER_SUBMITTED_JOB" });
+  if (recovered?.forceStopped || recovered?.stopped) {
+    stopContentAutomation("Force stop is active.");
+    return null;
+  }
   return recovered?.activeJob || null;
+}
+
+function stopContentAutomation(message = "Force stopped. No further fulfilment steps will run on this page.") {
+  fulfilmentForceStopped = true;
+  if (runIntervalId) clearInterval(runIntervalId);
+  if (panelIntervalId) clearInterval(panelIntervalId);
+  runIntervalId = null;
+  panelIntervalId = null;
+  window.__nutricityRunning = false;
+  window.__nutricityRunningAt = 0;
+  showPanel("Nutricity fulfilment stopped", message, null, null);
+  ensureOrderHistoryAnnotationLoop();
+  scheduleOrderHistoryAnnotation(0);
+}
+
+function ensureOrderHistoryAnnotationLoop() {
+  if (historyIntervalId) return;
+  historyIntervalId = setInterval(() => {
+    if (document.hidden || !/amazon\.com$/i.test(location.hostname)) return;
+    if (!isOrderHistoryPage() && !isOrderDetailsPage()) return;
+    scheduleOrderHistoryAnnotation(1200);
+  }, 15000);
+  registerContentCleanup(() => clearInterval(historyIntervalId));
 }
 
 const STAGE_PROGRESS = {
@@ -78,6 +238,26 @@ const STAGE_PROGRESS = {
 
 function stageProgress(stage) {
   return STAGE_PROGRESS[String(stage || "")] || 0;
+}
+
+function diagnosticPageInfo() {
+  return {
+    url: location.href,
+    title: document.title || "",
+    pathname: location.pathname,
+    search: location.search,
+  };
+}
+
+function sendDiagnostic(message, details = {}, level = "info") {
+  return send({
+    type: "DIAG_LOG",
+    source: "content",
+    level,
+    message,
+    page: diagnosticPageInfo(),
+    details,
+  });
 }
 
 async function setActiveJob(activeJob, options = {}) {
@@ -102,6 +282,12 @@ async function setActiveJob(activeJob, options = {}) {
         null,
         null,
       );
+      await sendDiagnostic("Ignored stale active-job update from content page.", {
+        incoming_group_key: activeJob.job.group_key,
+        current_group_key: latest.job.group_key,
+        incoming_stage: activeJob.stage || "",
+        current_stage: latest.stage || "",
+      }, "warn");
       return { ok: false, stale: true };
     }
     if (latest?.job?.group_key === activeJob.job.group_key) {
@@ -131,6 +317,12 @@ async function setActiveJob(activeJob, options = {}) {
       if (latest.dosageByOrder && Object.keys(latest.dosageByOrder).length && (!next.dosageByOrder || !Object.keys(next.dosageByOrder).length)) {
         next = { ...next, dosageByOrder: latest.dosageByOrder };
       }
+      if (latest.productPacks?.length && !next.productPacks?.length) {
+        next = { ...next, productPacks: latest.productPacks };
+      }
+      if (latest.packByOrder && Object.keys(latest.packByOrder).length && (!next.packByOrder || !Object.keys(next.packByOrder).length)) {
+        next = { ...next, packByOrder: latest.packByOrder };
+      }
     }
   }
   if (activeJob?.job?.group_key) {
@@ -142,10 +334,16 @@ async function setActiveJob(activeJob, options = {}) {
         null,
         null,
       );
+      await sendDiagnostic("Ignored stale active-job update from content page.", {
+        incoming_group_key: activeJob.job.group_key,
+        current_group_key: latest.job.group_key,
+        incoming_stage: activeJob.stage || "",
+        current_stage: latest.stage || "",
+      }, "warn");
       return { ok: false, stale: true };
     }
   }
-  return send({ type: "SET_ACTIVE_JOB", activeJob: next });
+  return send({ type: "SET_ACTIVE_JOB", activeJob: next, page: diagnosticPageInfo(), reason: options.reason || "" });
 }
 
 async function getExtensionState() {
@@ -159,7 +357,7 @@ async function isPaused() {
 }
 
 async function waitIfPaused() {
-  while (await isPaused()) {
+  while (!fulfilmentForceStopped && await isPaused()) {
     const activeJob = await getActiveJob();
     showPanel(
       "Nutricity fulfilment paused",
@@ -260,10 +458,14 @@ function showPanel(title, message, actionText, action) {
   if (!panel) {
     panel = document.createElement("div");
     panel.id = "nutricity-panel";
-    panel.innerHTML = `<div class="nutricity-panel-order" hidden><span class="nutricity-panel-order-label">Order being processed</span><span class="nutricity-panel-order-status"></span><div class="nutricity-panel-order-text"></div><div class="nutricity-panel-step">Step: <span class="nutricity-panel-step-text"></span></div></div><div class="nutricity-panel-header"><strong></strong><button class="nutricity-pause-toggle" type="button">Pause</button></div><div class="nutricity-panel-message"></div><ol class="nutricity-panel-activity"></ol>`;
+    panel.innerHTML = `<div class="nutricity-panel-order" hidden><span class="nutricity-panel-order-label">Order being processed</span><span class="nutricity-panel-order-status"></span><div class="nutricity-panel-order-text"></div><div class="nutricity-panel-step">Step: <span class="nutricity-panel-step-text"></span></div></div><div class="nutricity-panel-header"><strong></strong><div class="nutricity-panel-controls"><button class="nutricity-pause-toggle" type="button">Pause</button><button class="nutricity-panel-minimize" type="button" title="Minimize fulfilment notice" aria-label="Minimize fulfilment notice">-</button><button class="nutricity-panel-close" type="button" title="Close fulfilment notice" aria-label="Close fulfilment notice">x</button></div></div><div class="nutricity-panel-message"></div><ol class="nutricity-panel-activity"></ol>`;
     panel.querySelector(".nutricity-pause-toggle").addEventListener("click", togglePanelPause);
+    panel.querySelector(".nutricity-panel-minimize").addEventListener("click", togglePanelMinimized);
+    panel.querySelector(".nutricity-panel-close").addEventListener("click", closePanel);
     document.documentElement.append(panel);
   }
+  panel.classList.toggle("is-stopped", /\bstopped\b|force stop/i.test(`${title} ${message}`));
+  panel.classList.remove("is-minimized");
   panel.querySelector("strong").textContent = title;
   panel.querySelector(".nutricity-panel-message").textContent = message;
   rememberPanelActivity(panel, title, message);
@@ -279,8 +481,26 @@ function showPanel(title, message, actionText, action) {
   }
 }
 
+function togglePanelMinimized(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const panel = event.currentTarget.closest("#nutricity-panel");
+  if (!panel) return;
+  const minimized = !panel.classList.contains("is-minimized");
+  panel.classList.toggle("is-minimized", minimized);
+  event.currentTarget.textContent = minimized ? "+" : "-";
+  event.currentTarget.title = minimized ? "Expand fulfilment notice" : "Minimize fulfilment notice";
+  event.currentTarget.setAttribute("aria-label", event.currentTarget.title);
+}
+
+function closePanel(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  event.currentTarget.closest("#nutricity-panel")?.remove();
+}
+
 async function keepPanelAlive() {
-  if (!extensionContextAlive || !/amazon\.com$/i.test(location.hostname)) return;
+  if (fulfilmentForceStopped || !extensionContextAlive || !/amazon\.com$/i.test(location.hostname)) return;
   const activeJob = await getActiveJob();
   if (!activeJob?.job) return;
   if (!document.querySelector("#nutricity-panel")) {
@@ -370,14 +590,16 @@ function clickFirst(selectors) {
   return false;
 }
 
-async function clickElement(element, label = "element") {
+async function clickElement(element, label = "element", options = {}) {
   if (!element) return false;
+  const delayMs = Number.isFinite(options.delayMs) ? Math.max(0, options.delayMs) : ACTION_DELAY;
+  const preClickDelayMs = Number.isFinite(options.preClickDelayMs) ? Math.max(0, options.preClickDelayMs) : 250;
   await waitIfPaused();
   element.scrollIntoView({ block: "center", behavior: "smooth" });
-  await sleep(250);
+  if (preClickDelayMs > 0) await sleep(preClickDelayMs);
   await waitIfPaused();
   element.click();
-  await sleep(ACTION_DELAY);
+  if (delayMs > 0) await sleep(delayMs);
   return true;
 }
 
@@ -595,24 +817,101 @@ function dosageFromProductTitle() {
   return match ? `${match[1]}mg` : "";
 }
 
+function normalizePackLabel(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return "";
+  const clean = Number.isInteger(number) ? String(number) : String(number).replace(/\.0+$/, "");
+  return `${clean}Pack`;
+}
+
+function packLabelFromText(text) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const patterns = [
+    /\bpack\s*of\s*(\d+(?:\.\d+)?)\b/i,
+    /\b(\d+(?:\.\d+)?)\s*[- ]?\s*(?:packs?|pk|pks)\b/i,
+    /\b(\d+(?:\.\d+)?)(?:packs?|pk|pks)\b/i,
+  ];
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    const label = match ? normalizePackLabel(match[1]) : "";
+    if (label) return label;
+  }
+  return "";
+}
+
+function selectedVariantTextFromPage() {
+  const selectedSwatch = [...document.querySelectorAll("li[data-asin], .inline-twister-swatch, .a-button-selected")]
+    .find((node) => node.getAttribute?.("data-initiallyselected") === "true" || node.querySelector?.(".a-button-selected, input[aria-checked='true']"));
+  return [
+    document.querySelector("[id^='inline-twister-expanded-dimension-text']")?.textContent,
+    document.querySelector("[aria-label^='Selected Size is'], [aria-label^='Selected Style is'], [aria-label*='Selected' i]")?.getAttribute("aria-label"),
+    selectedSwatch ? swatchLabel(selectedSwatch) : "",
+    productTitleText(),
+  ].map((value) => String(value || "").replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
+}
+
+function packLabelFromSelectedVariantOrTitle() {
+  return packLabelFromText(selectedVariantTextFromPage());
+}
+
+function appendUniqueCompactLabels(list, labels) {
+  const next = Array.isArray(list) ? [...list] : [];
+  const seen = new Set(next.map((value) => String(value || "").toLowerCase()));
+  for (const label of labels) {
+    const normalized = String(label || "").replace(/\s+/g, "").trim();
+    if (!normalized || seen.has(normalized.toLowerCase())) continue;
+    next.push(normalized);
+    seen.add(normalized.toLowerCase());
+  }
+  return next;
+}
+
+function isPackLabel(value) {
+  return /^\d+(?:\.\d+)?pack$/i.test(String(value || "").replace(/\s+/g, "").trim());
+}
+
+function replaceRememberedPackLabels(list, pack) {
+  const normalizedPack = String(pack || "").replace(/\s+/g, "").trim();
+  const next = (Array.isArray(list) ? list : [])
+    .map((value) => String(value || "").replace(/\s+/g, "").trim())
+    .filter((value) => value && !isPackLabel(value));
+  return appendUniqueCompactLabels(next, [normalizedPack]);
+}
+
 function rememberProductDosage(activeJob, item = null) {
   const dosage = dosageFromProductTitle();
   if (!dosage) return activeJob;
-  const dosages = Array.isArray(activeJob.productDosages) ? activeJob.productDosages : [];
-  if (!dosages.map((item) => String(item).toLowerCase()).includes(dosage.toLowerCase())) {
-    activeJob.productDosages = [...dosages, dosage];
-  }
+  activeJob.productDosages = appendUniqueCompactLabels(activeJob.productDosages, [dosage]);
   const dosageByOrder = activeJob.dosageByOrder && typeof activeJob.dosageByOrder === "object" ? activeJob.dosageByOrder : {};
   const orderNames = item?.order_names?.length ? item.order_names : activeJob.job?.order_names || [];
   for (const orderName of orderNames) {
     const key = String(orderName || "").trim();
     if (!key) continue;
-    const orderDosages = Array.isArray(dosageByOrder[key]) ? dosageByOrder[key] : [];
-    if (!orderDosages.map((value) => String(value).toLowerCase()).includes(dosage.toLowerCase())) {
-      dosageByOrder[key] = [...orderDosages, dosage];
-    }
+    dosageByOrder[key] = appendUniqueCompactLabels(dosageByOrder[key], [dosage]);
   }
   activeJob.dosageByOrder = dosageByOrder;
+  return activeJob;
+}
+
+function rememberProductPack(activeJob, item = null) {
+  const selectedLabel = item?.asin ? activeJob?.variantSelections?.[item.asin]?.label : "";
+  const selectedPack = packLabelFromText(selectedLabel);
+  const pack = selectedPack || packLabelFromSelectedVariantOrTitle();
+  if (!pack) return activeJob;
+  activeJob.productPacks = selectedPack
+    ? replaceRememberedPackLabels(activeJob.productPacks, pack)
+    : appendUniqueCompactLabels(activeJob.productPacks, [pack]);
+  const packByOrder = activeJob.packByOrder && typeof activeJob.packByOrder === "object" ? activeJob.packByOrder : {};
+  const orderNames = item?.order_names?.length ? item.order_names : activeJob.job?.order_names || [];
+  for (const orderName of orderNames) {
+    const key = String(orderName || "").trim();
+    if (!key) continue;
+    packByOrder[key] = selectedPack
+      ? replaceRememberedPackLabels(packByOrder[key], pack)
+      : appendUniqueCompactLabels(packByOrder[key], [pack]);
+  }
+  activeJob.packByOrder = packByOrder;
   return activeJob;
 }
 
@@ -621,6 +920,7 @@ function recipientName(activeJob) {
   const mixedAsin = isMixedAsinOrder(activeJob);
   const recipientSuffix = String(activeJob?.job?.recipient_suffix || "").replace(/\s+/g, "").trim();
   const dosageByOrder = activeJob?.dosageByOrder && typeof activeJob.dosageByOrder === "object" ? activeJob.dosageByOrder : {};
+  const packByOrder = activeJob?.packByOrder && typeof activeJob.packByOrder === "object" ? activeJob.packByOrder : {};
   if (orderNames.length) {
     const parts = ["Nutricity"];
     const assigned = new Set();
@@ -637,6 +937,14 @@ function recipientName(activeJob) {
           assigned.add(normalized.toLowerCase());
         }
       }
+      const packs = Array.isArray(packByOrder[name]) ? packByOrder[name] : [];
+      for (const pack of packs) {
+        const normalized = String(pack || "").replace(/\s+/g, "").trim();
+        if (normalized) {
+          parts.push(normalized);
+          assigned.add(normalized.toLowerCase());
+        }
+      }
     }
     if (mixedAsin) parts.push("Multi");
     const globalDosages = (recipientSuffix ? [] : (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : []))
@@ -644,6 +952,13 @@ function recipientName(activeJob) {
       .filter(Boolean);
     for (const dosage of mixedAsin ? [] : globalDosages) {
       if (!assigned.has(dosage.toLowerCase())) parts.push(dosage);
+    }
+    const hasOrderSpecificPack = Object.values(packByOrder).some((packs) => Array.isArray(packs) && packs.some(isPackLabel));
+    const globalPacks = (recipientSuffix || hasOrderSpecificPack ? [] : (Array.isArray(activeJob?.productPacks) ? activeJob.productPacks : []))
+      .map((item) => String(item || "").replace(/\s+/g, "").trim())
+      .filter(Boolean);
+    for (const pack of mixedAsin ? [] : globalPacks) {
+      if (!assigned.has(pack.toLowerCase())) parts.push(pack);
     }
     if (recipientSuffix) parts.push(recipientSuffix);
     return parts.join(" ").replace(/\s+/g, " ").trim();
@@ -654,7 +969,10 @@ function recipientName(activeJob) {
   const dosages = (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : [])
     .map((item) => String(item || "").replace(/\s+/g, "").trim())
     .filter((dosage) => dosage && !base.toLowerCase().includes(dosage.toLowerCase()));
-  return [base, ...dosages, recipientSuffix].filter(Boolean).join(" ").trim();
+  const packs = (Array.isArray(activeJob?.productPacks) ? activeJob.productPacks : [])
+    .map((item) => String(item || "").replace(/\s+/g, "").trim())
+    .filter((pack) => pack && !base.toLowerCase().includes(pack.toLowerCase()));
+  return [base, ...dosages, ...packs, recipientSuffix].filter(Boolean).join(" ").trim();
 }
 
 function priceFromText(text) {
@@ -2767,6 +3085,7 @@ async function handleProduct(activeJob) {
     return;
   }
   rememberProductDosage(activeJob, item);
+  rememberProductPack(activeJob, item);
   await setActiveJob(activeJob);
 
   const unavailable = unavailableMessage();
@@ -2909,10 +3228,14 @@ async function handleProduct(activeJob) {
 
 async function handleAddClicked(activeJob) {
   const clickedAt = Number(activeJob.addClickedAt || 0);
-  const waitMs = Math.max(0, 4500 - (Date.now() - clickedAt));
-  if (waitMs) {
-    showPanel("Nutricity fulfilment", "Amazon add was clicked. Waiting before moving to the next step.", null, null);
-    await sleep(waitMs);
+  const remainingWaitMs = Math.max(0, 4500 - (Date.now() - clickedAt));
+  if (remainingWaitMs) {
+    showPanel("Nutricity fulfilment", "Amazon add was clicked. Waiting for Amazon to expose the next safe step.", null, null);
+    await waitUntil(() => (
+      /\/(?:cart|checkout)/i.test(location.pathname)
+      || findButtonByText(["proceed to checkout", "check out amazon cart"])
+      || document.querySelector("#sc-active-cart, input[name='proceedToRetailCheckout'], #sc-buy-box-ptc-button input")
+    ), remainingWaitMs, 250);
   }
   if (/\/cart/i.test(location.pathname)) {
     const nextIndex = Number(activeJob.itemIndex || 0) + 1;
@@ -3766,6 +4089,21 @@ function findCheckoutPaymentPanel() {
 }
 
 function checkoutSelectedPaymentText() {
+  const scopedPaymentText = [
+    "#selected-payment-methods-list-container",
+    "#payment-information",
+    "[id*='selected-payment']",
+    "#payment-option-text-default",
+    "[id^='payment-option-text'][data-testid]",
+    ".selected-payment-method-no-art-description-heading",
+  ]
+    .map((selector) => document.querySelector(selector))
+    .filter((element) => element && visible(element) && !element.closest?.("#nutricity-panel"))
+    .map((element) => elementReadableText(element).replace(/\s+/g, " ").trim())
+    .filter((text) => text.length <= 350 && /paying\s+with|ending\s+in\s+\d{4}|(?:visa|mastercard|american express|amex|discover|card)[^\d]{0,80}\d{4}/i.test(text))
+    .sort((left, right) => left.length - right.length)[0];
+  if (scopedPaymentText) return scopedPaymentText;
+
   const visiblePaymentSummaries = [...document.querySelectorAll("h2, h3, a, span, div")]
     .filter((element) => {
       if (!visible(element) || element.closest?.("#nutricity-panel") || element.closest?.(".a-popover, .a-popover-preload")) return false;
@@ -3838,7 +4176,7 @@ async function waitForPreferredCheckoutPayment(preferences = [], timeout = 8000)
     if (selectedDigits && (!preferences.length || preferences.includes(selectedDigits))) return selectedDigits;
     if (!preferences.length && checkoutPaymentConfirmed(preferences)) return true;
     return false;
-  }, timeout, 400);
+  }, timeout, 200);
 }
 
 function findPaymentRadioForPreferences(preferences = []) {
@@ -3892,8 +4230,8 @@ async function clickPaymentRadio(radio) {
       continue;
     }
     try {
-      await clickElement(target, "Payment method row");
-      await sleep(500);
+      await clickElement(target, "Payment method row", { preClickDelayMs: 80, delayMs: 120 });
+      await sleep(100);
       if (paymentRadioIsSelected(radio)) return true;
     } catch (err) {
       // Try the next candidate; Amazon often hides the real radio and binds the row instead.
@@ -3905,7 +4243,7 @@ async function clickPaymentRadio(radio) {
     radio.dispatchEvent(new Event("input", { bubbles: true }));
     radio.dispatchEvent(new Event("change", { bubbles: true }));
     radio.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-    await sleep(800);
+    await sleep(350);
   } catch (err) {
     // Ignore and let the caller decide whether manual checkout is needed.
   }
@@ -4133,23 +4471,30 @@ async function handleBusinessCheckoutInterstitial() {
 }
 
 async function handlePaymentSelection(activeJob) {
+  const started = Date.now();
   try {
     const state = await getExtensionState();
     const cardPreferences = cardPreferenceList(state.cardLast4Preference);
     let payment = findPaymentSelection(cardPreferences);
     if (!payment) {
       if (!findPaymentRadio()) return false;
-      payment = await waitUntil(() => findPaymentSelection(cardPreferences), 5000);
+      payment = await waitUntil(() => findPaymentSelection(cardPreferences), 2500, 150);
       if (!payment) {
         await pauseForManualCheckout(activeJob, "Amazon is asking for a payment method, but I could not find the payment Continue button.");
         return true;
       }
     }
     const selectedDigits = cardDigitsForPaymentRadio(payment.radio);
+    sendDiagnostic("Payment selection controls detected.", {
+      elapsedMs: Date.now() - started,
+      selectedDigits,
+      hasPreferences: cardPreferences.length > 0,
+      radioAlreadySelected: paymentRadioIsSelected(payment.radio),
+    }).catch(() => {});
     showPanel("Nutricity checkout", selectedDigits ? `Selecting card ending in ${selectedDigits}.` : "Selecting Amazon payment method.", null, null);
     if (!paymentRadioIsSelected(payment.radio)) {
       await clickPaymentRadio(payment.radio);
-      await waitUntil(() => paymentRadioIsSelected(payment.radio), 3000, 250);
+      await waitUntil(() => paymentRadioIsSelected(payment.radio), 1500, 150);
     }
     if (cardPreferences.length && selectedDigits && !cardPreferences.includes(selectedDigits)) {
       await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
@@ -4159,26 +4504,26 @@ async function handlePaymentSelection(activeJob) {
       await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
-    await clickElement(payment.continueButton, "Use this payment method button");
+    await clickElement(payment.continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
     let advanced = await waitUntil(
       () => checkoutPaymentConfirmed(cardPreferences)
         || (!cardPreferences.length && findPlaceOrderButton())
         || !findPaymentRadio(),
-      12000,
-      400,
+      8000,
+      200,
     );
     if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
       const alternate = alternatePaymentContinueButtons(payment.continueButton)[0];
       if (alternate) {
         showPanel("Nutricity checkout", "Retrying Amazon payment continue button.", null, null);
-        await clickElement(alternate, "alternate Use this payment method button");
+        await clickElement(alternate, "alternate Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
         advanced = await waitUntil(
           () => checkoutPaymentConfirmed(cardPreferences)
             || (!cardPreferences.length && findPlaceOrderButton())
             || !findPaymentRadio(),
-          12000,
-          400,
+          6000,
+          200,
         );
       }
     }
@@ -4188,6 +4533,13 @@ async function handlePaymentSelection(activeJob) {
     if (confirmedDigits) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
     }
+    sendDiagnostic("Payment selection completed.", {
+      elapsedMs: Date.now() - started,
+      selectedDigits,
+      confirmedDigits,
+      advanced: Boolean(advanced),
+      hasPlaceOrderButton: Boolean(findPlaceOrderButton()),
+    }).catch(() => {});
     return true;
   } catch (error) {
     await pauseForManualCheckout(activeJob, `Payment selection got stuck: ${error.message || error}`);
@@ -4199,8 +4551,8 @@ async function openPaymentSelectionIfAvailable() {
   const changePayment = findChangePaymentButton() || await waitUntil(findChangePaymentButton, 2500, 250);
   if (!changePayment) return false;
   showPanel("Nutricity checkout", "Opening payment method selection.", null, null);
-  await clickElement(changePayment, "Change payment method button");
-  await sleep(900);
+  await clickElement(changePayment, "Change payment method button", { preClickDelayMs: 80, delayMs: 180 });
+  await waitUntil(findPaymentRadio, 1200, 150);
   return true;
 }
 
@@ -4217,13 +4569,33 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   const selectedDigits = checkoutSelectedCardDigits();
   if (!paymentPanel && !selectedDigits && !findPlaceOrderButton() && !findChangePaymentButton()) return true;
 
+  const openPaymentRadio = findPaymentRadio();
+  if (openPaymentRadio) {
+    showPanel("Nutricity checkout", `Selecting preferred checkout card ending in ${cardPreferences.join(" or ")}.`, null, null);
+    await handlePaymentSelection(activeJob);
+    if (activeJob.paused) return false;
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 4000, 200);
+    const confirmedDigits = checkoutSelectedCardDigits();
+    if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
+      showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
+      return true;
+    }
+    await pauseForManualCheckout(
+      activeJob,
+      confirmedDigits
+        ? `Amazon still shows card ending in ${confirmedDigits} after payment selection; expected ${cardPreferences.join(" or ")}.`
+        : `Amazon did not confirm the selected card ending in ${cardPreferences.join(" or ")}.`,
+    );
+    return false;
+  }
+
   if (selectedDigits && cardPreferences.includes(selectedDigits)) {
     showPanel("Nutricity checkout", `Verified checkout card ending in ${selectedDigits}.`, null, null);
     return true;
   }
 
-  if (!selectedDigits) {
-    const settledDigits = await waitForPreferredCheckoutPayment(cardPreferences, 2000);
+  if (!selectedDigits && !findChangePaymentButton()) {
+    const settledDigits = await waitForPreferredCheckoutPayment(cardPreferences, 1000);
     if (settledDigits && settledDigits !== true) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${settledDigits}.`, null, null);
       return true;
@@ -4237,10 +4609,10 @@ async function ensurePreferredCheckoutPayment(activeJob) {
     showPanel("Nutricity checkout", `Could not verify checkout card; opening payment selection for ${expected}.`, null, null);
   }
 
-  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 3000, 250)) {
+  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 1800, 150)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 8000, 300);
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 5000, 200);
     const confirmedDigits = checkoutSelectedCardDigits();
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
@@ -4256,7 +4628,7 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   }
 
   if (!await openPaymentSelectionIfAvailable()) {
-    const lateDigits = await waitForPreferredCheckoutPayment(cardPreferences, 2500);
+    const lateDigits = await waitForPreferredCheckoutPayment(cardPreferences, 1500);
     if (lateDigits && lateDigits !== true) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${lateDigits}.`, null, null);
       return true;
@@ -4266,10 +4638,10 @@ async function ensurePreferredCheckoutPayment(activeJob) {
       : `Could not verify the checkout card, and I could not find the Change payment method link to select ${expected}.`);
     return false;
   }
-  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 5000, 300)) {
+  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 2500, 150)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 8000, 300);
+    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 5000, 200);
     const confirmedDigits = checkoutSelectedCardDigits();
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
@@ -4928,13 +5300,105 @@ function orderHistoryUrl() {
 }
 
 function isOrderHistoryPage() {
-  return /\/(?:gp\/your-account\/order-history|gp\/css\/order-history)/i.test(location.pathname)
-    || Boolean(document.querySelector("#yourOrderHistorySection, #yoOrdersTabination"));
+  const historyUrl = /\/(?:gp\/your-account\/order-history|gp\/css\/order-history|your-orders(?:\/orders?)?)(?:[/?#]|$)/i.test(location.href);
+  if (historyUrl) return true;
+  if (/\/(?:dp|gp\/product)\//i.test(location.pathname)) return false;
+  const hasHistoryLandmark = Boolean(document.querySelector("#yourOrderHistorySection, #yoOrdersTabination"));
+  const hasOrderCard = Boolean(document.querySelector("[class*='order-card'], [data-test-id='order-card'], [data-test-id='order-card-header']"));
+  const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
+  return (hasHistoryLandmark || hasOrderCard) && text.includes("order placed") && text.includes("order #");
 }
 
 function isOrderDetailsPage() {
   return /\/(?:your-orders\/order-details|gp\/your-account\/order-details)/i.test(location.pathname)
     || Boolean(new URLSearchParams(location.search).get("orderID") && document.querySelector("#orderDetails"));
+}
+
+function isAmazonThankYouPage() {
+  return /\/gp\/buy\/thankyou\/handlers\/display\.html/i.test(location.pathname)
+    || Boolean(new URLSearchParams(location.search).get("purchaseId") && /\/gp\/buy\/thankyou/i.test(location.pathname));
+}
+
+function pageLooksAfterAmazonSubmit() {
+  return isAmazonThankYouPage()
+    || confirmationSaysPlaced()
+    || ((isOrderHistoryPage() || isOrderDetailsPage()) && Boolean(extractOrderId()));
+}
+
+async function forceOrderReportingFromSubmittedPage(activeJob, reason = "") {
+  const orderId = extractOrderId();
+  await sendDiagnostic("Submitted/confirmation page guard took control of the active job.", {
+    group_key: activeJob?.job?.group_key || "",
+    stage: activeJob?.stage || "",
+    paused: Boolean(activeJob?.paused),
+    paused_stage: activeJob?.pausedStage || "",
+    order_id_on_page: orderId,
+    reason,
+  }, "warn");
+  if (!submittedOrPausedStage(activeJob) && !activeJobWasSubmittedToAmazon(activeJob)) {
+    await send({ type: "MARK_ORDER_SUBMITTED" }).catch((error) => {
+      sendDiagnostic("Could not mark job submitted during submitted-page guard.", {
+        message: error?.message || String(error || ""),
+      }, "warn");
+    });
+  }
+  const next = {
+    ...activeJob,
+    stage: orderId ? "reporting_complete" : "find_order_id",
+    paused: false,
+    pausedStage: null,
+    amazonSubmittedAt: activeJob.amazonSubmittedAt || Date.now(),
+    amazonConfirmationUrl: activeJob.amazonConfirmationUrl || location.href,
+  };
+  await setActiveJob(next, { allowUnpause: true, reason: "submitted_page_guard" });
+  if (orderId) {
+    showPanel("Nutricity fulfilment", `Found Amazon order ${orderId}. Reporting back to the app.`, null, null);
+    await reportAmazonOrder(next, orderId);
+    return true;
+  }
+  showPanel("Nutricity fulfilment", "Amazon shows the order was submitted. Opening order history to capture the order number.", null, null);
+  await handleOrderHistory(next);
+  return true;
+}
+
+async function guardUnexpectedAmazonPage(activeJob) {
+  if (
+    isAmazonThankYouPage() ||
+    confirmationSaysPlaced() ||
+    ((submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob)) && pageLooksAfterAmazonSubmit())
+  ) {
+    await forceOrderReportingFromSubmittedPage(activeJob, "Amazon confirmation URL or placed-order text detected.");
+    return true;
+  }
+  if ((isOrderHistoryPage() || isOrderDetailsPage()) && !submittedOrPausedStage(activeJob) && !activeJobWasSubmittedToAmazon(activeJob)) {
+    activeJob.paused = true;
+    activeJob.pausedStage = activeJob.stage || "product";
+    activeJob.pageGuardPausedAt = Date.now();
+    await setActiveJob(activeJob, { reason: "unexpected_order_history_page" });
+    await sendDiagnostic("Paused because active job is on order-history/details page before Amazon submit was protected.", {
+      group_key: activeJob?.job?.group_key || "",
+      stage: activeJob.stage || "",
+    }, "warn");
+    showPanel(
+      "Nutricity fulfilment paused",
+      "This Amazon page is order history/details, but the active job is not marked submitted. The extension will not clear cart, add products, or start another order from this page.",
+      null,
+      null,
+    );
+    return true;
+  }
+  if ((submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob)) && /\/cart/i.test(location.pathname)) {
+    await sendDiagnostic("Submitted job landed on cart; redirecting to order history instead of clearing cart.", {
+      group_key: activeJob?.job?.group_key || "",
+      stage: activeJob.stage || "",
+    }, "warn");
+    activeJob.stage = "find_order_id";
+    activeJob.amazonSubmittedAt = activeJob.amazonSubmittedAt || Date.now();
+    await setActiveJob(activeJob, { allowUnpause: true, reason: "submitted_cart_guard" });
+    location.href = orderHistoryUrl();
+    return true;
+  }
+  return false;
 }
 
 function submittedStage(activeJob) {
@@ -5097,9 +5561,40 @@ function extractRecentOrderId(activeJob) {
 }
 
 function orderCardOrderId(card) {
-  const headerText = (card.querySelector("#orderCardHeader")?.innerText || card.innerText || card.textContent || "").replace(/\s+/g, " ");
+  const dataId = String(card?.getAttribute?.("data-order-id") || card?.dataset?.orderId || "").trim();
+  if (/^\d{3}-\d{7}-\d{7}$/.test(dataId)) return dataId;
+  const orderLink = [...(card?.querySelectorAll?.("a[href*='orderID='], a[href*='order-details']") || [])]
+    .map((link) => orderIdFromAmazonOrderHref(link.href || link.getAttribute("href") || ""))
+    .find(Boolean);
+  if (orderLink) return orderLink;
+  const headerText = (card.querySelector("#orderCardHeader, [id*='orderCardHeader'], [data-test-id*='order-header']")?.innerText || card.innerText || card.textContent || "").replace(/\s+/g, " ");
   const match = headerText.match(/\b\d{3}-\d{7}-\d{7}\b/);
   return match ? match[0] : "";
+}
+
+function nearViewport(element, margin = 900) {
+  if (!element) return false;
+  const rect = element.getBoundingClientRect();
+  return rect.bottom >= -margin
+    && rect.right >= -margin
+    && rect.top <= (window.innerHeight || document.documentElement.clientHeight || 0) + margin
+    && rect.left <= (window.innerWidth || document.documentElement.clientWidth || 0) + margin;
+}
+
+function orderIdsFromOrderHistoryText(text = "") {
+  return [...new Set((String(text || "").match(/\b\d{3}-\d{7}-\d{7}\b/g) || []).map((value) => value.trim()))];
+}
+
+function orderIdFromAmazonOrderHref(href = "") {
+  const value = String(href || "");
+  try {
+    const parsed = new URL(value, location.href);
+    const fromQuery = parsed.searchParams.get("orderID") || parsed.searchParams.get("orderId") || "";
+    if (/^\d{3}-\d{7}-\d{7}$/.test(fromQuery)) return fromQuery;
+  } catch (_) {
+    // Fall back to the regexp below for Amazon's relative or escaped URLs.
+  }
+  return value.match(/\b\d{3}-\d{7}-\d{7}\b/)?.[0] || "";
 }
 
 function orderCardAsins(card) {
@@ -5210,32 +5705,49 @@ function orderDetailsPageDetails() {
   };
 }
 
+function recipientFromOrderHistoryText(text = "") {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  const nutricityMatch = value.match(/\bNutricity\s+NC\d+(?:\s+[A-Za-z0-9]+){0,4}/i);
+  if (nutricityMatch?.[0]) {
+    return nutricityMatch[0]
+      .replace(/\b(?:Order|Placed|Total|Ship|To|View|Buy|Again|Invoice|Details)\b.*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  const shipMatch = value.match(/\bShip\s+to\s+(.+?)(?:\s+\b(?:Order placed|Order #|Total|Buy it again|View order details|Invoice|Delivered|Arriving|Cancelled)\b|$)/i);
+  return shipMatch?.[1]?.replace(/\s+/g, " ").trim() || "";
+}
+
 function orderCardRecipient(card) {
   const selectors = [
     ".shipToTriggerTextTruncate .a-truncate-full",
     ".shipToTriggerTextTruncate",
     "[id^='a-popover-PreloadedContent_'] .a-text-bold",
+    "[data-test-id*='recipient']",
+    "[data-test-id*='ship']",
   ];
   for (const selector of selectors) {
     const text = [...card.querySelectorAll(selector)]
       .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
+      .map((text) => recipientFromOrderHistoryText(text) || text)
       .find(Boolean);
     if (text) return text;
   }
-  return "";
+  return recipientFromOrderHistoryText(card.innerText || card.textContent || "");
 }
 
 function orderCardDate(card) {
-  const headerText = (card.querySelector("#orderCardHeader")?.innerText || "").replace(/\s+/g, " ").trim();
+  const headerText = (card.querySelector("#orderCardHeader, [id*='orderCardHeader'], [data-test-id*='order-header']")?.innerText || card.innerText || card.textContent || "").replace(/\s+/g, " ").trim();
   const match = headerText.match(/Order placed\s+([A-Z][a-z]+ \d{1,2}, \d{4})/);
   return match?.[1] || "";
 }
 
 function orderCardStatus(card) {
-  const statuses = [...card.querySelectorAll("#orderCardDeliveryBox .a-size-medium .a-text-bold, #orderCardDeliveryBox .a-size-medium")]
+  const statuses = [...card.querySelectorAll("#orderCardDeliveryBox .a-size-medium .a-text-bold, #orderCardDeliveryBox .a-size-medium, [data-test-id*='status'], [class*='delivery'] .a-size-medium, .a-size-medium .a-text-bold, .a-size-medium")]
     .map((node) => (node.textContent || "").replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-  return statuses[0] || "";
+    .filter(Boolean)
+    .filter((text) => !/order placed|order #|total|ship to|buy it again|view order details|invoice/i.test(text));
+  return statuses.find((text) => /arriv|deliver|ship|cancel|refund|return/i.test(text)) || statuses[0] || "";
 }
 
 function isCancelledOrderCard(card) {
@@ -5243,10 +5755,21 @@ function isCancelledOrderCard(card) {
 }
 
 function orderHistoryCardCandidates() {
-  const exact = [...document.querySelectorAll("#yourOrderHistorySection #orderCard, #orderCard, .order-card")]
-    .filter(visible);
-  if (exact.length) return exact;
-  const headers = [...document.querySelectorAll("#yourOrderHistorySection #orderCardHeader, #orderCardHeader, [id*='orderCardHeader']")]
+  const linkCards = orderHistoryCardsFromOrderLinks();
+  if (linkCards.length) return linkCards.slice(0, MAX_ORDER_HISTORY_CARDS_PER_PASS);
+  const exactSelectors = [
+    "#yourOrderHistorySection #orderCard",
+    "#orderCard",
+    ".order-card",
+    ".js-order-card",
+    "[data-order-id]",
+    "[data-test-id*='order-card']",
+  ];
+  const root = document.querySelector("#yourOrderHistorySection") || document;
+  const exact = dedupeOrderHistoryCards([...root.querySelectorAll(exactSelectors.join(", "))])
+    .filter((element) => visible(element) && orderCardOrderId(element));
+  if (exact.length) return exact.slice(0, MAX_ORDER_HISTORY_CARDS_PER_PASS);
+  const headers = [...root.querySelectorAll("#orderCardHeader, [data-test-id*='order-header']")]
     .filter(visible);
   const cards = [];
   const seen = new Set();
@@ -5263,9 +5786,75 @@ function orderHistoryCardCandidates() {
     if (!seen.has(card) && visible(card)) {
       seen.add(card);
       cards.push(card);
+      if (cards.length >= MAX_ORDER_HISTORY_CARDS_PER_PASS) break;
     }
   }
-  return cards;
+  if (cards.length) return cards;
+  return [];
+}
+
+function dedupeOrderHistoryCards(cards = []) {
+  const result = [];
+  const seen = new Set();
+  for (const card of cards) {
+    if (!card || seen.has(card)) continue;
+    if (result.some((existing) => existing.contains(card) && orderCardOrderId(existing) === orderCardOrderId(card))) continue;
+    for (let index = result.length - 1; index >= 0; index -= 1) {
+      const existing = result[index];
+      if (card.contains(existing) && orderCardOrderId(existing) === orderCardOrderId(card)) {
+        seen.delete(existing);
+        result.splice(index, 1);
+      }
+    }
+    seen.add(card);
+    result.push(card);
+  }
+  return result;
+}
+
+function orderHistoryCardsFromOrderLinks() {
+  const links = [...document.querySelectorAll("a[href*='orderID='], a[href*='order-details']")]
+    .filter((link) => visible(link) && orderIdFromAmazonOrderHref(link.href || link.getAttribute("href") || ""))
+    .slice(0, MAX_ORDER_HISTORY_CARDS_PER_PASS * 3);
+  const cards = [];
+  const seenIds = new Set();
+  for (const link of links) {
+    const orderId = orderIdFromAmazonOrderHref(link.href || link.getAttribute("href") || "");
+    if (!orderId || seenIds.has(orderId)) continue;
+    let best = link.closest(".a-box-group, .order-card, .js-order-card, [class*='order-card'], [data-order-id], [data-test-id*='order-card']");
+    let parent = best || link.parentElement;
+    for (let depth = 0; parent && depth < 8; depth += 1, parent = parent.parentElement) {
+      const text = (parent.innerText || parent.textContent || "").replace(/\s+/g, " ").trim();
+      const ids = orderIdsFromOrderHistoryText(text);
+      if (
+        ids.includes(orderId)
+        && ids.length === 1
+        && text.length < 12000
+        && (
+          /\bOrder placed\b/i.test(text)
+          || /\bOrder #\b/i.test(text)
+          || /\b(?:Arriving|Delivered|Cancelled|Buy it again|View order details)\b/i.test(text)
+        )
+      ) {
+        best = parent;
+      }
+      if (
+        ids.includes(orderId)
+        && ids.length === 1
+        && text.length < 16000
+        && (/\bShip\s+to\b/i.test(text) || /\bNutricity\s+NC\d+\b/i.test(text))
+      ) {
+        best = parent;
+      }
+    }
+    best = best || link.parentElement || link;
+    if (visible(best)) {
+      seenIds.add(orderId);
+      cards.push(best);
+      if (cards.length >= MAX_ORDER_HISTORY_CARDS_PER_PASS) break;
+    }
+  }
+  return dedupeOrderHistoryCards(cards);
 }
 
 function extractOrderHistoryOrders() {
@@ -5295,6 +5884,30 @@ function visibleOrderHistoryCards() {
   return orderHistoryCardCandidates();
 }
 
+function orderHistoryAnnotationIsComplete(card) {
+  const annotations = [...(card?.querySelectorAll?.(".nutricity-order-history-annotation") || [])];
+  if (!annotations.length) return false;
+  const text = annotations.map((annotation) => annotation.textContent || "").join(" ");
+  if (isTransientOrderHistoryLookupError(text)) return false;
+  return !/checking app match/i.test(text);
+}
+
+function orderHistoryNeedsMoreAnnotation() {
+  if (document.hidden || !isOrderHistoryPage()) return false;
+  return visibleOrderHistoryCards().some((card) => {
+    const details = orderHistoryCardDetails(card);
+    if (!details?.amazon_order_id) return false;
+    const cached = orderHistoryLookupCache.get(details.amazon_order_id);
+    if (cached && Date.now() - Number(cached.cachedAt || 0) < 2 * 60 * 1000 && cached.odooDirectLoaded) return false;
+    return !orderHistoryAnnotationIsComplete(card);
+  });
+}
+
+function isTransientOrderHistoryLookupError(errorOrMessage) {
+  const message = String(errorOrMessage?.message || errorOrMessage || "");
+  return /abort|timed out|receiving end does not exist|extension context|could not establish connection|message channel closed|asynchronous response|networkerror|failed to fetch/i.test(message);
+}
+
 function orderHistoryCardDetails(card) {
   const orderId = orderCardOrderId(card);
   if (!orderId) return null;
@@ -5314,6 +5927,41 @@ function orderHistoryCardDetails(card) {
 function orderHistoryAnnotationContainer(card) {
   if (card?.dataset?.nutricityAnnotationHost === "true") return card;
   return card.querySelector("#orderCardHeader .a-box-inner") || card.querySelector("#orderCardHeader") || card;
+}
+
+function renderOrderHistoryPendingAnnotation(card, details) {
+  if (!card) return;
+  const existing = [...card.querySelectorAll(".nutricity-order-history-annotation")];
+  if (existing.length) {
+    const existingText = existing.map((annotation) => annotation.textContent || "").join(" ");
+    if (!isTransientOrderHistoryLookupError(existingText) && !/checking app match/i.test(existingText)) return;
+    for (const annotation of existing) annotation.remove();
+  }
+  const marker = document.createElement("div");
+  marker.className = "nutricity-order-history-annotation is-suggestion";
+  const label = document.createElement("span");
+  label.className = "nutricity-order-history-label";
+  label.textContent = "Nutricity";
+  const text = document.createElement("span");
+  text.className = "nutricity-order-history-links";
+  text.textContent = `Checking app match for ${details?.amazon_order_id || "Amazon order"}...`;
+  marker.append(label, text);
+  orderHistoryAnnotationContainer(card).appendChild(marker);
+}
+
+function renderOrderHistoryLookupError(card, details, message = "") {
+  if (!card) return;
+  for (const existing of card.querySelectorAll(".nutricity-order-history-annotation")) existing.remove();
+  const marker = document.createElement("div");
+  marker.className = "nutricity-order-history-annotation is-conflict";
+  const label = document.createElement("span");
+  label.className = "nutricity-order-history-label";
+  label.textContent = "Lookup failed";
+  const text = document.createElement("span");
+  text.className = "nutricity-order-history-warning";
+  text.textContent = message || `Could not check ${details?.amazon_order_id || "this Amazon order"} in the app.`;
+  marker.append(label, text);
+  orderHistoryAnnotationContainer(card).appendChild(marker);
 }
 
 function orderDetailsAnnotationHost() {
@@ -5344,14 +5992,15 @@ function orderDetailsAnnotationHost() {
 function renderOrderHistoryAnnotation(card, result) {
   for (const existing of card.querySelectorAll(".nutricity-order-history-annotation")) existing.remove();
   if (!result) return;
-  const orders = result.match?.orders || [];
-  const suggestions = result.suggestions || [];
-  const conflicts = result.conflicts || [];
-  const directOdoo = result.odooDirect || [];
+  const displayResult = filterOrderHistoryResultForCard(result);
+  const orders = displayResult.match?.orders || [];
+  const suggestions = displayResult.suggestions || [];
+  const conflicts = displayResult.conflicts || [];
+  const directOdoo = displayResult.odooDirect || [];
   const cancelled = result.cancelled === true;
   if (cancelled && !orders.length) return;
-  if (!orders.length && !suggestions.length && !conflicts.length && !directOdoo.length && !result.unmatched) return;
-  const syncedConfirmation = orderHistorySyncedConfirmations.get(result.orderId);
+  if (!orders.length && !suggestions.length && !conflicts.length && !directOdoo.length && !displayResult.unmatched) return;
+  const syncedConfirmation = orderHistorySyncedConfirmations.get(displayResult.orderId);
   const detailsClass = card?.dataset?.nutricityOrderDetailsHost === "true" ? " is-order-details" : "";
   if (syncedConfirmation && Date.now() - Number(syncedConfirmation.syncedAt || 0) < 30000) {
     const marker = document.createElement("div");
@@ -5361,16 +6010,16 @@ function renderOrderHistoryAnnotation(card, result) {
     label.textContent = "Synced";
     const text = document.createElement("span");
     text.className = "nutricity-order-history-links";
-    text.textContent = syncedConfirmation.message || `Amazon ${result.orderId} synced`;
+    text.textContent = syncedConfirmation.message || `Amazon ${displayResult.orderId} synced`;
     marker.append(label, text);
     orderHistoryAnnotationContainer(card).appendChild(marker);
     return;
   }
-  const syncStartedAt = orderHistorySyncInProgress.get(result.orderId);
+  const syncStartedAt = orderHistorySyncInProgress.get(displayResult.orderId);
   let syncInProgress = false;
   if (syncStartedAt) {
     syncInProgress = Date.now() - Number(syncStartedAt) < 120000;
-    if (!syncInProgress) orderHistorySyncInProgress.delete(result.orderId);
+    if (!syncInProgress) orderHistorySyncInProgress.delete(displayResult.orderId);
   }
   const marker = document.createElement("div");
   marker.className = `nutricity-order-history-annotation ${cancelled && orders.length ? "is-cancelled-sync" : conflicts.length ? "is-conflict" : orders.length ? "is-match" : suggestions.length ? "is-suggestion" : "is-miss"}${detailsClass}`;
@@ -5406,7 +6055,7 @@ function renderOrderHistoryAnnotation(card, result) {
     }
     marker.appendChild(links);
     appendOrderHistoryQuantitySummary(marker, orders);
-    appendOrderHistoryDateRepair(marker, result, orders, syncInProgress);
+    appendOrderHistoryDateRepair(marker, displayResult, orders, syncInProgress);
   } else if (suggestions.length) {
     const links = document.createElement("span");
     links.className = "nutricity-order-history-links";
@@ -5420,7 +6069,7 @@ function renderOrderHistoryAnnotation(card, result) {
       links.appendChild(link);
       links.appendChild(orderHistoryCopyButton(order.odoo_order_name || order.odoo_order_id || ""));
     });
-    const resultAsins = new Set((result.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
+    const resultAsins = new Set((displayResult.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
     const existingIds = [...new Set(suggestions
       .flatMap((order) => (order.lines || [])
         .filter((line) => !resultAsins.size || resultAsins.has(String(line.asin || "").toUpperCase()))
@@ -5444,32 +6093,32 @@ function renderOrderHistoryAnnotation(card, result) {
     button.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (orderHistorySyncInProgress.has(result.orderId)) return;
-      orderHistorySyncInProgress.set(result.orderId, Date.now());
+      if (orderHistorySyncInProgress.has(displayResult.orderId)) return;
+      orderHistorySyncInProgress.set(displayResult.orderId, Date.now());
       button.disabled = true;
       button.classList.add("is-syncing");
       button.textContent = "Syncing...";
       let synced = null;
       try {
-        synced = await syncSuggestedAmazonHistoryOrder(result);
+        synced = await syncSuggestedAmazonHistoryOrder(displayResult);
       } catch (error) {
         synced = { ok: false, message: error?.message || String(error || "Could not sync this Amazon order.") };
       }
       if (synced?.ok && Number(synced.matched || 0) > 0) {
-        orderHistorySyncInProgress.delete(result.orderId);
+        orderHistorySyncInProgress.delete(displayResult.orderId);
         button.classList.remove("is-syncing");
         button.classList.add("is-synced");
         button.disabled = true;
         button.textContent = "Synced";
-        orderHistorySyncedConfirmations.set(result.orderId, {
+        orderHistorySyncedConfirmations.set(displayResult.orderId, {
           syncedAt: Date.now(),
-          message: synced.message || `Synced ${result.orderId}`,
+          message: synced.message || `Synced ${displayResult.orderId}`,
         });
-        orderHistoryLookupCache.delete(result.orderId);
+        orderHistoryLookupCache.delete(displayResult.orderId);
         const annotation = button.closest(".nutricity-order-history-annotation");
         if (annotation) annotation.classList.add("is-synced");
       } else {
-        orderHistorySyncInProgress.delete(result.orderId);
+        orderHistorySyncInProgress.delete(displayResult.orderId);
         button.classList.remove("is-syncing");
         button.disabled = false;
         button.textContent = "Sync failed";
@@ -5477,18 +6126,90 @@ function renderOrderHistoryAnnotation(card, result) {
       }
     });
     marker.appendChild(button);
-  } else if (!result.cancelled) {
+  } else if (!displayResult.cancelled) {
     const link = document.createElement("a");
     link.className = "nutricity-order-history-not-found";
-    link.href = result.notFoundUrl || "#";
+    link.href = displayResult.notFoundUrl || "#";
     link.target = "_blank";
     link.rel = "noreferrer";
-    link.textContent = result.orderId;
+    link.textContent = displayResult.orderId;
     marker.appendChild(link);
   }
   const container = orderHistoryAnnotationContainer(card);
   container.appendChild(marker);
   appendDirectOdooHistoryRows(container, directOdoo, detailsClass);
+}
+
+function orderHistoryResultAsinSet(result = {}) {
+  const asins = new Set();
+  for (const asin of result.asins || []) {
+    const normalized = String(asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+  }
+  for (const item of result.items || []) {
+    const normalized = String(item?.asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+  }
+  return asins;
+}
+
+function orderHistoryCandidateAsins(candidate = {}) {
+  const asins = new Set();
+  for (const asin of candidate.asins || []) {
+    const normalized = String(asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+  }
+  for (const line of candidate.lines || []) {
+    const normalized = String(line?.asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+    const replacement = String(line?.replacement_asin || "").toUpperCase().trim();
+    if (replacement) asins.add(replacement);
+  }
+  for (const check of candidate.quantity_checks || []) {
+    const normalized = String(check?.asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+  }
+  for (const asin of Object.keys(candidate.asin_quantities || {})) {
+    const normalized = String(asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+  }
+  if (candidate.asin) {
+    const normalized = String(candidate.asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+  }
+  if (candidate.replacement_asin) {
+    const normalized = String(candidate.replacement_asin || "").toUpperCase().trim();
+    if (normalized) asins.add(normalized);
+  }
+  return asins;
+}
+
+function orderHistoryCandidateBelongsOnCard(candidate = {}, cardAsins = new Set()) {
+  if (!cardAsins.size) return true;
+  const candidateAsins = orderHistoryCandidateAsins(candidate);
+  if (!candidateAsins.size) return true;
+  return [...candidateAsins].some((asin) => cardAsins.has(asin));
+}
+
+function filterOrderHistoryCandidatesForCard(candidates = [], cardAsins = new Set()) {
+  return (candidates || []).filter((candidate) => orderHistoryCandidateBelongsOnCard(candidate, cardAsins));
+}
+
+function filterOrderHistoryResultForCard(result = {}) {
+  const cardAsins = orderHistoryResultAsinSet(result);
+  if (!cardAsins.size) return result;
+  const matchOrders = filterOrderHistoryCandidatesForCard(result.match?.orders || [], cardAsins);
+  const suggestions = filterOrderHistoryCandidatesForCard(result.suggestions || [], cardAsins);
+  const conflicts = filterOrderHistoryCandidatesForCard(result.conflicts || [], cardAsins);
+  const directOdoo = filterOrderHistoryCandidatesForCard(result.odooDirect || [], cardAsins);
+  return {
+    ...result,
+    match: result.match ? { ...result.match, orders: matchOrders } : result.match,
+    suggestions,
+    conflicts,
+    odooDirect: directOdoo,
+    unmatched: Boolean(result.unmatched && !matchOrders.length && !suggestions.length && !conflicts.length && !directOdoo.length),
+  };
 }
 
 function compactQuantity(value) {
@@ -5762,11 +6483,18 @@ async function syncSuggestedAmazonHistoryOrder(result) {
   const orderNames = [...new Set(suggestions.map((order) => order.odoo_order_name).filter(Boolean))];
   if (!result.orderId || !orderNames.length) return { ok: false, message: "No Odoo order suggestion is available." };
   const amazonAsins = new Set((result.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
+  const lineMatchesAmazonAsin = (line = {}) => {
+    if (!amazonAsins.size) return true;
+    return [line.asin, line.replacement_asin]
+      .map((asin) => String(asin || "").toUpperCase().trim())
+      .filter(Boolean)
+      .some((asin) => amazonAsins.has(asin));
+  };
   const matchingLineIds = [
     ...new Set(
       suggestions.flatMap((order) =>
         (order.lines || [])
-          .filter((line) => !amazonAsins.size || amazonAsins.has(String(line.asin || "").toUpperCase()))
+          .filter(lineMatchesAmazonAsin)
           .map((line) => Number(line.id || 0))
           .filter(Boolean),
       ),
@@ -5825,20 +6553,44 @@ async function annotateAmazonOrderHistoryDirectOdoo(pairs = []) {
   for (const { details } of queue) {
     orderHistoryOdooDirectInFlight.add(details.amazon_order_id);
   }
-  const workerCount = Math.min(3, queue.length);
-  let index = 0;
-  const workers = Array.from({ length: workerCount }, async () => {
-    while (index < queue.length) {
-      const current = queue[index];
-      index += 1;
-      await lookupDirectOdooForHistoryOrder(current.card, current.details);
+  try {
+    let result = await sendWithTimeout({
+      type: "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT",
+      orders: queue.map(({ details }) => details),
+    }, 20000);
+    if (!result?.ok) {
+      result = await lookupAmazonHistoryOdooDirectFromContent(queue.map(({ details }) => details));
     }
-  });
-  await Promise.all(workers);
+    for (const { card, details } of queue) {
+      const orderId = details?.amazon_order_id || "";
+      const cached = orderHistoryLookupCache.get(orderId);
+      if (!cached) continue;
+      const directRows = directOdooRowsForOrder(result, orderId);
+      cached.odooDirect = Array.isArray(directRows) ? directRows : [];
+      cached.odooDirectLoaded = result?.ok !== false;
+      cached.cachedAt = Date.now();
+      orderHistoryLookupCache.set(orderId, cached);
+      renderOrderHistoryAnnotation(card, cached);
+    }
+  } catch (_) {
+    for (const { details } of queue) {
+      const orderId = details?.amazon_order_id || "";
+      const cached = orderHistoryLookupCache.get(orderId);
+      if (cached) {
+        cached.odooDirectLoaded = false;
+        orderHistoryLookupCache.set(orderId, cached);
+      }
+    }
+  } finally {
+    for (const { details } of queue) {
+      orderHistoryOdooDirectInFlight.delete(details?.amazon_order_id || "");
+    }
+  }
 }
 
 async function annotateAmazonOrderHistory() {
   if (!extensionContextAlive || !/amazon\.com$/i.test(location.hostname) || (!isOrderHistoryPage() && !isOrderDetailsPage())) return;
+  orderHistoryLastAnnotatedAt = Date.now();
   const pairs = [];
   const unknown = [];
   const directCandidates = [];
@@ -5864,6 +6616,7 @@ async function annotateAmazonOrderHistory() {
       renderOrderHistoryAnnotation(card, cached);
       if (!cached.odooDirectLoaded) directCandidates.push({ card, details });
     } else {
+      renderOrderHistoryPendingAnnotation(card, details);
       unknown.push(details);
     }
   }
@@ -5871,11 +6624,32 @@ async function annotateAmazonOrderHistory() {
     annotateAmazonOrderHistoryDirectOdoo(directCandidates).catch(() => {});
     return;
   }
-  if (orderHistoryAnnotationInFlight) return;
+  if (orderHistoryAnnotationInFlight && Date.now() - Number(orderHistoryAnnotationInFlightAt || 0) < 25000) return;
   orderHistoryAnnotationInFlight = true;
+  orderHistoryAnnotationInFlightAt = Date.now();
   try {
-    const result = await send({ type: "LOOKUP_AMAZON_HISTORY_ORDERS", orders: unknown });
-    if (!result?.ok) return;
+    let result = await lookupAmazonHistoryOrdersFromContent(unknown).catch((error) => ({
+      ok: false,
+      message: error?.message || String(error || "The local app lookup failed."),
+    }));
+    if (!result?.ok) {
+      const message = result?.message || result?.error || "The app lookup did not return a usable response.";
+      if (isTransientOrderHistoryLookupError(message)) {
+        for (const { card, details } of pairs) {
+          if (unknown.some((order) => order.amazon_order_id === details.amazon_order_id)) {
+            renderOrderHistoryPendingAnnotation(card, details);
+          }
+        }
+        scheduleOrderHistoryAnnotation(2500);
+        return;
+      }
+      for (const { card, details } of pairs) {
+        if (unknown.some((order) => order.amazon_order_id === details.amazon_order_id)) {
+          renderOrderHistoryLookupError(card, details, message);
+        }
+      }
+      return;
+    }
     const matches = result.matches || {};
     const suggestions = result.suggestions || {};
     const conflicts = result.conflicts || {};
@@ -5918,18 +6692,42 @@ async function annotateAmazonOrderHistory() {
         }
       }
     }
+  } catch (error) {
+    const message = error?.message || String(error || "The app lookup failed.");
+    if (isTransientOrderHistoryLookupError(message)) {
+      for (const { card, details } of pairs) {
+        if (unknown.some((order) => order.amazon_order_id === details.amazon_order_id)) {
+          renderOrderHistoryPendingAnnotation(card, details);
+        }
+      }
+      scheduleOrderHistoryAnnotation(2500);
+      return;
+    }
+    for (const { card, details } of pairs) {
+      if (unknown.some((order) => order.amazon_order_id === details.amazon_order_id)) {
+        renderOrderHistoryLookupError(card, details, message);
+      }
+    }
   } finally {
     orderHistoryAnnotationInFlight = false;
+    orderHistoryAnnotationInFlightAt = 0;
+    if (orderHistoryNeedsMoreAnnotation()) {
+      scheduleOrderHistoryAnnotation(1200);
+    }
   }
 }
 
 function scheduleOrderHistoryAnnotation(delay = 350) {
   if (orderHistoryAnnotationScheduled) return;
+  if (document.hidden || !/amazon\.com$/i.test(location.hostname)) return;
+  if (!isOrderHistoryPage() && !isOrderDetailsPage()) return;
+  const sinceLastRun = Date.now() - Number(orderHistoryLastAnnotatedAt || 0);
+  const safeDelay = sinceLastRun < 1000 ? Math.max(delay, 1000 - sinceLastRun) : delay;
   orderHistoryAnnotationScheduled = true;
   setTimeout(() => {
     orderHistoryAnnotationScheduled = false;
     annotateAmazonOrderHistory().catch(() => {});
-  }, delay);
+  }, safeDelay);
 }
 
 function activeJobOrderNames(activeJob) {
@@ -6224,10 +7022,15 @@ async function reportAmazonOrders(activeJob, orders) {
   }
   window.__nutricityOrderReportLocks[reportKey] = now;
   showPanel("Nutricity fulfilment", `Found Amazon order ${orderLabel || orderId}. Reporting back to the app.`, null, null);
+  await sendDiagnostic("Reporting Amazon order back to the app.", {
+    group_key: activeJob?.job?.group_key || "",
+    order_ids: uniqueOrders.map((order) => order.amazon_order_id),
+    order_mappings: orderMappings,
+  });
   activeJob.stage = "reporting_complete";
   activeJob.reportedOrderId = orderLabel || orderId;
   activeJob.reportAttemptedAt = Date.now();
-  await setActiveJob(activeJob);
+  await setActiveJob(activeJob, { reason: "reporting_amazon_order" });
   let result = null;
   try {
     for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -6238,6 +7041,7 @@ async function reportAmazonOrders(activeJob, orders) {
         orderDate: uniqueOrders[0]?.order_date || "",
         orderMappings,
         amazonAccountName: amazonSignedInAccountName(),
+        page: diagnosticPageInfo(),
       });
       if (result?.ok) break;
       const message = normalizedText(result?.message || "");
@@ -6261,6 +7065,29 @@ async function reportAmazonOrders(activeJob, orders) {
       delete window.__nutricityOrderReportLocks[reportKey];
       return false;
     }
+    const returnedOrderId = String(result.amazon_order_id || "").trim();
+    const reportedOrderIds = new Set(uniqueOrders.map((order) => order.amazon_order_id));
+    if (returnedOrderId && reportedOrderIds.size && !reportedOrderIds.has(returnedOrderId)) {
+      const message = `The app returned Amazon order ${returnedOrderId}, but the extension reported ${orderLabel || orderId}.`;
+      activeJob.paused = true;
+      activeJob.pausedStage = "reporting_complete";
+      activeJob.reportError = message;
+      await setActiveJob(activeJob);
+      showPanel(
+        "Nutricity reporting needs attention",
+        `${message} Reporting paused so the wrong Amazon order number is not treated as completed.`,
+        "Retry reporting",
+        () => continueAfterManualStep(activeJob, "reporting_complete"),
+      );
+      await sendDiagnostic("App returned a different Amazon order ID than the one reported.", {
+        group_key: activeJob?.job?.group_key || "",
+        reported_order_ids: [...reportedOrderIds],
+        returned_order_id: returnedOrderId,
+        response: result,
+      }, "error");
+      delete window.__nutricityOrderReportLocks[reportKey];
+      return false;
+    }
     window.__nutricityOrderReportCompleted[reportKey] = Date.now();
     for (const order of uniqueOrders) {
       orderHistoryLookupCache.delete(order.amazon_order_id);
@@ -6279,6 +7106,26 @@ async function reportAmazonOrders(activeJob, orders) {
 }
 
 async function autoResumeResolvedCheckoutPause(activeJob) {
+  if (
+    submittedOrPausedStage(activeJob) &&
+    (
+      confirmationSaysPlaced() ||
+      extractOrderId() ||
+      isOrderHistoryPage() ||
+      activeJobWasSubmittedToAmazon(activeJob)
+    )
+  ) {
+    const next = {
+      ...activeJob,
+      stage: extractOrderId() ? "reporting_complete" : "find_order_id",
+      paused: false,
+      pausedStage: null,
+      amazonSubmittedAt: activeJob.amazonSubmittedAt || Date.now(),
+    };
+    await setActiveJob(next, { allowUnpause: true, reason: "auto_resume_submitted_pause" });
+    showPanel("Nutricity fulfilment", "Amazon order was submitted. Continuing to order history to capture the order number.", null, null);
+    return true;
+  }
   if (!/\/checkout/i.test(location.pathname)) return false;
   const pausedStage = String(activeJob?.pausedStage || activeJob?.stage || "");
   if (!["checkout", "editing_address"].includes(pausedStage)) return false;
@@ -6303,7 +7150,7 @@ async function autoResumeResolvedCheckoutPause(activeJob) {
       addressVerifiedRecipient: checkoutRecipient,
       addressVerifiedAt: Date.now(),
     };
-    await setActiveJob(next, { allowUnpause: true, allowStageRegression: true });
+    await setActiveJob(next, { allowUnpause: true, allowStageRegression: true, reason: "auto_resume_checkout_ready" });
     showPanel("Nutricity checkout", "Checkout is ready. Resuming placement.", null, null);
     return true;
   }
@@ -6311,9 +7158,24 @@ async function autoResumeResolvedCheckoutPause(activeJob) {
 }
 
 async function run() {
-  if (!extensionContextAlive) return;
+  if (!extensionContextAlive || fulfilmentForceStopped) return;
+  const now = Date.now();
+  if (!window.__nutricityHadActiveJob) {
+    if (document.hidden && !lastNoActiveJobCheckAt) {
+      lastNoActiveJobCheckAt = now;
+      return;
+    }
+    if (lastNoActiveJobCheckAt && now - lastNoActiveJobCheckAt < IDLE_ACTIVE_JOB_POLL_MS) return;
+  }
   const activeJob = await getActiveJob();
-  if (!activeJob?.job || !/amazon\.com$/i.test(location.hostname)) return;
+  if (!activeJob?.job || !/amazon\.com$/i.test(location.hostname)) {
+    window.__nutricityHadActiveJob = false;
+    lastNoActiveJobCheckAt = now;
+    return;
+  }
+  window.__nutricityHadActiveJob = true;
+  lastNoActiveJobCheckAt = 0;
+  if (await guardUnexpectedAmazonPage(activeJob)) return;
   if (activeJob.paused) {
     if (await autoResumeResolvedCheckoutPause(activeJob)) {
       setTimeout(runSafely, 250);
@@ -6515,6 +7377,7 @@ async function run() {
 }
 
 async function runSafely() {
+  if (fulfilmentForceStopped) return;
   if (window.__nutricityRunning) {
     if (Date.now() - Number(window.__nutricityRunningAt || 0) < 25000) return;
     console.warn("Nutricity fulfilment: recovering from a stale content-script run.");
@@ -6529,31 +7392,68 @@ async function runSafely() {
   }
 }
 
-runSafely();
+if (document.hidden) {
+  lastNoActiveJobCheckAt = Date.now();
+} else {
+  setTimeout(runSafely, 250);
+}
 scheduleOrderHistoryAnnotation(250);
-setInterval(runSafely, 5000);
-setInterval(() => keepPanelAlive().catch(() => undefined), 1000);
-setInterval(() => scheduleOrderHistoryAnnotation(0), 3000);
-window.addEventListener("pageshow", () => {
-  setTimeout(runSafely, 250);
+runIntervalId = setInterval(runSafely, 5000);
+registerContentCleanup(() => clearInterval(runIntervalId));
+panelIntervalId = setInterval(() => {
+  if (!fulfilmentForceStopped && window.__nutricityHadActiveJob) keepPanelAlive().catch(() => undefined);
+}, 1000);
+registerContentCleanup(() => clearInterval(panelIntervalId));
+ensureOrderHistoryAnnotationLoop();
+
+const onPageShow = () => {
+  lastNoActiveJobCheckAt = 0;
+  if (!fulfilmentForceStopped) setTimeout(runSafely, 250);
   scheduleOrderHistoryAnnotation(250);
-});
-window.addEventListener("focus", () => {
-  setTimeout(runSafely, 250);
+};
+window.addEventListener("pageshow", onPageShow);
+registerContentCleanup(() => window.removeEventListener("pageshow", onPageShow));
+
+const onFocus = () => {
+  lastNoActiveJobCheckAt = 0;
+  if (!fulfilmentForceStopped) setTimeout(runSafely, 250);
   scheduleOrderHistoryAnnotation(250);
+};
+window.addEventListener("focus", onFocus);
+registerContentCleanup(() => window.removeEventListener("focus", onFocus));
+
+const onHashChange = () => {
+  scheduleOrderHistoryAnnotation(500);
+};
+window.addEventListener("hashchange", onHashChange);
+registerContentCleanup(() => window.removeEventListener("hashchange", onHashChange));
+
+const onPopState = () => {
+  scheduleOrderHistoryAnnotation(500);
+};
+window.addEventListener("popstate", onPopState);
+registerContentCleanup(() => window.removeEventListener("popstate", onPopState));
+
+const onScroll = () => {
+  if (!/amazon\.com$/i.test(location.hostname) || (!isOrderHistoryPage() && !isOrderDetailsPage())) return;
+  clearTimeout(orderHistoryScrollTimer);
+  orderHistoryScrollTimer = setTimeout(() => scheduleOrderHistoryAnnotation(0), 900);
+};
+window.addEventListener("scroll", onScroll, { passive: true });
+registerContentCleanup(() => {
+  clearTimeout(orderHistoryScrollTimer);
+  window.removeEventListener("scroll", onScroll);
 });
-window.addEventListener("hashchange", () => scheduleOrderHistoryAnnotation(500));
-window.addEventListener("popstate", () => scheduleOrderHistoryAnnotation(500));
-document.addEventListener("visibilitychange", () => {
+
+const onVisibilityChange = () => {
   if (!document.hidden) {
-    setTimeout(runSafely, 250);
+    lastNoActiveJobCheckAt = 0;
+    if (!fulfilmentForceStopped) setTimeout(runSafely, 250);
     scheduleOrderHistoryAnnotation(250);
   }
-});
-if (document.body) {
-  const observer = new MutationObserver(() => scheduleOrderHistoryAnnotation(500));
-  observer.observe(document.body, { childList: true, subtree: true });
-}
+};
+document.addEventListener("visibilitychange", onVisibilityChange);
+registerContentCleanup(() => document.removeEventListener("visibilitychange", onVisibilityChange));
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type !== "CHECK_ASIN_AVAILABILITY") return false;
@@ -6569,3 +7469,4 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   return true;
 });
+})();

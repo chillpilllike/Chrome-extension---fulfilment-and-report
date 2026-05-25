@@ -13,8 +13,23 @@
   padding: 12px;
 }
 
+#nutricity-panel.is-minimized {
+  width: auto;
+  max-width: 260px;
+  padding: 8px 10px;
+  opacity: 0.88;
+}
+
 #nutricity-panel strong {
   display: block;
+}
+
+#nutricity-panel.is-minimized .nutricity-panel-order,
+#nutricity-panel.is-minimized .nutricity-panel-message,
+#nutricity-panel.is-minimized .nutricity-panel-activity,
+#nutricity-panel.is-minimized .nutricity-panel-action,
+#nutricity-panel.is-minimized .nutricity-pause-toggle {
+  display: none !important;
 }
 
 .nutricity-panel-order {
@@ -95,10 +110,28 @@
   margin-bottom: 4px;
 }
 
+.nutricity-panel-controls {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
 .nutricity-pause-toggle {
   flex: 0 0 auto;
   min-width: 70px;
   padding: 5px 9px !important;
+}
+
+.nutricity-panel-minimize,
+.nutricity-panel-close {
+  min-width: 24px;
+  padding: 5px 7px !important;
+  background: #e2e8f0 !important;
+  color: #0f172a !important;
+}
+
+#nutricity-panel.is-stopped .nutricity-pause-toggle {
+  display: none;
 }
 
 .nutricity-pause-toggle.is-paused {

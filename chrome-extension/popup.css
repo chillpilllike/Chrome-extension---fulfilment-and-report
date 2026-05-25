@@ -386,6 +386,17 @@ tfoot td {
   font-weight: 800;
 }
 
+.diagnostics {
+  display: grid;
+  gap: 8px;
+}
+
+.diagnostic-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
 #logs {
   display: grid;
   gap: 6px;

@@ -1,4 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-order-history-card-asin-filter-v18";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -11,6 +13,10 @@ const MISSING_ASIN_ALARM = "nutricity-missing-asin-availability";
 const MISSING_ASIN_CHECK_PERIOD_MINUTES = 24 * 60;
 const BROWSERLESS_SWITCH_POLL_MS = 2000;
 const BROWSERLESS_SWITCH_TIMEOUT_MS = 10 * 60 * 1000;
+const DIAGNOSTIC_SESSION_LIMIT = 4;
+const DIAGNOSTIC_ENTRY_LIMIT = 120;
+const DIAGNOSTIC_DUPLICATE_SUPPRESS_MS = 3000;
+const recentDiagnosticWrites = new Map();
 
 async function getSettings() {
   const data = await chrome.storage.local.get({
@@ -34,6 +40,7 @@ async function getSettings() {
     forceStop: { active: false, stoppedAt: 0, reason: "" },
     logs: [],
     logsByWindow: {},
+    diagnosticSessions: { currentSessionId: "", sessions: [] },
   });
   return data;
 }
@@ -52,6 +59,16 @@ function normalizeApiBase(value) {
 
 function messageWindowId(message = {}, sender = {}) {
   return Number(message.targetWindowId || sender.tab?.windowId || 0) || null;
+}
+
+function senderPageInfo(sender = {}, message = {}) {
+  const tab = sender.tab || {};
+  return {
+    url: message.url || tab.url || "",
+    title: message.title || tab.title || "",
+    tabId: tab.id || null,
+    windowId: tab.windowId || message.targetWindowId || null,
+  };
 }
 
 async function getWindowState(windowId) {
@@ -119,17 +136,121 @@ async function setControlWindow(controlWindowId, targetWindowId) {
   await chrome.storage.local.set({ controlWindowsById: next });
 }
 
-async function log(message, windowId = null) {
-  const { logs, logsByWindow } = await getSettings();
+function diagnosticSessionId(activeJob = null, windowId = null) {
+  const groupKey = activeJob?.job?.group_key || "";
+  if (groupKey) return `${groupKey}:${activeJob?.startedAt || activeJob?.amazonSubmittedAt || "active"}`;
+  return `general:${windowId || "global"}`;
+}
+
+function diagnosticJobSnapshot(activeJob = null, windowId = null) {
+  if (!activeJob?.job) return null;
+  const job = activeJob.job || {};
+  return {
+    group_key: job.group_key || "",
+    order_names: job.order_names || [],
+    recipient_name: job.recipient_name || "",
+    line_ids: job.line_ids || [],
+    items: (job.items || []).map((item) => ({
+      asin: item.asin || "",
+      quantity: item.quantity || 0,
+      line_ids: item.line_ids || [],
+      amazon_status: item.amazon_status || "",
+    })),
+    stage: activeJob.stage || "",
+    paused: Boolean(activeJob.paused),
+    pausedStage: activeJob.pausedStage || "",
+    workerId: activeJob.workerId || "",
+    targetWindowId: activeJob.targetWindowId || windowId || null,
+    amazonSubmittedAt: activeJob.amazonSubmittedAt || null,
+    reportedOrderId: activeJob.reportedOrderId || "",
+  };
+}
+
+async function diagnosticLog(message, options = {}) {
+  const windowId = options.windowId || null;
+  const state = await chrome.storage.local.get({
+    activeJob: null,
+    activeJobsByWindow: {},
+    diagnosticSessions: { currentSessionId: "", sessions: [] },
+  });
+  const activeJob = options.activeJob || (windowId ? state.activeJobsByWindow?.[String(windowId)] : state.activeJob) || state.activeJob || null;
+  const sessionId = options.sessionId || diagnosticSessionId(activeJob, windowId);
+  const duplicateKey = [
+    sessionId,
+    options.level || "info",
+    options.source || "background",
+    String(message || ""),
+    windowId || "",
+  ].join("|");
+  const now = Date.now();
+  const lastWriteAt = Number(recentDiagnosticWrites.get(duplicateKey) || 0);
+  if (now - lastWriteAt < DIAGNOSTIC_DUPLICATE_SUPPRESS_MS) return;
+  recentDiagnosticWrites.set(duplicateKey, now);
+  if (recentDiagnosticWrites.size > 200) {
+    for (const [key, value] of recentDiagnosticWrites.entries()) {
+      if (now - Number(value || 0) > 60 * 1000) recentDiagnosticWrites.delete(key);
+    }
+  }
+  const sessions = Array.isArray(state.diagnosticSessions?.sessions) ? [...state.diagnosticSessions.sessions] : [];
+  let session = sessions.find((item) => item.id === sessionId);
+  if (!session) {
+    session = {
+      id: sessionId,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      windowId: windowId || activeJob?.targetWindowId || null,
+      groupKey: activeJob?.job?.group_key || "",
+      orderNames: activeJob?.job?.order_names || [],
+      entries: [],
+    };
+    sessions.unshift(session);
+  }
+  const entry = {
+    at: now,
+    time: new Date().toISOString(),
+    level: options.level || "info",
+    source: options.source || "background",
+    message: String(message || ""),
+    windowId: windowId || activeJob?.targetWindowId || null,
+    url: options.url || options.page?.url || "",
+    page: options.page || null,
+    job: diagnosticJobSnapshot(activeJob, windowId),
+    details: options.details || null,
+  };
+  session.updatedAt = entry.at;
+  session.windowId = session.windowId || entry.windowId;
+  session.groupKey = session.groupKey || activeJob?.job?.group_key || "";
+  session.orderNames = session.orderNames?.length ? session.orderNames : activeJob?.job?.order_names || [];
+  session.entries = [entry, ...(session.entries || [])].slice(0, DIAGNOSTIC_ENTRY_LIMIT);
+  const trimmed = sessions
+    .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
+    .slice(0, DIAGNOSTIC_SESSION_LIMIT);
+  await chrome.storage.local.set({
+    diagnosticSessions: {
+      currentSessionId: sessionId,
+      sessions: trimmed,
+    },
+  });
+}
+
+function shouldRecordDiagnosticFromLog(message = "", details = null) {
+  if (details) return true;
+  return /fail|error|could not|ignored|duplicate|missing|submitted|completed|protected|force|paused|recovered|released|stale|timeout/i.test(String(message || ""));
+}
+
+async function log(message, windowId = null, details = null) {
+  const { logs, logsByWindow } = await chrome.storage.local.get({ logs: [], logsByWindow: {} });
   const entry = `${new Date().toLocaleTimeString()} ${message}`;
   if (!windowId) {
     await chrome.storage.local.set({ logs: [entry, ...logs].slice(0, 40) });
+    if (shouldRecordDiagnosticFromLog(message, details)) await diagnosticLog(message, { windowId, details });
     return;
   }
   const key = String(windowId);
   const next = { ...(logsByWindow || {}) };
   next[key] = [entry, ...(next[key] || [])].slice(0, 40);
   await chrome.storage.local.set({ logsByWindow: next, logs: next[key] });
+  if (shouldRecordDiagnosticFromLog(message, details)) await diagnosticLog(message, { windowId, details });
 }
 
 function jobLabel(job = {}) {
@@ -170,6 +291,11 @@ async function setForceStop(active, reason = "") {
     reason: active === true ? shortReason(reason, "Force stopped by popup.") : "",
   };
   await chrome.storage.local.set({ forceStop });
+  if (active === true && chrome.alarms?.clear) {
+    await chrome.alarms.clear(MISSING_ASIN_ALARM).catch(() => undefined);
+  } else if (active !== true) {
+    await setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+  }
   return forceStop;
 }
 
@@ -279,25 +405,18 @@ async function rememberRecentAmazonOrders(orders = []) {
 async function lookupAmazonHistoryOrders(orders = []) {
   const normalized = (orders || []).map(normalizeRecentAmazonOrder).filter(Boolean);
   if (!normalized.length) return { ok: true, matches: {}, unmatched: [], not_found_url: "/amazon-order-history-unmatched" };
-  const [result, directResult] = await Promise.all([
-    api("/api/chrome/order-history/lookup", {
-      method: "POST",
-      body: JSON.stringify({ orders: normalized }),
-      timeoutMs: 12000,
-    }),
-    api("/api/chrome/order-history/odoo-direct", {
-      method: "POST",
-      body: JSON.stringify({ orders: normalized }),
-      timeoutMs: 18000,
-    }).catch((error) => ({ ok: false, error: error?.message || String(error || "Direct Odoo lookup failed.") })),
-  ]);
+  const result = await api("/api/chrome/order-history/lookup", {
+    method: "POST",
+    body: JSON.stringify({ orders: normalized }),
+    timeoutMs: 18000,
+  });
   const { apiBase } = await getSettings();
   const base = normalizeApiBase(apiBase);
   return {
     app_base_url: base,
     ...result,
-    odoo_direct: directResult?.odoo_direct || directResult?.odooDirect || {},
-    odoo_direct_error: directResult?.ok === false ? directResult.error || "Direct Odoo lookup failed." : "",
+    odoo_direct: result?.odoo_direct || result?.odooDirect || {},
+    odoo_direct_error: result?.odoo_direct_error || result?.odooDirectError || "",
     not_found_url: `${base}${result.not_found_url || "/amazon-order-history-unmatched"}`,
   };
 }
@@ -340,17 +459,27 @@ async function syncAmazonHistoryOrder(order = {}) {
 }
 
 async function api(path, options = {}) {
-  const { apiBase, adminToken } = await getSettings();
-  const base = normalizeApiBase(apiBase);
+  const settings = await getSettings();
+  const base = normalizeApiBase(options.apiBase || settings.apiBase);
+  const adminToken = options.adminToken ?? settings.adminToken;
   const requestPath = String(path || "").startsWith("/") ? path : `/${path}`;
-  const { timeoutMs = 45000, ...fetchOptions } = options;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(timeoutMs || 45000));
-  const response = await fetch(`${base}${requestPath}`, {
-    headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...(fetchOptions.headers || {}) },
-    signal: controller.signal,
-    ...fetchOptions,
-  }).finally(() => clearTimeout(timeout));
+  const { timeoutMs = 45000, apiBase: _apiBase, adminToken: _adminToken, ...fetchOptions } = options;
+  const isLocalApi = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(base);
+  const authTokens = [
+    adminToken,
+    isLocalApi && adminToken !== LOCAL_ADMIN_TOKEN_FALLBACK ? LOCAL_ADMIN_TOKEN_FALLBACK : "",
+  ].filter(Boolean);
+  let response = null;
+  for (let index = 0; index < Math.max(1, authTokens.length); index += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Number(timeoutMs || 45000));
+    response = await fetch(`${base}${requestPath}`, {
+      headers: { "Content-Type": "application/json", ...(authTokens[index] ? { "X-Admin-Token": authTokens[index] } : {}), ...(fetchOptions.headers || {}) },
+      signal: controller.signal,
+      ...fetchOptions,
+    }).finally(() => clearTimeout(timeout));
+    if (response.ok || response.status !== 401 || index === authTokens.length - 1) break;
+  }
   if (!response.ok) {
     throw new Error((await response.text()) || response.statusText);
   }
@@ -377,12 +506,112 @@ async function testConnection() {
   return { ok: true, message: `Connected to ${base}. Admin token accepted.` };
 }
 
+function tabOrigin(url = "") {
+  try {
+    const parsed = new URL(url);
+    if (!["http:", "https:"].includes(parsed.protocol)) return "";
+    if (/amazon\./i.test(parsed.hostname)) return "";
+    return parsed.origin;
+  } catch (_) {
+    return "";
+  }
+}
+
+function isLikelyAppTab(tab = {}, origin = "") {
+  if (/^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(origin)) return true;
+  const haystack = `${tab.url || ""} ${tab.title || ""}`;
+  return /nutricity|fulfilment|fulfillment|chrome[_-]?queue|amazon[_-]?accounts|stores|inventory/i.test(haystack);
+}
+
+async function readAppTokenFromTab(tabId) {
+  if (!chrome.scripting?.executeScript || !tabId) return "";
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => (
+        window.localStorage.getItem("admin_access_token")
+        || window.sessionStorage.getItem("admin_access_token")
+        || ""
+      ),
+    });
+    return String(results?.[0]?.result || "").trim();
+  } catch (_) {
+    return "";
+  }
+}
+
+async function probeAppOrigin(origin, adminToken = "") {
+  await api("/api/settings/admin-access", {
+    apiBase: origin,
+    adminToken,
+    timeoutMs: 8000,
+  });
+  return api("/api/chrome/jobs?claim=false&job_limit=12", {
+    apiBase: origin,
+    adminToken,
+    timeoutMs: 12000,
+  });
+}
+
+async function discoverAppQueue(currentSnapshot = null) {
+  if (!chrome.tabs?.query) return null;
+  const tabs = await chrome.tabs.query({});
+  const seen = new Set();
+  const candidates = [];
+  for (const tab of tabs) {
+    const origin = tabOrigin(tab.url || "");
+    if (!origin || seen.has(origin)) continue;
+    if (!isLikelyAppTab(tab, origin)) continue;
+    seen.add(origin);
+    candidates.push({ tabId: tab.id, origin, active: tab.active, windowId: tab.windowId });
+  }
+  candidates.sort((a, b) => Number(b.active) - Number(a.active));
+  for (const candidate of candidates) {
+    const adminToken = await readAppTokenFromTab(candidate.tabId);
+    try {
+      const payload = await probeAppOrigin(candidate.origin, adminToken);
+      const jobs = payload.jobs || [];
+      const jobCount = Number(payload.job_count || jobs.length || 0);
+      if (jobCount <= 0 && currentSnapshot?.job_count > 0) continue;
+      await chrome.storage.local.set({
+        apiBase: normalizeApiBase(candidate.origin),
+        ...(adminToken ? { adminToken } : {}),
+        cachedQueueStatus: null,
+      });
+      await log(`Connected popup to app at ${candidate.origin}.`);
+      return { origin: candidate.origin, adminToken, payload };
+    } catch (_) {
+      // Try the next open app-looking tab.
+    }
+  }
+  return null;
+}
+
 async function getQueueStatus() {
   const workerId = await getWorkerId();
   if (queueStatusInFlight) return queueStatusInFlight;
   queueStatusInFlight = (async () => {
   try {
     const payload = await api("/api/chrome/jobs?claim=false&job_limit=12");
+    const empty = Number(payload.job_count || payload.jobs?.length || 0) <= 0;
+    if (empty) {
+      const discovered = await discoverAppQueue(payload);
+      if (discovered?.payload) {
+        const discoveredPayload = discovered.payload;
+        const snapshot = {
+          ok: true,
+          jobs: discoveredPayload.jobs || [],
+          counts: discoveredPayload.counts || [],
+          job_count: Number(discoveredPayload.job_count || 0),
+          workerId,
+          cached_at: Date.now(),
+          stale: false,
+          message: `Connected to app at ${discovered.origin}.`,
+        };
+        await chrome.storage.local.set({ cachedQueueStatus: snapshot });
+        return snapshot;
+      }
+    }
     const snapshot = {
       ok: true,
       jobs: payload.jobs || [],
@@ -395,6 +624,22 @@ async function getQueueStatus() {
     await chrome.storage.local.set({ cachedQueueStatus: snapshot });
     return snapshot;
   } catch (error) {
+    const discovered = await discoverAppQueue();
+    if (discovered?.payload) {
+      const payload = discovered.payload;
+      const snapshot = {
+        ok: true,
+        jobs: payload.jobs || [],
+        counts: payload.counts || [],
+        job_count: Number(payload.job_count || 0),
+        workerId,
+        cached_at: Date.now(),
+        stale: false,
+        message: `Connected to app at ${discovered.origin}.`,
+      };
+      await chrome.storage.local.set({ cachedQueueStatus: snapshot });
+      return snapshot;
+    }
     const { cachedQueueStatus } = await getSettings();
     if (cachedQueueStatus?.ok) {
       return {
@@ -578,7 +823,8 @@ async function navigateWindowToCart(windowId) {
   const tabs = await chrome.tabs.query({ windowId });
   const tab = tabs.find((item) => item.active) || tabs[0];
   if (tab?.id) {
-    await chrome.tabs.update(tab.id, { url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
+    const updated = await chrome.tabs.update(tab.id, { url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
+    await injectContentScriptWhenReady(updated?.id || tab.id);
   }
   await chrome.windows.update(windowId, { focused: true });
 }
@@ -590,9 +836,11 @@ async function navigateWindowToProduct(windowId, asin) {
   const tabs = await chrome.tabs.query({ windowId });
   const tab = tabs.find((item) => item.active) || tabs[0];
   if (tab?.id) {
-    await chrome.tabs.update(tab.id, { url, active: true });
+    const updated = await chrome.tabs.update(tab.id, { url, active: true });
+    await injectContentScriptWhenReady(updated?.id || tab.id);
   } else {
-    await chrome.tabs.create({ windowId, url, active: true });
+    const created = await chrome.tabs.create({ windowId, url, active: true });
+    await injectContentScriptWhenReady(created?.id);
   }
   await chrome.windows.update(windowId, { focused: true });
 }
@@ -601,14 +849,17 @@ async function navigateWindowToOrderHistory(windowId) {
   const url = "https://www.amazon.com/gp/your-account/order-history?ref=ppx_pt2_dt_b_yo_link";
   if (!windowId) {
     const created = await chrome.windows.create({ url, type: "normal", focused: true });
+    await injectActiveAmazonTabInWindow(created?.id);
     return created?.id || null;
   }
   const tabs = await chrome.tabs.query({ windowId });
   const tab = tabs.find((item) => item.active) || tabs[0];
   if (tab?.id) {
-    await chrome.tabs.update(tab.id, { url, active: true });
+    const updated = await chrome.tabs.update(tab.id, { url, active: true });
+    await injectContentScriptWhenReady(updated?.id || tab.id);
   } else {
-    await chrome.tabs.create({ windowId, url, active: true });
+    const created = await chrome.tabs.create({ windowId, url, active: true });
+    await injectContentScriptWhenReady(created?.id);
   }
   await chrome.windows.update(windowId, { focused: true });
   return windowId;
@@ -646,7 +897,8 @@ async function contentScriptLoaded(tabId) {
   try {
     const result = await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => Boolean(window.__nutricityContentLoaded),
+      func: (expectedBuild) => window.__nutricityContentLoaded === expectedBuild,
+      args: [EXPECTED_CONTENT_SCRIPT_BUILD],
     });
     return Boolean(result?.[0]?.result);
   } catch {
@@ -669,9 +921,28 @@ async function injectContentScript(tabId) {
   }
 }
 
-async function ensureContentScriptsInAmazonTabs(label = "extension recovery") {
+async function injectContentScriptWhenReady(tabId, timeoutMs = 30000) {
+  if (!tabId) return false;
+  await waitForTabComplete(tabId, timeoutMs).catch(() => undefined);
+  return injectContentScript(tabId);
+}
+
+async function injectActiveAmazonTabInWindow(windowId) {
+  if (!windowId || !chrome.tabs?.query) return false;
+  const tabs = await chrome.tabs.query({
+    windowId,
+    url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"],
+  });
+  const tab = tabs.find((item) => item.active) || tabs[0];
+  return injectContentScriptWhenReady(tab?.id);
+}
+
+async function ensureContentScriptsInAmazonTabs(label = "extension recovery", options = {}) {
   if (!chrome.tabs?.query) return;
-  const tabs = await chrome.tabs.query({ url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"] });
+  const tabs = await chrome.tabs.query({
+    url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"],
+    ...(options.activeOnly ? { active: true } : {}),
+  });
   let injected = 0;
   for (const tab of tabs) {
     if (await injectContentScript(tab.id)) injected += 1;
@@ -679,37 +950,25 @@ async function ensureContentScriptsInAmazonTabs(label = "extension recovery") {
   if (injected) await log(`Recovered Nutricity content script in ${injected} Amazon tab(s) after ${label}.`);
 }
 
+async function ensureStoredActiveJobContentScripts(label = "active job recovery") {
+  const state = await chrome.storage.local.get({ activeJob: null, activeJobsByWindow: {} });
+  const windowIds = new Set();
+  for (const activeJob of [state.activeJob, ...Object.values(state.activeJobsByWindow || {})]) {
+    const windowId = Number(activeJob?.targetWindowId || 0) || null;
+    if (activeJob?.job?.group_key && windowId) windowIds.add(windowId);
+  }
+  let injected = 0;
+  for (const windowId of windowIds) {
+    if (await injectActiveAmazonTabInWindow(windowId)) injected += 1;
+  }
+  if (injected) await log(`Recovered Nutricity content script in ${injected} active job window(s) after ${label}.`);
+}
+
 async function startNextJob(sourceWindowId = null) {
   if (startNextJobInFlight) return startNextJobInFlight;
   startNextJobInFlight = (async () => {
   await setForceStop(false);
   await releaseMissingWindowJobs();
-  try {
-    await testConnection();
-  } catch (error) {
-    const message = error.message || "Could not reach the local fulfilment app.";
-    await log(`Cannot start queued order: ${message}`, sourceWindowId);
-    await setOrderProgress({
-      running: false,
-      total: 0,
-      processed: 0,
-      message,
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    return { ok: false, message };
-  }
-  const browserless = await browserlessOrderStatus().catch(() => null);
-  if (browserless?.progress?.running === true) {
-    await stopBrowserlessOrderRun(sourceWindowId);
-    const stopped = await waitForBrowserlessOrderStop(sourceWindowId);
-    if (!stopped) {
-      const message = "Browserless ordering is still finishing the current job. Visible Chrome ordering will not start until it reports.";
-      await log(message, sourceWindowId);
-      return { ok: false, browserless_running: true, message };
-    }
-    await log("Browserless ordering stopped; starting the next queued order in Chrome UI mode.", sourceWindowId);
-  }
   const submittedRecovery = await recoverSubmittedJobInWindow(sourceWindowId);
   if (submittedRecovery?.activeJob) return submittedRecovery;
   const blocking = await blockingActiveJob(sourceWindowId);
@@ -730,14 +989,49 @@ async function startNextJob(sourceWindowId = null) {
     }
   }
   const workerId = await getWorkerId();
-  const { splitMixedAsinOrders, fulfilAvailableMixedAsin } = await getSettings();
-  try {
-    const queueBefore = await api("/api/chrome/jobs?claim=false&job_limit=1");
-    await startOrderProgress(Number(queueBefore.job_count || queueBefore.jobs?.length || 0), "Visible Chrome order run started.");
-  } catch {
-    await startOrderProgress(0, "Visible Chrome order run started.");
+  const { splitMixedAsinOrders, fulfilAvailableMixedAsin, browserlessOrderMode } = await getSettings();
+  if (browserlessOrderMode === true) {
+    const browserless = await browserlessOrderStatus().catch(() => null);
+    if (browserless?.progress?.running === true) {
+      await stopBrowserlessOrderRun(sourceWindowId);
+      const stopped = await waitForBrowserlessOrderStop(sourceWindowId);
+      if (!stopped) {
+        const message = "Browserless ordering is still finishing the current job. Visible Chrome ordering will not start until it reports.";
+        await log(message, sourceWindowId);
+        return { ok: false, browserless_running: true, message };
+      }
+      await log("Browserless ordering stopped; starting the next queued order in Chrome UI mode.", sourceWindowId);
+    }
   }
-  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId);
+  let queueBefore = null;
+  const { cachedQueueStatus } = await getSettings();
+  if (
+    cachedQueueStatus?.ok &&
+    Array.isArray(cachedQueueStatus.jobs) &&
+    Date.now() - Number(cachedQueueStatus.cached_at || 0) < 15000
+  ) {
+    queueBefore = cachedQueueStatus;
+    await startOrderProgress(Number(queueBefore.job_count || queueBefore.jobs?.length || 0), "Visible Chrome order run started.");
+  }
+  try {
+    if (!queueBefore) {
+      queueBefore = await api("/api/chrome/jobs?claim=false&job_limit=12");
+      await startOrderProgress(Number(queueBefore.job_count || queueBefore.jobs?.length || 0), "Visible Chrome order run started.");
+    }
+  } catch (error) {
+    const message = connectionErrorMessage(error);
+    await log(`Cannot start queued order: ${message}`, sourceWindowId);
+    await setOrderProgress({
+      running: false,
+      total: 0,
+      processed: 0,
+      message,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    return { ok: false, message };
+  }
+  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId, queueBefore);
   if (!preflight.ok) {
     await updateOrderProgressTotal(0, preflight.message || "Split-order preflight failed.");
     return { ok: false, message: preflight.message || "Split-order preflight failed." };
@@ -780,6 +1074,7 @@ async function startNextJob(sourceWindowId = null) {
   const activeJob = activeJobFor(job, workerId, targetWindowId);
   activeJob.incognito = incognito;
   await setWindowJob(targetWindowId, activeJob);
+  await injectActiveAmazonTabInWindow(targetWindowId);
   await log(`Started ${job.group_key} with ${job.items.length} item(s) in ${incognito ? "incognito" : "normal"} window.`, targetWindowId);
   return { ok: true, message: `Started ${job.group_key}.`, targetWindowId };
   })();
@@ -936,7 +1231,15 @@ async function claimNextJobInWindow(windowId) {
   }
   const workerId = await getWorkerId();
   const { splitMixedAsinOrders, fulfilAvailableMixedAsin } = await getSettings();
-  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, windowId);
+  let queueBefore = null;
+  if (splitMixedAsinOrders === true) {
+    try {
+      queueBefore = await api("/api/chrome/jobs?claim=false&job_limit=12", { timeoutMs: 15000 });
+    } catch (error) {
+      await log(`Could not load queue before split preflight: ${error.message || error}`, windowId);
+    }
+  }
+  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, windowId, queueBefore);
   if (!preflight.ok) {
     await log(preflight.message || "Split-order preflight failed.", windowId);
     return null;
@@ -1026,6 +1329,7 @@ async function recoverSubmittedJobInWindow(windowId) {
     lastHeartbeatAt: Date.now(),
   };
   await setWindowJob(targetWindowId, activeJob);
+  await injectActiveAmazonTabInWindow(targetWindowId);
   await log(`Recovered submitted ${job.group_key}; opened order history to look up Amazon order ID.`, targetWindowId);
   return { ok: true, recovered: true, activeJob, targetWindowId };
   })();
@@ -1107,26 +1411,20 @@ async function forceStopAll(windowId = null) {
 
   for (const { activeJob } of activeEntries) {
     await recordLastProcessed(activeJob, "force stopped", "Force stopped from the popup before the extension could continue.");
-    try {
+    (async () => {
       await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/force-release`, {
         method: "POST",
         timeoutMs: 8000,
       });
-    } catch (error) {
+    })().catch(async (error) => {
       await log(`Force stop could not release ${activeJob.job.group_key}: ${error.message}`, windowId);
-    }
-  }
-
-  try {
-    const browserless = await browserlessOrderStatus().catch(() => null);
-    if (browserless?.progress?.running === true) await stopBrowserlessOrderRun(windowId);
-  } catch (error) {
-    await log(`Force stop could not stop browserless ordering: ${error.message}`, windowId);
+    });
   }
 
   await chrome.storage.local.set({
     activeJob: null,
     activeJobsByWindow: {},
+    availabilityCheckInFlight: false,
     orderProgress: {
       running: false,
       total: Number(state.orderProgress?.total || 0),
@@ -1137,14 +1435,36 @@ async function forceStopAll(windowId = null) {
     },
   });
 
+  try {
+    const browserless = await browserlessOrderStatus().catch(() => null);
+    if (browserless?.progress?.running === true) {
+      stopBrowserlessOrderRun(windowId).catch((error) => log(`Force stop could not stop browserless ordering: ${error.message}`, windowId));
+    }
+  } catch (error) {
+    await log(`Force stop could not inspect browserless ordering: ${error.message}`, windowId);
+  }
+
+  const windowsToClose = new Set();
   for (const { windowId: activeWindowId } of activeEntries) {
-    if (!activeWindowId) continue;
+    if (activeWindowId) windowsToClose.add(Number(activeWindowId));
+  }
+  for (const controlWindowId of Object.keys(state.controlWindowsById || {})) {
+    if (Number(controlWindowId)) windowsToClose.add(Number(controlWindowId));
+  }
+  if (windowId) windowsToClose.add(Number(windowId));
+  for (const activeWindowId of windowsToClose) {
     try {
       await chrome.windows.remove(activeWindowId);
     } catch {
       // The window may already be gone; force stop still cleared extension state.
     }
   }
+
+  await chrome.storage.local.set({
+    activeJob: null,
+    activeJobsByWindow: {},
+    controlWindowsById: {},
+  });
 
   await log("Force stopped all fulfilment activity.", windowId);
   return { ok: true, force_stopped: true, stopped_jobs: activeEntries.length, message: `Force stopped ${activeEntries.length} active job(s). Order queue was not cleared. Click Start next queued order to allow processing again.` };
@@ -1436,7 +1756,7 @@ async function togglePause(windowId) {
   return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
 
-async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = [], orderDate = "") {
+async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = [], orderDate = "", page = null) {
   if (await forceStopActive()) {
     return { ok: false, stopped: true, message: "Force stop is active; ignored late order completion report." };
   }
@@ -1444,6 +1764,19 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
   if (!activeJob?.job) return { ok: false, message: "No active job." };
   const groupKey = activeJob.job.group_key;
   const lockKey = `${windowId || "global"}:${groupKey}`;
+  await diagnosticLog(`Completion report received for ${groupKey}.`, {
+    windowId,
+    source: "content",
+    activeJob,
+    page,
+    details: {
+      amazon_order_id: orderId || "",
+      amazon_order_url: orderUrl || "",
+      amazon_account_name: amazonAccountName || "",
+      order_date: orderDate || "",
+      order_mappings: orderMappings || [],
+    },
+  });
   if (completionLocks.has(lockKey)) {
     await log(`Ignored duplicate completion report for ${groupKey}.`, windowId);
     return { ok: true, duplicate_ignored: true, message: `Completion for ${groupKey} is already being reported.` };
@@ -1489,7 +1822,7 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
       }
       throw error;
     }
-    await log(`Completed ${groupKey} as ${result.amazon_order_id}.`, windowId);
+    await log(`Completed ${groupKey} as ${result.amazon_order_id}.`, windowId, { amazon_order_id: result.amazon_order_id || orderId || "", order_url: orderUrl || "" });
     await recordLastProcessed(activeJob, "placed", result.amazon_order_id ? `Placed ${result.amazon_order_id}.` : "Placed on Amazon.", {
       amazon_order_id: result.amazon_order_id || orderId || "",
     });
@@ -1761,6 +2094,7 @@ async function checkAmazonAvailabilityCandidate(candidate) {
   const tab = await chrome.tabs.create({ url: amazonUrl, active: false });
   try {
     await waitForTabComplete(tab.id, 30000);
+    await injectContentScript(tab.id);
     await new Promise((resolve) => setTimeout(resolve, 2500));
     try {
       return await chrome.tabs.sendMessage(tab.id, { type: "CHECK_ASIN_AVAILABILITY", asin: candidate.asin });
@@ -1826,12 +2160,14 @@ function preflightCandidatesFromJobs(jobs = []) {
   return candidates;
 }
 
-async function preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId = null) {
+async function preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId = null, initialSnapshot = null) {
   if (splitMixedAsinOrders !== true) return { ok: true };
   const blockedGroups = new Set();
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; split-order preflight stopped." };
-    const snapshot = await api(`/api/chrome/jobs?claim=false&job_limit=${fulfilAvailableMixedAsin === true ? 1 : 250}`, { timeoutMs: 15000 });
+    const snapshot = attempt === 0 && initialSnapshot
+      ? initialSnapshot
+      : await api(`/api/chrome/jobs?claim=false&job_limit=${fulfilAvailableMixedAsin === true ? 1 : 12}`, { timeoutMs: 15000 });
     const job = snapshot.jobs?.[0] || null;
     if (!job) return { ok: true, empty: true };
     const partInfo = splitPartInfo(job.group_key);
@@ -1958,19 +2294,27 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  releaseAllStoredJobs().catch((error) => log(`Could not release previous Chrome session jobs: ${error.message}`));
-  ensureContentScriptsInAmazonTabs("Chrome startup").catch((error) => log(`Could not recover Amazon tabs after startup: ${error.message}`));
-  setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+  forceStopActive().then((stopped) => {
+    if (stopped) return;
+    releaseAllStoredJobs().catch((error) => log(`Could not release previous Chrome session jobs: ${error.message}`));
+    setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+  });
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  ensureContentScriptsInAmazonTabs("extension reload").catch((error) => log(`Could not recover Amazon tabs after extension reload: ${error.message}`));
-  setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+  forceStopActive().then((stopped) => {
+    if (stopped) return;
+    ensureStoredActiveJobContentScripts("extension reload").catch((error) => log(`Could not recover active job tabs after extension reload: ${error.message}`));
+    setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+  });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== MISSING_ASIN_ALARM) return;
-  runMissingAsinAvailabilityCheck(false).catch((error) => log(`Missing ASIN availability check failed: ${error.message}`));
+  forceStopActive().then((stopped) => {
+    if (stopped) return;
+    runMissingAsinAvailabilityCheck(false).catch((error) => log(`Missing ASIN availability check failed: ${error.message}`));
+  });
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
@@ -2011,6 +2355,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "RESET_DUPLICATE_FULFILMENT") return resetDuplicateFulfilment(windowId);
     if (message.type === "TOGGLE_PAUSE") return togglePause(windowId);
     if (message.type === "GET_STATE") {
+      if (await forceStopActive()) return { ...(await getWindowState(windowId)), activeJob: null };
       await releaseMissingWindowJobs();
       await refreshActiveJobFromQueue(windowId);
       const { activeJob } = await getWindowState(windowId);
@@ -2021,8 +2366,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return getWindowState(windowId);
     }
     if (message.type === "GET_QUEUE_STATUS") {
-      await releaseMissingWindowJobs();
-      return getQueueStatus();
+      const forceStopped = await forceStopActive();
+      if (!forceStopped) await releaseMissingWindowJobs();
+      const queue = await getQueueStatus();
+      return {
+        ...queue,
+        forceStopped,
+        message: forceStopped
+          ? "Force stop is active. Queue is visible, but no orders will start until Start next queued order clears Force stop."
+          : queue.message,
+      };
     }
     if (message.type === "REMEMBER_RECENT_AMAZON_ORDERS") return rememberRecentAmazonOrders(message.orders || []);
     if (message.type === "LOOKUP_AMAZON_HISTORY_ORDERS") return lookupAmazonHistoryOrders(message.orders || []);
@@ -2033,6 +2386,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true, orders: recentAmazonOrders || [] };
     }
     if (message.type === "CLAIM_NEXT_IN_WINDOW") {
+      if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; did not claim another queued order." };
       const nextJob = await claimNextJobInWindow(windowId);
       return {
         ok: true,
@@ -2041,9 +2395,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         message: nextJob ? `Started next ${nextJob.job.group_key}.` : "No more queued Chrome jobs found.",
       };
     }
-    if (message.type === "FINISH_CLEANUP_AND_CLAIM_NEXT") return finishCleanupAndClaimNext(windowId);
-    if (message.type === "RECOVER_SUBMITTED_JOB") return recoverSubmittedJobInWindow(windowId);
-    if (message.type === "RUN_MISSING_ASIN_AVAILABILITY_CHECK") return runMissingAsinAvailabilityCheck(true);
+    if (message.type === "FINISH_CLEANUP_AND_CLAIM_NEXT") {
+      if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; cleanup/claim stopped." };
+      return finishCleanupAndClaimNext(windowId);
+    }
+    if (message.type === "RECOVER_SUBMITTED_JOB") {
+      if (await forceStopActive()) return { ok: true, recovered: false, activeJob: null, forceStopped: true };
+      return recoverSubmittedJobInWindow(windowId);
+    }
+    if (message.type === "RUN_MISSING_ASIN_AVAILABILITY_CHECK") {
+      if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; availability check stopped." };
+      return runMissingAsinAvailabilityCheck(true);
+    }
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "GET_ACTIVE_JOB") {
       if (await forceStopActive()) return { ok: true, activeJob: null, forceStopped: true };
@@ -2066,6 +2429,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (recovered?.activeJob) {
           activeJob = recovered.activeJob;
           return { ok: true, activeJob };
+        }
+      }
+      if (
+        activeJob?.job &&
+        (activeJob.stage === "reporting_complete" || activeJob.reportedOrderId) &&
+        Date.now() - Number(activeJob.lastReportedLockCheckAt || 0) > 10000
+      ) {
+        activeJob.lastReportedLockCheckAt = Date.now();
+        await setWindowJob(windowId, activeJob);
+        try {
+          await heartbeatJob(activeJob, windowId);
+        } catch (error) {
+          const message = String(error.message || "");
+          if (/lock is no longer owned|no longer active|not found/i.test(message)) {
+            await clearStoredJobGroup(activeJob.job.group_key);
+            await log(
+              `Cleared completed active job ${activeJob.job.group_key}; server no longer has an active lock after reporting: ${message}`,
+              windowId,
+            );
+            const nextJob = await claimNextJobInWindow(windowId);
+            return { ok: true, activeJob: nextJob || null };
+          }
+          await log(`Completed-job lock check failed for ${activeJob.job.group_key}: ${message}`, windowId);
         }
       }
       if (activeJob?.job && activeJob?.workerId && Date.now() - Number(activeJob.lastHeartbeatAt || 0) > 5 * 60 * 1000) {
@@ -2105,7 +2491,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await log(`Ignored late completed-state update for ${incomingJob.job.group_key}.`, windowId);
         return { ok: true, ignored_late_completed_update: true };
       }
+      if (incomingJob?.job?.group_key) {
+        const previousStage = currentJob?.job?.group_key === incomingJob.job.group_key ? currentJob.stage || "" : "";
+        const nextStage = incomingJob.stage || "";
+        const previousPaused = Boolean(currentJob?.paused);
+        const nextPaused = Boolean(incomingJob.paused);
+        if (previousStage !== nextStage || previousPaused !== nextPaused || message.reason) {
+          await diagnosticLog(
+            `Active job update ${incomingJob.job.group_key}: ${previousStage || "none"}${previousPaused ? " paused" : ""} -> ${nextStage || "none"}${nextPaused ? " paused" : ""}.`,
+            {
+              windowId,
+              source: "content",
+              page: senderPageInfo(sender, message.page || {}),
+              activeJob: incomingJob,
+              details: {
+                reason: message.reason || "",
+                previous_stage: previousStage,
+                next_stage: nextStage,
+                previous_paused: previousPaused,
+                next_paused: nextPaused,
+              },
+            },
+          );
+        }
+      }
       await setWindowJob(windowId, incomingJob);
+      return { ok: true };
+    }
+    if (message.type === "DIAG_LOG") {
+      await diagnosticLog(message.message || "Diagnostic event.", {
+        windowId,
+        source: message.source || "content",
+        level: message.level || "info",
+        page: senderPageInfo(sender, message.page || {}),
+        details: message.details || null,
+      });
       return { ok: true };
     }
     if (message.type === "SET_API_BASE") {
@@ -2120,13 +2540,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return { ok: true };
     }
-    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "");
+    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "", senderPageInfo(sender, message.page || {}));
     if (message.type === "MARK_LINE_MISSING") return markLineMissing(message.message || "Chrome extension line is missing.", message, windowId);
     if (message.type === "POST_SUBMIT_UNPLACED") return postSubmitUnplaced(message.message || "Amazon did not place the order after submit.", message, windowId);
     if (message.type === "SUBMIT_UNCERTAIN") return submitUncertain(message.message || "Amazon Place Order was submitted, but no matching Amazon order ID was found.", message, windowId);
     if (message.type === "FAIL_JOB") return failJob(message.message || "Chrome extension job failed.", message, windowId);
     if (message.type === "COSTLY_JOB") return costlyJob(message.message || "Chrome extension job needs costly approval.", message, windowId);
     if (message.type === "CLEAR_FAILED_JOBS") return clearFailedJobs();
+    if (message.type === "GET_DIAGNOSTIC_LOGS") {
+      const { diagnosticSessions } = await getSettings();
+      return { ok: true, diagnosticSessions: diagnosticSessions || { currentSessionId: "", sessions: [] } };
+    }
+    if (message.type === "CLEAR_DIAGNOSTIC_LOGS") {
+      await chrome.storage.local.set({ diagnosticSessions: { currentSessionId: "", sessions: [] }, logs: [], logsByWindow: {} });
+      return { ok: true, message: "Diagnostic logs cleared." };
+    }
     return { ok: false, message: "Unknown message." };
   })()
     .then((result) => sendResponse(result))
