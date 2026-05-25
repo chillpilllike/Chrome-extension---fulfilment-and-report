@@ -134,6 +134,9 @@ PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
 _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
+_SERVICE_SETTINGS_CACHE: tuple[dict[str, str], float] = ({}, 0.0)
+_SERVICE_SETTINGS_CACHE_LOCK = threading.Lock()
+SERVICE_SETTINGS_CACHE_TTL_SECONDS = 15
 _STORE_CACHE: dict[int, tuple[Store, float]] = {}
 _STORES_LIST_CACHE: tuple[list[dict[str, Any]], float] = ([], 0.0)
 _STORE_CACHE_LOCK = threading.Lock()
@@ -4012,6 +4015,27 @@ def destination_country_from_row(row: dict[str, Any]) -> tuple[str, str, str]:
     return code, name, country_label(code, name)
 
 
+def preserved_order_line_refresh_state(preserved: Optional[dict[str, Any]]) -> tuple[str, Optional[str]]:
+    if not preserved:
+        return "pulled", None
+    state = clean_text(preserved.get("state")) or "pulled"
+    amazon_status = clean_text(preserved.get("amazon_status"))
+    amazon_order_id = clean_text(preserved.get("amazon_order_id"))
+    amazon_group_key = clean_text(preserved.get("amazon_group_key"))
+    last_error = preserved.get("last_error")
+    if amazon_order_id:
+        return state, last_error
+    if state == "missing" or amazon_status == "missing":
+        return "missing", last_error
+    if state == "error" or amazon_status == "chrome_error":
+        return "error", last_error
+    if amazon_group_key and amazon_status in {"chrome_queued", "back_in_stock", "order_submitted", "reporting_complete"}:
+        return "submitted", last_error
+    if amazon_group_key and state == "submitted":
+        return "submitted", last_error
+    return "pulled", None
+
+
 def save_combined_order_line(
     store: Store,
     order: dict[str, Any],
@@ -4042,6 +4066,7 @@ def save_combined_order_line(
                 [store.id, *source_line_ids],
             ).fetchall()
         preserved = next((row for row in existing_rows if row["amazon_order_id"]), existing_rows[0] if existing_rows else None)
+        preserved_state, preserved_last_error = preserved_order_line_refresh_state(preserved)
         if delete_duplicates:
             conn.execute(
                 f"""
@@ -4156,8 +4181,8 @@ def save_combined_order_line(
                 preserved["tracking_status"] if preserved else None,
                 preserved["tracking_payload"] if preserved else None,
                 preserved["tracking_checked_at"] if preserved else None,
-                preserved["state"] if preserved and preserved["amazon_order_id"] else "pulled",
-                preserved["last_error"] if preserved and preserved["amazon_order_id"] else None,
+                preserved_state,
+                preserved_last_error,
                 ",".join(str(line_id) for line_id in source_line_ids),
                 len(source_line_ids),
                 json.dumps(raw, default=str),
@@ -4406,6 +4431,7 @@ def process_odoo_order_batch(
                 continue
             canonical_line_id = source_line_ids[0]
             preserved = next((row for row in combined_existing_rows if row["amazon_order_id"]), combined_existing_rows[0] if combined_existing_rows else None)
+            preserved_state, preserved_last_error = preserved_order_line_refresh_state(preserved)
             if not combined_existing_rows:
                 new_record_count += 1
             raw = {
@@ -4453,8 +4479,8 @@ def process_odoo_order_batch(
                     preserved["tracking_status"] if preserved else None,
                     preserved["tracking_payload"] if preserved else None,
                     preserved["tracking_checked_at"] if preserved else None,
-                    preserved["state"] if preserved and preserved["amazon_order_id"] else "pulled",
-                    preserved["last_error"] if preserved and preserved["amazon_order_id"] else None,
+                    preserved_state,
+                    preserved_last_error,
                     ",".join(str(line_id) for line_id in source_line_ids),
                     len(source_line_ids),
                     json.dumps(raw, default=str),
@@ -6999,6 +7025,7 @@ def persist_chrome_order_groups(
     attempts: list[tuple[Any, ...]] = []
     details: list[str] = []
     queued_line_ids: list[int] = []
+    queued_snapshots: list[dict[str, Any]] = []
     for group_key_seed, group_lines in grouped.items():
         group_key = f"chrome-{group_lines[0]['store_id']}-{group_key_seed}-{uuid.uuid4().hex[:10]}"
         order_names = list(dict.fromkeys(str(line["odoo_order_name"]) for line in group_lines))
@@ -7023,6 +7050,21 @@ def persist_chrome_order_groups(
         for line in group_lines:
             updates.append((line["id"], group_key))
             queued_line_ids.append(int(line["id"]))
+            snapshot = row_to_dict(line) if hasattr(line, "keys") else dict(line)
+            snapshot.update({
+                "state": "submitted",
+                "amazon_status": "chrome_queued",
+                "order_engine": "chrome",
+                "amazon_group_key": group_key,
+                "amazon_account_id": amazon_account["id"],
+                "amazon_account_name": amazon_account["name"],
+                "chrome_claimed_by": None,
+                "chrome_claimed_at": None,
+                "chrome_claim_expires_at": None,
+                "last_error": None,
+                "updated_at": now,
+            })
+            queued_snapshots.append(snapshot)
             if len(details) < 8:
                 details.append(f"{line['odoo_order_name']} {line['asin']}: queued for Chrome extension ordering")
     for batch in chunked(updates, 2000):
@@ -7060,10 +7102,8 @@ def persist_chrome_order_groups(
         template="(?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)",
         page_size=1000,
     )
-    if queued_line_ids:
-        placeholders = ",".join("?" for _ in queued_line_ids)
-        for row in conn.execute(f"SELECT * FROM order_lines WHERE id IN ({placeholders})", queued_line_ids).fetchall():
-            index_order_line(row)
+    for snapshot in queued_snapshots:
+        index_order_line(snapshot)
     return len(grouped), details
 
 
@@ -7095,21 +7135,28 @@ def queue_chrome_order_groups_fast(
     include_missing_asins: bool = False,
 ) -> tuple[int, int, int, dict[str, Any], list[str]]:
     with db() as conn:
-        cleared_cursor = conn.execute(
-            """
-            UPDATE order_lines
-            SET amazon_order_id = NULL,
-                amazon_order_url = NULL,
-                amazon_status = NULL,
-                state = 'pulled',
-                last_error = NULL,
-                ordered_at = NULL,
-                updated_at = ?
-            WHERE store_id = ?
-              AND COALESCE(amazon_order_id, '') LIKE 'DRYRUN-%'
-            """,
-            (utc_now(), store_id),
-        )
+        selected_scope = line_ids is not None
+        selected_ids = sorted({int(line_id) for line_id in (line_ids or []) if int(line_id or 0) > 0})
+        if selected_scope and not selected_ids:
+            return 0, 0, 0, {}, []
+        cleared_count = 0
+        if not selected_scope:
+            cleared_cursor = conn.execute(
+                """
+                UPDATE order_lines
+                SET amazon_order_id = NULL,
+                    amazon_order_url = NULL,
+                    amazon_status = NULL,
+                    state = 'pulled',
+                    last_error = NULL,
+                    ordered_at = NULL,
+                    updated_at = ?
+                WHERE store_id = ?
+                  AND COALESCE(amazon_order_id, '') LIKE 'DRYRUN-%'
+                """,
+                [utc_now(), store_id],
+            )
+            cleared_count = int(cleared_cursor.rowcount or 0)
         account = None
         if amazon_account_id:
             account = conn.execute("SELECT * FROM amazon_accounts WHERE id = ?", (amazon_account_id,)).fetchone()
@@ -7130,10 +7177,84 @@ def queue_chrome_order_groups_fast(
         if not address:
             raise HTTPException(400, "Add a fulfilment address before placing Amazon orders.")
 
-        line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids, include_missing_asins)
+        if selected_scope:
+            selected_order_rows = conn.execute(
+                f"""
+                SELECT *
+                FROM order_lines
+                WHERE store_id=?
+                  AND odoo_order_id IN (
+                    SELECT DISTINCT odoo_order_id
+                    FROM order_lines
+                    WHERE store_id=?
+                      AND id IN ({','.join('?' for _ in selected_ids)})
+                      AND state != 'ignored'
+                  )
+                ORDER BY odoo_order_id DESC, id ASC
+                """,
+                [store_id, store_id, *selected_ids],
+            ).fetchall()
+            if not selected_order_rows:
+                return 0, cleared_count, 0, account, []
+            blocked_by_order: dict[int, dict[str, Any]] = {}
+            for row in selected_order_rows:
+                amazon_order_id = clean_text(row.get("amazon_order_id"))
+                if not amazon_order_id:
+                    continue
+                order_id = int(row["odoo_order_id"])
+                entry = blocked_by_order.setdefault(order_id, {"name": row["odoo_order_name"], "orders": []})
+                if amazon_order_id not in entry["orders"]:
+                    entry["orders"].append(amazon_order_id)
+            if blocked_by_order:
+                now = utc_now()
+                for order_id, entry in blocked_by_order.items():
+                    amazon_orders = ", ".join(entry["orders"]) or "an existing Amazon order"
+                    message = (
+                        f"{entry['name']} already has Amazon order {amazon_orders}. "
+                        "Reset fulfilment before sending again to avoid a duplicate Amazon order."
+                    )
+                    conn.execute(
+                        """
+                        UPDATE order_lines
+                        SET state=CASE WHEN COALESCE(amazon_order_id, '') = '' THEN 'error' ELSE state END,
+                            last_error=?,
+                            updated_at=?
+                        WHERE store_id=?
+                          AND odoo_order_id=?
+                        """,
+                        (message, now, store_id, order_id),
+                    )
+                return 0, cleared_count, len(blocked_by_order), account, []
+            lines = [
+                row for row in selected_order_rows
+                if row.get("asin")
+                and not clean_text(row.get("amazon_order_id"))
+                and clean_text(row.get("state")) not in {"ordered", "delivered", "dispatched", "costly", "inventory", "ignored"}
+                and (include_missing_asins or clean_text(row.get("state")) != "missing")
+                and clean_text(row.get("odoo_status_label")) not in {"cancelled", "refunded"}
+            ]
+            if not lines:
+                return 0, cleared_count, 0, account, []
+            lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
+            blocked = date_blocked
+            if lines:
+                lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines], live_sync=False)
+                blocked += shopify_blocked
+            if not lines:
+                return 0, cleared_count, blocked, account, []
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            if club:
+                grouped[f"club-{uuid.uuid4().hex[:10]}"] = lines
+            else:
+                for line in lines:
+                    grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
+            queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
+            return queued, cleared_count, blocked, account, details
+
+        line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, selected_ids if selected_scope else None, include_missing_asins)
         line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
         if line_ids is not None and not line_ids:
-            return 0, int(cleared_cursor.rowcount or 0), blocked, account, []
+            return 0, cleared_count, blocked, account, []
         if line_ids or include_missing_asins:
             placeholders = ",".join("?" for _ in (line_ids or []))
             if include_missing_asins:
@@ -7185,7 +7306,7 @@ def queue_chrome_order_groups_fast(
             """,
             [store_id, 1 if include_missing_asins else 0, *params[1:]],
         ).fetchall()
-        if lines:
+        if lines and not selected_scope:
             allowed_ids, candidate_blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, [int(line["id"]) for line in lines])
             blocked += candidate_blocked
             if candidate_blocked:
@@ -7198,7 +7319,7 @@ def queue_chrome_order_groups_fast(
             lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
             blocked += shopify_blocked
         if not lines:
-            return 0, int(cleared_cursor.rowcount or 0), blocked, account, []
+            return 0, cleared_count, blocked, account, []
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         if club:
@@ -7208,7 +7329,7 @@ def queue_chrome_order_groups_fast(
                 grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
 
         queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
-        return queued, int(cleared_cursor.rowcount or 0), blocked, account, details
+        return queued, cleared_count, blocked, account, details
 
 
 def queue_chrome_order_groups_fast_task(
@@ -9980,7 +10101,7 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> None:
-    global _ADMIN_ACCESS_TOKEN_CACHE
+    global _ADMIN_ACCESS_TOKEN_CACHE, _SERVICE_SETTINGS_CACHE
     with db() as conn:
         conn.execute(
             """
@@ -9993,6 +10114,9 @@ def set_setting(key: str, value: str) -> None:
     if key == "admin_access_token":
         with _ADMIN_ACCESS_TOKEN_CACHE_LOCK:
             _ADMIN_ACCESS_TOKEN_CACHE = ("", 0.0)
+    if key in DEFAULT_SERVICE_SETTINGS:
+        with _SERVICE_SETTINGS_CACHE_LOCK:
+            _SERVICE_SETTINGS_CACHE = ({}, 0.0)
 
 
 def get_ui_copy() -> dict[str, dict[str, str]]:
@@ -10032,6 +10156,12 @@ def set_ui_copy(payload: UiCopyPayload) -> dict[str, str]:
 
 
 def get_service_settings() -> dict[str, str]:
+    global _SERVICE_SETTINGS_CACHE
+    now = time.monotonic()
+    with _SERVICE_SETTINGS_CACHE_LOCK:
+        cached, expires_at = _SERVICE_SETTINGS_CACHE
+        if cached and expires_at > now:
+            return dict(cached)
     settings = dict(DEFAULT_SERVICE_SETTINGS)
     with db() as conn:
         rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
@@ -10040,6 +10170,8 @@ def get_service_settings() -> dict[str, str]:
             settings[row["key"]] = str(row["value"] or "")
     for key in ("shopify_dtc_script_path", "shopify_dtb_script_path", "shopify_tracking_script_path"):
         settings[key] = DEFAULT_SERVICE_SETTINGS[key]
+    with _SERVICE_SETTINGS_CACHE_LOCK:
+        _SERVICE_SETTINGS_CACHE = (dict(settings), now + SERVICE_SETTINGS_CACHE_TTL_SECONDS)
     return settings
 
 
@@ -12268,7 +12400,7 @@ def start_shopify_tracking_job(job_id: str) -> None:
 
 
 def set_service_settings(values: dict[str, str]) -> None:
-    global _ADMIN_ACCESS_TOKEN_CACHE
+    global _ADMIN_ACCESS_TOKEN_CACHE, _SERVICE_SETTINGS_CACHE
     now = utc_now()
     allowed = {key: str(value or "") for key, value in values.items() if key in DEFAULT_SERVICE_SETTINGS}
     if not allowed:
@@ -12283,6 +12415,8 @@ def set_service_settings(values: dict[str, str]) -> None:
                 """,
                 (key, value, now),
             )
+    with _SERVICE_SETTINGS_CACHE_LOCK:
+        _SERVICE_SETTINGS_CACHE = ({}, 0.0)
 
 
 def send_email_alert(subject: str, message: str) -> None:
@@ -14719,13 +14853,13 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
             message += f" Cleared {cleared} dry-run marker{'s' if cleared != 1 else ''}."
         if skipped:
             message += f" Skipped {skipped} order{'s' if skipped != 1 else ''} that already had an Amazon order assigned; reset fulfilment before resending."
-        skip_details = selected_line_reasons(payload.store_id, payload.line_ids) if payload.line_ids else []
+        skip_details = details if queued and payload.line_ids else selected_line_reasons(payload.store_id, payload.line_ids) if payload.line_ids else []
         if skip_details:
             message += " Reason: " + " | ".join(skip_details)
         return {
             "ok": queued > 0,
             "message": message,
-            "defer_refresh": False,
+            "defer_refresh": True,
             "queued": queued,
             "details": details,
         }

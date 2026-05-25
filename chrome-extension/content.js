@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-05-25-order-history-card-asin-filter-v18";
+const CONTENT_SCRIPT_BUILD = "2026-05-25-navigation-recovery-v19";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -3702,7 +3702,17 @@ function elementReadableText(element) {
 function checkoutShowsRecipient(name) {
   const wanted = normalizedText(name);
   if (!wanted) return false;
-  const roots = [];
+  const roots = [
+    ...document.querySelectorAll(
+      [
+        "#change-delivery-link",
+        "a[aria-label*='Delivering to' i]",
+        "a[aria-label*='delivery address' i]",
+        "a[href*='shipaddressselect']",
+        "a[href*='ChangeDelivery']",
+      ].join(", "),
+    ),
+  ];
   const deliveryHeading = document.querySelector("#deliver-to-customer-text");
   if (deliveryHeading) roots.push(deliveryHeading.closest?.("a, .a-row, .a-section, div") || deliveryHeading);
   const deliveryAddress = document.querySelector("#deliver-to-address-text");
@@ -3721,6 +3731,7 @@ function checkoutShowsRecipient(name) {
 
 function currentCheckoutDeliveryText() {
   const roots = [
+    document.querySelector("#change-delivery-link"),
     document.querySelector("#deliver-to-address-text"),
     document.querySelector("#deliver-to-address-text")?.closest?.("a, .a-row, .a-section, div"),
     document.querySelector("#deliver-to-customer-text")?.closest?.("a, .a-row, .a-section, div"),
@@ -3754,6 +3765,15 @@ function checkoutDeliveryRecipientText() {
   const direct = document.querySelector("#deliver-to-customer-text");
   const candidates = [
     direct,
+    ...document.querySelectorAll(
+      [
+        "#change-delivery-link",
+        "a[aria-label*='Delivering to' i]",
+        "a[aria-label*='delivery address' i]",
+        "a[href*='shipaddressselect']",
+        "a[href*='ChangeDelivery']",
+      ].join(", "),
+    ),
     document.querySelector("#deliver-to-address-text")?.closest?.(".a-row, .a-section, a, div"),
     ...document.querySelectorAll("h2, [id*='deliver-to'][id*='customer'], a[aria-label='Change delivery address'], a[href*='/checkout/'][href*='/address']"),
   ].filter(Boolean);
@@ -4908,6 +4928,13 @@ async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
   const deliveredTo = checkoutDeliveryRecipientText();
   const placeOrderVisible = Boolean(findPlaceOrderButton());
   if (!deliveredTo) {
+    if (checkoutRecipientConfirmed(checkoutRecipient)) {
+      activeJob.addressVerifiedRecipient = checkoutRecipient;
+      activeJob.addressVerifiedAt = Date.now();
+      activeJob.addressVerifyAttempts = 0;
+      await setActiveJob(activeJob);
+      return true;
+    }
     if (placeOrderVisible || !checkoutShowsWarehouseAddress()) {
       await pauseForManualCheckout(
         activeJob,
@@ -5198,7 +5225,7 @@ async function handleCheckout(activeJob) {
     ], 5000)
     || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
-    if (!checkoutDeliveryRecipientMatches(checkoutRecipient)) {
+    if (!checkoutDeliveryRecipientMatches(checkoutRecipient) && !checkoutRecipientConfirmed(checkoutRecipient)) {
       const deliveredTo = checkoutDeliveryRecipientText() || "unknown recipient";
       await pauseForManualCheckout(
         activeJob,
@@ -7175,6 +7202,16 @@ async function run() {
   }
   window.__nutricityHadActiveJob = true;
   lastNoActiveJobCheckAt = 0;
+  const runDiagnosticKey = `${activeJob.job.group_key}:${location.pathname}:${activeJob.stage || ""}`;
+  if (window.__nutricityLastRunDiagnosticKey !== runDiagnosticKey) {
+    window.__nutricityLastRunDiagnosticKey = runDiagnosticKey;
+    await sendDiagnostic("Content script is running with an active fulfilment job.", {
+      group_key: activeJob.job.group_key,
+      stage: activeJob.stage || "",
+      item_index: activeJob.itemIndex || 0,
+      build: CONTENT_SCRIPT_BUILD,
+    });
+  }
   if (await guardUnexpectedAmazonPage(activeJob)) return;
   if (activeJob.paused) {
     if (await autoResumeResolvedCheckoutPause(activeJob)) {

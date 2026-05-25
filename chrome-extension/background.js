@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-order-history-card-asin-filter-v18";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-navigation-recovery-v19";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -902,7 +902,7 @@ async function contentScriptLoaded(tabId) {
     });
     return Boolean(result?.[0]?.result);
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -924,7 +924,11 @@ async function injectContentScript(tabId) {
 async function injectContentScriptWhenReady(tabId, timeoutMs = 30000) {
   if (!tabId) return false;
   await waitForTabComplete(tabId, timeoutMs).catch(() => undefined);
-  return injectContentScript(tabId);
+  if (await injectContentScript(tabId)) return true;
+  if (await contentScriptLoaded(tabId)) return true;
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  if (await injectContentScript(tabId)) return true;
+  return contentScriptLoaded(tabId);
 }
 
 async function injectActiveAmazonTabInWindow(windowId) {
@@ -934,7 +938,36 @@ async function injectActiveAmazonTabInWindow(windowId) {
     url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"],
   });
   const tab = tabs.find((item) => item.active) || tabs[0];
-  return injectContentScriptWhenReady(tab?.id);
+  if (!tab?.id) {
+    await diagnosticLog("Could not find an Amazon tab in the active worker window.", {
+      windowId,
+      level: "warn",
+      details: { window_id: windowId },
+    });
+    return false;
+  }
+  const injected = await injectContentScriptWhenReady(tab.id);
+  if (!injected) {
+    await diagnosticLog("Could not verify Nutricity content script in the Amazon worker tab.", {
+      windowId,
+      level: "warn",
+      page: { url: tab.url || "", title: tab.title || "", tabId: tab.id, windowId },
+      details: { tab_id: tab.id, status: tab.status || "" },
+    });
+  }
+  return injected;
+}
+
+async function amazonTabsInWindow(windowId) {
+  if (!windowId || !chrome.tabs?.query) return [];
+  try {
+    return await chrome.tabs.query({
+      windowId,
+      url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"],
+    });
+  } catch {
+    return [];
+  }
 }
 
 async function ensureContentScriptsInAmazonTabs(label = "extension recovery", options = {}) {
@@ -968,7 +1001,7 @@ async function startNextJob(sourceWindowId = null) {
   if (startNextJobInFlight) return startNextJobInFlight;
   startNextJobInFlight = (async () => {
   await setForceStop(false);
-  await releaseMissingWindowJobs();
+  await releaseMissingWindowJobs({ force: true });
   const submittedRecovery = await recoverSubmittedJobInWindow(sourceWindowId);
   if (submittedRecovery?.activeJob) return submittedRecovery;
   const blocking = await blockingActiveJob(sourceWindowId);
@@ -1074,7 +1107,10 @@ async function startNextJob(sourceWindowId = null) {
   const activeJob = activeJobFor(job, workerId, targetWindowId);
   activeJob.incognito = incognito;
   await setWindowJob(targetWindowId, activeJob);
-  await injectActiveAmazonTabInWindow(targetWindowId);
+  const injected = await injectActiveAmazonTabInWindow(targetWindowId);
+  if (!injected) {
+    await log(`Started ${job.group_key}, but could not verify the content script in the Amazon worker tab. Reload the Amazon tab if fulfilment does not continue.`, targetWindowId);
+  }
   await log(`Started ${job.group_key} with ${job.items.length} item(s) in ${incognito ? "incognito" : "normal"} window.`, targetWindowId);
   return { ok: true, message: `Started ${job.group_key}.`, targetWindowId };
   })();
@@ -1354,7 +1390,8 @@ async function cleanupCartBeforeNextJob(activeJob, windowId, reason = "") {
   await navigateWindowToCart(windowId);
 }
 
-async function stopJob(windowId) {
+async function stopJob(windowId, options = {}) {
+  const reason = options.reason || "Stopped manually from the popup.";
   const state = await getWindowState(windowId);
   const globalState = await getSettings();
   let { activeJob } = state;
@@ -1384,11 +1421,11 @@ async function stopJob(windowId) {
     }
   }
   if (activeJob?.job) {
-    await recordLastProcessed(activeJob, "stopped", "Stopped manually from the popup.");
+    await recordLastProcessed(activeJob, "stopped", reason);
   }
   await setWindowJob(targetWindowId, null);
   await releaseMissingWindowJobs();
-  await log("Stopped active job.", targetWindowId);
+  await log(`Stopped active job: ${reason}`, targetWindowId);
   return { ok: true, message: "Stopped active job." };
 }
 
@@ -1662,9 +1699,9 @@ async function markAmazonSubmitted(windowId) {
   return result;
 }
 
-async function releaseMissingWindowJobs() {
+async function releaseMissingWindowJobs(options = {}) {
   if (releaseMissingWindowJobsInFlight) return releaseMissingWindowJobsInFlight;
-  if (Date.now() - lastReleaseMissingWindowJobsAt < 15000) return;
+  if (!options.force && Date.now() - lastReleaseMissingWindowJobsAt < 15000) return;
   releaseMissingWindowJobsInFlight = (async () => {
     lastReleaseMissingWindowJobsAt = Date.now();
     const state = await getSettings();
@@ -1673,15 +1710,37 @@ async function releaseMissingWindowJobs() {
     const openWindowIds = new Set(windows.map((item) => String(item.id)));
     let changed = false;
     for (const [windowId, activeJob] of Object.entries(activeJobsByWindow)) {
-      if (openWindowIds.has(windowId)) continue;
-      const released = await releaseStoredJob(activeJob, Number(windowId) || null, "because its Chrome window is closed");
+      const numericWindowId = Number(windowId) || null;
+      let reason = "";
+      if (!openWindowIds.has(windowId)) {
+        reason = "because its Chrome window is closed";
+      } else if (!orderSubmitStarted(activeJob) && !(await amazonTabsInWindow(numericWindowId)).length) {
+        reason = "because its Chrome worker window no longer has an Amazon tab";
+      }
+      if (!reason) continue;
+      const released = await releaseStoredJob(activeJob, numericWindowId, reason);
       if (released) {
         delete activeJobsByWindow[windowId];
         changed = true;
       }
     }
+    let activeJob = state.activeJob || null;
+    if (activeJob?.job?.group_key && activeJob?.targetWindowId) {
+      const windowId = String(activeJob.targetWindowId);
+      const numericWindowId = Number(activeJob.targetWindowId) || null;
+      let reason = "";
+      if (!openWindowIds.has(windowId)) {
+        reason = "because its Chrome window is closed";
+      } else if (!orderSubmitStarted(activeJob) && !(await amazonTabsInWindow(numericWindowId)).length) {
+        reason = "because its Chrome worker window no longer has an Amazon tab";
+      }
+      if (reason && await releaseStoredJob(activeJob, numericWindowId, reason)) {
+        activeJob = null;
+        changed = true;
+      }
+    }
     if (changed) {
-      await chrome.storage.local.set({ activeJobsByWindow, activeJob: Object.values(activeJobsByWindow)[0] || null });
+      await chrome.storage.local.set({ activeJobsByWindow, activeJob: activeJob || Object.values(activeJobsByWindow)[0] || null });
     }
   })();
   try {
@@ -2317,6 +2376,17 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  if (!tab?.url || !/^https:\/\/(?:www\.)?amazon\.com\//i.test(tab.url)) return;
+  (async () => {
+    const state = await getSettings();
+    const activeJob = tab.windowId ? state.activeJobsByWindow?.[String(tab.windowId)] : null;
+    if (!activeJob?.job?.group_key) return;
+    await injectContentScript(tabId);
+  })().catch((error) => log(`Could not inject Nutricity content script after Amazon navigation: ${error.message}`, tab?.windowId || null));
+});
+
 chrome.windows.onRemoved.addListener((windowId) => {
   (async () => {
     const { controlWindowsById, activeJobsByWindow } = await getSettings();
@@ -2326,7 +2396,7 @@ chrome.windows.onRemoved.addListener((windowId) => {
       return;
     }
     if (activeJobsByWindow?.[String(windowId)]) {
-      await stopJob(windowId);
+      await stopJob(windowId, { reason: "Chrome worker window was closed before the job completed." });
     }
   })().catch((error) => log(`Could not release Chrome job after window closed: ${error.message}`));
 });

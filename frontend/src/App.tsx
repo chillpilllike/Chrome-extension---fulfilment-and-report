@@ -2208,18 +2208,21 @@ function App() {
     })
   }
 
-  async function refreshOrdersPage(nextStoreId = storeId, nextPage = ordersPage) {
+  async function refreshOrdersPage(nextStoreId = storeId, nextPage = ordersPage, options: { silent?: boolean } = {}) {
     const term = ordersQuery.trim()
     const cacheKey = ordersCacheKey(nextStoreId, nextPage, term)
     if (ordersInFlightKeyRef.current === cacheKey) return
+    const silent = options.silent === true
     const requestSeq = ++ordersRequestSeqRef.current
     ordersAbortRef.current?.abort()
     const controller = new AbortController()
     ordersAbortRef.current = controller
     ordersInFlightKeyRef.current = cacheKey
     setOrdersPage(nextPage)
-    setOrdersLoading(true)
-    setOrdersTransitioning(true)
+    if (!silent) {
+      setOrdersLoading(true)
+      setOrdersTransitioning(true)
+    }
     const cachedPage = ordersPageCacheRef.current.get(cacheKey)
     if (cachedPage && Date.now() - cachedPage.cachedAt < 30_000) {
       setOrderRows(cachedPage.rows)
@@ -2245,8 +2248,10 @@ function App() {
       })
     } finally {
       if (requestSeq === ordersRequestSeqRef.current) {
-        setOrdersLoading(false)
-        setOrdersTransitioning(false)
+        if (!silent) {
+          setOrdersLoading(false)
+          setOrdersTransitioning(false)
+        }
         if (ordersAbortRef.current === controller) ordersAbortRef.current = null
         if (ordersInFlightKeyRef.current === cacheKey) ordersInFlightKeyRef.current = ""
       }
@@ -2864,8 +2869,23 @@ function App() {
           window.open(result.punchout_launch_url, "_blank")
         }
       } else if (result.defer_refresh) {
+        if (selected.length && "queued" in result && Number(result.queued || 0) > 0) {
+          const queuedIds = new Set(selected)
+          const markQueued = (row: OrderLine) => queuedIds.has(row.id)
+            ? {
+                ...row,
+                state: "submitted",
+                amazon_status: "chrome_queued",
+                order_engine: "chrome",
+                amazon_account_name: selectedAmazonAccount?.name || row.amazon_account_name,
+                last_error: "",
+              }
+            : row
+          setOrderRows((current) => current.map(markQueued))
+          setData((current) => current ? { ...current, rows: current.rows.map(markQueued) } : current)
+        }
         window.setTimeout(() => {
-          void refreshCurrentOrdersPage().catch((error) => setModal({ ok: false, title: "Refresh Failed", message: String(error) }))
+          void refreshOrdersPage(storeId, ordersPage, { silent: true }).catch((error) => setModal({ ok: false, title: "Refresh Failed", message: String(error) }))
         }, 2500)
       } else {
         await refreshCurrentOrdersPage()
