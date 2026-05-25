@@ -11,6 +11,7 @@ import {
   IconChevronRight as ChevronRight,
   IconColumns3 as Columns3,
   IconCopy as Copy,
+  IconX as X,
   IconDatabase as Database,
   IconDownload as Download,
   IconEdit as Edit,
@@ -1302,10 +1303,23 @@ function SearchBox({
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
+        className={value ? "search-input-clearable" : ""}
       />
-      <span className="input-icon-addon">
-        <Search className="icon icon-1" />
-      </span>
+      {value ? (
+        <button
+          type="button"
+          className="input-icon-clear"
+          aria-label="Clear search"
+          title="Clear search"
+          onClick={() => onChange("")}
+        >
+          <X className="icon icon-1" />
+        </button>
+      ) : (
+        <span className="input-icon-addon">
+          <Search className="icon icon-1" />
+        </span>
+      )}
     </div>
   )
 }

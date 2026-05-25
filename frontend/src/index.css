@@ -1016,6 +1016,46 @@
     color: #98a2b3;
 }
 
+.tabler-admin-shell .input-icon {
+    position: relative;
+}
+
+.tabler-admin-shell .input-icon-addon,
+.tabler-admin-shell .input-icon-clear {
+    position: absolute;
+    top: 50%;
+    right: .75rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.25rem;
+    height: 1.25rem;
+    transform: translateY(-50%);
+    color: #667382;
+}
+
+.tabler-admin-shell .input-icon-addon {
+    pointer-events: none;
+}
+
+.tabler-admin-shell .input-icon-clear {
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    cursor: pointer;
+    padding: 0;
+}
+
+.tabler-admin-shell .input-icon-clear:hover,
+.tabler-admin-shell .input-icon-clear:focus-visible {
+    background: #edf2f7;
+    color: #182433;
+}
+
+.tabler-admin-shell .input-icon .form-control {
+    padding-right: 2.4rem;
+}
+
 .tabler-admin-shell .form-check-input {
     position: relative;
     display: inline-flex;
