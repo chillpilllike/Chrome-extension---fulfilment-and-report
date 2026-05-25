@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-navigation-recovery-v19";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-thankyou-url-recovery-v22";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -1641,6 +1641,47 @@ function orderSubmitStarted(activeJob) {
   );
 }
 
+function isAmazonThankYouUrl(url = "") {
+  return /^https:\/\/(?:www\.)?amazon\.com\/gp\/buy\/thankyou\/handlers\/display\.html/i.test(String(url || ""));
+}
+
+async function recoverBlankThankYouTab(tab = {}) {
+  const windowId = Number(tab.windowId || 0) || null;
+  const { activeJob } = await getWindowState(windowId);
+  if (!activeJob?.job?.group_key || activeJob.stage === "reporting_complete") return false;
+  if (Date.now() - Number(activeJob.thankYouUrlRecoveredAt || 0) < 15000) return false;
+
+  if (!orderSubmitStarted(activeJob)) {
+    const protectedResult = await markAmazonSubmitted(windowId);
+    if (!protectedResult?.ok && !protectedResult?.duplicate_submit_blocked) {
+      await log(
+        `Saw Amazon thank-you URL for ${activeJob.job.group_key}, but could not protect the submit before recovery: ${protectedResult?.message || "unknown error"}`,
+        windowId,
+      );
+      return false;
+    }
+  }
+
+  const latest = (await getWindowState(windowId)).activeJob || activeJob;
+  latest.stage = "find_order_id";
+  latest.paused = false;
+  latest.pausedStage = null;
+  latest.amazonSubmittedAt = latest.amazonSubmittedAt || Date.now();
+  latest.thankYouUrlRecoveredAt = Date.now();
+  latest.amazonConfirmationUrl = latest.amazonConfirmationUrl || tab.url || "";
+  await setWindowJob(windowId, latest);
+  await diagnosticLog("Background thank-you URL guard opened order history.", {
+    windowId,
+    activeJob: latest,
+    source: "background",
+    level: "warn",
+    page: { url: tab.url || "", title: tab.title || "", tabId: tab.id || null, windowId },
+    details: { group_key: latest.job.group_key, stage: latest.stage || "" },
+  });
+  await navigateWindowToOrderHistory(windowId);
+  return true;
+}
+
 function submittedWindowForGroup(state, groupKey, windowId) {
   const expectedWindow = String(windowId || "");
   for (const [key, activeJob] of Object.entries(state.activeJobsByWindow || {})) {
@@ -2377,9 +2418,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status !== "complete") return;
-  if (!tab?.url || !/^https:\/\/(?:www\.)?amazon\.com\//i.test(tab.url)) return;
+  const url = changeInfo.url || tab?.url || "";
+  if (!url || !/^https:\/\/(?:www\.)?amazon\.com\//i.test(url)) return;
   (async () => {
+    if (isAmazonThankYouUrl(url)) {
+      if (await recoverBlankThankYouTab({ ...tab, id: tabId, url })) return;
+    }
+    if (changeInfo.status !== "complete") return;
     const state = await getSettings();
     const activeJob = tab.windowId ? state.activeJobsByWindow?.[String(tab.windowId)] : null;
     if (!activeJob?.job?.group_key) return;

@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-05-25-navigation-recovery-v19";
+const CONTENT_SCRIPT_BUILD = "2026-05-25-thankyou-url-recovery-v22";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -4108,49 +4108,53 @@ function findCheckoutPaymentPanel() {
   )].find((element) => visible(element));
 }
 
-function checkoutSelectedPaymentText() {
-  const scopedPaymentText = [
-    "#selected-payment-methods-list-container",
-    "#payment-information",
-    "[id*='selected-payment']",
-    "#payment-option-text-default",
-    "[id^='payment-option-text'][data-testid]",
-    ".selected-payment-method-no-art-description-heading",
-  ]
-    .map((selector) => document.querySelector(selector))
-    .filter((element) => element && visible(element) && !element.closest?.("#nutricity-panel"))
-    .map((element) => elementReadableText(element).replace(/\s+/g, " ").trim())
-    .filter((text) => text.length <= 350 && /paying\s+with|ending\s+in\s+\d{4}|(?:visa|mastercard|american express|amex|discover|card)[^\d]{0,80}\d{4}/i.test(text))
-    .sort((left, right) => left.length - right.length)[0];
-  if (scopedPaymentText) return scopedPaymentText;
+function paymentSummaryText(element) {
+  return (element?.innerText || element?.textContent || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  const visiblePaymentSummaries = [...document.querySelectorAll("h2, h3, a, span, div")]
-    .filter((element) => {
-      if (!visible(element) || element.closest?.("#nutricity-panel") || element.closest?.(".a-popover, .a-popover-preload")) return false;
-      const text = normalizedText(elementReadableText(element));
-      return /\bpaying\s+with\b/.test(text) || /\bending\s+in\s+\d{4}\b/.test(text);
-    })
-    .map((element) => ({
-      element,
-      text: elementReadableText(element).replace(/\s+/g, " ").trim(),
-    }))
-    .filter((item) => item.text.length <= 220 || /\bpaying\s+with\b/i.test(item.text));
-  const visiblePaymentSummary = visiblePaymentSummaries.sort((left, right) => left.text.length - right.text.length)[0];
-  if (visiblePaymentSummary) {
-    return visiblePaymentSummary.text;
+function paymentSummaryLooksUseful(text = "") {
+  return text.length <= 350 && /paying\s+with|ending\s+in\s+\d{4}|(?:visa|mastercard|american express|amex|discover|card)[^\d]{0,80}\d{4}/i.test(text);
+}
+
+function checkoutPaymentSummaryCandidates() {
+  const roots = [
+    ...document.querySelectorAll([
+      "#selected-payment-methods-list-container",
+      "#payment-information",
+      "#checkout-paymentOptionPanel",
+      "#paymentOptionList",
+      "[id*='selected-payment' i]",
+      "[id*='payment-option' i]",
+      "[id*='paymentOption' i]",
+      "[id*='payment' i]",
+      "[class*='payment' i]",
+      "[data-testid*='payment' i]",
+      "[data-csa-c-slot-id*='pay' i]",
+      "a[href*='/checkout/'][href*='/pay']",
+    ].join(", ")),
+  ].filter((element) => element && visible(element) && !element.closest?.("#nutricity-panel, .a-popover, .a-popover-preload"));
+  const candidates = [];
+  const seen = new Set();
+  for (const root of roots.slice(0, 40)) {
+    const nodes = [
+      root,
+      ...root.querySelectorAll?.("h2, h3, a, span, div, p") || [],
+    ];
+    for (const node of nodes.slice(0, 80)) {
+      if (!node || seen.has(node) || !visible(node) || node.closest?.("#nutricity-panel, .a-popover, .a-popover-preload")) continue;
+      seen.add(node);
+      const text = paymentSummaryText(node);
+      if (paymentSummaryLooksUseful(text)) candidates.push(text);
+    }
   }
+  return candidates.sort((left, right) => left.length - right.length);
+}
 
-  const visibleSelectedRows = [...document.querySelectorAll(
-    "#selected-payment-methods-list-container *, #payment-information *, [id*='selected-payment'] *",
-  )]
-    .filter((element) => {
-      if (!visible(element) || element.closest?.("#nutricity-panel") || element.closest?.(".a-popover, .a-popover-preload")) return false;
-      const text = normalizedText(elementReadableText(element));
-      return /\b(?:visa|mastercard|american\s+express|amex|discover|card)\b.*\b\d{4}\b/.test(text);
-    })
-    .map((element) => elementReadableText(element).replace(/\s+/g, " ").trim())
-    .filter((text) => text.length <= 220);
-  if (visibleSelectedRows.length) return visibleSelectedRows.sort((left, right) => left.length - right.length)[0];
+function checkoutSelectedPaymentText() {
+  const scopedPaymentText = checkoutPaymentSummaryCandidates()[0];
+  if (scopedPaymentText) return scopedPaymentText;
 
   const heading = document.querySelector(
     [
@@ -4161,14 +4165,14 @@ function checkoutSelectedPaymentText() {
     ].join(", "),
   );
   if (heading && visible(heading)) {
-    const text = elementReadableText(heading).replace(/\s+/g, " ").trim();
-    if (/paying\s+with|ending\s+in\s+\d{4}|(?:visa|mastercard|american express|amex|discover|card)[^\d]{0,80}\d{4}/i.test(text)) return text;
+    const text = paymentSummaryText(heading);
+    if (paymentSummaryLooksUseful(text)) return text;
   }
 
   const panel = findCheckoutPaymentPanel();
   if (panel) {
-    const text = elementReadableText(panel).replace(/\s+/g, " ").trim();
-    if (text.length <= 350 && /paying\s+with|ending\s+in\s+\d{4}|(?:visa|mastercard|american express|amex|discover|card)[^\d]{0,80}\d{4}/i.test(text)) return text;
+    const text = paymentSummaryText(panel);
+    if (paymentSummaryLooksUseful(text)) return text;
   }
   return "";
 }
@@ -4188,6 +4192,31 @@ function checkoutPaymentConfirmed(preferences = []) {
   if (placeOrder && !placeOrder.disabled) return true;
   if (!text) return false;
   return /(?:payment method|paying with|ending in|visa|mastercard|american express|amex|discover|card)/i.test(text);
+}
+
+function checkoutPaymentProgress(preferences = []) {
+  const selectedDigits = checkoutSelectedCardDigits();
+  const hasPlaceOrderButton = Boolean(findPlaceOrderButton());
+  const hasPaymentRadio = Boolean(findPaymentRadio());
+  return {
+    selectedDigits,
+    hasPlaceOrderButton,
+    hasPaymentRadio,
+    confirmed: preferences.length
+      ? Boolean(selectedDigits && preferences.includes(selectedDigits))
+      : Boolean(hasPlaceOrderButton || checkoutPaymentConfirmed(preferences)),
+  };
+}
+
+async function waitForCheckoutPaymentProgress(preferences = [], timeout = 4500, options = {}) {
+  const stopOnTransition = options.stopOnTransition === true;
+  return waitUntil(() => {
+    const progress = checkoutPaymentProgress(preferences);
+    if (progress.confirmed) return progress;
+    if (progress.hasPlaceOrderButton) return progress;
+    if (stopOnTransition && !progress.hasPaymentRadio) return progress;
+    return false;
+  }, timeout, 150);
 }
 
 async function waitForPreferredCheckoutPayment(preferences = [], timeout = 8000) {
@@ -4526,30 +4555,38 @@ async function handlePaymentSelection(activeJob) {
     }
     await clickElement(payment.continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
-    let advanced = await waitUntil(
-      () => checkoutPaymentConfirmed(cardPreferences)
-        || (!cardPreferences.length && findPlaceOrderButton())
-        || !findPaymentRadio(),
-      8000,
-      200,
-    );
+    let progress = await waitForCheckoutPaymentProgress(cardPreferences, 4500, { stopOnTransition: true });
+    let advanced = Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
     if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
       const alternate = alternatePaymentContinueButtons(payment.continueButton)[0];
       if (alternate) {
         showPanel("Nutricity checkout", "Retrying Amazon payment continue button.", null, null);
         await clickElement(alternate, "alternate Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
-        advanced = await waitUntil(
-          () => checkoutPaymentConfirmed(cardPreferences)
-            || (!cardPreferences.length && findPlaceOrderButton())
-            || !findPaymentRadio(),
-          6000,
-          200,
-        );
+        progress = await waitForCheckoutPaymentProgress(cardPreferences, 3500, { stopOnTransition: true });
+        advanced = Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
       }
+    }
+    if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
+      const currentDigits = checkoutSelectedCardDigits();
+      await sendDiagnostic("Payment selection guard paused checkout.", {
+        elapsedMs: Date.now() - started,
+        selectedDigits,
+        currentDigits,
+        preferredDigits: cardPreferences,
+        hasPaymentRadio: Boolean(findPaymentRadio()),
+        hasPlaceOrderButton: Boolean(findPlaceOrderButton()),
+      }, "warn").catch(() => {});
+      await pauseForManualCheckout(
+        activeJob,
+        selectedDigits
+          ? `Amazon did not leave payment selection after choosing card ending in ${selectedDigits}.`
+          : "Amazon did not leave payment selection after choosing the payment method.",
+      );
+      return true;
     }
     activeJob.stage = "checkout";
     await setActiveJob(activeJob);
-    const confirmedDigits = checkoutSelectedCardDigits();
+    const confirmedDigits = progress?.selectedDigits || checkoutSelectedCardDigits();
     if (confirmedDigits) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
     }
@@ -4559,6 +4596,7 @@ async function handlePaymentSelection(activeJob) {
       confirmedDigits,
       advanced: Boolean(advanced),
       hasPlaceOrderButton: Boolean(findPlaceOrderButton()),
+      hasPaymentRadio: Boolean(findPaymentRadio()),
     }).catch(() => {});
     return true;
   } catch (error) {
@@ -4594,8 +4632,8 @@ async function ensurePreferredCheckoutPayment(activeJob) {
     showPanel("Nutricity checkout", `Selecting preferred checkout card ending in ${cardPreferences.join(" or ")}.`, null, null);
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 4000, 200);
-    const confirmedDigits = checkoutSelectedCardDigits();
+    const progress = await waitForCheckoutPaymentProgress(cardPreferences, 1800);
+    const confirmedDigits = progress?.selectedDigits || checkoutSelectedCardDigits();
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
       return true;
@@ -4632,8 +4670,8 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   if (findPaymentRadio() || await waitUntil(findPaymentRadio, 1800, 150)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 5000, 200);
-    const confirmedDigits = checkoutSelectedCardDigits();
+    const progress = await waitForCheckoutPaymentProgress(cardPreferences, 2200);
+    const confirmedDigits = progress?.selectedDigits || checkoutSelectedCardDigits();
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
       return true;
@@ -4661,8 +4699,8 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   if (findPaymentRadio() || await waitUntil(findPaymentRadio, 2500, 150)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    await waitUntil(() => checkoutPaymentConfirmed(cardPreferences), 5000, 200);
-    const confirmedDigits = checkoutSelectedCardDigits();
+    const progress = await waitForCheckoutPaymentProgress(cardPreferences, 2200);
+    const confirmedDigits = progress?.selectedDigits || checkoutSelectedCardDigits();
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
       return true;
