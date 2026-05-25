@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-thankyou-url-recovery-v22";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-replacement-recipient-alt-v23";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -2134,8 +2134,17 @@ async function clearFailedJobs() {
 }
 
 async function forceClearQueue(windowId = null) {
-  await forceStopAll(windowId);
+  await setForceStop(true, "Force cleared Chrome queue from the popup.");
+  await chrome.storage.local.set({ cachedQueueStatus: null });
   const result = await api("/api/chrome/queue/force-clear", { method: "POST", body: JSON.stringify({}) });
+  try {
+    const browserless = await browserlessOrderStatus().catch(() => null);
+    if (browserless?.progress?.running === true) {
+      stopBrowserlessOrderRun(windowId).catch((error) => log(`Force clear could not stop browserless ordering: ${error.message}`, windowId));
+    }
+  } catch (error) {
+    await log(`Force clear could not inspect browserless ordering: ${error.message}`, windowId);
+  }
   await chrome.storage.local.set({
     activeJob: null,
     activeJobsByWindow: {},

@@ -4874,9 +4874,12 @@ def backfill_cxml_order_references() -> int:
 def aggregate_items_by_asin(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for line in lines:
-        asin = str(line["asin"] or "").strip().upper()
+        asin = normalize_asin(line["asin"] if "asin" in line.keys() else "")
         if not asin:
             continue
+        replacement_asin = normalize_asin(line["replacement_asin"] if "replacement_asin" in line.keys() else "")
+        original_asin = normalize_asin(line["original_asin"] if "original_asin" in line.keys() else "")
+        uses_replacement_asin = bool(replacement_asin and replacement_asin == asin and replacement_asin != original_asin)
         quantity = float(line["quantity"] or 1)
         store_total = order_line_store_total(line)
         entry = grouped.setdefault(
@@ -4891,8 +4894,17 @@ def aggregate_items_by_asin(lines: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "line_id": f"asin-{asin}",
                 "supplier_part_auxiliary_id": str(line["supplier_part_auxiliary_id"] or "").strip(),
                 "source_line_ids": [],
+                "uses_replacement_asin": False,
+                "replacement_asins": [],
+                "original_asins": [],
             },
         )
+        if uses_replacement_asin:
+            entry["uses_replacement_asin"] = True
+            if replacement_asin not in entry["replacement_asins"]:
+                entry["replacement_asins"].append(replacement_asin)
+            if original_asin and original_asin not in entry["original_asins"]:
+                entry["original_asins"].append(original_asin)
         entry["quantity"] += quantity
         entry["store_total_price"] += store_total
         entry["store_unit_price"] = entry["store_total_price"] / entry["quantity"] if entry["quantity"] else 0.0
@@ -6449,6 +6461,7 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
     account_id = int(group_rows[0]["amazon_account_id"] or 0)
     account = (accounts_by_id or {}).get(account_id) or get_amazon_account(account_id)
     items = aggregate_items_by_asin(group_rows)
+    has_replacement_asin = any(bool(item.get("uses_replacement_asin")) for item in items)
     group_key = str(group_rows[0]["amazon_group_key"])
     part_suffix = chrome_part_suffix(group_key)
     amazon_statuses = [clean_text(row.get("amazon_status")) for row in group_rows if clean_text(row.get("amazon_status"))]
@@ -6468,6 +6481,7 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
         "order_names": order_names,
         "recipient_name": chrome_recipient_name(order_names, part_suffix),
         "recipient_suffix": part_suffix,
+        "has_replacement_asin": has_replacement_asin,
         "back_in_stock": "back_in_stock" in amazon_statuses,
         "line_ids": [row["id"] for row in group_rows],
         "cancelled_amazon_order_ids": sorted({
@@ -6487,6 +6501,9 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
                 "product_names": item.get("product_names") or [],
                 "order_names": item.get("order_names") or [],
                 "line_ids": item["source_line_ids"],
+                "uses_replacement_asin": bool(item.get("uses_replacement_asin")),
+                "replacement_asins": item.get("replacement_asins") or [],
+                "original_asins": item.get("original_asins") or [],
                 "cost_approved": all(
                     row["cost_approved_at"] if "cost_approved_at" in row.keys() else False
                     for row in group_rows

@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-05-25-thankyou-url-recovery-v22";
+const CONTENT_SCRIPT_BUILD = "2026-05-25-replacement-recipient-alt-v23";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -915,6 +915,29 @@ function rememberProductPack(activeJob, item = null) {
   return activeJob;
 }
 
+function activeJobUsesReplacementAsin(activeJob) {
+  const job = activeJob?.job || {};
+  if (job.has_replacement_asin === true || job.uses_replacement_asin === true) return true;
+  const items = Array.isArray(job.items) ? job.items : [];
+  return items.some((item) => {
+    if (!item || typeof item !== "object") return false;
+    if (item.uses_replacement_asin === true || item.is_replacement_asin === true) return true;
+    const replacementAsins = Array.isArray(item.replacement_asins) ? item.replacement_asins : [];
+    if (replacementAsins.some((asin) => String(asin || "").trim())) return true;
+    const replacementAsin = String(item.replacement_asin || "").trim();
+    const originalAsin = String(item.original_asin || "").trim();
+    const asin = String(item.asin || "").trim();
+    return Boolean(replacementAsin && (!asin || replacementAsin.toUpperCase() === asin.toUpperCase()) && replacementAsin.toUpperCase() !== originalAsin.toUpperCase());
+  });
+}
+
+function recipientNameWithReplacementSuffix(name, activeJob) {
+  const cleaned = String(name || "").replace(/\s+/g, " ").trim();
+  if (!activeJobUsesReplacementAsin(activeJob)) return cleaned;
+  if (/(?:^|\s)alt$/i.test(cleaned)) return cleaned;
+  return [cleaned, "Alt"].filter(Boolean).join(" ").trim();
+}
+
 function recipientName(activeJob) {
   const orderNames = Array.isArray(activeJob?.job?.order_names) ? activeJob.job.order_names : [];
   const mixedAsin = isMixedAsinOrder(activeJob);
@@ -961,18 +984,18 @@ function recipientName(activeJob) {
       if (!assigned.has(pack.toLowerCase())) parts.push(pack);
     }
     if (recipientSuffix) parts.push(recipientSuffix);
-    return parts.join(" ").replace(/\s+/g, " ").trim();
+    return recipientNameWithReplacementSuffix(parts.join(" ").replace(/\s+/g, " ").trim(), activeJob);
   }
   const base = String(activeJob?.job?.recipient_name || "").replace(/\s+/g, " ").trim();
-  if (mixedAsin) return `${base} Multi${recipientSuffix ? ` ${recipientSuffix}` : ""}`.replace(/\s+/g, " ").trim();
-  if (recipientSuffix) return [base, recipientSuffix].filter(Boolean).join(" ").trim();
+  if (mixedAsin) return recipientNameWithReplacementSuffix(`${base} Multi${recipientSuffix ? ` ${recipientSuffix}` : ""}`.replace(/\s+/g, " ").trim(), activeJob);
+  if (recipientSuffix) return recipientNameWithReplacementSuffix([base, recipientSuffix].filter(Boolean).join(" ").trim(), activeJob);
   const dosages = (Array.isArray(activeJob?.productDosages) ? activeJob.productDosages : [])
     .map((item) => String(item || "").replace(/\s+/g, "").trim())
     .filter((dosage) => dosage && !base.toLowerCase().includes(dosage.toLowerCase()));
   const packs = (Array.isArray(activeJob?.productPacks) ? activeJob.productPacks : [])
     .map((item) => String(item || "").replace(/\s+/g, "").trim())
     .filter((pack) => pack && !base.toLowerCase().includes(pack.toLowerCase()));
-  return [base, ...dosages, ...packs, recipientSuffix].filter(Boolean).join(" ").trim();
+  return recipientNameWithReplacementSuffix([base, ...dosages, ...packs, recipientSuffix].filter(Boolean).join(" ").trim(), activeJob);
 }
 
 function priceFromText(text) {
