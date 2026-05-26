@@ -8807,11 +8807,40 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
   }
   async function cancel(jobId: string) {
     setJobBusy(`cancel-${jobId}`)
+    const cancelledAt = new Date().toISOString()
+    setJobs((current) => current.map((job) => (
+      job.id === jobId
+        ? {
+            ...job,
+            status: "cancelled",
+            last_error: "Tracking sync cancelled by user.",
+            completed_at: cancelledAt,
+            updated_at: cancelledAt,
+            progress: {
+              ...(job.progress || {}),
+              status: "cancelled",
+              current_order: "",
+              message: "Tracking sync cancelled by user.",
+              updated_at: cancelledAt,
+            },
+          }
+        : job
+    )))
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), 8000)
     try {
-      const result = await api<{ ok: boolean; message: string }>(`/api/shopify/tracking/jobs/${jobId}/cancel`, { method: "POST" })
+      const result = await api<{ ok: boolean; message: string }>(`/api/shopify/tracking/jobs/${jobId}/cancel`, { method: "POST", signal: controller.signal })
       await load()
       onResult({ ok: result.ok, title: "Kill Tracking Sync", message: result.message })
+    } catch (error) {
+      await load().catch(() => undefined)
+      if ((error as Error).name === "AbortError") {
+        onResult({ ok: true, title: "Kill Tracking Sync", message: "Kill was requested. The job is marked cancelled locally and will refresh from Postgres." })
+      } else {
+        throw error
+      }
     } finally {
+      window.clearTimeout(timeout)
       setJobBusy("")
     }
   }

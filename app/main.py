@@ -12512,6 +12512,74 @@ def request_shopify_tracking_job_cancel(job_id: str, message: str = "Tracking sy
     mark_shopify_tracking_job_cancelled(job_id, message)
 
 
+def request_shopify_tracking_job_cancel_fast(job_id: str, message: str = "Tracking sync cancelled by user.") -> str:
+    """Cancel through a short-lived Postgres connection so kill is not blocked by the app DB pool."""
+    now = utc_now()
+    progress = {
+        "status": "cancelled",
+        "total": 0,
+        "processed": 0,
+        "current_order": "",
+        "source": "",
+        "message": message,
+        "updated_at": now,
+        "counters": {},
+    }
+    postgres_url = db_session.POSTGRES_URL
+    if not postgres_url:
+        mark_shopify_tracking_job_cancelled(job_id, message)
+        return "cancelled"
+    raw = None
+    try:
+        raw = db_session.psycopg2.connect(postgres_url, connect_timeout=3, options="-c statement_timeout=5000")
+        raw.autocommit = False
+        with raw.cursor() as cursor:
+            cursor.execute("SELECT status, progress_json FROM shopify_tracking_jobs WHERE id=%s", (job_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise KeyError(job_id)
+            status, progress_json = row
+            if status not in {"queued", "running", "cancel_requested"}:
+                raw.rollback()
+                return str(status)
+            try:
+                existing = json.loads(progress_json or "{}")
+                if isinstance(existing, dict):
+                    progress.update(existing)
+            except Exception:
+                pass
+            progress["status"] = "cancelled"
+            progress["current_order"] = ""
+            progress["message"] = message
+            progress["updated_at"] = now
+            cursor.execute(
+                """
+                UPDATE shopify_tracking_jobs
+                SET status='cancelled', progress_json=%s, last_error=%s, completed_at=%s, updated_at=%s
+                WHERE id=%s
+                """,
+                (json.dumps(progress), message, now, now, job_id),
+            )
+        raw.commit()
+        return "cancelled"
+    except KeyError:
+        if raw:
+            raw.rollback()
+        raise HTTPException(404, "Tracking sync job not found.")
+    except Exception:
+        if raw:
+            raw.rollback()
+        # Fallback keeps older/dev environments working if a direct connection fails.
+        mark_shopify_tracking_job_cancelled(job_id, message)
+        return "cancelled"
+    finally:
+        if raw:
+            try:
+                raw.close()
+            except Exception:
+                pass
+
+
 def run_shopify_tracking_job(job_id: str) -> None:
     cancel_before_start = False
     settings = get_service_settings()
@@ -16042,15 +16110,11 @@ def api_shopify_tracking_retry(job_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/shopify/tracking/jobs/{job_id}/cancel")
-def api_shopify_tracking_cancel(job_id: str) -> dict[str, Any]:
-    with db() as conn:
-        row = conn.execute("SELECT id, status, progress_json FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Tracking sync job not found.")
-        if row["status"] not in {"queued", "running", "cancel_requested"}:
-            return {"ok": True, "message": f"Tracking sync job is already {row['status']}."}
-    request_shopify_tracking_job_cancel(job_id)
-    return {"ok": True, "message": "Tracking sync job was cancelled."}
+async def api_shopify_tracking_cancel(job_id: str) -> dict[str, Any]:
+    status = request_shopify_tracking_job_cancel_fast(job_id)
+    if status == "cancelled":
+        return {"ok": True, "status": status, "message": "Tracking sync job was cancelled."}
+    return {"ok": True, "status": status, "message": f"Tracking sync job is already {status}."}
 
 
 @app.post("/api/chrome/order-history/lookup")
