@@ -47,6 +47,26 @@
     {% endfor %}
   </section>
 
+  {% if system %}
+  <section class="system-stats">
+    <div>
+      <strong>{{ system.postgres.total if system.postgres.total is not none else "?" }}{% if system.postgres.max_connections %}/{{ system.postgres.max_connections }}{% endif %}</strong>
+      <span>Postgres connections</span>
+      <small>{{ system.postgres.active if system.postgres.active is not none else "?" }} active · {{ system.postgres.idle if system.postgres.idle is not none else "?" }} idle</small>
+    </div>
+    <div>
+      <strong>{{ system.cpu.percent if system.cpu.percent is not none else "?" }}%</strong>
+      <span>CPU</span>
+      <small>{{ system.cpu.cores }} cores · load {{ system.cpu.load_1 if system.cpu.load_1 is not none else "?" }}</small>
+    </div>
+    <div>
+      <strong>{{ system.memory.percent if system.memory.percent is not none else "?" }}%</strong>
+      <span>RAM</span>
+      <small>{{ system.host }}</small>
+    </div>
+  </section>
+  {% endif %}
+
   {% if duplicate_asins %}
   <section class="duplicate-panel">
     <h2>Duplicate ASINs Ready For Bulk Ordering</h2>

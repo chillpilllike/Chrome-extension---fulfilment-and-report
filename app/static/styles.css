@@ -200,7 +200,7 @@ button.ghost {
   color: var(--foreground);
 }
 
-.toolbar, .actions, .stats {
+.toolbar, .actions, .stats, .system-stats {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -218,6 +218,7 @@ button.ghost {
 .panel,
 .edit-card,
 .notice,
+.system-stats div,
 .stats div {
   background: var(--card);
   border: 1px solid var(--border);
@@ -252,20 +253,38 @@ button.ghost {
   margin: 0;
 }
 
-.stats div {
+.stats div,
+.system-stats div {
   min-width: 110px;
   padding: 14px 16px;
 }
 
-.stats strong {
+.stats strong,
+.system-stats strong {
   display: block;
   font-size: 24px;
   line-height: 1.1;
   font-weight: 750;
 }
 
-.stats span {
+.stats span,
+.system-stats span {
   color: var(--muted-foreground);
+}
+
+.system-stats {
+  margin: 0;
+}
+
+.system-stats div {
+  min-width: 220px;
+}
+
+.system-stats small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted-foreground);
+  font-size: 12px;
 }
 
 .duplicate-panel {

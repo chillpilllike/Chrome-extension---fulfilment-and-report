@@ -61,12 +61,38 @@ import webbrowser
 import re
 import os
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode, urlparse, parse_qs
 import hashlib
 import requests
 import xmlrpc.client
+
+PROGRESS_CALLBACK = None
+CANCEL_CALLBACK = None
+CSV_LOCK = threading.Lock()
+
+
+class TrackingSyncCancelled(BaseException):
+    pass
+
+
+def check_cancelled():
+    callback = CANCEL_CALLBACK
+    if callback and callback():
+        raise TrackingSyncCancelled("Tracking sync cancelled by user.")
+
+
+def emit_progress(**payload):
+    check_cancelled()
+    callback = PROGRESS_CALLBACK
+    if not callback:
+        return
+    try:
+        callback(payload)
+    except Exception:
+        pass
 
 
 # ----------------------------
@@ -202,19 +228,21 @@ REPORT_FIELDS = [
 def ensure_csv_header(path: str):
     if not path:
         return
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
-        w.writeheader()
+    with CSV_LOCK:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
+            w.writeheader()
 
 
 def append_csv_row(path: str, row: dict):
     if not path:
         return
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
-        w.writerow({k: row.get(k, "") for k in REPORT_FIELDS})
+    with CSV_LOCK:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
+            w.writerow({k: row.get(k, "") for k in REPORT_FIELDS})
 
 
 
@@ -247,6 +275,7 @@ class StateDB:
         self.path = path
         self.read_only = read_only
         self.conn = None
+        self.lock = threading.Lock()
         self._open()
         if not self.read_only:
             self.conn.execute("PRAGMA journal_mode=WAL;")
@@ -256,11 +285,11 @@ class StateDB:
         if self.read_only:
             # If DB doesn't exist, fall back to memory to avoid creating files.
             if not os.path.exists(self.path):
-                self.conn = sqlite3.connect(":memory:")
+                self.conn = sqlite3.connect(":memory:", check_same_thread=False)
                 return
-            self.conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            self.conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, check_same_thread=False)
             return
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
 
     def _init_schema(self):
         cur = self.conn.cursor()
@@ -292,9 +321,10 @@ class StateDB:
     # token cache
     def get_token(self, shop: str):
         try:
-            cur = self.conn.cursor()
-            cur.execute("SELECT access_token, expires_at FROM token_cache WHERE shop=?", (shop,))
-            row = cur.fetchone()
+            with self.lock:
+                cur = self.conn.cursor()
+                cur.execute("SELECT access_token, expires_at FROM token_cache WHERE shop=?", (shop,))
+                row = cur.fetchone()
             if not row:
                 return None
             return {"access_token": row[0], "expires_at": row[1]}
@@ -304,48 +334,51 @@ class StateDB:
     def set_token(self, shop: str, token: str, expires_at: int):
         if self.read_only:
             return
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO token_cache(shop, access_token, expires_at, updated_at)
-            VALUES(?,?,?,?)
-            ON CONFLICT(shop) DO UPDATE SET
-              access_token=excluded.access_token,
-              expires_at=excluded.expires_at,
-              updated_at=excluded.updated_at
-            """,
-            (shop, token, expires_at, int(time.time())),
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO token_cache(shop, access_token, expires_at, updated_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(shop) DO UPDATE SET
+                  access_token=excluded.access_token,
+                  expires_at=excluded.expires_at,
+                  updated_at=excluded.updated_at
+                """,
+                (shop, token, expires_at, int(time.time())),
+            )
+            self.conn.commit()
 
     # idempotency
     def already_synced(self, src_shop: str, src_order_id: str, src_fulfillment_id: str) -> bool:
         try:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                SELECT 1 FROM tracking_sync_log
-                WHERE src_shop=? AND src_order_id=? AND src_fulfillment_id=?
-                """,
-                (src_shop, src_order_id, src_fulfillment_id),
-            )
-            return cur.fetchone() is not None
+            with self.lock:
+                cur = self.conn.cursor()
+                cur.execute(
+                    """
+                    SELECT 1 FROM tracking_sync_log
+                    WHERE src_shop=? AND src_order_id=? AND src_fulfillment_id=?
+                    """,
+                    (src_shop, src_order_id, src_fulfillment_id),
+                )
+                return cur.fetchone() is not None
         except Exception:
             return False
 
     def log_sync(self, src_shop: str, src_order_id: str, src_fulfillment_id: str, odoo_db: str, odoo_order: str):
         if self.read_only:
             return
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO tracking_sync_log
-            (src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, synced_at)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, int(time.time())),
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO tracking_sync_log
+                (src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, synced_at)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, int(time.time())),
+            )
+            self.conn.commit()
 
 
 # ----------------------------
@@ -944,6 +977,7 @@ def main():
     )
     ap.add_argument("--report-csv", default="", help="CSV report path. Default auto timestamp.")
     ap.add_argument("--ineligible-csv", default="", help="Optional CSV for Odoo-ineligible orders (cancel/unpaid/unconfirmed). Default auto.")
+    ap.add_argument("--workers", type=int, default=int(os.getenv("SHOPIFY_TRACKING_WORKERS", "1") or "1"), help="Parallel order workers. Use 1 for serial processing.")
     args = ap.parse_args()
 
     from_ymd = parse_date_to_ymd(args.from_date)
@@ -951,6 +985,7 @@ def main():
     dry_run = args.dry_run
     skip_done_pickings = args.skip_done_pickings
     validate_deliveries = (not args.no_validate_deliveries)
+    workers = max(1, min(12, int(args.workers or 1)))
 
     start_dt = datetime.fromisoformat(from_ymd + "T00:00:00+00:00")
     end_dt = datetime.fromisoformat(to_ymd + "T23:59:59+00:00")
@@ -978,10 +1013,26 @@ def main():
 
     # Connect Odoo destinations
     odoo_by_db = {}
+    odoo_cfg_by_db = {o["db"]: o for o in ODOO_DESTS}
     for o in ODOO_DESTS:
         oc = OdooClient(o["url"], o["db"], o["username"], o["password"])
         oc.connect()
         odoo_by_db[o["db"]] = {"name": o.get("name", o["db"]), "url": o["url"], "client": oc}
+    worker_local = threading.local()
+
+    def dest_meta_for_db(odoo_db: str) -> dict:
+        if workers <= 1:
+            return odoo_by_db[odoo_db]
+        clients = getattr(worker_local, "odoo_by_db", None)
+        if clients is None:
+            clients = {}
+            worker_local.odoo_by_db = clients
+        if odoo_db not in clients:
+            cfg = odoo_cfg_by_db[odoo_db]
+            oc = OdooClient(cfg["url"], cfg["db"], cfg["username"], cfg["password"])
+            oc.connect()
+            clients[odoo_db] = {"name": cfg.get("name", cfg["db"]), "url": cfg["url"], "client": oc}
+        return clients[odoo_db]
 
     print("\n======================================================")
     print(" Odoo Tracking Sync (SMART v3.3) Shopify -> Odoo")
@@ -990,13 +1041,20 @@ def main():
     print(f"Order updated_at fetch range: {from_ymd}  ->  {to_ymd}")
     print(f"Odoo DBs: {len(ODOO_DESTS)} | Shopify SOURCE stores: {len(SHOPIFY_SOURCES)}")
     print(f"Dry-run (report-only): {dry_run}")
+    print(f"Parallel workers: {workers}")
     print(f"Smart update DONE pickings: {'NO' if skip_done_pickings else 'YES'}")
     print(f"CSV report: {report_csv}")
     print(f"Odoo-ineligible CSV: {ineligible_csv}")
 
     counters = {
+        "total_orders": 0,
+        "processed_orders": 0,
         "processed_fulfillments": 0,
         "synced": 0,
+        "tracking_codes_added": 0,
+        "tracking_codes_would_add": 0,
+        "tracking_pickings_updated": 0,
+        "tracking_pickings_would_update": 0,
         "validated": 0,
         "validation_failed": 0,
         "skipped_already": 0,
@@ -1012,10 +1070,57 @@ def main():
         "errors": 0,
     }
 
+    counters_lock = threading.Lock()
+
+    def add_counter(key: str, amount: int = 1):
+        with counters_lock:
+            counters[key] += amount
+            return counters[key]
+
+    def counters_snapshot() -> dict:
+        with counters_lock:
+            return counters.copy()
+
+    def finish_current_order(src_shop: str, current_order: str, message: str):
+        processed = add_counter("processed_orders")
+        snapshot = counters_snapshot()
+        emit_progress(
+            status="running",
+            source=src_shop,
+            total=snapshot["total_orders"],
+            processed=processed,
+            current_order=current_order,
+            message=message,
+            counters=snapshot,
+        )
+
     for src in sources_auth:
         print(f"\n--- SOURCE: {src['name']} ({src['shop']}) ---")
+        source_orders = list(fetch_source_orders(src["shop"], src["token"], src["api_version"], from_ymd, to_ymd))
+        add_counter("total_orders", len(source_orders))
+        emit_progress(
+            status="running",
+            source=src["shop"],
+            total=counters_snapshot()["total_orders"],
+            processed=counters_snapshot()["processed_orders"],
+            current_order="",
+            message=f"Loaded {len(source_orders)} Shopify order(s) from {src['shop']}.",
+            counters=counters_snapshot(),
+        )
 
-        for src_order in fetch_source_orders(src["shop"], src["token"], src["api_version"], from_ymd, to_ymd):
+        def process_source_order(src_order: dict):
+            check_cancelled()
+            current_order = src_order.get("name", "") or src_order.get("id", "")
+            snapshot = counters_snapshot()
+            emit_progress(
+                status="running",
+                source=src["shop"],
+                total=snapshot["total_orders"],
+                processed=snapshot["processed_orders"],
+                current_order=current_order,
+                message=f"Syncing Shopify order {current_order}.",
+                counters=snapshot,
+            )
             src_tags = src_order.get("tags") or []
             v = validate_src_tags_for_odoo(src_tags)
 
@@ -1037,7 +1142,7 @@ def main():
 
             # Validate tags first
             if v["status"] == "MISSING":
-                counters["skipped_missing_tags"] += 1
+                add_counter("skipped_missing_tags")
                 append_csv_row(
                     report_csv,
                     {
@@ -1047,10 +1152,11 @@ def main():
                         "message": "Order missing SRC_ODOO_DB or SRC_ODOO_ORDER tag",
                     },
                 )
-                continue
+                finish_current_order(src["shop"], current_order, f"Skipped Shopify order {current_order}: missing Odoo tags.")
+                return
 
             if v["status"] == "EXCEPTION":
-                counters["skipped_exception_tags"] += 1
+                add_counter("skipped_exception_tags")
                 append_csv_row(
                     report_csv,
                     {
@@ -1060,12 +1166,13 @@ def main():
                         "message": f"Tag validation exception: {v.get('exception_code','')}",
                     },
                 )
-                continue
+                finish_current_order(src["shop"], current_order, f"Skipped Shopify order {current_order}: tag exception.")
+                return
 
             odoo_db = v["odoo_db"]
             odoo_order = v["odoo_order"]
             if odoo_db not in odoo_by_db:
-                counters["skipped_odoo_db_missing"] += 1
+                add_counter("skipped_odoo_db_missing")
                 append_csv_row(
                     report_csv,
                     {
@@ -1077,9 +1184,10 @@ def main():
                         "message": "SRC_ODOO_DB points to a DB not present in ODOO_DESTS config",
                     },
                 )
-                continue
+                finish_current_order(src["shop"], current_order, f"Skipped Shopify order {current_order}: Odoo DB not configured.")
+                return
 
-            dest_meta = odoo_by_db[odoo_db]
+            dest_meta = dest_meta_for_db(odoo_db)
             oc = dest_meta["client"]
 
             fulfillments = src_order.get("fulfillments") or []
@@ -1089,13 +1197,14 @@ def main():
 
             # Iterate fulfillments
             for f in fulfillments:
+                check_cancelled()
                 # If it's in edges format, unwrap
                 if isinstance(f, dict) and "node" in f:
                     f = f["node"]
 
                 f_id = f.get("id", "")
                 f_created = f.get("createdAt") or ""
-                counters["processed_fulfillments"] += 1
+                add_counter("processed_fulfillments")
 
                 row_common = {
                     **base_row,
@@ -1110,10 +1219,10 @@ def main():
                 already_synced = False
                 if (not dry_run) and st.already_synced(src["shop"], src_order.get("id", ""), f_id):
                     already_synced = True
-                    counters["skipped_already"] += 1
+                    add_counter("skipped_already")
 
                 if not iso_in_range(f_created, start_dt, end_dt):
-                    counters["skipped_out_of_range"] += 1
+                    add_counter("skipped_out_of_range")
                     append_csv_row(
                         report_csv,
                         {
@@ -1131,7 +1240,7 @@ def main():
                     if (t.get("number") or "").strip()
                 ]
                 if not tracking_list:
-                    counters["skipped_no_tracking"] += 1
+                    add_counter("skipped_no_tracking")
                     append_csv_row(
                         report_csv,
                         {
@@ -1159,9 +1268,10 @@ def main():
                 )
 
                 try:
+                    check_cancelled()
                     so_id = oc.find_sale_order_id_by_name(odoo_order)
                     if not so_id:
-                        counters["skipped_odoo_order_not_found"] += 1
+                        add_counter("skipped_odoo_order_not_found")
                         append_csv_row(
                             report_csv,
                             {
@@ -1181,7 +1291,7 @@ def main():
                     so_paid = "YES" if eligible else "NO"
 
                     if not eligible:
-                        counters["skipped_odoo_order_ineligible"] += 1
+                        add_counter("skipped_odoo_order_ineligible")
                         append_csv_row(
                             ineligible_csv,
                             {
@@ -1199,7 +1309,7 @@ def main():
 
                     picking_ids = oc.get_pickings_of_sale_order(so_id)
                     if not picking_ids:
-                        counters["skipped_no_pickings"] += 1
+                        add_counter("skipped_no_pickings")
                         append_csv_row(
                             report_csv,
                             {
@@ -1217,6 +1327,7 @@ def main():
 
                     carrier_id = oc.find_carrier_id_by_name(carrier_name) if carrier_name else None
                     pickings = oc.read_pickings(picking_ids)
+                    check_cancelled()
 
                     picking_states = []
                     picking_existing = []
@@ -1253,13 +1364,14 @@ def main():
                                     validate_needed.add(pid2)
 
                             for pid2 in sorted(validate_needed, key=lambda x: int(x)):
+                                check_cancelled()
                                 okv, msgv = oc.validate_picking_safely(int(pid2))
                                 if okv:
                                     validated_ids.append(pid2)
-                                    counters["validated"] += 1
+                                    add_counter("validated")
                                 else:
                                     validation_msgs.append(f"{pid2}:{msgv}")
-                                    counters["validation_failed"] += 1
+                                    add_counter("validation_failed")
 
                         # IMPORTANT: in dry-run we do NOT log sync
                         if not dry_run:
@@ -1267,7 +1379,7 @@ def main():
 
                         did_validate = bool(validated_ids)
                         if not did_validate:
-                            counters["skipped_no_update_needed"] += 1
+                            add_counter("skipped_no_update_needed")
 
                         append_csv_row(
                             report_csv,
@@ -1298,11 +1410,18 @@ def main():
 
                     if dry_run:
                         updated_ids = update_needed_ids[:]  # what would update
+                        if updated_ids:
+                            add_counter("tracking_codes_would_add", len(tracking_numbers))
+                            add_counter("tracking_pickings_would_update", len(updated_ids))
                     else:
                         for pid in update_needed_ids:
+                            check_cancelled()
                             ok = oc.write_picking_tracking(int(pid), tracking_text, carrier_id=carrier_id, append_note=note_append)
                             if ok:
                                 updated_ids.append(pid)
+                        if updated_ids:
+                            add_counter("tracking_codes_added", len(tracking_numbers))
+                            add_counter("tracking_pickings_updated", len(updated_ids))
 
                     validated_ids = []
                     validation_msgs = []
@@ -1320,13 +1439,14 @@ def main():
                                 validate_needed.add(pid)
 
                         for pid in sorted(validate_needed, key=lambda x: int(x)):
+                            check_cancelled()
                             okv, msgv = oc.validate_picking_safely(int(pid))
                             if okv:
                                 validated_ids.append(pid)
-                                counters["validated"] += 1
+                                add_counter("validated")
                             else:
                                 validation_msgs.append(f"{pid}:{msgv}")
-                                counters["validation_failed"] += 1
+                                add_counter("validation_failed")
                     else:
                         validated_ids = []
                         validation_msgs = []
@@ -1334,7 +1454,7 @@ def main():
                     if not dry_run:
                         st.log_sync(src["shop"], src_order.get("id", ""), f_id, odoo_db, odoo_order)
 
-                    counters["synced"] += 1
+                    add_counter("synced")
                     append_csv_row(
                         report_csv,
                         {
@@ -1362,7 +1482,7 @@ def main():
                     )
 
                 except Exception as e:
-                    counters["errors"] += 1
+                    add_counter("errors")
                     append_csv_row(
                         report_csv,
                         {
@@ -1373,12 +1493,38 @@ def main():
                         },
                     )
                     print(f"[ERROR] {src['shop']} {src_order.get('name')} -> Odoo({odoo_db}) {odoo_order}: {e}")
+            finish_current_order(src["shop"], current_order, f"Finished Shopify order {current_order}.")
+
+        if workers > 1 and len(source_orders) > 1:
+            executor = ThreadPoolExecutor(max_workers=min(workers, len(source_orders)), thread_name_prefix="tracking-order")
+            futures = [executor.submit(process_source_order, src_order) for src_order in source_orders]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except TrackingSyncCancelled:
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
+        else:
+            for src_order in source_orders:
+                process_source_order(src_order)
 
     print("\n================ SUMMARY ================")
     for k, v in counters.items():
         print(f"{k:28s}: {v}")
     print(f"CSV report: {report_csv}")
     print(f"Odoo-ineligible CSV: {ineligible_csv}")
+    emit_progress(
+        status="completed",
+        total=counters["total_orders"],
+        processed=counters["processed_orders"],
+        current_order="",
+        message="Shopify tracking sync complete.",
+        counters=counters.copy(),
+    )
 
 
 if __name__ == "__main__":

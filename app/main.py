@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import smtplib
@@ -857,6 +858,7 @@ def init_db() -> None:
                 skip_done_pickings INTEGER NOT NULL DEFAULT 0,
                 validate_deliveries INTEGER NOT NULL DEFAULT 1,
                 report_csv TEXT,
+                progress_json TEXT NOT NULL DEFAULT '{}',
                 counters_json TEXT,
                 last_error TEXT,
                 locked_at TEXT,
@@ -1000,6 +1002,9 @@ def init_db() -> None:
             existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(inventory_items)").fetchall()}
             if column not in existing_cols:
                 conn.execute(ddl)
+        existing_tracking_cols = {r["name"] for r in conn.execute("PRAGMA table_info(shopify_tracking_jobs)").fetchall()}
+        if "progress_json" not in existing_tracking_cols:
+            conn.execute("ALTER TABLE shopify_tracking_jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
         for index_sql in (
             "CREATE INDEX IF NOT EXISTS idx_inventory_store_asin_status ON inventory_items(store_id, asin, status)",
             "CREATE INDEX IF NOT EXISTS idx_inventory_store_asin_available_qty ON inventory_items(store_id, asin) WHERE status='available'",
@@ -10206,14 +10211,39 @@ def _safe_script_dict(value: Any) -> Any:
     return value
 
 
+def masked_json_list_setting(value: str) -> str:
+    parsed = json_list_setting(value)
+    if parsed is None:
+        return value
+    return json.dumps(_safe_script_dict(parsed))
+
+
+def json_list_setting(value: str) -> Optional[list[Any]]:
+    if not clean_text(value):
+        return None
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
 def apply_shopify_runtime_settings(module: Any, route: str, settings: Optional[dict[str, str]] = None) -> None:
     settings = settings or get_service_settings()
     route = clean_text(route).lower()
+    tracking_odoo_destinations_json = json_list_setting(settings.get("shopify_tracking_odoo_destinations_json", "")) if route == "tracking" else None
+    if route == "tracking":
+        tracking_sources_json = json_list_setting(settings.get("shopify_tracking_sources_json", ""))
+        if tracking_sources_json is not None:
+            module.SHOPIFY_SOURCES = tracking_sources_json
+        if tracking_odoo_destinations_json is not None:
+            module.ODOO_DESTS = tracking_odoo_destinations_json
     odoo_password = settings.get("odoo_script_password", "")
     if odoo_password:
         for attr in ("ODOO_SOURCES", "ODOO_DESTS"):
             for odoo_cfg in getattr(module, attr, []) or []:
-                odoo_cfg["password"] = odoo_password
+                if route != "tracking" or tracking_odoo_destinations_json is None or not odoo_cfg.get("password"):
+                    odoo_cfg["password"] = odoo_password
         if hasattr(module, "ODOO_PASSWORD"):
             module.ODOO_PASSWORD = odoo_password
     secret_key = {
@@ -10223,6 +10253,10 @@ def apply_shopify_runtime_settings(module: Any, route: str, settings: Optional[d
     }.get(route, "")
     client_secret = settings.get(secret_key, "") if secret_key else ""
     if route in {"dtc", "dtb"}:
+        destinations_json = json_list_setting(settings.get(f"shopify_{route}_destinations_json", ""))
+        if destinations_json is not None:
+            module.DESTS = destinations_json
+            return
         for dest in getattr(module, "DESTS", []) or []:
             prefix = f"shopify_{route}_"
             mapping = {
@@ -10245,6 +10279,22 @@ def apply_shopify_runtime_settings(module: Any, route: str, settings: Optional[d
         return
     if route == "tracking":
         for source in getattr(module, "SHOPIFY_SOURCES", []) or []:
+            mapping = {
+                "shop": "shop",
+                "auth_mode": "auth_mode",
+                "client_id": "client_id",
+                "scopes": "scopes",
+                "redirect_uri": "redirect_uri",
+                "api_version": "api_version",
+            }
+            for setting_key, source_key in mapping.items():
+                value = clean_text(settings.get(f"shopify_tracking_{setting_key}"))
+                if not value:
+                    continue
+                if source_key == "scopes":
+                    source[source_key] = [item.strip() for item in value.split(",") if item.strip()]
+                else:
+                    source[source_key] = value
             if client_secret:
                 source["client_secret"] = client_secret
 
@@ -10318,6 +10368,43 @@ def shopify_script_config_summary() -> dict[str, Any]:
             "state_storage": "Postgres adapter in app runtime",
         },
     }
+
+
+def tracking_script_config_raw(settings: Optional[dict[str, str]] = None) -> dict[str, Any]:
+    settings = settings or get_service_settings()
+    tracking = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_tracking_script_path"], f"shopify_cfg_tracking_raw_{uuid.uuid4().hex}")
+    apply_shopify_runtime_settings(tracking, "tracking", settings)
+    return {
+        "sources": getattr(tracking, "SHOPIFY_SOURCES", []) or [],
+        "odoo_destinations": getattr(tracking, "ODOO_DESTS", []) or [],
+    }
+
+
+def export_script_config_raw(route: str, settings: Optional[dict[str, str]] = None) -> dict[str, Any]:
+    route = clean_text(route).lower()
+    settings = settings or get_service_settings()
+    script_path = DEFAULT_SERVICE_SETTINGS["shopify_dtb_script_path"] if route == "dtb" else DEFAULT_SERVICE_SETTINGS["shopify_dtc_script_path"]
+    module = load_external_script(script_path, f"shopify_cfg_{route}_raw_{uuid.uuid4().hex}")
+    apply_shopify_runtime_settings(module, route, settings)
+    return {"destinations": getattr(module, "DESTS", []) or []}
+
+
+def preserve_masked_config_values(value: Any, previous: Any) -> Any:
+    if value == "********":
+        return previous
+    if isinstance(value, list):
+        previous_list = previous if isinstance(previous, list) else []
+        return [
+            preserve_masked_config_values(item, previous_list[index] if index < len(previous_list) else None)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        previous_dict = previous if isinstance(previous, dict) else {}
+        return {
+            key: preserve_masked_config_values(item, previous_dict.get(key))
+            for key, item in value.items()
+        }
+    return value
 
 
 def load_external_script(path: str, module_name: str) -> Any:
@@ -12334,6 +12421,7 @@ def clear_completed_shopify_fulfilment_jobs() -> int:
 
 
 def list_shopify_tracking_jobs(page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int, int, int]:
+    reconcile_stale_shopify_tracking_jobs()
     page, per_page, offset = pagination_bounds(page, per_page)
     with db() as conn:
         total = int(conn.execute("SELECT COUNT(*) AS count FROM shopify_tracking_jobs").fetchone()["count"] or 0)
@@ -12346,19 +12434,130 @@ def list_shopify_tracking_jobs(page: int = 1, per_page: int = 100) -> tuple[list
             """,
             (per_page, offset),
         ).fetchall()
-    return rows_to_dicts(rows), total, page, per_page
+    result = rows_to_dicts(rows)
+    for row in result:
+        try:
+            row["progress"] = json.loads(row.get("progress_json") or "{}")
+        except Exception:
+            row["progress"] = {}
+        try:
+            row["counters"] = json.loads(row.get("counters_json") or "{}")
+        except Exception:
+            row["counters"] = {}
+        row["report_url"] = f"/api/shopify/tracking/jobs/{row['id']}/download" if row.get("report_csv") else ""
+    return result, total, page, per_page
+
+
+def set_shopify_tracking_job_progress(job_id: str, progress: dict[str, Any]) -> None:
+    safe_progress = {
+        "status": clean_text(progress.get("status")) or "running",
+        "total": int(progress.get("total") or 0),
+        "processed": int(progress.get("processed") or 0),
+        "current_order": clean_text(progress.get("current_order")),
+        "source": clean_text(progress.get("source")),
+        "message": clean_text(progress.get("message")),
+        "updated_at": utc_now(),
+        "counters": progress.get("counters") if isinstance(progress.get("counters"), dict) else {},
+    }
+    with db() as conn:
+        conn.execute(
+            "UPDATE shopify_tracking_jobs SET progress_json=?, updated_at=? WHERE id=?",
+            (json.dumps(safe_progress), safe_progress["updated_at"], job_id),
+        )
+
+
+SHOPIFY_TRACKING_ACTIVE_JOBS: set[str] = set()
+SHOPIFY_TRACKING_ACTIVE_LOCK = threading.Lock()
+
+
+def shopify_tracking_job_cancel_requested(job_id: str) -> bool:
+    with db() as conn:
+        row = conn.execute("SELECT status FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+    return bool(row and row["status"] in {"cancel_requested", "cancelled"})
+
+
+def mark_shopify_tracking_job_cancelled(job_id: str, message: str = "Tracking sync cancelled by user.") -> None:
+    now = utc_now()
+    progress = {
+        "status": "cancelled",
+        "total": 0,
+        "processed": 0,
+        "current_order": "",
+        "source": "",
+        "message": message,
+        "updated_at": now,
+        "counters": {},
+    }
+    with db() as conn:
+        existing = conn.execute("SELECT progress_json FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+        if existing:
+            try:
+                progress.update(json.loads(existing["progress_json"] or "{}"))
+            except Exception:
+                pass
+        progress["status"] = "cancelled"
+        progress["current_order"] = ""
+        progress["message"] = message
+        progress["updated_at"] = now
+        conn.execute(
+            "UPDATE shopify_tracking_jobs SET status='cancelled', progress_json=?, last_error=?, completed_at=?, updated_at=? WHERE id=?",
+            (json.dumps(progress), message, now, now, job_id),
+        )
+
+
+def request_shopify_tracking_job_cancel(job_id: str, message: str = "Tracking sync cancelled by user.") -> None:
+    # Mark the job terminal immediately so the UI leaves the "Killing" state.
+    # Active worker threads observe this status through CANCEL_CALLBACK and stop
+    # at their next network-safe checkpoint.
+    mark_shopify_tracking_job_cancelled(job_id, message)
 
 
 def run_shopify_tracking_job(job_id: str) -> None:
-    with db() as conn:
-        job = conn.execute("SELECT * FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
-        if not job:
-            return
-        conn.execute("UPDATE shopify_tracking_jobs SET status='running', attempts=attempts+1, locked_at=?, updated_at=? WHERE id=?", (utc_now(), utc_now(), job_id))
+    cancel_before_start = False
     settings = get_service_settings()
     report_dir = BASE_DIR / "reports"
     report_dir.mkdir(exist_ok=True)
     report_csv = str(report_dir / f"shopify_tracking_{job_id}.csv")
+    with db() as conn:
+        job = conn.execute("SELECT * FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            return
+        previous_report_csv = clean_text(job["report_csv"])
+        if int(job["attempts"] or 0) > 0 and previous_report_csv:
+            for stale_report in (Path(previous_report_csv), Path(previous_report_csv.replace(".csv", "_odoo_ineligible.csv"))):
+                try:
+                    if stale_report.exists() and stale_report.is_file():
+                        stale_report.unlink()
+                except Exception:
+                    pass
+        if job["status"] == "cancel_requested":
+            cancel_before_start = True
+        if cancel_before_start:
+            pass
+        else:
+            now = utc_now()
+            progress = {
+                "status": "running",
+                "total": 0,
+                "processed": 0,
+                "current_order": "",
+                "source": "",
+                "message": "Starting Shopify tracking sync.",
+                "updated_at": now,
+                "counters": {},
+            }
+            cursor = conn.execute(
+                "UPDATE shopify_tracking_jobs SET status='running', attempts=attempts+1, locked_at=?, report_csv=?, progress_json=?, counters_json='{}', last_error='', completed_at=NULL, updated_at=? WHERE id=? AND status='queued'",
+                (now, report_csv, json.dumps(progress), now, job_id),
+            )
+            if not cursor.rowcount:
+                current = conn.execute("SELECT status FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+                cancel_before_start = bool(current and current["status"] == "cancel_requested")
+                if not cancel_before_start:
+                    return
+    if cancel_before_start:
+        mark_shopify_tracking_job_cancelled(job_id)
+        return
     argv = [
         str(settings["shopify_tracking_script_path"]),
         "--from-date",
@@ -12367,6 +12566,8 @@ def run_shopify_tracking_job(job_id: str) -> None:
         str(job["to_date"]),
         "--report-csv",
         report_csv,
+        "--workers",
+        str(max(1, min(16, int(float(settings.get("shopify_tracking_workers") or 8))))),
     ]
     if int(job["dry_run"] or 0):
         argv.append("--dry-run")
@@ -12379,6 +12580,15 @@ def run_shopify_tracking_job(job_id: str) -> None:
         apply_shopify_runtime_settings(module, "tracking", settings)
         module.StateDB = PostgresShopifyTrackingStateDB
         module.STATE_DB = "postgres:tracking"
+        cancelled_exc = getattr(module, "TrackingSyncCancelled", BaseException)
+        module.CANCEL_CALLBACK = lambda: shopify_tracking_job_cancel_requested(job_id)
+
+        def progress_callback(progress: dict[str, Any]) -> None:
+            if shopify_tracking_job_cancel_requested(job_id):
+                raise cancelled_exc("Tracking sync cancelled by user.")
+            set_shopify_tracking_job_progress(job_id, progress)
+
+        module.PROGRESS_CALLBACK = progress_callback
         stdout = io.StringIO()
         stderr = io.StringIO()
         old_argv = sys.argv[:]
@@ -12388,32 +12598,296 @@ def run_shopify_tracking_job(job_id: str) -> None:
                 module.main()
         finally:
             sys.argv = old_argv
+        if shopify_tracking_job_cancel_requested(job_id):
+            raise cancelled_exc("Tracking sync cancelled by user.")
         counters = {"stdout": stdout.getvalue()[-8000:], "stderr": stderr.getvalue()[-8000:], "returncode": 0}
         with db() as conn:
+            progress = {
+                "status": "completed",
+                "total": 0,
+                "processed": 0,
+                "current_order": "",
+                "source": "",
+                "message": "Shopify tracking sync complete.",
+                "updated_at": utc_now(),
+                "counters": counters,
+            }
+            existing = conn.execute("SELECT progress_json FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+            if existing:
+                try:
+                    progress.update(json.loads(existing["progress_json"] or "{}"))
+                except Exception:
+                    pass
+            progress["status"] = "completed"
+            progress["current_order"] = ""
+            progress["message"] = "Shopify tracking sync complete."
+            progress["updated_at"] = utc_now()
             conn.execute(
-                "UPDATE shopify_tracking_jobs SET status='completed', report_csv=?, counters_json=?, last_error='', completed_at=?, updated_at=? WHERE id=?",
-                (report_csv, json.dumps(counters), utc_now(), utc_now(), job_id),
+                "UPDATE shopify_tracking_jobs SET status='completed', report_csv=?, progress_json=?, counters_json=?, last_error='', completed_at=?, updated_at=? WHERE id=?",
+                (report_csv, json.dumps(progress), json.dumps(counters), progress["updated_at"], progress["updated_at"], job_id),
             )
+            if not int(job["dry_run"] or 0):
+                set_setting("shopify_tracking_last_success_at", progress["updated_at"])
     except SystemExit as exc:
         error_text = f"Tracking script exited {exc.code}"
         with db() as conn:
             conn.execute(
-                "UPDATE shopify_tracking_jobs SET status='failed', last_error=?, updated_at=? WHERE id=?",
-                (error_text, utc_now(), job_id),
+                "UPDATE shopify_tracking_jobs SET status='failed', progress_json=?, last_error=?, updated_at=? WHERE id=?",
+                (json.dumps({"status": "failed", "message": error_text, "error": error_text, "updated_at": utc_now()}), error_text, utc_now(), job_id),
             )
         send_email_alert_async("Shopify tracking sync failed", f"Job: {job_id}\nError: {error_text}")
+    except BaseException as exc:
+        if exc.__class__.__name__ != "TrackingSyncCancelled":
+            raise
+        mark_shopify_tracking_job_cancelled(job_id, str(exc)[:2000] or "Tracking sync cancelled by user.")
     except Exception as exc:
         error_text = str(exc)[:2000]
         with db() as conn:
             conn.execute(
-                "UPDATE shopify_tracking_jobs SET status='failed', last_error=?, updated_at=? WHERE id=?",
-                (error_text, utc_now(), job_id),
+                "UPDATE shopify_tracking_jobs SET status='failed', progress_json=?, last_error=?, updated_at=? WHERE id=?",
+                (json.dumps({"status": "failed", "message": f"Shopify tracking sync failed: {error_text}", "error": error_text, "updated_at": utc_now()}), error_text, utc_now(), job_id),
             )
         send_email_alert_async("Shopify tracking sync failed", f"Job: {job_id}\nError: {error_text}")
 
 
 def start_shopify_tracking_job(job_id: str) -> None:
-    threading.Thread(target=run_shopify_tracking_job, args=(job_id,), daemon=True).start()
+    def runner() -> None:
+        try:
+            run_shopify_tracking_job(job_id)
+        finally:
+            with SHOPIFY_TRACKING_ACTIVE_LOCK:
+                SHOPIFY_TRACKING_ACTIVE_JOBS.discard(job_id)
+
+    with SHOPIFY_TRACKING_ACTIVE_LOCK:
+        SHOPIFY_TRACKING_ACTIVE_JOBS.add(job_id)
+    threading.Thread(target=runner, daemon=True).start()
+
+
+def parse_utc_datetime(value: str) -> Optional[datetime]:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    try:
+        parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def reconcile_stale_shopify_tracking_jobs(max_idle_seconds: int = 300) -> int:
+    with SHOPIFY_TRACKING_ACTIVE_LOCK:
+        active_job_ids = set(SHOPIFY_TRACKING_ACTIVE_JOBS)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_idle_seconds)
+    now = utc_now()
+    updated = 0
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, status, progress_json, updated_at
+            FROM shopify_tracking_jobs
+            WHERE status IN ('queued', 'running', 'cancel_requested')
+            """
+        ).fetchall()
+        for row in rows:
+            if row["id"] in active_job_ids:
+                continue
+            if row["status"] == "cancel_requested":
+                message = "Tracking sync cancelled by user."
+                progress = {
+                    "status": "cancelled",
+                    "total": 0,
+                    "processed": 0,
+                    "current_order": "",
+                    "source": "",
+                    "message": message,
+                    "updated_at": now,
+                    "counters": {},
+                }
+                try:
+                    existing_progress = json.loads(row["progress_json"] or "{}")
+                    if isinstance(existing_progress, dict):
+                        progress.update(existing_progress)
+                except Exception:
+                    pass
+                progress["status"] = "cancelled"
+                progress["current_order"] = ""
+                progress["message"] = message
+                progress["updated_at"] = now
+                conn.execute(
+                    "UPDATE shopify_tracking_jobs SET status='cancelled', progress_json=?, last_error=?, completed_at=?, updated_at=? WHERE id=?",
+                    (json.dumps(progress), message, now, now, row["id"]),
+                )
+                updated += 1
+                continue
+            updated_at = parse_utc_datetime(row["updated_at"])
+            if updated_at and updated_at > cutoff:
+                continue
+            message = "Tracking sync worker is no longer active. Retry the job to run it again."
+            progress = {
+                "status": "stalled",
+                "total": 0,
+                "processed": 0,
+                "current_order": "",
+                "source": "",
+                "message": message,
+                "updated_at": now,
+                "counters": {},
+            }
+            try:
+                existing_progress = json.loads(row["progress_json"] or "{}")
+                if isinstance(existing_progress, dict):
+                    progress.update(existing_progress)
+            except Exception:
+                pass
+            progress["status"] = "stalled"
+            progress["current_order"] = ""
+            progress["message"] = message
+            progress["updated_at"] = now
+            conn.execute(
+                "UPDATE shopify_tracking_jobs SET status='stalled', progress_json=?, last_error=?, completed_at=?, updated_at=? WHERE id=?",
+                (json.dumps(progress), message, now, now, row["id"]),
+            )
+            updated += 1
+    return updated
+
+
+def resume_interrupted_shopify_tracking_jobs() -> int:
+    with SHOPIFY_TRACKING_ACTIVE_LOCK:
+        active_job_ids = set(SHOPIFY_TRACKING_ACTIVE_JOBS)
+    now = utc_now()
+    resume_ids: list[str] = []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, status, progress_json
+            FROM shopify_tracking_jobs
+            WHERE status IN ('queued', 'running')
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+        for row in rows:
+            job_id = row["id"]
+            if job_id in active_job_ids:
+                continue
+            progress = {
+                "status": "queued",
+                "total": 0,
+                "processed": 0,
+                "current_order": "",
+                "source": "",
+                "message": "Resuming tracking sync after server restart.",
+                "updated_at": now,
+                "counters": {},
+            }
+            try:
+                existing_progress = json.loads(row["progress_json"] or "{}")
+                if isinstance(existing_progress, dict):
+                    progress.update(existing_progress)
+            except Exception:
+                pass
+            progress["status"] = "queued"
+            progress["current_order"] = ""
+            progress["message"] = "Resuming tracking sync after server restart."
+            progress["updated_at"] = now
+            conn.execute(
+                "UPDATE shopify_tracking_jobs SET status='queued', progress_json=?, last_error='', completed_at=NULL, updated_at=? WHERE id=?",
+                (json.dumps(progress), now, job_id),
+            )
+            resume_ids.append(job_id)
+    for job_id in resume_ids:
+        start_shopify_tracking_job(job_id)
+    return len(resume_ids)
+
+
+def ymd_from_iso_datetime(value: str) -> str:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return ""
+    try:
+        return datetime.fromisoformat(cleaned.replace("Z", "+00:00")).date().isoformat()
+    except Exception:
+        return cleaned[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", cleaned) else ""
+
+
+def tracking_schedule_days(schedule: str) -> int:
+    return {
+        "daily": 1,
+        "every_2_days": 2,
+        "every_3_days": 3,
+        "every_4_days": 4,
+        "weekly": 7,
+    }.get(clean_text(schedule), 0)
+
+
+def has_active_shopify_tracking_job() -> bool:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM shopify_tracking_jobs
+            WHERE status IN ('queued', 'running', 'cancel_requested')
+            """
+        ).fetchone()
+    return int(row["count"] or 0) > 0
+
+
+def create_shopify_tracking_job(payload: dict[str, Any], queued_by: str = "manual") -> dict[str, Any]:
+    settings = get_service_settings()
+    today = datetime.now(timezone.utc).date()
+    from_days = max(1, min(365, int(float(settings.get("shopify_tracking_from_days") or 7))))
+    requested_from = clean_text(payload.get("from_date"))
+    requested_to = clean_text(payload.get("to_date"))
+    incremental = bool(payload.get("incremental", True)) and not requested_from and not requested_to
+    last_success_at = get_setting("shopify_tracking_last_success_at", "")
+    if incremental and last_success_at:
+        from_date = ymd_from_iso_datetime(last_success_at) or (today - timedelta(days=from_days)).isoformat()
+    else:
+        from_date = requested_from or (today - timedelta(days=from_days)).isoformat()
+    to_date = requested_to or today.isoformat()
+    dry_run = bool(payload.get("dry_run", False))
+    skip_done = bool(payload.get("skip_done_pickings", str(settings.get("shopify_tracking_skip_done_pickings", "false")).lower() in {"1", "true", "yes", "on"}))
+    validate = bool(payload.get("validate_deliveries", str(settings.get("shopify_tracking_validate_deliveries", "true")).lower() in {"1", "true", "yes", "on"}))
+    job_id = uuid.uuid4().hex
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO shopify_tracking_jobs
+            (id, status, attempts, max_attempts, from_date, to_date, dry_run, skip_done_pickings,
+             validate_deliveries, report_csv, progress_json, counters_json, last_error, created_at, updated_at)
+            VALUES (?, 'queued', 0, 3, ?, ?, ?, ?, ?, '', '{}', '{}', '', ?, ?)
+            """,
+            (job_id, from_date, to_date, 1 if dry_run else 0, 1 if skip_done else 0, 1 if validate else 0, utc_now(), utc_now()),
+        )
+    start_shopify_tracking_job(job_id)
+    if queued_by == "auto":
+        message = f"Queued automatic tracking sync: {from_date} to {to_date}."
+        set_setting("shopify_tracking_auto_last_run_at", utc_now())
+        set_setting("shopify_tracking_auto_last_message", message)
+    else:
+        mode_label = "new tracking since last successful sync" if incremental and last_success_at else "selected date range"
+        message = f"Shopify tracking sync queued for {mode_label}: {from_date} to {to_date}."
+    return {
+        "ok": True,
+        "message": message,
+        "job_id": job_id,
+        "from_date": from_date,
+        "to_date": to_date,
+        "incremental": incremental,
+        "last_success_at": last_success_at,
+        "queued_by": queued_by,
+    }
+
+
+def maybe_queue_scheduled_shopify_tracking(settings: dict[str, str]) -> None:
+    days = tracking_schedule_days(settings.get("shopify_tracking_auto_schedule", "off"))
+    if days <= 0:
+        return
+    if has_active_shopify_tracking_job():
+        return
+    last_run = parse_utc_datetime(get_setting("shopify_tracking_auto_last_run_at", ""))
+    if last_run and datetime.now(timezone.utc) - last_run < timedelta(days=days):
+        return
+    create_shopify_tracking_job({"incremental": True, "dry_run": False}, queued_by="auto")
 
 
 def set_service_settings(values: dict[str, str]) -> None:
@@ -12779,6 +13253,132 @@ def get_default_ordering_engine() -> str:
     return normalize_ordering_engine(get_setting("default_ordering_engine", "rest"))
 
 
+def read_proc_cpu_sample() -> Optional[tuple[int, int]]:
+    try:
+        parts = Path("/proc/stat").read_text().splitlines()[0].split()
+        values = [int(value) for value in parts[1:]]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        total = sum(values)
+        return idle, total
+    except Exception:
+        return None
+
+
+def host_cpu_percent() -> Optional[float]:
+    first = read_proc_cpu_sample()
+    if first:
+        time.sleep(0.08)
+        second = read_proc_cpu_sample()
+        if second:
+            idle_delta = second[0] - first[0]
+            total_delta = second[1] - first[1]
+            if total_delta > 0:
+                return round(max(0.0, min(100.0, 100.0 * (1.0 - (idle_delta / total_delta)))), 1)
+    try:
+        output = subprocess.check_output(["ps", "-A", "-o", "%cpu="], text=True, timeout=2)
+        total = sum(float(line.strip() or 0) for line in output.splitlines())
+        cores = max(1, os.cpu_count() or 1)
+        return round(max(0.0, min(100.0, total / cores)), 1)
+    except Exception:
+        return None
+
+
+def host_memory_usage() -> dict[str, Optional[Union[int, float]]]:
+    try:
+        values: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, raw = line.split(":", 1)
+            values[key] = int(raw.strip().split()[0]) * 1024
+        total = values.get("MemTotal")
+        available = values.get("MemAvailable")
+        if total and available is not None:
+            used = total - available
+            return {"total_bytes": total, "used_bytes": used, "available_bytes": available, "percent": round((used / total) * 100, 1)}
+    except Exception:
+        pass
+    try:
+        total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, timeout=2).strip())
+        page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True, timeout=2).strip())
+        vm_output = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+        pages: dict[str, int] = {}
+        for line in vm_output.splitlines():
+            if ":" not in line:
+                continue
+            key, raw = line.split(":", 1)
+            pages[key.strip()] = int(re.sub(r"[^0-9]", "", raw) or "0")
+        free_pages = pages.get("Pages free", 0) + pages.get("Pages speculative", 0)
+        available = free_pages * page_size
+        used = max(0, total - available)
+        return {"total_bytes": total, "used_bytes": used, "available_bytes": available, "percent": round((used / total) * 100, 1)}
+    except Exception:
+        return {"total_bytes": None, "used_bytes": None, "available_bytes": None, "percent": None}
+
+
+def postgres_connection_stats() -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "total": None,
+        "active": None,
+        "idle": None,
+        "idle_in_transaction": None,
+        "max_connections": None,
+        "app_pool_max": int(os.getenv("POSTGRES_POOL_MAX", "30") or 30),
+        "database": "",
+        "host": "",
+        "error": "",
+    }
+    postgres_url = active_postgres_url()
+    if postgres_url:
+        parsed = urlsplit(postgres_url)
+        stats["database"] = (parsed.path or "").strip("/")
+        stats["host"] = parsed.hostname or ""
+    try:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE state='active') AS active,
+                    COUNT(*) FILTER (WHERE state='idle') AS idle,
+                    COUNT(*) FILTER (WHERE state='idle in transaction') AS idle_in_transaction
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                """
+            ).fetchone() or {}
+            max_row = conn.execute("SHOW max_connections").fetchone() or {}
+        stats.update({
+            "total": int(row.get("total") or 0),
+            "active": int(row.get("active") or 0),
+            "idle": int(row.get("idle") or 0),
+            "idle_in_transaction": int(row.get("idle_in_transaction") or 0),
+            "max_connections": int(max_row.get("max_connections") or 0),
+        })
+    except Exception as error:
+        stats["error"] = str(error)
+    return stats
+
+
+def system_diagnostics() -> dict[str, Any]:
+    try:
+        load_1, load_5, load_15 = os.getloadavg()
+    except Exception:
+        load_1 = load_5 = load_15 = None
+    return {
+        "ok": True,
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "cpu": {
+            "percent": host_cpu_percent(),
+            "cores": os.cpu_count() or 1,
+            "load_1": round(load_1, 2) if load_1 is not None else None,
+            "load_5": round(load_5, 2) if load_5 is not None else None,
+            "load_15": round(load_15, 2) if load_15 is not None else None,
+        },
+        "memory": host_memory_usage(),
+        "postgres": postgres_connection_stats(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
     order_by_sql = order_group_sort_sql(sort_by, sort_dir)
@@ -12930,6 +13530,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
         "pull_orders_days": int(payload.get("pull_orders_days") or DEFAULT_SERVICE_SETTINGS.get("pull_orders_days", "7") or 7),
         "pull_orders_limit": normalize_pull_limit(payload.get("pull_orders_limit") or DEFAULT_SERVICE_SETTINGS.get("pull_orders_limit", "0"), 0),
         "pull_orders_batch_size": normalize_pull_batch_size(payload.get("pull_orders_batch_size") or DEFAULT_SERVICE_SETTINGS.get("pull_orders_batch_size", "50")),
+        "system": system_diagnostics(),
     }
 
 
@@ -13241,6 +13842,7 @@ def startup() -> None:
         ensure_shopify_order_status_cache_table()
         should_reindex_typesense = typesense_enabled() and get_setting("typesense_schema_version", "") != TYPESENSE_SCHEMA_VERSION
         threading.Thread(target=init_db, daemon=True).start()
+        resume_interrupted_shopify_tracking_jobs()
         threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
         threading.Thread(target=autosync_loop, daemon=True).start()
         threading.Thread(target=backup_loop, daemon=True).start()
@@ -13253,6 +13855,11 @@ def startup() -> None:
 @app.get("/api/dashboard")
 def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
     return dashboard_data(store_id, page, per_page, sort_by, sort_dir)
+
+
+@app.get("/api/system-diagnostics")
+def api_system_diagnostics() -> dict[str, Any]:
+    return system_diagnostics()
 
 
 @app.get("/api/orders")
@@ -13299,6 +13906,14 @@ def api_service_settings() -> dict[str, Any]:
     for key in secret_keys:
         if masked.get(key):
             masked[key] = "********"
+    for key in (
+        "shopify_dtc_destinations_json",
+        "shopify_dtb_destinations_json",
+        "shopify_tracking_sources_json",
+        "shopify_tracking_odoo_destinations_json",
+    ):
+        if masked.get(key):
+            masked[key] = masked_json_list_setting(masked[key])
     masked["amazon_otp_last_sync_at"] = get_setting("amazon_otp_last_sync_at", "")
     masked["amazon_otp_last_sync_message"] = get_setting("amazon_otp_last_sync_message", "")
     masked["openexchange_last_sync_at"] = get_setting("openexchange_last_sync_at", "")
@@ -13315,9 +13930,32 @@ def api_shopify_script_config() -> dict[str, Any]:
 def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]:
     current = get_service_settings()
     values = {}
+    raw_tracking_config: Optional[dict[str, Any]] = None
     for key, value in payload.settings.items():
         if value == "********":
             values[key] = current.get(key, "")
+        elif key in {
+            "shopify_dtc_destinations_json",
+            "shopify_dtb_destinations_json",
+            "shopify_tracking_sources_json",
+            "shopify_tracking_odoo_destinations_json",
+        }:
+            try:
+                parsed_value = json.loads(value or "[]")
+            except Exception:
+                raise HTTPException(400, f"{key} must be valid JSON.")
+            if not isinstance(parsed_value, list):
+                raise HTTPException(400, f"{key} must be a JSON list.")
+            if key.startswith("shopify_tracking_"):
+                if raw_tracking_config is None:
+                    raw_tracking_config = tracking_script_config_raw(current)
+                previous_key = "sources" if key == "shopify_tracking_sources_json" else "odoo_destinations"
+                previous_value = raw_tracking_config.get(previous_key, [])
+            else:
+                route = "dtc" if key == "shopify_dtc_destinations_json" else "dtb"
+                raw_config = export_script_config_raw(route, current)
+                previous_value = raw_config.get("destinations", [])
+            values[key] = json.dumps(preserve_masked_config_values(parsed_value, previous_value))
         else:
             values[key] = value
     set_service_settings(values)
@@ -13335,6 +13973,14 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
     ):
         if response.get(key):
             response[key] = "********"
+    for key in (
+        "shopify_dtc_destinations_json",
+        "shopify_dtb_destinations_json",
+        "shopify_tracking_sources_json",
+        "shopify_tracking_odoo_destinations_json",
+    ):
+        if response.get(key):
+            response[key] = masked_json_list_setting(response[key])
     return {"ok": True, "message": "Service settings saved.", "settings": response}
 
 
@@ -13542,6 +14188,7 @@ def autosync_loop() -> None:
                 for store in list_stores():
                     sync_cancelled_orders_for_store(int(store["id"]), days=days)
                 last_cancelled_run = time.time()
+            maybe_queue_scheduled_shopify_tracking(settings)
         except Exception:
             pass
         time.sleep(60)
@@ -15203,7 +15850,7 @@ def api_shopify_fulfilment_retry(job_id: str) -> dict[str, Any]:
         cursor = conn.execute(
             """
             UPDATE shopify_fulfilment_jobs
-            SET status='amazon_placed', next_run_at=?, last_error='', updated_at=?
+            SET status='amazon_placed', attempts=0, next_run_at=?, last_error='', updated_at=?
             WHERE id=? AND status IN ('amazon_placed', 'queued', 'failed', 'dead')
             """,
             (utc_now(), utc_now(), job_id),
@@ -15347,44 +15994,63 @@ def api_shopify_fulfilment_repush(job_id: str) -> dict[str, Any]:
 @app.get("/api/shopify/tracking/jobs")
 def api_shopify_tracking_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
     rows, total, page, per_page = list_shopify_tracking_jobs(page, per_page)
-    return {"ok": True, "jobs": rows, "page": page, "per_page": per_page, "total": total}
+    return {
+        "ok": True,
+        "jobs": rows,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "last_success_at": get_setting("shopify_tracking_last_success_at", ""),
+    }
+
+
+@app.get("/api/shopify/tracking/jobs/{job_id}/download")
+def api_shopify_tracking_download(job_id: str) -> FileResponse:
+    with db() as conn:
+        row = conn.execute("SELECT id, status, report_csv FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Tracking sync job not found.")
+    report_csv = clean_text(row["report_csv"])
+    if not report_csv:
+        raise HTTPException(404, "Tracking sync report is not ready yet.")
+    report_path = Path(report_csv)
+    if not report_path.exists() or not report_path.is_file():
+        raise HTTPException(404, "Tracking sync report file was not found on disk.")
+    return FileResponse(
+        report_path,
+        media_type="text/csv",
+        filename=report_path.name,
+    )
 
 
 @app.post("/api/shopify/tracking/jobs")
 def api_shopify_tracking_create(payload: dict[str, Any]) -> dict[str, Any]:
-    settings = get_service_settings()
-    today = datetime.now(timezone.utc).date()
-    from_days = max(1, min(365, int(float(settings.get("shopify_tracking_from_days") or 7))))
-    from_date = clean_text(payload.get("from_date")) or (today - timedelta(days=from_days)).isoformat()
-    to_date = clean_text(payload.get("to_date")) or today.isoformat()
-    dry_run = bool(payload.get("dry_run", False))
-    skip_done = bool(payload.get("skip_done_pickings", str(settings.get("shopify_tracking_skip_done_pickings", "false")).lower() in {"1", "true", "yes", "on"}))
-    validate = bool(payload.get("validate_deliveries", str(settings.get("shopify_tracking_validate_deliveries", "true")).lower() in {"1", "true", "yes", "on"}))
-    job_id = uuid.uuid4().hex
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO shopify_tracking_jobs
-            (id, status, attempts, max_attempts, from_date, to_date, dry_run, skip_done_pickings,
-             validate_deliveries, report_csv, counters_json, last_error, created_at, updated_at)
-            VALUES (?, 'queued', 0, 3, ?, ?, ?, ?, ?, '', '{}', '', ?, ?)
-            """,
-            (job_id, from_date, to_date, 1 if dry_run else 0, 1 if skip_done else 0, 1 if validate else 0, utc_now(), utc_now()),
-        )
-    start_shopify_tracking_job(job_id)
-    return {"ok": True, "message": "Shopify tracking sync queued.", "job_id": job_id}
+    return create_shopify_tracking_job(payload, queued_by="manual")
 
 
 @app.post("/api/shopify/tracking/jobs/{job_id}/retry")
 def api_shopify_tracking_retry(job_id: str) -> dict[str, Any]:
+    reconcile_stale_shopify_tracking_jobs()
     with db() as conn:
         cursor = conn.execute(
-            "UPDATE shopify_tracking_jobs SET status='queued', last_error='', updated_at=? WHERE id=? AND status='failed'",
+            "UPDATE shopify_tracking_jobs SET status='queued', last_error='', completed_at=NULL, updated_at=? WHERE id=? AND status IN ('failed', 'cancelled', 'stalled')",
             (utc_now(), job_id),
         )
     if cursor.rowcount:
         start_shopify_tracking_job(job_id)
     return {"ok": True, "message": f"Requeued {cursor.rowcount} tracking sync job(s)."}
+
+
+@app.post("/api/shopify/tracking/jobs/{job_id}/cancel")
+def api_shopify_tracking_cancel(job_id: str) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT id, status, progress_json FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Tracking sync job not found.")
+        if row["status"] not in {"queued", "running", "cancel_requested"}:
+            return {"ok": True, "message": f"Tracking sync job is already {row['status']}."}
+    request_shopify_tracking_job_cancel(job_id)
+    return {"ok": True, "message": "Tracking sync job was cancelled."}
 
 
 @app.post("/api/chrome/order-history/lookup")

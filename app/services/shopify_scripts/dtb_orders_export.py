@@ -481,6 +481,116 @@ def _clean_dict(d: dict) -> dict:
     return out
 
 
+def _shopify_error_is_invalid_phone(message: str) -> bool:
+    return "phone" in (message or "").lower() and "invalid" in (message or "").lower()
+
+
+def _shopify_error_is_invalid_province(message: str) -> bool:
+    return "addresses.province" in message or ("province" in message and "not valid" in message)
+
+
+def _drop_customer_phone_fields(payload: dict) -> bool:
+    customer = payload.get("customer") if isinstance(payload, dict) else None
+    if not isinstance(customer, dict):
+        return False
+    changed = customer.pop("phone", None) is not None
+    for address in customer.get("addresses") or []:
+        if isinstance(address, dict):
+            changed = address.pop("phone", None) is not None or changed
+    return changed
+
+
+def _customer_phone_values(payload: dict) -> list[str]:
+    customer = payload.get("customer") if isinstance(payload, dict) else None
+    if not isinstance(customer, dict):
+        return []
+    values = []
+    if customer.get("phone"):
+        values.append(str(customer["phone"]))
+    for address in customer.get("addresses") or []:
+        if isinstance(address, dict) and address.get("phone"):
+            values.append(str(address["phone"]))
+    return values
+
+
+def _customer_phone_variants(payload: dict) -> list[str]:
+    variants = []
+    for value in _customer_phone_values(payload):
+        raw = value.strip()
+        digits = re.sub(r"\D", "", raw)
+        candidates = [raw]
+        if digits:
+            candidates.append(digits)
+            if len(digits) == 11 and digits.startswith("1"):
+                candidates.append(digits[1:])
+            if raw.startswith("+"):
+                candidates.append(raw[1:])
+        for candidate in candidates:
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+    return variants
+
+
+def _set_customer_phone_fields(payload: dict, phone: str) -> bool:
+    customer = payload.get("customer") if isinstance(payload, dict) else None
+    if not isinstance(customer, dict):
+        return False
+    changed = False
+    if "phone" in customer:
+        customer["phone"] = phone
+        changed = True
+    for address in customer.get("addresses") or []:
+        if isinstance(address, dict) and "phone" in address:
+            address["phone"] = phone
+            changed = True
+    return changed
+
+
+def _drop_customer_address_province_fields(payload: dict) -> bool:
+    customer = payload.get("customer") if isinstance(payload, dict) else None
+    if not isinstance(customer, dict):
+        return False
+    changed = False
+    for address in customer.get("addresses") or []:
+        if isinstance(address, dict):
+            changed = address.pop("province", None) is not None or changed
+            changed = address.pop("province_code", None) is not None or changed
+    return changed
+
+
+def _request_customer_with_validation_retry(shop: "ShopifyClient", method: str, url: str, payload: dict) -> dict:
+    phone_variants = _customer_phone_variants(payload)
+    phone_variant_index = 0
+    dropped_phone = False
+    dropped_province = False
+    while True:
+        try:
+            return shop._request(method, url, payload)
+        except RuntimeError as e:
+            msg = str(e)
+            if not dropped_province and _shopify_error_is_invalid_province(msg) and _drop_customer_address_province_fields(payload):
+                dropped_province = True
+                log("WARN", f"{shop.name}: Shopify rejected customer province; retrying without province fields")
+                continue
+            if _shopify_error_is_invalid_phone(msg):
+                while phone_variant_index < len(phone_variants):
+                    next_phone = phone_variants[phone_variant_index]
+                    phone_variant_index += 1
+                    if next_phone in _customer_phone_values(payload):
+                        continue
+                    if _set_customer_phone_fields(payload, next_phone):
+                        log("WARN", f"{shop.name}: Shopify rejected customer phone; retrying with phone={next_phone}")
+                        break
+                else:
+                    if not dropped_phone and _drop_customer_phone_fields(payload):
+                        dropped_phone = True
+                        log("WARN", f"{shop.name}: Shopify rejected all customer phone formats; retrying without phone fields")
+                        continue
+                    raise
+                continue
+            raise
+
+
 def sanitize_sku(value: str | None, max_len: int = 39) -> str | None:
     """Keep SKUs simple for Shopify/admin search: letters, digits, and spaces only."""
     s = (value or "").strip()
@@ -1177,18 +1287,7 @@ class ShopifyClient:
                     payload["customer"]["phone"] = phone
                 if default_address:
                     payload["customer"]["addresses"] = [default_address]
-                try:
-                    self._request("PUT", self.rest_base + f"customers/{cid}.json", payload)
-                except RuntimeError as e:
-                    msg = str(e)
-                    if "addresses.province" in msg or ("province" in msg and "not valid" in msg):
-                        # Retry once by dropping province fields
-                        if payload.get("customer", {}).get("addresses"):
-                            for a in payload["customer"]["addresses"]:
-                                a.pop("province", None)
-                        self._request("PUT", self.rest_base + f"customers/{cid}.json", payload)
-                    else:
-                        raise
+                _request_customer_with_validation_retry(self, "PUT", self.rest_base + f"customers/{cid}.json", payload)
             if odoo_partner_id:
                 state.set_customer_id(self.name, f"odoo:{odoo_partner_id}", cid)
             if email:
@@ -1217,17 +1316,7 @@ class ShopifyClient:
         if default_address:
             payload["customer"]["addresses"] = [default_address]
 
-        try:
-            resp = self._request("POST", self.rest_base + "customers.json", payload)
-        except RuntimeError as e:
-            msg = str(e)
-            if "addresses.province" in msg or ("province" in msg and "not valid" in msg):
-                if payload.get("customer", {}).get("addresses"):
-                    for a in payload["customer"]["addresses"]:
-                        a.pop("province", None)
-                resp = self._request("POST", self.rest_base + "customers.json", payload)
-            else:
-                raise
+        resp = _request_customer_with_validation_retry(self, "POST", self.rest_base + "customers.json", payload)
         cid = int(resp["customer"]["id"])
         if odoo_partner_id:
             state.set_customer_id(self.name, f"odoo:{odoo_partner_id}", cid)
@@ -1248,18 +1337,7 @@ class ShopifyClient:
             "phone": normalize_phone(GENERIC_CUSTOMER_PHONE),
             "addresses": [get_generic_default_address()],
         }}
-        try:
-            self._request("PUT", self.rest_base + f"customers/{cid}.json", payload)
-        except RuntimeError as e:
-            msg = str(e)
-            if "addresses.province" in msg or ("province" in msg and "not valid" in msg):
-                if payload.get("customer", {}).get("addresses"):
-                    for a in payload["customer"]["addresses"]:
-                        a.pop("province", None)
-                        a.pop("province_code", None)
-                self._request("PUT", self.rest_base + f"customers/{cid}.json", payload)
-            else:
-                raise
+        _request_customer_with_validation_retry(self, "PUT", self.rest_base + f"customers/{cid}.json", payload)
 
     def get_or_create_generic_customer(self, state: StateDB) -> int | None:
         email = normalize_email(GENERIC_CUSTOMER_EMAIL)
@@ -1286,17 +1364,7 @@ class ShopifyClient:
             "phone": normalize_phone(GENERIC_CUSTOMER_PHONE),
             "addresses": [get_generic_default_address()],
         }}
-        try:
-            resp = self._request("POST", self.rest_base + "customers.json", payload)
-        except RuntimeError as e:
-            msg = str(e)
-            if "addresses.province" in msg or ("province" in msg and "not valid" in msg):
-                if payload.get("customer", {}).get("addresses"):
-                    for a in payload["customer"]["addresses"]:
-                        a.pop("province", None)
-                resp = self._request("POST", self.rest_base + "customers.json", payload)
-            else:
-                raise
+        resp = _request_customer_with_validation_retry(self, "POST", self.rest_base + "customers.json", payload)
         cid = int(resp["customer"]["id"])
         state.set_customer_id(self.name, f"email:{email}", cid)
         return cid

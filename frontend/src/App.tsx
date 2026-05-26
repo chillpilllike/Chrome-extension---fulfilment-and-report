@@ -453,6 +453,37 @@ type ChromeQueueCount = {
   locked?: number
 }
 
+type SystemDiagnostics = {
+  ok?: boolean
+  host?: string
+  platform?: string
+  updated_at?: string
+  cpu?: {
+    percent?: number | null
+    cores?: number | null
+    load_1?: number | null
+    load_5?: number | null
+    load_15?: number | null
+  }
+  memory?: {
+    total_bytes?: number | null
+    used_bytes?: number | null
+    available_bytes?: number | null
+    percent?: number | null
+  }
+  postgres?: {
+    total?: number | null
+    active?: number | null
+    idle?: number | null
+    idle_in_transaction?: number | null
+    max_connections?: number | null
+    app_pool_max?: number | null
+    database?: string
+    host?: string
+    error?: string
+  }
+}
+
 type DashboardData = {
   stores: Store[]
   current_store_id: number | null
@@ -476,6 +507,7 @@ type DashboardData = {
   message?: string
   ok?: boolean
   punchout_launch_url?: string
+  system?: SystemDiagnostics
 }
 
 type ModalState = { title: string; message: string; ok: boolean } | null
@@ -806,6 +838,19 @@ type ShopifyTrackingJob = {
   skip_done_pickings: number
   validate_deliveries: number
   report_csv: string
+  report_url?: string
+  counters?: Record<string, number | string>
+  progress?: {
+    status?: string
+    total?: number
+    processed?: number
+    current_order?: string
+    source?: string
+    message?: string
+    error?: string
+    updated_at?: string
+    counters?: Record<string, number | string>
+  }
   last_error: string
   created_at: string
   updated_at: string
@@ -1117,7 +1162,20 @@ function formatFileSize(value?: number) {
   const bytes = Number(value || 0)
   if (!bytes) return "0 KB"
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
+}
+
+function formatPercent(value?: number | null) {
+  return Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)}%` : "?"
+}
+
+function formatCount(value?: number | null) {
+  return Number.isFinite(Number(value)) ? Number(value).toLocaleString() : "?"
+}
+
+function progressWidth(value?: number | null) {
+  return `${Math.max(0, Math.min(100, Number(value || 0)))}%`
 }
 
 function formatMoney(value?: number) {
@@ -2413,6 +2471,25 @@ function App() {
     })
     if (!initialDashboardRefreshDone.current) loadUiCopy().catch(() => undefined)
   }, [page, ordersPage, sortKey, sortDirection, storeId, ordersQuery, orderCondition])
+
+  useEffect(() => {
+    if (page !== "home" || !data || !savedAdminToken()) return
+    let cancelled = false
+    const loadSystem = () => {
+      api<SystemDiagnostics>("/api/system-diagnostics")
+        .then((system) => {
+          if (cancelled) return
+          setData((current) => current ? { ...current, system } : current)
+        })
+        .catch(() => undefined)
+    }
+    loadSystem()
+    const timer = window.setInterval(loadSystem, 15000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [page, Boolean(data)])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -4346,6 +4423,53 @@ function App() {
   )
 }
 
+function SystemDiagnosticsCard({ system }: { system?: SystemDiagnostics }) {
+  const cpuPercent = system?.cpu?.percent ?? null
+  const memoryPercent = system?.memory?.percent ?? null
+  const postgresTotal = system?.postgres?.total ?? null
+  const postgresMax = system?.postgres?.max_connections ?? null
+  const postgresPercent = postgresMax ? (Number(postgresTotal || 0) / Number(postgresMax)) * 100 : null
+  const memoryUsed = system?.memory?.used_bytes ? formatFileSize(Number(system.memory.used_bytes)) : "?"
+  const memoryTotal = system?.memory?.total_bytes ? formatFileSize(Number(system.memory.total_bytes)) : "?"
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <CardTitle>System Load</CardTitle>
+          <CardDescription>{system?.host || "Current app host"} · {system?.postgres?.host || "Postgres"}</CardDescription>
+        </div>
+        <Badge variant={system?.postgres?.error ? "destructive" : "outline"}>{system?.postgres?.error ? "DB check failed" : "live"}</Badge>
+      </CardHeader>
+      <CardContent className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-2">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <span className="font-medium">Postgres</span>
+            <span className="text-muted-foreground">{formatCount(postgresTotal)}{postgresMax ? ` / ${formatCount(postgresMax)}` : ""}</span>
+          </div>
+          <div className="progress"><div className="progress-bar bg-primary" style={{ width: progressWidth(postgresPercent) }} /></div>
+          <div className="text-xs text-muted-foreground">{formatCount(system?.postgres?.active)} active · {formatCount(system?.postgres?.idle)} idle · pool {formatCount(system?.postgres?.app_pool_max)}</div>
+        </div>
+        <div className="grid gap-2">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <span className="font-medium">CPU</span>
+            <span className="text-muted-foreground">{formatPercent(cpuPercent)}</span>
+          </div>
+          <div className="progress"><div className="progress-bar bg-yellow" style={{ width: progressWidth(cpuPercent) }} /></div>
+          <div className="text-xs text-muted-foreground">{formatCount(system?.cpu?.cores)} cores · load {formatCount(system?.cpu?.load_1)}</div>
+        </div>
+        <div className="grid gap-2">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <span className="font-medium">RAM</span>
+            <span className="text-muted-foreground">{formatPercent(memoryPercent)}</span>
+          </div>
+          <div className="progress"><div className="progress-bar bg-green" style={{ width: progressWidth(memoryPercent) }} /></div>
+          <div className="text-xs text-muted-foreground">{memoryUsed} used of {memoryTotal}</div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 function HomeDashboard({
   data,
   missingRows,
@@ -4540,6 +4664,8 @@ function HomeDashboard({
           </CardContent>
         </Card>
       </section>
+
+      <SystemDiagnosticsCard system={data.system} />
 
       <section className="grid gap-3 lg:grid-cols-[1.1fr_0.9fr]">
         <Card>
@@ -8628,10 +8754,28 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
   const [fromDate, setFromDate] = useState("")
   const [toDate, setToDate] = useState("")
   const [dryRun, setDryRun] = useState(false)
+  const [incremental, setIncremental] = useState(true)
+  const [lastSuccessAt, setLastSuccessAt] = useState("")
   const [busy, setBusy] = useState(false)
+  const [jobBusy, setJobBusy] = useState("")
+  function jobProgress(job: ShopifyTrackingJob) {
+    const processed = Math.max(0, Number(job.progress?.processed || 0))
+    const total = Math.max(0, Number(job.progress?.total || 0))
+    const counters = job.progress?.counters || job.counters || {}
+    const added = Math.max(0, Number(counters.tracking_codes_added || 0))
+    const wouldAdd = Math.max(0, Number(counters.tracking_codes_would_add || 0))
+    const percent = total ? Math.max(0, Math.min(100, Math.round((processed / total) * 100))) : job.status === "completed" ? 100 : 0
+    const running = job.status === "running" || job.status === "queued" || job.status === "cancel_requested"
+    return { processed, total, percent, running, added, wouldAdd }
+  }
+  function reportName(path?: string) {
+    if (!path) return ""
+    return path.split(/[\\/]/).pop() || path
+  }
   async function load() {
-    const result = await api<{ jobs: ShopifyTrackingJob[] }>("/api/shopify/tracking/jobs?page=1&per_page=100")
+    const result = await api<{ jobs: ShopifyTrackingJob[]; last_success_at?: string }>("/api/shopify/tracking/jobs?page=1&per_page=100")
     setJobs(result.jobs || [])
+    setLastSuccessAt(result.last_success_at || "")
   }
   useEffect(() => {
     load().catch((error) => onResult({ ok: false, title: "Shopify Tracking", message: String(error) }))
@@ -8643,7 +8787,7 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
     try {
       const result = await api<{ ok: boolean; message: string }>("/api/shopify/tracking/jobs", {
         method: "POST",
-        body: JSON.stringify({ from_date: fromDate, to_date: toDate, dry_run: dryRun }),
+        body: JSON.stringify({ from_date: fromDate, to_date: toDate, dry_run: dryRun, incremental }),
       })
       await load()
       onResult({ ok: result.ok, title: "Shopify Tracking", message: result.message })
@@ -8652,9 +8796,24 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
     }
   }
   async function retry(jobId: string) {
-    const result = await api<{ ok: boolean; message: string }>(`/api/shopify/tracking/jobs/${jobId}/retry`, { method: "POST" })
-    await load()
-    onResult({ ok: result.ok, title: "Retry Tracking Sync", message: result.message })
+    setJobBusy(`retry-${jobId}`)
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/shopify/tracking/jobs/${jobId}/retry`, { method: "POST" })
+      await load()
+      onResult({ ok: result.ok, title: "Retry Tracking Sync", message: result.message })
+    } finally {
+      setJobBusy("")
+    }
+  }
+  async function cancel(jobId: string) {
+    setJobBusy(`cancel-${jobId}`)
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/shopify/tracking/jobs/${jobId}/cancel`, { method: "POST" })
+      await load()
+      onResult({ ok: result.ok, title: "Kill Tracking Sync", message: result.message })
+    } finally {
+      setJobBusy("")
+    }
   }
   return (
     <div className="grid gap-5">
@@ -8666,16 +8825,23 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
       <Card>
         <CardHeader>
           <CardTitle>Start Tracking Sync</CardTitle>
-          <CardDescription>Uses SRC_ODOO_DB and SRC_ODOO_ORDER tags only. Empty dates use the configured default window.</CardDescription>
+          <CardDescription>Selected dates are passed directly to the sync script. Empty dates can sync only new tracking since the last successful run.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-4">
           <TextField label="From Date" type="date" value={fromDate} onChange={setFromDate} />
           <TextField label="To Date" type="date" value={toDate} onChange={setToDate} />
           <label className="form-check mt-6 w-fit cursor-pointer">
+            <Checkbox checked={incremental} onCheckedChange={(checked) => setIncremental(checked)} />
+            <span className="form-check-label">New only when dates empty</span>
+          </label>
+          <label className="form-check mt-6 w-fit cursor-pointer">
             <Checkbox checked={dryRun} onCheckedChange={(checked) => setDryRun(checked)} />
             <span className="form-check-label">Dry run</span>
           </label>
-          <div className="mt-6 btn-list">
+          <div className="md:col-span-4 text-xs text-muted-foreground">
+            Last successful tracking sync: {lastSuccessAt ? formatDateTime(lastSuccessAt) : "Never"}
+          </div>
+          <div className="md:col-span-4 btn-list">
             <Button onClick={startSync} disabled={busy}>{busy ? "Queueing..." : "Run Sync"}</Button>
             <Button variant="outline" onClick={load}>Refresh</Button>
           </div>
@@ -8685,19 +8851,79 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
         <CardHeader><CardTitle>Tracking Jobs</CardTitle></CardHeader>
         <CardContent className="p-0">
           <Table>
-            <TableHeader><TableRow><TableHead>Date Range</TableHead><TableHead>Status</TableHead><TableHead>Attempts</TableHead><TableHead>Report</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>Date Range</TableHead><TableHead>Status</TableHead><TableHead>Progress</TableHead><TableHead>Current Order</TableHead><TableHead>Report</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
             <TableBody>
-              {jobs.map((job) => (
-                <TableRow key={job.id}>
-                  <TableCell>{job.from_date} to {job.to_date}{job.dry_run ? " (dry run)" : ""}</TableCell>
-                  <TableCell><StatusBadge value={job.status} /></TableCell>
-                  <TableCell>{job.attempts}</TableCell>
-                  <TableCell className="max-w-sm truncate">{job.report_csv}</TableCell>
-                  <TableCell className="max-w-md"><ErrorTooltip value={job.last_error} /></TableCell>
-                  <TableCell>{job.status === "failed" && <Button size="sm" variant="outline" onClick={() => retry(job.id)}>Retry</Button>}</TableCell>
-                </TableRow>
-              ))}
-              {!jobs.length && <TableRow><TableCell colSpan={6} className="py-8 text-center text-muted-foreground">No tracking sync jobs yet.</TableCell></TableRow>}
+              {jobs.map((job) => {
+                const progress = jobProgress(job)
+                return (
+                  <TableRow key={job.id}>
+                    <TableCell>
+                      <div>{job.from_date} to {job.to_date}{job.dry_run ? " (dry run)" : ""}</div>
+                      <div className="text-xs text-muted-foreground">Attempt {job.attempts}</div>
+                    </TableCell>
+                    <TableCell><StatusBadge value={job.status} /></TableCell>
+                    <TableCell className="min-w-48">
+                      <div className="mb-1 flex items-center justify-between gap-3 text-xs">
+                        <span>{progress.processed.toLocaleString()} / {progress.total.toLocaleString()} order{progress.total === 1 ? "" : "s"}</span>
+                        <span className="text-muted-foreground">{progress.percent}%</span>
+                      </div>
+                      <div className="mb-1 text-xs font-medium text-emerald-700">
+                        New tracking codes added: {progress.added.toLocaleString()}
+                        {job.dry_run ? <span className="text-muted-foreground"> · Would add: {progress.wouldAdd.toLocaleString()}</span> : null}
+                      </div>
+                      <div className="progress">
+                        <div
+                          className={`progress-bar bg-primary transition-all ${progress.running ? "progress-bar-striped progress-bar-animated" : ""}`}
+                          role="progressbar"
+                          aria-valuenow={progress.percent}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-label={`Shopify tracking sync ${progress.percent}% complete`}
+                          style={{ width: `${progress.percent}%` }}
+                        />
+                      </div>
+                      {job.progress?.message ? <div className="mt-1 text-xs text-muted-foreground">{job.progress.message}</div> : null}
+                    </TableCell>
+                    <TableCell className="max-w-xs">
+                      {job.progress?.current_order ? (
+                        <span className="font-medium">{job.progress.current_order}</span>
+                      ) : (
+                        <span className="text-muted-foreground">{job.status === "completed" ? "Finished" : "Waiting"}</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {job.report_url ? (
+                        <a className="btn btn-outline-secondary btn-sm" href={adminDownloadHref(job.report_url)} target="_blank" rel="noreferrer">
+                          <Download className="size-4" />
+                          Download
+                        </a>
+                      ) : job.report_csv ? (
+                        <span className="text-xs text-muted-foreground">{reportName(job.report_csv)}</span>
+                      ) : (
+                        <span className="text-muted-foreground">Not ready</span>
+                      )}
+                    </TableCell>
+                    <TableCell className="max-w-md"><ErrorTooltip value={job.last_error || job.progress?.error || ""} /></TableCell>
+                    <TableCell>
+                      {["queued", "running", "cancel_requested"].includes(job.status) ? (
+                        <Button
+                          size="sm"
+                          variant="destructive"
+                          disabled={job.status === "cancel_requested" || jobBusy === `cancel-${job.id}`}
+                          onClick={() => cancel(job.id)}
+                        >
+                          {job.status === "cancel_requested" || jobBusy === `cancel-${job.id}` ? "Killing..." : "Kill"}
+                        </Button>
+                      ) : ["failed", "cancelled", "stalled"].includes(job.status) ? (
+                        <Button size="sm" variant="outline" disabled={jobBusy === `retry-${job.id}`} onClick={() => retry(job.id)}>
+                          {jobBusy === `retry-${job.id}` ? "Retrying..." : "Retry"}
+                        </Button>
+                      ) : null}
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+              {!jobs.length && <TableRow><TableCell colSpan={7} className="py-8 text-center text-muted-foreground">No tracking sync jobs yet.</TableCell></TableRow>}
             </TableBody>
           </Table>
         </CardContent>
@@ -8775,14 +9001,156 @@ function ScriptConfigSection({ label, value }: { label: string; value: any }) {
   return <ScriptConfigField label={label} value={value} />
 }
 
+function trackingFieldValue(value: any): string {
+  if (Array.isArray(value)) return value.join(",")
+  if (value === null || value === undefined) return ""
+  return String(value)
+}
+
+function parseTrackingField(key: string, value: string): any {
+  if (key === "scopes") return value.split(",").map((item) => item.trim()).filter(Boolean)
+  return value
+}
+
+function parseExportField(key: string, value: string): any {
+  if (key === "force_reauth") return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase())
+  return value
+}
+
+function ExportConfigEditor({
+  config,
+  script,
+  saving,
+  onSave,
+}: {
+  config: Record<string, any>
+  script: string
+  saving: boolean
+  onSave: (script: string, destinations: Record<string, any>[]) => Promise<void>
+}) {
+  const [destinations, setDestinations] = useState<Record<string, any>[]>([])
+  useEffect(() => {
+    setDestinations(JSON.parse(JSON.stringify(config.destinations || [])))
+  }, [config])
+  const updateDestination = (index: number, key: string, value: string) => {
+    setDestinations((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, [key]: parseExportField(key, value) } : item))
+  }
+  return (
+    <div className="grid gap-5">
+      <div className="grid gap-4">
+        <h3 className="text-base font-semibold">Destinations</h3>
+        {destinations.map((destination, index) => (
+          <div key={`export-destination-${index}`} className="rounded border bg-muted/10 p-3">
+            <div className="mb-3 text-xs font-semibold uppercase text-muted-foreground">Destinations {index + 1}</div>
+            <div className="grid gap-3 md:grid-cols-2">
+              {["name", "shop", "auth", "client_id", "client_secret", "scopes", "redirect_uri", "api_version", "force_reauth"].map((key) => (
+                <TextField
+                  key={key}
+                  label={key.replace(/_/g, " ")}
+                  type={key.includes("secret") ? "password" : "text"}
+                  value={trackingFieldValue(destination[key])}
+                  onChange={(value) => updateDestination(index, key, value)}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="btn-list justify-end">
+        <Button onClick={() => onSave(script, destinations)} disabled={saving}>
+          {saving ? "Saving..." : `Save ${script.toUpperCase()} Script Fields`}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function TrackingConfigEditor({
+  config,
+  saving,
+  onSave,
+}: {
+  config: Record<string, any>
+  saving: boolean
+  onSave: (sources: Record<string, any>[], destinations: Record<string, any>[]) => Promise<void>
+}) {
+  const [sources, setSources] = useState<Record<string, any>[]>([])
+  const [destinations, setDestinations] = useState<Record<string, any>[]>([])
+  useEffect(() => {
+    setSources(JSON.parse(JSON.stringify(config.sources || [])))
+    setDestinations(JSON.parse(JSON.stringify(config.odoo_destinations || [])))
+  }, [config])
+  const updateSource = (index: number, key: string, value: string) => {
+    setSources((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, [key]: parseTrackingField(key, value) } : item))
+  }
+  const updateDestination = (index: number, key: string, value: string) => {
+    setDestinations((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, [key]: value } : item))
+  }
+  return (
+    <div className="grid gap-5">
+      <div className="grid gap-4">
+        <h3 className="text-base font-semibold">Sources</h3>
+        {sources.map((source, index) => (
+          <div key={`source-${index}`} className="rounded border bg-muted/10 p-3">
+            <div className="mb-3 text-xs font-semibold uppercase text-muted-foreground">Sources {index + 1}</div>
+            <div className="grid gap-3 md:grid-cols-2">
+              {["name", "shop", "auth_mode", "client_id", "client_secret", "scopes", "redirect_uri", "api_version"].map((key) => (
+                <TextField
+                  key={key}
+                  label={key.replace(/_/g, " ")}
+                  type={key.includes("secret") ? "password" : "text"}
+                  value={trackingFieldValue(source[key])}
+                  onChange={(value) => updateSource(index, key, value)}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="grid gap-4">
+        <h3 className="text-base font-semibold">Odoo Destinations</h3>
+        {destinations.map((destination, index) => (
+          <div key={`destination-${index}`} className="rounded border bg-muted/10 p-3">
+            <div className="mb-3 text-xs font-semibold uppercase text-muted-foreground">Odoo Destinations {index + 1}</div>
+            <div className="grid gap-3 md:grid-cols-2">
+              {["name", "url", "db", "username", "password"].map((key) => (
+                <TextField
+                  key={key}
+                  label={key.replace(/_/g, " ")}
+                  type={key.includes("password") ? "password" : "text"}
+                  value={trackingFieldValue(destination[key])}
+                  onChange={(value) => updateDestination(index, key, value)}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="btn-list justify-end">
+        <Button onClick={() => onSave(sources, destinations)} disabled={saving}>
+          {saving ? "Saving..." : "Save Tracking Script Fields"}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 function ScriptConfigPanel({
   activeScript,
   onActiveScript,
   config,
+  savingTracking,
+  savingExport,
+  onSaveTracking,
+  onSaveExport,
 }: {
   activeScript: string
   onActiveScript: (value: string) => void
   config: ShopifyScriptConfig
+  savingTracking: boolean
+  savingExport: boolean
+  onSaveTracking: (sources: Record<string, any>[], destinations: Record<string, any>[]) => Promise<void>
+  onSaveExport: (script: string, destinations: Record<string, any>[]) => Promise<void>
 }) {
   const selectedConfig = (config[activeScript as keyof ShopifyScriptConfig] || {}) as Record<string, any>
   return (
@@ -8803,11 +9171,17 @@ function ScriptConfigPanel({
             <div className="font-semibold">{scriptConfigTitle(activeScript)}</div>
           </div>
         </div>
-        <div className="grid gap-4">
-          {Object.entries(selectedConfig).map(([key, value]) => (
-            <ScriptConfigSection key={key} label={key} value={value} />
-          ))}
-        </div>
+        {activeScript === "tracking" ? (
+          <TrackingConfigEditor config={selectedConfig} saving={savingTracking} onSave={onSaveTracking} />
+        ) : activeScript === "dtc" || activeScript === "dtb" ? (
+          <ExportConfigEditor config={selectedConfig} script={activeScript} saving={savingExport} onSave={onSaveExport} />
+        ) : (
+          <div className="grid gap-4">
+            {Object.entries(selectedConfig).map(([key, value]) => (
+              <ScriptConfigSection key={key} label={key} value={value} />
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   )
@@ -8846,9 +9220,7 @@ function SettingsPage({
     api<{ settings: ServiceSettings }>("/api/settings/services")
       .then((result) => setSettings(result.settings))
       .catch((error) => onResult({ ok: false, title: "Settings Load Failed", message: String(error) }))
-    api<{ config: ShopifyScriptConfig }>("/api/settings/shopify-script-config")
-      .then((result) => setShopifyScriptConfig(result.config))
-      .catch(() => setShopifyScriptConfig(null))
+    loadShopifyScriptConfig()
     loadReindexProgress()
     loadBackupProgress()
     loadBackups()
@@ -8906,6 +9278,14 @@ function SettingsPage({
       setOdooRpcCacheEntries(0)
     }
   }
+  async function loadShopifyScriptConfig() {
+    try {
+      const result = await api<{ config: ShopifyScriptConfig }>("/api/settings/shopify-script-config")
+      setShopifyScriptConfig(result.config)
+    } catch {
+      setShopifyScriptConfig(null)
+    }
+  }
 
   async function saveSettingsGroup(title: string, keys: string[]) {
     setSavingServices(title)
@@ -8918,7 +9298,51 @@ function SettingsPage({
         method: "POST",
         body: JSON.stringify({ settings: nextSettings }),
       })
-      setSettings((current) => ({ ...current, ...result.settings }))
+      const savedSettings = keys.reduce<ServiceSettings>((values, key) => {
+        if (Object.prototype.hasOwnProperty.call(result.settings, key)) values[key] = result.settings[key]
+        return values
+      }, {})
+      setSettings((current) => ({ ...current, ...savedSettings }))
+      if (title === "Shopify Scripts") loadShopifyScriptConfig()
+      onResult({ ok: result.ok, title, message: result.message })
+    } finally {
+      setSavingServices("")
+    }
+  }
+  async function saveTrackingScriptConfig(sources: Record<string, any>[], destinations: Record<string, any>[]) {
+    setSavingServices("Tracking Script Fields")
+    try {
+      const result = await api<{ ok: boolean; message: string; settings: ServiceSettings }>("/api/settings/services", {
+        method: "POST",
+        body: JSON.stringify({
+          settings: {
+            shopify_tracking_sources_json: JSON.stringify(sources),
+            shopify_tracking_odoo_destinations_json: JSON.stringify(destinations),
+          },
+        }),
+      })
+      setSettings((current) => ({
+        ...current,
+        shopify_tracking_sources_json: result.settings.shopify_tracking_sources_json || current.shopify_tracking_sources_json || "",
+        shopify_tracking_odoo_destinations_json: result.settings.shopify_tracking_odoo_destinations_json || current.shopify_tracking_odoo_destinations_json || "",
+      }))
+      await loadShopifyScriptConfig()
+      onResult({ ok: result.ok, title: "Tracking Script Fields", message: result.message })
+    } finally {
+      setSavingServices("")
+    }
+  }
+  async function saveExportScriptConfig(script: string, destinations: Record<string, any>[]) {
+    const title = `${script.toUpperCase()} Script Fields`
+    const settingKey = script === "dtb" ? "shopify_dtb_destinations_json" : "shopify_dtc_destinations_json"
+    setSavingServices(title)
+    try {
+      const result = await api<{ ok: boolean; message: string; settings: ServiceSettings }>("/api/settings/services", {
+        method: "POST",
+        body: JSON.stringify({ settings: { [settingKey]: JSON.stringify(destinations) } }),
+      })
+      setSettings((current) => ({ ...current, [settingKey]: result.settings[settingKey] || current[settingKey] || "" }))
+      await loadShopifyScriptConfig()
       onResult({ ok: result.ok, title, message: result.message })
     } finally {
       setSavingServices("")
@@ -9144,7 +9568,13 @@ function SettingsPage({
               <option value="false">Use saved token</option>
               <option value="true">Force OAuth every run</option>
             </SelectField>
+            <TextField label="Tracking Shop" value={settings.shopify_tracking_shop || ""} onChange={(value) => setSetting("shopify_tracking_shop", value)} />
+            <TextField label="Tracking Auth Mode" value={settings.shopify_tracking_auth_mode || ""} onChange={(value) => setSetting("shopify_tracking_auth_mode", value)} />
+            <TextField label="Tracking Client ID" value={settings.shopify_tracking_client_id || ""} onChange={(value) => setSetting("shopify_tracking_client_id", value)} />
             <TextField label="Tracking Client Secret" type="password" value={settings.shopify_tracking_client_secret || ""} onChange={(value) => setSetting("shopify_tracking_client_secret", value)} />
+            <TextField label="Tracking Scopes" value={settings.shopify_tracking_scopes || ""} onChange={(value) => setSetting("shopify_tracking_scopes", value)} />
+            <TextField label="Tracking Redirect URI" value={settings.shopify_tracking_redirect_uri || ""} onChange={(value) => setSetting("shopify_tracking_redirect_uri", value)} />
+            <TextField label="Tracking API Version" value={settings.shopify_tracking_api_version || ""} onChange={(value) => setSetting("shopify_tracking_api_version", value)} />
             <TextField label="Odoo Script Password" type="password" value={settings.odoo_script_password || ""} onChange={(value) => setSetting("odoo_script_password", value)} />
             <SelectField label="Auto Queue After Amazon Order" value={settings.shopify_auto_enqueue_enabled || "true"} onChange={(value) => setSetting("shopify_auto_enqueue_enabled", value)}>
               <option value="true">Enabled</option>
@@ -9168,6 +9598,19 @@ function SettingsPage({
             <TextField label="Shopify API Requests/sec" value={settings.shopify_admin_api_requests_per_second || "2"} onChange={(value) => setSetting("shopify_admin_api_requests_per_second", value)} />
             <TextField label="Shopify API Burst" value={settings.shopify_admin_api_burst || "35"} onChange={(value) => setSetting("shopify_admin_api_burst", value)} />
             <TextField label="Tracking Default Days" value={settings.shopify_tracking_from_days || "7"} onChange={(value) => setSetting("shopify_tracking_from_days", value)} />
+            <TextField label="Tracking Parallel Workers" value={settings.shopify_tracking_workers || "8"} onChange={(value) => setSetting("shopify_tracking_workers", value)} />
+            <SelectField label="Tracking Auto Sync Schedule" value={settings.shopify_tracking_auto_schedule || "off"} onChange={(value) => setSetting("shopify_tracking_auto_schedule", value)}>
+              <option value="off">Off</option>
+              <option value="daily">Daily</option>
+              <option value="every_2_days">Every 2 days</option>
+              <option value="every_3_days">Every 3 days</option>
+              <option value="every_4_days">Every 4 days</option>
+              <option value="weekly">Weekly</option>
+            </SelectField>
+            <div className="rounded border bg-muted/20 p-3 text-sm text-muted-foreground">
+              Automatic tracking last queued: {settings.shopify_tracking_auto_last_run_at ? formatDateTime(settings.shopify_tracking_auto_last_run_at) : "Never"}
+              {settings.shopify_tracking_auto_last_message ? <div>{settings.shopify_tracking_auto_last_message}</div> : null}
+            </div>
             <SelectField label="Tracking Validates Deliveries" value={settings.shopify_tracking_validate_deliveries || "true"} onChange={(value) => setSetting("shopify_tracking_validate_deliveries", value)}>
               <option value="true">Validate pickings</option>
               <option value="false">Only write tracking</option>
@@ -9197,7 +9640,13 @@ function SettingsPage({
                 "shopify_dtb_redirect_uri",
                 "shopify_dtb_api_version",
                 "shopify_dtb_force_reauth",
+                "shopify_tracking_shop",
+                "shopify_tracking_auth_mode",
+                "shopify_tracking_client_id",
                 "shopify_tracking_client_secret",
+                "shopify_tracking_scopes",
+                "shopify_tracking_redirect_uri",
+                "shopify_tracking_api_version",
                 "odoo_script_password",
                 "shopify_auto_enqueue_enabled",
                 "amazon_order_date_guard_enabled",
@@ -9209,6 +9658,8 @@ function SettingsPage({
                 "shopify_admin_api_requests_per_second",
                 "shopify_admin_api_burst",
                 "shopify_tracking_from_days",
+                "shopify_tracking_workers",
+                "shopify_tracking_auto_schedule",
                 "shopify_tracking_validate_deliveries",
                 "shopify_tracking_skip_done_pickings",
               ])}
@@ -9218,7 +9669,15 @@ function SettingsPage({
             </Button>
           </div>
           {shopifyScriptConfig && (
-            <ScriptConfigPanel activeScript={activeShopifyScript} onActiveScript={setActiveShopifyScript} config={shopifyScriptConfig} />
+            <ScriptConfigPanel
+              activeScript={activeShopifyScript}
+              onActiveScript={setActiveShopifyScript}
+              config={shopifyScriptConfig}
+              savingTracking={savingServices === "Tracking Script Fields"}
+              savingExport={savingServices === `${activeShopifyScript.toUpperCase()} Script Fields`}
+              onSaveTracking={saveTrackingScriptConfig}
+              onSaveExport={saveExportScriptConfig}
+            />
           )}
         </CardContent>
       </Card>
