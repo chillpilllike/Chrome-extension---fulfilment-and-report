@@ -103,6 +103,8 @@ COUNTRY_NAME_BY_CODE = {
     "GB": "United Kingdom",
     "US": "United States",
 }
+COUNTRY_CODE_BY_NAME = {value.lower(): key for key, value in COUNTRY_NAME_BY_CODE.items()}
+COUNTRY_CODE_BY_NAME["united kingdom"] = "GB"
 COUNTRY_CODE_BY_HOST_SUFFIX = {
     ".com.au": "AU",
     ".co.nz": "NZ",
@@ -4020,6 +4022,20 @@ def destination_country_from_row(row: dict[str, Any]) -> tuple[str, str, str]:
     return code, name, country_label(code, name)
 
 
+def destination_country_code_sql(alias: str = "order_lines") -> str:
+    return (
+        "COALESCE("
+        f"NULLIF(UPPER(CASE WHEN COALESCE({alias}.raw_json, '') ~ '^\\s*\\{{' THEN {alias}.raw_json::jsonb -> 'order' ->> 'destination_country_code' ELSE '' END), ''), "
+        f"NULLIF(UPPER(substring(COALESCE({alias}.fulfilment_note, '') from '\\\\(([A-Z]{{2}})\\\\)')), ''), "
+        f"NULLIF(UPPER(substring(COALESCE({alias}.last_error, '') from '\\\\(([A-Z]{{2}})\\\\)')), '')"
+        ")"
+    )
+
+
+def destination_country_name_sql(alias: str = "order_lines") -> str:
+    return f"NULLIF(CASE WHEN COALESCE({alias}.raw_json, '') ~ '^\\s*\\{{' THEN {alias}.raw_json::jsonb -> 'order' ->> 'destination_country_name' ELSE '' END, '')"
+
+
 def preserved_order_line_refresh_state(preserved: Optional[dict[str, Any]]) -> tuple[str, Optional[str]]:
     if not preserved:
         return "pulled", None
@@ -6168,17 +6184,62 @@ ORDER_CONDITION_FILTERS: dict[str, str] = {
 }
 
 
-def order_condition_filter(condition: str, store_id: Optional[int] = None) -> tuple[str, bool]:
+def order_condition_filter(condition: str, store_id: Optional[int] = None, country: str = "") -> tuple[str, bool]:
     condition_key = clean_text(condition or "all").lower() or "all"
     if condition_key not in ORDER_CONDITION_FILTERS:
         raise HTTPException(400, "Unknown order filter.")
     filters = []
     if store_id:
         filters.append(f"store_id:={int(store_id)}")
+    country_code = clean_text(country).upper()
+    if country_code:
+        # Current Typesense order_lines schema does not include country fields.
+        # The SQL fallback handles country filtering.
+        filters.append(f"destination_country_code:={country_code}")
     condition_filter = ORDER_CONDITION_FILTERS[condition_key]
     if condition_filter:
         filters.append(condition_filter)
-    return " && ".join(filters), condition_key != "all"
+    return " && ".join(filters), condition_key != "all" or bool(country_code)
+
+
+def order_condition_uses_typesense(condition: str, country: str = "") -> bool:
+    condition_key = clean_text(condition or "all").lower() or "all"
+    if clean_text(country):
+        return False
+    # The UI's "Missing marked" state also includes rows with missing_asin set.
+    # Typesense's current order_lines collection cannot reliably express
+    # non-empty string filters across old schemas, so use Postgres for this one.
+    return condition_key != "missing"
+
+
+def order_condition_sql(condition: str = "all", store_id: Optional[int] = None, country: str = "") -> tuple[str, list[Any], bool]:
+    condition_key = clean_text(condition or "all").lower() or "all"
+    if condition_key not in ORDER_CONDITION_FILTERS:
+        raise HTTPException(400, "Unknown order filter.")
+    clauses = ["odoo_order_id IS NOT NULL"]
+    params: list[Any] = []
+    if store_id:
+        clauses.append("store_id=?")
+        params.append(int(store_id))
+    condition_clauses = {
+        "ready": "state IN ('pulled', 'error') AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')",
+        "missing": "((state='missing' OR amazon_status='missing' OR COALESCE(missing_asin, '') != '') AND COALESCE(amazon_order_id, '') = '' AND state NOT IN ('ordered', 'dispatched', 'delivered'))",
+        "ignored": "state='ignored'",
+        "costly": "state='costly'",
+        "queued": "state='submitted'",
+        "ordered": "state IN ('ordered', 'dispatched')",
+        "delivered": "state='delivered'",
+        "inventory": "state='inventory'",
+        "error": "state='error'",
+        "cancelled_refunded": "COALESCE(odoo_status_label, '') IN ('cancelled', 'refunded')",
+    }
+    if condition_key in condition_clauses:
+        clauses.append(condition_clauses[condition_key])
+    country_code = clean_text(country).upper()
+    if country_code:
+        clauses.append(f"{destination_country_code_sql()} = ?")
+        params.append(country_code)
+    return "WHERE " + " AND ".join(f"({clause})" for clause in clauses), params, condition_key != "all" or bool(country_code)
 
 
 def order_sort_sql(sort_by: str = "", sort_dir: str = "") -> str:
@@ -6295,7 +6356,7 @@ def order_sort_for_typesense(sort_by: str = "", sort_dir: str = "") -> str:
         "last_error": "last_error",
     }
     field = fields.get(sort_key, "order_date_ts")
-    return f"{field}:{direction},odoo_order_id:{direction},id:asc"
+    return f"{field}:{direction},odoo_order_id:{direction},row_id:asc"
 
 
 def typesense_search_order_lines(
@@ -7901,7 +7962,7 @@ def place_orders(
                 with db() as conn:
                     for line in group_lines:
                         conn.execute(
-                            "UPDATE order_lines SET amazon_order_id=?, order_engine='cxml', state='ordered', last_error=NULL, ordered_at=COALESCE(ordered_at, ?), updated_at=? WHERE id=?",
+                            "UPDATE order_lines SET amazon_order_id=?, order_engine='cxml', state='ordered', amazon_status='ordered', missing_asin=NULL, last_error=NULL, ordered_at=COALESCE(ordered_at, ?), updated_at=? WHERE id=?",
                             (old_amazon_order, utc_now(), utc_now(), line["id"]),
                         )
                 placed += len(group_lines)
@@ -7947,7 +8008,7 @@ def place_orders(
             with db() as conn:
                 for line in group_lines:
                     conn.execute(
-                        "UPDATE order_lines SET amazon_order_id=?, state='ordered', last_error=NULL, ordered_at=COALESCE(ordered_at, ?), updated_at=? WHERE id=?",
+                        "UPDATE order_lines SET amazon_order_id=?, state='ordered', amazon_status='ordered', missing_asin=NULL, last_error=NULL, ordered_at=COALESCE(ordered_at, ?), updated_at=? WHERE id=?",
                         (old_amazon_order, utc_now(), utc_now(), line["id"]),
                     )
             placed += len(group_lines)
@@ -8882,7 +8943,9 @@ def normalize_export_columns(view: str, columns: list[dict[str, str]]) -> list[d
 def export_queryset(view: str, store_id: Optional[int], selected_ids: list[Union[int, str]], select_all: bool, filters: dict[str, Any]) -> list[dict[str, Any]]:
     if view == "orders":
         with db() as conn:
-            params: list[Any] = [store_id, store_id]
+            condition = clean_text(str(filters.get("condition") or "all"))
+            country = clean_text(str(filters.get("country") or ""))
+            where_sql, params, _ = order_condition_sql(condition, store_id, country)
             id_clause = ""
             search_clause = ""
             term = clean_text(str(filters.get("q") or "")).lower()
@@ -8907,7 +8970,7 @@ def export_queryset(view: str, store_id: Optional[int], selected_ids: list[Union
             rows = conn.execute(
                 f"""
                 SELECT * FROM order_lines
-                WHERE (? IS NULL OR store_id=?)
+                {where_sql}
                 {search_clause}
                 {id_clause}
                 ORDER BY updated_at DESC, id DESC
@@ -10228,6 +10291,28 @@ def json_list_setting(value: str) -> Optional[list[Any]]:
     return parsed if isinstance(parsed, list) else None
 
 
+def normalize_country_code_list(value: str) -> list[str]:
+    codes: list[str] = []
+    for raw_item in re.split(r"[,;\n]+", clean_text(value)):
+        item = clean_text(raw_item)
+        if not item:
+            continue
+        code = item.upper()
+        if code == "UK":
+            code = "GB"
+        if len(code) != 2:
+            code = COUNTRY_CODE_BY_NAME.get(item.lower(), "")
+        if len(code) == 2 and code.isalpha() and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def shopify_dtb_country_codes(settings: Optional[dict[str, str]] = None) -> set[str]:
+    settings = settings or get_service_settings()
+    codes = normalize_country_code_list(settings.get("shopify_dtb_country_codes", ""))
+    return set(codes)
+
+
 def apply_shopify_runtime_settings(module: Any, route: str, settings: Optional[dict[str, str]] = None) -> None:
     settings = settings or get_service_settings()
     route = clean_text(route).lower()
@@ -10310,6 +10395,8 @@ def shopify_product_rename_manager(module: Any, settings: Optional[dict[str, str
 
 def shopify_script_config_summary() -> dict[str, Any]:
     settings = get_service_settings()
+    dtb_codes = sorted(shopify_dtb_country_codes(settings))
+    dtb_label = ", ".join(country_label(code, COUNTRY_NAME_BY_CODE.get(code, "")) for code in dtb_codes)
     dtc = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_dtc_script_path"], f"shopify_cfg_dtc_{uuid.uuid4().hex}")
     dtb = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_dtb_script_path"], f"shopify_cfg_dtb_{uuid.uuid4().hex}")
     tracking = load_external_script(DEFAULT_SERVICE_SETTINGS["shopify_tracking_script_path"], f"shopify_cfg_tracking_{uuid.uuid4().hex}")
@@ -10318,7 +10405,7 @@ def shopify_script_config_summary() -> dict[str, Any]:
     apply_shopify_runtime_settings(tracking, "tracking", settings)
     return {
         "dtc": {
-            "route": "Non-India orders",
+            "route": f"Orders outside DTB countries ({dtb_label or 'none'})",
             "destinations": _safe_script_dict(getattr(dtc, "DESTS", [])),
             "assign_to_generic_customer": bool(getattr(dtc, "ASSIGN_TO_GENERIC_CUSTOMER", False)),
             "generic_customer": {
@@ -10340,7 +10427,7 @@ def shopify_script_config_summary() -> dict[str, Any]:
             },
         },
         "dtb": {
-            "route": "India orders",
+            "route": f"DTB countries ({dtb_label or 'none'})",
             "destinations": _safe_script_dict(getattr(dtb, "DESTS", [])),
             "assign_to_generic_customer": bool(getattr(dtb, "ASSIGN_TO_GENERIC_CUSTOMER", True)),
             "generic_customer": {
@@ -10780,6 +10867,8 @@ def start_shopify_oauth(route: str, request: Request, force: bool = False) -> di
 
 
 def shopify_route_for_order(store_id: int, odoo_order_id: int) -> tuple[str, str]:
+    settings = get_service_settings()
+    dtb_countries = shopify_dtb_country_codes(settings)
     store = get_store(store_id)
     odoo = OdooClient(store)
     rows = odoo.read("sale.order", [odoo_order_id], odoo.existing_fields("sale.order", ["partner_shipping_id", "partner_invoice_id", "partner_id"]))
@@ -10796,7 +10885,8 @@ def shopify_route_for_order(store_id: int, odoo_order_id: int) -> tuple[str, str
             country = country_rows[0] if country_rows else {}
             country_code = clean_text(country.get("code")).upper()
             country_name = clean_text(country.get("name"))
-    route = "dtb" if country_code == "IN" or country_name.lower() == "india" else "dtc"
+    resolved_country_code = country_code or COUNTRY_CODE_BY_NAME.get(country_name.lower(), "")
+    route = "dtb" if resolved_country_code in dtb_countries else "dtc"
     return route, country_code or country_name
 
 
@@ -10816,6 +10906,17 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
     with db() as conn:
         for (store_id, odoo_order_id, order_name), line_ids in grouped.items():
             route, country = shopify_route_for_order(store_id, odoo_order_id)
+            other_route = "dtc" if route == "dtb" else "dtb"
+            conn.execute(
+                """
+                DELETE FROM shopify_fulfilment_jobs
+                WHERE store_id=?
+                  AND odoo_order_name=?
+                  AND route=?
+                  AND status NOT IN ('running', 'completed')
+                """,
+                (store_id, order_name, other_route),
+            )
             cursor = conn.execute(
                 """
                 INSERT INTO shopify_fulfilment_jobs
@@ -13602,10 +13703,10 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
     }
 
 
-def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
+def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "") -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
     order_by_sql = order_sort_sql(sort_by, sort_dir)
-    store_clause = "WHERE (? IS NULL OR store_id=?) AND odoo_order_id IS NOT NULL"
+    store_clause, params, _ = order_condition_sql("all", store_id, country)
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -13613,11 +13714,45 @@ def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_pag
             ORDER BY {order_by_sql}
             LIMIT ? OFFSET ?
             """,
-            (store_id, store_id, per_page, offset),
+            [*params, per_page, offset],
         ).fetchall()
         total_row = conn.execute(
             f"SELECT COUNT(*) AS total FROM order_lines {store_clause}",
-            (store_id, store_id),
+            params,
+        ).fetchone()
+        row_dicts = hydrate_order_line_rows(rows, conn=conn)
+    return {
+        "rows": row_dicts,
+        "page": page,
+        "per_page": per_page,
+        "total": int(total_row["total"] if total_row else 0),
+    }
+
+
+def order_lines_condition_page_data(
+    store_id: Optional[int] = None,
+    page: int = 1,
+    per_page: int = 100,
+    condition: str = "all",
+    sort_by: str = "odoo_order_date",
+    sort_dir: str = "desc",
+    country: str = "",
+) -> dict[str, Any]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    order_by_sql = order_sort_sql(sort_by, sort_dir)
+    where_sql, params, _ = order_condition_sql(condition, store_id, country)
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            {order_line_search_select_sql(where_sql)}
+            ORDER BY {order_by_sql}
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total FROM order_lines {where_sql}",
+            params,
         ).fetchone()
         row_dicts = hydrate_order_line_rows(rows, conn=conn)
     return {
@@ -13718,10 +13853,23 @@ def order_lines_by_ids(ids: list[int], stores: Optional[list[dict[str, Any]]] = 
     return hydrate_order_line_rows(rows, stores)
 
 
-def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
+def search_order_lines_sql(
+    query: str,
+    store_id: Optional[int],
+    page: int = 1,
+    per_page: int = 100,
+    sort_by: str = "odoo_order_date",
+    sort_dir: str = "desc",
+    condition: str = "all",
+    country: str = "",
+) -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
     clean_query = query.strip()
+    if not clean_query:
+        return order_lines_condition_page_data(store_id, page, per_page, condition, sort_by, sort_dir, country)
     order_by_sql = order_sort_sql(sort_by, sort_dir)
+    condition_where_sql, condition_params, _ = order_condition_sql(condition, store_id, country)
+    condition_suffix = condition_where_sql.removeprefix("WHERE ").strip()
     exact_columns = (
         "odoo_order_name",
         "amazon_order_id",
@@ -13733,20 +13881,17 @@ def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, p
         "default_code",
     )
     exact_clause = " OR ".join(f"{column} = ?" for column in exact_columns)
-    exact_params: list[Any] = [clean_query for _ in exact_columns]
-    exact_store_clause = ""
-    if store_id:
-        exact_store_clause = " AND store_id=?"
-        exact_params.append(int(store_id))
+    exact_params: list[Any] = [*condition_params, *[clean_query for _ in exact_columns]]
+    exact_where_sql = f"WHERE ({condition_suffix}) AND ({exact_clause})"
     with db() as conn:
         exact_total = int(conn.execute(
-            f"SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) AS count FROM order_lines WHERE ({exact_clause}){exact_store_clause} AND odoo_order_id IS NOT NULL",
+            f"SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) AS count FROM order_lines {exact_where_sql}",
             exact_params,
         ).fetchone()["count"] or 0)
         if exact_total:
             rows = conn.execute(
                 f"""
-                {order_line_search_select_sql(f"WHERE ({exact_clause}){exact_store_clause}")}
+                {order_line_search_select_sql(exact_where_sql)}
                 ORDER BY {order_by_sql}
                 LIMIT ? OFFSET ?
                 """,
@@ -13761,15 +13906,11 @@ def search_order_lines_sql(query: str, store_id: Optional[int], page: int = 1, p
 
     term = f"%{clean_query}%"
     search_clause = " OR ".join(f"COALESCE({column}, '') ILIKE ?" for column in ORDER_LINE_SEARCH_COLUMNS)
-    params: list[Any] = [term for _ in ORDER_LINE_SEARCH_COLUMNS]
-    store_clause = ""
-    if store_id:
-        store_clause = " AND store_id=?"
-        params.append(int(store_id))
-    where_sql = f"WHERE ({search_clause}){store_clause}"
+    params: list[Any] = [*condition_params, *[term for _ in ORDER_LINE_SEARCH_COLUMNS]]
+    where_sql = f"WHERE ({condition_suffix}) AND ({search_clause})"
     with db() as conn:
         total = int(conn.execute(
-            f"SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) AS count FROM order_lines {where_sql} AND odoo_order_id IS NOT NULL",
+            f"SELECT COUNT(DISTINCT store_id || ':' || odoo_order_id) AS count FROM order_lines {where_sql}",
             params,
         ).fetchone()["count"] or 0)
         rows = conn.execute(
@@ -13931,22 +14072,67 @@ def api_system_diagnostics() -> dict[str, Any]:
 
 
 @app.get("/api/orders")
-def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
-    filter_by, filtered = order_condition_filter(condition, store_id)
+def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "") -> dict[str, Any]:
+    filter_by, filtered = order_condition_filter(condition, store_id, country)
+    if filtered and order_condition_uses_typesense(condition, country):
+        try:
+            result = typesense_search_order_lines("*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
+            if result.get("enabled"):
+                return {
+                    "rows": order_lines_by_ids([int(value) for value in result.get("ids") or []]),
+                    "page": page,
+                    "per_page": per_page,
+                    "total": int(result.get("total") or 0),
+                    "search_engine": "typesense",
+                }
+        except Exception:
+            pass
     if filtered:
-        result = typesense_search_order_lines("*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
-        if not result.get("enabled"):
-            raise HTTPException(503, "Typesense is required for order condition filters.")
-        return {
-            "rows": order_lines_by_ids([int(value) for value in result.get("ids") or []]),
-            "page": page,
-            "per_page": per_page,
-            "total": int(result.get("total") or 0),
-            "search_engine": "typesense",
-        }
-    data = order_lines_page_data(store_id, page, per_page, sort_by, sort_dir)
+        data = order_lines_condition_page_data(store_id, page, per_page, condition, sort_by, sort_dir, country)
+        data["search_engine"] = "postgres"
+        if order_condition_uses_typesense(condition, country):
+            data["search_warning"] = "Typesense filter unavailable; using Postgres fallback."
+        return data
+    data = order_lines_page_data(store_id, page, per_page, sort_by, sort_dir, country)
     data["search_engine"] = "postgres"
     return data
+
+
+@app.get("/api/orders/countries")
+def api_order_countries(store_id: Optional[int] = None) -> dict[str, Any]:
+    code_expr = destination_country_code_sql()
+    name_expr = destination_country_name_sql()
+    params: list[Any] = []
+    store_clause = ""
+    if store_id:
+        store_clause = "AND store_id=?"
+        params.append(int(store_id))
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT {code_expr} AS code,
+                   MAX({name_expr}) AS name,
+                   COUNT(*) AS count
+            FROM order_lines
+            WHERE odoo_order_id IS NOT NULL
+              {store_clause}
+            GROUP BY {code_expr}
+            HAVING {code_expr} IS NOT NULL AND {code_expr} != ''
+            ORDER BY count DESC, code ASC
+            """,
+            params,
+        ).fetchall()
+    countries = [
+        {
+            "code": clean_text(row["code"]).upper(),
+            "name": clean_text(row["name"]) or COUNTRY_NAME_BY_CODE.get(clean_text(row["code"]).upper(), ""),
+            "label": country_label(clean_text(row["code"]).upper(), clean_text(row["name"]) or COUNTRY_NAME_BY_CODE.get(clean_text(row["code"]).upper(), "")),
+            "count": int(row["count"] or 0),
+        }
+        for row in rows
+        if clean_text(row["code"])
+    ]
+    return {"ok": True, "countries": countries}
 
 
 @app.post("/api/settings/ordering-engine")
@@ -14024,6 +14210,8 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
                 raw_config = export_script_config_raw(route, current)
                 previous_value = raw_config.get("destinations", [])
             values[key] = json.dumps(preserve_masked_config_values(parsed_value, previous_value))
+        elif key == "shopify_dtb_country_codes":
+            values[key] = ",".join(normalize_country_code_list(str(value or "")))
         else:
             values[key] = value
     set_service_settings(values)
@@ -14190,12 +14378,14 @@ def api_delete_backup(payload: BackupKeyPayload) -> dict[str, Any]:
 
 
 @app.get("/api/search")
-def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
+def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
-    filter_by, filtered = order_condition_filter(condition, store_id)
+    filter_by, filtered = order_condition_filter(condition, store_id, country)
     if not q.strip() and not filtered:
         return dashboard_data(store_id, page, per_page, sort_by, sort_dir)
     try:
+        if filtered and not order_condition_uses_typesense(condition, country):
+            raise RuntimeError("Postgres filter required for this condition.")
         search_result = typesense_search_order_lines(q or "*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
         ids = list(search_result.get("ids") or [])
         if search_result.get("enabled"):
@@ -14211,11 +14401,13 @@ def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_p
         search_warning = "Typesense is disabled or not configured; using Postgres fallback."
     except Exception as exc:
         if filtered:
-            if isinstance(exc, HTTPException):
-                raise exc
-            raise HTTPException(503, f"Typesense order filter failed: {exc}")
+            fallback = search_order_lines_sql(q, store_id, page, per_page, sort_by, sort_dir, condition, country)
+            fallback["search_engine"] = "postgres"
+            if order_condition_uses_typesense(condition, country):
+                fallback["search_warning"] = f"Typesense order filter unavailable; using Postgres fallback: {exc}"
+            return fallback
         search_warning = str(exc)
-    fallback = search_order_lines_sql(q, store_id, page, per_page, sort_by, sort_dir)
+    fallback = search_order_lines_sql(q, store_id, page, per_page, sort_by, sort_dir, condition, country)
     fallback["search_engine"] = "postgres"
     fallback["search_warning"] = search_warning
     return fallback
@@ -18499,6 +18691,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                                 chrome_claimed_by=NULL,
                                 chrome_claimed_at=NULL,
                                 chrome_claim_expires_at=NULL,
+                                missing_asin=NULL,
                                 last_error=NULL,
                                 ordered_at=?,
                                 updated_at=?
@@ -19438,6 +19631,7 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
                         amazon_group_key=NULL,
                         amazon_status='third_party_fulfilled',
                         state='ordered',
+                        missing_asin=NULL,
                         amazon_unit_price=?,
                         amazon_total_price=?,
                         chrome_profit_total=?,
@@ -19480,6 +19674,7 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
                         amazon_group_key=NULL,
                         amazon_status='ordered',
                         state='ordered',
+                        missing_asin=NULL,
                         last_error=NULL,
                         ordered_at=COALESCE(ordered_at, ?),
                         updated_at=?

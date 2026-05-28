@@ -217,6 +217,45 @@ type OrderLine = {
   inventory_quantity: number
 }
 
+type OrderCountryOption = {
+  code: string
+  name?: string
+  label: string
+  count: number
+}
+
+const commonCountryOptions: OrderCountryOption[] = [
+  { code: "IN", name: "India", label: "India (IN)", count: 0 },
+  { code: "AU", name: "Australia", label: "Australia (AU)", count: 0 },
+  { code: "GB", name: "United Kingdom", label: "United Kingdom (GB)", count: 0 },
+  { code: "US", name: "United States", label: "United States (US)", count: 0 },
+  { code: "CA", name: "Canada", label: "Canada (CA)", count: 0 },
+  { code: "NZ", name: "New Zealand", label: "New Zealand (NZ)", count: 0 },
+]
+
+const countryCodeByName: Record<string, string> = Object.fromEntries(
+  commonCountryOptions.flatMap((country) => [
+    [country.code.toLowerCase(), country.code],
+    [(country.name || "").toLowerCase(), country.code],
+    [(country.label || "").toLowerCase(), country.code],
+  ]),
+)
+countryCodeByName.uk = "GB"
+
+function normalizeCountryCodes(value: string) {
+  const codes: string[] = []
+  value
+    .split(/[,;\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .forEach((item) => {
+      const upper = item.toUpperCase() === "UK" ? "GB" : item.toUpperCase()
+      const code = /^[A-Z]{2}$/.test(upper) ? upper : countryCodeByName[item.toLowerCase()] || ""
+      if (code && !codes.includes(code)) codes.push(code)
+    })
+  return codes
+}
+
 type DuplicateAsin = {
   asin: string
   asin_url?: string
@@ -1582,17 +1621,35 @@ function ErrorTooltip({ value, className = "" }: { value?: string; className?: s
 function ResultDialog({ modal, onClose }: { modal: ModalState; onClose: () => void }) {
   useEffect(() => {
     if (!modal) return
-    const timer = window.setTimeout(onClose, 2000)
+    const timer = window.setTimeout(onClose, modal.ok ? 2500 : 7000)
     return () => window.clearTimeout(timer)
   }, [modal, onClose])
 
   if (!modal) return null
 
+  if (!modal.ok) {
+    return (
+      <div className="result-popover-wrap" role="alert" aria-live="assertive">
+        <div className="popover bs-popover-start show result-popover">
+          <div className="popover-arrow" />
+          <div className="popover-header">
+            <span className="d-inline-flex align-items-center gap-2">
+              <AlertCircle className="size-4 text-danger" />
+              {modal.title}
+            </span>
+            <button type="button" className="btn-close" onClick={onClose} aria-label="Close notification" />
+          </div>
+          <div className="popover-body">{modal.message}</div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="alert-toast" role="status" aria-live="polite">
-      <div className={`alert ${modal.ok ? "alert-success" : "alert-danger"} alert-dismissible`} role="alert">
+      <div className="alert alert-success alert-dismissible" role="alert">
         <div className="alert-icon">
-          {modal.ok ? <CheckCircle2 className="icon alert-icon icon-2" /> : <AlertCircle className="icon alert-icon icon-2" />}
+          <CheckCircle2 className="icon alert-icon icon-2" />
         </div>
         <div className="min-w-0">
           <h4 className="alert-title">{modal.title}</h4>
@@ -2071,6 +2128,8 @@ function App() {
   const [search, setSearch] = useState("")
   const [ordersQuery, setOrdersQuery] = useState("")
   const [orderCondition, setOrderCondition] = useState("all")
+  const [orderCountry, setOrderCountry] = useState("")
+  const [orderCountries, setOrderCountries] = useState<OrderCountryOption[]>([])
   const [selected, setSelected] = useState<number[]>([])
   const [ordersSelectAll, setOrdersSelectAll] = useState(false)
   const [pendingSelected, setPendingSelected] = useState<number[]>([])
@@ -2136,6 +2195,7 @@ function App() {
       page: nextPage,
       q: term,
       condition: orderCondition,
+      country: orderCountry,
       sort: sortKey,
       direction: sortDirection,
       perPage: ORDERS_PAGE_SIZE,
@@ -2183,6 +2243,16 @@ function App() {
     ordersRequestSeqRef.current += 1
     ordersAbortRef.current?.abort()
     setOrderCondition(value)
+    setOrdersPage(1)
+    setOrdersSelectAll(false)
+    setSelected([])
+  }
+
+  function updateOrderCountry(value: string) {
+    ordersRequestSeqRef.current += 1
+    ordersAbortRef.current?.abort()
+    ordersPageCacheRef.current.clear()
+    setOrderCountry(value)
     setOrdersPage(1)
     setOrdersSelectAll(false)
     setSelected([])
@@ -2258,16 +2328,35 @@ function App() {
 
   async function fetchOrdersPageData(nextStoreId: string, nextPage: number, term: string, signal?: AbortSignal) {
     const hasCondition = orderCondition !== "all"
-    if (term || hasCondition) {
+    const hasCountry = Boolean(orderCountry)
+    const queryOptions = {
+      per_page: ORDERS_PAGE_SIZE,
+      condition: orderCondition,
+      sort_by: sortKey,
+      sort_dir: sortDirection,
+      ...(hasCountry ? { country: orderCountry } : {}),
+    }
+    if (term || hasCondition || hasCountry) {
       return api<DashboardData>(
-        `/api/search${pagedQuery(nextStoreId, nextPage, { per_page: ORDERS_PAGE_SIZE, condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}&q=${encodeURIComponent(term)}`,
+        `/api/search${pagedQuery(nextStoreId, nextPage, queryOptions)}&q=${encodeURIComponent(term)}`,
         signal ? { signal } : {},
       )
     }
     return api<{ rows: OrderLine[]; page: number; per_page: number; total: number }>(
-      `/api/orders${pagedQuery(nextStoreId, nextPage, { per_page: ORDERS_PAGE_SIZE, condition: orderCondition, sort_by: sortKey, sort_dir: sortDirection })}`,
+      `/api/orders${pagedQuery(nextStoreId, nextPage, queryOptions)}`,
       signal ? { signal } : {},
     )
+  }
+
+  async function loadOrderCountries(nextStoreId = storeId) {
+    const query = nextStoreId ? `?store_id=${encodeURIComponent(nextStoreId)}` : ""
+    const result = await api<{ countries: OrderCountryOption[] }>(`/api/orders/countries${query}`)
+    const countries = result.countries || []
+    setOrderCountries(countries)
+    setOrderCountry((current) => {
+      if (!current) return current
+      return countries.some((country) => country.code === current) ? current : ""
+    })
   }
 
   function cacheOrdersPage(cacheKey: string, result: { rows?: OrderLine[]; page?: number; per_page?: number; total?: number }, fallbackPage: number) {
@@ -2470,7 +2559,12 @@ function App() {
       setModal({ ok: false, title: "Unable to load app", message: String(error) })
     })
     if (!initialDashboardRefreshDone.current) loadUiCopy().catch(() => undefined)
-  }, [page, ordersPage, sortKey, sortDirection, storeId, ordersQuery, orderCondition])
+  }, [page, ordersPage, sortKey, sortDirection, storeId, ordersQuery, orderCondition, orderCountry])
+
+  useEffect(() => {
+    if (page !== "orders" || !savedAdminToken()) return
+    loadOrderCountries(storeId).catch(() => undefined)
+  }, [page, storeId])
 
   useEffect(() => {
     if (page !== "home" || !data || !savedAdminToken()) return
@@ -3804,6 +3898,7 @@ function App() {
                       <option value="default_code">Reference</option>
                       <option value="asin">ASIN</option>
                       <option value="supplier_part_auxiliary_id">SPAID</option>
+                      <option value="destination_country">Country</option>
                       <option value="quantity">Quantity</option>
                       <option value="state">State</option>
                       <option value="amazon_order_id">Amazon order</option>
@@ -3817,6 +3912,14 @@ function App() {
                     <SelectField className="w-[210px]" label="Filter" value={orderCondition} onChange={updateOrderCondition}>
                       {orderConditionOptions.map((option) => (
                         <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </SelectField>
+                    <SelectField className="w-[240px]" label="Country" value={orderCountry} onChange={updateOrderCountry}>
+                      <option value="">All countries</option>
+                      {orderCountries.map((country) => (
+                        <option key={country.code} value={country.code}>
+                          {country.label || country.code} ({country.count})
+                        </option>
                       ))}
                     </SelectField>
                     <SearchBox className="w-full sm:w-[360px]" value={search} onChange={updateOrdersSearch} placeholder="Search order, product, ASIN, status..." />
@@ -3924,7 +4027,7 @@ function App() {
                   selectedIds={selected}
                   selectAll={ordersSelectAll}
                   total={ordersTotal}
-                  filters={{ q: search.trim(), condition: orderCondition }}
+                  filters={{ q: search.trim(), condition: orderCondition, country: orderCountry }}
                   onSelectAll={() => setOrdersSelectAll(true)}
                   onClear={() => { setOrdersSelectAll(false); setSelected([]) }}
                   onResult={setModal}
@@ -8059,6 +8162,10 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [genericProductName, setGenericProductName] = useState("")
   const [productTitleLoaded, setProductTitleLoaded] = useState(false)
   const [savingProductTitle, setSavingProductTitle] = useState(false)
+  const [dtbCountryCodes, setDtbCountryCodes] = useState<string[]>([])
+  const [dtbCountryDropdownOpen, setDtbCountryDropdownOpen] = useState(false)
+  const [orderCountryOptions, setOrderCountryOptions] = useState<OrderCountryOption[]>(commonCountryOptions)
+  const [savingRouting, setSavingRouting] = useState(false)
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [jobStatusCounts, setJobStatusCounts] = useState<Record<string, number>>({})
@@ -8085,6 +8192,17 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     if (duplicateFilter === "cancelled") return group.orders.some((order) => order.cancel_status === "cancelled")
     return true
   })
+  const mergedCountryOptions = [...orderCountryOptions, ...commonCountryOptions, ...dtbCountryCodes.map((code) => ({ code, label: code, count: 0 }))]
+    .filter((country, index, countries) => country.code && countries.findIndex((item) => item.code === country.code) === index)
+    .sort((left, right) => {
+      return (left.label || left.code).localeCompare(right.label || right.code)
+    })
+  const selectedDtbCountries = dtbCountryCodes
+    .map((code) => mergedCountryOptions.find((country) => country.code === code) || { code, label: code, count: 0 })
+    .sort((left, right) => (left.label || left.code).localeCompare(right.label || right.code))
+  const dtbCountryLabel = selectedDtbCountries.length
+    ? selectedDtbCountries.map((country) => country.code).join(", ")
+    : "Select DTB countries"
 
   useEffect(() => {
     pageRef.current = page
@@ -8114,10 +8232,18 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     setProductRepairProgress(result.progress || null)
     setProductRepairLogs(result.logs || [])
   }
+  async function loadOrderCountryOptions() {
+    const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""
+    const result = await api<{ countries: OrderCountryOption[] }>(`/api/orders/countries${query}`)
+    setOrderCountryOptions(result.countries?.length ? result.countries : commonCountryOptions)
+  }
   async function fetchProductTitleSettings() {
     const result = await api<{ settings: ServiceSettings }>("/api/settings/services")
     setProductRenameEnabled(result.settings.shopify_product_rename_enabled || "true")
     setGenericProductName(result.settings.shopify_generic_product_name || "")
+    const countryCodes = normalizeCountryCodes(result.settings.shopify_dtb_country_codes || "")
+    setDtbCountryCodes(countryCodes)
+    setDtbCountryDropdownOpen(false)
     setProductTitleLoaded(true)
     return result.settings
   }
@@ -8153,6 +8279,32 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       setSavingProductTitle(false)
     }
   }
+  async function saveRoutingSettings(showResult = true) {
+    const countryCodes = normalizeCountryCodes(dtbCountryCodes.join(","))
+    setSavingRouting(true)
+    try {
+      const result = await api<{ ok: boolean; message: string; settings: ServiceSettings }>("/api/settings/services", {
+        method: "POST",
+        body: JSON.stringify({ settings: { shopify_dtb_country_codes: countryCodes.join(",") } }),
+      })
+      const savedCodes = normalizeCountryCodes(result.settings.shopify_dtb_country_codes || "")
+      setDtbCountryCodes(savedCodes)
+      setDtbCountryDropdownOpen(false)
+      if (showResult) onResult({ ok: result.ok, title: "DTB Routing Saved", message: savedCodes.length ? `DTB countries saved: ${savedCodes.join(", ")}` : "No countries are routed to DTB." })
+      return true
+    } finally {
+      setSavingRouting(false)
+    }
+  }
+  function toggleDtbCountry(code: string) {
+    const next = dtbCountryCodes.includes(code)
+      ? dtbCountryCodes.filter((item) => item !== code)
+      : Array.from(new Set([...dtbCountryCodes, code]))
+    setDtbCountryCodes(next)
+  }
+  function removeDtbCountry(code: string) {
+    setDtbCountryCodes(dtbCountryCodes.filter((item) => item !== code))
+  }
   useEffect(() => {
     load(page).catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
     const timer = window.setInterval(() => load(page).catch(() => undefined), 5000)
@@ -8171,6 +8323,9 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   useEffect(() => {
     loadProductTitleSettings().catch(() => undefined)
   }, [])
+  useEffect(() => {
+    loadOrderCountryOptions().catch(() => undefined)
+  }, [storeId])
   async function enqueuePending() {
     setBusy("Queue")
     setProgress({
@@ -8181,6 +8336,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     })
     try {
       await saveProductTitleSettings(false)
+      if (!(await saveRoutingSettings(false))) return
       const path = `/api/shopify/fulfilment/enqueue${storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""}`
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
       if (result.progress) setProgress(result.progress)
@@ -8200,6 +8356,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     })
     try {
       await saveProductTitleSettings(false)
+      if (!(await saveRoutingSettings(false))) return
       const path = `/api/shopify/fulfilment/enqueue?limit=1${storeId ? `&store_id=${encodeURIComponent(storeId)}` : ""}`
       const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(path, { method: "POST" })
       if (result.progress) setProgress(result.progress)
@@ -8372,7 +8529,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       <section className="page-section">
         <div className="page-pretitle">Fulfilment queue</div>
         <h2 className="page-title">Shopify Fulfilment</h2>
-        <p className="text-sm text-muted-foreground">Amazon-ordered Odoo orders are routed to DTC for non-India countries and DTB for India, then processed one job at a time.</p>
+        <p className="text-sm text-muted-foreground">Amazon-ordered Odoo orders are routed to DTB for selected countries and DTC for all other countries, then processed one job at a time.</p>
       </section>
       <Card>
         <CardHeader>
@@ -8396,6 +8553,69 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                 ? "When typed-title mode is on, synced Shopify products use this title and the original Odoo product name is kept in the SKU with a 39 character limit."
                 : "Loading saved Shopify product title."}
             </p>
+          </div>
+          <div className="form-fieldset grid gap-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="grid min-w-[260px] flex-1 gap-1.5">
+                <Label>DTB Countries</Label>
+                <div className="dropdown">
+                  <button
+                    type="button"
+                    className="btn dropdown-toggle w-100 justify-content-between"
+                    aria-expanded={dtbCountryDropdownOpen}
+                    data-bs-toggle="dropdown"
+                    onClick={() => setDtbCountryDropdownOpen((current) => !current)}
+                  >
+                    {dtbCountryLabel}
+                  </button>
+                  {dtbCountryDropdownOpen ? (
+                    <div className="dropdown-menu show w-100 p-2">
+                      <span className="dropdown-header">Send these countries to DTB</span>
+                      {mergedCountryOptions.map((country) => {
+                        const checked = dtbCountryCodes.includes(country.code)
+                        return (
+                          <button
+                            key={country.code}
+                            type="button"
+                            className={`dropdown-item rounded dtb-country-option ${checked ? "active selected" : ""}`}
+                            aria-pressed={checked}
+                            onClick={() => toggleDtbCountry(country.code)}
+                          >
+                            <span className={`dtb-country-check ${checked ? "checked" : ""}`} aria-hidden="true">
+                              {checked ? <Check className="icon icon-1" strokeWidth={3} /> : null}
+                            </span>
+                            <span>{country.label || country.code}</span>
+                            {country.count ? <span className="badge bg-blue text-white ms-auto dtb-country-count">{country.count}</span> : null}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <Button className="min-w-[128px]" variant="outline" onClick={() => saveRoutingSettings(true)} disabled={Boolean(busy) || savingRouting}>
+                {savingRouting ? "Saving..." : "Save Routing"}
+              </Button>
+            </div>
+            <div className="dtb-selected-countries">
+              <div className="badges-list">
+              {selectedDtbCountries.map((country) => (
+                <span key={country.code} className="badge bg-blue-lt text-blue badge-pill selected-country-badge">
+                  <span>{country.label || country.code}</span>
+                  {country.count ? <span className="badge bg-blue text-blue-fg badge-pill selected-country-count">{country.count}</span> : null}
+                  <button
+                    type="button"
+                    className="selected-country-remove"
+                    onClick={() => removeDtbCountry(country.code)}
+                    aria-label={`Remove ${country.label || country.code}`}
+                  >
+                    <X className="icon icon-1" />
+                  </button>
+                </span>
+              ))}
+              {!selectedDtbCountries.length ? <span className="text-sm text-muted-foreground">No DTB countries selected.</span> : null}
+              </div>
+            </div>
           </div>
           <div className="btn-list">
             <Button onClick={enqueuePending} disabled={Boolean(busy)}>{busy === "Queue" ? "Queueing..." : "Queue Pending Amazon Orders"}</Button>
@@ -9609,6 +9829,7 @@ function SettingsPage({
               <option value="true">Enabled</option>
               <option value="false">Disabled</option>
             </SelectField>
+            <TextField label="DTB Country Codes" value={settings.shopify_dtb_country_codes || ""} onChange={(value) => setSetting("shopify_dtb_country_codes", value)} />
             <SelectField label="Block Old Odoo Orders" value={settings.amazon_order_date_guard_enabled || "true"} onChange={(value) => setSetting("amazon_order_date_guard_enabled", value)}>
               <option value="true">Enabled - block before 18 May</option>
               <option value="false">Disabled - allow old orders</option>
@@ -9678,6 +9899,7 @@ function SettingsPage({
                 "shopify_tracking_api_version",
                 "odoo_script_password",
                 "shopify_auto_enqueue_enabled",
+                "shopify_dtb_country_codes",
                 "amazon_order_date_guard_enabled",
                 "shopify_fulfilled_order_guard_enabled",
                 "shopify_product_rename_enabled",

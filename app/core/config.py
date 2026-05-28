@@ -86,6 +86,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "odoo_script_password": os.getenv("ODOO_SCRIPT_PASSWORD", ""),
     "shopify_oauth_public_base_url": os.getenv("SHOPIFY_OAUTH_PUBLIC_BASE_URL", ""),
     "shopify_auto_enqueue_enabled": os.getenv("SHOPIFY_AUTO_ENQUEUE_ENABLED", "true"),
+    "shopify_dtb_country_codes": os.getenv("SHOPIFY_DTB_COUNTRY_CODES", ""),
     "amazon_order_date_guard_enabled": os.getenv("AMAZON_ORDER_DATE_GUARD_ENABLED", "true"),
     "shopify_fulfilled_order_guard_enabled": os.getenv("SHOPIFY_FULFILLED_ORDER_GUARD_ENABLED", "false"),
     "shopify_product_rename_enabled": os.getenv("SHOPIFY_PRODUCT_RENAME_ENABLED", "true"),
