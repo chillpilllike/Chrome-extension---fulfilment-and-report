@@ -34,6 +34,7 @@ import {
 } from "@tabler/icons-react"
 import { Popover } from "@base-ui/react/popover"
 
+import { APP_VERSION } from "@/appVersion"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -90,6 +91,14 @@ function appPageFromLocation() {
 
 function pagePath(page: string) {
   return page === "home" ? "/" : `/${page}`
+}
+
+function AppVersionBadge() {
+  return (
+    <div className="app-version-badge d-print-none" aria-label={`App version ${APP_VERSION}`}>
+      v{APP_VERSION}
+    </div>
+  )
 }
 
 function rangeSelection<T extends SelectId>(
@@ -3592,6 +3601,7 @@ function App() {
       <TooltipProvider>
         <AdminAccessScreen onSubmit={handleAdminTokenSave} error={adminAuthError} busy={adminAuthBusy} />
         <ResultDialog modal={modal} onClose={() => setModal(null)} />
+        <AppVersionBadge />
       </TooltipProvider>
     )
   }
@@ -4733,6 +4743,7 @@ function App() {
       </div>
       </div>
       </main>
+      <AppVersionBadge />
     </div>
     </TooltipProvider>
   )

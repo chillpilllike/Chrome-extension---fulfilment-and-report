@@ -1738,6 +1738,23 @@
     color: #111827;
 }
 
+.app-version-badge {
+    position: fixed;
+    left: .75rem;
+    bottom: .75rem;
+    z-index: 1040;
+    padding: .25rem .5rem;
+    border: 1px solid var(--tblr-border-color);
+    border-radius: var(--tblr-border-radius);
+    background: rgba(255, 255, 255, .92);
+    color: var(--muted-foreground);
+    font-size: .75rem;
+    font-weight: 600;
+    line-height: 1.2;
+    box-shadow: 0 .25rem .75rem rgba(24, 36, 51, .08);
+    pointer-events: none;
+}
+
 @media (max-width: 900px) {
     .tabler-admin-shell .navbar > .container-xl,
     .tabler-admin-shell .page-header-row {
@@ -1747,5 +1764,13 @@
 
     .tabler-admin-shell .navbar-brand {
         white-space: normal;
+    }
+}
+
+@media (max-width: 640px) {
+    .app-version-badge {
+        left: .5rem;
+        bottom: .5rem;
+        font-size: .6875rem;
     }
 }
