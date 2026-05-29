@@ -207,7 +207,7 @@
 .tabler-admin-shell .navbar-tabs {
     position: sticky;
     top: 0;
-    z-index: 80;
+    z-index: 1050;
     width: 100%;
     border-top: 1px solid var(--tblr-border-color);
     border-bottom: 1px solid var(--tblr-border-color);
@@ -253,6 +253,7 @@
 
 .tabler-admin-shell .nav-item {
     position: relative;
+    z-index: 1051;
     display: flex;
     align-items: center;
 }
@@ -339,7 +340,7 @@
     position: absolute;
     top: calc(100% + .35rem);
     left: 0;
-    z-index: 30;
+    z-index: 1060;
     display: block;
     min-width: 12rem;
     padding: .35rem;
@@ -413,6 +414,8 @@
 }
 
 .tabler-admin-shell .page-wrapper {
+    position: relative;
+    z-index: 1;
     min-height: calc(100vh - 4rem);
 }
 
@@ -579,7 +582,7 @@
 .tabler-admin-shell .table-responsive {
     display: block;
     width: 100%;
-    overflow-x: auto;
+    overflow: auto;
     -webkit-overflow-scrolling: touch;
 }
 
@@ -589,9 +592,19 @@
     vertical-align: top;
 }
 
+.tabler-admin-shell .tabler-sticky-table-wrap {
+    max-height: min(72vh, calc(100vh - 12rem));
+    border-bottom: 1px solid var(--tblr-border-color);
+}
+
+.tabler-admin-shell .tabler-sticky-table {
+    min-width: 960px;
+}
+
 .tabler-admin-shell .table > :not(caption) > * > * {
     padding: .75rem 1rem;
     border-bottom: 1px solid var(--tblr-border-color);
+    overflow-wrap: anywhere;
 }
 
 .tabler-admin-shell .table-vcenter > :not(caption) > * > * {
@@ -603,12 +616,30 @@
 }
 
 .tabler-admin-shell th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
     color: var(--muted-foreground);
     background: #f8fafc;
     font-size: 0.7rem;
     font-weight: 700;
     letter-spacing: .02em;
     text-transform: uppercase;
+    white-space: nowrap;
+    box-shadow: inset 0 -1px 0 var(--tblr-border-color);
+}
+
+.tabler-admin-shell:has(.navbar-tabs .dropdown-menu.show) [data-slot="table-header"] {
+    visibility: hidden;
+}
+
+.tabler-admin-shell td {
+    white-space: normal;
+}
+
+.tabler-admin-shell .table-nowrap td,
+.tabler-admin-shell .text-nowrap {
+    white-space: nowrap;
 }
 
 .tabler-admin-shell tbody tr:hover {
@@ -1250,6 +1281,52 @@
     overflow-wrap: anywhere;
 }
 
+.error-popover-trigger {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    font: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: .18em;
+}
+
+.error-popover-trigger:hover,
+.error-popover-trigger:focus-visible {
+    color: #c92a2a;
+}
+
+.error-popover-positioner {
+    z-index: 1500;
+}
+
+.error-popover {
+    position: relative;
+    display: block;
+    width: min(680px, calc(100vw - 2rem));
+    max-width: none;
+    border-color: #f1bcbc;
+    box-shadow: 0 .75rem 2rem rgba(24, 36, 51, .18);
+}
+
+.error-popover .popover-header {
+    color: var(--tblr-danger);
+    background: var(--tblr-red-lt);
+    border-bottom-color: #f1bcbc;
+    font-weight: 650;
+}
+
+.error-popover .popover-body {
+    max-height: min(48vh, 24rem);
+    overflow: auto;
+    white-space: pre-wrap;
+    color: var(--foreground);
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
 .dtb-selected-countries {
     min-height: 3rem;
     padding: .75rem;
@@ -1302,6 +1379,97 @@
 .selected-country-remove:hover {
     background: rgba(var(--tblr-blue-rgb), .12);
     opacity: 1;
+}
+
+.epost-tracking-table-wrap .table-responsive {
+    overflow-x: auto;
+}
+
+.epost-tracking-table-wrap .epost-tracking-table {
+    table-layout: fixed;
+    min-width: 1540px;
+}
+
+.epost-tracking-table-wrap .epost-tracking-table th,
+.epost-tracking-table-wrap .epost-tracking-table td {
+    vertical-align: top;
+    white-space: normal;
+}
+
+.epost-col-store {
+    width: 9rem;
+}
+
+.epost-col-order {
+    width: 10rem;
+}
+
+.epost-col-amazon {
+    width: 12rem;
+}
+
+.epost-col-tracking {
+    width: 13rem;
+}
+
+.epost-col-status {
+    width: 18rem;
+}
+
+.epost-col-charges {
+    width: 12rem;
+}
+
+.epost-col-refund {
+    width: 12rem;
+}
+
+.epost-col-date {
+    width: 14rem;
+}
+
+.epost-col-destination {
+    width: 10rem;
+}
+
+.epost-col-awb {
+    width: 8rem;
+}
+
+.epost-col-checked {
+    width: 10rem;
+}
+
+.epost-tracking-table-wrap .epost-cell-status,
+.epost-tracking-table-wrap .epost-cell-charges,
+.epost-tracking-table-wrap .epost-cell-refund,
+.epost-tracking-table-wrap .epost-cell-date {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.epost-tracking-table-wrap .epost-cell-status .badge,
+.epost-tracking-table-wrap .epost-cell-charges .badge {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+    line-height: 1.2;
+}
+
+.epost-tracking-table-wrap .epost-status-pill {
+    display: inline-flex;
+    max-width: 100%;
+}
+
+.epost-refund-received-row {
+    background: rgba(var(--tblr-success-rgb), .12);
+}
+
+.epost-refund-received-badge {
+    border-color: rgba(var(--tblr-success-rgb), .32);
+    color: var(--tblr-success);
+    background: rgba(var(--tblr-success-rgb), .08);
 }
 
 .modal-backdrop.show {

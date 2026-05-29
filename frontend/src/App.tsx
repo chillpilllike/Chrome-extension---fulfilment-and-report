@@ -32,6 +32,7 @@ import {
   IconLogout as Logout,
   IconUserCircle as UserCircle,
 } from "@tabler/icons-react"
+import { Popover } from "@base-ui/react/popover"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -59,6 +60,7 @@ const KNOWN_APP_PAGES = new Set([
   "pull-jobs",
   "chrome-queue",
   "tracking",
+  "dispatch-status",
   "payment-failed",
   "amazon-otp",
   "epost",
@@ -268,7 +270,7 @@ type DuplicateAsin = {
 type TrackingOrder = {
   amazon_order_id: string
   amazon_order_url: string
-  odoo_order_names: string[]
+  odoo_order_names: string[] | string
   tracking_status: string
   tracking_checked_at: string
   amazon_cancelled_at?: string
@@ -290,6 +292,20 @@ type PaymentFailure = {
   resolved_at?: string
 }
 
+function paymentFailureOrderNames(row: PaymentFailure): string[] {
+  const raw = row.odoo_order_names
+  if (Array.isArray(raw)) return raw.filter(Boolean)
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : []
+    } catch {
+      return raw ? [raw] : []
+    }
+  }
+  return []
+}
+
 type FulfilmentPendingRow = OrderLine & {
   store_name: string
   fulfilment_status: string
@@ -300,6 +316,48 @@ type FulfilmentPendingRow = OrderLine & {
   odoo_sale_state: string
   odoo_invoice_status: string
   tracking_checked_at: string
+  amazon_delivered_at?: string
+  amazon_delivered_display?: string
+  amazon_delivered_source?: string
+}
+
+type DispatchStatusSummary = {
+  total: number
+  pending_dispatch: number
+  timely_dispatch: number
+  late_dispatch: number
+  dispatched_waiting_movement: number
+  avg_dispatch_days: number
+  sla_days: number
+}
+
+type DispatchStatusRow = {
+  id: string
+  store_id: number
+  store_name: string
+  odoo_order_id: number
+  odoo_order_name: string
+  odoo_order_url: string
+  odoo_order_date: string
+  amazon_order_ids: string
+  asins: string
+  products: string
+  line_count: number
+  dispatched_at: string
+  dispatch_source: string
+  dispatch_status: string
+  dispatch_delay_days: number | null
+  movement_at: string
+  movement_status: string
+  movement_tracking_code: string
+  tracking_checked_at: string
+  amazon_delivered_at: string
+  amazon_delivered_display: string
+  amazon_delivered_source: string
+  movement_delay_days: number | null
+  total_days_to_movement: number | null
+  total_delay_days: number | null
+  tracking_code_count: number
 }
 
 type PartialFulfilment = {
@@ -345,6 +403,12 @@ type EpostTrackingRow = {
   fulfilment_fee: number
   shipping_total: number
   shipping_match_type: string
+  days_since_update?: number | null
+  stale_days_threshold?: number
+  suspected_lost?: boolean
+  refund_status?: string
+  refund_claimed_at?: string
+  refund_received_at?: string
 }
 
 type ShippingChargeRow = {
@@ -418,6 +482,10 @@ type InventoryItem = {
   amazon_account_name: string
   source_type: string
   reserved_order_line_id: number | null
+  reserved_quantity?: number | null
+  reserved_odoo_order_name?: string
+  reserved_odoo_order_url?: string
+  reserved_product_name?: string
   notes: string
   status: string
   updated_at: string
@@ -572,6 +640,7 @@ const defaultUiCopy: UiCopy = {
   "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
   "chrome-queue": { title: "Chrome Queue", description: "Review Chrome extension jobs and release stale locks." },
   tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
+  "dispatch-status": { title: "Dispatch Status", description: "Track Odoo order to dispatch timing, ePost movement, and delay risk." },
   "payment-failed": { title: "Payment Failed", description: "Review Amazon orders that need payment revision." },
   "amazon-otp": { title: "Amazon OTP", description: "Match OTP emails to Amazon and Odoo orders." },
   epost: { title: "ePost Tracking", description: "Monitor ePost Global shipment events." },
@@ -701,6 +770,7 @@ const orderConditionOptions = [
   { value: "delivered", label: "Delivered" },
   { value: "inventory", label: "Using inventory" },
   { value: "error", label: "Errors" },
+  { value: "amazon_cancelled", label: "Amazon cancelled" },
   { value: "cancelled_refunded", label: "Cancelled / refunded" },
 ]
 
@@ -761,6 +831,7 @@ type ShopifyFulfilmentJob = {
   shopify_order_url?: string
   last_error: string
   created_at: string
+  locked_at?: string
   updated_at: string
   completed_at: string
 }
@@ -892,6 +963,7 @@ type ShopifyTrackingJob = {
   }
   last_error: string
   created_at: string
+  locked_at?: string
   updated_at: string
   completed_at: string
 }
@@ -911,6 +983,7 @@ const fulfilmentPendingExportColumns: ExportColumn[] = [
   { key: "amazon_order_id", label: "Amazon Order" },
   { key: "carrier_tracking", label: "Carrier / Tracking" },
   { key: "tracking_status", label: "Tracking" },
+  { key: "amazon_delivered_display", label: "Delivered At" },
   { key: "picking_summary", label: "Odoo Pickings" },
   { key: "fulfilment_status", label: "Status" },
   { key: "message", label: "Message" },
@@ -925,6 +998,9 @@ const epostExportColumns: ExportColumn[] = [
   { key: "shipping_fee", label: "Shipping Fee" },
   { key: "fulfilment_fee", label: "Fulfilment Fee" },
   { key: "shipping_total", label: "Shipping Total" },
+  { key: "refund_status", label: "Refund Status" },
+  { key: "refund_claimed_at", label: "Refund Claimed" },
+  { key: "refund_received_at", label: "Refund Received" },
   { key: "last_update_at", label: "Last Update" },
   { key: "destination", label: "Destination" },
   { key: "awb", label: "AWB" },
@@ -1600,21 +1676,32 @@ function ErrorTooltip({ value, className = "" }: { value?: string; className?: s
   if (!text) return null
   if (text.startsWith("Shopify OAuth token")) return null
   return (
-    <Tooltip>
-      <TooltipTrigger className={`block w-full cursor-help truncate text-left text-destructive ${className}`}>
+    <Popover.Root>
+      <Popover.Trigger
+        type="button"
+        openOnHover
+        delay={120}
+        closeDelay={120}
+        className={`error-popover-trigger block w-full truncate text-left text-destructive ${className}`}
+      >
         {text}
-      </TooltipTrigger>
-      <TooltipContent
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Positioner
         side="top"
         align="end"
-        className="max-w-[calc(100vw-32px)]"
-        innerClassName="max-h-[min(45vh,360px)] w-[min(680px,calc(100vw-56px))] overflow-auto whitespace-normal break-words text-left leading-relaxed [overflow-wrap:anywhere]"
+          sideOffset={8}
+          collisionPadding={16}
+          className="error-popover-positioner"
       >
-        <div className="grid min-w-0 gap-2">
-          <span>{text}</span>
-        </div>
-      </TooltipContent>
-    </Tooltip>
+          <Popover.Popup className="popover bs-popover-auto show error-popover">
+            <Popover.Arrow className="popover-arrow" />
+            <div className="popover-header">Error details</div>
+            <div className="popover-body">{text}</div>
+          </Popover.Popup>
+        </Popover.Positioner>
+      </Popover.Portal>
+    </Popover.Root>
   )
 }
 
@@ -2084,10 +2171,23 @@ function App() {
   const [fulfilmentPendingRows, setFulfilmentPendingRows] = useState<FulfilmentPendingRow[]>([])
   const [fulfilmentPendingPage, setFulfilmentPendingPage] = useState(1)
   const [fulfilmentPendingTotal, setFulfilmentPendingTotal] = useState(0)
+  const [fulfilmentPendingQuery, setFulfilmentPendingQuery] = useState("")
+  const [fulfilmentPendingLoading, setFulfilmentPendingLoading] = useState(false)
+  const [dispatchRows, setDispatchRows] = useState<DispatchStatusRow[]>([])
+  const [dispatchPage, setDispatchPage] = useState(1)
+  const [dispatchTotal, setDispatchTotal] = useState(0)
+  const [dispatchStatusFilter, setDispatchStatusFilter] = useState("all")
+  const [dispatchQuery, setDispatchQuery] = useState("")
+  const [dispatchSummary, setDispatchSummary] = useState<DispatchStatusSummary>({ total: 0, pending_dispatch: 0, timely_dispatch: 0, late_dispatch: 0, dispatched_waiting_movement: 0, avg_dispatch_days: 0, sla_days: 3 })
+  const [dispatchLoading, setDispatchLoading] = useState(false)
   const [epostRows, setEpostRows] = useState<EpostTrackingRow[]>([])
   const [epostPage, setEpostPage] = useState(1)
   const [epostTotal, setEpostTotal] = useState(0)
   const [epostStatusFilter, setEpostStatusFilter] = useState("all")
+  const [epostStaleDays, setEpostStaleDays] = useState("10")
+  const [epostStaleOnly, setEpostStaleOnly] = useState(false)
+  const [epostLoading, setEpostLoading] = useState(false)
+  const epostRequestRef = useRef(0)
   const [trackingOrders] = useState<TrackingOrder[]>([])
   const [trackingPage, setTrackingPage] = useState(1)
   const trackingTotal = 0
@@ -2134,6 +2234,8 @@ function App() {
   const [ordersSelectAll, setOrdersSelectAll] = useState(false)
   const [pendingSelected, setPendingSelected] = useState<number[]>([])
   const [pendingSelectAll, setPendingSelectAll] = useState(false)
+  const [dispatchSelected, setDispatchSelected] = useState<string[]>([])
+  const [, setDispatchSelectAll] = useState(false)
   const [epostSelected, setEpostSelected] = useState<number[]>([])
   const [epostSelectAll, setEpostSelectAll] = useState(false)
   const [trackingSelected, setTrackingSelected] = useState<string[]>([])
@@ -2704,13 +2806,35 @@ function App() {
 
   useEffect(() => {
     if (page !== "fulfilment-pending") return
-    api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage)}`)
+    setFulfilmentPendingLoading(true)
+    api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim() })}`)
       .then((result) => {
         setFulfilmentPendingRows(result.rows)
         setFulfilmentPendingTotal(result.total || 0)
       })
       .catch((error) => setModal({ ok: false, title: "Fulfilment pending load failed", message: String(error) }))
-  }, [page, storeId, fulfilmentPendingPage])
+      .finally(() => setFulfilmentPendingLoading(false))
+  }, [page, storeId, fulfilmentPendingPage, fulfilmentPendingQuery])
+
+  useEffect(() => {
+    if (page !== "dispatch-status") return
+    setDispatchLoading(true)
+    api<{ rows: DispatchStatusRow[]; total: number; summary: DispatchStatusSummary }>(`/api/dispatch-status${pagedQuery(storeId, dispatchPage, { status: dispatchStatusFilter, q: dispatchQuery.trim() })}`)
+      .then((result) => {
+        setDispatchRows(result.rows || [])
+        setDispatchTotal(result.total || 0)
+        setDispatchSummary(result.summary || dispatchSummary)
+      })
+      .catch((error) => setModal({ ok: false, title: "Dispatch status load failed", message: String(error) }))
+      .finally(() => setDispatchLoading(false))
+  }, [page, storeId, dispatchPage, dispatchStatusFilter, dispatchQuery])
+
+  useEffect(() => {
+    if (page !== "home") return
+    api<{ summary: DispatchStatusSummary }>(`/api/dispatch-status/summary${pagedQuery(storeId, 1)}`)
+      .then((result) => setDispatchSummary(result.summary || dispatchSummary))
+      .catch(() => {})
+  }, [page, storeId])
 
   useEffect(() => {
     if (page !== "payment-failed") return
@@ -2724,13 +2848,19 @@ function App() {
 
   useEffect(() => {
     if (page !== "epost") return
-    api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking${pagedQuery(storeId, epostPage, { status: epostStatusFilter })}`)
+    const requestId = ++epostRequestRef.current
+    setEpostLoading(true)
+    api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking${pagedQuery(storeId, epostPage, { status: epostStatusFilter, stale_days: epostStaleDays || "10", stale_only: epostStaleOnly ? "true" : "false" })}`)
       .then((result) => {
+        if (requestId !== epostRequestRef.current) return
         setEpostRows(result.rows)
         setEpostTotal(result.total || 0)
       })
       .catch((error) => setModal({ ok: false, title: "ePost tracking load failed", message: String(error) }))
-  }, [page, storeId, epostPage, epostStatusFilter])
+      .finally(() => {
+        if (requestId === epostRequestRef.current) setEpostLoading(false)
+      })
+  }, [page, storeId, epostPage, epostStatusFilter, epostStaleDays, epostStaleOnly])
 
   useEffect(() => {
     if (page !== "bulk" || !storeId) return
@@ -3322,24 +3452,7 @@ function App() {
           </Tooltip>
         ) : ""
       case "error":
-        return row.last_error ? (
-          <Tooltip>
-            <TooltipTrigger className="block w-full cursor-help truncate text-left text-destructive">
-              {row.missing_asin ? (
-                <>
-                  ASIN{" "}
-                  <a className="underline underline-offset-4" href={`https://www.amazon.com/dp/${row.missing_asin}`} target="_blank">
-                    {row.missing_asin}
-                  </a>{" "}
-                  missing; skipped.
-                </>
-              ) : row.last_error}
-            </TooltipTrigger>
-            <TooltipContent side="top" align="end" className="max-w-xl whitespace-normal break-words leading-relaxed">
-              {row.last_error}
-            </TooltipContent>
-          </Tooltip>
-        ) : ""
+        return <ErrorTooltip value={row.last_error} />
       default:
         return ""
     }
@@ -3382,6 +3495,7 @@ function App() {
       icon: PackageCheck,
       items: [
         ["tracking", "Amazon Tracking", PackageCheck],
+        ["dispatch-status", "Dispatch Status", PackageCheck],
         ["payment-failed", "Payment Failed", AlertCircle],
         ["amazon-otp", "Amazon OTP", Bell],
         ["epost", "ePost Global", PackageCheck],
@@ -3635,12 +3749,14 @@ function App() {
             fulfilmentPendingRows={fulfilmentPendingRows}
             epostRows={epostRows}
             trackingOrders={trackingOrders}
+            dispatchSummary={dispatchSummary}
             stores={stores}
             storeId={storeId}
             addresses={addresses}
             accounts={accounts}
             orderingEngine={orderingEngine}
             onNavigate={setPage}
+            onDispatchFilter={(status) => { setDispatchStatusFilter(status); setDispatchPage(1); setPage("dispatch-status") }}
             onRefresh={() => refresh()}
           />
         )}
@@ -4323,7 +4439,10 @@ function App() {
             storeId={storeId}
             page={fulfilmentPendingPage}
             total={fulfilmentPendingTotal}
+            query={fulfilmentPendingQuery}
+            loading={fulfilmentPendingLoading}
             onPage={setFulfilmentPendingPage}
+            onQuery={(value) => { setFulfilmentPendingQuery(value); setFulfilmentPendingPage(1) }}
             selected={pendingSelected}
             selectAll={pendingSelectAll}
             onSelected={setPendingSelected}
@@ -4331,10 +4450,27 @@ function App() {
             onNavigate={setPage}
             onResult={setModal}
             onRefresh={async () => {
-              const result = await api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage)}`)
+              const result = await api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim() })}`)
               setFulfilmentPendingRows(result.rows)
               setFulfilmentPendingTotal(result.total || 0)
             }}
+          />
+        )}
+        {page === "dispatch-status" && (
+          <DispatchStatusPage
+            rows={dispatchRows}
+            page={dispatchPage}
+            total={dispatchTotal}
+            statusFilter={dispatchStatusFilter}
+            query={dispatchQuery}
+            summary={dispatchSummary}
+            loading={dispatchLoading}
+            selected={dispatchSelected}
+            onPage={setDispatchPage}
+            onStatusFilter={(value) => { setDispatchStatusFilter(value); setDispatchPage(1) }}
+            onQuery={(value) => { setDispatchQuery(value); setDispatchPage(1) }}
+            onSelected={setDispatchSelected}
+            onSelectAll={setDispatchSelectAll}
           />
         )}
         {page === "epost" && (
@@ -4344,8 +4480,13 @@ function App() {
             page={epostPage}
             total={epostTotal}
             statusFilter={epostStatusFilter}
+            staleDays={epostStaleDays}
+            staleOnly={epostStaleOnly}
+            initialLoading={epostLoading}
             onPage={setEpostPage}
-            onStatusFilter={(value) => { setEpostStatusFilter(value); setEpostPage(1) }}
+            onStatusFilter={(value) => { setEpostStatusFilter(value); setEpostStaleOnly(value === "suspected_lost"); setEpostPage(1) }}
+            onStaleDays={(value) => { setEpostStaleDays(value); setEpostStatusFilter("suspected_lost"); setEpostStaleOnly(true); setEpostPage(1) }}
+            onStaleOnly={(value) => { setEpostStaleOnly(value); if (value) setEpostStatusFilter("suspected_lost"); setEpostPage(1) }}
             selected={epostSelected}
             selectAll={epostSelectAll}
             onSelected={setEpostSelected}
@@ -4582,12 +4723,14 @@ function HomeDashboard({
   fulfilmentPendingRows,
   epostRows,
   trackingOrders,
+  dispatchSummary,
   stores,
   storeId,
   addresses,
   accounts,
   orderingEngine,
   onNavigate,
+  onDispatchFilter,
   onRefresh,
 }: {
   data: DashboardData
@@ -4598,12 +4741,14 @@ function HomeDashboard({
   fulfilmentPendingRows: FulfilmentPendingRow[]
   epostRows: EpostTrackingRow[]
   trackingOrders: TrackingOrder[]
+  dispatchSummary: DispatchStatusSummary
   stores: Store[]
   storeId: string
   addresses: Address[]
   accounts: AmazonAccount[]
   orderingEngine: string
   onNavigate: (page: string) => void
+  onDispatchFilter: (status: string) => void
   onRefresh: () => Promise<void>
 }) {
   const stateCount = (state: string) => Number(data.counts.find((item) => item.state === state)?.count || 0)
@@ -4625,6 +4770,12 @@ function HomeDashboard({
   const completionRate = data.total ? Math.round((deliveredCount / data.total) * 100) : 0
   const epostDelivered = epostRows.filter((row) => row.epost_status === "delivered").length
   const epostRate = epostRows.length ? Math.round((epostDelivered / epostRows.length) * 100) : 0
+  const dispatchTotal = Number(dispatchSummary.total || 0)
+  const timelyDispatch = Number(dispatchSummary.timely_dispatch || 0)
+  const lateDispatch = Number(dispatchSummary.late_dispatch || 0)
+  const pendingDispatch = Number(dispatchSummary.pending_dispatch || 0)
+  const waitingMovement = Number(dispatchSummary.dispatched_waiting_movement || 0)
+  const dispatchOnTimeRate = dispatchTotal ? Math.round((timelyDispatch / dispatchTotal) * 100) : 0
   const orderSpark = data.counts.map((item, index) => ({
     label: item.state,
     value: Number(item.count || 0),
@@ -4635,6 +4786,12 @@ function HomeDashboard({
     ["ePost pending", epostPending, "bg-yellow"],
     ["ePost lost", epostLost, "bg-red"],
     ["Odoo pending", fulfilmentPendingRows.length, "bg-green"],
+  ] as const
+  const dispatchBars = [
+    ["Timely", timelyDispatch, "bg-green", "timely_dispatch"],
+    ["Late", lateDispatch, "bg-red", "late_dispatch"],
+    ["Pending", pendingDispatch, "bg-yellow", "pending_dispatch"],
+    ["No movement", waitingMovement, "bg-blue", "dispatched_waiting_movement"],
   ] as const
 
   const panels = [
@@ -4685,6 +4842,14 @@ function HomeDashboard({
       primaryLabel: "Amazon orders",
       details: [`${pendingTracking} still moving`, `${fulfilmentPendingRows.length} delivered but Odoo pending`],
       tone: fulfilmentPendingRows.length ? "bg-destructive/10" : "",
+    },
+    {
+      title: "Dispatch",
+      page: "dispatch-status",
+      primary: lateDispatch + pendingDispatch + waitingMovement,
+      primaryLabel: "need attention",
+      details: [`${timelyDispatch} timely`, `${lateDispatch} late`, `${pendingDispatch} pending`, `${waitingMovement} waiting movement`],
+      tone: lateDispatch || pendingDispatch ? "bg-destructive/10" : "",
     },
     {
       title: "ePost",
@@ -4750,6 +4915,20 @@ function HomeDashboard({
                   <div className="progress"><div className={`progress-bar ${color}`} style={{ width: `${Math.min(100, Number(value || 0) * 8)}%` }} /></div>
                 </div>
               ))}
+            </div>
+            <div className="mt-6 border-top pt-4">
+              <div className="mb-2 flex items-baseline justify-between">
+                <span className="text-xs font-bold uppercase text-muted-foreground">Dispatch SLA</span>
+                <button className="text-primary text-sm" onClick={() => onDispatchFilter("all")}>{dispatchOnTimeRate}% timely</button>
+              </div>
+              <div className="grid gap-2">
+                {dispatchBars.map(([label, value, color, filter]) => (
+                  <button key={label} className="text-left" onClick={() => onDispatchFilter(filter)}>
+                    <div className="mb-1 flex justify-between text-sm"><span>{label}</span><span>{value}</span></div>
+                    <div className="progress"><div className={`progress-bar ${color}`} style={{ width: `${Math.min(100, Number(value || 0) * 8)}%` }} /></div>
+                  </button>
+                ))}
+              </div>
             </div>
           </CardContent>
         </Card>
@@ -5169,13 +5348,13 @@ function PaymentFailedPage({
             {rows.map((row) => (
               <TableRow key={row.amazon_order_id}>
                 <TableCell>
-                  <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.action_url || row.amazon_order_url} target="_blank">
+                  <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(row.amazon_order_id)}`} target="_blank">
                     {row.amazon_order_id}
                   </a>
                 </TableCell>
                 <TableCell className="max-w-[260px]">
                   <div className="flex flex-wrap gap-1">
-                    {(row.odoo_order_names || []).map((name) => (
+                    {paymentFailureOrderNames(row).map((name) => (
                       <OdooOrderRef key={name} name={name} />
                     ))}
                   </div>
@@ -5349,12 +5528,198 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
   )
 }
 
+function dispatchStatusLabel(value: string) {
+  switch (value) {
+    case "timely_dispatch":
+      return "Timely"
+    case "late_dispatch":
+      return "Late"
+    case "pending_dispatch":
+      return "Pending dispatch"
+    case "dispatched_waiting_movement":
+      return "Waiting movement"
+    default:
+      return value || "Unknown"
+  }
+}
+
+function dispatchStatusBadgeVariant(value: string) {
+  if (value === "late_dispatch" || value === "pending_dispatch") return "destructive"
+  if (value === "timely_dispatch") return "outline"
+  return "secondary"
+}
+
+function DispatchStatusPage({
+  rows,
+  page,
+  total,
+  statusFilter,
+  query,
+  summary,
+  loading,
+  selected,
+  onPage,
+  onStatusFilter,
+  onQuery,
+  onSelected,
+  onSelectAll,
+}: {
+  rows: DispatchStatusRow[]
+  page: number
+  total: number
+  statusFilter: string
+  query: string
+  summary: DispatchStatusSummary
+  loading: boolean
+  selected: string[]
+  onPage: (page: number) => void
+  onStatusFilter: (value: string) => void
+  onQuery: (value: string) => void
+  onSelected: (ids: string[]) => void
+  onSelectAll: (value: boolean) => void
+}) {
+  const selectionAnchor = useRef<string | null>(null)
+  const metricCards = [
+    ["Timely", summary.timely_dispatch || 0, "timely_dispatch", "text-success"],
+    ["Late", summary.late_dispatch || 0, "late_dispatch", "text-danger"],
+    ["Pending", summary.pending_dispatch || 0, "pending_dispatch", "text-warning"],
+    ["Waiting movement", summary.dispatched_waiting_movement || 0, "dispatched_waiting_movement", "text-info"],
+  ] as const
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <CardTitle>Dispatch Status</CardTitle>
+          <CardDescription>Tracks each Odoo order from received date to Odoo dispatch sync and first ePost movement. Late means dispatched more than {summary.sla_days || 3} days after Odoo order date.</CardDescription>
+        </div>
+        <div className="flex flex-col gap-2 md:flex-row md:items-end">
+          <SelectField className="w-52" label="Filter" value={statusFilter} onChange={onStatusFilter}>
+            <option value="all">All dispatches</option>
+            <option value="pending_dispatch">Pending dispatch</option>
+            <option value="timely_dispatch">Timely dispatch</option>
+            <option value="late_dispatch">Late dispatch</option>
+            <option value="dispatched_waiting_movement">Dispatched, no movement</option>
+          </SelectField>
+          <div className="min-w-[280px]">
+            <Label>Search</Label>
+            <SearchBox value={query} onChange={onQuery} placeholder="Odoo order, Amazon order, ASIN, product..." />
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-4">
+        {metricCards.map(([label, value, filter, color]) => (
+          <button key={label} type="button" className="card card-sm text-left" onClick={() => onStatusFilter(filter)}>
+            <div className="text-xs font-bold uppercase text-muted-foreground">{label}</div>
+            <div className={`mt-1 text-2xl font-semibold ${color}`}>{Number(value || 0).toLocaleString()}</div>
+          </button>
+        ))}
+      </CardContent>
+      <div className="border-t px-6 py-3">
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+          <div className="text-sm text-muted-foreground">
+            {Number(summary.avg_dispatch_days || 0)} avg dispatch day(s) · {Number(summary.total || 0).toLocaleString()} tracked order(s)
+          </div>
+          <PaginationControls page={page} total={total} onPage={onPage} disabled={loading} />
+        </div>
+      </div>
+      <CardContent className="p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-10">
+                <Checkbox
+                  checked={rows.length > 0 && rows.every((row) => selected.includes(row.id))}
+                  onCheckedChange={(checked) => {
+                    onSelectAll(false)
+                    const ids = rows.map((row) => row.id)
+                    onSelected(checked ? Array.from(new Set([...selected, ...ids])) : selected.filter((id) => !ids.includes(id)))
+                  }}
+                />
+              </TableHead>
+              <TableHead>Odoo Order</TableHead>
+              <TableHead>Amazon / Products</TableHead>
+              <TableHead>Dispatch SLA</TableHead>
+              <TableHead>Dates</TableHead>
+              <TableHead>ePost Movement</TableHead>
+              <TableHead>Delay</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow key={row.id} className={row.dispatch_status === "late_dispatch" ? "bg-destructive/10" : row.dispatch_status === "pending_dispatch" ? "bg-warning/10" : ""}>
+                <TableCell>
+                  <Checkbox
+                    checked={selected.includes(row.id)}
+                    onCheckedChange={(checked, event) => {
+                      onSelectAll(false)
+                      const visibleIds = rows.map((item) => item.id)
+                      onSelected(rangeSelection(visibleIds, selected, row.id, Boolean(checked), event.shiftKey, selectionAnchor.current))
+                      selectionAnchor.current = row.id
+                    }}
+                  />
+                </TableCell>
+                <TableCell>
+                  <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName="font-medium" />
+                  <div className="text-xs text-muted-foreground">{row.store_name} · {row.line_count} line{Number(row.line_count || 0) === 1 ? "" : "s"}</div>
+                </TableCell>
+                <TableCell className="max-w-[360px]">
+                  <div className="font-mono text-sm">{row.amazon_order_ids || "No Amazon order"}</div>
+                  <div className="truncate text-xs text-muted-foreground">{row.products || row.asins}</div>
+                </TableCell>
+                <TableCell>
+                  <div className="grid gap-1">
+                    <Badge variant={dispatchStatusBadgeVariant(row.dispatch_status) as any}>{dispatchStatusLabel(row.dispatch_status)}</Badge>
+                    <span className="text-xs text-muted-foreground">{row.dispatch_source || "No dispatch sync yet"}</span>
+                  </div>
+                </TableCell>
+                <TableCell className="text-sm">
+                  <div>Odoo: {formatDateTime(row.odoo_order_date)}</div>
+                  <div>Amazon delivered: {row.amazon_delivered_display || formatDateTime(row.amazon_delivered_at) || "Not delivered"}</div>
+                  <div>Dispatch: {row.dispatched_at ? formatDateTime(row.dispatched_at) : "Not dispatched"}</div>
+                  <div>Checked: {formatDateTime(row.tracking_checked_at)}</div>
+                </TableCell>
+                <TableCell className="max-w-[320px]">
+                  {row.movement_at ? (
+                    <div className="grid gap-1">
+                      <span>{formatDateTime(row.movement_at)}</span>
+                      <span className="truncate text-xs text-muted-foreground">{row.movement_tracking_code} · {row.movement_status}</span>
+                    </div>
+                  ) : (
+                    <span className="text-muted-foreground">No ePost movement yet</span>
+                  )}
+                </TableCell>
+                <TableCell className="text-sm">
+                  <div>Order to dispatch: {row.dispatch_delay_days ?? "-"} day(s)</div>
+                  <div>Dispatch to movement: {row.movement_delay_days ?? "-"} day(s)</div>
+                  <div className={Number(row.total_delay_days || 0) > 0 ? "text-destructive font-medium" : "text-muted-foreground"}>
+                    Delay vs SLA: {row.total_delay_days ?? "-"} day(s)
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+            {!rows.length && (
+              <TableRow>
+                <TableCell colSpan={7} className="py-8 text-center text-muted-foreground">
+                  No dispatch status rows match this filter.
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  )
+}
+
 function FulfilmentPendingPage({
   rows,
   storeId,
   page,
   total,
+  query,
+  loading: externalLoading,
   onPage,
+  onQuery,
   selected,
   selectAll,
   onSelected,
@@ -5367,7 +5732,10 @@ function FulfilmentPendingPage({
   storeId: string
   page: number
   total: number
+  query: string
+  loading: boolean
   onPage: (page: number) => void
+  onQuery: (value: string) => void
   selected: number[]
   selectAll: boolean
   onSelected: (ids: number[]) => void
@@ -5377,6 +5745,7 @@ function FulfilmentPendingPage({
   onRefresh: () => Promise<void>
 }) {
   const [loading, setLoading] = useState(false)
+  const isLoading = loading || externalLoading
   const selectionAnchor = useRef<number | null>(null)
   function rowPackages(row: FulfilmentPendingRow) {
     try {
@@ -5401,15 +5770,32 @@ function FulfilmentPendingPage({
           <CardTitle>Amazon Delivered, Odoo Fulfilment Pending</CardTitle>
           <CardDescription>Delivered Amazon orders whose related Odoo pickings are not done or cancelled in the selected store.</CardDescription>
         </div>
-        <Button variant="outline" onClick={refresh} disabled={loading || !storeId}>
-          <RefreshCw className="size-4" />
-          Check Odoo
-        </Button>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+          <div className="min-w-[280px]">
+            <Label>Search</Label>
+            <SearchBox value={query} onChange={onQuery} placeholder="Order, Amazon id, ASIN, product, carrier..." />
+          </div>
+          <Button variant="outline" onClick={refresh} disabled={isLoading || !storeId}>
+            <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
+            Check Odoo
+          </Button>
+        </div>
       </CardHeader>
+      {isLoading ? (
+        <div className="border-t px-6 py-3">
+          <div className="d-flex align-items-center justify-content-between gap-3 text-sm">
+            <span className="text-muted-foreground">Fetching delivered Amazon orders and checking Odoo pickings...</span>
+            <span className="text-muted-foreground">{rows.length ? `${rows.length} current result${rows.length === 1 ? "" : "s"}` : "checking"}</span>
+          </div>
+          <div className="progress mt-2">
+            <div className="progress-bar progress-bar-striped progress-bar-animated bg-primary" style={{ width: "100%" }} />
+          </div>
+        </div>
+      ) : null}
       <div className="border-t px-6 py-3">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <ExportControls view="fulfilment_pending" storeId={storeId} columns={fulfilmentPendingExportColumns} selectedIds={selected} selectAll={selectAll} total={total} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
-          <PaginationControls page={page} total={total} onPage={onPage} disabled={loading} />
+          <ExportControls view="fulfilment_pending" storeId={storeId} columns={fulfilmentPendingExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ q: query.trim() }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+          <PaginationControls page={page} total={total} onPage={onPage} disabled={isLoading} />
         </div>
       </div>
       <CardContent className="p-0">
@@ -5482,7 +5868,10 @@ function FulfilmentPendingPage({
                     <TableCell>
                       <div className="grid gap-1">
                         <StatusBadge value={row.tracking_status || "Delivered"} />
-                        <span className="text-xs text-muted-foreground">{formatDateTime(row.tracking_checked_at)}</span>
+                        <span className="text-xs font-medium">
+                          Delivered: {row.amazon_delivered_display || formatDateTime(row.amazon_delivered_at) || "date unknown"}
+                        </span>
+                        <span className="text-xs text-muted-foreground">Checked: {formatDateTime(row.tracking_checked_at)}</span>
                       </div>
                     </TableCell>
                     <TableCell className="max-w-[320px]">
@@ -5522,8 +5911,13 @@ function EpostTrackingPage({
   page,
   total,
   statusFilter,
+  staleDays,
+  staleOnly,
+  initialLoading,
   onPage,
   onStatusFilter,
+  onStaleDays,
+  onStaleOnly,
   selected,
   selectAll,
   onSelected,
@@ -5537,8 +5931,13 @@ function EpostTrackingPage({
   page: number
   total: number
   statusFilter: string
+  staleDays: string
+  staleOnly: boolean
+  initialLoading: boolean
   onPage: (page: number) => void
   onStatusFilter: (value: string) => void
+  onStaleDays: (value: string) => void
+  onStaleOnly: (value: boolean) => void
   selected: number[]
   selectAll: boolean
   onSelected: (ids: number[]) => void
@@ -5548,8 +5947,53 @@ function EpostTrackingPage({
   onRows: (rows: EpostTrackingRow[], total: number) => void
 }) {
   const [loading, setLoading] = useState(false)
+  const isLoading = loading || initialLoading
   const [syncDays, setSyncDays] = useState("2")
   const selectionAnchor = useRef<number | null>(null)
+  function refundDetails(row: EpostTrackingRow) {
+    return [
+      "ePost refund claim",
+      `Store: ${row.store_name || ""}`,
+      `Odoo order: ${row.odoo_order_name || ""}`,
+      `Picking: ${row.picking_name || ""}`,
+      `Amazon order: ${row.amazon_order_id || "Not linked"}`,
+      `Tracking: ${row.tracking_code || ""}`,
+      `Tracking URL: ${row.tracking_url || `https://epgtrack.com/${row.tracking_code}`}`,
+      `Status: ${row.status || row.epost_status || ""}`,
+      `Last update: ${row.last_update_at || ""}`,
+      `Days since update: ${typeof row.days_since_update === "number" ? row.days_since_update : ""}`,
+      `Destination: ${row.destination || ""}`,
+      `AWB: ${row.awb || ""}`,
+      `Shipping total: ${formatMoney(Number(row.shipping_total || 0))}`,
+      `Shipping fee: ${formatMoney(Number(row.shipping_fee || 0))}`,
+      `Fulfilment fee: ${formatMoney(Number(row.fulfilment_fee || 0))}`,
+      `Odoo URL: ${row.odoo_order_url || ""}`,
+    ].filter((line) => !line.endsWith(": ")).join("\n")
+  }
+  async function copyRefundDetails(row: EpostTrackingRow) {
+    const details = refundDetails(row)
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(details)
+      } else {
+        const textarea = document.createElement("textarea")
+        textarea.value = details
+        textarea.setAttribute("readonly", "true")
+        textarea.style.position = "fixed"
+        textarea.style.opacity = "0"
+        document.body.appendChild(textarea)
+        textarea.select()
+        const copied = document.execCommand("copy")
+        document.body.removeChild(textarea)
+        if (!copied) throw new Error("Clipboard copy is not available in this browser.")
+      }
+      onResult({ ok: true, title: "Refund Details Copied", message: "Shipment details copied to clipboard." })
+      return true
+    } catch (error) {
+      onResult({ ok: false, title: "Copy Failed", message: String(error) })
+      return false
+    }
+  }
   async function refresh() {
     setLoading(true)
     try {
@@ -5558,6 +6002,8 @@ function EpostTrackingPage({
       query.set("page", String(page))
       query.set("per_page", String(PAGE_SIZE))
       query.set("status", statusFilter)
+      query.set("stale_days", staleDays || "10")
+      query.set("stale_only", staleOnly ? "true" : "false")
       const result = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${query.toString()}`)
       onRows(result.rows, result.total || 0)
     } catch (error) {
@@ -5579,11 +6025,41 @@ function EpostTrackingPage({
       query.set("page", "1")
       query.set("per_page", String(PAGE_SIZE))
       query.set("status", statusFilter)
+      query.set("stale_days", staleDays || "10")
+      query.set("stale_only", staleOnly ? "true" : "false")
       const refreshed = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${query.toString()}`)
       onRows(refreshed.rows, refreshed.total || 0)
       onResult({ ok: true, title: "ePost Sync", message: result.message })
     } catch (error) {
       onResult({ ok: false, title: "ePost Sync Failed", message: String(error) })
+    } finally {
+      setLoading(false)
+    }
+  }
+  async function markRefund(row: EpostTrackingRow, status: "claimed" | "received" | "clear") {
+    setLoading(true)
+    try {
+      const copied = status === "claimed" ? await copyRefundDetails(row) : false
+      const result = await api<{ ok: boolean; row: EpostTrackingRow | null }>(`/api/epost/tracking/${row.id}/refund`, {
+        method: "POST",
+        body: JSON.stringify({ status }),
+      })
+      const updated = result.row
+      if (updated) {
+        onRows(rows.map((item) => item.id === row.id ? {
+          ...item,
+          refund_status: updated.refund_status || "",
+          refund_claimed_at: updated.refund_claimed_at || "",
+          refund_received_at: updated.refund_received_at || "",
+        } : item), total)
+      }
+      onResult({
+        ok: true,
+        title: "Refund Updated",
+        message: status === "received" ? "Shipment marked as refund received." : status === "claimed" ? `Shipment marked as refund claimed${copied ? " and details copied." : "."}` : "Refund status cleared.",
+      })
+    } catch (error) {
+      onResult({ ok: false, title: "Refund Update Failed", message: String(error) })
     } finally {
       setLoading(false)
     }
@@ -5609,28 +6085,56 @@ function EpostTrackingPage({
           </div>
           <SelectField className="w-36" label="Status" value={statusFilter} onChange={onStatusFilter}>
             <option value="all">All</option>
+            <option value="active">Not delivered</option>
             <option value="pending">Pending</option>
+            <option value="suspected_lost">Suspected lost</option>
             <option value="lost">Lost</option>
             <option value="delivered">Delivered</option>
           </SelectField>
-          <Button variant="outline" onClick={refresh} disabled={loading}>
-            <RefreshCw className="size-4" />
+          <div className="w-32">
+            <Label htmlFor="epost-stale-days">Suspect after days</Label>
+            <Input
+              id="epost-stale-days"
+              type="number"
+              min={1}
+              max={90}
+              value={staleDays}
+              onChange={(event) => onStaleDays(event.target.value)}
+            />
+          </div>
+          <label className="form-check mb-2">
+            <Checkbox checked={staleOnly} onCheckedChange={(checked) => onStaleOnly(Boolean(checked))} />
+            <span className="form-check-label">Only no update after days</span>
+          </label>
+          <Button variant="outline" onClick={refresh} disabled={isLoading}>
+            <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
             Refresh
           </Button>
-          <Button onClick={syncFromOdoo} disabled={loading || !storeId}>
+          <Button onClick={syncFromOdoo} disabled={isLoading || !storeId}>
             <PackageCheck className="size-4" />
             Sync from Odoo
           </Button>
         </div>
       </CardHeader>
+      {isLoading ? (
+        <div className="border-t px-6 py-3">
+          <div className="d-flex align-items-center justify-content-between gap-3 text-sm">
+            <span className="text-muted-foreground">Loading ePost rows, charges, and matched Amazon orders...</span>
+            <span className="text-muted-foreground">{rows.length ? `${rows.length} cached result${rows.length === 1 ? "" : "s"}` : "loading"}</span>
+          </div>
+          <div className="progress mt-2">
+            <div className="progress-bar progress-bar-striped progress-bar-animated bg-primary" style={{ width: "100%" }} />
+          </div>
+        </div>
+      ) : null}
       <div className="border-t px-6 py-3">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <ExportControls view="epost" storeId={storeId} columns={epostExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ status: statusFilter }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
-          <PaginationControls page={page} total={total} onPage={onPage} disabled={loading} />
+          <ExportControls view="epost" storeId={storeId} columns={epostExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ status: statusFilter, stale_days: staleDays || "10", stale_only: staleOnly ? "true" : "false" }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+          <PaginationControls page={page} total={total} onPage={onPage} disabled={isLoading} />
         </div>
       </div>
-      <CardContent className="p-0">
-        <Table>
+      <CardContent className="p-0 epost-tracking-table-wrap">
+        <Table className="epost-tracking-table">
           <TableHeader>
             <TableRow>
               <TableHead className="w-10">
@@ -5643,21 +6147,22 @@ function EpostTrackingPage({
                   }}
                 />
               </TableHead>
-              <TableHead>Store</TableHead>
-              <TableHead>Odoo Order</TableHead>
-              <TableHead>Amazon Order</TableHead>
-              <TableHead>ePost Tracking</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Shipping Charges</TableHead>
-              <TableHead>Last Update</TableHead>
-              <TableHead>Destination</TableHead>
-              <TableHead>AWB</TableHead>
-              <TableHead>Checked</TableHead>
+              <TableHead className="epost-col-store">Store</TableHead>
+              <TableHead className="epost-col-order">Odoo Order</TableHead>
+              <TableHead className="epost-col-amazon">Amazon Order</TableHead>
+              <TableHead className="epost-col-tracking">ePost Tracking</TableHead>
+              <TableHead className="epost-col-status">Status</TableHead>
+              <TableHead className="epost-col-charges">Shipping Charges</TableHead>
+              <TableHead className="epost-col-refund">Refund</TableHead>
+              <TableHead className="epost-col-date">Last Update</TableHead>
+              <TableHead className="epost-col-destination">Destination</TableHead>
+              <TableHead className="epost-col-awb">AWB</TableHead>
+              <TableHead className="epost-col-checked">Checked</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {rows.map((row) => (
-              <TableRow key={row.id} className={row.epost_status === "lost" ? "bg-destructive/10" : row.epost_status === "delivered" ? "" : "bg-muted/30"}>
+              <TableRow key={row.id} className={row.refund_status === "received" ? "epost-refund-received-row" : row.refund_status === "claimed" ? "bg-success/10" : row.suspected_lost || row.epost_status === "lost" ? "bg-destructive/10" : row.epost_status === "delivered" ? "" : "bg-muted/30"}>
                 <TableCell>
                   <Checkbox
                     checked={selected.includes(row.id)}
@@ -5686,10 +6191,15 @@ function EpostTrackingPage({
                     {row.tracking_code}
                   </a>
                 </TableCell>
-                <TableCell>
-                  <StatusBadge value={row.epost_status === "lost" ? "lost" : row.status || row.epost_status || "pending"} />
+                <TableCell className="epost-cell-status">
+                  <div className="grid gap-1">
+                    <span className="epost-status-pill"><StatusBadge value={row.epost_status === "lost" ? "lost" : row.status || row.epost_status || "pending"} /></span>
+                    {row.suspected_lost ? (
+                      <Badge variant="destructive">suspect {row.days_since_update ?? staleDays}+ days</Badge>
+                    ) : null}
+                  </div>
                 </TableCell>
-                <TableCell>
+                <TableCell className="epost-cell-charges">
                   {Number(row.shipping_total || 0) > 0 ? (
                     <div className="grid gap-1 text-sm">
                       <span className="font-semibold">{formatMoney(Number(row.shipping_total || 0))}</span>
@@ -5702,7 +6212,47 @@ function EpostTrackingPage({
                     <span className="text-muted-foreground">Not synced</span>
                   )}
                 </TableCell>
-                <TableCell>{row.last_update_at || ""}</TableCell>
+                <TableCell className="epost-cell-refund">
+                  <div className="grid gap-2">
+                    {row.refund_status === "received" ? (
+                      <>
+                        <Badge variant="outline" className="epost-refund-received-badge">Refund received</Badge>
+                        <span className="text-xs text-muted-foreground">{formatDateTime(row.refund_received_at)}</span>
+                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Copy refund details" onClick={() => copyRefundDetails(row)}>
+                          <Copy className="size-4" />
+                        </Button>
+                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Reset refund status" onClick={() => markRefund(row, "clear")}>
+                          <RefreshCw className="size-4" />
+                        </Button>
+                      </>
+                    ) : row.refund_status === "claimed" ? (
+                      <>
+                        <Badge variant="outline">Refund claimed</Badge>
+                        <span className="text-xs text-muted-foreground">{formatDateTime(row.refund_claimed_at)}</span>
+                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Copy refund details" onClick={() => copyRefundDetails(row)}>
+                          <Copy className="size-4" />
+                        </Button>
+                        <Button size="sm" variant="success" disabled={isLoading} onClick={() => markRefund(row, "received")}>
+                          <Check className="size-4" />
+                          Received
+                        </Button>
+                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Reset refund status" onClick={() => markRefund(row, "clear")}>
+                          <RefreshCw className="size-4" />
+                        </Button>
+                      </>
+                    ) : (
+                      <Button size="sm" variant="outline" disabled={isLoading} onClick={() => markRefund(row, "claimed")}>
+                        Claim refund
+                      </Button>
+                    )}
+                  </div>
+                </TableCell>
+                <TableCell className="epost-cell-date">
+                  <div className="grid gap-1">
+                    <span>{row.last_update_at || ""}</span>
+                    {typeof row.days_since_update === "number" ? <span className={row.suspected_lost ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>{row.days_since_update} day{row.days_since_update === 1 ? "" : "s"} ago</span> : null}
+                  </div>
+                </TableCell>
                 <TableCell>{row.destination || ""}</TableCell>
                 <TableCell>{row.awb || ""}</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.last_checked_at)}</TableCell>
@@ -5710,8 +6260,8 @@ function EpostTrackingPage({
             ))}
             {!rows.length && (
               <TableRow>
-                <TableCell colSpan={11} className="py-8 text-center text-muted-foreground">
-                  No ePost Global tracking codes match this filter.
+                <TableCell colSpan={12} className="py-8 text-center text-muted-foreground">
+                  {isLoading ? "Applying ePost tracking filter..." : "No ePost Global tracking codes match this filter."}
                 </TableCell>
               </TableRow>
             )}
@@ -5994,6 +6544,38 @@ function InventoryPage({
       onResult({ ok: false, title: "Inventory Add Failed", message: String(error) })
     }
   }
+
+  async function attachInventory(item: InventoryItem) {
+    const orderRef = window.prompt(`Attach ${item.asin} inventory to which new Odoo order? Enter order name, e.g. NC12345.`)
+    if (!orderRef?.trim()) return
+    try {
+      const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${item.id}/attach`, {
+        method: "POST",
+        body: JSON.stringify({ order_ref: orderRef.trim() }),
+      })
+      onPage(1)
+      onRows(result.items || [], result.total || 0)
+      onResult({ ok: result.ok, title: "Inventory Attached", message: result.message })
+    } catch (error) {
+      onResult({ ok: false, title: "Inventory Attach Failed", message: String(error) })
+    }
+  }
+
+  async function confirmInventorySent(item: InventoryItem) {
+    const target = item.reserved_odoo_order_name || `line ${item.reserved_order_line_id}`
+    if (!window.confirm(`Confirm inventory item ${item.asin} was manually sent for ${target}? This removes the used quantity from active inventory.`)) return
+    try {
+      const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${item.id}/confirm-sent`, {
+        method: "POST",
+      })
+      onPage(1)
+      onRows(result.items || [], result.total || 0)
+      onResult({ ok: result.ok, title: "Inventory Sent", message: result.message })
+    } catch (error) {
+      onResult({ ok: false, title: "Inventory Sent Failed", message: String(error) })
+    }
+  }
+
   return (
     <div className="grid gap-5">
       <Card>
@@ -6055,6 +6637,7 @@ function InventoryPage({
                 <TableHead>Reserved For</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Updated</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -6073,14 +6656,42 @@ function InventoryPage({
                     {item.amazon_order_id ? <a className="font-mono text-xs text-primary underline-offset-4 hover:underline" href={item.amazon_order_url} target="_blank">{item.amazon_order_id}</a> : <span className="text-muted-foreground">Manual</span>}
                     <div className="text-xs text-muted-foreground">{item.amazon_account_name || ""}</div>
                   </TableCell>
-                  <TableCell>{item.reserved_order_line_id ? <Badge variant="secondary">Line {item.reserved_order_line_id}</Badge> : ""}</TableCell>
+                  <TableCell>
+                    {item.reserved_order_line_id ? (
+                      <div className="grid gap-1">
+                        {item.reserved_odoo_order_name ? (
+                          <OdooOrderRef name={item.reserved_odoo_order_name} url={item.reserved_odoo_order_url} />
+                        ) : (
+                          <Badge variant="secondary">Line {item.reserved_order_line_id}</Badge>
+                        )}
+                        <span className="text-xs text-muted-foreground">
+                          Attached{item.reserved_quantity ? ` qty ${Number(item.reserved_quantity).toLocaleString()}` : ""}
+                        </span>
+                      </div>
+                    ) : <span className="text-muted-foreground">Not attached</span>}
+                  </TableCell>
                   <TableCell><StatusBadge value={item.status} /></TableCell>
                   <TableCell className="text-xs text-muted-foreground">{formatDateTime(item.updated_at)}</TableCell>
+                  <TableCell className="text-right">
+                    <div className="btn-list justify-end">
+                      {item.status === "reserved" ? (
+                        <Button size="sm" onClick={() => confirmInventorySent(item)}>
+                          <CheckCircle2 className="size-4" />
+                          Confirm Sent
+                        </Button>
+                      ) : (
+                        <Button variant="outline" size="sm" disabled={item.status === "used"} onClick={() => attachInventory(item)}>
+                          <Link className="size-4" />
+                          Attach
+                        </Button>
+                      )}
+                    </div>
+                  </TableCell>
                 </TableRow>
               ))}
               {!rows.length && (
                 <TableRow>
-                  <TableCell colSpan={8} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
+                  <TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
                 </TableRow>
               )}
             </TableBody>
@@ -7110,7 +7721,7 @@ function ProfitLossPage({
             </CardDescription>
           )}
         </CardHeader>
-        <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_220px_1fr_auto] lg:items-end">
+        <CardContent className="grid gap-3 lg:grid-cols-[160px_180px_240px_1fr_auto] lg:items-end">
           <SelectField label="View" value={period} onChange={(value) => { onPeriod(value); setPage(1) }}>
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
@@ -7126,16 +7737,16 @@ function ProfitLossPage({
               <Input type="month" value={month} onChange={(event) => { setMonth(event.target.value); setPage(1) }} />
             )}
           </div>
-          <SelectField label="Net Profit Includes" value={profitScope} onChange={(value) => { setProfitScope(value); setPage(1) }}>
+          <SelectField label="Profit Calculation" value={profitScope} onChange={(value) => { setProfitScope(value); setPage(1) }}>
             <option value="all">All orders</option>
-            <option value="ordered">Ordered on Amazon</option>
+            <option value="ordered">Hide not ordered</option>
             <option value="not_ordered">Not ordered on Amazon</option>
           </SelectField>
           <div>
-            <Label>Search</Label>
-            <SearchBox value={query} onChange={setQuery} placeholder="Odoo order or Amazon order" />
+            <Label>Search Order Profit/Loss</Label>
+            <SearchBox value={query} onChange={setQuery} placeholder="Odoo order, Amazon order, account..." />
           </div>
-          <Button variant="outline" onClick={applyFilters}>Apply</Button>
+          <Button variant="outline" onClick={applyFilters}>Search</Button>
         </CardContent>
         <CardContent className="grid gap-3 lg:grid-cols-[1fr_auto] lg:items-end">
           <div>
@@ -8871,13 +9482,13 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                             </Badge>
                             {order.fulfillment_status ? <span className="text-xs text-muted-foreground">{order.fulfillment_status}</span> : null}
                             <span className="text-xs text-muted-foreground">{order.created_at ? formatDateTime(order.created_at) : ""}</span>
-                            {order.cancel_error ? <span className="text-xs text-destructive">{order.cancel_error}</span> : null}
+                            {order.cancel_error ? <span className="max-w-[280px] text-xs"><ErrorTooltip value={order.cancel_error} /></span> : null}
                           </div>
                         ))}
                       </div>
                     </TableCell>
                     <TableCell>
-                      {group.error ? <span className="text-destructive">{group.error}</span> : `${Number(group.duplicate_count || 0).toLocaleString()} duplicate${Number(group.duplicate_count || 0) === 1 ? "" : "s"}`}
+                      {group.error ? <ErrorTooltip value={group.error} /> : `${Number(group.duplicate_count || 0).toLocaleString()} duplicate${Number(group.duplicate_count || 0) === 1 ? "" : "s"}`}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -9100,7 +9711,7 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
         <CardHeader><CardTitle>Tracking Jobs</CardTitle></CardHeader>
         <CardContent className="p-0">
           <Table>
-            <TableHeader><TableRow><TableHead>Date Range</TableHead><TableHead>Status</TableHead><TableHead>Progress</TableHead><TableHead>Current Order</TableHead><TableHead>Report</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>Date Range</TableHead><TableHead>Run Time</TableHead><TableHead>Status</TableHead><TableHead>Progress</TableHead><TableHead>Current Order</TableHead><TableHead>Report</TableHead><TableHead>Error</TableHead><TableHead /></TableRow></TableHeader>
             <TableBody>
               {jobs.map((job) => {
                 const progress = jobProgress(job)
@@ -9109,6 +9720,11 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
                     <TableCell>
                       <div>{job.from_date} to {job.to_date}{job.dry_run ? " (dry run)" : ""}</div>
                       <div className="text-xs text-muted-foreground">Attempt {job.attempts}</div>
+                    </TableCell>
+                    <TableCell className="min-w-40">
+                      <div className="font-medium">{job.locked_at ? formatDateTime(job.locked_at) : "Not started"}</div>
+                      <div className="text-xs text-muted-foreground">Queued {formatDateTime(job.created_at)}</div>
+                      {job.completed_at ? <div className="text-xs text-muted-foreground">Finished {formatDateTime(job.completed_at)}</div> : null}
                     </TableCell>
                     <TableCell><StatusBadge value={job.status} /></TableCell>
                     <TableCell className="min-w-48">
@@ -9172,7 +9788,7 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
                   </TableRow>
                 )
               })}
-              {!jobs.length && <TableRow><TableCell colSpan={7} className="py-8 text-center text-muted-foreground">No tracking sync jobs yet.</TableCell></TableRow>}
+              {!jobs.length && <TableRow><TableCell colSpan={8} className="py-8 text-center text-muted-foreground">No tracking sync jobs yet.</TableCell></TableRow>}
             </TableBody>
           </Table>
         </CardContent>

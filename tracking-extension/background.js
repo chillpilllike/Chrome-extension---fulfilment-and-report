@@ -1,11 +1,15 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
+const AUTO_TRACKING_ALARM = "amazonTrackingAuto";
+const DEFAULT_AUTO_TRACKING_HOURS = 3;
 
 async function getState() {
   return chrome.storage.local.get({
     apiBase: DEFAULT_API_BASE,
     adminToken: "",
     headlessTrackingMode: false,
+    autoTrackingEnabled: false,
+    autoTrackingHours: DEFAULT_AUTO_TRACKING_HOURS,
     tracking: { running: false, orders: [], index: 0, packages: [], packageIndex: 0 },
     trackingByWindow: {},
     logs: [],
@@ -94,6 +98,38 @@ function connectionErrorMessage(error, base = "") {
 
 function isConnectionError(error) {
   return /failed to fetch|networkerror|load failed|abort|could not reach/i.test(String(error?.message || error || ""));
+}
+
+function clampAutoHours(value, fallback = DEFAULT_AUTO_TRACKING_HOURS) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(168, Math.round(parsed)));
+}
+
+async function scheduleAutoTracking(enabled, hours) {
+  await chrome.alarms.clear(AUTO_TRACKING_ALARM);
+  if (!enabled) return;
+  const autoTrackingHours = clampAutoHours(hours);
+  chrome.alarms.create(AUTO_TRACKING_ALARM, {
+    delayInMinutes: Math.max(1, autoTrackingHours * 60),
+    periodInMinutes: Math.max(1, autoTrackingHours * 60),
+  });
+}
+
+async function restoreAutoTrackingAlarm() {
+  const state = await getState();
+  await scheduleAutoTracking(state.autoTrackingEnabled === true, state.autoTrackingHours);
+}
+
+async function startAutoTracking() {
+  const state = await getState();
+  if (state.autoTrackingEnabled !== true) return { ok: false, message: "Amazon auto tracking is disabled." };
+  if (state.tracking?.running) {
+    await log("Skipped scheduled Amazon tracking because a visible tracking run is already active.");
+    return { ok: true, skipped: true };
+  }
+  await log(`Scheduled Amazon tracking started; interval is every ${clampAutoHours(state.autoTrackingHours)} hour(s).`);
+  return startTracking(null);
 }
 
 async function testConnection() {
@@ -362,6 +398,22 @@ async function postStandalonePackageTracking(message, windowId) {
   return { ok: true, recovered: true, message: `Posted standalone tracking update for ${amazonOrderId}.` };
 }
 
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === AUTO_TRACKING_ALARM) {
+    startAutoTracking().catch((error) => log(`Scheduled Amazon tracking failed: ${error.message}`));
+  }
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  restoreAutoTrackingAlarm().catch((error) => log(`Could not restore Amazon auto tracking: ${error.message}`));
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  restoreAutoTrackingAlarm()
+    .then(() => startAutoTracking())
+    .catch((error) => log(`Could not start Amazon auto tracking after Chrome startup: ${error.message}`));
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
@@ -372,7 +424,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         apiBase: normalizeApiBase(message.apiBase),
         adminToken: message.adminToken || "",
         headlessTrackingMode: message.headlessTrackingMode === true,
+        autoTrackingEnabled: message.autoTrackingEnabled === true,
+        autoTrackingHours: clampAutoHours(message.autoTrackingHours),
       });
+      await scheduleAutoTracking(message.autoTrackingEnabled === true, message.autoTrackingHours);
       return { ok: true };
     }
     if (message.type === "START_TRACKING") return startTracking(windowId);

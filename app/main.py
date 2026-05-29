@@ -64,6 +64,7 @@ from app.schemas import (
     DeleteLinesPayload,
     EnginePayload,
     EpostBrowserlessRunPayload,
+    EpostRefundPayload,
     ExportCreatePayload,
     EpostSyncPayload,
     EpostTrackingUpdatePayload,
@@ -304,6 +305,7 @@ FRONTEND_SHELL_PATHS = {
     "/orders",
     "/pull-jobs",
     "/tracking",
+    "/dispatch-status",
     "/payment-failed",
     "/amazon-otp",
     "/epost",
@@ -672,6 +674,9 @@ def init_db() -> None:
                 events_json TEXT,
                 last_checked_at TEXT,
                 epost_status TEXT NOT NULL DEFAULT 'pending',
+                refund_status TEXT NOT NULL DEFAULT '',
+                refund_claimed_at TEXT,
+                refund_received_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(store_id, tracking_code)
@@ -997,6 +1002,7 @@ def init_db() -> None:
         for column, ddl in {
             "source_type": "ALTER TABLE inventory_items ADD COLUMN source_type TEXT NOT NULL DEFAULT 'amazon_cancelled'",
             "reserved_order_line_id": "ALTER TABLE inventory_items ADD COLUMN reserved_order_line_id INTEGER",
+            "reserved_quantity": "ALTER TABLE inventory_items ADD COLUMN reserved_quantity REAL",
             "reserved_at": "ALTER TABLE inventory_items ADD COLUMN reserved_at TEXT",
             "used_at": "ALTER TABLE inventory_items ADD COLUMN used_at TEXT",
             "manual_reference": "ALTER TABLE inventory_items ADD COLUMN manual_reference TEXT",
@@ -1007,6 +1013,14 @@ def init_db() -> None:
         existing_tracking_cols = {r["name"] for r in conn.execute("PRAGMA table_info(shopify_tracking_jobs)").fetchall()}
         if "progress_json" not in existing_tracking_cols:
             conn.execute("ALTER TABLE shopify_tracking_jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
+        existing_epost_cols = {r["name"] for r in conn.execute("PRAGMA table_info(epost_global_tracking)").fetchall()}
+        for column, ddl in {
+            "refund_status": "ALTER TABLE epost_global_tracking ADD COLUMN refund_status TEXT NOT NULL DEFAULT ''",
+            "refund_claimed_at": "ALTER TABLE epost_global_tracking ADD COLUMN refund_claimed_at TEXT",
+            "refund_received_at": "ALTER TABLE epost_global_tracking ADD COLUMN refund_received_at TEXT",
+        }.items():
+            if column not in existing_epost_cols:
+                conn.execute(ddl)
         for index_sql in (
             "CREATE INDEX IF NOT EXISTS idx_inventory_store_asin_status ON inventory_items(store_id, asin, status)",
             "CREATE INDEX IF NOT EXISTS idx_inventory_store_asin_available_qty ON inventory_items(store_id, asin) WHERE status='available'",
@@ -2792,19 +2806,45 @@ def list_inventory_items(store_id: Optional[int] = None, page: int = 1, per_page
     page = max(1, int(page or 1))
     per_page = max(1, min(100, int(per_page or 100)))
     offset = (page - 1) * per_page
+    where = "WHERE status != 'used' AND (? IS NULL OR store_id=?)"
     with db() as conn:
         total = conn.execute(
-            "SELECT COUNT(*) AS count FROM inventory_items WHERE (? IS NULL OR store_id=?)",
+            f"SELECT COUNT(*) AS count FROM inventory_items {where}",
             (store_id, store_id),
         ).fetchone()["count"]
-        if store_id:
-            rows = conn.execute(
-                "SELECT * FROM inventory_items WHERE store_id=? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-                (store_id, per_page, offset),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM inventory_items ORDER BY updated_at DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM inventory_items {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+            (store_id, store_id, per_page, offset),
+        ).fetchall()
     return rows, int(total)
+
+
+def inventory_items_payload(items: list[Any]) -> list[dict[str, Any]]:
+    data = rows_to_dicts(items)
+    reserved_ids = sorted({
+        int(item.get("reserved_order_line_id") or 0)
+        for item in data
+        if int(item.get("reserved_order_line_id") or 0)
+    })
+    if not reserved_ids:
+        return data
+    with db() as conn:
+        placeholders = ",".join("?" for _ in reserved_ids)
+        rows = rows_to_dicts(conn.execute(
+            f"SELECT id, store_id, odoo_order_id, odoo_order_name, product_name FROM order_lines WHERE id IN ({placeholders})",
+            reserved_ids,
+        ).fetchall())
+    lines_by_id = {int(row["id"]): row for row in rows}
+    stores_by_id = {int(store["id"]): store for store in rows_to_dicts(list_stores())}
+    for item in data:
+        line = lines_by_id.get(int(item.get("reserved_order_line_id") or 0))
+        if not line:
+            continue
+        store = stores_by_id.get(int(line.get("store_id") or item.get("store_id") or 0))
+        item["reserved_odoo_order_name"] = line.get("odoo_order_name") or ""
+        item["reserved_odoo_order_url"] = odoo_order_admin_url(store, line.get("odoo_order_id")) if store else ""
+        item["reserved_product_name"] = line.get("product_name") or ""
+    return data
 
 
 def list_cancelled_order_lines(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int]:
@@ -2893,10 +2933,10 @@ def reserve_inventory_for_line(line: dict[str, Any]) -> bool:
             conn.execute(
                 """
                 UPDATE inventory_items
-                SET status='reserved', reserved_order_line_id=?, reserved_at=?, updated_at=?
+                SET status='reserved', reserved_order_line_id=?, reserved_quantity=?, reserved_at=?, updated_at=?
                 WHERE id=?
                 """,
-                (line["id"], utc_now(), utc_now(), item["id"]),
+                (line["id"], float(item["quantity"] or 0), utc_now(), utc_now(), item["id"]),
             )
         conn.execute(
             """
@@ -2914,6 +2954,21 @@ def reserve_inventory_for_line(line: dict[str, Any]) -> bool:
             ),
         )
     return True
+
+
+def append_note(existing: str, note: str) -> str:
+    existing = clean_text(existing)
+    note = clean_text(note)
+    if not existing:
+        return note
+    if not note or note in existing:
+        return existing
+    return f"{existing} | {note}"
+
+
+def refresh_inventory_response(store_id: Optional[int], page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    items, total = list_inventory_items(store_id, page, per_page)
+    return {"items": inventory_items_payload(items), "page": page, "per_page": per_page, "total": total}
 
 
 def list_missing_order_lines(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int]:
@@ -6180,6 +6235,7 @@ ORDER_CONDITION_FILTERS: dict[str, str] = {
     "delivered": "state:=delivered",
     "inventory": "state:=inventory",
     "error": "state:=error",
+    "amazon_cancelled": "",
     "cancelled_refunded": "odoo_status_label:=[cancelled,refunded]",
 }
 
@@ -6209,7 +6265,7 @@ def order_condition_uses_typesense(condition: str, country: str = "") -> bool:
     # The UI's "Missing marked" state also includes rows with missing_asin set.
     # Typesense's current order_lines collection cannot reliably express
     # non-empty string filters across old schemas, so use Postgres for this one.
-    return condition_key != "missing"
+    return condition_key not in {"missing", "amazon_cancelled"}
 
 
 def order_condition_sql(condition: str = "all", store_id: Optional[int] = None, country: str = "") -> tuple[str, list[Any], bool]:
@@ -6231,6 +6287,7 @@ def order_condition_sql(condition: str = "all", store_id: Optional[int] = None, 
         "delivered": "state='delivered'",
         "inventory": "state='inventory'",
         "error": "state='error'",
+        "amazon_cancelled": "(COALESCE(amazon_cancelled_at, '') != '' OR COALESCE(amazon_cancelled_order_id, '') != '' OR tracking_status='Amazon cancelled')",
         "cancelled_refunded": "COALESCE(odoo_status_label, '') IN ('cancelled', 'refunded')",
     }
     if condition_key in condition_clauses:
@@ -8131,6 +8188,314 @@ def tracking_status_from_packages(packages: list[dict[str, Any]]) -> str:
     return "Unknown"
 
 
+def parse_amazon_delivery_date_text(date_text: str, time_text: str = "", checked_at: str = "") -> tuple[str, str]:
+    date_text = re.sub(r"\s+", " ", clean_text(date_text))
+    time_text = re.sub(r"\s+", " ", clean_text(time_text))
+    if not date_text:
+        return "", ""
+    checked_dt = parse_utc_datetime(checked_at) or datetime.now(timezone.utc)
+    year = checked_dt.year
+    cleaned = re.sub(r"^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,]?\s+", "", date_text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bdelivered\b", "", cleaned, flags=re.IGNORECASE).strip(" ,")
+    cleaned = re.sub(r"(\d+)(?:st|nd|rd|th)\b", r"\1", cleaned, flags=re.IGNORECASE)
+    candidates = [cleaned]
+    if not re.search(r"\b\d{4}\b", cleaned):
+        candidates.append(f"{cleaned}, {year}")
+    formats = (
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%m/%d/%Y",
+        "%Y-%m-%d",
+    )
+    date_part: Optional[datetime] = None
+    for candidate in candidates:
+        for fmt in formats:
+            try:
+                date_part = datetime.strptime(candidate, fmt)
+                break
+            except ValueError:
+                continue
+        if date_part:
+            break
+    if not date_part:
+        return "", date_text
+    delivery_time = None
+    if time_text:
+        for fmt in ("%I:%M %p", "%I %p", "%H:%M"):
+            try:
+                delivery_time = datetime.strptime(time_text, fmt).time()
+                break
+            except ValueError:
+                continue
+    if delivery_time:
+        delivered = datetime.combine(date_part.date(), delivery_time, tzinfo=timezone.utc)
+    else:
+        delivered = datetime.combine(date_part.date(), datetime.min.time(), tzinfo=timezone.utc)
+    if delivered - checked_dt > timedelta(days=1):
+        delivered = delivered.replace(year=delivered.year - 1)
+    display = delivered.strftime("%b %-d, %Y")
+    if delivery_time:
+        display = f"{display} {delivered.strftime('%-I:%M %p')}"
+    return delivered.isoformat(), display
+
+
+def amazon_delivery_info_from_payload(payload_text: str, checked_at: str = "") -> dict[str, str]:
+    try:
+        packages = json.loads(payload_text or "[]")
+    except Exception:
+        packages = []
+    if isinstance(packages, dict):
+        packages = [packages]
+    if not isinstance(packages, list):
+        packages = []
+    candidates: list[tuple[str, str, str]] = []
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        for event in package.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            message = clean_text(event.get("message"))
+            if re.search(r"\bdelivered\b", message, re.IGNORECASE):
+                candidates.append((clean_text(event.get("date")), clean_text(event.get("time")), message))
+        latest = package.get("latest_event") if isinstance(package.get("latest_event"), dict) else {}
+        if latest and re.search(r"\bdelivered\b", clean_text(latest.get("message")), re.IGNORECASE):
+            candidates.append((clean_text(latest.get("date")), clean_text(latest.get("time")), clean_text(latest.get("message"))))
+        for key in ("status", "promise", "order_status"):
+            text = clean_text(package.get(key))
+            match = re.search(r"\bdelivered\s+(.+)$", text, re.IGNORECASE)
+            if match:
+                candidates.append((match.group(1), "", text))
+    for date_text, time_text, source in candidates:
+        delivered_at, display = parse_amazon_delivery_date_text(date_text, time_text, checked_at)
+        if delivered_at or display:
+            return {
+                "amazon_delivered_at": delivered_at,
+                "amazon_delivered_display": display or date_text,
+                "amazon_delivered_source": source,
+            }
+    return {"amazon_delivered_at": "", "amazon_delivered_display": "", "amazon_delivered_source": ""}
+
+
+def iso_from_epoch(value: Any) -> str:
+    try:
+        timestamp = int(value or 0)
+    except Exception:
+        return ""
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def parse_any_datetime(value: Any) -> Optional[datetime]:
+    text = clean_text(value)
+    if not text:
+        return None
+    parsed = parse_utc_datetime(text)
+    if parsed:
+        return parsed
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def calendar_days_between(start: Any, end: Any) -> Optional[int]:
+    start_dt = parse_any_datetime(start)
+    end_dt = parse_any_datetime(end)
+    if not start_dt or not end_dt:
+        return None
+    return max(0, (end_dt.date() - start_dt.date()).days)
+
+
+def epost_movement_info(rows: list[dict[str, Any]]) -> dict[str, str]:
+    candidates: list[tuple[datetime, str, str]] = []
+    for row in rows:
+        tracking_code = clean_text(row.get("tracking_code"))
+        try:
+            events = json.loads(row.get("events_json") or "[]")
+        except Exception:
+            events = []
+        if not isinstance(events, list):
+            events = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            status = clean_text(event.get("status") or event.get("message"))
+            if not status or re.search(r"\b(data received|label created|pre[- ]?advice)\b", status, re.IGNORECASE):
+                continue
+            event_dt = parse_epost_datetime(event.get("date") or event.get("datetime") or "")
+            if event_dt:
+                candidates.append((event_dt, status, tracking_code))
+        status = clean_text(row.get("status"))
+        if status and not re.search(r"\b(data received|label created|pre[- ]?advice)\b", status, re.IGNORECASE):
+            event_dt = parse_epost_datetime(row.get("last_update_at") or "")
+            if event_dt:
+                candidates.append((event_dt, status, tracking_code))
+    if not candidates:
+        return {"movement_at": "", "movement_status": "", "movement_tracking_code": ""}
+    movement_at, movement_status, tracking_code = min(candidates, key=lambda item: item[0])
+    return {
+        "movement_at": movement_at.isoformat(),
+        "movement_status": movement_status,
+        "movement_tracking_code": tracking_code,
+    }
+
+
+def summarize_dispatch_status(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = {
+        "total": len(rows),
+        "pending_dispatch": 0,
+        "timely_dispatch": 0,
+        "late_dispatch": 0,
+        "dispatched_waiting_movement": 0,
+    }
+    delay_values = []
+    for row in rows:
+        status = clean_text(row.get("dispatch_status")) or "unknown"
+        if status in counts:
+            counts[status] += 1
+        if row.get("dispatch_delay_days") is not None:
+            delay_values.append(int(row["dispatch_delay_days"]))
+    counts["avg_dispatch_days"] = round(sum(delay_values) / len(delay_values), 1) if delay_values else 0
+    counts["sla_days"] = 3
+    return counts
+
+
+def dispatch_status_rows(
+    store_id: Optional[int] = None,
+    status: str = "all",
+    q: str = "",
+    page: int = 1,
+    per_page: int = 100,
+) -> tuple[list[dict[str, Any]], int, int, int, dict[str, Any]]:
+    page, per_page, _ = pagination_bounds(page, per_page)
+    search = clean_text(q)
+    search_like = f"%{search}%" if search else None
+    with db() as conn:
+        order_rows = rows_to_dicts(conn.execute(
+            """
+            WITH line_orders AS (
+                SELECT
+                    store_id,
+                    odoo_order_id,
+                    odoo_order_name,
+                    MIN(NULLIF(odoo_order_date, '')) AS odoo_order_date,
+                    MIN(NULLIF(created_at, '')) AS first_seen_at,
+                    MAX(NULLIF(ordered_at, '')) AS amazon_ordered_at,
+                    MAX(NULLIF(tracking_checked_at, '')) AS tracking_checked_at,
+                    STRING_AGG(DISTINCT NULLIF(tracking_payload, ''), E'\n---TRACKING-PAYLOAD---\n') AS tracking_payloads,
+                    STRING_AGG(DISTINCT NULLIF(amazon_order_id, ''), ',') AS amazon_order_ids,
+                    STRING_AGG(DISTINCT NULLIF(asin, ''), ',') AS asins,
+                    STRING_AGG(DISTINCT NULLIF(product_name, ''), ' | ') AS products,
+                    COUNT(*) AS line_count
+                FROM order_lines
+                WHERE COALESCE(odoo_order_name, '') != ''
+                  AND (? IS NULL OR store_id=?)
+                  AND (
+                    ? IS NULL
+                    OR odoo_order_name ILIKE ?
+                    OR amazon_order_id ILIKE ?
+                    OR asin ILIKE ?
+                    OR product_name ILIKE ?
+                  )
+                GROUP BY store_id, odoo_order_id, odoo_order_name
+            ),
+            sync AS (
+                SELECT odoo_db, odoo_order, MIN(synced_at) AS first_synced_at, COUNT(*) AS sync_count
+                FROM shopify_tracking_sync_log
+                GROUP BY odoo_db, odoo_order
+            )
+            SELECT line_orders.*,
+                   stores.name AS store_name,
+                   stores.odoo_url AS odoo_url,
+                   stores.odoo_db AS odoo_db,
+                   sync.first_synced_at,
+                   COALESCE(sync.sync_count, 0) AS sync_count
+            FROM line_orders
+            JOIN stores ON stores.id=line_orders.store_id
+            LEFT JOIN sync ON sync.odoo_db=stores.odoo_db AND sync.odoo_order=line_orders.odoo_order_name
+            ORDER BY COALESCE(line_orders.odoo_order_date, line_orders.first_seen_at) DESC NULLS LAST, line_orders.odoo_order_id DESC
+            LIMIT 3000
+            """,
+            (store_id, store_id, search_like, search_like, search_like, search_like, search_like),
+        ).fetchall())
+        epost_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT store_id, odoo_order_name, tracking_code, events_json, created_at, last_update_at, status
+            FROM epost_global_tracking
+            WHERE (? IS NULL OR store_id=?)
+              AND COALESCE(odoo_order_name, '') != ''
+            ORDER BY created_at ASC
+            """,
+            (store_id, store_id),
+        ).fetchall())
+    epost_by_order: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in epost_rows:
+        epost_by_order.setdefault((int(row.get("store_id") or 0), clean_text(row.get("odoo_order_name"))), []).append(row)
+    all_rows: list[dict[str, Any]] = []
+    for row in order_rows:
+        order_date = clean_text(row.get("odoo_order_date") or row.get("first_seen_at"))
+        delivered_candidates: list[dict[str, str]] = []
+        for payload_text in clean_text(row.get("tracking_payloads")).split("\n---TRACKING-PAYLOAD---\n"):
+            delivery_info = amazon_delivery_info_from_payload(payload_text, clean_text(row.get("tracking_checked_at")))
+            if delivery_info.get("amazon_delivered_at") or delivery_info.get("amazon_delivered_display"):
+                delivered_candidates.append(delivery_info)
+        delivered_candidates.sort(key=lambda item: parse_any_datetime(item.get("amazon_delivered_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        delivered_info = delivered_candidates[0] if delivered_candidates else {"amazon_delivered_at": "", "amazon_delivered_display": "", "amazon_delivered_source": ""}
+        synced_at = iso_from_epoch(row.get("first_synced_at"))
+        related_epost = epost_by_order.get((int(row.get("store_id") or 0), clean_text(row.get("odoo_order_name"))), [])
+        first_epost_seen = min([clean_text(item.get("created_at")) for item in related_epost if clean_text(item.get("created_at"))], default="")
+        dispatched_at = synced_at or first_epost_seen
+        dispatch_source = "Shopify tracking sync" if synced_at else "ePost/Odoo tracking" if first_epost_seen else ""
+        movement = epost_movement_info(related_epost)
+        movement_at = movement.get("movement_at") or ""
+        dispatch_delay = calendar_days_between(order_date, dispatched_at) if dispatched_at else None
+        movement_delay = calendar_days_between(dispatched_at, movement_at) if dispatched_at and movement_at else None
+        total_days = calendar_days_between(order_date, movement_at or dispatched_at) if (movement_at or dispatched_at) else None
+        if not dispatched_at:
+            dispatch_status = "pending_dispatch"
+        elif not movement_at:
+            dispatch_status = "dispatched_waiting_movement"
+        elif dispatch_delay is not None and dispatch_delay > 3:
+            dispatch_status = "late_dispatch"
+        else:
+            dispatch_status = "timely_dispatch"
+        total_delay_days = max(0, int(dispatch_delay or 0) - 3) if dispatch_delay is not None else None
+        row.update(
+            {
+                "id": f"{row.get('store_id')}:{row.get('odoo_order_id') or row.get('odoo_order_name')}",
+                "odoo_order_url": odoo_order_admin_url({"odoo_url": row.get("odoo_url") or ""}, row.get("odoo_order_id")) if row.get("odoo_url") else "",
+                "odoo_order_date": order_date,
+                "dispatched_at": dispatched_at,
+                "dispatch_source": dispatch_source,
+                "dispatch_status": dispatch_status,
+                "dispatch_delay_days": dispatch_delay,
+                "movement_at": movement_at,
+                "movement_status": movement.get("movement_status") or "",
+                "movement_tracking_code": movement.get("movement_tracking_code") or "",
+                "movement_delay_days": movement_delay,
+                "total_days_to_movement": total_days,
+                "total_delay_days": total_delay_days,
+                "tracking_code_count": len({clean_text(item.get("tracking_code")) for item in related_epost if clean_text(item.get("tracking_code"))}),
+                "amazon_delivered_at": delivered_info.get("amazon_delivered_at") or "",
+                "amazon_delivered_display": delivered_info.get("amazon_delivered_display") or "",
+                "amazon_delivered_source": delivered_info.get("amazon_delivered_source") or "",
+            }
+        )
+        row.pop("tracking_payloads", None)
+        all_rows.append(row)
+    status = clean_text(status or "all")
+    if status != "all":
+        all_rows = [row for row in all_rows if row.get("dispatch_status") == status]
+    summary = summarize_dispatch_status(all_rows)
+    paged_rows, total, page, per_page = paginate_values(all_rows, page, per_page)
+    return paged_rows, total, page, per_page, summary
+
+
 def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
     asins = {normalize_asin(str(value)) for value in package.get("asins") or []}
     asin = normalize_asin(str(line["asin"] or ""))
@@ -8175,6 +8540,17 @@ def payload_has_payment_revision(payload: ChromeTrackingUpdatePayload) -> bool:
     return any(pattern in lowered for pattern in PAYMENT_REVISION_PATTERNS)
 
 
+def normalize_payment_failure_row(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        names = json.loads(row.get("odoo_order_names") or "[]")
+    except Exception:
+        names = []
+    row["odoo_order_names"] = names if isinstance(names, list) else []
+    row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
+    row["action_url"] = row.get("revise_payment_url") or row.get("amazon_order_url")
+    return row
+
+
 def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "open") -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     where = ["(? IS NULL OR store_id=?)"]
@@ -8198,12 +8574,7 @@ def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page
             ).fetchall()
         )
     for row in rows:
-        try:
-            row["odoo_order_names"] = json.loads(row.get("odoo_order_names") or "[]")
-        except Exception:
-            row["odoo_order_names"] = []
-        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
-        row["action_url"] = row.get("revise_payment_url") or row.get("amazon_order_url")
+        normalize_payment_failure_row(row)
     return rows, total, page, per_page
 
 
@@ -8273,7 +8644,9 @@ def tracking_rows(store_id: Optional[int] = None, status: str = "active", q: str
     return data
 
 
-def delivered_unfulfilled_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
+def delivered_unfulfilled_rows(store_id: Optional[int] = None, q: str = "") -> list[dict[str, Any]]:
+    search = clean_text(q)
+    search_like = f"%{search}%" if search else None
     with db() as conn:
         rows = conn.execute(
             """
@@ -8286,9 +8659,26 @@ def delivered_unfulfilled_rows(store_id: Optional[int] = None) -> list[dict[str,
                 OR LOWER(COALESCE(tracking_status, '')) = 'delivered'
               )
               AND (? IS NULL OR store_id=?)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM shopify_tracking_sync_log
+                JOIN stores tracking_store ON tracking_store.odoo_db=shopify_tracking_sync_log.odoo_db
+                WHERE tracking_store.id=order_lines.store_id
+                  AND shopify_tracking_sync_log.odoo_order=order_lines.odoo_order_name
+              )
+              AND (
+                ? IS NULL
+                OR odoo_order_name ILIKE ?
+                OR amazon_order_id ILIKE ?
+                OR asin ILIKE ?
+                OR product_name ILIKE ?
+                OR tracking_payload ILIKE ?
+                OR amazon_account_name ILIKE ?
+              )
             ORDER BY tracking_checked_at DESC, ordered_at DESC, updated_at DESC
+            LIMIT 1000
             """,
-            (store_id, store_id),
+            (store_id, store_id, search_like, search_like, search_like, search_like, search_like, search_like, search_like),
         ).fetchall()
     stores = {int(store["id"]): store for store in list_stores()}
     clients: dict[int, OdooClient] = {}
@@ -8299,10 +8689,11 @@ def delivered_unfulfilled_rows(store_id: Optional[int] = None) -> list[dict[str,
         data["store_name"] = store["name"] if store else ""
         data["odoo_order_url"] = odoo_order_admin_url(store, row["odoo_order_id"]) if store else ""
         data["amazon_order_url"] = data.get("amazon_order_url") or order_line_amazon_url(row["amazon_order_id"])
+        data.update(amazon_delivery_info_from_payload(data.get("tracking_payload") or "", data.get("tracking_checked_at") or ""))
         try:
             if not store:
                 raise RuntimeError("Store not found")
-            client = clients.setdefault(int(row["store_id"]), OdooClient(store))
+            client = clients.setdefault(int(row["store_id"]), OdooClient(get_store(int(row["store_id"]))))
             status = client.picking_fulfilment_status_for_order(int(row["odoo_order_id"]))
             data.update(status)
             if status.get("fulfilment_status") == "fulfilment pending":
@@ -8335,7 +8726,7 @@ def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2)
             WHERE odoo_order_id IS NOT NULL
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               AND (? IS NULL OR store_id=?)
-            ORDER BY updated_at DESC
+            ORDER BY CASE WHEN COALESCE(amazon_order_id, '') != '' THEN 0 ELSE 1 END, updated_at DESC
             LIMIT 5000
             """,
             (store_id, store_id),
@@ -8343,7 +8734,10 @@ def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2)
     local_by_order: dict[tuple[int, int], dict[str, Any]] = {}
     for row in local_rows:
         try:
-            local_by_order[(int(row["store_id"]), int(row["odoo_order_id"]))] = row
+            key = (int(row["store_id"]), int(row["odoo_order_id"]))
+            current = local_by_order.get(key)
+            if current is None or (not current["amazon_order_id"] and row["amazon_order_id"]):
+                local_by_order[key] = row
         except Exception:
             continue
     synced = 0
@@ -8430,7 +8824,24 @@ def epost_status_from_update(status: str, last_update_at: Any, fallback_at: Any 
     return "pending"
 
 
+def annotate_epost_staleness(row: dict[str, Any], stale_days: int = 10) -> None:
+    threshold = max(1, min(90, int(stale_days or 10)))
+    update_dt = parse_epost_datetime(row.get("last_update_at")) or parse_epost_datetime(row.get("created_at"))
+    days_since = None
+    if update_dt:
+        days_since = max(0, (datetime.now(timezone.utc) - update_dt).days)
+    delivered = clean_text(row.get("epost_status")).lower() == "delivered" or re.search(r"\bdelivered\b", clean_text(row.get("status")), re.IGNORECASE)
+    row["days_since_update"] = days_since
+    row["stale_days_threshold"] = threshold
+    row["suspected_lost"] = bool(not delivered and days_since is not None and days_since >= threshold)
+
+
 def refresh_epost_lost_statuses(store_id: Optional[int] = None) -> None:
+    refresh_key = f"epost_lost_refresh_last_at:{store_id or 'all'}"
+    last_refresh = parse_utc_datetime(get_setting(refresh_key, ""))
+    if last_refresh and datetime.now(timezone.utc) - last_refresh < timedelta(minutes=5):
+        return
+    set_setting(refresh_key, utc_now())
     changed = 0
     with db() as conn:
         rows = conn.execute(
@@ -8482,7 +8893,21 @@ def epost_tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
                    COALESCE(
                        (SELECT COUNT(*) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
                        0
-                   ) AS shipping_order_matches
+                   ) AS shipping_order_matches,
+                   (
+                       SELECT STRING_AGG(DISTINCT amazon_order_id, ',')
+                       FROM order_lines
+                       WHERE order_lines.store_id=epost_global_tracking.store_id
+                         AND order_lines.odoo_order_name=epost_global_tracking.odoo_order_name
+                         AND COALESCE(amazon_order_id, '') != ''
+                   ) AS matched_amazon_order_id,
+                   (
+                       SELECT MIN(NULLIF(amazon_order_url, ''))
+                       FROM order_lines
+                       WHERE order_lines.store_id=epost_global_tracking.store_id
+                         AND order_lines.odoo_order_name=epost_global_tracking.odoo_order_name
+                         AND COALESCE(amazon_order_id, '') != ''
+                   ) AS matched_amazon_order_url
             FROM epost_global_tracking
             JOIN stores ON stores.id = epost_global_tracking.store_id
             WHERE (? IS NULL OR epost_global_tracking.store_id=?)
@@ -8499,10 +8924,15 @@ def epost_tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
     stores = {int(store["id"]): store for store in list_stores()}
     for row in data:
         store = stores.get(int(row["store_id"]))
+        if not clean_text(row.get("amazon_order_id")) and clean_text(row.get("matched_amazon_order_id")):
+            row["amazon_order_id"] = row.get("matched_amazon_order_id") or ""
+        if not clean_text(row.get("amazon_order_url")) and clean_text(row.get("matched_amazon_order_url")):
+            row["amazon_order_url"] = row.get("matched_amazon_order_url") or ""
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
         row["tracking_url"] = row.get("tracking_url") or f"https://epgtrack.com/{row.get('tracking_code')}"
         row["shipping_match_type"] = "tracking" if int(row.get("shipping_tracking_matches") or 0) else "order" if int(row.get("shipping_order_matches") or 0) else ""
+        annotate_epost_staleness(row, 10)
     return data
 
 
@@ -8511,14 +8941,46 @@ def paged_epost_tracking_rows(
     page: int = 1,
     per_page: int = 100,
     status: str = "all",
+    stale_days: int = 10,
+    stale_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     refresh_epost_lost_statuses(store_id)
     page, per_page, offset = pagination_bounds(page, per_page)
     status = clean_text(status or "all").lower()
+    stale_days = max(1, min(90, int(stale_days or 10)))
+    if stale_only or status in {"suspected_lost", "stale"}:
+        with db() as conn:
+            rows = rows_to_dicts(conn.execute(
+                """
+                SELECT epost_global_tracking.*
+                FROM epost_global_tracking
+                WHERE (? IS NULL OR store_id=?)
+                ORDER BY
+                  CASE WHEN epost_status='lost' THEN 0 ELSE 1 END,
+                  CASE WHEN epost_status='delivered' THEN 1 ELSE 0 END,
+                  last_checked_at IS NULL DESC,
+                  last_checked_at ASC,
+                  updated_at DESC
+                """,
+                (store_id, store_id),
+            ).fetchall())
+        for row in rows:
+            annotate_epost_staleness(row, stale_days)
+        if status == "pending":
+            rows = [row for row in rows if row.get("epost_status") not in {"delivered", "lost"}]
+        elif status in {"active", "not_delivered"}:
+            rows = [row for row in rows if row.get("epost_status") != "delivered"]
+        elif status in {"delivered", "lost"}:
+            rows = [row for row in rows if row.get("epost_status") == status]
+        rows = [row for row in rows if row.get("suspected_lost")]
+        paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
+        return epost_tracking_rows_by_ids([int(row["id"]) for row in paged_rows], stale_days), total, page, per_page
     status_clause = ""
     params: list[Any] = [store_id, store_id]
     if status == "pending":
         status_clause = " AND epost_status NOT IN ('delivered', 'lost')"
+    elif status in {"active", "not_delivered"}:
+        status_clause = " AND epost_status != 'delivered'"
     elif status in {"delivered", "lost"}:
         status_clause = " AND epost_status = ?"
         params.append(status)
@@ -8534,41 +8996,68 @@ def paged_epost_tracking_rows(
         ).fetchone()["count"] or 0)
         rows = conn.execute(
             f"""
-            SELECT epost_global_tracking.*, stores.name AS store_name,
-                   COALESCE(
-                       (SELECT SUM(shipping_fee) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
-                       (SELECT SUM(shipping_fee) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
-                       0
-                   ) AS shipping_fee,
-                   COALESCE(
-                       (SELECT SUM(fulfilment_fee) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
-                       (SELECT SUM(fulfilment_fee) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
-                       0
-                   ) AS fulfilment_fee,
-                   COALESCE(
-                       (SELECT SUM(total_cost) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
-                       (SELECT SUM(total_cost) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
-                       0
-                   ) AS shipping_total,
-                   COALESCE(
-                       (SELECT COUNT(*) FROM shipping_charges WHERE UPPER(tracking_number)=UPPER(epost_global_tracking.tracking_code)),
-                       0
-                   ) AS shipping_tracking_matches,
-                   COALESCE(
-                       (SELECT COUNT(*) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
-                       0
-                   ) AS shipping_order_matches
-            FROM epost_global_tracking
-            JOIN stores ON stores.id = epost_global_tracking.store_id
-            WHERE (? IS NULL OR epost_global_tracking.store_id=?)
-            {status_clause}
+            WITH target AS (
+                SELECT *
+                FROM epost_global_tracking
+                WHERE (? IS NULL OR store_id=?)
+                {status_clause}
+                ORDER BY
+                  CASE WHEN epost_status='lost' THEN 0 ELSE 1 END,
+                  CASE WHEN epost_status='delivered' THEN 1 ELSE 0 END,
+                  last_checked_at IS NULL DESC,
+                  last_checked_at ASC,
+                  updated_at DESC
+                LIMIT ? OFFSET ?
+            ),
+            shipping_tracking AS (
+                SELECT UPPER(shipping_charges.tracking_number) AS tracking_key,
+                       SUM(shipping_fee) AS shipping_fee,
+                       SUM(fulfilment_fee) AS fulfilment_fee,
+                       SUM(total_cost) AS shipping_total,
+                       COUNT(*) AS match_count
+                FROM shipping_charges
+                JOIN target ON UPPER(shipping_charges.tracking_number)=UPPER(target.tracking_code)
+                GROUP BY UPPER(shipping_charges.tracking_number)
+            ),
+            shipping_order AS (
+                SELECT shipping_charges.odoo_order_name,
+                       SUM(shipping_fee) AS shipping_fee,
+                       SUM(fulfilment_fee) AS fulfilment_fee,
+                       SUM(total_cost) AS shipping_total,
+                       COUNT(*) AS match_count
+                FROM shipping_charges
+                JOIN target ON shipping_charges.odoo_order_name=target.odoo_order_name
+                GROUP BY shipping_charges.odoo_order_name
+            ),
+            order_match AS (
+                SELECT order_lines.store_id,
+                       order_lines.odoo_order_name,
+                       STRING_AGG(DISTINCT order_lines.amazon_order_id, ',') AS matched_amazon_order_id,
+                       MIN(NULLIF(order_lines.amazon_order_url, '')) AS matched_amazon_order_url
+                FROM order_lines
+                JOIN target ON target.store_id=order_lines.store_id AND target.odoo_order_name=order_lines.odoo_order_name
+                WHERE COALESCE(order_lines.amazon_order_id, '') != ''
+                GROUP BY order_lines.store_id, order_lines.odoo_order_name
+            )
+            SELECT target.*, stores.name AS store_name,
+                   COALESCE(shipping_tracking.shipping_fee, shipping_order.shipping_fee, 0) AS shipping_fee,
+                   COALESCE(shipping_tracking.fulfilment_fee, shipping_order.fulfilment_fee, 0) AS fulfilment_fee,
+                   COALESCE(shipping_tracking.shipping_total, shipping_order.shipping_total, 0) AS shipping_total,
+                   COALESCE(shipping_tracking.match_count, 0) AS shipping_tracking_matches,
+                   COALESCE(shipping_order.match_count, 0) AS shipping_order_matches,
+                   order_match.matched_amazon_order_id,
+                   order_match.matched_amazon_order_url
+            FROM target
+            JOIN stores ON stores.id = target.store_id
+            LEFT JOIN shipping_tracking ON shipping_tracking.tracking_key=UPPER(target.tracking_code)
+            LEFT JOIN shipping_order ON shipping_order.odoo_order_name=target.odoo_order_name
+            LEFT JOIN order_match ON order_match.store_id=target.store_id AND order_match.odoo_order_name=target.odoo_order_name
             ORDER BY
-              CASE WHEN epost_status='lost' THEN 0 ELSE 1 END,
-              CASE WHEN epost_status='delivered' THEN 1 ELSE 0 END,
-              last_checked_at IS NULL DESC,
-              last_checked_at ASC,
-              updated_at DESC
-            LIMIT ? OFFSET ?
+              CASE WHEN target.epost_status='lost' THEN 0 ELSE 1 END,
+              CASE WHEN target.epost_status='delivered' THEN 1 ELSE 0 END,
+              target.last_checked_at IS NULL DESC,
+              target.last_checked_at ASC,
+              target.updated_at DESC
             """,
             [*params, per_page, offset],
         ).fetchall()
@@ -8576,14 +9065,19 @@ def paged_epost_tracking_rows(
     stores = {int(store["id"]): store for store in list_stores()}
     for row in data:
         store = stores.get(int(row["store_id"]))
+        if not clean_text(row.get("amazon_order_id")) and clean_text(row.get("matched_amazon_order_id")):
+            row["amazon_order_id"] = row.get("matched_amazon_order_id") or ""
+        if not clean_text(row.get("amazon_order_url")) and clean_text(row.get("matched_amazon_order_url")):
+            row["amazon_order_url"] = row.get("matched_amazon_order_url") or ""
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
         row["tracking_url"] = row.get("tracking_url") or f"https://epgtrack.com/{row.get('tracking_code')}"
         row["shipping_match_type"] = "tracking" if int(row.get("shipping_tracking_matches") or 0) else "order" if int(row.get("shipping_order_matches") or 0) else ""
+        annotate_epost_staleness(row, stale_days)
     return data, total, page, per_page
 
 
-def epost_tracking_rows_by_ids(ids: list[int]) -> list[dict[str, Any]]:
+def epost_tracking_rows_by_ids(ids: list[int], stale_days: int = 10) -> list[dict[str, Any]]:
     if not ids:
         return []
     with db() as conn:
@@ -8615,7 +9109,21 @@ def epost_tracking_rows_by_ids(ids: list[int]) -> list[dict[str, Any]]:
                    COALESCE(
                        (SELECT COUNT(*) FROM shipping_charges WHERE odoo_order_name=epost_global_tracking.odoo_order_name),
                        0
-                   ) AS shipping_order_matches
+                   ) AS shipping_order_matches,
+                   (
+                       SELECT STRING_AGG(DISTINCT amazon_order_id, ',')
+                       FROM order_lines
+                       WHERE order_lines.store_id=epost_global_tracking.store_id
+                         AND order_lines.odoo_order_name=epost_global_tracking.odoo_order_name
+                         AND COALESCE(amazon_order_id, '') != ''
+                   ) AS matched_amazon_order_id,
+                   (
+                       SELECT MIN(NULLIF(amazon_order_url, ''))
+                       FROM order_lines
+                       WHERE order_lines.store_id=epost_global_tracking.store_id
+                         AND order_lines.odoo_order_name=epost_global_tracking.odoo_order_name
+                         AND COALESCE(amazon_order_id, '') != ''
+                   ) AS matched_amazon_order_url
             FROM epost_global_tracking
             JOIN stores ON stores.id = epost_global_tracking.store_id
             JOIN matched ON matched.id = epost_global_tracking.id
@@ -8627,16 +9135,25 @@ def epost_tracking_rows_by_ids(ids: list[int]) -> list[dict[str, Any]]:
     stores = {int(store["id"]): store for store in list_stores()}
     for row in data:
         store = stores.get(int(row["store_id"]))
+        if not clean_text(row.get("amazon_order_id")) and clean_text(row.get("matched_amazon_order_id")):
+            row["amazon_order_id"] = row.get("matched_amazon_order_id") or ""
+        if not clean_text(row.get("amazon_order_url")) and clean_text(row.get("matched_amazon_order_url")):
+            row["amazon_order_url"] = row.get("matched_amazon_order_url") or ""
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or "")
         row["tracking_url"] = row.get("tracking_url") or f"https://epgtrack.com/{row.get('tracking_code')}"
         row["shipping_match_type"] = "tracking" if int(row.get("shipping_tracking_matches") or 0) else "order" if int(row.get("shipping_order_matches") or 0) else ""
+        annotate_epost_staleness(row, stale_days)
     return data
 
 
-def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None) -> list[dict[str, Any]]:
-    days = max(0, min(30, int(days or 1)))
-    cutoff = time.time() - days * 86400
+def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None, hours: Optional[int] = None) -> list[dict[str, Any]]:
+    if hours is not None:
+        interval_seconds = max(3600, min(720 * 3600, int(float(hours or 24)) * 3600))
+    else:
+        days = max(0, min(30, int(days or 1)))
+        interval_seconds = days * 86400
+    cutoff = time.time() - interval_seconds
     rows = epost_tracking_rows(store_id)
     due = []
     for row in rows:
@@ -8901,6 +9418,8 @@ DEFAULT_EXPORT_COLUMNS: dict[str, list[dict[str, str]]] = {
         {"key": "amazon_order_id", "label": "Amazon Order"},
         {"key": "carrier_tracking", "label": "Carrier / Tracking"},
         {"key": "tracking_status", "label": "Tracking"},
+        {"key": "amazon_delivered_display", "label": "Delivered At"},
+        {"key": "tracking_checked_at", "label": "Checked At"},
         {"key": "picking_summary", "label": "Odoo Pickings"},
         {"key": "fulfilment_status", "label": "Status"},
         {"key": "message", "label": "Message"},
@@ -9004,11 +9523,21 @@ def export_queryset(view: str, store_id: Optional[int], selected_ids: list[Union
         data = rows_to_dicts(rows)
     elif view == "epost":
         status = clean_text(str(filters.get("status") or "all"))
+        stale_days = max(1, min(90, int(filters.get("stale_days") or 10)))
+        stale_only = str(filters.get("stale_only") or "").strip().lower() in {"1", "true", "yes", "on"}
         data = epost_tracking_rows(store_id)
+        for row in data:
+            annotate_epost_staleness(row, stale_days)
         if status == "pending":
             data = [row for row in data if row.get("epost_status") not in {"delivered", "lost"}]
+        elif status in {"active", "not_delivered"}:
+            data = [row for row in data if row.get("epost_status") != "delivered"]
+        elif status in {"suspected_lost", "stale"}:
+            data = [row for row in data if row.get("suspected_lost")]
         elif status in {"delivered", "lost"}:
             data = [row for row in data if row.get("epost_status") == status]
+        if stale_only:
+            data = [row for row in data if row.get("suspected_lost")]
     elif view == "duplicate_tracking":
         data = duplicate_tracking_rows(store_id, clean_text(str(filters.get("q") or "")))
     elif view == "tracking":
@@ -9033,7 +9562,7 @@ def export_queryset(view: str, store_id: Optional[int], selected_ids: list[Union
             entry["lines"].append(row)
         data = list(grouped.values())
     elif view == "fulfilment_pending":
-        data = delivered_unfulfilled_rows(store_id)
+        data = delivered_unfulfilled_rows(store_id, clean_text(str(filters.get("q") or "")))
     elif view == "bulk":
         days = int(filters.get("days") or 2)
         data = bulk_opportunity_groups(store_id, days)
@@ -9626,11 +10155,11 @@ def profit_loss_data(
                 COALESCE(shipping.package_count, 0) AS package_count
             FROM line_orders
             LEFT JOIN shipping ON shipping.odoo_order_name = line_orders.odoo_order_name
-            WHERE (? IS NULL OR line_orders.odoo_order_name LIKE ? OR line_orders.amazon_order_ids LIKE ?)
+            WHERE (? IS NULL OR line_orders.odoo_order_name ILIKE ? OR line_orders.amazon_order_ids ILIKE ? OR line_orders.amazon_accounts ILIKE ?)
               {candidate_clause}
             ORDER BY line_orders.order_date DESC, line_orders.odoo_order_id DESC
             """,
-            (store_id, store_id, start_text, end_text, search, search, search, *candidate_params),
+            (store_id, store_id, start_text, end_text, search, search, search, search, *candidate_params),
         ).fetchall()
         imports = conn.execute("SELECT * FROM shipping_imports ORDER BY created_at DESC LIMIT 12").fetchall()
     order_rows = rows_to_dicts(rows)
@@ -14487,7 +15016,10 @@ def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int =
     page, per_page, _ = pagination_bounds(page, per_page)
     search_engine = "postgres"
     try:
-        filter_by = f"store_id:={int(store_id)}" if store_id else ""
+        filters = ["status:!=used"]
+        if store_id:
+            filters.append(f"store_id:={int(store_id)}")
+        filter_by = " && ".join(filters)
         result = typesense_search_documents(
             "inventory_items",
             q or "*",
@@ -14505,10 +15037,14 @@ def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int =
             items, total = list_inventory_items(store_id, page, per_page)
     except Exception:
         items, total = list_inventory_items(store_id, page, per_page)
+    stores = rows_to_dicts(list_stores())
+    for store in stores:
+        if store.get("odoo_password"):
+            store["odoo_password"] = "********"
     return {
-        "stores": rows_to_dicts(list_stores()),
+        "stores": stores,
         "current_store_id": store_id,
-        "items": rows_to_dicts(items) if items and not isinstance(items[0], dict) else items,
+        "items": inventory_items_payload(items),
         "page": page,
         "per_page": per_page,
         "total": total,
@@ -14643,8 +15179,144 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             row = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inserted["id"],)).fetchone()
     if row:
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(row) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
-    items, total = list_inventory_items(store_id, 1, 100)
-    return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {asin}.", "items": rows_to_dicts(items), "page": 1, "per_page": 100, "total": total}
+    return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {asin}.", **refresh_inventory_response(store_id, 1, 100)}
+
+
+@app.post("/api/inventory/{inventory_id}/attach")
+def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    order_ref = clean_text(payload.get("order_ref") or payload.get("odoo_order_name"))
+    if not order_ref:
+        raise HTTPException(400, "Enter the new Odoo order name to attach this inventory item.")
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        if clean_text(item["status"]) == "used":
+            raise HTTPException(400, "This inventory item has already been used.")
+        if clean_text(item["status"]) == "reserved":
+            raise HTTPException(400, "This inventory item is already attached to an order.")
+        asin = normalize_asin(item["asin"])
+        candidates = conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE store_id=?
+              AND UPPER(odoo_order_name)=UPPER(?)
+              AND asin=?
+              AND state NOT IN ('ordered', 'dispatched', 'delivered', 'inventory', 'ignored')
+              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            ORDER BY id ASC
+            """,
+            (item["store_id"], order_ref, asin),
+        ).fetchall()
+        if not candidates:
+            raise HTTPException(404, f"No open order line with ASIN {asin} found for {order_ref}.")
+        line = candidates[0]
+        quantity_needed = float(line["quantity"] or 1)
+        quantity_available = float(item["quantity"] or 0)
+        if quantity_available < quantity_needed:
+            raise HTTPException(400, f"Inventory quantity is {quantity_available:g}, but {order_ref} needs {quantity_needed:g}.")
+        note = f"Attached inventory item #{inventory_id} to {line['odoo_order_name']}. Manually verify dispatch, then confirm sent from Inventory."
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE inventory_items
+            SET status='reserved',
+                reserved_order_line_id=?,
+                reserved_quantity=?,
+                reserved_at=?,
+                notes=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (line["id"], quantity_needed, now, append_note(item["notes"], note), now, inventory_id),
+        )
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET state='inventory',
+                fulfilment_note=?,
+                last_error=NULL,
+                updated_at=?
+            WHERE id=?
+            """,
+            (append_note(line["fulfilment_note"], f"Fulfil from local inventory item #{inventory_id}: ASIN {asin}, qty {quantity_needed:g}."), now, line["id"]),
+        )
+        updated_item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        updated_line = conn.execute("SELECT * FROM order_lines WHERE id=?", (line["id"],)).fetchone()
+    if updated_item:
+        _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(updated_item) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
+    if updated_line:
+        index_order_line(updated_line)
+    return {"ok": True, "message": f"Attached inventory item #{inventory_id} to {line['odoo_order_name']}. Confirm sent after manual verification.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
+
+
+@app.post("/api/inventory/{inventory_id}/confirm-sent")
+def api_confirm_inventory_sent(inventory_id: int, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        if clean_text(item["status"]) == "used":
+            return {"ok": True, "message": "Inventory item was already marked sent.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
+        line = None
+        if item["reserved_order_line_id"]:
+            line = conn.execute("SELECT * FROM order_lines WHERE id=?", (item["reserved_order_line_id"],)).fetchone()
+        if not line:
+            raise HTTPException(400, "Attach this inventory item to a new order before confirming it was sent.")
+        now = utc_now()
+        reserved_quantity = float(item["reserved_quantity"] or line["quantity"] or item["quantity"] or 0)
+        current_quantity = float(item["quantity"] or 0)
+        remaining_quantity = max(0, current_quantity - reserved_quantity)
+        sent_note = f"Inventory item #{inventory_id} manually verified sent for {line['odoo_order_name']}."
+        if remaining_quantity > 0:
+            conn.execute(
+                """
+                UPDATE inventory_items
+                SET quantity=?,
+                    status='available',
+                    reserved_order_line_id=NULL,
+                    reserved_quantity=NULL,
+                    reserved_at=NULL,
+                    used_at=?,
+                    notes=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (remaining_quantity, now, append_note(item["notes"], sent_note), now, inventory_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE inventory_items
+                SET status='used',
+                    used_at=?,
+                    notes=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (now, append_note(item["notes"], sent_note), now, inventory_id),
+            )
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET state='delivered',
+                tracking_status='Inventory sent',
+                tracking_checked_at=?,
+                fulfilment_note=?,
+                last_error=NULL,
+                updated_at=?
+            WHERE id=?
+            """,
+            (now, append_note(line["fulfilment_note"], sent_note), now, line["id"]),
+        )
+        updated_item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        updated_line = conn.execute("SELECT * FROM order_lines WHERE id=?", (line["id"],)).fetchone()
+    if updated_item:
+        _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(updated_item) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
+    if updated_line:
+        index_order_line(updated_line)
+    return {"ok": True, "message": f"Marked inventory sent for {line['odoo_order_name']}.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
 
 
 @app.get("/api/missing")
@@ -15299,9 +15971,15 @@ def api_profit_loss(
         try:
             candidate_order_names = profit_loss_order_names_from_typesense(store_id, period, month, start, end, q)
         except HTTPException:
-            raise
+            candidate_order_names = None
         except Exception as exc:
-            raise HTTPException(500, f"Profit/Loss Typesense filter failed: {exc}") from exc
+            candidate_order_names = None
+    start_dt, end_dt, _resolved_month = date_range_from_params(period, month, start, end)
+    start_text = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+    end_text = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+    backfill_missing_profit_loss_order_dates(store_id)
+    backfill_missing_order_financials_for_profit_loss(store_id, start_text, end_text)
+    normalize_converted_profit_columns(store_id, start_text, end_text)
     result = profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names, amazon_ordered_only, profit_scope)
     with _PROFIT_LOSS_CACHE_LOCK:
         if len(_PROFIT_LOSS_CACHE) > 256:
@@ -17631,18 +18309,19 @@ def set_epost_browserless_progress(**updates: Any) -> dict[str, Any]:
     return dict(_EPOST_BROWSERLESS_PROGRESS)
 
 
-def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: int = 0) -> list[list[str]]:
-    rows = due_epost_tracking_rows(max(1, int(days or 1)), store_id)
+def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: int = 0, hours: Optional[int] = None) -> list[list[str]]:
+    rows = due_epost_tracking_rows(max(1, int(days or 1)), store_id, hours)
     codes = [clean_text(row.get("tracking_code")).upper() for row in rows if clean_text(row.get("tracking_code"))]
     batches = [codes[index:index + 25] for index in range(0, len(codes), 25)]
     return batches[: max_batches] if max_batches else batches
 
 
 class EpostBrowserlessSession:
-    def __init__(self, worker_id: str, store_id: Optional[int], interval_days: int, max_batches: int) -> None:
+    def __init__(self, worker_id: str, store_id: Optional[int], interval_days: int, max_batches: int, interval_hours: Optional[int] = None) -> None:
         self.worker_id = worker_id
         self.store_id = store_id
         self.interval_days = max(1, int(interval_days or 1))
+        self.interval_hours = max(1, int(interval_hours or self.interval_days * 24))
         self.max_batches = max(0, int(max_batches or 0))
         self.batches: list[list[str]] = []
         self.batch_index = 0
@@ -17654,7 +18333,7 @@ class EpostBrowserlessSession:
         return bool(_EPOST_BROWSERLESS_PROGRESS.get("stop_requested"))
 
     def load_batches(self) -> list[list[str]]:
-        self.batches = epost_browserless_batches(self.interval_days, self.store_id, self.max_batches)
+        self.batches = epost_browserless_batches(self.interval_days, self.store_id, self.max_batches, self.interval_hours)
         return self.batches
 
     def current_codes(self) -> list[str]:
@@ -17741,7 +18420,7 @@ def run_epost_browserless_payload(payload: EpostBrowserlessRunPayload) -> None:
     profile_dir.mkdir(parents=True, exist_ok=True)
     content_js = BASE_DIR / "epost-extension" / "content.js"
     content_css = BASE_DIR / "epost-extension" / "content.css"
-    session = EpostBrowserlessSession(worker_id, payload.store_id, payload.interval_days, payload.max_batches)
+    session = EpostBrowserlessSession(worker_id, payload.store_id, payload.interval_days, payload.max_batches, payload.interval_hours)
     executable = chrome_browserless_executable()
     launch_args = [
         "--disable-blink-features=AutomationControlled",
@@ -17869,7 +18548,7 @@ def api_epost_browserless_run(payload: EpostBrowserlessRunPayload) -> dict[str, 
             message="Headless ePost could not start.",
         )
         return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
-    batches = epost_browserless_batches(payload.interval_days, payload.store_id, payload.max_batches)
+    batches = epost_browserless_batches(payload.interval_days, payload.store_id, payload.max_batches, payload.interval_hours)
     if not batches:
         try:
             _EPOST_BROWSERLESS_LOCK.release()
@@ -19047,10 +19726,22 @@ def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page:
 
 
 @app.get("/api/tracking/fulfilment-pending")
-def api_tracking_fulfilment_pending(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    rows = delivered_unfulfilled_rows(store_id)
+def api_tracking_fulfilment_pending(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> dict[str, Any]:
+    rows = delivered_unfulfilled_rows(store_id, q)
     paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
-    return {"ok": True, "rows": paged_rows, "count": total, "page": page, "per_page": per_page, "total": total}
+    return {"ok": True, "rows": paged_rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": len(rows)}
+
+
+@app.get("/api/dispatch-status")
+def api_dispatch_status(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", q: str = "") -> dict[str, Any]:
+    rows, total, page, per_page, summary = dispatch_status_rows(store_id, status, q, page, per_page)
+    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "summary": summary}
+
+
+@app.get("/api/dispatch-status/summary")
+def api_dispatch_status_summary(store_id: Optional[int] = None) -> dict[str, Any]:
+    _rows, _total, _page, _per_page, summary = dispatch_status_rows(store_id, "all", "", 1, 1)
+    return {"ok": True, "summary": summary}
 
 
 @app.post("/api/tracking/update")
@@ -19357,6 +20048,7 @@ def api_tracking_payment_failures(store_id: Optional[int] = None, page: int = 1,
         )
         if result.get("enabled"):
             rows = sql_rows_by_ids("amazon_payment_failures", list(result.get("ids") or []), "amazon_order_id")
+            rows = [normalize_payment_failure_row(dict(row)) for row in rows]
             total = int(result.get("total") or 0)
             search_engine = "typesense"
         else:
@@ -19711,36 +20403,63 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/api/epost/tracking")
-def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all") -> dict[str, Any]:
+def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", stale_days: int = 10, stale_only: bool = False) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
     status = clean_text(status or "all").lower()
+    stale_days = max(1, min(90, int(stale_days or 10)))
     search_engine = "postgres"
     try:
-        filters = []
-        if store_id:
-            filters.append(f"store_id:={int(store_id)}")
-        if status == "pending":
-            filters.append("epost_status:!=delivered && epost_status:!=lost")
-        elif status in {"delivered", "lost"}:
-            filters.append(f"epost_status:={status}")
-        result = typesense_search_documents(
-            "epost_global_tracking",
-            "*",
-            "tracking_code,odoo_order_name,amazon_order_id,picking_name,status,epost_status,destination,awb,location",
-            filter_by=" && ".join(filters),
-            page=page,
-            per_page=per_page,
-            sort_by="updated_ts:desc",
-        )
-        if result.get("enabled"):
-            rows = epost_tracking_rows_by_ids([int(value) for value in result.get("ids") or []])
-            total = int(result.get("total") or 0)
-            search_engine = "typesense"
-        else:
-            rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status)
+        rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
     except Exception:
-        rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status)
-    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
+        rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
+    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only}
+
+
+@app.post("/api/epost/tracking/{tracking_id}/refund")
+def api_epost_refund_status(tracking_id: int, payload: EpostRefundPayload) -> dict[str, Any]:
+    status = clean_text(payload.status).lower().replace("-", "_")
+    if status not in {"claimed", "received", "clear"}:
+        raise HTTPException(status_code=400, detail="Refund status must be claimed, received, or clear.")
+    now = utc_now()
+    with db() as conn:
+        row = conn.execute("SELECT id FROM epost_global_tracking WHERE id=?", (tracking_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="ePost tracking row not found.")
+        if status == "clear":
+            conn.execute(
+                """
+                UPDATE epost_global_tracking
+                SET refund_status='', refund_claimed_at=NULL, refund_received_at=NULL, updated_at=?
+                WHERE id=?
+                """,
+                (now, tracking_id),
+            )
+        elif status == "claimed":
+            conn.execute(
+                """
+                UPDATE epost_global_tracking
+                SET refund_status='claimed',
+                    refund_claimed_at=COALESCE(refund_claimed_at, ?),
+                    refund_received_at=NULL,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (now, now, tracking_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE epost_global_tracking
+                SET refund_status='received',
+                    refund_claimed_at=COALESCE(refund_claimed_at, ?),
+                    refund_received_at=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (now, now, now, tracking_id),
+            )
+    updated = epost_tracking_rows_by_ids([tracking_id])
+    return {"ok": True, "row": updated[0] if updated else None}
 
 
 @app.get("/api/public/epost")
@@ -20080,8 +20799,8 @@ def api_epost_sync(payload: EpostSyncPayload) -> dict[str, Any]:
 
 
 @app.get("/api/epost/due")
-def api_epost_due(days: int = 1, store_id: Optional[int] = None) -> dict[str, Any]:
-    return {"ok": True, "rows": due_epost_tracking_rows(days, store_id)}
+def api_epost_due(days: int = 1, hours: Optional[int] = None, store_id: Optional[int] = None) -> dict[str, Any]:
+    return {"ok": True, "rows": due_epost_tracking_rows(days, store_id, hours)}
 
 
 @app.post("/api/epost/update")

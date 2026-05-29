@@ -17,8 +17,12 @@
         <input id="adminToken" type="password" spellcheck="false" autocomplete="off">
       </label>
       <label>
-        Track again after days
-        <input id="intervalDays" type="number" min="1" max="30" step="1">
+        Auto check every hours
+        <input id="intervalHours" type="number" min="1" max="720" step="1">
+      </label>
+      <label class="checkbox-row">
+        <input id="autoEpostEnabled" type="checkbox">
+        <span>Auto check ePost tracking</span>
       </label>
       <label class="checkbox-row">
         <input id="headlessEpostMode" type="checkbox">

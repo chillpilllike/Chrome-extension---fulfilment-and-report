@@ -6,11 +6,11 @@ function Table({ className, ...props }: React.ComponentProps<"table">) {
   return (
     <div
       data-slot="table-container"
-      className="table-responsive"
+      className="table-responsive tabler-sticky-table-wrap"
     >
       <table
         data-slot="table"
-        className={cn("table table-vcenter card-table table-nowrap", className)}
+        className={cn("table table-vcenter card-table tabler-sticky-table", className)}
         {...props}
       />
     </div>
@@ -21,7 +21,7 @@ function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
   return (
     <thead
       data-slot="table-header"
-      className={cn(className)}
+      className={cn("sticky-top", className)}
       {...props}
     />
   )

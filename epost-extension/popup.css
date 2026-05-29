@@ -73,12 +73,42 @@ button.secondary {
   background: #475569;
 }
 
+button[hidden] {
+  display: none;
+}
+
 #status {
   min-height: 20px;
   border: 1px solid #e2e8f0;
   border-radius: 6px;
   background: white;
   padding: 8px;
+  opacity: 1;
+  transition: opacity 350ms ease, border-color 200ms ease, background 200ms ease, color 200ms ease;
+}
+
+#status.status-success {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #166534;
+  font-weight: 700;
+}
+
+#status.status-error {
+  border-color: #fecaca;
+  background: #fee2e2;
+  color: #991b1b;
+  font-weight: 700;
+}
+
+#status.status-info {
+  border-color: #dbeafe;
+  background: #eff6ff;
+  color: #1e3a8a;
+}
+
+#status.status-fading {
+  opacity: 0;
 }
 
 #logs {

@@ -1,12 +1,16 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const TRACKER_URL = "https://portal.epgshipping.com/ParcelTracker/HomePageTracker";
+const EPOST_TRACKING_ALARM = "epostTracking";
+const DEFAULT_EPOST_AUTO_HOURS = 24;
 
 async function getState() {
   return chrome.storage.local.get({
     apiBase: DEFAULT_API_BASE,
     adminToken: "",
     intervalDays: 1,
+    intervalHours: DEFAULT_EPOST_AUTO_HOURS,
+    autoEpostEnabled: false,
     headlessEpostMode: false,
     epostRun: { running: false, batches: [], batchIndex: 0 },
     epostRunByWindow: {},
@@ -115,10 +119,41 @@ async function openTracker(windowId) {
   await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
 }
 
-async function scheduleAlarm(days) {
-  await chrome.alarms.clear("epostTracking");
-  const periodInMinutes = Math.max(60, Math.max(1, Number(days || 1)) * 24 * 60 || 60);
-  chrome.alarms.create("epostTracking", { periodInMinutes });
+function clampIntervalHours(value, fallback = DEFAULT_EPOST_AUTO_HOURS) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(720, Math.round(parsed)));
+}
+
+function hoursToDueDays(hours) {
+  return Math.max(1, Math.min(30, Math.ceil(clampIntervalHours(hours) / 24)));
+}
+
+async function scheduleAlarm(enabled, hours) {
+  await chrome.alarms.clear(EPOST_TRACKING_ALARM);
+  if (!enabled) return;
+  const intervalHours = clampIntervalHours(hours);
+  chrome.alarms.create(EPOST_TRACKING_ALARM, {
+    delayInMinutes: Math.max(1, intervalHours * 60),
+    periodInMinutes: Math.max(1, intervalHours * 60),
+  });
+}
+
+async function restoreAlarm() {
+  const state = await getState();
+  const migratedHours = state.intervalHours || Math.max(1, Number(state.intervalDays || 1)) * 24;
+  await scheduleAlarm(state.autoEpostEnabled === true, migratedHours);
+}
+
+async function startScheduledEpost() {
+  const state = await getState();
+  if (state.autoEpostEnabled !== true) return { ok: false, message: "ePost auto tracking is disabled." };
+  if (state.epostRun?.running) {
+    await log("Skipped scheduled ePost tracking because a visible ePost run is already active.");
+    return { ok: true, skipped: true };
+  }
+  await log(`Scheduled ePost tracking started; interval is every ${clampIntervalHours(state.intervalHours)} hour(s).`);
+  return startEpost(null);
 }
 
 async function startEpost(windowId = null) {
@@ -126,8 +161,9 @@ async function startEpost(windowId = null) {
   if (state.headlessEpostMode) return startHeadlessEpost();
   await log("Starting visible ePost tracking.", windowId);
   try {
-    await scheduleAlarm(state.intervalDays);
-    const payload = await api(`/api/epost/due?days=${encodeURIComponent(state.intervalDays || 1)}`);
+    const intervalHours = clampIntervalHours(state.intervalHours || (Number(state.intervalDays || 1) * 24));
+    const dueDays = hoursToDueDays(intervalHours);
+    const payload = await api(`/api/epost/due?days=${encodeURIComponent(dueDays)}&hours=${encodeURIComponent(intervalHours)}`);
     const rows = payload.rows || [];
     const batches = chunk(rows.map((row) => row.tracking_code).filter(Boolean), 25);
     const epostRun = { running: true, batches, batchIndex: 0, submittedBatchIndex: null };
@@ -159,10 +195,12 @@ async function stopEpost(windowId) {
 }
 
 async function startHeadlessEpost() {
-  const { intervalDays } = await getState();
+  const { intervalDays, intervalHours } = await getState();
+  const hours = clampIntervalHours(intervalHours || (Number(intervalDays || 1) * 24));
+  const dueDays = hoursToDueDays(hours);
   const result = await api("/api/epost/browserless/run", {
     method: "POST",
-    body: JSON.stringify({ worker_id: `epost-extension-${chrome.runtime.id || "local"}`, interval_days: Math.max(1, Math.min(30, Number(intervalDays || 1))) }),
+    body: JSON.stringify({ worker_id: `epost-extension-${chrome.runtime.id || "local"}`, interval_days: dueDays, interval_hours: hours }),
     timeoutMs: 10000,
   });
   await log(result.message || "Headless ePost started.");
@@ -257,9 +295,19 @@ async function handleResults(message, windowId) {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "epostTracking") {
-    startEpost().catch((error) => log(`Scheduled ePost tracking failed: ${error.message}`));
+  if (alarm.name === EPOST_TRACKING_ALARM) {
+    startScheduledEpost().catch((error) => log(`Scheduled ePost tracking failed: ${error.message}`));
   }
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  restoreAlarm().catch((error) => log(`Could not restore ePost auto tracking: ${error.message}`));
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  restoreAlarm()
+    .then(() => startScheduledEpost())
+    .catch((error) => log(`Could not start ePost auto tracking after Chrome startup: ${error.message}`));
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -268,13 +316,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "GET_STATE") return getWindowState(windowId);
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "SET_SETTINGS") {
+      const intervalHours = clampIntervalHours(message.intervalHours ?? (Number(message.intervalDays || 1) * 24));
       await chrome.storage.local.set({
         apiBase: normalizeApiBase(message.apiBase),
         adminToken: message.adminToken || "",
-        intervalDays: Math.max(1, Math.min(30, Number(message.intervalDays || 1))),
+        intervalDays: hoursToDueDays(intervalHours),
+        intervalHours,
+        autoEpostEnabled: message.autoEpostEnabled === true,
         headlessEpostMode: message.headlessEpostMode === true,
       });
-      await scheduleAlarm(message.intervalDays);
+      await scheduleAlarm(message.autoEpostEnabled === true, intervalHours);
       return { ok: true };
     }
     if (message.type === "START_EPOST") return startEpost(windowId);

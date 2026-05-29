@@ -20,6 +20,14 @@
         <input id="headlessTrackingMode" type="checkbox">
         <span>Run tracking in background/headless Chrome</span>
       </label>
+      <label class="checkbox-row">
+        <input id="autoTrackingEnabled" type="checkbox">
+        <span>Auto check Amazon tracking</span>
+      </label>
+      <label>
+        Auto check every hours
+        <input id="autoTrackingHours" type="number" min="1" max="168" step="1">
+      </label>
       <section id="modeNotice" class="mode-notice"></section>
       <div class="actions">
         <button id="save">Save</button>

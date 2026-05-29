@@ -59,8 +59,16 @@ function absoluteUrl(href) {
 }
 
 function parsePaymentRevision() {
-  const text = clean(document.querySelector("[data-component='alerts']")?.textContent || document.body.textContent || "");
-  const needed = /payment revision needed/i.test(text) || /please update your payment method/i.test(text);
+  const alertBlocks = [
+    ...document.querySelectorAll("[data-component='alerts'], .a-alert-heading, .a-alert-content, .a-box-inner, .od-status-message"),
+  ];
+  const matchedBlock = alertBlocks.find((element) => {
+    const text = clean(element.textContent);
+    return /payment revision needed/i.test(text) || /please update your payment method/i.test(text);
+  });
+  const pageText = clean(document.body.textContent || "");
+  const text = clean(matchedBlock?.textContent || pageText);
+  const needed = Boolean(matchedBlock) || /payment revision needed/i.test(pageText) || /please update your payment method/i.test(pageText);
   const reviseLink = document.querySelector("a[href*='/cpe/revisepayments'], a[href*='revisepayments']");
   return {
     paymentRevisionNeeded: needed,

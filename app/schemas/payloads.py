@@ -182,6 +182,7 @@ class EpostBrowserlessRunPayload(BaseModel):
     worker_id: str = ""
     store_id: Optional[int] = None
     interval_days: int = 1
+    interval_hours: int = 24
     max_batches: int = 0
 
 
@@ -192,6 +193,10 @@ class EpostTrackingUpdatePayload(BaseModel):
 class EpostSyncPayload(BaseModel):
     store_id: Optional[int] = None
     days: int = 2
+
+
+class EpostRefundPayload(BaseModel):
+    status: str
 
 
 class ExportCreatePayload(BaseModel):
