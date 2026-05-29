@@ -7,10 +7,13 @@ import re
 
 ASIN_SECRET = b"NUTRICITY-KEY"
 ASIN_RE = re.compile(r"\b[A-Z0-9]{10}\b")
+ASIN_FALSE_POSITIVES = {"SUPPLEMENT"}
 
 
 def normalize_asin(value: str) -> str:
     value = str(value or "").strip().upper()
+    if value in ASIN_FALSE_POSITIVES:
+        return ""
     return value if ASIN_RE.fullmatch(value) else ""
 
 

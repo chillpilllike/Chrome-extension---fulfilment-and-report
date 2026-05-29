@@ -127,6 +127,22 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "app" / "static")), na
 if (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="frontend-assets")
 
+
+def frontend_index_response() -> Response:
+    index_path = FRONTEND_DIST / "index.html"
+    if index_path.exists():
+        return FileResponse(
+            index_path,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
+    return HTMLResponse(
+        "<h1>Frontend not built</h1><p>Run <code>cd frontend && npm run build</code>, then restart FastAPI.</p>",
+        status_code=503,
+    )
+
 _sync_thread_started = False
 _TYPESENSE_INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="typesense-index")
 _TYPESENSE_COLLECTION_CACHE: dict[str, float] = {}
@@ -141,7 +157,7 @@ _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
 _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
 _SERVICE_SETTINGS_CACHE: tuple[dict[str, str], float] = ({}, 0.0)
 _SERVICE_SETTINGS_CACHE_LOCK = threading.Lock()
-SERVICE_SETTINGS_CACHE_TTL_SECONDS = 15
+SERVICE_SETTINGS_CACHE_TTL_SECONDS = 300
 _FAST_PAGE_CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
 _FAST_PAGE_CACHE_LOCK = threading.Lock()
 FAST_PAGE_CACHE_TTL_SECONDS = 20
@@ -2115,9 +2131,13 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
 def amazon_history_order_refs_from_text(value: Any) -> list[str]:
     text = clean_text(value).upper()
     refs = list(dict.fromkeys(match.group(0).upper() for match in ORDER_REF_RE.finditer(text)))
+    refs.extend(
+        f"{match.group(1).upper()}{match.group(2)}"
+        for match in re.finditer(r"\b([A-Z]{2,5}\d{2,})\s+(\d{1,4})\b", text, re.IGNORECASE)
+    )
     # Amazon sometimes compacts fulfilment labels into e.g. NC104194Pack.
     # Keep the Odoo order ref distinct from the pack-size suffix.
-    refs.extend(match.group(1).upper() for match in re.finditer(r"\b(NC\d{5})(?=\d+\s*PACK\b)", text, re.IGNORECASE))
+    refs.extend(match.group(1).upper() for match in re.finditer(r"\b([A-Z]{2,5}\d{2,})(?:\d{1,4})\s*PACK\b", text, re.IGNORECASE))
     return list(dict.fromkeys(refs))
 
 
@@ -2264,6 +2284,31 @@ def amazon_history_apply_order_date_checks(records: list[dict[str, Any]], *group
                 candidate["order_date_checks"] = checks
                 candidate["order_date_mismatch"] = bool(checks) and any(not check["matches"] for check in checks)
                 candidate["amazon_order_placed_at"] = amazon_placed_at
+
+
+def amazon_history_apply_recipient_ref_card_asins(records: list[dict[str, Any]], *groups: dict[str, Any]) -> None:
+    records_by_order = {record["amazon_order_id"]: record for record in records if record.get("amazon_order_id")}
+    refs_by_order = {
+        amazon_order_id: set(amazon_history_order_refs_from_text(record.get("recipient") or ""))
+        for amazon_order_id, record in records_by_order.items()
+    }
+    for group in groups:
+        for amazon_order_id, value in (group or {}).items():
+            record = records_by_order.get(amazon_order_id) or {}
+            card_asins = [normalize_asin(asin) for asin in (record.get("asins") or []) if normalize_asin(asin)]
+            refs = refs_by_order.get(amazon_order_id) or set()
+            if not card_asins or not refs:
+                continue
+            candidates = value.get("orders") if isinstance(value, dict) and "orders" in value else value
+            for candidate in candidates or []:
+                order_name = clean_text(candidate.get("odoo_order_name")).upper()
+                if not order_name or order_name not in refs:
+                    continue
+                candidate_asins = candidate.setdefault("asins", [])
+                for asin in card_asins:
+                    if asin not in candidate_asins:
+                        candidate_asins.append(asin)
+                candidate["matched_by_recipient_ref"] = True
 
 
 def amazon_history_direct_odoo_order(
@@ -4878,13 +4923,18 @@ def update_lines_after_order(
 
 
 ORDER_REF_RE = re.compile(r"\b[A-Z]{2,5}\d{2,}\b", re.IGNORECASE)
+SPLIT_ORDER_REF_RE = re.compile(r"\b([A-Z]{2,5}\d{2,})\s+(\d{1,4})\b", re.IGNORECASE)
 
 
 def manual_order_refs_from_payload(payload: ManualAmazonOrderMatchPayload) -> list[str]:
     refs: list[str] = []
     for value in payload.order_names or []:
-        refs.extend(match.group(0).upper() for match in ORDER_REF_RE.finditer(str(value or "")))
-    refs.extend(match.group(0).upper() for match in ORDER_REF_RE.finditer(payload.source_text or ""))
+        text = str(value or "")
+        refs.extend(match.group(0).upper() for match in ORDER_REF_RE.finditer(text))
+        refs.extend(f"{match.group(1).upper()}{match.group(2)}" for match in SPLIT_ORDER_REF_RE.finditer(text))
+    source_text = payload.source_text or ""
+    refs.extend(match.group(0).upper() for match in ORDER_REF_RE.finditer(source_text))
+    refs.extend(f"{match.group(1).upper()}{match.group(2)}" for match in SPLIT_ORDER_REF_RE.finditer(source_text))
     return list(dict.fromkeys(refs))
 
 
@@ -4913,6 +4963,19 @@ def manual_amazon_match_followups(
     amazon_order_url: str,
     amazon_account_name: str,
 ) -> None:
+    try:
+        with db() as conn:
+            conn.execute(
+                """
+                UPDATE amazon_order_history_unmatched
+                SET resolved_at=COALESCE(resolved_at, ?),
+                    last_seen_at=?
+                WHERE amazon_order_id=?
+                """,
+                (utc_now(), utc_now(), amazon_order_id),
+            )
+    except Exception as exc:
+        print(f"Manual Amazon match unmatched-history cleanup failed for {amazon_order_id}: {exc}", flush=True)
     for row in updated_for_shopify:
         try:
             ensure_inventory_for_line(row)
@@ -14595,7 +14658,7 @@ def search_order_lines_sql(
         "supplier_part_auxiliary_id",
         "default_code",
     )
-    exact_clause = " OR ".join(f"{column} = ?" for column in exact_columns)
+    exact_clause = " OR ".join(f"UPPER(COALESCE({column}, '')) = UPPER(?)" for column in exact_columns)
     exact_params: list[Any] = [*condition_params, *[clean_query for _ in exact_columns]]
     exact_where_sql = f"WHERE ({condition_suffix}) AND ({exact_clause})"
     with db() as conn:
@@ -14787,7 +14850,11 @@ def api_system_diagnostics() -> dict[str, Any]:
 
 
 @app.get("/api/orders")
-def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "") -> dict[str, Any]:
+def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "", q: str = "") -> dict[str, Any]:
+    if clean_text(q):
+        data = search_order_lines_sql(q, store_id, page, per_page, sort_by, sort_dir, condition, country)
+        data["search_engine"] = "postgres"
+        return data
     filter_by, filtered = order_condition_filter(condition, store_id, country)
     if filtered and order_condition_uses_typesense(condition, country):
         try:
@@ -17184,12 +17251,14 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
         try:
             with db() as conn:
                 matches = amazon_history_matches(conn, order_ids)
-                suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
+                suggestions = amazon_history_name_suggestions(conn, records, set())
                 conflicts = amazon_history_asin_conflicts(conn, records, matches, suggestions)
                 amazon_history_apply_quantity_checks(records, matches, suggestions)
                 amazon_history_apply_order_date_checks(records, matches, suggestions)
+                amazon_history_apply_recipient_ref_card_asins(records, matches, suggestions, conflicts)
                 direct_targets = amazon_history_direct_odoo_targets(conn, records, matches, suggestions)
-                unmatched = upsert_amazon_history_unmatched(conn, records, set(matches.keys()))
+                resolved_ids = set(matches.keys()) | set(suggestions.keys()) | set(direct_targets.keys())
+                unmatched = upsert_amazon_history_unmatched(conn, records, resolved_ids)
             break
         except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
             last_db_error = exc
@@ -17230,7 +17299,7 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
         try:
             with db() as conn:
                 matches = amazon_history_matches(conn, order_ids)
-                suggestions = amazon_history_name_suggestions(conn, records, set(matches.keys()))
+                suggestions = amazon_history_name_suggestions(conn, records, set())
                 targets = amazon_history_direct_odoo_targets(conn, records, matches, suggestions)
             break
         except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
@@ -17242,6 +17311,7 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
     else:
         raise last_db_error or RuntimeError("Amazon order-history direct Odoo lookup failed.")
     direct_odoo = amazon_history_direct_odoo_matches_from_targets(records, targets)
+    amazon_history_apply_recipient_ref_card_asins(records, direct_odoo)
     return {"ok": True, "odoo_direct": direct_odoo}
 
 
@@ -20317,7 +20387,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
             for row_store_id in sorted({int(row["store_id"]) for row in rows}):
                 store_rows = [row for row in rows if int(row["store_id"]) == row_store_id]
                 date_allowed, date_blocked, date_messages = block_lines_before_min_odoo_order_date(conn, store_rows)
-                allowed, blocked_count, messages = block_lines_with_fulfilled_shopify_orders(conn, row_store_id, date_allowed)
+                allowed, blocked_count, messages = block_lines_with_fulfilled_shopify_orders(conn, row_store_id, date_allowed, live_sync=False)
                 allowed_rows.extend(allowed)
                 blocked_total += date_blocked + blocked_count
                 blocked_messages.extend([*date_messages, *messages])
@@ -20351,8 +20421,18 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                         """,
                         (amazon_order_url, amazon_account_name, amazon_order_placed_at, now, row["id"]),
                     )
-                    updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
-                    updated_for_shopify.append(dict(updated) if updated else dict(row))
+                    updated_for_shopify.append({
+                        **dict(row),
+                        "amazon_order_url": amazon_order_url,
+                        "amazon_account_name": amazon_account_name,
+                        "order_engine": "chrome",
+                        "amazon_status": "ordered",
+                        "state": "ordered",
+                        "missing_asin": None,
+                        "last_error": None,
+                        "ordered_at": amazon_order_placed_at,
+                        "updated_at": now,
+                    })
                 else:
                     updated_for_shopify.append(dict(row))
                 continue
@@ -20371,31 +20451,65 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                     amazon_status='ordered',
                     state='ordered',
                     missing_asin=NULL,
+                    tracking_status=CASE
+                        WHEN COALESCE(amazon_order_id, '') != ? THEN NULL
+                        ELSE tracking_status
+                    END,
+                    tracking_payload=CASE
+                        WHEN COALESCE(amazon_order_id, '') != ? THEN NULL
+                        ELSE tracking_payload
+                    END,
+                    tracking_checked_at=CASE
+                        WHEN COALESCE(amazon_order_id, '') != ? THEN NULL
+                        ELSE tracking_checked_at
+                    END,
                     last_error=NULL,
                     ordered_at=?,
                     updated_at=?
                 WHERE id=?
                 """,
-                (amazon_order_id, amazon_order_url, amazon_account_name, amazon_order_id, ordered_at, now, row["id"]),
+                (
+                    amazon_order_id,
+                    amazon_order_url,
+                    amazon_account_name,
+                    amazon_order_id,
+                    amazon_order_id,
+                    amazon_order_id,
+                    amazon_order_id,
+                    ordered_at,
+                    now,
+                    row["id"],
+                ),
             )
-            updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
-            if updated:
-                updated_for_shopify.append(dict(updated))
-        conn.execute(
-            """
-            UPDATE amazon_order_history_unmatched
-            SET resolved_at=COALESCE(resolved_at, ?),
-                last_seen_at=?
-            WHERE amazon_order_id=?
-            """,
-            (now, now, amazon_order_id),
-        )
+            updated_for_shopify.append({
+                **dict(row),
+                "amazon_order_id": amazon_order_id,
+                "amazon_order_url": amazon_order_url,
+                "amazon_account_name": amazon_account_name,
+                "amazon_cancelled_order_id": clean_text(row.get("amazon_cancelled_order_id")) or (
+                    clean_text(row.get("amazon_order_id"))
+                    if clean_text(row.get("amazon_order_id")) and clean_text(row.get("amazon_order_id")) != amazon_order_id
+                    else clean_text(row.get("amazon_cancelled_order_id"))
+                ),
+                "order_engine": "chrome",
+                "amazon_status": "ordered",
+                "state": "ordered",
+                "missing_asin": None,
+                "tracking_status": None if clean_text(row.get("amazon_order_id")) != amazon_order_id else row.get("tracking_status"),
+                "tracking_payload": None if clean_text(row.get("amazon_order_id")) != amazon_order_id else row.get("tracking_payload"),
+                "tracking_checked_at": None if clean_text(row.get("amazon_order_id")) != amazon_order_id else row.get("tracking_checked_at"),
+                "last_error": None,
+                "ordered_at": ordered_at,
+                "updated_at": now,
+            })
     matched_refs = sorted({str(row["odoo_order_name"]).upper() for row in rows})
-    threading.Timer(
+    followup_timer = threading.Timer(
         0.1,
         manual_amazon_match_followups,
         args=(rows, updated_for_shopify, amazon_order_id, amazon_order_url, amazon_account_name),
-    ).start()
+    )
+    followup_timer.daemon = True
+    followup_timer.start()
     return {
         "ok": True,
         "matched": len(rows),
@@ -21709,13 +21823,7 @@ def api_test_amazon_account(account_id: int) -> dict[str, Any]:
 
 @app.get("/")
 def app_home():
-    index_path = FRONTEND_DIST / "index.html"
-    if index_path.exists():
-        return FileResponse(index_path)
-    return HTMLResponse(
-        "<h1>Frontend not built</h1><p>Run <code>cd frontend && npm run build</code>, then restart FastAPI.</p>",
-        status_code=503,
-    )
+    return frontend_index_response()
 
 
 @app.get("/legacy", response_class=HTMLResponse)
@@ -21783,13 +21891,7 @@ def chrome_queue_release_lock(group_key: str = Form(...), store_id: str = Form("
 
 @app.get("/inventory", response_class=HTMLResponse)
 def inventory_page(request: Request, store_id: Optional[int] = None) -> Response:
-    index_path = FRONTEND_DIST / "index.html"
-    if index_path.exists():
-        return FileResponse(index_path)
-    return HTMLResponse(
-        "<h1>Frontend not built</h1><p>Run <code>cd frontend && npm run build</code>, then restart FastAPI.</p>",
-        status_code=503,
-    )
+    return frontend_index_response()
 
 
 @app.get("/stores", response_class=HTMLResponse)
@@ -22252,10 +22354,4 @@ def amazon_order_history_unmatched_page(request: Request) -> HTMLResponse:
 def app_frontend_page(frontend_path: str):
     if f"/{frontend_path.strip('/')}" not in FRONTEND_SHELL_PATHS:
         raise HTTPException(404, "Not found")
-    index_path = FRONTEND_DIST / "index.html"
-    if index_path.exists():
-        return FileResponse(index_path)
-    return HTMLResponse(
-        "<h1>Frontend not built</h1><p>Run <code>cd frontend && npm run build</code>, then restart FastAPI.</p>",
-        status_code=503,
-    )
+    return frontend_index_response()

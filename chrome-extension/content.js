@@ -64,6 +64,8 @@ let panelIntervalId = null;
 let historyIntervalId = null;
 let lastNoActiveJobCheckAt = 0;
 const MAX_ORDER_HISTORY_CARDS_PER_PASS = 12;
+const ORDER_HISTORY_CACHE_MS = 2 * 60 * 1000;
+const ORDER_HISTORY_NOT_FOUND_CACHE_MS = 15 * 1000;
 const IDLE_ACTIVE_JOB_POLL_MS = 30000;
 
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
@@ -5799,6 +5801,7 @@ function recipientFromOrderHistoryText(text = "") {
   if (nutricityMatch?.[0]) {
     return nutricityMatch[0]
       .replace(/\b(?:Order|Placed|Total|Ship|To|View|Buy|Again|Invoice|Details)\b.*$/i, "")
+      .replace(/\b([A-Z]{2,5}\d{2,})\s+(\d{1,4})\b/g, "$1$2")
       .replace(/\s+/g, " ")
       .trim();
   }
@@ -5807,8 +5810,12 @@ function recipientFromOrderHistoryText(text = "") {
 }
 
 function orderCardRecipient(card) {
+  const orderId = orderCardOrderId(card);
   const selectors = [
     ".shipToTriggerTextTruncate .a-truncate-full",
+    ".shipToTriggerTextTruncate .a-truncate-cut",
+    "[data-a-popover*='PreloadedContent_'] .shipToTriggerTextTruncate .a-truncate-full",
+    "[data-a-popover*='PreloadedContent_'] .shipToTriggerTextTruncate .a-truncate-cut",
     ".shipToTriggerTextTruncate",
     "[id^='a-popover-PreloadedContent_'] .a-text-bold",
     "[data-test-id*='recipient']",
@@ -5820,6 +5827,13 @@ function orderCardRecipient(card) {
       .map((text) => recipientFromOrderHistoryText(text) || text)
       .find(Boolean);
     if (text) return text;
+  }
+  if (orderId) {
+    const preloaded = document.getElementById(`a-popover-PreloadedContent_${orderId}`);
+    const popoverText = [...(preloaded?.querySelectorAll?.(".a-text-bold") || [])]
+      .map((node) => recipientFromOrderHistoryText(node.textContent || "") || (node.textContent || "").replace(/\s+/g, " ").trim())
+      .find(Boolean);
+    if (popoverText) return popoverText;
   }
   return recipientFromOrderHistoryText(card.innerText || card.textContent || "");
 }
@@ -5977,7 +5991,31 @@ function orderHistoryAnnotationIsComplete(card) {
   if (!annotations.length) return false;
   const text = annotations.map((annotation) => annotation.textContent || "").join(" ");
   if (isTransientOrderHistoryLookupError(text)) return false;
+  if (/not found in app/i.test(text)) {
+    const newestLookupAt = Math.max(
+      ...annotations.map((annotation) => Number(annotation.dataset.lookupAt || 0)),
+      0,
+    );
+    return newestLookupAt > 0 && Date.now() - newestLookupAt < ORDER_HISTORY_NOT_FOUND_CACHE_MS;
+  }
   return !/checking app match/i.test(text);
+}
+
+function orderHistoryLookupHasTarget(result = {}) {
+  return Boolean(
+    (result.match?.orders || []).length
+    || (result.suggestions || []).length
+    || (result.conflicts || []).length
+    || (result.odooDirect || []).length
+  );
+}
+
+function orderHistoryLookupCacheFresh(result = {}) {
+  const age = Date.now() - Number(result.cachedAt || 0);
+  const ttl = result.unmatched && !orderHistoryLookupHasTarget(result)
+    ? ORDER_HISTORY_NOT_FOUND_CACHE_MS
+    : ORDER_HISTORY_CACHE_MS;
+  return age >= 0 && age < ttl;
 }
 
 function orderHistoryNeedsMoreAnnotation() {
@@ -5986,7 +6024,7 @@ function orderHistoryNeedsMoreAnnotation() {
     const details = orderHistoryCardDetails(card);
     if (!details?.amazon_order_id) return false;
     const cached = orderHistoryLookupCache.get(details.amazon_order_id);
-    if (cached && Date.now() - Number(cached.cachedAt || 0) < 2 * 60 * 1000 && cached.odooDirectLoaded) return false;
+    if (cached && orderHistoryLookupCacheFresh(cached) && cached.odooDirectLoaded) return false;
     return !orderHistoryAnnotationIsComplete(card);
   });
 }
@@ -6111,6 +6149,7 @@ function renderOrderHistoryAnnotation(card, result) {
   }
   const marker = document.createElement("div");
   marker.className = `nutricity-order-history-annotation ${cancelled && orders.length ? "is-cancelled-sync" : conflicts.length ? "is-conflict" : orders.length ? "is-match" : suggestions.length ? "is-suggestion" : "is-miss"}${detailsClass}`;
+  marker.dataset.lookupAt = String(result.cachedAt || Date.now());
   const label = document.createElement("span");
   label.className = "nutricity-order-history-label";
   label.textContent = cancelled && orders.length ? "Cancelled warning" : conflicts.length ? "Warning" : orders.length ? "Odoo order" : suggestions.length ? "Odoo order found" : "Not found in app";
@@ -6243,31 +6282,29 @@ function orderHistoryResultAsinSet(result = {}) {
 
 function orderHistoryCandidateAsins(candidate = {}) {
   const asins = new Set();
+  const addAsin = (value) => {
+    const normalized = String(value || "").toUpperCase().trim();
+    if (!normalized || normalized === "SUPPLEMENT") return;
+    asins.add(normalized);
+  };
   for (const asin of candidate.asins || []) {
-    const normalized = String(asin || "").toUpperCase().trim();
-    if (normalized) asins.add(normalized);
+    addAsin(asin);
   }
   for (const line of candidate.lines || []) {
-    const normalized = String(line?.asin || "").toUpperCase().trim();
-    if (normalized) asins.add(normalized);
-    const replacement = String(line?.replacement_asin || "").toUpperCase().trim();
-    if (replacement) asins.add(replacement);
+    addAsin(line?.asin);
+    addAsin(line?.replacement_asin);
   }
   for (const check of candidate.quantity_checks || []) {
-    const normalized = String(check?.asin || "").toUpperCase().trim();
-    if (normalized) asins.add(normalized);
+    addAsin(check?.asin);
   }
   for (const asin of Object.keys(candidate.asin_quantities || {})) {
-    const normalized = String(asin || "").toUpperCase().trim();
-    if (normalized) asins.add(normalized);
+    addAsin(asin);
   }
   if (candidate.asin) {
-    const normalized = String(candidate.asin || "").toUpperCase().trim();
-    if (normalized) asins.add(normalized);
+    addAsin(candidate.asin);
   }
   if (candidate.replacement_asin) {
-    const normalized = String(candidate.replacement_asin || "").toUpperCase().trim();
-    if (normalized) asins.add(normalized);
+    addAsin(candidate.replacement_asin);
   }
   return asins;
 }
@@ -6283,13 +6320,37 @@ function filterOrderHistoryCandidatesForCard(candidates = [], cardAsins = new Se
   return (candidates || []).filter((candidate) => orderHistoryCandidateBelongsOnCard(candidate, cardAsins));
 }
 
+function orderHistoryTextMatchesOrderName(text = "", orderName = "") {
+  const normalizeRefs = (value) => String(value || "")
+    .toUpperCase()
+    .replace(/\b([A-Z]{2,5}\d{2,})\s+(\d{1,4})\b/g, "$1$2")
+    .replace(/[^A-Z0-9]+/g, " ");
+  const normalizedText = normalizeRefs(text);
+  const normalizedOrder = String(orderName || "").toUpperCase().replace(/[^A-Z0-9]+/g, "");
+  return Boolean(
+    normalizedOrder
+    && (
+      new RegExp(`\\b${normalizedOrder}\\b`).test(normalizedText)
+      || normalizedText.replace(/\s+/g, "").includes(normalizedOrder)
+    )
+  );
+}
+
+function filterOrderHistoryCandidatesForCardAndRecipient(candidates = [], cardAsins = new Set(), recipient = "") {
+  return (candidates || []).filter((candidate) =>
+    orderHistoryTextMatchesOrderName(recipient, candidate.odoo_order_name)
+    || orderHistoryCandidateBelongsOnCard(candidate, cardAsins),
+  );
+}
+
 function filterOrderHistoryResultForCard(result = {}) {
   const cardAsins = orderHistoryResultAsinSet(result);
   if (!cardAsins.size) return result;
-  const matchOrders = filterOrderHistoryCandidatesForCard(result.match?.orders || [], cardAsins);
-  const suggestions = filterOrderHistoryCandidatesForCard(result.suggestions || [], cardAsins);
-  const conflicts = filterOrderHistoryCandidatesForCard(result.conflicts || [], cardAsins);
-  const directOdoo = filterOrderHistoryCandidatesForCard(result.odooDirect || [], cardAsins);
+  const recipient = result.recipient || "";
+  const matchOrders = filterOrderHistoryCandidatesForCardAndRecipient(result.match?.orders || [], cardAsins, recipient);
+  const suggestions = filterOrderHistoryCandidatesForCardAndRecipient(result.suggestions || [], cardAsins, recipient);
+  const conflicts = filterOrderHistoryCandidatesForCardAndRecipient(result.conflicts || [], cardAsins, recipient);
+  const directOdoo = filterOrderHistoryCandidatesForCardAndRecipient(result.odooDirect || [], cardAsins, recipient);
   return {
     ...result,
     match: result.match ? { ...result.match, orders: matchOrders } : result.match,
@@ -6578,6 +6639,9 @@ async function syncSuggestedAmazonHistoryOrder(result) {
       .filter(Boolean)
       .some((asin) => amazonAsins.has(asin));
   };
+  const suggestionLineIds = [
+    ...new Set(suggestions.flatMap((order) => (order.line_ids || []).map(Number).filter(Boolean))),
+  ];
   const matchingLineIds = [
     ...new Set(
       suggestions.flatMap((order) =>
@@ -6588,10 +6652,16 @@ async function syncSuggestedAmazonHistoryOrder(result) {
       ),
     ),
   ];
-  if (amazonAsins.size && !matchingLineIds.length) {
-    return { ok: false, message: "No matching Odoo line ASIN was found for this Amazon order card." };
+  const lineIdsForSync = matchingLineIds.length ? matchingLineIds : suggestionLineIds;
+  if (!lineIdsForSync.length) {
+    return {
+      ok: false,
+      message: amazonAsins.size
+        ? "No matching Odoo line ASIN or app line id was found for this Amazon order card."
+        : "No app line id is available for this Amazon order card.",
+    };
   }
-  return send({
+  return sendWithTimeout({
     type: "SYNC_AMAZON_HISTORY_ORDER",
     order: {
       amazon_order_id: result.orderId,
@@ -6600,11 +6670,11 @@ async function syncSuggestedAmazonHistoryOrder(result) {
       recipient: result.recipient || "",
       source_text: result.recipient || orderNames.join(" "),
       order_names: orderNames,
-      line_ids: matchingLineIds,
+      line_ids: lineIdsForSync,
       store_id: suggestions.length === 1 ? suggestions[0].store_id : null,
       replace_existing: true,
     },
-  });
+  }, 25000);
 }
 
 async function syncMatchedAmazonHistoryDate(result) {
@@ -6612,7 +6682,7 @@ async function syncMatchedAmazonHistoryDate(result) {
   const orderNames = [...new Set(orders.map((order) => order.odoo_order_name).filter(Boolean))];
   const lineIds = [...new Set(orders.flatMap((order) => order.line_ids || []).map(Number).filter(Boolean))];
   if (!result.orderId || !orderNames.length || !lineIds.length) return { ok: false, message: "No matched app lines are available for date sync." };
-  return send({
+  return sendWithTimeout({
     type: "SYNC_AMAZON_HISTORY_ORDER",
     order: {
       amazon_order_id: result.orderId,
@@ -6625,7 +6695,7 @@ async function syncMatchedAmazonHistoryDate(result) {
       store_id: orders.length === 1 ? orders[0].store_id : null,
       replace_existing: true,
     },
-  });
+  }, 25000);
 }
 
 async function annotateAmazonOrderHistoryDirectOdoo(pairs = []) {
@@ -6700,10 +6770,11 @@ async function annotateAmazonOrderHistory() {
   }
   for (const { card, details } of pairs) {
     const cached = orderHistoryLookupCache.get(details.amazon_order_id);
-    if (cached && Date.now() - Number(cached.cachedAt || 0) < 2 * 60 * 1000) {
+    if (cached && orderHistoryLookupCacheFresh(cached)) {
       renderOrderHistoryAnnotation(card, cached);
       if (!cached.odooDirectLoaded) directCandidates.push({ card, details });
     } else {
+      if (cached) orderHistoryLookupCache.delete(details.amazon_order_id);
       renderOrderHistoryPendingAnnotation(card, details);
       unknown.push(details);
     }

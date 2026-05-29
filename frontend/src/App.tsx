@@ -1202,6 +1202,57 @@ type SortKey =
   | "last_error"
 type SortDirection = "asc" | "desc"
 
+const validOrderConditions = new Set(orderConditionOptions.map((option) => option.value))
+const validSortKeys = new Set<SortKey>([
+  "odoo_order_name",
+  "odoo_order_date",
+  "destination_country",
+  "product_name",
+  "default_code",
+  "pulled_at",
+  "ordered_at",
+  "asin",
+  "supplier_part_auxiliary_id",
+  "quantity",
+  "odoo_status_label",
+  "state",
+  "order_engine",
+  "amazon_account_name",
+  "tracking_status",
+  "amazon_cancelled_order_id",
+  "amazon_order_id",
+  "fulfilment_note",
+  "last_error",
+])
+
+function initialOrdersUrlParams() {
+  if (typeof window === "undefined") {
+    return {
+      storeId: "",
+      q: "",
+      condition: "all",
+      country: "",
+      page: 1,
+      sortBy: "odoo_order_date" as SortKey,
+      sortDir: "desc" as SortDirection,
+    }
+  }
+  const params = new URLSearchParams(window.location.search)
+  const condition = params.get("condition") || "all"
+  const sortBy = params.get("sort_by") || "odoo_order_date"
+  const sortDir = params.get("sort_dir") === "asc" ? "asc" : "desc"
+  const page = Math.max(1, Number(params.get("page") || 1) || 1)
+  return {
+    storeId: params.get("store_id") || "",
+    q: params.get("q") || "",
+    condition: validOrderConditions.has(condition) ? condition : "all",
+    country: (params.get("country") || "").toUpperCase(),
+    page,
+    sortBy: validSortKeys.has(sortBy as SortKey) ? (sortBy as SortKey) : "odoo_order_date",
+    sortDir: sortDir as SortDirection,
+  }
+}
+
 type OrderColumn = {
   key: OrderColumnKey
   label: string
@@ -2147,6 +2198,7 @@ function ExportControls({
 
 function App() {
   const initialDashboard = cachedDashboardData()
+  const initialOrdersParams = initialOrdersUrlParams()
   const [data, setData] = useState<DashboardData | null>(() => initialDashboard)
   const [orderRows, setOrderRows] = useState<OrderLine[]>(() => initialDashboard?.rows || [])
   const [inventory, setInventory] = useState<InventoryItem[]>([])
@@ -2155,7 +2207,7 @@ function App() {
   const [cancelledOrders, setCancelledOrders] = useState<CancelledOrderRow[]>([])
   const [cancelledOrdersPage, setCancelledOrdersPage] = useState(1)
   const [cancelledOrdersTotal, setCancelledOrdersTotal] = useState(0)
-  const [ordersPage, setOrdersPage] = useState(1)
+  const [ordersPage, setOrdersPage] = useState(initialOrdersParams.page)
   const [ordersTotal, setOrdersTotal] = useState(() => initialDashboard?.total || 0)
   const [ordersLoading, setOrdersLoading] = useState(false)
   const [ordersTransitioning, setOrdersTransitioning] = useState(false)
@@ -2217,7 +2269,7 @@ function App() {
   const ordersShiftKeyDown = useRef(false)
   const initialDashboardRefreshDone = useRef(false)
   const initialDashboardRefreshStarted = useRef(false)
-  const [storeId, setStoreId] = useState(() => String(initialDashboard?.current_store_id || ""))
+  const [storeId, setStoreId] = useState(() => initialOrdersParams.storeId || String(initialDashboard?.current_store_id || ""))
   const [addressId, setAddressId] = useState(() => String(initialDashboard?.addresses.find((address) => address.is_default)?.id || initialDashboard?.addresses[0]?.id || ""))
   const [amazonAccountId, setAmazonAccountId] = useState(() => String(initialDashboard?.amazon_accounts.find((account) => account.is_default)?.id || initialDashboard?.amazon_accounts[0]?.id || ""))
   const [orderingEngine, setOrderingEngine] = useState(() => initialDashboard?.default_ordering_engine || "rest")
@@ -2225,10 +2277,10 @@ function App() {
   const [limit, setLimit] = useState(() => savedPullSetting(PULL_LIMIT_STORAGE_KEY, "0"))
   const [pullStoreIds, setPullStoreIds] = useState<string[]>(savedPullStoreIds)
   const [pullOrderNames, setPullOrderNames] = useState("")
-  const [search, setSearch] = useState("")
-  const [ordersQuery, setOrdersQuery] = useState("")
-  const [orderCondition, setOrderCondition] = useState("all")
-  const [orderCountry, setOrderCountry] = useState("")
+  const [search, setSearch] = useState(initialOrdersParams.q)
+  const [ordersQuery, setOrdersQuery] = useState(initialOrdersParams.q)
+  const [orderCondition, setOrderCondition] = useState(initialOrdersParams.condition)
+  const [orderCountry, setOrderCountry] = useState(initialOrdersParams.country)
   const [orderCountries, setOrderCountries] = useState<OrderCountryOption[]>([])
   const [selected, setSelected] = useState<number[]>([])
   const [ordersSelectAll, setOrdersSelectAll] = useState(false)
@@ -2254,8 +2306,8 @@ function App() {
   const [placeRecentDays, setPlaceRecentDays] = useState(() => savedPullSetting(PULL_DAYS_STORAGE_KEY, "5"))
   const [allowMissingSpaid, setAllowMissingSpaid] = useState(false)
   const [resendMissingAsins, setResendMissingAsins] = useState(false)
-  const [sortKey, setSortKey] = useState<SortKey>("odoo_order_date")
-  const [sortDirection, setSortDirection] = useState<SortDirection>("desc")
+  const [sortKey, setSortKey] = useState<SortKey>(initialOrdersParams.sortBy)
+  const [sortDirection, setSortDirection] = useState<SortDirection>(initialOrdersParams.sortDir)
   const [showColumnSettings, setShowColumnSettings] = useState(false)
   const [orderColumns, setOrderColumns] = useState<OrderColumn[]>(loadOrderColumns)
   const [draggedColumnKey, setDraggedColumnKey] = useState<OrderColumnKey | null>(null)
@@ -2406,7 +2458,7 @@ function App() {
       }))
     }
     const resolvedStore = String(next.current_store_id || "")
-    setStoreId(resolvedStore)
+    setStoreId((current) => current || resolvedStore)
     setAddressId((current) => current || String(next.addresses.find((address) => address.is_default)?.id || next.addresses[0]?.id || ""))
     setAmazonAccountId((current) => current || String(next.amazon_accounts.find((account) => account.is_default)?.id || next.amazon_accounts[0]?.id || ""))
     setOrderingEngine(next.default_ordering_engine || "rest")
@@ -2425,7 +2477,7 @@ function App() {
     const query = pagedQuery(nextStoreId, nextPage, { per_page: ORDERS_PAGE_SIZE, sort_by: sortKey, sort_dir: sortDirection })
     const next = await api<DashboardData>(`/api/dashboard${query}`)
     if (requestSeq !== dashboardRequestSeqRef.current) return
-    applyDashboardData(next, nextPage, { updateOrders: page !== "orders" || ordersPageRef.current === nextPage })
+    applyDashboardData(next, nextPage, { updateOrders: page !== "orders" })
   }
 
   async function fetchOrdersPageData(nextStoreId: string, nextPage: number, term: string, signal?: AbortSignal) {
@@ -2635,6 +2687,23 @@ function App() {
   }, [page])
 
   useEffect(() => {
+    if (page !== "orders") return
+    const query = new URLSearchParams()
+    if (storeId) query.set("store_id", storeId)
+    if (orderCondition !== "all") query.set("condition", orderCondition)
+    if (ordersQuery.trim()) query.set("q", ordersQuery.trim())
+    if (orderCountry) query.set("country", orderCountry)
+    if (ordersPage > 1) query.set("page", String(ordersPage))
+    if (sortKey !== "odoo_order_date") query.set("sort_by", sortKey)
+    if (sortDirection !== "desc") query.set("sort_dir", sortDirection)
+    const nextUrl = `${pagePath(page)}${query.toString() ? `?${query.toString()}` : ""}`
+    const currentUrl = `${window.location.pathname}${window.location.search}`
+    if (currentUrl !== nextUrl) {
+      window.history.replaceState({ page }, "", nextUrl)
+    }
+  }, [page, storeId, orderCondition, ordersQuery, orderCountry, ordersPage, sortKey, sortDirection])
+
+  useEffect(() => {
     const timer = window.setTimeout(() => setOrdersQuery(search.trim()), 250)
     return () => window.clearTimeout(timer)
   }, [search])
@@ -2647,9 +2716,11 @@ function App() {
     const load = !initialDashboardRefreshStarted.current
       ? (() => {
         initialDashboardRefreshStarted.current = true
-        return refresh(storeId, 1).finally(() => {
-          initialDashboardRefreshDone.current = true
-        })
+        return refresh(storeId, page === "orders" ? ordersPage : 1)
+          .then(() => (page === "orders" ? refreshOrdersPage(storeId, ordersPage) : undefined))
+          .finally(() => {
+            initialDashboardRefreshDone.current = true
+          })
       })()
       : page === "orders" && data
         ? refreshOrdersPage(storeId, ordersPage)
