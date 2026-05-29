@@ -2054,6 +2054,17 @@ def amazon_history_lookup_records(payload: AmazonHistoryLookupPayload) -> list[d
     return list(by_id.values())[:80]
 
 
+def order_line_asin_aliases(row: dict[str, Any]) -> list[str]:
+    aliases = [
+        normalize_asin(row.get("asin") if "asin" in row.keys() else ""),
+        normalize_asin(row.get("replacement_asin") if "replacement_asin" in row.keys() else ""),
+        normalize_asin(row.get("asin_from_reference") if "asin_from_reference" in row.keys() else ""),
+        normalize_asin(row.get("asin_from_note") if "asin_from_note" in row.keys() else ""),
+        normalize_asin(row.get("original_asin") if "original_asin" in row.keys() else ""),
+    ]
+    return list(dict.fromkeys(alias for alias in aliases if alias))
+
+
 def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[str, Any]]:
     if not order_ids:
         return {}
@@ -2066,6 +2077,8 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
                order_lines.odoo_order_id,
                order_lines.odoo_order_name,
                order_lines.asin,
+               order_lines.asin_from_reference,
+               order_lines.asin_from_note,
                order_lines.replacement_asin,
                order_lines.quantity,
                order_lines.state,
@@ -2110,21 +2123,23 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
         if asin:
             ordered_at = clean_text(row["ordered_at"])
             replacement_asin = normalize_asin(row["replacement_asin"] if "replacement_asin" in row.keys() else "")
+            asin_aliases = order_line_asin_aliases(row)
             order["lines"].append({
                 "id": row["id"],
                 "asin": asin,
                 "replacement_asin": replacement_asin,
+                "asin_from_reference": normalize_asin(row.get("asin_from_reference") if "asin_from_reference" in row.keys() else ""),
+                "asin_from_note": normalize_asin(row.get("asin_from_note") if "asin_from_note" in row.keys() else ""),
                 "quantity": float(row["quantity"] or 1),
                 "ordered_at": ordered_at,
             })
             if ordered_at and ordered_at not in order["ordered_at_values"]:
                 order["ordered_at_values"].append(ordered_at)
-            if asin not in order["asins"]:
-                order["asins"].append(asin)
-            if replacement_asin and replacement_asin not in order["asins"]:
-                order["asins"].append(replacement_asin)
             order.setdefault("asin_quantities", {})
-            order["asin_quantities"][asin] = float(order["asin_quantities"].get(asin) or 0) + float(row["quantity"] or 1)
+            for alias in asin_aliases:
+                if alias not in order["asins"]:
+                    order["asins"].append(alias)
+                order["asin_quantities"][alias] = float(order["asin_quantities"].get(alias) or 0) + float(row["quantity"] or 1)
     return matches
 
 
@@ -2160,6 +2175,8 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                order_lines.odoo_order_id,
                order_lines.odoo_order_name,
                order_lines.asin,
+               order_lines.asin_from_reference,
+               order_lines.asin_from_note,
                order_lines.replacement_asin,
                order_lines.quantity,
                order_lines.state,
@@ -2206,22 +2223,24 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                 if asin:
                     ordered_at = clean_text(row.get("ordered_at"))
                     current_amazon_order_id = clean_text(row.get("current_amazon_order_id"))
+                    asin_aliases = order_line_asin_aliases(row)
+                    replacement_asin = normalize_asin(row.get("replacement_asin") if "replacement_asin" in row.keys() else "")
                     suggestion["lines"].append({
                         "id": row["id"],
                         "asin": asin,
+                        "asin_from_reference": normalize_asin(row.get("asin_from_reference") if "asin_from_reference" in row.keys() else ""),
+                        "asin_from_note": normalize_asin(row.get("asin_from_note") if "asin_from_note" in row.keys() else ""),
                         "quantity": float(row.get("quantity") or 1),
                         "ordered_at": ordered_at,
                         "current_amazon_order_id": current_amazon_order_id,
                     })
                     if ordered_at and ordered_at not in suggestion["ordered_at_values"]:
                         suggestion["ordered_at_values"].append(ordered_at)
-                    if asin not in suggestion["asins"]:
-                        suggestion["asins"].append(asin)
-                    replacement_asin = normalize_asin(row.get("replacement_asin") if "replacement_asin" in row.keys() else "")
-                    if replacement_asin and replacement_asin not in suggestion["asins"]:
-                        suggestion["asins"].append(replacement_asin)
                     suggestion.setdefault("asin_quantities", {})
-                    suggestion["asin_quantities"][asin] = float(suggestion["asin_quantities"].get(asin) or 0) + float(row.get("quantity") or 1)
+                    for alias in asin_aliases:
+                        if alias not in suggestion["asins"]:
+                            suggestion["asins"].append(alias)
+                        suggestion["asin_quantities"][alias] = float(suggestion["asin_quantities"].get(alias) or 0) + float(row.get("quantity") or 1)
                     if replacement_asin:
                         suggestion["replacement_asin"] = replacement_asin
                         suggestion["lines"][-1]["replacement_asin"] = replacement_asin
@@ -2305,9 +2324,20 @@ def amazon_history_apply_recipient_ref_card_asins(records: list[dict[str, Any]],
                 if not order_name or order_name not in refs:
                     continue
                 candidate_asins = candidate.setdefault("asins", [])
+                candidate_quantities = candidate.setdefault("asin_quantities", {})
+                fallback_quantity = 0.0
+                for quantity in candidate_quantities.values():
+                    try:
+                        fallback_quantity = float(quantity or 0)
+                    except (TypeError, ValueError):
+                        fallback_quantity = 0.0
+                    if fallback_quantity:
+                        break
                 for asin in card_asins:
                     if asin not in candidate_asins:
                         candidate_asins.append(asin)
+                    if asin not in candidate_quantities and fallback_quantity:
+                        candidate_quantities[asin] = fallback_quantity
                 candidate["matched_by_recipient_ref"] = True
 
 
@@ -2369,14 +2399,20 @@ def amazon_history_direct_odoo_order(
             continue
         default_code = product.get("default_code") or tmpl.get("default_code") or ""
         note = strip_html(tmpl.get("description") or "")
-        asin = normalize_asin(decode_asin_reference(default_code) or extract_asin_from_notes(note, line.get("name") or "", order.get("note") or ""))
+        asin_from_reference = normalize_asin(decode_asin_reference(default_code))
+        asin_from_note = normalize_asin(extract_asin_from_notes(note, line.get("name") or "", order.get("note") or ""))
+        asin = normalize_asin(asin_from_reference or asin_from_note)
         if not asin:
             continue
+        asin_aliases = list(dict.fromkeys(alias for alias in (asin, asin_from_reference, asin_from_note) if alias))
         quantity = float(line.get("product_uom_qty") or 1)
-        asin_quantities[asin] = float(asin_quantities.get(asin) or 0) + quantity
+        for alias in asin_aliases:
+            asin_quantities[alias] = float(asin_quantities.get(alias) or 0) + quantity
         direct_lines.append({
             "id": line.get("id"),
             "asin": asin,
+            "asin_from_reference": asin_from_reference,
+            "asin_from_note": asin_from_note,
             "quantity": quantity,
             "name": line.get("name") or "",
         })
@@ -2387,6 +2423,8 @@ def amazon_history_direct_odoo_order(
     }
     checks: list[dict[str, Any]] = []
     for asin in sorted({normalize_asin(value) for value in asin_quantities.keys() if normalize_asin(value)}):
+        if asin not in actual_by_asin:
+            continue
         expected = float(asin_quantities.get(asin) or 0)
         actual = float(actual_by_asin.get(asin) or 0)
         checks.append({
@@ -2448,14 +2486,20 @@ def amazon_history_direct_odoo_result_from_rows(
             continue
         default_code = product.get("default_code") or tmpl.get("default_code") or ""
         note = strip_html(tmpl.get("description") or "")
-        asin = normalize_asin(decode_asin_reference(default_code) or extract_asin_from_notes(note, line.get("name") or "", order.get("note") or ""))
+        asin_from_reference = normalize_asin(decode_asin_reference(default_code))
+        asin_from_note = normalize_asin(extract_asin_from_notes(note, line.get("name") or "", order.get("note") or ""))
+        asin = normalize_asin(asin_from_reference or asin_from_note)
         if not asin:
             continue
+        asin_aliases = list(dict.fromkeys(alias for alias in (asin, asin_from_reference, asin_from_note) if alias))
         quantity = float(line.get("product_uom_qty") or 1)
-        asin_quantities[asin] = float(asin_quantities.get(asin) or 0) + quantity
+        for alias in asin_aliases:
+            asin_quantities[alias] = float(asin_quantities.get(alias) or 0) + quantity
         direct_lines.append({
             "id": line.get("id"),
             "asin": asin,
+            "asin_from_reference": asin_from_reference,
+            "asin_from_note": asin_from_note,
             "quantity": quantity,
             "name": line.get("name") or "",
         })
@@ -2466,6 +2510,8 @@ def amazon_history_direct_odoo_result_from_rows(
     }
     checks: list[dict[str, Any]] = []
     for asin in sorted({normalize_asin(value) for value in asin_quantities.keys() if normalize_asin(value)}):
+        if asin not in actual_by_asin:
+            continue
         expected = float(asin_quantities.get(asin) or 0)
         actual = float(actual_by_asin.get(asin) or 0)
         checks.append({
@@ -8591,8 +8637,8 @@ def dispatch_status_rows(
 
 def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
     asins = {normalize_asin(str(value)) for value in package.get("asins") or []}
-    asin = normalize_asin(str(line["asin"] or ""))
-    return bool(asin and asin in asins)
+    line_asins = set(order_line_asin_aliases(line))
+    return bool(asins and line_asins and line_asins.intersection(asins))
 
 
 PAYMENT_REVISION_PATTERNS = ("payment revision needed", "please update your payment method")
@@ -20215,6 +20261,7 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     tracking_payload=?,
                     tracking_checked_at=?,
                     state=?,
+                    last_error=NULL,
                     updated_at=?
                 WHERE id=?
                 """,
