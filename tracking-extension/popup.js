@@ -108,6 +108,19 @@ function progressText(progress = {}) {
   return `${progress.message || "Headless tracking status loaded."} ${processed}/${total} processed${current}`;
 }
 
+function visibleProgressText(tracking = {}) {
+  const total = tracking.orders?.length || 0;
+  const index = Math.max(0, Number(tracking.index || 0));
+  const processed = Math.min(index, total);
+  const current = tracking.orders?.[index]?.amazon_order_id || tracking.currentOrderId || "";
+  const completed = tracking.completedOrderIds?.length || 0;
+  const failed = tracking.failedOrderIds?.length || 0;
+  const skipped = Number(tracking.skippedRecentCount || 0);
+  const currentText = current ? ` · current ${current}` : "";
+  const extra = ` · checked ${completed} · failed ${failed}${skipped ? ` · skipped recent ${skipped}` : ""}`;
+  return `Running: ${processed}/${total}${currentText}${extra}`;
+}
+
 function settingsPayload() {
   return {
     type: "SET_API_BASE",
@@ -136,7 +149,7 @@ async function refresh() {
     }
   } else {
     setRunButtons(tracking.running);
-    applyStatusFromRefresh(tracking.running ? `Running: ${tracking.index + 1 || 1}/${tracking.orders?.length || 0}` : "Stopped");
+    applyStatusFromRefresh(tracking.running ? visibleProgressText(tracking) : "Stopped");
   }
   logsBox.innerHTML = "";
   for (const line of state.logs || []) {

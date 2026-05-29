@@ -2,7 +2,10 @@ const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const TRACKER_URL = "https://portal.epgshipping.com/ParcelTracker/HomePageTracker";
 const EPOST_TRACKING_ALARM = "epostTracking";
+const EPOST_WATCHDOG_ALARM = "epostTrackingWatchdog";
 const DEFAULT_EPOST_AUTO_HOURS = 24;
+const EPOST_STEP_TIMEOUT_MS = 120000;
+const RECENT_EPOST_CACHE_TTL_MS = 36 * 60 * 60 * 1000;
 
 async function getState() {
   return chrome.storage.local.get({
@@ -13,6 +16,7 @@ async function getState() {
     autoEpostEnabled: false,
     headlessEpostMode: false,
     epostRun: { running: false, batches: [], batchIndex: 0 },
+    recentEpostChecks: [],
     epostRunByWindow: {},
     logs: [],
     logsByWindow: {},
@@ -35,12 +39,71 @@ async function getWindowState(windowId) {
 }
 
 async function saveEpostRun(epostRun, windowId) {
+  epostRun.updatedAt = Date.now();
   if (!windowId) {
     await chrome.storage.local.set({ epostRun });
     return;
   }
   const { epostRunByWindow } = await getState();
   await chrome.storage.local.set({ epostRunByWindow: { ...(epostRunByWindow || {}), [String(windowId)]: epostRun }, epostRun });
+}
+
+function flatCodes(batches = []) {
+  return (batches || []).flat().map((code) => String(code || "").trim().toUpperCase()).filter(Boolean);
+}
+
+function epostProgress(epostRun = {}) {
+  const batches = epostRun.batches || [];
+  const totalCodes = flatCodes(batches).length;
+  const processedCodes = flatCodes(batches.slice(0, Math.max(0, Number(epostRun.batchIndex || 0)))).length;
+  const currentBatch = batches[epostRun.batchIndex] || [];
+  return {
+    total_batches: batches.length,
+    processed_batches: Math.min(Number(epostRun.batchIndex || 0), batches.length),
+    total_codes: totalCodes,
+    processed_codes: Math.min(processedCodes, totalCodes),
+    current_batch_size: currentBatch.length,
+    completed_codes: epostRun.completedCodes?.length || 0,
+    failed_codes: epostRun.failedCodes?.length || 0,
+    skipped_recent: epostRun.skippedRecentCount || 0,
+    started_at: epostRun.startedAt || null,
+    last_activity_at: epostRun.lastActivityAt || epostRun.updatedAt || null,
+    message: epostRun.running ? "ePost tracking is running." : "ePost tracking is stopped.",
+  };
+}
+
+async function rememberRecentEpostCodes(codes, status = "checked") {
+  const cleanCodes = (codes || []).map((code) => String(code || "").trim().toUpperCase()).filter(Boolean);
+  if (!cleanCodes.length) return;
+  const { recentEpostChecks } = await getState();
+  const cutoff = Date.now() - RECENT_EPOST_CACHE_TTL_MS;
+  const seen = new Set(cleanCodes);
+  const next = cleanCodes.map((tracking_code) => ({ tracking_code, checkedAt: Date.now(), status }))
+    .concat((recentEpostChecks || []).filter((item) => !seen.has(String(item.tracking_code || "").trim().toUpperCase()) && Number(item.checkedAt || 0) >= cutoff))
+    .slice(0, 5000);
+  await chrome.storage.local.set({ recentEpostChecks: next });
+}
+
+function recentEpostSet(recentEpostChecks = []) {
+  const cutoff = Date.now() - RECENT_EPOST_CACHE_TTL_MS;
+  return new Set(
+    (recentEpostChecks || [])
+      .filter((item) => Number(item.checkedAt || 0) >= cutoff)
+      .map((item) => String(item.tracking_code || "").trim().toUpperCase())
+      .filter(Boolean),
+  );
+}
+
+async function clearEpostWatchdogIfIdle() {
+  const state = await getState();
+  const anyWindowRunning = Object.values(state.epostRunByWindow || {}).some((item) => item?.running);
+  if (!state.epostRun?.running && !anyWindowRunning) {
+    await chrome.alarms.clear(EPOST_WATCHDOG_ALARM);
+  }
+}
+
+async function ensureEpostWatchdog() {
+  chrome.alarms.create(EPOST_WATCHDOG_ALARM, { periodInMinutes: 1 });
 }
 
 async function log(message, windowId = null) {
@@ -149,8 +212,10 @@ async function startScheduledEpost() {
   const state = await getState();
   if (state.autoEpostEnabled !== true) return { ok: false, message: "ePost auto tracking is disabled." };
   if (state.epostRun?.running) {
-    await log("Skipped scheduled ePost tracking because a visible ePost run is already active.");
-    return { ok: true, skipped: true };
+    await log("Scheduled ePost tracking found an existing run; resuming from the saved batch.");
+    await ensureEpostWatchdog();
+    await openTracker(null);
+    return { ok: true, resumed: true, progress: epostProgress(state.epostRun) };
   }
   await log(`Scheduled ePost tracking started; interval is every ${clampIntervalHours(state.intervalHours)} hour(s).`);
   return startEpost(null);
@@ -164,9 +229,22 @@ async function startEpost(windowId = null) {
     const intervalHours = clampIntervalHours(state.intervalHours || (Number(state.intervalDays || 1) * 24));
     const dueDays = hoursToDueDays(intervalHours);
     const payload = await api(`/api/epost/due?days=${encodeURIComponent(dueDays)}&hours=${encodeURIComponent(intervalHours)}`);
-    const rows = payload.rows || [];
+    const recent = recentEpostSet(state.recentEpostChecks);
+    const allRows = payload.rows || [];
+    const rows = allRows.filter((row) => !recent.has(String(row.tracking_code || "").trim().toUpperCase()));
     const batches = chunk(rows.map((row) => row.tracking_code).filter(Boolean), 25);
-    const epostRun = { running: true, batches, batchIndex: 0, submittedBatchIndex: null };
+    const epostRun = {
+      running: true,
+      batches,
+      batchIndex: 0,
+      submittedBatchIndex: null,
+      completedCodes: [],
+      failedCodes: [],
+      skippedRecentCount: allRows.length - rows.length,
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      lastMessage: "ePost tracking started.",
+    };
     if (!batches.length) {
       epostRun.running = false;
       await saveEpostRun(epostRun, windowId);
@@ -174,10 +252,11 @@ async function startEpost(windowId = null) {
       return { ok: false, message: "No ePost tracking codes are due." };
     }
     await saveEpostRun(epostRun, windowId);
-    await log(`Loaded ${rows.length} due ePost code(s) in ${batches.length} batch(es).`, windowId);
+    await ensureEpostWatchdog();
+    await log(`Loaded ${rows.length} due ePost code(s) in ${batches.length} batch(es); skipped ${epostRun.skippedRecentCount} recently checked code(s).`, windowId);
     await openTracker(windowId);
     await log("Opened ePost portal for visible tracking.", windowId);
-    return { ok: true, message: `Tracking ${rows.length} ePost code(s).` };
+    return { ok: true, message: `Tracking ${rows.length} ePost code(s).`, progress: epostProgress(epostRun) };
   } catch (error) {
     await log(`Visible ePost tracking failed to start: ${error.message}`, windowId);
     throw error;
@@ -189,8 +268,10 @@ async function stopEpost(windowId) {
   if (headlessEpostMode) return stopHeadlessEpost();
   const { epostRun } = await getWindowState(windowId);
   epostRun.running = false;
+  epostRun.lastMessage = "ePost tracking stopped by user.";
   await saveEpostRun(epostRun, windowId);
   await log("ePost tracking stopped.", windowId);
+  await clearEpostWatchdogIfIdle();
   return { ok: true, message: "Stopped." };
 }
 
@@ -237,6 +318,9 @@ async function handlePortalReady(windowId) {
   const submittedBatchIndex = Number.isInteger(epostRun.submittedBatchIndex) ? epostRun.submittedBatchIndex : null;
   const batchIndex = submittedBatchIndex ?? epostRun.batchIndex;
   const codes = epostRun.batches[batchIndex] || [];
+  epostRun.lastActivityAt = Date.now();
+  epostRun.lastMessage = `Portal ready for batch ${batchIndex + 1}/${epostRun.batches.length}.`;
+  await saveEpostRun(epostRun, windowId);
   return { ok: true, codes, batchIndex, submitted: submittedBatchIndex !== null };
 }
 
@@ -248,6 +332,8 @@ async function handleBatchSubmitted(message, windowId) {
     return { ok: false, stale: true };
   }
   epostRun.submittedBatchIndex = message.batchIndex;
+  epostRun.lastActivityAt = Date.now();
+  epostRun.lastMessage = `Submitted ePost batch ${message.batchIndex + 1}/${epostRun.batches.length}.`;
   await saveEpostRun(epostRun, windowId);
   await log(`Submitted ePost batch ${message.batchIndex + 1}/${epostRun.batches.length}.`, windowId);
   return { ok: true };
@@ -262,10 +348,18 @@ async function handleResults(message, windowId) {
     return { ok: false, stale: true };
   }
   const resultCount = message.results?.length || 0;
+  const submittedCodes = epostRun.batches?.[expectedBatchIndex] || [];
+  const completedCodes = (message.results || []).map((item) => item.tracking_code).filter(Boolean);
+  const checkedCodes = completedCodes.length ? completedCodes : submittedCodes;
+  await rememberRecentEpostCodes(checkedCodes, "checked");
+  epostRun.completedCodes = [...(epostRun.completedCodes || []), ...checkedCodes];
   epostRun.submittedBatchIndex = null;
   epostRun.batchIndex = expectedBatchIndex + 1;
+  epostRun.lastActivityAt = Date.now();
+  epostRun.lastMessage = `Captured ePost batch ${expectedBatchIndex + 1}/${epostRun.batches.length}.`;
   if (epostRun.batchIndex >= epostRun.batches.length) {
     epostRun.running = false;
+    epostRun.finishedAt = Date.now();
     await saveEpostRun(epostRun, windowId);
     try {
       await api("/api/epost/update", {
@@ -277,6 +371,7 @@ async function handleResults(message, windowId) {
       await log(`ePost result upload failed after final batch: ${error.message}`, windowId);
     }
     await log("ePost tracking run complete.", windowId);
+    await clearEpostWatchdogIfIdle();
     return { ok: true, done: true };
   }
   await saveEpostRun(epostRun, windowId);
@@ -294,9 +389,51 @@ async function handleResults(message, windowId) {
   return { ok: true };
 }
 
+async function skipStaleEpostBatch(epostRun, windowId) {
+  if (!epostRun?.running) return false;
+  const lastActivityAt = Number(epostRun.lastActivityAt || epostRun.updatedAt || epostRun.startedAt || 0);
+  if (!lastActivityAt || Date.now() - lastActivityAt < EPOST_STEP_TIMEOUT_MS) return false;
+  const batchIndex = Number.isInteger(epostRun.submittedBatchIndex) ? epostRun.submittedBatchIndex : Number(epostRun.batchIndex || 0);
+  const codes = epostRun.batches?.[batchIndex] || [];
+  await rememberRecentEpostCodes(codes, "failed");
+  epostRun.failedCodes = [...(epostRun.failedCodes || []), ...codes];
+  epostRun.submittedBatchIndex = null;
+  epostRun.batchIndex = batchIndex + 1;
+  epostRun.lastActivityAt = Date.now();
+  epostRun.lastMessage = `Timed out on ePost batch ${batchIndex + 1}; moving to next batch.`;
+  await log(`ePost batch ${batchIndex + 1} timed out; skipped ${codes.length} code(s) for this session and continuing.`, windowId);
+  if (epostRun.batchIndex >= (epostRun.batches?.length || 0)) {
+    epostRun.running = false;
+    epostRun.finishedAt = Date.now();
+    await saveEpostRun(epostRun, windowId);
+    await log("ePost tracking run complete after timeout recovery.", windowId);
+    await clearEpostWatchdogIfIdle();
+    return true;
+  }
+  await saveEpostRun(epostRun, windowId);
+  await openTracker(windowId);
+  return true;
+}
+
+async function runEpostWatchdog() {
+  const state = await getState();
+  let recovered = false;
+  const windowEntries = Object.entries(state.epostRunByWindow || {}).filter(([, run]) => run?.running);
+  if (!windowEntries.length && state.epostRun?.running) {
+    recovered = await skipStaleEpostBatch(state.epostRun, null) || recovered;
+  }
+  for (const [key, run] of windowEntries) {
+    recovered = await skipStaleEpostBatch(run, Number(key) || null) || recovered;
+  }
+  if (!recovered) await clearEpostWatchdogIfIdle();
+}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === EPOST_TRACKING_ALARM) {
     startScheduledEpost().catch((error) => log(`Scheduled ePost tracking failed: ${error.message}`));
+  }
+  if (alarm.name === EPOST_WATCHDOG_ALARM) {
+    runEpostWatchdog().catch((error) => log(`ePost tracking watchdog failed: ${error.message}`));
   }
 });
 
@@ -314,6 +451,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
     if (message.type === "GET_STATE") return getWindowState(windowId);
+    if (message.type === "GET_PROGRESS") {
+      const { epostRun } = await getWindowState(windowId);
+      return { ok: true, progress: epostProgress(epostRun) };
+    }
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "SET_SETTINGS") {
       const intervalHours = clampIntervalHours(message.intervalHours ?? (Number(message.intervalDays || 1) * 24));

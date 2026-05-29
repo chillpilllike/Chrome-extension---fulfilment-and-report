@@ -1,7 +1,10 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const AUTO_TRACKING_ALARM = "amazonTrackingAuto";
+const TRACKING_WATCHDOG_ALARM = "amazonTrackingWatchdog";
 const DEFAULT_AUTO_TRACKING_HOURS = 3;
+const TRACKING_STEP_TIMEOUT_MS = 90000;
+const RECENT_TRACKING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 async function getState() {
   return chrome.storage.local.get({
@@ -11,6 +14,7 @@ async function getState() {
     autoTrackingEnabled: false,
     autoTrackingHours: DEFAULT_AUTO_TRACKING_HOURS,
     tracking: { running: false, orders: [], index: 0, packages: [], packageIndex: 0 },
+    recentTrackingChecks: [],
     trackingByWindow: {},
     logs: [],
     logsByWindow: {},
@@ -33,12 +37,62 @@ async function getWindowState(windowId) {
 }
 
 async function saveTracking(tracking, windowId) {
+  tracking.updatedAt = Date.now();
   if (!windowId) {
     await chrome.storage.local.set({ tracking });
     return;
   }
   const { trackingByWindow } = await getState();
   await chrome.storage.local.set({ trackingByWindow: { ...(trackingByWindow || {}), [String(windowId)]: tracking }, tracking });
+}
+
+function trackingProgress(tracking = {}) {
+  const total = tracking.orders?.length || 0;
+  const index = Math.max(0, Number(tracking.index || 0));
+  return {
+    total,
+    processed: Math.min(index, total),
+    current_order: tracking.orders?.[index]?.amazon_order_id || "",
+    completed: tracking.completedOrderIds?.length || 0,
+    failed: tracking.failedOrderIds?.length || 0,
+    skipped_recent: tracking.skippedRecentCount || 0,
+    started_at: tracking.startedAt || null,
+    last_activity_at: tracking.lastActivityAt || tracking.updatedAt || null,
+    message: tracking.running ? "Tracking is running." : "Tracking is stopped.",
+  };
+}
+
+async function rememberRecentCheck(orderId, status = "checked") {
+  const cleanId = String(orderId || "").trim();
+  if (!cleanId) return;
+  const { recentTrackingChecks } = await getState();
+  const cutoff = Date.now() - RECENT_TRACKING_CACHE_TTL_MS;
+  const next = [{ amazon_order_id: cleanId, checkedAt: Date.now(), status }]
+    .concat((recentTrackingChecks || []).filter((item) => item.amazon_order_id !== cleanId && Number(item.checkedAt || 0) >= cutoff))
+    .slice(0, 800);
+  await chrome.storage.local.set({ recentTrackingChecks: next });
+}
+
+function recentCheckSet(recentTrackingChecks = []) {
+  const cutoff = Date.now() - RECENT_TRACKING_CACHE_TTL_MS;
+  return new Set(
+    (recentTrackingChecks || [])
+      .filter((item) => Number(item.checkedAt || 0) >= cutoff)
+      .map((item) => String(item.amazon_order_id || "").trim())
+      .filter(Boolean),
+  );
+}
+
+async function clearWatchdogIfIdle() {
+  const state = await getState();
+  const anyWindowRunning = Object.values(state.trackingByWindow || {}).some((item) => item?.running);
+  if (!state.tracking?.running && !anyWindowRunning) {
+    await chrome.alarms.clear(TRACKING_WATCHDOG_ALARM);
+  }
+}
+
+async function ensureWatchdog() {
+  chrome.alarms.create(TRACKING_WATCHDOG_ALARM, { periodInMinutes: 1 });
 }
 
 async function log(message, windowId = null) {
@@ -125,8 +179,10 @@ async function startAutoTracking() {
   const state = await getState();
   if (state.autoTrackingEnabled !== true) return { ok: false, message: "Amazon auto tracking is disabled." };
   if (state.tracking?.running) {
-    await log("Skipped scheduled Amazon tracking because a visible tracking run is already active.");
-    return { ok: true, skipped: true };
+    await log("Scheduled Amazon tracking found an existing run; resuming from the saved position.");
+    await ensureWatchdog();
+    await openCurrentOrder(null);
+    return { ok: true, resumed: true, progress: trackingProgress(state.tracking) };
   }
   await log(`Scheduled Amazon tracking started; interval is every ${clampAutoHours(state.autoTrackingHours)} hour(s).`);
   return startTracking(null);
@@ -164,28 +220,73 @@ async function openCurrentOrder(windowId) {
   const order = tracking.orders[tracking.index];
   if (!order) {
     tracking.running = false;
+    tracking.finishedAt = Date.now();
+    tracking.lastMessage = "Tracking complete.";
     await saveTracking(tracking, windowId);
     await log("Tracking complete. No more open Amazon orders.", windowId);
+    await clearWatchdogIfIdle();
     return;
   }
   tracking.packages = [];
   tracking.packageIndex = 0;
+  tracking.currentStep = "order";
+  tracking.currentUrl = orderUrl(order);
+  tracking.currentOrderId = order.amazon_order_id;
+  tracking.lastActivityAt = Date.now();
+  tracking.lastMessage = `Opening Amazon order ${order.amazon_order_id}.`;
   await saveTracking(tracking, windowId);
+  await ensureWatchdog();
   await log(`Opening Amazon order ${order.amazon_order_id}.`, windowId);
   await openUrl(orderUrl(order), windowId);
+}
+
+async function advanceCurrentOrder(tracking, windowId, status = "checked") {
+  const order = tracking.orders?.[tracking.index];
+  if (order?.amazon_order_id) {
+    await rememberRecentCheck(order.amazon_order_id, status);
+    if (status === "failed") {
+      tracking.failedOrderIds = [...(tracking.failedOrderIds || []), order.amazon_order_id];
+    } else {
+      tracking.completedOrderIds = [...(tracking.completedOrderIds || []), order.amazon_order_id];
+    }
+  }
+  tracking.index += 1;
+  tracking.packages = [];
+  tracking.packageIndex = 0;
+  tracking.currentStep = "";
+  tracking.currentUrl = "";
+  tracking.currentOrderId = "";
+  tracking.lastActivityAt = Date.now();
+  await saveTracking(tracking, windowId);
+  await openCurrentOrder(windowId);
 }
 
 async function startTracking(windowId) {
   const { headlessTrackingMode } = await getState();
   if (headlessTrackingMode) return startHeadlessTracking();
   const payload = await api("/api/tracking/orders");
-  const orders = (payload.orders || []).filter((order) => String(order.tracking_status || "").toLowerCase() !== "delivered");
-  const tracking = { running: true, orders, index: 0, packages: [], packageIndex: 0 };
+  const { recentTrackingChecks } = await getState();
+  const recent = recentCheckSet(recentTrackingChecks);
+  const allOrders = (payload.orders || []).filter((order) => String(order.tracking_status || "").toLowerCase() !== "delivered");
+  const orders = allOrders.filter((order) => !recent.has(String(order.amazon_order_id || "").trim()));
+  const tracking = {
+    running: true,
+    orders,
+    index: 0,
+    packages: [],
+    packageIndex: 0,
+    completedOrderIds: [],
+    failedOrderIds: [],
+    skippedRecentCount: allOrders.length - orders.length,
+    startedAt: Date.now(),
+    lastActivityAt: Date.now(),
+    lastMessage: "Tracking started.",
+  };
   await saveTracking(tracking, windowId);
-  await log(`Loaded ${orders.length} Amazon order(s) for tracking.`, windowId);
+  await log(`Loaded ${orders.length} Amazon order(s) for tracking; skipped ${tracking.skippedRecentCount} recently checked order(s).`, windowId);
   if (!orders.length) return { ok: false, message: "No Amazon orders need tracking." };
   await openCurrentOrder(windowId);
-  return { ok: true, message: `Started tracking ${orders.length} order(s).` };
+  return { ok: true, message: `Started tracking ${orders.length} order(s).`, progress: trackingProgress(tracking) };
 }
 
 async function stopTracking(windowId) {
@@ -193,8 +294,10 @@ async function stopTracking(windowId) {
   if (headlessTrackingMode) return stopHeadlessTracking();
   const { tracking } = await getWindowState(windowId);
   tracking.running = false;
+  tracking.lastMessage = "Tracking stopped by user.";
   await saveTracking(tracking, windowId);
   await log("Tracking stopped.", windowId);
+  await clearWatchdogIfIdle();
   return { ok: true, message: "Stopped." };
 }
 
@@ -264,11 +367,7 @@ async function handleOrderPackages(message, windowId) {
       }),
     });
     await log(`Amazon order ${order.amazon_order_id} is cancelled; reset lines for reorder.`, windowId);
-    tracking.index += 1;
-    tracking.packages = [];
-    tracking.packageIndex = 0;
-    await saveTracking(tracking, windowId);
-    await openCurrentOrder(windowId);
+    await advanceCurrentOrder(tracking, windowId, "cancelled");
     return { ok: true };
   }
   if (message.paymentRevisionNeeded) {
@@ -284,15 +383,14 @@ async function handleOrderPackages(message, windowId) {
       }),
     });
     await log(`Payment revision needed for ${order.amazon_order_id}; posted to Payment Failed page.`, windowId);
-    tracking.index += 1;
-    tracking.packages = [];
-    tracking.packageIndex = 0;
-    await saveTracking(tracking, windowId);
-    await openCurrentOrder(windowId);
+    await advanceCurrentOrder(tracking, windowId, "payment_revision");
     return { ok: true };
   }
   tracking.packages = message.packages || [];
   tracking.packageIndex = 0;
+  tracking.lastActivityAt = Date.now();
+  tracking.currentStep = "packages";
+  tracking.lastMessage = `Found ${tracking.packages.length} package link(s) for ${order.amazon_order_id}.`;
   await saveTracking(tracking, windowId);
   if (!tracking.packages.length) {
     await api("/api/tracking/update", {
@@ -309,12 +407,14 @@ async function handleOrderPackages(message, windowId) {
       }),
     });
     await log(`No tracking buttons found for ${order.amazon_order_id}; saved order-page status.`, windowId);
-    tracking.index += 1;
-    await saveTracking(tracking, windowId);
-    await openCurrentOrder(windowId);
+    await advanceCurrentOrder(tracking, windowId, "checked");
     return { ok: true };
   }
   await log(`Found ${tracking.packages.length} package link(s) for ${order.amazon_order_id}.`, windowId);
+  tracking.currentStep = "package";
+  tracking.currentUrl = tracking.packages[0].tracking_url;
+  tracking.lastActivityAt = Date.now();
+  await saveTracking(tracking, windowId);
   await openUrl(tracking.packages[0].tracking_url, windowId);
   return { ok: true };
 }
@@ -345,9 +445,15 @@ async function handlePackageTracking(message, windowId) {
   }
   tracking.packages[tracking.packageIndex] = packageData;
   tracking.packageIndex += 1;
+  tracking.lastActivityAt = Date.now();
+  tracking.lastMessage = `Captured ${packageData.carrier || "carrier"} ${packageData.tracking_id || ""} for ${order.amazon_order_id}.`;
   await saveTracking(tracking, windowId);
   await log(`Captured ${packageData.carrier || "carrier"} ${packageData.tracking_id || ""} for ${order.amazon_order_id}.`, windowId);
   if (tracking.packageIndex < tracking.packages.length) {
+    tracking.currentStep = "package";
+    tracking.currentUrl = tracking.packages[tracking.packageIndex].tracking_url;
+    tracking.lastActivityAt = Date.now();
+    await saveTracking(tracking, windowId);
     await openUrl(tracking.packages[tracking.packageIndex].tracking_url, windowId);
     return { ok: true };
   }
@@ -363,11 +469,7 @@ async function handlePackageTracking(message, windowId) {
     }),
   });
   await log(`Posted tracking update for ${order.amazon_order_id}.`, windowId);
-  tracking.index += 1;
-  tracking.packages = [];
-  tracking.packageIndex = 0;
-  await saveTracking(tracking, windowId);
-  await openCurrentOrder(windowId);
+  await advanceCurrentOrder(tracking, windowId, "checked");
   return { ok: true };
 }
 
@@ -398,9 +500,44 @@ async function postStandalonePackageTracking(message, windowId) {
   return { ok: true, recovered: true, message: `Posted standalone tracking update for ${amazonOrderId}.` };
 }
 
+async function recoverStaleTrackingRun(tracking, windowId) {
+  if (!tracking?.running) return false;
+  const lastActivityAt = Number(tracking.lastActivityAt || tracking.updatedAt || tracking.startedAt || 0);
+  if (!lastActivityAt || Date.now() - lastActivityAt < TRACKING_STEP_TIMEOUT_MS) return false;
+  const order = tracking.orders?.[tracking.index];
+  if (!order) {
+    tracking.running = false;
+    tracking.finishedAt = Date.now();
+    tracking.lastMessage = "Tracking finished after watchdog found no active order.";
+    await saveTracking(tracking, windowId);
+    await clearWatchdogIfIdle();
+    return true;
+  }
+  await log(`Amazon tracking timed out on ${order.amazon_order_id}; skipping it for this session and continuing.`, windowId);
+  tracking.lastMessage = `Timed out on ${order.amazon_order_id}; moving to next order.`;
+  await advanceCurrentOrder(tracking, windowId, "failed");
+  return true;
+}
+
+async function runTrackingWatchdog() {
+  const state = await getState();
+  let recovered = false;
+  const windowEntries = Object.entries(state.trackingByWindow || {}).filter(([, tracking]) => tracking?.running);
+  if (!windowEntries.length && state.tracking?.running) {
+    recovered = await recoverStaleTrackingRun(state.tracking, null) || recovered;
+  }
+  for (const [key, tracking] of windowEntries) {
+    recovered = await recoverStaleTrackingRun(tracking, Number(key) || null) || recovered;
+  }
+  if (!recovered) await clearWatchdogIfIdle();
+}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === AUTO_TRACKING_ALARM) {
     startAutoTracking().catch((error) => log(`Scheduled Amazon tracking failed: ${error.message}`));
+  }
+  if (alarm.name === TRACKING_WATCHDOG_ALARM) {
+    runTrackingWatchdog().catch((error) => log(`Amazon tracking watchdog failed: ${error.message}`));
   }
 });
 
@@ -418,6 +555,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
     if (message.type === "GET_STATE") return getWindowState(windowId);
+    if (message.type === "GET_PROGRESS") {
+      const { tracking } = await getWindowState(windowId);
+      return { ok: true, progress: trackingProgress(tracking) };
+    }
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "SET_API_BASE") {
       await chrome.storage.local.set({

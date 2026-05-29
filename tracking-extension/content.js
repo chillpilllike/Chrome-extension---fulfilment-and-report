@@ -224,7 +224,7 @@ async function run() {
     }
     return;
   }
-  if (/ship-track/i.test(location.href)) {
+  if (/ship-track|progress-tracker\/package/i.test(location.href)) {
     const data = await parseTrackingPage();
     if (!data.amazonOrderId) return;
     showPanel("Nutricity tracking", `Capturing tracking for ${data.amazonOrderId}: ${data.package.status}.`);

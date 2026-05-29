@@ -5755,6 +5755,14 @@ function FulfilmentPendingPage({
       return []
     }
   }
+  async function copyPendingText(value: string, label: string) {
+    const copied = await copyPlainText(value)
+    onResult({
+      ok: copied,
+      title: copied ? `${label} Copied` : "Copy Failed",
+      message: copied ? `${label} copied to clipboard.` : `${label} could not be copied.`,
+    })
+  }
   async function refresh() {
     setLoading(true)
     try {
@@ -5768,7 +5776,7 @@ function FulfilmentPendingPage({
       <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
           <CardTitle>Amazon Delivered, Odoo Fulfilment Pending</CardTitle>
-          <CardDescription>Delivered Amazon orders whose related Odoo pickings are not done or cancelled in the selected store.</CardDescription>
+          <CardDescription>Delivered Amazon orders that do not yet have a Shopify tracking sync recorded for the matching Odoo order.</CardDescription>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
           <div className="min-w-[280px]">
@@ -5777,14 +5785,14 @@ function FulfilmentPendingPage({
           </div>
           <Button variant="outline" onClick={refresh} disabled={isLoading || !storeId}>
             <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
-            Check Odoo
+            Refresh
           </Button>
         </div>
       </CardHeader>
       {isLoading ? (
         <div className="border-t px-6 py-3">
           <div className="d-flex align-items-center justify-content-between gap-3 text-sm">
-            <span className="text-muted-foreground">Fetching delivered Amazon orders and checking Odoo pickings...</span>
+            <span className="text-muted-foreground">Fetching delivered Amazon orders and dispatch sync status...</span>
             <span className="text-muted-foreground">{rows.length ? `${rows.length} current result${rows.length === 1 ? "" : "s"}` : "checking"}</span>
           </div>
           <div className="progress mt-2">
@@ -5846,18 +5854,39 @@ function FulfilmentPendingPage({
                       </div>
                     </TableCell>
                     <TableCell>
-                      <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
-                        {row.amazon_order_id}
-                      </a>
+                      <div className="flex items-center gap-2">
+                        <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
+                          {row.amazon_order_id}
+                        </a>
+                        <Button size="icon-sm" variant="ghost" title="Copy Amazon order ID" onClick={() => copyPendingText(row.amazon_order_id, "Amazon order ID")}>
+                          <Copy className="size-4" />
+                        </Button>
+                      </div>
                     </TableCell>
                     <TableCell className="max-w-[320px]">
                       {packages.length ? (
                         <div className="grid gap-1 text-sm">
-                          {packages.map((pkg: any, index: number) => (
-                            <a key={`${row.id}-${pkg.tracking_id || index}`} className="truncate font-mono text-primary underline-offset-4 hover:underline" href={pkg.tracking_url || row.amazon_order_url} target="_blank">
-                              {pkg.carrier || "Amazon shipment"}: {pkg.tracking_id || "tracking page"}
-                            </a>
-                          ))}
+                          {packages.map((pkg: any, index: number) => {
+                            const trackingId = String(pkg.tracking_id || pkg.trackingId || pkg.tracking_number || pkg.trackingNumber || "").trim()
+                            const latest = pkg.latest_event || {}
+                            const latestMessage = [latest.date, latest.time, latest.message].filter(Boolean).join(" ")
+                            return (
+                              <div key={`${row.id}-${trackingId || index}`} className="grid gap-0.5">
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <a className="min-w-0 truncate font-mono text-primary underline-offset-4 hover:underline" href={pkg.tracking_url || row.amazon_order_url} target="_blank">
+                                    {trackingId || "Amazon tracking page"}
+                                  </a>
+                                  {trackingId ? (
+                                    <Button size="icon-sm" variant="ghost" title="Copy Amazon tracking ID" onClick={() => copyPendingText(trackingId, "Amazon tracking ID")}>
+                                      <Copy className="size-4" />
+                                    </Button>
+                                  ) : null}
+                                </div>
+                                <span className="truncate text-xs text-muted-foreground">{pkg.carrier || "Amazon shipment"}</span>
+                                {latestMessage ? <span className="truncate text-xs text-muted-foreground">{latestMessage}</span> : null}
+                              </div>
+                            )
+                          })}
                         </div>
                       ) : (
                         <a className="text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
@@ -5887,7 +5916,7 @@ function FulfilmentPendingPage({
                     <TableCell>
                       <Badge variant="destructive">Fulfilment pending</Badge>
                     </TableCell>
-                    <TableCell className="max-w-[360px] truncate text-destructive">{row.message}</TableCell>
+                    <TableCell className="max-w-[360px]"><ErrorTooltip value={row.message} /></TableCell>
                 </TableRow>
               )
             })}

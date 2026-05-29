@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import html
 import http.client
 import importlib.util
@@ -141,6 +142,9 @@ _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
 _SERVICE_SETTINGS_CACHE: tuple[dict[str, str], float] = ({}, 0.0)
 _SERVICE_SETTINGS_CACHE_LOCK = threading.Lock()
 SERVICE_SETTINGS_CACHE_TTL_SECONDS = 15
+_FAST_PAGE_CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
+_FAST_PAGE_CACHE_LOCK = threading.Lock()
+FAST_PAGE_CACHE_TTL_SECONDS = 20
 _STORE_CACHE: dict[int, tuple[Store, float]] = {}
 _STORES_LIST_CACHE: tuple[list[dict[str, Any]], float] = ([], 0.0)
 _STORE_CACHE_LOCK = threading.Lock()
@@ -191,6 +195,27 @@ def ensure_shopify_order_status_cache_table() -> None:
             return
         _ensure_shopify_order_status_cache_table()
         _SHOPIFY_ORDER_STATUS_CACHE_READY = True
+
+
+def fast_page_cache_get(key: tuple[Any, ...]) -> Any:
+    now = time.monotonic()
+    with _FAST_PAGE_CACHE_LOCK:
+        cached = _FAST_PAGE_CACHE.get(key)
+        if not cached:
+            return None
+        expires_at, value = cached
+        if expires_at <= now:
+            _FAST_PAGE_CACHE.pop(key, None)
+            return None
+        return copy.deepcopy(value)
+
+
+def fast_page_cache_set(key: tuple[Any, ...], value: Any, ttl_seconds: int = FAST_PAGE_CACHE_TTL_SECONDS) -> Any:
+    with _FAST_PAGE_CACHE_LOCK:
+        if len(_FAST_PAGE_CACHE) > 200:
+            _FAST_PAGE_CACHE.clear()
+        _FAST_PAGE_CACHE[key] = (time.monotonic() + max(1, ttl_seconds), copy.deepcopy(value))
+    return value
 
 
 def _ensure_shopify_order_status_cache_table() -> None:
@@ -353,6 +378,9 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_default_code ON order_lines(store_id, default_code) WHERE COALESCE(default_code, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_spaid ON order_lines(store_id, supplier_part_auxiliary_id) WHERE COALESCE(supplier_part_auxiliary_id, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_ordered_tracking ON order_lines(store_id, tracking_checked_at ASC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_delivered_tracking ON order_lines(store_id, tracking_checked_at DESC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND (state='delivered' OR LOWER(COALESCE(tracking_status, ''))='delivered')",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_tracking_active_order ON order_lines(store_id, amazon_order_id, tracking_checked_at ASC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_tracking_checked_order ON order_lines(store_id, amazon_order_id, tracking_checked_at DESC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND COALESCE(tracking_checked_at, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_queue ON order_lines(store_id, updated_at ASC, odoo_order_id DESC, id) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(amazon_group_key, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_worker ON order_lines(chrome_claimed_by, store_id, updated_at ASC) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_group ON order_lines(amazon_group_key, id) WHERE order_engine='chrome'",
@@ -367,6 +395,8 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_amazon_attempts_mode_status ON amazon_attempts(mode, status)",
         # ePost and shipping lookups use case-insensitive tracking numbers.
         "CREATE INDEX IF NOT EXISTS idx_epost_store_status_checked ON epost_global_tracking(store_id, epost_status, last_checked_at ASC, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_epost_store_checked ON epost_global_tracking(store_id, last_checked_at ASC, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_epost_store_order_name ON epost_global_tracking(store_id, odoo_order_name)",
         "CREATE INDEX IF NOT EXISTS idx_epost_upper_tracking ON epost_global_tracking(UPPER(tracking_code))",
         "CREATE INDEX IF NOT EXISTS idx_epost_order_name ON epost_global_tracking(odoo_order_name)",
         "CREATE INDEX IF NOT EXISTS idx_shipping_charges_upper_tracking ON shipping_charges(UPPER(tracking_number))",
@@ -8644,74 +8674,225 @@ def tracking_rows(store_id: Optional[int] = None, status: str = "active", q: str
     return data
 
 
-def delivered_unfulfilled_rows(store_id: Optional[int] = None, q: str = "") -> list[dict[str, Any]]:
-    search = clean_text(q)
-    search_like = f"%{search}%" if search else None
-    with db() as conn:
-        rows = conn.execute(
+def tracking_filter_sql(status: str) -> tuple[str, str]:
+    status = clean_text(status).lower() or "active"
+    if status == "cancelled":
+        return "COALESCE(amazon_cancelled_at, '') != ''", "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC"
+    if status == "delivered":
+        return (
             """
-            SELECT *
-            FROM order_lines
-            WHERE COALESCE(amazon_order_id, '') != ''
-              AND (
+            COALESCE(amazon_order_id, '') != ''
+            AND (
                 state = 'delivered'
                 OR tracking_status = 'Delivered'
                 OR LOWER(COALESCE(tracking_status, '')) = 'delivered'
-              )
-              AND (? IS NULL OR store_id=?)
-              AND NOT EXISTS (
-                SELECT 1
-                FROM shopify_tracking_sync_log
-                JOIN stores tracking_store ON tracking_store.odoo_db=shopify_tracking_sync_log.odoo_db
-                WHERE tracking_store.id=order_lines.store_id
-                  AND shopify_tracking_sync_log.odoo_order=order_lines.odoo_order_name
-              )
-              AND (
-                ? IS NULL
-                OR odoo_order_name ILIKE ?
-                OR amazon_order_id ILIKE ?
-                OR asin ILIKE ?
-                OR product_name ILIKE ?
-                OR tracking_payload ILIKE ?
-                OR amazon_account_name ILIKE ?
-              )
-            ORDER BY tracking_checked_at DESC, ordered_at DESC, updated_at DESC
-            LIMIT 1000
+            )
             """,
-            (store_id, store_id, search_like, search_like, search_like, search_like, search_like, search_like, search_like),
+            "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC",
+        )
+    if status in {"recent", "checked"}:
+        return "COALESCE(amazon_order_id, '') != '' AND COALESCE(tracking_checked_at, '') != ''", "tracking_checked_at DESC, ordered_at DESC, updated_at DESC"
+    if status == "all":
+        return "COALESCE(amazon_order_id, '') != ''", "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC"
+    return "COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')", "tracking_checked_at IS NULL DESC, tracking_checked_at ASC, ordered_at DESC, updated_at DESC"
+
+
+def tracking_search_clause(q: str) -> tuple[str, list[Any]]:
+    search = clean_text(q)
+    if not search:
+        return "", []
+    return (
+        """
+          AND LOWER(
+            COALESCE(amazon_order_id, '') || ' ' ||
+            COALESCE(amazon_cancelled_order_id, '') || ' ' ||
+            COALESCE(odoo_order_name, '') || ' ' ||
+            COALESCE(CAST(odoo_order_id AS TEXT), '') || ' ' ||
+            COALESCE(CAST(odoo_line_id AS TEXT), '') || ' ' ||
+            COALESCE(tracking_payload, '') || ' ' ||
+            COALESCE(tracking_status, '') || ' ' ||
+            COALESCE(asin, '') || ' ' ||
+            COALESCE(product_name, '')
+          ) LIKE ?
+        """,
+        [f"%{search.lower()}%"],
+    )
+
+
+def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active", q: str = "", page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    where_status, order_sql = tracking_filter_sql(status)
+    search_clause, search_params = tracking_search_clause(q)
+    order_expr = "COALESCE(NULLIF(amazon_order_id, ''), NULLIF(amazon_cancelled_order_id, ''), '')"
+    target_order_sql = (
+        """
+                  CASE WHEN MAX(NULLIF(tracking_checked_at, '')) IS NULL THEN 0 ELSE 1 END,
+                  MAX(NULLIF(tracking_checked_at, '')) ASC NULLS FIRST,
+                  MAX(NULLIF(ordered_at, '')) DESC,
+                  MAX(NULLIF(updated_at, '')) DESC
+        """
+        if clean_text(status).lower() not in {"cancelled", "delivered", "recent", "checked", "all"}
+        else
+        """
+                  CASE WHEN MAX(NULLIF(tracking_checked_at, '')) IS NULL THEN 1 ELSE 0 END,
+                  MAX(NULLIF(tracking_checked_at, '')) DESC,
+                  MAX(NULLIF(ordered_at, '')) DESC,
+                  MAX(NULLIF(updated_at, '')) DESC
+        """
+    )
+    base_where = f"""
+        {where_status}
+        AND COALESCE(order_engine, '') != 'third_party'
+        AND (? IS NULL OR store_id=?)
+        AND {order_expr} != ''
+        {search_clause}
+    """
+    params: list[Any] = [store_id, store_id, *search_params]
+    with db() as conn:
+        total = int(conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM (
+                SELECT {order_expr} AS amazon_key
+                FROM order_lines
+                WHERE {base_where}
+                GROUP BY {order_expr}
+            ) grouped
+            """,
+            params,
+        ).fetchone()["count"] or 0)
+        rows = conn.execute(
+            f"""
+            WITH target_orders AS (
+                SELECT {order_expr} AS amazon_key,
+                       MAX(NULLIF(tracking_checked_at, '')) AS checked_sort,
+                       MAX(NULLIF(ordered_at, '')) AS ordered_sort,
+                       MAX(NULLIF(updated_at, '')) AS updated_sort
+                FROM order_lines
+                WHERE {base_where}
+                GROUP BY {order_expr}
+                ORDER BY {target_order_sql}
+                LIMIT ? OFFSET ?
+            )
+            SELECT order_lines.id, order_lines.store_id, order_lines.odoo_order_id, order_lines.odoo_order_name,
+                   order_lines.odoo_line_id, order_lines.asin, order_lines.product_name, order_lines.state,
+                   order_lines.amazon_order_id, order_lines.amazon_order_url, order_lines.amazon_cancelled_at,
+                   order_lines.amazon_cancelled_order_id, order_lines.tracking_status, order_lines.tracking_payload,
+                   order_lines.tracking_checked_at, order_lines.ordered_at, order_lines.updated_at
+            FROM order_lines
+            JOIN target_orders ON target_orders.amazon_key={order_expr}
+            WHERE {base_where}
+            ORDER BY {order_sql}, order_lines.id
+            """,
+            [*params, per_page, offset, *params],
         ).fetchall()
-    stores = {int(store["id"]): store for store in list_stores()}
-    clients: dict[int, OdooClient] = {}
+    data = rows_to_dicts(rows)
+    stores_by_id = {store["id"]: store for store in list_stores()}
+    for row in data:
+        store = stores_by_id.get(row.get("store_id"))
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        amazon_id = row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or ""
+        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(amazon_id)
+        row["asin_url"] = asin_product_url(row.get("asin") or "")
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in data:
+        order_id = str(row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or "")
+        if not order_id:
+            continue
+        entry = grouped.setdefault(
+            order_id,
+            {
+                "amazon_order_id": order_id,
+                "amazon_order_url": row.get("amazon_order_url") or order_line_amazon_url(order_id),
+                "odoo_order_names": [],
+                "lines": [],
+                "tracking_checked_at": row.get("tracking_checked_at") or "",
+                "tracking_status": row.get("tracking_status") or "",
+                "amazon_cancelled_at": row.get("amazon_cancelled_at") or "",
+                "amazon_cancelled_order_id": row.get("amazon_cancelled_order_id") or "",
+            },
+        )
+        if row.get("odoo_order_name") not in entry["odoo_order_names"]:
+            entry["odoo_order_names"].append(row.get("odoo_order_name"))
+        entry["lines"].append(row)
+    return list(grouped.values()), data, total, page, per_page
+
+
+def delivered_unfulfilled_rows(store_id: Optional[int] = None, q: str = "") -> list[dict[str, Any]]:
+    rows, _total, _page, _per_page = paged_delivered_unfulfilled_rows(store_id, 1, 1000, q)
+    return rows
+
+
+def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> tuple[list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    search = clean_text(q)
+    search_like = f"%{search}%" if search else None
+    where_sql = """
+        COALESCE(order_lines.amazon_order_id, '') != ''
+        AND (
+          order_lines.state = 'delivered'
+          OR order_lines.tracking_status = 'Delivered'
+          OR LOWER(COALESCE(order_lines.tracking_status, '')) = 'delivered'
+        )
+        AND (? IS NULL OR order_lines.store_id=?)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM shopify_tracking_sync_log
+          JOIN stores tracking_store ON tracking_store.odoo_db=shopify_tracking_sync_log.odoo_db
+          WHERE tracking_store.id=order_lines.store_id
+            AND shopify_tracking_sync_log.odoo_order=order_lines.odoo_order_name
+        )
+        AND (
+          ? IS NULL
+          OR order_lines.odoo_order_name ILIKE ?
+          OR order_lines.amazon_order_id ILIKE ?
+          OR order_lines.asin ILIKE ?
+          OR order_lines.product_name ILIKE ?
+          OR order_lines.tracking_payload ILIKE ?
+          OR order_lines.amazon_account_name ILIKE ?
+        )
+    """
+    params = [store_id, store_id, search_like, search_like, search_like, search_like, search_like, search_like, search_like]
+    with db() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS count FROM order_lines WHERE {where_sql}", params).fetchone()["count"] or 0)
+        rows = conn.execute(
+            f"""
+            SELECT order_lines.id, order_lines.store_id, order_lines.odoo_order_id, order_lines.odoo_order_name,
+                   order_lines.odoo_line_id, order_lines.odoo_order_state, order_lines.odoo_order_date,
+                   order_lines.odoo_invoice_status, order_lines.odoo_status_label, order_lines.asin,
+                   order_lines.product_name, order_lines.state, order_lines.amazon_order_id,
+                   order_lines.amazon_order_url, order_lines.amazon_account_name, order_lines.tracking_status,
+                   order_lines.tracking_payload, order_lines.tracking_checked_at, order_lines.ordered_at,
+                   order_lines.updated_at, stores.name AS store_name, stores.odoo_url AS store_odoo_url
+            FROM order_lines
+            JOIN stores ON stores.id=order_lines.store_id
+            WHERE {where_sql}
+            ORDER BY order_lines.tracking_checked_at DESC, order_lines.ordered_at DESC, order_lines.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
     results: list[dict[str, Any]] = []
     for row in rows:
         data = rows_to_dicts([row])[0]
-        store = stores.get(int(row["store_id"]))
-        data["store_name"] = store["name"] if store else ""
+        store = {"id": row["store_id"], "name": row["store_name"], "odoo_url": row["store_odoo_url"]}
         data["odoo_order_url"] = odoo_order_admin_url(store, row["odoo_order_id"]) if store else ""
         data["amazon_order_url"] = data.get("amazon_order_url") or order_line_amazon_url(row["amazon_order_id"])
         data.update(amazon_delivery_info_from_payload(data.get("tracking_payload") or "", data.get("tracking_checked_at") or ""))
-        try:
-            if not store:
-                raise RuntimeError("Store not found")
-            client = clients.setdefault(int(row["store_id"]), OdooClient(get_store(int(row["store_id"]))))
-            status = client.picking_fulfilment_status_for_order(int(row["odoo_order_id"]))
-            data.update(status)
-            if status.get("fulfilment_status") == "fulfilment pending":
-                results.append(data)
-        except Exception as exc:
-            data.update(
-                {
-                    "fulfilment_status": "fulfilment pending",
-                    "message": f"Odoo fulfilment check failed: {exc}",
-                    "picking_ids": [],
-                    "picking_names": [],
-                    "picking_states": [],
-                    "open_picking_ids": [],
-                    "open_picking_names": [],
-                }
-            )
-            results.append(data)
-    return results
+        data.update(
+            {
+                "fulfilment_status": "fulfilment pending",
+                "message": "Amazon delivered locally, but no Shopify tracking sync has been recorded for this Odoo order.",
+                "picking_ids": [],
+                "picking_names": [],
+                "picking_states": [],
+                "open_picking_ids": [],
+                "open_picking_names": [],
+            }
+        )
+        data.pop("store_odoo_url", None)
+        results.append(data)
+    return results, total, page, per_page
 
 
 def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2) -> int:
@@ -8923,6 +9104,7 @@ def epost_tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
     data = rows_to_dicts(rows)
     stores = {int(store["id"]): store for store in list_stores()}
     for row in data:
+        row.pop("events_json", None)
         store = stores.get(int(row["store_id"]))
         if not clean_text(row.get("amazon_order_id")) and clean_text(row.get("matched_amazon_order_id")):
             row["amazon_order_id"] = row.get("matched_amazon_order_id") or ""
@@ -8997,7 +9179,10 @@ def paged_epost_tracking_rows(
         rows = conn.execute(
             f"""
             WITH target AS (
-                SELECT *
+                SELECT id, store_id, order_line_id, odoo_order_id, odoo_order_name, amazon_order_id,
+                       amazon_order_url, picking_id, picking_name, tracking_code, tracking_url, status,
+                       last_update_at, location, destination, awb, last_checked_at, epost_status,
+                       refund_status, refund_claimed_at, refund_received_at, created_at, updated_at
                 FROM epost_global_tracking
                 WHERE (? IS NULL OR store_id=?)
                 {status_clause}
@@ -9064,6 +9249,7 @@ def paged_epost_tracking_rows(
     data = rows_to_dicts(rows)
     stores = {int(store["id"]): store for store in list_stores()}
     for row in data:
+        row.pop("events_json", None)
         store = stores.get(int(row["store_id"]))
         if not clean_text(row.get("amazon_order_id")) and clean_text(row.get("matched_amazon_order_id")):
             row["amazon_order_id"] = row.get("matched_amazon_order_id") or ""
@@ -19699,49 +19885,42 @@ def api_chrome_job_costly(group_key: str, payload: ChromeJobCostlyPayload) -> di
 
 @app.get("/api/tracking/orders")
 def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "active", q: str = "") -> dict[str, Any]:
-    rows = tracking_rows(store_id, status, q)
-    grouped: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        order_id = str(row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or "")
-        if not order_id:
-            continue
-        entry = grouped.setdefault(
-            order_id,
-            {
-                "amazon_order_id": order_id,
-                "amazon_order_url": row.get("amazon_order_url") or order_line_amazon_url(order_id),
-                "odoo_order_names": [],
-                "lines": [],
-                "tracking_checked_at": row.get("tracking_checked_at") or "",
-                "tracking_status": row.get("tracking_status") or "",
-                "amazon_cancelled_at": row.get("amazon_cancelled_at") or "",
-                "amazon_cancelled_order_id": row.get("amazon_cancelled_order_id") or "",
-            },
-        )
-        if row.get("odoo_order_name") not in entry["odoo_order_names"]:
-            entry["odoo_order_names"].append(row.get("odoo_order_name"))
-        entry["lines"].append(row)
-    orders, total, page, per_page = paginate_values(list(grouped.values()), page, per_page)
-    return {"ok": True, "orders": orders, "rows": rows[:per_page], "page": page, "per_page": per_page, "total": total}
+    cache_key = ("tracking-orders", store_id, page, per_page, clean_text(status), clean_text(q))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    orders, rows, total, page, per_page = paged_tracking_orders(store_id, status, q, page, per_page)
+    return fast_page_cache_set(cache_key, {"ok": True, "orders": orders, "rows": [], "page": page, "per_page": per_page, "total": total}, 15)
 
 
 @app.get("/api/tracking/fulfilment-pending")
 def api_tracking_fulfilment_pending(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> dict[str, Any]:
-    rows = delivered_unfulfilled_rows(store_id, q)
-    paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
-    return {"ok": True, "rows": paged_rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": len(rows)}
+    cache_key = ("fulfilment-pending", store_id, page, per_page, clean_text(q))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    rows, total, page, per_page = paged_delivered_unfulfilled_rows(store_id, page, per_page, q)
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": total}, 15)
 
 
 @app.get("/api/dispatch-status")
 def api_dispatch_status(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", q: str = "") -> dict[str, Any]:
+    cache_key = ("dispatch-status", store_id, page, per_page, clean_text(status), clean_text(q))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     rows, total, page, per_page, summary = dispatch_status_rows(store_id, status, q, page, per_page)
-    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "summary": summary}
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "summary": summary}, 20)
 
 
 @app.get("/api/dispatch-status/summary")
 def api_dispatch_status_summary(store_id: Optional[int] = None) -> dict[str, Any]:
+    cache_key = ("dispatch-status-summary", store_id)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     _rows, _total, _page, _per_page, summary = dispatch_status_rows(store_id, "all", "", 1, 1)
-    return {"ok": True, "summary": summary}
+    return fast_page_cache_set(cache_key, {"ok": True, "summary": summary}, 20)
 
 
 @app.post("/api/tracking/update")
@@ -20408,11 +20587,15 @@ def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: 
     status = clean_text(status or "all").lower()
     stale_days = max(1, min(90, int(stale_days or 10)))
     search_engine = "postgres"
+    cache_key = ("epost-tracking", store_id, page, per_page, status, stale_days, bool(stale_only))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
     except Exception:
         rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
-    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only}
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only}, 15)
 
 
 @app.post("/api/epost/tracking/{tracking_id}/refund")

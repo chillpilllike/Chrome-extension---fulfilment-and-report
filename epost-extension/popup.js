@@ -113,6 +113,18 @@ function progressText(progress = {}) {
   return `${progress.message || "Headless ePost status loaded."} ${processed}/${total} batch(es) processed${current}`;
 }
 
+function visibleProgressText(run = {}) {
+  const batches = run.batches || [];
+  const processedBatches = Math.min(Number(run.batchIndex || 0), batches.length);
+  const totalCodes = batches.flat().filter(Boolean).length;
+  const processedCodes = batches.slice(0, processedBatches).flat().filter(Boolean).length;
+  const currentCodes = batches[run.batchIndex]?.length || 0;
+  const completed = run.completedCodes?.length || 0;
+  const failed = run.failedCodes?.length || 0;
+  const skipped = Number(run.skippedRecentCount || 0);
+  return `Running: batch ${processedBatches + 1}/${batches.length} · codes ${processedCodes}/${totalCodes} · current ${currentCodes} · checked ${completed} · failed ${failed}${skipped ? ` · skipped recent ${skipped}` : ""}`;
+}
+
 function errorMessage(error) {
   return String(error?.message || error || "Unexpected extension error.");
 }
@@ -155,7 +167,7 @@ async function refresh() {
     }
   } else {
     setRunButtons(run.running);
-    applyStatusFromRefresh(run.running ? `Running: batch ${run.batchIndex + 1 || 1}/${run.batches?.length || 0}` : "Stopped");
+    applyStatusFromRefresh(run.running ? visibleProgressText(run) : "Stopped");
   }
   logsBox.innerHTML = "";
   for (const line of state.logs || []) {
