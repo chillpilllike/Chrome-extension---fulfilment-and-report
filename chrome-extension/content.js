@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-05-25-replacement-recipient-alt-v23";
+const CONTENT_SCRIPT_BUILD = "2026-05-29-universal-nutricity-ref-v1";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5738,7 +5738,7 @@ function orderDetailsPageRoot() {
 
 function orderDetailsPageRecipient() {
   const text = (orderDetailsPageRoot()?.innerText || "").replace(/\s+/g, " ").trim();
-  const refMatch = text.match(/\bNutricity\s+NC\d+(?:\s+[A-Za-z0-9]+){0,3}/i);
+  const refMatch = text.match(/\bNutricity\s+[A-Z]{2,5}\d{2,}(?:\s+[A-Za-z0-9]+){0,3}/i);
   if (refMatch?.[0]) return refMatch[0].replace(/\s+/g, " ").trim();
   const shipMatch = text.match(/\bShip to\s+(.+?)\s+\d{2,}/i);
   return shipMatch?.[1]?.replace(/\s+/g, " ").trim() || "";
@@ -5795,7 +5795,7 @@ function orderDetailsPageDetails() {
 
 function recipientFromOrderHistoryText(text = "") {
   const value = String(text || "").replace(/\s+/g, " ").trim();
-  const nutricityMatch = value.match(/\bNutricity\s+NC\d+(?:\s+[A-Za-z0-9]+){0,4}/i);
+  const nutricityMatch = value.match(/\bNutricity\s+[A-Z]{2,5}\d{2,}(?:\s+[A-Za-z0-9]+){0,4}/i);
   if (nutricityMatch?.[0]) {
     return nutricityMatch[0]
       .replace(/\b(?:Order|Placed|Total|Ship|To|View|Buy|Again|Invoice|Details)\b.*$/i, "")

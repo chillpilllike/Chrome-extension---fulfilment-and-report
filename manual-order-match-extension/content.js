@@ -59,7 +59,7 @@ function orderIdsFromText(text) {
 }
 
 function orderRefsFromText(text) {
-  return [...new Set((text.match(/\bNC\d+\b/gi) || []).map((value) => value.toUpperCase()))];
+  return [...new Set((text.match(/\b[A-Z]{2,5}\d{2,}\b/gi) || []).map((value) => value.toUpperCase()))];
 }
 
 function orderUrlFor(orderId, root) {

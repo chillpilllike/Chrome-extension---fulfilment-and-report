@@ -4734,7 +4734,7 @@ def fetch_odoo_orders_by_names(store: Store, order_names: list[str]) -> int:
     ]
     normalized_names = list(dict.fromkeys(normalized_names))
     if not normalized_names:
-        raise HTTPException(400, "Enter at least one Odoo order number, for example NC10216.")
+        raise HTTPException(400, "Enter at least one Odoo order number, for example ES00259.")
     print(f"[pull-by-order] store={store.id} orders={','.join(normalized_names)} connecting to Odoo", flush=True)
     odoo = OdooClient(store)
     domain: list[Any] = [("name", "in", normalized_names)]
@@ -4847,7 +4847,7 @@ def update_lines_after_order(
                 index_order_line(updated)
 
 
-ORDER_REF_RE = re.compile(r"\bNC\d+\b", re.IGNORECASE)
+ORDER_REF_RE = re.compile(r"\b[A-Z]{2,5}\d{2,}\b", re.IGNORECASE)
 
 
 def manual_order_refs_from_payload(payload: ManualAmazonOrderMatchPayload) -> list[str]:

@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-25-replacement-recipient-alt-v23";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-05-29-universal-nutricity-ref-v1";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
