@@ -2900,6 +2900,44 @@ def asin_product_url(asin: str) -> str:
     return f"https://www.amazon.com/dp/{quote_plus(asin)}" if asin else ""
 
 
+def amazon_products_from_tracking_payload(payload_text: str, fallback_asin: str = "", fallback_title: str = "") -> list[dict[str, str]]:
+    try:
+        packages = json.loads(payload_text or "[]")
+    except Exception:
+        packages = []
+    if isinstance(packages, dict):
+        packages = [packages]
+    if not isinstance(packages, list):
+        packages = []
+    products: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_product(asin_value: Any, url: str = "", title: str = "", image_url: str = "") -> None:
+        asin = normalize_asin(str(asin_value or ""))
+        if not asin or asin in seen:
+            return
+        seen.add(asin)
+        products.append(
+            {
+                "asin": asin,
+                "url": clean_text(url) or asin_product_url(asin),
+                "title": clean_text(title),
+                "image_url": clean_text(image_url),
+            }
+        )
+
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        for product in package.get("products") or []:
+            if isinstance(product, dict):
+                add_product(product.get("asin"), product.get("url"), product.get("title"), product.get("image_url"))
+        for asin in package.get("asins") or []:
+            add_product(asin)
+    add_product(fallback_asin, asin_product_url(fallback_asin), fallback_title)
+    return products
+
+
 def list_addresses() -> list[dict[str, Any]]:
     with db() as conn:
         return conn.execute("SELECT * FROM fulfilment_addresses ORDER BY is_default DESC, label").fetchall()
@@ -8987,6 +9025,13 @@ def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int =
         store = {"id": row["store_id"], "name": row["store_name"], "odoo_url": row["store_odoo_url"]}
         data["odoo_order_url"] = odoo_order_admin_url(store, row["odoo_order_id"]) if store else ""
         data["amazon_order_url"] = data.get("amazon_order_url") or order_line_amazon_url(row["amazon_order_id"])
+        data["asin_url"] = asin_product_url(data.get("asin") or "")
+        data["amazon_products"] = amazon_products_from_tracking_payload(
+            data.get("tracking_payload") or "",
+            data.get("asin") or "",
+            data.get("product_name") or "",
+        )
+        data["amazon_product_asins"] = ", ".join(product["asin"] for product in data["amazon_products"])
         data.update(amazon_delivery_info_from_payload(data.get("tracking_payload") or "", data.get("tracking_checked_at") or ""))
         data.update(
             {
@@ -9902,6 +9947,11 @@ def export_cell(row: dict[str, Any], key: str) -> Any:
                     pass
         latest = (packages[0] or {}).get("latest_event") if packages else {}
         return " ".join(str(latest.get(part) or "") for part in ("date", "time", "message")).strip() if isinstance(latest, dict) else ""
+    if key == "amazon_product_asins":
+        products = row.get("amazon_products") or []
+        if isinstance(products, list):
+            return ", ".join(clean_text(product.get("asin")) for product in products if isinstance(product, dict) and clean_text(product.get("asin")))
+        return row.get("asin") or ""
     if key == "picking_summary":
         names = row.get("picking_names") or []
         states = row.get("picking_states") or []

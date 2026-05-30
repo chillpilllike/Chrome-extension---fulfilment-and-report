@@ -89,13 +89,32 @@ function parseOrderCancellation() {
 }
 
 function asinsFrom(root) {
-  return [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]
-    .map((link) => {
-      const href = link.getAttribute("href") || "";
-      const match = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
-      return match ? match[1].toUpperCase() : "";
-    })
-    .filter(Boolean);
+  return productItemsFrom(root).map((item) => item.asin);
+}
+
+function productItemsFrom(root) {
+  const products = [];
+  const seen = new Set();
+  for (const link of [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]) {
+    const href = link.getAttribute("href") || "";
+    const match = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
+    const asin = match ? match[1].toUpperCase() : "";
+    if (!asin || seen.has(asin)) continue;
+    seen.add(asin);
+    const itemBox = link.closest("[data-component='purchasedItems'], .a-fixed-left-grid, .a-row") || link.parentElement || root;
+    const image = itemBox.querySelector("img") || link.querySelector("img");
+    const title =
+      clean(link.textContent) ||
+      clean(image?.getAttribute("alt")) ||
+      clean(itemBox.querySelector("[data-component='itemTitle'] a")?.textContent);
+    products.push({
+      asin,
+      url: absoluteUrl(href),
+      title,
+      image_url: image ? absoluteUrl(image.getAttribute("data-a-hires") || image.getAttribute("src") || "") : "",
+    });
+  }
+  return products;
 }
 
 function parseOrderDetails() {
@@ -117,16 +136,19 @@ function parseOrderDetails() {
     seen.add(href);
     const box = link.closest(".a-box, [data-component='shipments'], [data-component='orderCard']") || document.body;
     const status = clean(box.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
-    const asins = [...new Set(asinsFrom(box))];
+    const products = productItemsFrom(box);
+    const asins = products.map((item) => item.asin);
     packages.push({
       tracking_url: href,
       order_status: status,
       promise: status,
       asins,
+      products,
     });
   }
+  const products = productItemsFrom(document.body);
   const orderStatus = clean(document.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
-  return { amazonOrderId, packages, orderStatus, promise: orderStatus, ...paymentRevision, ...cancellation };
+  return { amazonOrderId, packages, products, orderStatus, promise: orderStatus, ...paymentRevision, ...cancellation };
 }
 
 function parseCarrierAndTrackingId() {

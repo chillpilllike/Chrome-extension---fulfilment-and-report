@@ -319,6 +319,8 @@ type FulfilmentPendingRow = OrderLine & {
   store_name: string
   fulfilment_status: string
   message: string
+  amazon_products?: Array<{ asin: string; url?: string; title?: string; image_url?: string }>
+  amazon_product_asins?: string
   picking_names: string[]
   picking_states: string[]
   open_picking_names: string[]
@@ -990,6 +992,7 @@ const fulfilmentPendingExportColumns: ExportColumn[] = [
   { key: "store_name", label: "Store" },
   { key: "odoo_order_name", label: "Odoo Order" },
   { key: "amazon_order_id", label: "Amazon Order" },
+  { key: "amazon_product_asins", label: "Amazon Product ASINs" },
   { key: "carrier_tracking", label: "Carrier / Tracking" },
   { key: "tracking_status", label: "Tracking" },
   { key: "amazon_delivered_display", label: "Delivered At" },
@@ -5837,6 +5840,28 @@ function FulfilmentPendingPage({
       return []
     }
   }
+  function pendingAmazonProducts(row: FulfilmentPendingRow, packages: any[]) {
+    const products: Array<{ asin: string; url: string; title?: string; image_url?: string }> = []
+    const seen = new Set<string>()
+    const addProduct = (value: any) => {
+      const asin = String(value?.asin || value || "").trim().toUpperCase()
+      if (!asin || seen.has(asin)) return
+      seen.add(asin)
+      products.push({
+        asin,
+        url: String(value?.url || row.asin_url || `https://www.amazon.com/dp/${encodeURIComponent(asin)}`),
+        title: String(value?.title || (asin === row.asin ? row.product_name : "") || ""),
+        image_url: String(value?.image_url || ""),
+      })
+    }
+    ;(row.amazon_products || []).forEach(addProduct)
+    packages.forEach((pkg: any) => {
+      ;(pkg.products || []).forEach(addProduct)
+      ;(pkg.asins || []).forEach(addProduct)
+    })
+    addProduct({ asin: row.asin, url: row.asin_url, title: row.product_name })
+    return products
+  }
   async function copyPendingText(value: string, label: string) {
     const copied = await copyPlainText(value)
     onResult({
@@ -5905,6 +5930,7 @@ function FulfilmentPendingPage({
               <TableHead>Store</TableHead>
               <TableHead>Odoo Order</TableHead>
               <TableHead>Amazon Order</TableHead>
+              <TableHead>Product ASIN</TableHead>
               <TableHead>Carrier / Tracking</TableHead>
               <TableHead>Tracking</TableHead>
               <TableHead>Odoo Pickings</TableHead>
@@ -5915,6 +5941,7 @@ function FulfilmentPendingPage({
           <TableBody>
             {rows.map((row) => {
               const packages = rowPackages(row)
+              const amazonProducts = pendingAmazonProducts(row, packages)
               return (
                 <TableRow key={row.id} className="bg-destructive/5">
                     <TableCell>
@@ -5943,6 +5970,24 @@ function FulfilmentPendingPage({
                         <Button size="icon-sm" variant="ghost" title="Copy Amazon order ID" onClick={() => copyPendingText(row.amazon_order_id, "Amazon order ID")}>
                           <Copy className="size-4" />
                         </Button>
+                      </div>
+                    </TableCell>
+                    <TableCell className="max-w-[320px]">
+                      <div className="grid gap-2">
+                        {amazonProducts.map((product) => (
+                          <div key={`${row.id}-${product.asin}`} className="flex min-w-0 items-center gap-2">
+                            {product.image_url ? (
+                              <img className="size-10 rounded border bg-white object-contain" src={product.image_url} alt="" />
+                            ) : null}
+                            <div className="min-w-0">
+                              <a className="font-mono text-primary underline-offset-4 hover:underline" href={product.url} target="_blank">
+                                {product.asin}
+                              </a>
+                              {product.title ? <div className="truncate text-xs text-muted-foreground">{product.title}</div> : null}
+                            </div>
+                          </div>
+                        ))}
+                        {!amazonProducts.length ? <span className="text-muted-foreground">No ASIN captured</span> : null}
                       </div>
                     </TableCell>
                     <TableCell className="max-w-[320px]">
@@ -6004,7 +6049,7 @@ function FulfilmentPendingPage({
             })}
             {!rows.length && (
               <TableRow>
-                <TableCell colSpan={9} className="py-8 text-center text-muted-foreground">
+                <TableCell colSpan={10} className="py-8 text-center text-muted-foreground">
                   No delivered Amazon orders are pending Odoo fulfilment.
                 </TableCell>
               </TableRow>

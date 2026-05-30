@@ -393,6 +393,7 @@ async function handleOrderPackages(message, windowId) {
   tracking.lastMessage = `Found ${tracking.packages.length} package link(s) for ${order.amazon_order_id}.`;
   await saveTracking(tracking, windowId);
   if (!tracking.packages.length) {
+    const products = Array.isArray(message.products) ? message.products : [];
     await api("/api/tracking/update", {
       method: "POST",
       body: JSON.stringify({
@@ -402,7 +403,8 @@ async function handleOrderPackages(message, windowId) {
           status: message.orderStatus || "Unknown",
           promise: message.promise || "",
           tracking_url: orderUrl(order),
-          asins: [],
+          asins: products.map((item) => item.asin).filter(Boolean),
+          products,
         }],
       }),
     });
@@ -437,6 +439,9 @@ async function handlePackageTracking(message, windowId) {
   const packageData = { ...queuedPackage, ...pagePackage };
   if (Array.isArray(queuedPackage.asins) && queuedPackage.asins.length) {
     packageData.asins = queuedPackage.asins;
+  }
+  if (Array.isArray(queuedPackage.products) && queuedPackage.products.length) {
+    packageData.products = queuedPackage.products;
   }
   if (message.paymentRevisionNeeded) {
     packageData.payment_revision_needed = true;
