@@ -117,6 +117,15 @@ function productItemsFrom(root) {
   return products;
 }
 
+function shipmentRootForTrackingLink(link) {
+  const rightGrid = link.closest("[data-component='shipmentsRightGrid'], [data-component='shipmentConnections']");
+  const shipmentGrid = rightGrid?.closest(".a-fixed-right-grid-inner");
+  if (shipmentGrid) return shipmentGrid;
+  const shipmentComponent = link.closest("[data-component='shipments']");
+  if (shipmentComponent) return shipmentComponent;
+  return link.closest(".a-box, [data-component='orderCard']") || document.body;
+}
+
 function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
   const paymentRevision = parsePaymentRevision();
@@ -134,7 +143,7 @@ function parseOrderDetails() {
     const href = absoluteUrl(link.getAttribute("href") || "");
     if (seen.has(href)) continue;
     seen.add(href);
-    const box = link.closest(".a-box, [data-component='shipments'], [data-component='orderCard']") || document.body;
+    const box = shipmentRootForTrackingLink(link);
     const status = clean(box.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
     const products = productItemsFrom(box);
     const asins = products.map((item) => item.asin);

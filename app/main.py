@@ -152,6 +152,15 @@ _PROFIT_LOSS_CACHE_LOCK = threading.Lock()
 PROFIT_LOSS_CACHE_TTL_SECONDS = 90
 TYPESENSE_SCHEMA_VERSION = "3"
 PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/assets", "/static", "/health", "/favicon")
+PUBLIC_FRONTEND_PATHS = {"/tracking", "/fulfilment-pending", "/dispatch-status", "/amazon-otp", "/epost"}
+PUBLIC_API_PATHS = {
+    "/api/tracking/orders",
+    "/api/tracking/fulfilment-pending",
+    "/api/dispatch-status",
+    "/api/dispatch-status/summary",
+    "/api/amazon-otp",
+    "/api/epost/tracking",
+}
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
 _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
@@ -507,7 +516,9 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     if request.method == "OPTIONS":
         return await call_next(request)
     allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
-    if token and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
+    allow_public_frontend = request.method in {"GET", "HEAD"} and path in PUBLIC_FRONTEND_PATHS
+    allow_public_api = request.method in {"GET", "HEAD"} and path in PUBLIC_API_PATHS
+    if token and not allow_public_frontend and not allow_public_api and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
         if not request_has_admin_access(request):
             return Response("Admin token required.", status_code=401)
     return await call_next(request)
@@ -2934,7 +2945,12 @@ def amazon_products_from_tracking_payload(payload_text: str, fallback_asin: str 
                 add_product(product.get("asin"), product.get("url"), product.get("title"), product.get("image_url"))
         for asin in package.get("asins") or []:
             add_product(asin)
-    add_product(fallback_asin, asin_product_url(fallback_asin), fallback_title)
+    fallback = normalize_asin(fallback_asin)
+    if fallback:
+        matching_products = [product for product in products if product.get("asin") == fallback]
+        if matching_products:
+            return matching_products
+        add_product(fallback, asin_product_url(fallback), fallback_title)
     return products
 
 
@@ -9934,6 +9950,25 @@ def export_cell(row: dict[str, Any], key: str) -> Any:
                 except Exception:
                     pass
         return " | ".join(f"{pkg.get('carrier') or 'Carrier'} {pkg.get('tracking_id') or ''}".strip() for pkg in packages) or row.get("amazon_order_url", "")
+    if key == "tracking_numbers":
+        try:
+            packages = json.loads(row.get("tracking_payload") or "[]") if isinstance(row.get("tracking_payload"), str) else []
+        except Exception:
+            packages = []
+        if not packages and row.get("lines"):
+            for line in row.get("lines") or []:
+                try:
+                    packages.extend(json.loads(line.get("tracking_payload") or "[]"))
+                except Exception:
+                    pass
+        values = []
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            tracking_id = clean_text(package.get("tracking_id") or package.get("trackingId") or package.get("tracking_number") or package.get("trackingNumber"))
+            if tracking_id and tracking_id not in values:
+                values.append(tracking_id)
+        return ", ".join(values)
     if key == "latest_update":
         try:
             packages = json.loads(row.get("tracking_payload") or "[]") if isinstance(row.get("tracking_payload"), str) else []

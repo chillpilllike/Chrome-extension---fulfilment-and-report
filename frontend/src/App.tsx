@@ -81,6 +81,7 @@ const KNOWN_APP_PAGES = new Set([
   "cancelled-orders",
   "settings",
 ])
+const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "amazon-otp", "epost"])
 
 function appPageFromLocation() {
   if (typeof window === "undefined") return "home"
@@ -91,6 +92,10 @@ function appPageFromLocation() {
 
 function pagePath(page: string) {
   return page === "home" ? "/" : `/${page}`
+}
+
+function pageAllowsPublicAccess(page: string) {
+  return PUBLIC_APP_PAGES.has(page)
 }
 
 function AppVersionBadge() {
@@ -983,6 +988,7 @@ const trackingExportColumns: ExportColumn[] = [
   { key: "odoo_order_names", label: "Odoo Orders" },
   { key: "amazon_order_id", label: "Amazon Order" },
   { key: "tracking_status", label: "Status" },
+  { key: "tracking_numbers", label: "Tracking Numbers" },
   { key: "carrier_tracking", label: "Carrier / Tracking" },
   { key: "latest_update", label: "Latest Update" },
   { key: "tracking_checked_at", label: "Checked" },
@@ -2209,6 +2215,7 @@ function ExportControls({
 }
 
 function App() {
+  const initialPage = appPageFromLocation()
   const initialDashboard = cachedDashboardData()
   const initialOrdersParams = initialOrdersUrlParams()
   const [data, setData] = useState<DashboardData | null>(() => initialDashboard)
@@ -2274,7 +2281,7 @@ function App() {
   const [costlyRows, setCostlyRows] = useState<OrderLine[]>([])
   const [costlyPage, setCostlyPage] = useState(1)
   const [costlyTotal, setCostlyTotal] = useState(0)
-  const [page, setPage] = useState(appPageFromLocation)
+  const [page, setPage] = useState(initialPage)
   const [openNavGroup, setOpenNavGroup] = useState<string | null>(null)
   const navTabsRef = useRef<HTMLDivElement | null>(null)
   const ordersSelectionAnchor = useRef<number | null>(null)
@@ -2328,7 +2335,7 @@ function App() {
   const [modal, setModal] = useState<ModalState>(null)
   const [shopifyStatusForceSync, setShopifyStatusForceSync] = useState<ShopifyOrderStatusForceSyncProgress | null>(null)
   const [adminTokenSaved, setAdminTokenSaved] = useState(Boolean(savedAdminToken()))
-  const [adminAccessOpen, setAdminAccessOpen] = useState(!savedAdminToken())
+  const [adminAccessOpen, setAdminAccessOpen] = useState(!savedAdminToken() && !pageAllowsPublicAccess(initialPage))
   const [adminAuthError, setAdminAuthError] = useState("")
   const [adminAuthBusy, setAdminAuthBusy] = useState(false)
   const [uiCopy, setUiCopy] = useState<UiCopy>({})
@@ -3598,8 +3605,10 @@ function App() {
     },
   ] as const
   const activeNavGroup = navGroups.find((group) => group.items.some((item) => item[0] === page))
+  const currentPageIsPublic = pageAllowsPublicAccess(page)
+  const currentPageNeedsAdmin = !currentPageIsPublic && !adminTokenSaved && !data
 
-  if (!adminTokenSaved && !data) {
+  if (currentPageNeedsAdmin) {
     return (
       <TooltipProvider>
         <AdminAccessScreen onSubmit={handleAdminTokenSave} error={adminAuthError} busy={adminAuthBusy} />
@@ -5221,6 +5230,15 @@ function TrackingPage({
   const [queryText, setQueryText] = useState("")
   const selectionAnchor = useRef<string | null>(null)
 
+  function trackingNumbersFromPayloads(payloads: any[]) {
+    const values: string[] = []
+    payloads.forEach((pkg: any) => {
+      const trackingId = String(pkg.tracking_id || pkg.trackingId || pkg.tracking_number || pkg.trackingNumber || "").trim()
+      if (trackingId && !values.includes(trackingId)) values.push(trackingId)
+    })
+    return values
+  }
+
   async function refreshTracking() {
     setLoading(true)
     try {
@@ -5297,6 +5315,7 @@ function TrackingPage({
               <TableHead>Amazon Order</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Cancelled Earlier</TableHead>
+              <TableHead>Tracking Number</TableHead>
               <TableHead>Carrier / Tracking</TableHead>
               <TableHead>Latest Update</TableHead>
               <TableHead>Checked</TableHead>
@@ -5313,6 +5332,7 @@ function TrackingPage({
               })
               const firstPackage = payloads[0] || {}
               const latest = firstPackage.latest_event || {}
+              const trackingNumbers = trackingNumbersFromPayloads(payloads)
               return (
                 <TableRow key={order.amazon_order_id} className={order.amazon_cancelled_at ? "bg-red-50" : ""}>
                   <TableCell>
@@ -5340,6 +5360,17 @@ function TrackingPage({
                   </TableCell>
                   <TableCell><StatusBadge value={order.tracking_status || firstPackage.status || "Unknown"} /></TableCell>
                   <TableCell>{order.amazon_cancelled_at ? <Badge className="bg-red-100 text-red-700 hover:bg-red-100">Yes</Badge> : <Badge variant="outline">No</Badge>}</TableCell>
+                  <TableCell className="max-w-[220px]">
+                    {trackingNumbers.length ? (
+                      <div className="grid gap-1">
+                        {trackingNumbers.map((trackingId) => (
+                          <span key={`${order.amazon_order_id}-${trackingId}`} className="truncate font-mono text-sm">
+                            {trackingId}
+                          </span>
+                        ))}
+                      </div>
+                    ) : <span className="text-muted-foreground">Pending</span>}
+                  </TableCell>
                   <TableCell className="max-w-[320px]">
                     {payloads.length ? (
                       <div className="grid gap-1 text-sm">
@@ -5843,6 +5874,7 @@ function FulfilmentPendingPage({
   function pendingAmazonProducts(row: FulfilmentPendingRow, packages: any[]) {
     const products: Array<{ asin: string; url: string; title?: string; image_url?: string }> = []
     const seen = new Set<string>()
+    const rowAsin = String(row.asin || "").trim().toUpperCase()
     const addProduct = (value: any) => {
       const asin = String(value?.asin || value || "").trim().toUpperCase()
       if (!asin || seen.has(asin)) return
@@ -5860,7 +5892,9 @@ function FulfilmentPendingPage({
       ;(pkg.asins || []).forEach(addProduct)
     })
     addProduct({ asin: row.asin, url: row.asin_url, title: row.product_name })
-    return products
+    if (!rowAsin) return products
+    const matchingProducts = products.filter((product) => product.asin === rowAsin)
+    return matchingProducts.length ? matchingProducts : products.slice(-1)
   }
   async function copyPendingText(value: string, label: string) {
     const copied = await copyPlainText(value)
