@@ -3604,8 +3604,24 @@ function App() {
       ],
     },
   ] as const
-  const activeNavGroup = navGroups.find((group) => group.items.some((item) => item[0] === page))
   const currentPageIsPublic = pageAllowsPublicAccess(page)
+  const publicVisitor = currentPageIsPublic && !adminTokenSaved
+  const publicNavGroups = [
+    {
+      key: "dispatch-team",
+      label: "Dispatch Team",
+      icon: PackageCheck,
+      items: [
+        ["tracking", "Amazon Tracking", PackageCheck],
+        ["fulfilment-pending", "Pending Dispatch", AlertCircle],
+        ["dispatch-status", "Dispatch Status", PackageCheck],
+        ["amazon-otp", "Amazon OTP", Bell],
+        ["epost", "ePost Global", PackageCheck],
+      ],
+    },
+  ] as const
+  const visibleNavGroups = publicVisitor ? publicNavGroups : navGroups
+  const activeNavGroup = visibleNavGroups.find((group) => group.items.some((item) => item[0] === page))
   const currentPageNeedsAdmin = !currentPageIsPublic && !adminTokenSaved && !data
 
   if (currentPageNeedsAdmin) {
@@ -3710,7 +3726,7 @@ function App() {
       <AdminAccessDialog open={adminAccessOpen} onSubmit={handleAdminTokenSave} onClose={() => setAdminAccessOpen(false)} error={adminAuthError} busy={adminAuthBusy} />
       <header className="navbar navbar-expand-md d-print-none">
         <div className="container-xl flex items-center justify-between gap-4 py-3">
-          <button className="navbar-brand" onClick={() => setPage("home")}>
+          <button className="navbar-brand" onClick={() => setPage(publicVisitor ? "tracking" : "home")}>
             <div className="avatar avatar-sm bg-primary text-primary-fg">
               <HeaderIcon className="size-4" />
             </div>
@@ -3719,26 +3735,32 @@ function App() {
               <p className="navbar-brand-subtitle">{headerCopy.description}</p>
             </div>
           </button>
-          <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey("app_header")} title="Edit header text">
-            <Edit className="size-4" />
-          </Button>
+          {!publicVisitor && (
+            <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey("app_header")} title="Edit header text">
+              <Edit className="size-4" />
+            </Button>
+          )}
           <div className="flex items-center gap-2">
             <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Day mode"><Sun className="size-5" /></button>
             <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Dark mode"><Moon className="size-5" /></button>
-            <button className="btn btn-icon relative" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Notifications">
-              <Bell className="size-5" />
-              {(missingRows.length + partialFulfilments.length + costlyRows.length + fulfilmentPendingRows.length) > 0 && <span className="absolute right-1 top-1 size-2 rounded-full bg-red" />}
-            </button>
+            {!publicVisitor && (
+              <button className="btn btn-icon relative" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Notifications">
+                <Bell className="size-5" />
+                {(missingRows.length + partialFulfilments.length + costlyRows.length + fulfilmentPendingRows.length) > 0 && <span className="absolute right-1 top-1 size-2 rounded-full bg-red" />}
+              </button>
+            )}
             <button className={`btn btn-icon ${adminTokenSaved ? "text-green" : "text-yellow"}`} data-bs-toggle="tooltip" data-bs-placement="bottom" title={adminTokenSaved ? "Admin code saved on this PC" : "Enter admin code"} onClick={() => { setAdminAuthError(""); setAdminAccessOpen(true) }}>
               <Lock className="size-5" />
             </button>
-            <button className="nav-link d-flex lh-1 text-reset" onClick={() => setPage("settings")}>
-              <div className="avatar avatar-sm bg-blue-lt text-blue"><UserCircle className="size-5" /></div>
-              <div className="hidden text-left text-sm md:block">
-                <div className="font-medium">Admin Team</div>
-                <div className="text-xs text-muted-foreground">{adminTokenSaved ? "Access saved" : "Code required"}</div>
-              </div>
-            </button>
+            {!publicVisitor && (
+              <button className="nav-link d-flex lh-1 text-reset" onClick={() => setPage("settings")}>
+                <div className="avatar avatar-sm bg-blue-lt text-blue"><UserCircle className="size-5" /></div>
+                <div className="hidden text-left text-sm md:block">
+                  <div className="font-medium">Admin Team</div>
+                  <div className="text-xs text-muted-foreground">{adminTokenSaved ? "Access saved" : "Code required"}</div>
+                </div>
+              </button>
+            )}
             {adminTokenSaved && (
               <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Forget admin code on this PC" onClick={clearAdminToken}>
                 <Logout className="size-5" />
@@ -3750,13 +3772,15 @@ function App() {
       <nav className="navbar-tabs d-print-none" ref={navTabsRef}>
         <div className="container-xl flex items-center justify-between gap-4">
           <ul className="navbar-nav nav-tabs">
-            <li className={`nav-item ${page === "home" ? "active" : ""}`}>
-              <button className={`nav-link ${page === "home" ? "active" : ""}`} onClick={() => { setPage("home"); setOpenNavGroup(null) }}>
-                <span className="nav-link-icon"><Home className="size-4" /></span>
-                <span className="nav-link-title">Home</span>
-              </button>
-            </li>
-            {navGroups.map((group) => {
+            {!publicVisitor && (
+              <li className={`nav-item ${page === "home" ? "active" : ""}`}>
+                <button className={`nav-link ${page === "home" ? "active" : ""}`} onClick={() => { setPage("home"); setOpenNavGroup(null) }}>
+                  <span className="nav-link-icon"><Home className="size-4" /></span>
+                  <span className="nav-link-title">Home</span>
+                </button>
+              </li>
+            )}
+            {visibleNavGroups.map((group) => {
               const Icon = group.icon
               const groupActive = activeNavGroup?.key === group.key
               return (
@@ -3791,10 +3815,10 @@ function App() {
               )
             })}
           </ul>
-          <button className={`nav-link ms-auto ${page === "settings" ? "active" : ""}`} onClick={() => { setPage("settings"); setOpenNavGroup(null) }}>
+          {!publicVisitor && <button className={`nav-link ms-auto ${page === "settings" ? "active" : ""}`} onClick={() => { setPage("settings"); setOpenNavGroup(null) }}>
               <span className="nav-link-icon"><Settings className="size-4" /></span>
               <span className="nav-link-title">Settings</span>
-            </button>
+            </button>}
         </div>
       </nav>
 
@@ -3806,9 +3830,9 @@ function App() {
               <div className="page-pretitle">Control panel</div>
               <div className="flex items-center gap-2">
                 <h2 className="page-title">{pageTitle}</h2>
-                <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey(page)} title="Edit page text">
+                {!publicVisitor && <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey(page)} title="Edit page text">
                   <Edit className="size-4" />
-                </Button>
+                </Button>}
               </div>
               {currentPageCopy.description && <p className="mt-1 text-sm text-muted-foreground">{currentPageCopy.description}</p>}
               {page === "profit-loss" && (
