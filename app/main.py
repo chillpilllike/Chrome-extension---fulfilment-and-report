@@ -9062,6 +9062,7 @@ def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int =
         )
         data.pop("store_odoo_url", None)
         results.append(data)
+    attach_shopify_status_to_rows(results)
     return results, total, page, per_page
 
 

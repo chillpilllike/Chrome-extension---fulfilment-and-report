@@ -997,6 +997,7 @@ const trackingExportColumns: ExportColumn[] = [
 const fulfilmentPendingExportColumns: ExportColumn[] = [
   { key: "store_name", label: "Store" },
   { key: "odoo_order_name", label: "Odoo Order" },
+  { key: "shopify_order_name", label: "Shopify Order" },
   { key: "amazon_order_id", label: "Amazon Order" },
   { key: "amazon_product_asins", label: "Amazon Product ASINs" },
   { key: "carrier_tracking", label: "Carrier / Tracking" },
@@ -5987,6 +5988,7 @@ function FulfilmentPendingPage({
               </TableHead>
               <TableHead>Store</TableHead>
               <TableHead>Odoo Order</TableHead>
+              <TableHead>Shopify Order</TableHead>
               <TableHead>Amazon Order</TableHead>
               <TableHead>Product ASIN</TableHead>
               <TableHead>Carrier / Tracking</TableHead>
@@ -6019,6 +6021,18 @@ function FulfilmentPendingPage({
                       <div className="text-xs text-muted-foreground">
                         {row.odoo_sale_state || "state unknown"} / {row.odoo_invoice_status || "invoice unknown"}
                       </div>
+                    </TableCell>
+                    <TableCell>
+                      {row.shopify_order_url ? (
+                        <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.shopify_order_url} target="_blank" rel="noreferrer">
+                          {row.shopify_order_name || `#${row.shopify_order_id}`}
+                        </a>
+                      ) : row.shopify_order_name || row.shopify_order_id ? (
+                        <span className="font-mono text-sm">{row.shopify_order_name || `#${row.shopify_order_id}`}</span>
+                      ) : (
+                        <span className="text-muted-foreground">Not linked</span>
+                      )}
+                      {row.shopify_fulfillment_status ? <div className="text-xs text-muted-foreground">{row.shopify_fulfillment_status}</div> : null}
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-2">
@@ -6107,7 +6121,7 @@ function FulfilmentPendingPage({
             })}
             {!rows.length && (
               <TableRow>
-                <TableCell colSpan={10} className="py-8 text-center text-muted-foreground">
+                <TableCell colSpan={11} className="py-8 text-center text-muted-foreground">
                   No delivered Amazon orders are pending Odoo fulfilment.
                 </TableCell>
               </TableRow>
