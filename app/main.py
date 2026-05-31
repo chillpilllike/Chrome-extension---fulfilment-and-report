@@ -243,6 +243,11 @@ def fast_page_cache_set(key: tuple[Any, ...], value: Any, ttl_seconds: int = FAS
     return value
 
 
+def fast_page_cache_clear() -> None:
+    with _FAST_PAGE_CACHE_LOCK:
+        _FAST_PAGE_CACHE.clear()
+
+
 def _ensure_shopify_order_status_cache_table() -> None:
     with db() as conn:
         conn.execute(
@@ -285,6 +290,8 @@ _SHOPIFY_ORDER_STATUS_FORCE_SYNC_PROGRESS: dict[str, Any] = {
     "completed_at": "",
     "error": "",
 }
+_SHOPIFY_STATUS_REFRESH_LOCK = threading.Lock()
+_SHOPIFY_STATUS_REFRESH_IN_FLIGHT: set[tuple[int, str]] = set()
 _SHOPIFY_PRODUCT_REPAIR_LOCK = threading.Lock()
 _SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK = threading.Lock()
 _SHOPIFY_PRODUCT_REPAIR_CANCEL_EVENT = threading.Event()
@@ -9063,6 +9070,12 @@ def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int =
         data.pop("store_odoo_url", None)
         results.append(data)
     attach_shopify_status_to_rows(results)
+    if any(not clean_text(row.get("shopify_order_id")) for row in results):
+        unique_result_names = {clean_text(row.get("odoo_order_name")).upper() for row in results if clean_text(row.get("odoo_order_name"))}
+        wait_for_refresh = bool(search and len(unique_result_names) <= 5)
+        refresh_missing_shopify_status_for_rows(results, wait=wait_for_refresh)
+        if wait_for_refresh:
+            attach_shopify_status_to_rows(results)
     return results, total, page, per_page
 
 
@@ -12278,6 +12291,34 @@ def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], f
         return
     ensure_shopify_order_status_cache_table()
     now = datetime.now(timezone.utc)
+    mapped_targets: dict[str, list[dict[str, str]]] = {}
+    with db() as conn:
+        store_row = conn.execute("SELECT odoo_db FROM stores WHERE id=?", (store_id,)).fetchone()
+        odoo_db = clean_text((store_row or {}).get("odoo_db"))
+        if odoo_db:
+            source_keys = [f"{odoo_db}:{name}" for name in clean_names]
+            export_rows = conn.execute(
+                f"""
+                SELECT state_scope, dest_name, src_order_key, dest_order_id
+                FROM shopify_export_order_map
+                WHERE src_order_key IN ({",".join("?" for _ in source_keys)})
+                  AND COALESCE(dest_order_id, '') != ''
+                ORDER BY created_at DESC
+                """,
+                source_keys,
+            ).fetchall()
+            for row in export_rows:
+                source_key = clean_text(row.get("src_order_key"))
+                order_name = clean_text(source_key.split(":", 1)[-1]).upper()
+                if not order_name:
+                    continue
+                mapped_targets.setdefault(order_name, []).append(
+                    {
+                        "route": clean_text(row.get("state_scope")).lower(),
+                        "dest_name": clean_text(row.get("dest_name")),
+                        "order_id": clean_text(row.get("dest_order_id")),
+                    }
+                )
     if not force:
         with db() as conn:
             cached = conn.execute(
@@ -12311,6 +12352,16 @@ def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], f
         for shop in clients:
             for order_name in clean_names:
                 try:
+                    mapped = [
+                        target for target in mapped_targets.get(order_name, [])
+                        if target.get("route") == route and target.get("dest_name") == shop.name and target.get("order_id")
+                    ]
+                    if mapped:
+                        for target in mapped:
+                            mapped_order = shopify_order_by_id(shop, target["order_id"])
+                            if mapped_order:
+                                upsert_shopify_order_status(store_id, route, shop.name, shop.shop, order_name, mapped_order)
+                        continue
                     orders = shopify_orders_by_name(shop, order_name, limit=10)
                     active = [order for order in orders if not order.get("cancelled_at")]
                     chosen = next((order for order in active if shopify_order_is_fulfilled(order)), active[0] if active else (orders[0] if orders else None))
@@ -12359,8 +12410,55 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
         row["shopify_financial_status"] = clean_text((cached or {}).get("financial_status"))
         row["shopify_fulfillment_status"] = clean_text((cached or {}).get("fulfillment_status"))
         row["shopify_fulfillment_at"] = clean_text((cached or {}).get("fulfillment_at"))
+        row["shopify_cancelled_at"] = clean_text((cached or {}).get("cancelled_at"))
         row["shopify_synced_at"] = clean_text((cached or {}).get("synced_at"))
     return rows
+
+
+def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait: bool = False) -> int:
+    groups: dict[int, set[str]] = {}
+    for row in rows:
+        if clean_text(row.get("shopify_order_id")):
+            continue
+        store_id = parse_optional_int(row.get("store_id"))
+        order_name = clean_text(row.get("odoo_order_name")).upper()
+        if not store_id or not order_name:
+            continue
+        groups.setdefault(store_id, set()).add(order_name)
+    if not groups:
+        return 0
+    if wait:
+        for store_id, order_names in groups.items():
+            sync_shopify_status_for_order_names(store_id, sorted(order_names), force=True)
+        fast_page_cache_clear()
+        return sum(len(order_names) for order_names in groups.values())
+
+    queued_groups: dict[int, set[str]] = {}
+    queued_keys: set[tuple[int, str]] = set()
+    with _SHOPIFY_STATUS_REFRESH_LOCK:
+        for store_id, order_names in groups.items():
+            for order_name in order_names:
+                key = (store_id, order_name)
+                if key in _SHOPIFY_STATUS_REFRESH_IN_FLIGHT:
+                    continue
+                _SHOPIFY_STATUS_REFRESH_IN_FLIGHT.add(key)
+                queued_keys.add(key)
+                queued_groups.setdefault(store_id, set()).add(order_name)
+    if not queued_groups:
+        return 0
+
+    def worker() -> None:
+        try:
+            for store_id, order_names in queued_groups.items():
+                sync_shopify_status_for_order_names(store_id, sorted(order_names), force=True)
+            fast_page_cache_clear()
+        finally:
+            with _SHOPIFY_STATUS_REFRESH_LOCK:
+                for key in queued_keys:
+                    _SHOPIFY_STATUS_REFRESH_IN_FLIGHT.discard(key)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return sum(len(order_names) for order_names in queued_groups.values())
 
 
 def block_lines_with_fulfilled_shopify_orders(conn: Any, store_id: int, lines: list[dict[str, Any]], live_sync: bool = True) -> tuple[list[dict[str, Any]], int, list[str]]:

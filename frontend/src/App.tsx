@@ -216,6 +216,7 @@ type OrderLine = {
   shopify_financial_status?: string
   shopify_fulfillment_status?: string
   shopify_fulfillment_at?: string
+  shopify_cancelled_at?: string
   amazon_account_name: string
   order_engine: string
   tracking_status: string
@@ -6032,7 +6033,11 @@ function FulfilmentPendingPage({
                       ) : (
                         <span className="text-muted-foreground">Not linked</span>
                       )}
-                      {row.shopify_fulfillment_status ? <div className="text-xs text-muted-foreground">{row.shopify_fulfillment_status}</div> : null}
+                      {row.shopify_cancelled_at ? (
+                        <div className="text-xs font-medium text-destructive">Cancelled</div>
+                      ) : row.shopify_fulfillment_status ? (
+                        <div className="text-xs text-muted-foreground">{row.shopify_fulfillment_status}</div>
+                      ) : null}
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-2">
