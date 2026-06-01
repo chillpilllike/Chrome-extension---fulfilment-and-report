@@ -9015,6 +9015,14 @@ def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int =
           WHERE tracking_store.id=order_lines.store_id
             AND shopify_tracking_sync_log.odoo_order=order_lines.odoo_order_name
         )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM shopify_order_status_cache fulfilled_shopify_order
+          WHERE fulfilled_shopify_order.store_id=order_lines.store_id
+            AND UPPER(fulfilled_shopify_order.odoo_order_name)=UPPER(order_lines.odoo_order_name)
+            AND COALESCE(fulfilled_shopify_order.cancelled_at, '') = ''
+            AND UPPER(REPLACE(COALESCE(fulfilled_shopify_order.fulfillment_status, ''), ' ', '_')) IN ('FULFILLED', 'PARTIALLY_FULFILLED', 'PARTIAL')
+        )
         AND (
           ? IS NULL
           OR order_lines.odoo_order_name ILIKE ?
