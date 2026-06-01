@@ -161,6 +161,9 @@ PUBLIC_API_PATHS = {
     "/api/amazon-otp",
     "/api/epost/tracking",
 }
+PUBLIC_POST_API_PATHS = {
+    "/api/shopify/orders/status/sync",
+}
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
 _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
@@ -524,7 +527,7 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
         return await call_next(request)
     allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
     allow_public_frontend = request.method in {"GET", "HEAD"} and path in PUBLIC_FRONTEND_PATHS
-    allow_public_api = request.method in {"GET", "HEAD"} and path in PUBLIC_API_PATHS
+    allow_public_api = (request.method in {"GET", "HEAD"} and path in PUBLIC_API_PATHS) or (request.method == "POST" and path in PUBLIC_POST_API_PATHS)
     if token and not allow_public_frontend and not allow_public_api and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
         if not request_has_admin_access(request):
             return Response("Admin token required.", status_code=401)
@@ -12352,6 +12355,7 @@ def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], f
         for shop in clients:
             for order_name in clean_names:
                 try:
+                    candidates: list[dict[str, Any]] = []
                     mapped = [
                         target for target in mapped_targets.get(order_name, [])
                         if target.get("route") == route and target.get("dest_name") == shop.name and target.get("order_id")
@@ -12360,11 +12364,19 @@ def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], f
                         for target in mapped:
                             mapped_order = shopify_order_by_id(shop, target["order_id"])
                             if mapped_order:
-                                upsert_shopify_order_status(store_id, route, shop.name, shop.shop, order_name, mapped_order)
-                        continue
+                                candidates.append(mapped_order)
                     orders = shopify_orders_by_name(shop, order_name, limit=10)
-                    active = [order for order in orders if not order.get("cancelled_at")]
-                    chosen = next((order for order in active if shopify_order_is_fulfilled(order)), active[0] if active else (orders[0] if orders else None))
+                    candidates.extend(orders)
+                    deduped: list[dict[str, Any]] = []
+                    seen_order_ids: set[str] = set()
+                    for order in candidates:
+                        order_id = clean_text(order.get("id"))
+                        if not order_id or order_id in seen_order_ids:
+                            continue
+                        seen_order_ids.add(order_id)
+                        deduped.append(order)
+                    active = [order for order in deduped if not order.get("cancelled_at")]
+                    chosen = next((order for order in active if shopify_order_is_fulfilled(order)), active[0] if active else (deduped[0] if deduped else None))
                     if chosen:
                         upsert_shopify_order_status(store_id, route, shop.name, shop.shop, order_name, chosen)
                 except Exception:
@@ -12388,6 +12400,7 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
             WHERE store_id = ANY(?::int[])
               AND UPPER(odoo_order_name) = ANY(?::text[])
             ORDER BY store_id, UPPER(odoo_order_name),
+                     CASE WHEN COALESCE(cancelled_at, '') = '' THEN 0 ELSE 1 END,
                      CASE WHEN fulfillment_status ILIKE '%FULFILLED%' THEN 0 ELSE 1 END,
                      synced_at DESC
             """,
@@ -17186,7 +17199,17 @@ def api_shopify_orders_status_sync(payload: dict[str, Any]) -> dict[str, Any]:
     if not order_names:
         return {"ok": True, "synced": 0, "rows": []}
     order_names = sorted(set(order_names))[:100]
+    if bool(payload.get("background")):
+        force = bool(payload.get("force"))
+
+        def worker() -> None:
+            sync_shopify_status_for_order_names(store_id, order_names, force=force)
+            fast_page_cache_clear()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "queued": len(order_names), "synced": 0, "rows": []}
     sync_shopify_status_for_order_names(store_id, order_names, force=bool(payload.get("force")))
+    fast_page_cache_clear()
     with db() as conn:
         rows = conn.execute(
             f"""

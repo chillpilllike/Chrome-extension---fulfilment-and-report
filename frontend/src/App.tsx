@@ -5887,8 +5887,10 @@ function FulfilmentPendingPage({
   onRefresh: () => Promise<void>
 }) {
   const [loading, setLoading] = useState(false)
+  const [shopifyRecheckLoading, setShopifyRecheckLoading] = useState(false)
   const isLoading = loading || externalLoading
   const selectionAnchor = useRef<number | null>(null)
+  const selectedRows = rows.filter((row) => selected.includes(row.id))
   function rowPackages(row: FulfilmentPendingRow) {
     try {
       const parsed = JSON.parse(row.tracking_payload || "[]")
@@ -5930,6 +5932,28 @@ function FulfilmentPendingPage({
       message: copied ? `${label} copied to clipboard.` : `${label} could not be copied.`,
     })
   }
+  async function recheckSelectedShopifyOrders() {
+    const orderNames = Array.from(new Set(selectedRows.map((row) => row.odoo_order_name).filter(Boolean)))
+    if (!storeId || !orderNames.length) return
+    setShopifyRecheckLoading(true)
+    try {
+      const result = await api<{ ok: boolean; synced: number; queued?: number }>("/api/shopify/orders/status/sync", {
+        method: "POST",
+        body: JSON.stringify({ store_id: Number(storeId), order_names: orderNames, force: true, background: true }),
+      })
+      window.setTimeout(() => { onRefresh().catch(() => {}) }, 8000)
+      await onRefresh()
+      onResult({
+        ok: true,
+        title: "Shopify recheck queued",
+        message: `Force recheck queued for ${result.queued || orderNames.length} selected Odoo order${(result.queued || orderNames.length) === 1 ? "" : "s"}. The table will refresh again in a few seconds.`,
+      })
+    } catch (error) {
+      onResult({ ok: false, title: "Shopify recheck failed", message: String(error) })
+    } finally {
+      setShopifyRecheckLoading(false)
+    }
+  }
   async function refresh() {
     setLoading(true)
     try {
@@ -5969,7 +5993,13 @@ function FulfilmentPendingPage({
       ) : null}
       <div className="border-t px-6 py-3">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <ExportControls view="fulfilment_pending" storeId={storeId} columns={fulfilmentPendingExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ q: query.trim() }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <ExportControls view="fulfilment_pending" storeId={storeId} columns={fulfilmentPendingExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ q: query.trim() }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+            <Button variant="outline" onClick={recheckSelectedShopifyOrders} disabled={isLoading || shopifyRecheckLoading || !selectedRows.length || !storeId}>
+              <RefreshCw className={`size-4 ${shopifyRecheckLoading ? "animate-spin" : ""}`} />
+              Recheck Shopify
+            </Button>
+          </div>
           <PaginationControls page={page} total={total} onPage={onPage} disabled={isLoading} />
         </div>
       </div>
