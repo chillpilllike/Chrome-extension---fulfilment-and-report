@@ -253,18 +253,41 @@ def append_csv_row(path: str, row: dict):
 
 def tracking_matches(existing: str, desired: str) -> bool:
     # Compare existing and desired tracking strings in a forgiving way.
-    # Returns True if they look equivalent (ignoring whitespace/case) or desired is contained in existing.
-    if not desired:
+    # Returns True when every desired tracking code is already present in existing.
+    desired_parts = tracking_parts(desired)
+    if not desired_parts:
         return False
-    a = re.sub(r"\s+", "", (existing or "").lower())
-    b = re.sub(r"\s+", "", (desired or "").lower())
-    if not b:
+    existing_parts = tracking_parts(existing)
+    if not existing_parts:
         return False
-    if a == b:
-        return True
-    if b and a and b in a:
-        return True
-    return False
+    return all(part in existing_parts for part in desired_parts)
+
+
+def tracking_parts(value: str) -> list[str]:
+    parts: list[str] = []
+    for item in re.split(r"[,;\n]+", value or ""):
+        normalized = re.sub(r"\s+", "", item.strip().lower())
+        if normalized and normalized not in parts:
+            parts.append(normalized)
+    return parts
+
+
+def merge_tracking_text(existing: str, desired: str) -> str:
+    labels: dict[str, str] = {}
+    merged: list[str] = []
+    for item in re.split(r"[,;\n]+", existing or ""):
+        text = item.strip()
+        key = re.sub(r"\s+", "", text.lower())
+        if key and key not in labels:
+            labels[key] = text
+            merged.append(key)
+    for item in re.split(r"[,;\n]+", desired or ""):
+        text = item.strip()
+        key = re.sub(r"\s+", "", text.lower())
+        if key and key not in labels:
+            labels[key] = text
+            merged.append(key)
+    return ", ".join(labels[key] for key in merged)
 # ----------------------------
 # SQLite state (read-only support)
 # ----------------------------
@@ -811,28 +834,20 @@ class OdooClient:
 
     def sale_order_is_eligible(self, sale_id: int):
         """
-        Eligibility rule (STRICT):
+        Eligibility rule:
         - Must be confirmed (state in sale/done)
-        - Must be fully invoiced (invoice_status == invoiced)
-        - Must have at least one PAID customer invoice
+
+        Tracking is a fulfilment signal coming from Shopify. Do not block it
+        just because the Odoo invoice is not paid yet; otherwise already
+        dispatched Shopify orders can be left without tracking in Odoo.
 
         Returns: (eligible: bool, meta: dict, reason_code: str)
         """
         meta = self.read_sale_order_meta(sale_id)
         state = (meta.get("state") or "").lower()
-        invoice_status = (meta.get("invoice_status") or "").lower()
-        sale_name = meta.get("name") or ""
 
         if state not in ("sale", "done"):
             return False, meta, "ODOO_ORDER_NOT_CONFIRMED"
-
-        # invoice_status can be: no, to invoice, invoiced, upselling
-        if invoice_status != "invoiced":
-            return False, meta, "ODOO_ORDER_NOT_FULLY_INVOICED"
-
-        paid_ok = self._has_paid_invoice_for_sale_order(sale_name, meta.get("invoice_ids") or [])
-        if not paid_ok:
-            return False, meta, "ODOO_ORDER_INVOICE_NOT_PAID"
 
         return True, meta, ""
 
@@ -1332,10 +1347,12 @@ def main():
                     picking_states = []
                     picking_existing = []
                     update_needed_ids = []
+                    picking_existing_by_id = {}
                     for p in pickings:
                         pid = p.get("id")
                         stt = p.get("state")
                         existing = (p.get("carrier_tracking_ref") or "").strip()
+                        picking_existing_by_id[str(pid)] = existing
                         picking_states.append(f"{pid}:{stt}")
                         picking_existing.append(f"{pid}:{existing}")
 
@@ -1343,7 +1360,7 @@ def main():
                             continue
                         if stt == "done" and skip_done_pickings:
                             continue
-                        if existing and existing == tracking_text:
+                        if tracking_matches(existing, tracking_text):
                             continue
                         update_needed_ids.append(str(pid))
 
@@ -1416,7 +1433,8 @@ def main():
                     else:
                         for pid in update_needed_ids:
                             check_cancelled()
-                            ok = oc.write_picking_tracking(int(pid), tracking_text, carrier_id=carrier_id, append_note=note_append)
+                            merged_tracking_text = merge_tracking_text(picking_existing_by_id.get(str(pid), ""), tracking_text)
+                            ok = oc.write_picking_tracking(int(pid), merged_tracking_text, carrier_id=carrier_id, append_note=note_append)
                             if ok:
                                 updated_ids.append(pid)
                         if updated_ids:

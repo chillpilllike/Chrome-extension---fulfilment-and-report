@@ -5307,6 +5307,7 @@ function TrackingPage({
           <SelectField className="w-44" label="Filter" value={statusFilter} onChange={(value) => { setStatusFilter(value); onPage(1) }}>
             <option value="active">Active</option>
             <option value="recent">Recently checked</option>
+            <option value="not_delivered">Not delivered</option>
             <option value="delivered">Delivered</option>
             <option value="cancelled">Cancelled</option>
             <option value="all">All</option>
@@ -5319,7 +5320,7 @@ function TrackingPage({
       </CardHeader>
       <div className="border-t px-6 py-3">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <ExportControls view="tracking" storeId={storeId} columns={trackingExportColumns} selectedIds={selected} selectAll={selectAll} total={localTotal} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+          <ExportControls view="tracking" storeId={storeId} columns={trackingExportColumns} selectedIds={selected} selectAll={selectAll} total={localTotal} filters={{ status: statusFilter, q: queryText.trim() }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
           <PaginationControls page={page} total={localTotal} onPage={onPage} disabled={loading} />
         </div>
       </div>
@@ -6097,7 +6098,7 @@ function FulfilmentPendingPage({
                         {!amazonProducts.length ? <span className="text-muted-foreground">No ASIN captured</span> : null}
                       </div>
                     </TableCell>
-                    <TableCell className="max-w-[320px]">
+                    <TableCell className="min-w-[260px] max-w-[420px]">
                       {packages.length ? (
                         <div className="grid gap-1 text-sm">
                           {packages.map((pkg: any, index: number) => {
@@ -6106,8 +6107,8 @@ function FulfilmentPendingPage({
                             const latestMessage = [latest.date, latest.time, latest.message].filter(Boolean).join(" ")
                             return (
                               <div key={`${row.id}-${trackingId || index}`} className="grid gap-0.5">
-                                <div className="flex min-w-0 items-center gap-2">
-                                  <a className="min-w-0 truncate font-mono text-primary underline-offset-4 hover:underline" href={pkg.tracking_url || row.amazon_order_url} target="_blank">
+                                <div className="flex min-w-0 items-start gap-2">
+                                  <a className="break-all font-mono text-primary underline-offset-4 hover:underline" href={pkg.tracking_url || row.amazon_order_url} target="_blank">
                                     {trackingId || "Amazon tracking page"}
                                   </a>
                                   {trackingId ? (
@@ -6116,8 +6117,8 @@ function FulfilmentPendingPage({
                                     </Button>
                                   ) : null}
                                 </div>
-                                <span className="truncate text-xs text-muted-foreground">{pkg.carrier || "Amazon shipment"}</span>
-                                {latestMessage ? <span className="truncate text-xs text-muted-foreground">{latestMessage}</span> : null}
+                                <span className="break-words text-xs text-muted-foreground">{pkg.carrier || "Amazon shipment"}</span>
+                                {latestMessage ? <span className="break-words text-xs text-muted-foreground">{latestMessage}</span> : null}
                               </div>
                             )
                           })}

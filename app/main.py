@@ -8382,6 +8382,8 @@ def tracking_status_from_packages(packages: list[dict[str, Any]]) -> str:
     if all("delivered" in text for text in package_texts):
         return "Delivered"
     text = " ".join(package_texts)
+    if "delivery date currently unavailable" in text or "delivery date unavailable" in text:
+        return "Delivery unavailable"
     if "out for delivery" in text:
         return "Out for delivery"
     if "shipped" in text or "carrier" in text or "transit" in text:
@@ -8863,6 +8865,24 @@ def tracking_filter_sql(status: str) -> tuple[str, str]:
             """,
             "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC",
         )
+    if status in {"not_delivered", "undelivered", "delivery_unavailable"}:
+        return (
+            """
+            COALESCE(amazon_order_id, '') != ''
+            AND COALESCE(amazon_cancelled_at, '') = ''
+            AND NOT (
+                state = 'delivered'
+                OR tracking_status = 'Delivered'
+                OR LOWER(COALESCE(tracking_status, '')) = 'delivered'
+                OR LOWER(COALESCE(tracking_payload, '')) LIKE '%delivered%'
+                OR LOWER(COALESCE(tracking_payload, '')) LIKE '%"status": "delivered"%'
+                OR LOWER(COALESCE(tracking_payload, '')) LIKE '%"status":"delivered"%'
+                OR LOWER(COALESCE(tracking_payload, '')) LIKE '%"order_status": "delivered"%'
+                OR LOWER(COALESCE(tracking_payload, '')) LIKE '%"order_status":"delivered"%'
+            )
+            """,
+            "tracking_checked_at DESC NULLS LAST, ordered_at DESC, updated_at DESC",
+        )
     if status in {"recent", "checked"}:
         return "COALESCE(amazon_order_id, '') != '' AND COALESCE(tracking_checked_at, '') != ''", "tracking_checked_at DESC, ordered_at DESC, updated_at DESC"
     if status == "all":
@@ -8904,7 +8924,7 @@ def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active"
                   MAX(NULLIF(ordered_at, '')) DESC,
                   MAX(NULLIF(updated_at, '')) DESC
         """
-        if clean_text(status).lower() not in {"cancelled", "delivered", "recent", "checked", "all"}
+        if clean_text(status).lower() not in {"cancelled", "delivered", "not_delivered", "undelivered", "delivery_unavailable", "recent", "checked", "all"}
         else
         """
                   CASE WHEN MAX(NULLIF(tracking_checked_at, '')) IS NULL THEN 1 ELSE 0 END,
@@ -9923,7 +9943,9 @@ def export_queryset(view: str, store_id: Optional[int], selected_ids: list[Union
         data = duplicate_tracking_rows(store_id, clean_text(str(filters.get("q") or "")))
     elif view == "tracking":
         grouped: dict[str, dict[str, Any]] = {}
-        for row in tracking_rows(store_id):
+        status = clean_text(str(filters.get("status") or "active"))
+        query_text = clean_text(str(filters.get("q") or ""))
+        for row in tracking_rows(store_id, status, query_text):
             order_id = str(row.get("amazon_order_id") or "")
             if not order_id:
                 continue
