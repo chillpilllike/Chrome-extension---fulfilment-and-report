@@ -1256,6 +1256,10 @@ def init_db() -> None:
         try:
             conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
             for index_sql in (
+                "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_scan_code ON amazon_dispatch_packages USING gin (UPPER(scan_code) gin_trgm_ops)",
+                "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_canonical ON amazon_dispatch_packages USING gin (UPPER(canonical_scan_code) gin_trgm_ops)",
+                "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_display ON amazon_dispatch_packages USING gin (UPPER(display_code) gin_trgm_ops)",
+                "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_tracking_url ON amazon_dispatch_packages USING gin (UPPER(tracking_url) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_scan_events_trgm_scan_query ON amazon_dispatch_scan_events USING gin (UPPER(scan_query) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_scan_events_trgm_normalized ON amazon_dispatch_scan_events USING gin (UPPER(normalized_query) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_scan_events_trgm_amazon ON amazon_dispatch_scan_events USING gin (UPPER(amazon_order_id) gin_trgm_ops)",
@@ -4354,6 +4358,16 @@ def dispatch_enrich_package_for_scan(conn: Any, row: dict[str, Any]) -> dict[str
     package["suggested_tote"] = dispatch_tote_code_for_rack(package, rack_key)
     package["rack_key"] = dispatch_rack_key_for_package(package)
     package["rack_label"] = dispatch_rack_label_for_package(package)
+    return package
+
+
+def dispatch_ambiguous_match_payload(row: dict[str, Any]) -> dict[str, Any]:
+    package = dispatch_package_payload(None, row, include_related=False)
+    package["order_ready"] = False
+    package["all_parts_received"] = False
+    package["suggested_tote"] = dispatch_tote_code_for_rack(package, "later")
+    package["rack_key"] = "later"
+    package["rack_label"] = "Select exact package"
     return package
 
 
@@ -22540,7 +22554,7 @@ def api_dispatch_sorting_scan(payload: DispatchScanPayload) -> dict[str, Any]:
                     "matched": False,
                     "ambiguous": True,
                     "scan_code": scan_code,
-                    "matches": [dispatch_package_payload(conn, match, include_related=False) for match in fragment_matches],
+                    "matches": [dispatch_ambiguous_match_payload(match) for match in fragment_matches],
                     "suggested_tote": "",
                     "message": message,
                 }

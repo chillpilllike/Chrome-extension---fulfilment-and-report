@@ -5556,6 +5556,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   const [rebuildProgress, setRebuildProgress] = useState<DispatchRebuildProgress | null>(null)
   const [lastMessage, setLastMessage] = useState("")
   const [searchConfirmation, setSearchConfirmation] = useState("")
+  const [scanEventNotice, setScanEventNotice] = useState("")
   const [rackDialog, setRackDialog] = useState<"" | "today" | "tomorrow" | "later" | "exception">("")
   const [scanEventPage, setScanEventPage] = useState(1)
   const [scanEventJumpPage, setScanEventJumpPage] = useState("1")
@@ -5575,6 +5576,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   const scannerControlsRef = useRef<IScannerControls | null>(null)
   const scannerReaderRef = useRef<BrowserMultiFormatReader | null>(null)
   const scannerLastCodeRef = useRef("")
+  const scanResultRef = useRef<HTMLDivElement | null>(null)
 
   async function refreshSummary() {
     const query = new URLSearchParams()
@@ -5637,6 +5639,11 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
     scanInputRef.current?.focus()
   }, [matchedPackage])
 
+  useEffect(() => {
+    if (!searchConfirmation && !lastMessage && !scanMatches.length && !matchedPackage) return
+    window.setTimeout(() => scanResultRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 50)
+  }, [searchConfirmation, lastMessage, scanMatches.length, matchedPackage?.id])
+
   async function submitScan(rawCode: string) {
     const code = rawCode.trim()
     if (!code) return
@@ -5692,7 +5699,12 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
         void refreshSummary().catch((error) => onResult({ ok: false, title: "Dispatch Summary Failed", message: String(error) }))
       }
     } catch (error) {
-      onResult({ ok: false, title: "Scan Failed", message: String(error) })
+      const message = `Scan failed for ${code}: ${String(error)}`
+      setMatchedPackage(null)
+      setScanMatches([])
+      setLastMessage(message)
+      setSearchConfirmation(message)
+      onResult({ ok: false, title: "Scan Failed", message })
     } finally {
       setBusy(false)
     }
@@ -5832,6 +5844,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               scannerControlsRef.current?.stop()
               scannerControlsRef.current = null
               setScannerOpen(false)
+              setSearchConfirmation(`Scanned ${text}. Checking package...`)
               void submitScan(text)
             }
           },
@@ -5970,6 +5983,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   }
   const submitScanEventSearch = () => {
     const nextQuery = scanEventQueryDraft.trim()
+    setScanEventNotice(nextQuery ? `Searching scan log for "${nextQuery}"...` : "Showing all scan log events.")
     if (nextQuery === scanEventQuery) {
       if (scanEventPage !== 1) setScanEventPage(1)
       return
@@ -5980,6 +5994,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   }
   const clearScanEventSearch = () => {
     setScanEventQueryDraft("")
+    setScanEventNotice("")
     if (scanEventQuery) {
       setScanEventQuery("")
       setScanEventPage(1)
@@ -6114,18 +6129,61 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               {busy ? "Scanning..." : "Scan"}
             </Button>
           </form>
-          {searchConfirmation ? (
-            <div className={cn(
-              "rounded border-2 px-4 py-3 text-sm font-semibold",
-              matchedPackage
-                ? "border-emerald-200 bg-emerald-50 text-emerald-900"
-                : scanMatches.length
-                  ? "border-orange-200 bg-orange-50 text-orange-900"
-                  : "border-red-200 bg-red-50 text-red-900",
-            )}>
-              {dispatchDisplayText(searchConfirmation)}
-            </div>
-          ) : null}
+          <div ref={scanResultRef} className="grid gap-3">
+            {searchConfirmation ? (
+              <div
+                role="status"
+                aria-live="polite"
+                className={cn(
+                  "rounded border-2 px-4 py-4 text-base font-semibold shadow-sm",
+                  matchedPackage
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                    : scanMatches.length
+                      ? "border-orange-300 bg-orange-50 text-orange-950"
+                      : "border-red-200 bg-red-50 text-red-900",
+                )}
+              >
+                {dispatchDisplayText(searchConfirmation)}
+              </div>
+            ) : null}
+
+            {lastMessage && (
+              <Alert variant={matchedPackage || scanMatches.length ? "default" : "destructive"}>
+                <AlertCircle className="size-4" />
+                <AlertTitle>{matchedPackage ? "Matched" : scanMatches.length ? `${scanMatches.length} matching packages found` : "Exception"}</AlertTitle>
+                <AlertDescription>{dispatchDisplayText(lastMessage)}</AlertDescription>
+              </Alert>
+            )}
+
+            {scanMatches.length ? (
+              <div className="overflow-hidden rounded border-2 border-orange-200 bg-white shadow-sm">
+                <div className="border-b bg-orange-50 px-4 py-3">
+                  <div className="font-semibold text-orange-950">{scanMatches.length} matching package{scanMatches.length === 1 ? "" : "s"} found</div>
+                  <div className="text-xs text-orange-900">Choose the exact package below. Nothing has been marked received yet.</div>
+                </div>
+                <div className="divide-y">
+                  {scanMatches.map((pkg) => (
+                    <div key={`${pkg.id}-${pkg.scan_code}`} className="grid gap-3 px-4 py-3 text-sm md:grid-cols-[1fr_auto] md:items-center">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-semibold">{pkg.odoo_order_name || pkg.amazon_order_id}</span>
+                          <Badge variant="outline">{pkg.destination_zone || "ROW"}</Badge>
+                          <Badge variant={pkg.priority === "U" ? "destructive" : "outline"}>{pkg.priority === "U" ? "Urgent" : "Normal"}</Badge>
+                          <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready" : "Hold"}</Badge>
+                        </div>
+                        <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
+                        <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
+                        <div className="mt-1 text-xs text-muted-foreground">Package {pkg.package_index || 1} · {pkg.package_status || pkg.promise || "Amazon package"}</div>
+                      </div>
+                      <Button type="button" variant="outline" onClick={() => submitScan(pkg.scan_code || pkg.display_code)}>
+                        Select
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
           <div className="rounded border bg-white p-4">
             <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px_auto_auto] lg:items-end">
               <div>
@@ -6179,43 +6237,6 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               </div>
             ) : null}
           </div>
-          {lastMessage && (
-            <Alert variant={matchedPackage || scanMatches.length ? "default" : "destructive"}>
-              <AlertCircle className="size-4" />
-              <AlertTitle>{matchedPackage ? "Matched" : scanMatches.length ? "Select matching package" : "Exception"}</AlertTitle>
-              <AlertDescription>{dispatchDisplayText(lastMessage)}</AlertDescription>
-            </Alert>
-          )}
-
-          {scanMatches.length ? (
-            <div className="rounded border bg-white">
-              <div className="border-b px-4 py-3">
-                <div className="font-medium">Matching packages</div>
-                <div className="text-xs text-muted-foreground">Choose the exact package, then place it in the suggested tote.</div>
-              </div>
-              <div className="divide-y">
-                {scanMatches.map((pkg) => (
-                  <div key={`${pkg.id}-${pkg.scan_code}`} className="grid gap-3 px-4 py-3 text-sm md:grid-cols-[1fr_auto] md:items-center">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-semibold">{pkg.odoo_order_name || pkg.amazon_order_id}</span>
-                        <Badge variant="outline">{pkg.destination_zone || "ROW"}</Badge>
-                        <Badge variant={pkg.priority === "U" ? "destructive" : "outline"}>{pkg.priority === "U" ? "Urgent" : "Normal"}</Badge>
-                        <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready" : "Hold"}</Badge>
-                      </div>
-                      <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
-                      <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
-                      <div className="mt-1 text-xs text-muted-foreground">Package {pkg.package_index || 1} · {pkg.package_status || pkg.promise || "Amazon package"}</div>
-                    </div>
-                    <Button type="button" variant="outline" onClick={() => submitScan(pkg.scan_code || pkg.display_code)}>
-                      Select
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
-
           {matchedPackage ? (
             <div className={cn("rounded border-2 p-4", allRecipientPartsReceived ? "border-emerald-200 bg-emerald-50/70" : "border-red-200 bg-red-50/70")}>
               <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_260px] xl:items-start">
@@ -6651,6 +6672,11 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
           </div>
         </div>
         <div className="divide-y">
+          {scanEventNotice ? (
+            <div className="bg-blue-50 px-4 py-2 text-sm font-medium text-blue-900">
+              {scanEventNotice} {scanEventQuery ? `${scanEventsTotal.toLocaleString()} result${scanEventsTotal === 1 ? "" : "s"} found.` : ""}
+            </div>
+          ) : null}
           {summary.scan_events?.length ? summary.scan_events.map((event) => {
             const status = String(event.result_status || "")
             const isException = status === "not_found"
