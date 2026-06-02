@@ -6704,7 +6704,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
             <div className="font-medium">Scan/search log</div>
             <div className="text-xs text-muted-foreground">Saved scan attempts, partial searches, multiple matches, and exceptions for supervisor review.</div>
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
+          <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
             <Input
               value={scanEventQueryDraft}
               onChange={(event) => setScanEventQueryDraft(event.target.value)}
@@ -6712,7 +6712,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                 if (event.key === "Enter") submitScanEventSearch()
               }}
               placeholder="Filter saved scan log only"
-              className="h-9 w-56"
+              className="h-9 w-full sm:w-56"
             />
             <Button type="button" variant="outline" size="sm" onClick={submitScanEventSearch}>
               Filter log
@@ -6742,20 +6742,27 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
             return (
               <div
                 key={event.id}
-                style={{ display: "flex", alignItems: "flex-start" }}
                 className={cn(
-                  "flex gap-3 px-4 py-3 text-sm",
+                  "grid grid-cols-[76px_minmax(0,1fr)] gap-3 px-4 py-3 text-sm md:flex md:items-start",
                   isResolved ? "bg-slate-50" : isException ? "bg-red-50/70" : isMultiple ? "bg-orange-50/70" : "",
                 )}
               >
                 <DispatchProductThumbs images={dispatchProductImagesFrom(event)} onPreview={setImagePreview} size="sm" />
-                <div className="grid min-w-0 flex-1 gap-2 lg:grid-cols-[160px_minmax(0,1fr)] lg:items-center">
-                  <div className="font-mono text-xs font-semibold">{event.scan_query || event.normalized_query}</div>
-                  <div className="min-w-0">
-                    <div className={cn("font-medium", isException ? "text-red-800" : isMultiple ? "text-orange-800" : "text-emerald-800")}>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0 font-mono text-sm font-semibold break-all md:text-xs">{event.scan_query || event.normalized_query}</div>
+                    <div className="flex shrink-0 flex-wrap items-center gap-2">
+                      <Badge variant={isResolved ? "outline" : isException ? "destructive" : isMultiple ? "outline" : "secondary"}>
+                        {isResolved ? "Resolved" : isException ? "Exception" : isMultiple ? "Multiple" : "Matched"}
+                      </Badge>
+                      <span className="text-xs text-muted-foreground">{formatDateTime(event.created_at)}</span>
+                    </div>
+                  </div>
+                  <div className="mt-2 min-w-0">
+                    <div className={cn("text-sm font-medium leading-snug break-words", isException ? "text-red-800" : isMultiple ? "text-orange-800" : "text-emerald-800")}>
                       {dispatchScanMainText(event.message || `${Number(event.result_count || 0)} result(s) found.`)}
                     </div>
-                    <div className="mt-1 truncate text-xs text-muted-foreground">
+                    <div className="mt-1 text-xs text-muted-foreground md:truncate">
                       Order ref: {event.odoo_order_name || "Unknown"}
                       {" · "}
                       Amazon order: {event.amazon_order_id || "Unknown"}
@@ -6781,17 +6788,11 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                       </div>
                     ) : null}
                   </div>
-                </div>
-                <div className="ml-auto flex shrink-0 flex-wrap justify-start gap-2 md:justify-end">
-                  <Badge variant={isResolved ? "outline" : isException ? "destructive" : isMultiple ? "outline" : "secondary"}>
-                    {isResolved ? "Resolved" : isException ? "Exception" : isMultiple ? "Multiple" : "Matched"}
-                  </Badge>
                   {!isResolved && (isException || isMultiple) ? (
-                    <Button type="button" variant="outline" size="sm" onClick={() => resolveScanEvent(event.id)}>
+                    <Button type="button" variant="outline" size="sm" className="mt-2" onClick={() => resolveScanEvent(event.id)}>
                       Mark resolved
                     </Button>
                   ) : null}
-                  <span className="text-xs text-muted-foreground">{formatDateTime(event.created_at)}</span>
                 </div>
               </div>
             )
