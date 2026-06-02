@@ -3,11 +3,16 @@ const adminToken = document.querySelector("#adminToken");
 const headlessTrackingMode = document.querySelector("#headlessTrackingMode");
 const autoTrackingEnabled = document.querySelector("#autoTrackingEnabled");
 const autoTrackingHours = document.querySelector("#autoTrackingHours");
+const trackAllStartPage = document.querySelector("#trackAllStartPage");
+const trackAllMaxPages = document.querySelector("#trackAllMaxPages");
 const modeNotice = document.querySelector("#modeNotice");
 const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
 const startButton = document.querySelector("#start");
 const stopButton = document.querySelector("#stop");
+const trackAllButton = document.querySelector("#trackAll");
+const resumeTrackAllButton = document.querySelector("#resumeTrackAll");
+const stopTrackAllButton = document.querySelector("#stopTrackAll");
 
 let targetWindowId = null;
 let settingsDirty = false;
@@ -15,7 +20,7 @@ let settingsHydrated = false;
 let statusFadeTimer = null;
 let statusHoldUntil = 0;
 
-const settingsInputs = [apiBase, adminToken, headlessTrackingMode, autoTrackingEnabled, autoTrackingHours];
+const settingsInputs = [apiBase, adminToken, headlessTrackingMode, autoTrackingEnabled, autoTrackingHours, trackAllStartPage, trackAllMaxPages];
 
 settingsInputs.forEach((input) => {
   input.addEventListener("input", () => {
@@ -34,6 +39,8 @@ function syncSettingsInputs(state) {
   headlessTrackingMode.checked = state.headlessTrackingMode === true;
   autoTrackingEnabled.checked = state.autoTrackingEnabled === true;
   autoTrackingHours.value = state.autoTrackingHours ?? 3;
+  trackAllStartPage.value = state.trackAllStartPage ?? 1;
+  trackAllMaxPages.value = state.trackAllMaxPages ?? 202;
   updateModeNotice();
   settingsHydrated = true;
 }
@@ -61,9 +68,20 @@ function setStatus(text, kind = "info", options = {}) {
   }
 }
 
-function setRunButtons(running) {
+function canResumeTrackAll(tracking = {}) {
+  if (tracking.source !== "history" || tracking.running) return false;
+  const hasCurrent = Boolean(tracking.currentOrder?.amazon_order_id);
+  const hasQueue = Array.isArray(tracking.queue) && tracking.queue.length > 0;
+  const hasMorePages = Boolean(tracking.nextUrl) && Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0);
+  return hasCurrent || hasQueue || hasMorePages;
+}
+
+function setRunButtons(running, trackAllRunning = false, trackAllResumable = false) {
   startButton.hidden = Boolean(running);
   stopButton.hidden = !running;
+  trackAllButton.hidden = Boolean(running);
+  resumeTrackAllButton.hidden = Boolean(running) || !trackAllResumable;
+  stopTrackAllButton.hidden = !trackAllRunning;
 }
 
 function applyStatusFromRefresh(text) {
@@ -109,6 +127,14 @@ function progressText(progress = {}) {
 }
 
 function visibleProgressText(tracking = {}) {
+  if (tracking.source === "history") {
+    const queue = tracking.queue?.length || 0;
+    const completed = tracking.completedOrderIds?.length || 0;
+    const failed = tracking.failedOrderIds?.length || 0;
+    const page = tracking.currentPage ? ` · page ${tracking.currentPage}` : "";
+    const current = tracking.currentOrder?.amazon_order_id ? ` · current ${tracking.currentOrder.amazon_order_id}` : "";
+    return `Track all running${page}${current} · queue ${queue} · checked ${completed} · failed ${failed}`;
+  }
   const total = tracking.orders?.length || 0;
   const index = Math.max(0, Number(tracking.index || 0));
   const processed = Math.min(index, total);
@@ -121,6 +147,16 @@ function visibleProgressText(tracking = {}) {
   return `Running: ${processed}/${total}${currentText}${extra}`;
 }
 
+function stoppedTrackAllText(tracking = {}) {
+  const queue = tracking.queue?.length || 0;
+  const completed = tracking.completedOrderIds?.length || 0;
+  const failed = tracking.failedOrderIds?.length || 0;
+  const page = tracking.currentPage || tracking.startPage || 1;
+  const nextPage = tracking.nextUrl && Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0) ? ` · next page ${Number(page) + 1}` : "";
+  const current = tracking.currentOrder?.amazon_order_id ? ` · current ${tracking.currentOrder.amazon_order_id}` : "";
+  return `Stopped · Track all can resume from page ${page}${nextPage}${current} · queue ${queue} · checked ${completed} · failed ${failed}`;
+}
+
 function settingsPayload() {
   return {
     type: "SET_API_BASE",
@@ -129,6 +165,8 @@ function settingsPayload() {
     headlessTrackingMode: headlessTrackingMode.checked,
     autoTrackingEnabled: autoTrackingEnabled.checked,
     autoTrackingHours: Number(autoTrackingHours.value || 3),
+    trackAllStartPage: Number(trackAllStartPage.value || 1),
+    trackAllMaxPages: Number(trackAllMaxPages.value || 202),
   };
 }
 
@@ -137,19 +175,21 @@ async function refresh() {
   const state = await send({ type: "GET_STATE" });
   syncSettingsInputs(state);
   const tracking = state.tracking || {};
+  const trackAllRunning = tracking.running === true && tracking.source === "history";
+  const trackAllResumable = canResumeTrackAll(tracking);
   if (headlessTrackingMode.checked) {
     try {
       const headless = await send({ type: "GET_HEADLESS_TRACKING_STATUS" });
-      const running = headlessRunning(headless.progress || {});
-      setRunButtons(running);
-      applyStatusFromRefresh(progressText(headless.progress || {}));
+      const running = trackAllRunning || headlessRunning(headless.progress || {});
+      setRunButtons(running, trackAllRunning, trackAllResumable);
+      applyStatusFromRefresh(trackAllRunning ? visibleProgressText(tracking) : trackAllResumable ? stoppedTrackAllText(tracking) : progressText(headless.progress || {}));
     } catch (error) {
-      setRunButtons(false);
-      applyStatusFromRefresh(error.message || "Could not load headless tracking status.");
+      setRunButtons(trackAllRunning, trackAllRunning, trackAllResumable);
+      applyStatusFromRefresh(trackAllResumable ? stoppedTrackAllText(tracking) : error.message || "Could not load headless tracking status.");
     }
   } else {
-    setRunButtons(tracking.running);
-    applyStatusFromRefresh(tracking.running ? visibleProgressText(tracking) : "Stopped");
+    setRunButtons(tracking.running, trackAllRunning, trackAllResumable);
+    applyStatusFromRefresh(tracking.running ? visibleProgressText(tracking) : trackAllResumable ? stoppedTrackAllText(tracking) : "Stopped");
   }
   logsBox.innerHTML = "";
   for (const line of state.logs || []) {
@@ -199,13 +239,39 @@ document.querySelector("#start").addEventListener("click", async () => {
   setResultStatus(result, "Started.", "Could not start.");
 });
 
+document.querySelector("#trackAll").addEventListener("click", async () => {
+  await send(settingsPayload());
+  settingsDirty = false;
+  const result = await send({
+    type: "START_TRACK_ALL",
+    startPage: Number(trackAllStartPage.value || 1),
+    maxPages: Number(trackAllMaxPages.value || 202),
+  });
+  if (result.ok !== false) setRunButtons(true, true, false);
+  setResultStatus(result, "Track all started.", "Could not start Track all.");
+});
+
+document.querySelector("#resumeTrackAll").addEventListener("click", async () => {
+  const result = await send({ type: "RESUME_TRACK_ALL" });
+  if (result.ok !== false) setRunButtons(true, true, false);
+  setResultStatus(result, "Track all resumed.", "Could not resume Track all.");
+});
+
+document.querySelector("#stopTrackAll").addEventListener("click", async () => {
+  const result = await send({ type: "STOP_TRACKING" });
+  if (result.ok !== false) setRunButtons(false, false, true);
+  setResultStatus(result, "Track all stopped.", "Could not stop Track all.");
+});
+
 document.querySelector("#stop").addEventListener("click", async () => {
-  const result = await send({ type: headlessTrackingMode.checked ? "STOP_HEADLESS_TRACKING" : "STOP_TRACKING" });
+  const state = await send({ type: "GET_STATE" });
+  const isTrackAll = state?.tracking?.running && state.tracking.source === "history";
+  const result = await send({ type: headlessTrackingMode.checked && !isTrackAll ? "STOP_HEADLESS_TRACKING" : "STOP_TRACKING" });
   if (result.ok !== false) setRunButtons(false);
   setResultStatus(result, "Stopped.", "Could not stop.");
 });
 
 updateModeNotice();
-setRunButtons(false);
+setRunButtons(false, false, false);
 refresh();
 setInterval(refresh, 3000);

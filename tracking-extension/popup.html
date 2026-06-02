@@ -28,6 +28,24 @@
         Auto check every hours
         <input id="autoTrackingHours" type="number" min="1" max="168" step="1">
       </label>
+      <section class="track-all-panel">
+        <h2>Track all from Amazon order history</h2>
+        <div class="track-all-grid">
+          <label>
+            Start from page
+            <input id="trackAllStartPage" type="number" min="1" max="999" step="1">
+          </label>
+          <label>
+            Pages to scan
+            <input id="trackAllMaxPages" type="number" min="1" max="999" step="1">
+          </label>
+        </div>
+        <div class="actions">
+          <button id="trackAll" class="warning">Track all</button>
+          <button id="resumeTrackAll" class="secondary">Resume Track all</button>
+          <button id="stopTrackAll" class="danger">Stop Track all</button>
+        </div>
+      </section>
       <section id="modeNotice" class="mode-notice"></section>
       <div class="actions">
         <button id="save">Save</button>

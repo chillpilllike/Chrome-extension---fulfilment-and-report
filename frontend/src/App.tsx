@@ -84,7 +84,7 @@ const KNOWN_APP_PAGES = new Set([
   "cancelled-orders",
   "settings",
 ])
-const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "amazon-otp", "epost"])
+const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "dispatch-sorting", "amazon-otp", "epost"])
 
 function appPageFromLocation() {
   if (typeof window === "undefined") return "home"
@@ -303,6 +303,7 @@ type DispatchPackage = {
   amazon_order_id: string
   amazon_order_url?: string
   odoo_order_name: string
+  recipient_ref?: string
   package_index: number
   package_status: string
   promise: string
@@ -319,12 +320,39 @@ type DispatchPackage = {
   fulfilment_type: string
   tote_code: string
   suggested_tote: string
+  rack_key?: string
+  rack_label?: string
   scan_status: string
   received_at: string
   placed_at: string
   last_scanned_at: string
   scan_count: number
   order_ready: boolean
+  all_parts_received?: boolean
+  guidance_loading?: boolean
+  related_parts?: Array<{
+    id: number
+    display_code: string
+    amazon_order_id: string
+    odoo_order_name: string
+    recipient_ref?: string
+    package_index: number
+    package_status: string
+    promise: string
+    delivery_label?: string
+    scan_label?: string
+    products?: Array<{ asin?: string; title?: string; image_url?: string; url?: string }>
+    products_json?: string
+    asins?: string[]
+    asins_json?: string
+    scan_status: string
+    tote_code: string
+    suggested_tote?: string
+    rack_key?: string
+    rack_label?: string
+    received?: boolean
+    scan_count?: number
+  }>
   remaining_packages: Array<{
     id: number
     display_code: string
@@ -336,11 +364,51 @@ type DispatchPackage = {
     last_scanned_at: string
     placed_at: string
   }>
+  order_packages?: Array<{
+    id: number
+    display_code: string
+    package_index: number
+    package_status: string
+    promise: string
+    scan_status: string
+    tote_code: string
+    last_scanned_at: string
+    placed_at: string
+    scan_count?: number
+  }>
 }
 
 type DispatchSortingSummary = {
   summary: Record<string, number>
   totes: Array<{ tote_code: string; count: number; updated_at: string }>
+  scan_events?: Array<{
+    id: number
+    scan_query: string
+    normalized_query: string
+    result_status: string
+    result_count: number
+    package_id?: number
+    amazon_order_id?: string
+    odoo_order_name?: string
+    display_code?: string
+    suggested_tote?: string
+    products_json?: string
+    asins_json?: string
+    related_parts?: DispatchPackage["related_parts"]
+    message: string
+    store_id?: number
+    resolved_at?: string
+    resolved_by?: string
+    resolved_note?: string
+    created_at: string
+  }>
+  scan_events_page?: number
+  scan_events_per_page?: number
+  scan_events_total?: number
+  rack_snapshot?: {
+    summary: Record<string, number>
+    items: Record<string, DispatchPackage[]>
+  }
   recent: Array<{
     id: number
     display_code: string
@@ -351,8 +419,28 @@ type DispatchSortingSummary = {
     scan_status: string
     last_scanned_at: string
     placed_at: string
+    scan_count?: number
     package_status: string
+    products_json?: string
+    asins_json?: string
   }>
+}
+
+type DispatchRebuildProgress = {
+  status: string
+  total: number
+  processed: number
+  packages: number
+  failed?: number
+  workers?: number
+  db_writers?: number
+  submitted?: number
+  in_flight?: number
+  current_order: string
+  message: string
+  started_at?: string | null
+  completed_at?: string | null
+  error?: string
 }
 
 type PaymentFailure = {
@@ -909,6 +997,12 @@ type ShopifyFulfilmentJob = {
   shopify_dest_name?: string
   shopify_order_id?: string
   shopify_order_url?: string
+  shopify_fulfillment_status?: string
+  shopify_financial_status?: string
+  shopify_cancelled_at?: string
+  shopify_status_synced_at?: string
+  needs_attention?: boolean
+  attention_reason?: string
   last_error: string
   created_at: string
   locked_at?: string
@@ -1398,7 +1492,7 @@ function formatDateTime(value?: string) {
   const date = new Date(hasTime && !hasTimezone ? `${normalized}Z` : normalized)
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString(undefined, {
-    timeZone: "Asia/Kolkata",
+    timeZone: "America/New_York",
     year: "numeric",
     month: "short",
     day: "2-digit",
@@ -1425,6 +1519,162 @@ function formatCount(value?: number | null) {
 
 function progressWidth(value?: number | null) {
   return `${Math.max(0, Math.min(100, Number(value || 0)))}%`
+}
+
+function dispatchDayCode(offsetDays = 0) {
+  const date = new Date()
+  date.setDate(date.getDate() + offsetDays)
+  return `D${String(date.getDate()).padStart(2, "0")}`
+}
+
+function dispatchDayLabel(value?: string) {
+  const code = String(value || "").trim().toUpperCase()
+  if (!code) return "Dispatch timing: review date"
+  if (code === dispatchDayCode(0)) return "Send today"
+  if (code === dispatchDayCode(1)) return "Send tomorrow"
+  return `Later / other date (${code})`
+}
+
+function dispatchRackLabel(pkg?: DispatchPackage | null) {
+  if (!pkg) return "Review rack"
+  if (pkg.rack_label) return pkg.rack_label
+  const tote = String(pkg.tote_code || pkg.suggested_tote || "").toUpperCase()
+  if (pkg.scan_status === "exception" || tote.startsWith("EXCEPTION")) return "Exception rack"
+  if (!pkg.order_ready || tote.startsWith("HOLD-PARTIAL")) return "Later / Hold rack"
+  const code = String(pkg.dispatch_date || "").trim().toUpperCase()
+  if (code === dispatchDayCode(0)) return "Today rack"
+  if (code === dispatchDayCode(1)) return "Tomorrow rack"
+  return "Later / Hold rack"
+}
+
+function dispatchDayClass(value?: string) {
+  const code = String(value || "").trim().toUpperCase()
+  if (code === dispatchDayCode(0)) return "border-emerald-200 bg-emerald-50 text-emerald-800"
+  if (code === dispatchDayCode(1)) return "border-orange-200 bg-orange-50 text-orange-800"
+  return "border-red-200 bg-red-50 text-red-800"
+}
+
+function fulfilmentActionClass(ready?: boolean) {
+  return ready
+    ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+    : "border-red-200 bg-red-50 text-red-800"
+}
+
+function dispatchLocationCode(pkg?: { tote_code?: string; suggested_tote?: string; recipient_ref?: string; odoo_order_name?: string } | null, fallback = "", orderText = "") {
+  const raw = String(pkg?.suggested_tote || pkg?.tote_code || fallback || "").trim()
+  if (!raw) return ""
+  const source = `${orderText} ${pkg?.recipient_ref || ""} ${pkg?.odoo_order_name || ""}`
+  const orderMatch = source.match(/\b[A-Z]{1,6}0*(\d{2,})\b/)
+  const direct = raw.match(/^(Today|Tomorrow|Later)[-\s]+(\d{2}-\d{2})$/i)
+  if (direct) return `${direct[1][0].toUpperCase()}${direct[1].slice(1).toLowerCase()} ${direct[2]}`
+  const legacySection = raw.match(/^(D\d{2}|HOLD-PARTIAL|Today|Tomorrow|Later)\D+(\d{5})-\d{5}/i)
+  if (legacySection) {
+    const day = legacySection[1].toUpperCase()
+    const lastTwo = Number.parseInt(String(orderMatch?.[1] || legacySection[2]).slice(-2), 10)
+    const start = Math.floor(lastTwo / 20) * 20
+    const section = `${String(start).padStart(2, "0")}-${String(start + 19).padStart(2, "0")}`
+    if (day === "TODAY" || day === dispatchDayCode(0)) return `Today ${section}`
+    if (day === "TOMORROW" || day === dispatchDayCode(1)) return `Tomorrow ${section}`
+    return `Later ${section}`
+  }
+  return raw
+}
+
+function dispatchDisplayText(value?: string) {
+  const source = String(value || "")
+  const orderMatch = source.match(/\b[A-Z]{1,6}0*(\d{2,})\b/)
+  return source.replace(/\b(Today|Tomorrow|Later|D\d{2}|HOLD-PARTIAL)-([A-Z]{1,6})?(\d{5})-\d{5}(?:-[A-Z]{2,5})?(?:-[A-Z0-9]+)*/gi, (_match, day: string, _prefix: string, rangeStart: string) => {
+    const code = String(day || "").toUpperCase()
+    const lastTwo = Number.parseInt(String(orderMatch?.[1] || rangeStart).slice(-2), 10)
+    const start = Math.floor(lastTwo / 20) * 20
+    const section = `${String(start).padStart(2, "0")}-${String(start + 19).padStart(2, "0")}`
+    if (code === "TODAY") return `Today ${section}`
+    if (code === "TOMORROW") return `Tomorrow ${section}`
+    if (code === dispatchDayCode(0)) return `Today ${section}`
+    if (code === dispatchDayCode(1)) return `Tomorrow ${section}`
+    return `Later ${section}`
+  }).replace(/\b(Today|Tomorrow|Later)-(\d{2}-\d{2})\b/gi, (_match, day: string, section: string) => {
+    return `${day[0].toUpperCase()}${day.slice(1).toLowerCase()} ${section}`
+  })
+}
+
+function dispatchOrderSection(value?: string) {
+  const match = String(value || "").match(/\b[A-Z]{1,6}0*(\d{2,})\b/)
+  if (!match) return "00-19"
+  const lastTwo = Number.parseInt(match[1].slice(-2), 10)
+  const start = Math.floor(lastTwo / 20) * 20
+  return `${String(start).padStart(2, "0")}-${String(start + 19).padStart(2, "0")}`
+}
+
+function dispatchRackMoveCode(pkg: DispatchPackage, rack: "today" | "tomorrow" | "later" | "exception") {
+  if (rack === "exception") return "EXCEPTION-SCAN-01"
+  const section = dispatchOrderSection(`${pkg.recipient_ref || ""} ${pkg.odoo_order_name || ""}`)
+  const label = rack === "today" ? "Today" : rack === "tomorrow" ? "Tomorrow" : "Later"
+  return `${label}-${section}`
+}
+
+function dispatchScanMainText(value?: string) {
+  const text = dispatchDisplayText(value)
+  return text
+    .replace(/\s*Other parts:\s.*?(?=\sScan count:|\s*$)/i, "")
+    .replace(/\s*Parts received:\s*\d+\/\d+\.\s*Keep related parts together until all arrive\./i, "")
+    .trim()
+}
+
+function dispatchPartIsReceived(part: { received?: boolean; scan_status?: string }) {
+  return Boolean(part.received) || !["", "pending"].includes(String(part.scan_status || ""))
+}
+
+function DispatchOrderRefs({ orderRef, amazonOrderId, recipientRef }: { orderRef?: string; amazonOrderId?: string; recipientRef?: string }) {
+  return (
+    <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+      {recipientRef ? <span><span className="font-medium text-foreground">Recipient:</span> {recipientRef}</span> : null}
+      <span><span className="font-medium text-foreground">Order ref:</span> {orderRef || "Unknown"}</span>
+      <span><span className="font-medium text-foreground">Amazon order:</span> {amazonOrderId || "Unknown"}</span>
+    </div>
+  )
+}
+
+type DispatchProductImage = { src: string; title: string; asin?: string }
+
+function dispatchProductImagesFrom(value: { products?: Array<{ asin?: string; title?: string; image_url?: string; url?: string }>; products_json?: string; asins?: string[]; asins_json?: string } | null | undefined): DispatchProductImage[] {
+  if (!value) return []
+  let products = Array.isArray(value.products) ? value.products : []
+  if (!products.length && value.products_json) {
+    try {
+      const parsed = JSON.parse(value.products_json)
+      if (Array.isArray(parsed)) products = parsed
+    } catch {
+      products = []
+    }
+  }
+  return products
+    .map((item) => ({
+      src: String(item?.image_url || "").trim(),
+      title: String(item?.title || item?.asin || "Amazon product").trim(),
+      asin: String(item?.asin || "").trim(),
+    }))
+    .filter((item) => item.src)
+}
+
+function DispatchProductThumbs({ images, onPreview, size = "md" }: { images: DispatchProductImage[]; onPreview: (image: DispatchProductImage) => void; size?: "sm" | "md" }) {
+  if (!images.length) return null
+  const itemClass = size === "sm" ? "size-12" : "size-[88px]"
+  return (
+    <div className="flex shrink-0 flex-wrap gap-2" style={{ flexShrink: 0 }}>
+      {images.map((image, index) => (
+        <button
+          key={`${image.src}-${index}`}
+          type="button"
+          className={cn("flex items-center justify-center overflow-hidden rounded border bg-white transition hover:border-primary hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary", itemClass)}
+          onClick={() => onPreview(image)}
+          title={image.title}
+        >
+          <img src={image.src} alt={image.title} className="h-full w-full object-contain" />
+        </button>
+      ))}
+    </div>
+  )
 }
 
 function formatMoney(value?: number) {
@@ -3394,20 +3644,22 @@ function App() {
 
   async function runPullOrderNames() {
     const title = "Pull Odoo Orders"
-    const orderRefs = Array.from(new Set((pullOrderNames.match(/\bNC\d+\b/gi) || []).map((value) => value.toUpperCase())))
-    if (!storeId) {
-      setModal({ ok: false, title, message: "Select a store first." })
+    const orderRefs = Array.from(new Set((pullOrderNames.match(/\b[A-Z]{1,8}\d{2,}\b/gi) || []).map((value) => value.toUpperCase())))
+    const selectedStoreIds = pullStoreIds.map(Number).filter(Boolean)
+    const targetStoreIds = selectedStoreIds.length ? selectedStoreIds : storeId ? [Number(storeId)] : []
+    if (!targetStoreIds.length) {
+      setModal({ ok: false, title, message: "Select at least one store to pull these orders." })
       return
     }
     if (!orderRefs.length) {
-      setModal({ ok: false, title, message: "Enter at least one Odoo order number, for example NC10216." })
+      setModal({ ok: false, title, message: "Enter at least one Odoo order number, for example S02631, ES00246, VG00067, or NC10216." })
       return
     }
     try {
       setBusy(title)
       const result = await api<{ ok?: boolean; message?: string; pulled?: number }>("/api/pull/order-names", {
         method: "POST",
-        body: JSON.stringify({ store_id: Number(storeId), order_names: orderRefs }),
+        body: JSON.stringify({ store_ids: targetStoreIds, order_names: orderRefs }),
       })
       await refreshCurrentOrdersPage()
       setModal({ ok: result.ok ?? true, title, message: result.message || "Pulled requested Odoo orders." })
@@ -4004,9 +4256,9 @@ function App() {
                         label="Pull specific Odoo orders"
                         value={pullOrderNames}
                         onChange={setPullOrderNames}
-                        placeholder="NC10216, NC10212 or one per line"
+                        placeholder="ES00246, VG00067, NC10216 or one per line"
                       />
-                      <Button variant="outline" onClick={runPullOrderNames} disabled={!storeId || Boolean(busy)}>
+                      <Button variant="outline" onClick={runPullOrderNames} disabled={Boolean(busy) || (!pullStoreIds.length && !storeId)}>
                         <RefreshCw className="size-4" />
                         Pull These Orders
                       </Button>
@@ -4585,7 +4837,7 @@ function App() {
           />
         )}
         {page === "dispatch-sorting" && (
-          <DispatchSortingPage storeId={storeId} onResult={setModal} />
+          <DispatchSortingPage storeId={storeId} publicVisitor={publicVisitor} onResult={setModal} />
         )}
         {page === "amazon-otp" && (
           <AmazonOtpPage onResult={setModal} />
@@ -5294,16 +5546,30 @@ function StoresPage({ stores, onChanged, onResult }: { stores: Store[]; onChange
   )
 }
 
-function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult: (modal: ModalState) => void }) {
+function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { storeId: string; publicVisitor?: boolean; onResult: (modal: ModalState) => void }) {
   const [scanCode, setScanCode] = useState("")
   const [matchedPackage, setMatchedPackage] = useState<DispatchPackage | null>(null)
+  const [scanMatches, setScanMatches] = useState<DispatchPackage[]>([])
   const [suggestedTote, setSuggestedTote] = useState("")
-  const [summary, setSummary] = useState<DispatchSortingSummary>({ summary: {}, totes: [], recent: [] })
+  const [summary, setSummary] = useState<DispatchSortingSummary>({ summary: {}, totes: [], recent: [], scan_events: [] })
   const [busy, setBusy] = useState(false)
+  const [rebuildProgress, setRebuildProgress] = useState<DispatchRebuildProgress | null>(null)
   const [lastMessage, setLastMessage] = useState("")
+  const [searchConfirmation, setSearchConfirmation] = useState("")
+  const [rackDialog, setRackDialog] = useState<"" | "today" | "tomorrow" | "later" | "exception">("")
+  const [scanEventPage, setScanEventPage] = useState(1)
+  const [scanEventJumpPage, setScanEventJumpPage] = useState("1")
+  const [scanEventQuery, setScanEventQuery] = useState("")
+  const [scanEventQueryDraft, setScanEventQueryDraft] = useState("")
+  const [batchLimit, setBatchLimit] = useState("10")
+  const [batchInput, setBatchInput] = useState("")
+  const [batchResults, setBatchResults] = useState<Array<{ code: string; message: string; ok: boolean; package?: DispatchPackage; matches?: DispatchPackage[] }>>([])
+  const [batchBusy, setBatchBusy] = useState(false)
+  const [batchCameraMode, setBatchCameraMode] = useState(false)
   const [scannerOpen, setScannerOpen] = useState(false)
   const [scannerError, setScannerError] = useState("")
   const [scannerStatus, setScannerStatus] = useState("")
+  const [imagePreview, setImagePreview] = useState<{ src: string; title: string; asin?: string } | null>(null)
   const scanInputRef = useRef<HTMLInputElement | null>(null)
   const scannerVideoRef = useRef<HTMLVideoElement | null>(null)
   const scannerControlsRef = useRef<IScannerControls | null>(null)
@@ -5313,13 +5579,59 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
   async function refreshSummary() {
     const query = new URLSearchParams()
     if (storeId) query.set("store_id", storeId)
+    query.set("scan_page", String(scanEventPage))
+    query.set("scan_per_page", "10")
+    if (scanEventQuery.trim()) query.set("scan_q", scanEventQuery.trim())
     const result = await api<DispatchSortingSummary & { ok: boolean }>(`/api/dispatch-sorting/summary?${query.toString()}`)
-    setSummary({ summary: result.summary || {}, totes: result.totes || [], recent: result.recent || [] })
+    setSummary({
+      summary: result.summary || {},
+      totes: result.totes || [],
+      recent: result.recent || [],
+      scan_events: result.scan_events || [],
+      scan_events_page: result.scan_events_page || scanEventPage,
+      scan_events_per_page: result.scan_events_per_page || 10,
+      scan_events_total: result.scan_events_total || 0,
+      rack_snapshot: result.rack_snapshot,
+    })
+  }
+
+  async function refreshRebuildProgress() {
+    const result = await api<{ ok: boolean; progress: DispatchRebuildProgress }>("/api/dispatch-sorting/rebuild")
+    setRebuildProgress(result.progress || null)
+    return result.progress
   }
 
   useEffect(() => {
     refreshSummary().catch((error) => onResult({ ok: false, title: "Dispatch Summary Failed", message: String(error) }))
-  }, [storeId])
+  }, [storeId, scanEventPage, scanEventQuery])
+
+  useEffect(() => {
+    setScanEventJumpPage(String(scanEventPage))
+  }, [scanEventPage])
+
+  useEffect(() => {
+    api<{ settings: ServiceSettings }>("/api/dispatch-sorting/settings")
+      .then((result) => setBatchLimit(result.settings.dispatch_scan_batch_limit || "10"))
+      .catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
+    refreshRebuildProgress().catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
+    if (rebuildProgress?.status !== "running") return
+    const timer = window.setInterval(() => {
+      refreshRebuildProgress()
+        .then((progress) => {
+          if (progress?.status === "completed") {
+            void refreshSummary()
+          }
+        })
+        .catch(() => undefined)
+    }, 1200)
+    return () => window.clearInterval(timer)
+  }, [rebuildProgress?.status])
 
   useEffect(() => {
     scanInputRef.current?.focus()
@@ -5330,24 +5642,55 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
     if (!code) return
     scannerLastCodeRef.current = code
     setScannerStatus(code)
+    setSearchConfirmation(`Searching for ${code}...`)
+    setLastMessage("")
+    setScanMatches([])
     setBusy(true)
     try {
-      const result = await api<{ ok: boolean; matched: boolean; package?: DispatchPackage; suggested_tote?: string; message: string }>("/api/dispatch-sorting/scan", {
+      const result = await api<{ ok: boolean; matched: boolean; ambiguous?: boolean; package?: DispatchPackage; matches?: DispatchPackage[]; suggested_tote?: string; message: string }>("/api/dispatch-sorting/scan", {
         method: "POST",
         body: JSON.stringify({ scan_code: code, store_id: storeId ? Number(storeId) : null }),
       })
-      if (!result.matched || !result.package) {
+      if (result.ambiguous && result.matches?.length) {
         setMatchedPackage(null)
+        setScanMatches(result.matches)
+        setSuggestedTote("")
+        const message = result.message || "Multiple packages matched. Select the correct package."
+        setLastMessage(message)
+        setSearchConfirmation(message)
+        onResult({ ok: true, title: "Multiple Matches", message })
+      } else if (!result.matched || !result.package) {
+        setMatchedPackage(null)
+        setScanMatches([])
         setSuggestedTote(result.suggested_tote || "EXCEPTION-SCAN-01")
-        setLastMessage(result.message || "No match found.")
-        onResult({ ok: false, title: "Package Not Matched", message: `${result.message || "No match found."} Scan: ${code}` })
+        const message = result.message || "No match found."
+        setLastMessage(message)
+        setSearchConfirmation(message)
+        onResult({ ok: false, title: "Package Not Matched", message: `${message} Scan: ${code}` })
       } else {
         setMatchedPackage(result.package)
+        setScanMatches([])
         setSuggestedTote(result.package.suggested_tote || result.package.tote_code || "")
-        setLastMessage(result.message || "Package matched.")
+        const message = result.message || "Package matched."
+        setLastMessage(message)
+        setSearchConfirmation(message)
+        void api<{ ok: boolean; package: DispatchPackage; message: string }>(`/api/dispatch-sorting/packages/${result.package.id}`)
+          .then((detail) => {
+            setMatchedPackage(detail.package)
+            setSuggestedTote(detail.package.suggested_tote || detail.package.tote_code || result.package?.suggested_tote || "")
+            if (detail.message) {
+              setLastMessage(detail.message)
+              setSearchConfirmation(detail.message)
+            }
+          })
+          .catch(() => undefined)
       }
       setScanCode("")
-      await refreshSummary()
+      if (scanEventPage !== 1) {
+        setScanEventPage(1)
+      } else {
+        void refreshSummary().catch((error) => onResult({ ok: false, title: "Dispatch Summary Failed", message: String(error) }))
+      }
     } catch (error) {
       onResult({ ok: false, title: "Scan Failed", message: String(error) })
     } finally {
@@ -5360,21 +5703,99 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
     await submitScan(scanCode)
   }
 
+  async function saveBatchLimit() {
+    const limit = Math.max(1, Math.min(50, Number.parseInt(batchLimit || "10", 10) || 10))
+    setBatchLimit(String(limit))
+    try {
+      const result = await api<{ ok: boolean; message: string; settings: ServiceSettings }>("/api/dispatch-sorting/settings", {
+        method: "POST",
+        body: JSON.stringify({ dispatch_scan_batch_limit: String(limit) }),
+      })
+      setBatchLimit(result.settings.dispatch_scan_batch_limit || String(limit))
+      onResult({ ok: true, title: "Batch Limit Saved", message: `Batch scanner will allow ${result.settings.dispatch_scan_batch_limit || limit} package(s) in one go.` })
+    } catch (error) {
+      onResult({ ok: false, title: "Save Failed", message: String(error) })
+    }
+  }
+
+  async function runBatchScan() {
+    const limit = Math.max(1, Math.min(50, Number.parseInt(batchLimit || "10", 10) || 10))
+    const codes = batchInput
+      .split(/[\n,;\t ]+/)
+      .map((code) => code.trim())
+      .filter(Boolean)
+      .slice(0, limit)
+    if (!codes.length) return
+    setBatchBusy(true)
+    setBatchResults([])
+    try {
+      const results: Array<{ code: string; message: string; ok: boolean; package?: DispatchPackage; matches?: DispatchPackage[] }> = []
+      for (const code of codes) {
+        const result = await api<{ ok: boolean; matched: boolean; ambiguous?: boolean; package?: DispatchPackage; matches?: DispatchPackage[]; message: string }>("/api/dispatch-sorting/scan", {
+          method: "POST",
+          body: JSON.stringify({ scan_code: code, store_id: storeId ? Number(storeId) : null }),
+        })
+        results.push({ code, message: result.message || "", ok: Boolean(result.matched), package: result.package, matches: result.matches })
+        setBatchResults([...results])
+      }
+      setBatchInput("")
+      setSearchConfirmation(`Batch scan completed: ${results.length} package code${results.length === 1 ? "" : "s"} processed.`)
+      if (scanEventPage !== 1) setScanEventPage(1)
+      else await refreshSummary()
+    } catch (error) {
+      onResult({ ok: false, title: "Batch Scan Failed", message: String(error) })
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
+  async function submitBatchCameraScan(code: string) {
+    const limit = Math.max(1, Math.min(50, Number.parseInt(batchLimit || "10", 10) || 10))
+    setBatchBusy(true)
+    try {
+      const result = await api<{ ok: boolean; matched: boolean; ambiguous?: boolean; package?: DispatchPackage; matches?: DispatchPackage[]; message: string }>("/api/dispatch-sorting/scan", {
+        method: "POST",
+        body: JSON.stringify({ scan_code: code, store_id: storeId ? Number(storeId) : null }),
+      })
+      setBatchResults((current) => {
+        const next = [...current, { code, message: result.message || "", ok: Boolean(result.matched), package: result.package, matches: result.matches }]
+        if (next.length >= limit) {
+          scannerControlsRef.current?.stop()
+          scannerControlsRef.current = null
+          setScannerOpen(false)
+          setBatchCameraMode(false)
+          setScannerStatus(`Batch limit reached: ${limit} package(s).`)
+        } else {
+          setScannerStatus(`Scanned ${next.length}/${limit}. Continue scanning packages.`)
+        }
+        return next
+      })
+      if (scanEventPage !== 1) setScanEventPage(1)
+      else await refreshSummary()
+    } catch (error) {
+      setScannerError(String(error))
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
   function stopCameraScanner() {
     scannerControlsRef.current?.stop()
     scannerControlsRef.current = null
     scannerReaderRef.current = null
     setScannerOpen(false)
+    setBatchCameraMode(false)
     setScannerError("")
     setScannerStatus("")
     scanInputRef.current?.focus()
   }
 
-  async function openCameraScanner() {
+  async function openCameraScanner(batch = false) {
     scannerLastCodeRef.current = ""
+    setBatchCameraMode(batch)
     setScannerOpen(true)
     setScannerError("")
-    setScannerStatus("Opening camera...")
+    setScannerStatus(batch ? "Opening camera for batch scan..." : "Opening camera...")
   }
 
   useEffect(() => {
@@ -5402,10 +5823,17 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
             const text = result?.getText?.().trim()
             if (!text || scannerLastCodeRef.current === text) return
             scannerLastCodeRef.current = text
-            scannerControlsRef.current?.stop()
-            scannerControlsRef.current = null
-            setScannerOpen(false)
-            void submitScan(text)
+            if (batchCameraMode) {
+              void submitBatchCameraScan(text)
+              window.setTimeout(() => {
+                if (scannerLastCodeRef.current === text) scannerLastCodeRef.current = ""
+              }, 1200)
+            } else {
+              scannerControlsRef.current?.stop()
+              scannerControlsRef.current = null
+              setScannerOpen(false)
+              void submitScan(text)
+            }
           },
         )
         if (cancelled) {
@@ -5426,7 +5854,7 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
       scannerControlsRef.current = null
       scannerReaderRef.current = null
     }
-  }, [scannerOpen])
+  }, [scannerOpen, batchCameraMode, batchLimit, scanEventPage, storeId])
 
   useEffect(() => () => {
     scannerControlsRef.current?.stop()
@@ -5456,23 +5884,140 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
     }
   }
 
-  async function rebuildIndex() {
+  async function updateRackPackage(pkg: DispatchPackage, status: string, toteCode: string, title: string) {
     setBusy(true)
     try {
-      const query = new URLSearchParams()
-      if (storeId) query.set("store_id", storeId)
-      const result = await api<{ ok: boolean; message: string; orders: number; packages: number }>(`/api/dispatch-sorting/rebuild?${query.toString()}`, { method: "POST" })
+      const result = await api<{ ok: boolean; package: DispatchPackage; message: string }>(`/api/dispatch-sorting/packages/${pkg.id}/place`, {
+        method: "POST",
+        body: JSON.stringify({
+          tote_code: toteCode,
+          status,
+          exception_reason: status === "exception" ? "manual_exception" : "",
+        }),
+      })
+      onResult({ ok: true, title, message: dispatchDisplayText(result.message || "Package updated.") })
       await refreshSummary()
-      onResult({ ok: true, title: "Scan Index Rebuilt", message: result.message || `Indexed ${result.packages} package(s).` })
     } catch (error) {
-      onResult({ ok: false, title: "Rebuild Failed", message: String(error) })
+      onResult({ ok: false, title: "Rack Update Failed", message: String(error) })
     } finally {
       setBusy(false)
     }
   }
 
+  async function fulfillRackPackage(pkg: DispatchPackage) {
+    await updateRackPackage(pkg, "dispatched", dispatchLocationCode(pkg) || dispatchRackMoveCode(pkg, "today"), "Package Fulfilled")
+  }
+
+  async function moveRackPackage(pkg: DispatchPackage) {
+    const target = window.prompt("Move to rack: today, tomorrow, later, or exception", String(pkg.rack_key || rackDialog || "later"))
+    const rack = String(target || "").trim().toLowerCase()
+    if (!["today", "tomorrow", "later", "exception"].includes(rack)) return
+    const typedRack = rack as "today" | "tomorrow" | "later" | "exception"
+    await updateRackPackage(pkg, typedRack === "exception" ? "exception" : "sorted_holding", dispatchRackMoveCode(pkg, typedRack), `Moved to ${typedRack}`)
+  }
+
+  async function resolveScanEvent(eventId: number) {
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/dispatch-sorting/scan-events/${eventId}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ note: "Reviewed by dispatch team." }),
+      })
+      onResult({ ok: true, title: "Exception Resolved", message: result.message || "Scan exception marked resolved." })
+      await refreshSummary()
+    } catch (error) {
+      onResult({ ok: false, title: "Resolve Failed", message: String(error) })
+    }
+  }
+
+  async function rebuildIndex() {
+    try {
+      const query = new URLSearchParams()
+      if (storeId) query.set("store_id", storeId)
+      const result = await api<{ ok: boolean; message: string; progress: DispatchRebuildProgress }>(`/api/dispatch-sorting/rebuild?${query.toString()}`, { method: "POST" })
+      setRebuildProgress(result.progress || null)
+      onResult({ ok: true, title: "Scan Index Rebuild Started", message: result.message || "Rebuild is running in the background." })
+    } catch (error) {
+      onResult({ ok: false, title: "Rebuild Failed", message: String(error) })
+    }
+  }
+
   const counts = summary.summary || {}
+  const rackSummary = summary.rack_snapshot?.summary || {}
+  const rackItems = summary.rack_snapshot?.items || {}
+  const rackCards = [
+    { key: "today", label: "Today", tone: "border-emerald-200 bg-emerald-50 text-emerald-900", count: Number(rackSummary.today || 0) },
+    { key: "tomorrow", label: "Tomorrow", tone: "border-orange-200 bg-orange-50 text-orange-900", count: Number(rackSummary.tomorrow || 0) },
+    { key: "later", label: "Later / Hold", tone: "border-red-200 bg-red-50 text-red-900", count: Number(rackSummary.later || 0) },
+    { key: "exception", label: "Exception", tone: "border-red-300 bg-red-100 text-red-950", count: Number(rackSummary.exception || 0) },
+  ] as const
+  const rackDialogTitle = rackCards.find((rack) => rack.key === rackDialog)?.label || ""
+  const rackDialogItems = rackDialog ? (rackItems[rackDialog] || []) : []
+  const rackDialogGroups = Object.entries(
+    rackDialogItems.reduce<Record<string, DispatchPackage[]>>((groups, pkg) => {
+      const key = String(pkg.odoo_order_name || pkg.recipient_ref || pkg.amazon_order_id || "Unknown order")
+      groups[key] = groups[key] || []
+      groups[key].push(pkg)
+      return groups
+    }, {}),
+  ).sort(([a], [b]) => a.localeCompare(b))
+  const scanEventsTotal = Number(summary.scan_events_total || 0)
+  const scanEventsPerPage = Number(summary.scan_events_per_page || 10)
+  const scanEventsTotalPages = Math.max(1, Math.ceil(scanEventsTotal / scanEventsPerPage))
+  const jumpToScanEventPage = () => {
+    const page = Math.max(1, Math.min(scanEventsTotalPages, Number.parseInt(scanEventJumpPage || "1", 10) || 1))
+    setScanEventJumpPage(String(page))
+    setScanEventPage(page)
+  }
+  const submitScanEventSearch = () => {
+    const nextQuery = scanEventQueryDraft.trim()
+    if (nextQuery === scanEventQuery) {
+      if (scanEventPage !== 1) setScanEventPage(1)
+      return
+    }
+    setScanEventQuery(nextQuery)
+    setScanEventPage(1)
+    setScanEventJumpPage("1")
+  }
+  const clearScanEventSearch = () => {
+    setScanEventQueryDraft("")
+    if (scanEventQuery) {
+      setScanEventQuery("")
+      setScanEventPage(1)
+      setScanEventJumpPage("1")
+    }
+  }
+  const productImages = dispatchProductImagesFrom(matchedPackage || {})
   const product = matchedPackage?.products?.[0]
+  const rebuildTotal = Math.max(0, Number(rebuildProgress?.total || 0))
+  const rebuildProcessed = Math.max(0, Number(rebuildProgress?.processed || 0))
+  const rebuildPercent = rebuildTotal ? Math.max(0, Math.min(100, Math.round((rebuildProcessed / rebuildTotal) * 100))) : rebuildProgress?.status === "completed" ? 100 : 0
+  const rebuildRunning = rebuildProgress?.status === "running"
+  const showRebuildProgress = Boolean(rebuildProgress && rebuildProgress.status !== "idle")
+  const dispatchDay = matchedPackage ? dispatchDayLabel(matchedPackage.dispatch_date) : ""
+  const dispatchDayBoxClass = matchedPackage ? dispatchDayClass(matchedPackage.dispatch_date) : ""
+  const relatedParts = matchedPackage?.related_parts || []
+  const guidanceLoading = Boolean(matchedPackage?.guidance_loading)
+  const otherRelatedParts = matchedPackage ? relatedParts.filter((part) => Number(part.id) !== Number(matchedPackage.id)) : []
+  const receivedRelatedParts = otherRelatedParts.filter(dispatchPartIsReceived)
+  const pendingRelatedParts = otherRelatedParts.filter((part) => !dispatchPartIsReceived(part))
+  const allRecipientPartsReceived = matchedPackage && !guidanceLoading ? (relatedParts.length > 1 ? Boolean(matchedPackage.all_parts_received) : Boolean(matchedPackage.order_ready)) : false
+  const fulfilmentBoxClass = matchedPackage ? fulfilmentActionClass(allRecipientPartsReceived) : ""
+  const matchedRackLabel = dispatchRackLabel(matchedPackage)
+  const matchedLocationCode = dispatchLocationCode(matchedPackage, suggestedTote)
+  const nextActionTitle = matchedPackage
+    ? guidanceLoading
+      ? `Place this package in ${matchedRackLabel}`
+      : allRecipientPartsReceived
+      ? "Move all received parts to Ready for fulfilment"
+      : `Hold this unopened package in ${matchedRackLabel}`
+    : ""
+  const nextActionDetail = matchedPackage
+    ? guidanceLoading
+      ? "Matched instantly. Related package parts are loading in the background; place this package in the shown rack code now."
+      : allRecipientPartsReceived
+      ? `${dispatchDay}. Pick any earlier scanned parts shown below, keep the parts together, then send the complete recipient order to fulfilment.`
+      : `${dispatchDay}. Other packages/items for this recipient are still pending, so place this unopened package in the hold location shown here.`
+    : ""
 
   return (
     <div className="grid gap-4">
@@ -5496,12 +6041,61 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
             <CardTitle>Amazon Package Scan</CardTitle>
             <CardDescription>Scan the Amazon label, match the app order, and place the unopened package into the assigned tote.</CardDescription>
           </div>
-          <Button variant="outline" onClick={rebuildIndex} disabled={busy}>
-            <RefreshCw className="size-4" />
-            Rebuild scan index
-          </Button>
+          {!publicVisitor ? (
+            <Button variant="outline" onClick={rebuildIndex} disabled={rebuildRunning}>
+              <RefreshCw className="size-4" />
+              {rebuildRunning ? "Rebuilding..." : "Rebuild scan index"}
+            </Button>
+          ) : null}
         </CardHeader>
         <CardContent className="grid gap-4">
+          {showRebuildProgress ? (
+            <div className="rounded border bg-muted/40 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="font-medium">
+                  Rebuild scan index: {rebuildProgress?.status || "idle"}
+                  {rebuildProgress?.current_order ? ` - ${rebuildProgress.current_order}` : ""}
+                </span>
+                <span className="text-muted-foreground">
+                  {rebuildProcessed.toLocaleString()} / {rebuildTotal.toLocaleString()} order{rebuildTotal === 1 ? "" : "s"} · {Number(rebuildProgress?.packages || 0).toLocaleString()} package row{Number(rebuildProgress?.packages || 0) === 1 ? "" : "s"}
+                  {Number(rebuildProgress?.workers || 0) ? ` · ${Number(rebuildProgress?.workers || 0)} workers` : ""}
+                  {Number(rebuildProgress?.db_writers || 0) ? ` · ${Number(rebuildProgress?.db_writers || 0)} DB writers` : ""}
+                  {Number(rebuildProgress?.in_flight || 0) ? ` · ${Number(rebuildProgress?.in_flight || 0)} in flight` : ""}
+                  {Number(rebuildProgress?.failed || 0) ? ` · ${Number(rebuildProgress?.failed || 0).toLocaleString()} skipped` : ""}
+                </span>
+              </div>
+              <div className="progress mt-2">
+                <div
+                  className={`progress-bar bg-primary transition-all ${rebuildRunning ? "progress-bar-striped progress-bar-animated" : ""}`}
+                  role="progressbar"
+                  aria-valuenow={rebuildPercent}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Dispatch scan index rebuild ${rebuildPercent}% complete`}
+                  style={{ width: progressWidth(rebuildPercent) }}
+                />
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                <span>{rebuildProgress?.message || "Waiting for rebuild progress."}</span>
+                <span>{rebuildPercent}%</span>
+              </div>
+              {rebuildProgress?.error ? <div className="mt-2 text-xs text-destructive">{rebuildProgress.error}</div> : null}
+            </div>
+          ) : null}
+          <div className="grid gap-3 md:grid-cols-4">
+            {rackCards.map((rack) => (
+              <button
+                key={rack.key}
+                type="button"
+                className={cn("rounded border-2 p-4 text-left transition hover:shadow-sm", rack.tone)}
+                onClick={() => setRackDialog(rack.key)}
+              >
+                <div className="text-xs font-semibold uppercase">{rack.label}</div>
+                <div className="mt-2 text-3xl font-bold">{rack.count.toLocaleString()}</div>
+                <div className="mt-1 text-xs">Click to view packages</div>
+              </button>
+            ))}
+          </div>
           <form className="grid gap-2 md:grid-cols-[1fr_auto_auto]" onSubmit={scanPackage}>
             <Input
               ref={scanInputRef}
@@ -5511,22 +6105,219 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
               className="h-14 text-lg font-semibold"
               autoComplete="off"
             />
-            <Button type="button" variant="outline" className="h-14 px-5" disabled={busy} onClick={openCameraScanner}>
+            <Button type="button" variant="outline" className="h-14 px-5" disabled={busy} onClick={() => openCameraScanner(false)}>
               <Camera className="size-5" />
               Camera
             </Button>
             <Button className="h-14 px-6" disabled={busy || !scanCode.trim()}>
               <Search className="size-5" />
-              Scan
+              {busy ? "Scanning..." : "Scan"}
             </Button>
           </form>
+          {searchConfirmation ? (
+            <div className={cn(
+              "rounded border-2 px-4 py-3 text-sm font-semibold",
+              matchedPackage
+                ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                : scanMatches.length
+                  ? "border-orange-200 bg-orange-50 text-orange-900"
+                  : "border-red-200 bg-red-50 text-red-900",
+            )}>
+              {dispatchDisplayText(searchConfirmation)}
+            </div>
+          ) : null}
+          <div className="rounded border bg-white p-4">
+            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px_auto_auto] lg:items-end">
+              <div>
+                <Label>Batch scan package codes</Label>
+                <textarea
+                  value={batchInput}
+                  onChange={(event) => setBatchInput(event.target.value)}
+                  placeholder="Paste or type package codes, one per line"
+                  className="mt-2 min-h-24 w-full rounded border bg-background px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <Label>Max packages in one go</Label>
+                <Input className="mt-2" value={batchLimit} onChange={(event) => setBatchLimit(event.target.value.replace(/[^0-9]/g, ""))} />
+              </div>
+              <Button type="button" variant="outline" disabled={batchBusy} onClick={saveBatchLimit}>
+                <Settings className="size-4" />
+                Save limit
+              </Button>
+              <div className="grid gap-2">
+                <Button type="button" disabled={batchBusy || !batchInput.trim()} onClick={runBatchScan}>
+                  <Search className="size-4" />
+                  Run batch
+                </Button>
+                <Button type="button" variant="outline" disabled={batchBusy} onClick={() => openCameraScanner(true)}>
+                  <Camera className="size-4" />
+                  Batch camera
+                </Button>
+              </div>
+            </div>
+            {batchResults.length ? (
+              <div className="mt-4 rounded border">
+                <div className="border-b px-3 py-2 text-sm font-medium">Batch scan results</div>
+                <div className="divide-y">
+                  {batchResults.map((result, index) => (
+                    <div key={`${result.code}-${index}`} className={cn("grid gap-2 px-3 py-2 text-sm md:grid-cols-[150px_1fr_auto] md:items-center", result.ok ? "bg-emerald-50/70" : result.matches?.length ? "bg-orange-50/70" : "bg-red-50/70")}>
+                      <div className="break-all font-mono text-xs">{result.code}</div>
+                      <div>
+                        <div className="font-medium">{result.message}</div>
+                        {result.package ? (
+                          <>
+                            <DispatchOrderRefs orderRef={result.package.odoo_order_name} amazonOrderId={result.package.amazon_order_id} recipientRef={result.package.recipient_ref} />
+                            <div className="mt-1 text-xs text-muted-foreground">{dispatchRackLabel(result.package)} · {dispatchLocationCode(result.package) || "No tote code"}</div>
+                          </>
+                        ) : null}
+                      </div>
+                      <Badge variant={result.ok ? "secondary" : result.matches?.length ? "outline" : "destructive"}>{result.ok ? "Matched" : result.matches?.length ? "Multiple" : "Exception"}</Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
           {lastMessage && (
-            <Alert variant={matchedPackage ? "default" : "destructive"}>
+            <Alert variant={matchedPackage || scanMatches.length ? "default" : "destructive"}>
               <AlertCircle className="size-4" />
-              <AlertTitle>{matchedPackage ? "Matched" : "Exception"}</AlertTitle>
-              <AlertDescription>{lastMessage}</AlertDescription>
+              <AlertTitle>{matchedPackage ? "Matched" : scanMatches.length ? "Select matching package" : "Exception"}</AlertTitle>
+              <AlertDescription>{dispatchDisplayText(lastMessage)}</AlertDescription>
             </Alert>
           )}
+
+          {scanMatches.length ? (
+            <div className="rounded border bg-white">
+              <div className="border-b px-4 py-3">
+                <div className="font-medium">Matching packages</div>
+                <div className="text-xs text-muted-foreground">Choose the exact package, then place it in the suggested tote.</div>
+              </div>
+              <div className="divide-y">
+                {scanMatches.map((pkg) => (
+                  <div key={`${pkg.id}-${pkg.scan_code}`} className="grid gap-3 px-4 py-3 text-sm md:grid-cols-[1fr_auto] md:items-center">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold">{pkg.odoo_order_name || pkg.amazon_order_id}</span>
+                        <Badge variant="outline">{pkg.destination_zone || "ROW"}</Badge>
+                        <Badge variant={pkg.priority === "U" ? "destructive" : "outline"}>{pkg.priority === "U" ? "Urgent" : "Normal"}</Badge>
+                        <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready" : "Hold"}</Badge>
+                      </div>
+                      <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
+                      <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
+                      <div className="mt-1 text-xs text-muted-foreground">Package {pkg.package_index || 1} · {pkg.package_status || pkg.promise || "Amazon package"}</div>
+                    </div>
+                    <Button type="button" variant="outline" onClick={() => submitScan(pkg.scan_code || pkg.display_code)}>
+                      Select
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {matchedPackage ? (
+            <div className={cn("rounded border-2 p-4", allRecipientPartsReceived ? "border-emerald-200 bg-emerald-50/70" : "border-red-200 bg-red-50/70")}>
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_260px] xl:items-start">
+                <div>
+                  <div className={cn("text-xs font-semibold uppercase", allRecipientPartsReceived ? "text-emerald-800" : "text-red-800")}>Do this now</div>
+                  <div className="mt-1 text-2xl font-semibold">{nextActionTitle}</div>
+                  <div className="mt-2 text-sm text-muted-foreground">{nextActionDetail}</div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Badge variant="outline" className={cn("border px-3 py-1 text-sm font-semibold", dispatchDayBoxClass)}>{dispatchDay}</Badge>
+                    <Badge variant="outline" className={cn("border px-3 py-1 text-sm font-semibold", fulfilmentBoxClass)}>
+                      {allRecipientPartsReceived ? "Ready for fulfilment" : "Hold partial order"}
+                    </Badge>
+                    <Badge variant={matchedPackage.priority === "U" ? "destructive" : "outline"}>
+                      {matchedPackage.priority === "U" ? "Urgent" : "Normal priority"}
+                    </Badge>
+                    <Badge variant="outline">{matchedPackage.destination_zone || "ROW"}</Badge>
+                  </div>
+                </div>
+                <div className="rounded bg-white px-4 py-3 text-center shadow-sm">
+                  <div className="text-xs font-medium uppercase text-muted-foreground">Place scanned package</div>
+                  <div className="mt-1 text-xl font-bold">{matchedRackLabel}</div>
+                  <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{matchedLocationCode || "No tote code"}</div>
+                </div>
+              </div>
+
+              <div className="mt-4 grid gap-3 lg:grid-cols-3">
+                <div className="rounded border bg-white p-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Badge variant="outline">1</Badge>
+                    Scan package
+                  </div>
+                  <div className="mt-2 text-sm">
+                    Put this unopened package in <span className="font-semibold">{matchedRackLabel}</span>.
+                  </div>
+                  <div className="mt-2 break-all rounded bg-muted px-3 py-2 font-mono text-xs">{matchedLocationCode || "No tote code"}</div>
+                </div>
+
+                <div className="rounded border bg-white p-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Badge variant="outline">2</Badge>
+                    Related parts
+                  </div>
+                  {guidanceLoading ? (
+                    <div className="mt-2 rounded bg-muted px-3 py-2 text-sm text-muted-foreground">
+                      Checking earlier scanned parts and hold-rack locations...
+                    </div>
+                  ) : receivedRelatedParts.length ? (
+                    <div className="mt-2 grid gap-2">
+                      <div className="text-sm font-medium">Pick earlier scanned part{receivedRelatedParts.length === 1 ? "" : "s"} from:</div>
+                      {receivedRelatedParts.slice(0, 4).map((part) => (
+                        <div key={part.id} className="rounded bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+                          <div className="font-semibold">{part.recipient_ref || part.odoo_order_name || "Related part"}</div>
+                          <div className="break-all font-mono">{dispatchLocationCode(part) || "No saved location"}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="mt-2 text-sm text-muted-foreground">No earlier scanned parts are stored in racks yet.</div>
+                  )}
+                  {!guidanceLoading && pendingRelatedParts.length ? (
+                    <div className="mt-3 rounded bg-orange-50 px-3 py-2 text-xs text-orange-900">
+                      {pendingRelatedParts.length} part{pendingRelatedParts.length === 1 ? "" : "s"} not scanned yet:
+                      {" "}
+                      {pendingRelatedParts.slice(0, 3).map((part) => `${part.recipient_ref || "Related part"} - ${part.delivery_label || part.package_status || "delivery not captured"}`).join(", ")}
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="rounded border bg-white p-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Badge variant="outline">3</Badge>
+                    Finish move
+                  </div>
+                  <div className="mt-2 text-sm text-muted-foreground">
+                    {allRecipientPartsReceived
+                      ? "After all parts are in hand, mark fulfilment so these packages leave the rack queue."
+                      : "After placing the package in the hold location, confirm the tote so anyone can find it later."}
+                  </div>
+                  <div className="mt-3 grid gap-2">
+                    <Button disabled={busy || !matchedLocationCode} onClick={() => placePackage("sorted_holding")}>
+                      <Check className="size-4" />
+                      Confirm placed
+                    </Button>
+                    <Button variant={allRecipientPartsReceived ? "default" : "outline"} disabled={busy || !allRecipientPartsReceived} onClick={() => placePackage("dispatched")}>
+                      <PackageCheck className="size-4" />
+                      Move to fulfilment
+                    </Button>
+                    <Button variant="outline" disabled={busy} onClick={() => placePackage("exception")}>
+                      <AlertCircle className="size-4" />
+                      Not found / exception
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : suggestedTote ? (
+            <div className="rounded border-2 border-destructive bg-destructive/5 p-4">
+              <div className="text-xs font-semibold uppercase text-destructive">Next action</div>
+              <div className="mt-1 text-2xl font-semibold">Put this package in {suggestedTote}</div>
+              <div className="mt-2 text-sm text-muted-foreground">Do not mix it with normal dispatch totes. Supervisor should review the label/order match before fulfilment.</div>
+            </div>
+          ) : null}
 
           {matchedPackage && (
             <div className="grid gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(320px,.8fr)]">
@@ -5534,19 +6325,27 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
                 <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                   <div>
                     <div className="text-xs font-medium uppercase text-muted-foreground">Matched Amazon Order</div>
-                    <div className="mt-1 text-xl font-semibold">{matchedPackage.amazon_order_id}</div>
-                    <div className="mt-1 text-sm text-muted-foreground">{matchedPackage.odoo_order_name} · {matchedPackage.destination_zone || "ROW"} · package {matchedPackage.package_index}</div>
+                    <div className="mt-1 text-xl font-semibold">{matchedPackage.odoo_order_name || matchedPackage.amazon_order_id}</div>
+                    <DispatchOrderRefs orderRef={matchedPackage.odoo_order_name} amazonOrderId={matchedPackage.amazon_order_id} recipientRef={matchedPackage.recipient_ref} />
+                    <div className="mt-1 text-sm text-muted-foreground">{matchedPackage.destination_zone || "ROW"} · package {matchedPackage.package_index}</div>
                   </div>
                   <StatusBadge value={matchedPackage.scan_status} />
                 </div>
-                <div className="mt-4 grid gap-3 md:grid-cols-[88px_1fr]">
-                  <div className="flex size-[88px] items-center justify-center overflow-hidden rounded border bg-muted">
-                    {product?.image_url ? <img src={product.image_url} alt="" className="h-full w-full object-contain" /> : <PackageCheck className="size-8 text-muted-foreground" />}
+                <div className="mt-4 grid gap-3 md:grid-cols-[minmax(96px,auto)_1fr]">
+                  <div className="max-w-[280px]">
+                    {productImages.length ? (
+                      <DispatchProductThumbs images={productImages} onPreview={setImagePreview} />
+                    ) : (
+                      <div className="flex size-[88px] items-center justify-center overflow-hidden rounded border bg-muted">
+                        <PackageCheck className="size-8 text-muted-foreground" />
+                      </div>
+                    )}
                   </div>
                   <div className="min-w-0">
                     <div className="font-medium">{product?.title || matchedPackage.package_status || "Amazon package"}</div>
                     <div className="mt-1 text-sm text-muted-foreground">
                       {matchedPackage.asins?.length ? `ASIN ${matchedPackage.asins.join(", ")}` : "ASIN not captured"}
+                      {productImages.length > 1 ? ` · ${productImages.length} product images` : ""}
                     </div>
                     <div className="mt-2 flex flex-wrap gap-2">
                       <Badge variant="outline">{matchedPackage.service || "STD"}</Badge>
@@ -5559,24 +6358,76 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
               </div>
 
               <div className="rounded border bg-white p-4">
-                <Label>Place in tote</Label>
+                <Label>Confirm package location</Label>
                 <Input value={suggestedTote} onChange={(event) => setSuggestedTote(event.target.value.toUpperCase())} className="mt-2 h-12 font-mono text-lg font-semibold" />
-                <div className="mt-3 grid grid-cols-2 gap-2">
+                <div className="mt-3 grid gap-2 md:grid-cols-3">
                   <Button disabled={busy || !suggestedTote.trim()} onClick={() => placePackage("sorted_holding")}>
                     <Check className="size-4" />
-                    Placed
+                    Confirm tote
+                  </Button>
+                  <Button variant="outline" disabled={busy || !allRecipientPartsReceived} onClick={() => placePackage("dispatched")}>
+                    <PackageCheck className="size-4" />
+                    Mark fulfilment
                   </Button>
                   <Button variant="outline" disabled={busy} onClick={() => placePackage("exception")}>
                     <AlertCircle className="size-4" />
-                    Exception
+                    Move exception
                   </Button>
                 </div>
                 <div className="mt-3 text-xs text-muted-foreground">
-                  Suggested from date, destination zone, service, priority, and fulfilment type.
+                  Use the rack code shown above unless the package label is damaged, not matched, or needs supervisor review.
                 </div>
               </div>
             </div>
           )}
+
+          {matchedPackage?.related_parts && matchedPackage.related_parts.length > 1 ? (
+            <div className="rounded border bg-white">
+              <div className="border-b px-4 py-3">
+                <div className="font-medium">Other parts for this recipient</div>
+                <div className="text-xs text-muted-foreground">
+                  Keep these parts together. Move each unopened package to the rack shown here until all parts are received.
+                </div>
+              </div>
+              <div className="divide-y">
+                {matchedPackage.related_parts.map((part) => {
+                  const received = Boolean(part.received)
+                  const current = part.id === matchedPackage.id
+                  return (
+                    <div
+                      key={part.id}
+                      style={{ display: "flex", alignItems: "center" }}
+                      className={cn(
+                        "flex items-center gap-3 px-4 py-3 text-sm",
+                        received ? "bg-emerald-50/70" : "bg-orange-50/70",
+                        current ? "ring-1 ring-inset ring-primary/30" : "",
+                      )}
+                    >
+                      <DispatchProductThumbs images={dispatchProductImagesFrom(part)} onPreview={setImagePreview} size="sm" />
+                      <div className="grid min-w-0 flex-1 gap-2 lg:grid-cols-[minmax(180px,1fr)_minmax(180px,1fr)_150px_150px] lg:items-center">
+                        <div className="min-w-0">
+                          <div className="truncate font-semibold">{part.recipient_ref || part.odoo_order_name || "Recipient part"}</div>
+                          <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{part.display_code || part.amazon_order_id}</div>
+                        </div>
+                        <div className="min-w-0">
+                          <div className="truncate font-medium">{part.delivery_label || part.package_status || part.promise || "Delivery not captured"}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">Amazon order {part.amazon_order_id || "Unknown"}</div>
+                        </div>
+                        <Badge variant={received ? "secondary" : "outline"}>{part.scan_label || (received ? "Received / scanned" : "Not scanned yet")}</Badge>
+                        <div>
+                          <div className="font-semibold">{part.rack_label || dispatchRackLabel(part as DispatchPackage)}</div>
+                          <div className="mt-1 font-mono text-xs text-muted-foreground">{dispatchLocationCode(part) || "No tote code"}</div>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+              <div className={cn("border-t px-4 py-3 text-sm font-semibold", matchedPackage.all_parts_received ? "bg-emerald-50 text-emerald-900" : "bg-red-50 text-red-900")}>
+                {matchedPackage.all_parts_received ? "All parts received. This recipient can move to fulfilment." : "Some parts are still pending. Hold related parts together until the final part arrives."}
+              </div>
+            </div>
+          ) : null}
 
           {matchedPackage?.remaining_packages?.length ? (
             <div className="rounded border bg-white">
@@ -5587,9 +6438,31 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
                     <div className="font-mono">Pkg {pkg.package_index}</div>
                     <div className="min-w-0 truncate">{pkg.display_code || pkg.package_status || "Package"}</div>
                     <StatusBadge value={pkg.scan_status} />
-                    <div className="font-mono text-xs text-muted-foreground">{pkg.tote_code || "Not placed"}</div>
+                    <div className="font-mono text-xs text-muted-foreground">{dispatchLocationCode(pkg) || "Not placed"}</div>
                   </div>
                 ))}
+              </div>
+            </div>
+          ) : null}
+
+          {matchedPackage?.order_packages && matchedPackage.order_packages.length > 1 ? (
+            <div className="rounded border bg-white">
+              <div className="border-b px-4 py-3">
+                <div className="font-medium">All package parts for this order</div>
+                <div className="text-xs text-muted-foreground">Use this to collect earlier packages from Later/Hold when the final part arrives.</div>
+              </div>
+              <div className="divide-y">
+                {matchedPackage.order_packages.map((pkg) => {
+                  const received = !["", "pending"].includes(String(pkg.scan_status || ""))
+                  return (
+                    <div key={pkg.id} className={cn("grid gap-2 px-4 py-3 text-sm md:grid-cols-[80px_1fr_150px_180px] md:items-center", received ? "bg-emerald-50/70" : "")}>
+                      <div className="font-mono">Pkg {pkg.package_index}</div>
+                      <div className="min-w-0 truncate">{pkg.display_code || pkg.package_status || "Package"}</div>
+                      <StatusBadge value={pkg.scan_status} />
+                      <div className="font-mono text-xs text-muted-foreground">{dispatchLocationCode(pkg) || "No rack yet"}</div>
+                    </div>
+                  )
+                })}
               </div>
             </div>
           ) : null}
@@ -5601,9 +6474,11 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
           <DialogHeader className="border-b px-4 py-3">
             <DialogTitle className="flex items-center gap-2">
               <Camera className="size-5" />
-              Camera Scanner
+              {batchCameraMode ? "Batch Camera Scanner" : "Camera Scanner"}
             </DialogTitle>
-            <DialogDescription>Point the phone camera at the Amazon label barcode or QR code.</DialogDescription>
+            <DialogDescription>
+              {batchCameraMode ? `Scan up to ${batchLimit || "10"} package labels. The camera stays open until the batch limit is reached or you close it.` : "Point the phone camera at the Amazon label barcode or QR code."}
+            </DialogDescription>
           </DialogHeader>
           <div className="grid gap-3 p-4">
             <div className="relative overflow-hidden rounded border bg-black">
@@ -5641,6 +6516,76 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
         </DialogContent>
       </Dialog>
 
+      <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>{imagePreview?.title || "Amazon product image"}</DialogTitle>
+            <DialogDescription>
+              {imagePreview?.asin ? `ASIN ${imagePreview.asin}` : "Product thumbnail from Amazon package details."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex max-h-[72vh] items-center justify-center overflow-hidden rounded border bg-white p-4">
+            {imagePreview?.src ? (
+              <img src={imagePreview.src} alt={imagePreview.title || "Amazon product"} className="max-h-[68vh] w-full object-contain" />
+            ) : null}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(rackDialog)} onOpenChange={(open) => !open && setRackDialog("")}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>{rackDialogTitle} rack</DialogTitle>
+            <DialogDescription>Packages currently scanned into this rack and not marked dispatched.</DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[70vh] overflow-auto rounded border">
+            {rackDialogGroups.length ? rackDialogGroups.map(([groupName, packages]) => (
+              <div key={groupName} className="border-b last:border-b-0">
+                <div className="flex items-center justify-between gap-3 bg-muted/40 px-4 py-2">
+                  <div className="font-semibold">{groupName}</div>
+                  <Badge variant="outline">{packages.length} package{packages.length === 1 ? "" : "s"}</Badge>
+                </div>
+                <div className="divide-y">
+                  {packages.map((pkg) => {
+                    const received = !["", "pending"].includes(String(pkg.scan_status || ""))
+                    return (
+                      <div key={`${pkg.id}-${pkg.scan_status}`} style={{ display: "flex", alignItems: "center" }} className={cn("flex items-center gap-3 px-4 py-3 text-sm", received ? "bg-emerald-50/70" : "bg-white")}>
+                        <DispatchProductThumbs images={dispatchProductImagesFrom(pkg)} onPreview={setImagePreview} size="sm" />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold">{pkg.recipient_ref || pkg.odoo_order_name || pkg.amazon_order_id}</span>
+                            <StatusBadge value={pkg.scan_status} />
+                            <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready for fulfilment" : "Hold"}</Badge>
+                          </div>
+                          <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
+                          <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
+                          <div className="mt-1 text-xs text-muted-foreground">{dispatchLocationCode(pkg) || "No rack"} · package {pkg.package_index || 1}</div>
+                        </div>
+                        <div className="ml-auto grid shrink-0 gap-2 text-right text-xs text-muted-foreground">
+                          <span>{pkg.last_scanned_at ? formatDateTime(pkg.last_scanned_at) : pkg.placed_at ? formatDateTime(pkg.placed_at) : "No scan time"}</span>
+                          <div className="flex justify-end gap-2">
+                            {rackDialog === "today" ? (
+                              <Button type="button" size="sm" disabled={busy} onClick={() => fulfillRackPackage(pkg)}>
+                                <PackageCheck className="size-4" />
+                                Fulfilled
+                              </Button>
+                            ) : null}
+                            <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => moveRackPackage(pkg)}>
+                              <ChevronRight className="size-4" />
+                              Move
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )) : <div className="px-4 py-8 text-sm text-muted-foreground">No packages in this rack.</div>}
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <div className="grid gap-4 lg:grid-cols-2">
         <div className="rounded border bg-white">
           <div className="border-b px-4 py-3 font-medium">Active totes</div>
@@ -5657,15 +6602,142 @@ function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult:
           <div className="border-b px-4 py-3 font-medium">Recent scans</div>
           <div className="divide-y">
             {summary.recent.length ? summary.recent.map((row) => (
-              <div key={`${row.id}-${row.scan_status}`} className="grid gap-1 px-4 py-3 text-sm">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="font-semibold">{row.odoo_order_name || row.amazon_order_id}</span>
-                  <StatusBadge value={row.scan_status} />
+              <div key={`${row.id}-${row.scan_status}-${row.last_scanned_at || row.placed_at || ""}-${row.scan_count || 0}`} style={{ display: "flex", alignItems: "center" }} className="flex items-center gap-3 px-4 py-3 text-sm">
+                <DispatchProductThumbs images={dispatchProductImagesFrom(row)} onPreview={setImagePreview} size="sm" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-semibold">{row.odoo_order_name || row.amazon_order_id}</span>
+                    <StatusBadge value={row.scan_status} />
+                  </div>
+                  <div className="font-mono text-xs text-muted-foreground">{row.display_code} · {dispatchLocationCode(row) || "No tote"}</div>
+                  <div className="text-xs text-muted-foreground">
+                    Scanned {Number(row.scan_count || 0).toLocaleString()} time{Number(row.scan_count || 0) === 1 ? "" : "s"}
+                    {row.last_scanned_at ? ` · ${formatDateTime(row.last_scanned_at)}` : ""}
+                  </div>
                 </div>
-                <div className="font-mono text-xs text-muted-foreground">{row.display_code} · {row.tote_code || "No tote"}</div>
               </div>
             )) : <div className="px-4 py-6 text-sm text-muted-foreground">No scans yet.</div>}
           </div>
+        </div>
+      </div>
+
+      <div className="rounded border bg-white">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
+          <div>
+            <div className="font-medium">Scan/search log</div>
+            <div className="text-xs text-muted-foreground">Saved scan attempts, partial searches, multiple matches, and exceptions for supervisor review.</div>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Input
+              value={scanEventQueryDraft}
+              onChange={(event) => setScanEventQueryDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") submitScanEventSearch()
+              }}
+              placeholder="Tracking, Amazon order, or order ref"
+              className="h-9 w-56"
+            />
+            <Button type="button" variant="outline" size="sm" onClick={submitScanEventSearch}>
+              Search
+            </Button>
+            {scanEventQuery || scanEventQueryDraft ? (
+              <Button type="button" variant="outline" size="sm" onClick={clearScanEventSearch}>
+                Clear
+              </Button>
+            ) : null}
+            <div className="text-xs text-muted-foreground">
+              Page {scanEventPage} / {scanEventsTotalPages} · {scanEventsTotal.toLocaleString()} result{scanEventsTotal === 1 ? "" : "s"}
+            </div>
+          </div>
+        </div>
+        <div className="divide-y">
+          {summary.scan_events?.length ? summary.scan_events.map((event) => {
+            const status = String(event.result_status || "")
+            const isException = status === "not_found"
+            const isMultiple = status === "multiple_matches"
+            const isResolved = Boolean(event.resolved_at)
+            const relatedEventParts = event.related_parts || []
+            return (
+              <div
+                key={event.id}
+                style={{ display: "flex", alignItems: "flex-start" }}
+                className={cn(
+                  "flex gap-3 px-4 py-3 text-sm",
+                  isResolved ? "bg-slate-50" : isException ? "bg-red-50/70" : isMultiple ? "bg-orange-50/70" : "",
+                )}
+              >
+                <DispatchProductThumbs images={dispatchProductImagesFrom(event)} onPreview={setImagePreview} size="sm" />
+                <div className="grid min-w-0 flex-1 gap-2 lg:grid-cols-[160px_minmax(0,1fr)] lg:items-center">
+                  <div className="font-mono text-xs font-semibold">{event.scan_query || event.normalized_query}</div>
+                  <div className="min-w-0">
+                    <div className={cn("font-medium", isException ? "text-red-800" : isMultiple ? "text-orange-800" : "text-emerald-800")}>
+                      {dispatchScanMainText(event.message || `${Number(event.result_count || 0)} result(s) found.`)}
+                    </div>
+                    <div className="mt-1 truncate text-xs text-muted-foreground">
+                      Order ref: {event.odoo_order_name || "Unknown"}
+                      {" · "}
+                      Amazon order: {event.amazon_order_id || "Unknown"}
+                      {event.display_code ? ` · ${event.display_code}` : ""}
+                      {event.suggested_tote ? ` · ${dispatchLocationCode({ suggested_tote: event.suggested_tote, odoo_order_name: event.odoo_order_name }, "", event.message)}` : ""}
+                    </div>
+                    {relatedEventParts.length ? (
+                      <div className="mt-3 overflow-hidden rounded border bg-white">
+                        <div className="border-b bg-muted/40 px-3 py-2 text-xs font-semibold text-foreground">Other parts in this order</div>
+                        <div className="divide-y">
+                          {relatedEventParts.map((part) => {
+                            const received = dispatchPartIsReceived(part)
+                            return (
+                              <div key={`${event.id}-${part.id}`} className="grid gap-2 px-3 py-2 text-xs md:grid-cols-[minmax(180px,1fr)_130px_minmax(160px,1fr)_120px] md:items-center">
+                                <div className="font-semibold">{part.recipient_ref || part.odoo_order_name || "Related part"}</div>
+                                <Badge variant={received ? "secondary" : "outline"}>{part.scan_label || (received ? "Received / scanned" : "Not scanned yet")}</Badge>
+                                <div className="text-muted-foreground">{part.delivery_label || part.package_status || part.promise || "Delivery not captured"}</div>
+                                <div className="font-mono text-muted-foreground">{dispatchLocationCode(part) || "No rack yet"}</div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="ml-auto flex shrink-0 flex-wrap justify-start gap-2 md:justify-end">
+                  <Badge variant={isResolved ? "outline" : isException ? "destructive" : isMultiple ? "outline" : "secondary"}>
+                    {isResolved ? "Resolved" : isException ? "Exception" : isMultiple ? "Multiple" : "Matched"}
+                  </Badge>
+                  {!isResolved && (isException || isMultiple) ? (
+                    <Button type="button" variant="outline" size="sm" onClick={() => resolveScanEvent(event.id)}>
+                      Mark resolved
+                    </Button>
+                  ) : null}
+                  <span className="text-xs text-muted-foreground">{formatDateTime(event.created_at)}</span>
+                </div>
+              </div>
+            )
+          }) : <div className="px-4 py-6 text-sm text-muted-foreground">No scan/search events recorded yet.</div>}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-3">
+          <Button type="button" variant="outline" disabled={scanEventPage <= 1} onClick={() => setScanEventPage((page) => Math.max(1, page - 1))}>
+            Previous
+          </Button>
+          <div className="flex shrink-0 items-center gap-2 whitespace-nowrap text-sm text-muted-foreground">
+            <span className="leading-9">Page</span>
+            <Input
+              value={scanEventJumpPage}
+              onChange={(event) => setScanEventJumpPage(event.target.value.replace(/[^0-9]/g, ""))}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") jumpToScanEventPage()
+              }}
+              className="h-9 w-14 px-2 text-center"
+              inputMode="numeric"
+            />
+            <span className="leading-9">of {scanEventsTotalPages}</span>
+            <Button type="button" variant="outline" size="sm" onClick={jumpToScanEventPage}>
+              Go
+            </Button>
+          </div>
+          <Button type="button" variant="outline" disabled={scanEventPage >= scanEventsTotalPages} onClick={() => setScanEventPage((page) => Math.min(scanEventsTotalPages, page + 1))}>
+            Next
+          </Button>
         </div>
       </div>
     </div>
@@ -9557,6 +10629,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [savingRouting, setSavingRouting] = useState(false)
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
+  const [jobStatusFilter, setJobStatusFilter] = useState("attention")
   const [jobStatusCounts, setJobStatusCounts] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState("")
   const pageRef = useRef(page)
@@ -9575,6 +10648,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const productRepairBusy = productRepairProgress?.status === "running"
   const showProductRepairProgress = Boolean(productRepairProgress && (productRepairBusy || productRepairTotal > 0 || productRepairProgress.message))
   const completedJobCount = Number(jobStatusCounts.completed || 0)
+  const attentionJobCount = Number(jobStatusCounts.attention || 0)
   const filteredDuplicateGroups = duplicateGroups.filter((group) => {
     if (duplicateFilter === "duplicates") return Number(group.duplicate_count || 0) > 0
     if (duplicateFilter === "errors") return Boolean(group.error || group.orders.some((order) => order.cancel_error))
@@ -9599,7 +10673,13 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
 
   async function load(nextPage = page) {
     const requestedPage = nextPage
-    const result = await api<{ jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?page=${nextPage}&per_page=${PAGE_SIZE}`)
+    const query = new URLSearchParams({
+      page: String(nextPage),
+      per_page: String(PAGE_SIZE),
+      status: jobStatusFilter,
+    })
+    if (storeId) query.set("store_id", storeId)
+    const result = await api<{ jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?${query.toString()}`)
     const resultPage = result.page || requestedPage
     if (requestedPage !== pageRef.current && resultPage !== pageRef.current) return
     setJobs(result.jobs || [])
@@ -9698,7 +10778,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     load(page).catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
     const timer = window.setInterval(() => load(page).catch(() => undefined), 5000)
     return () => window.clearInterval(timer)
-  }, [page, storeId])
+  }, [page, storeId, jobStatusFilter])
   useEffect(() => {
     loadDuplicates().catch(() => undefined)
     const timer = window.setInterval(() => loadDuplicates().catch(() => undefined), 5000)
@@ -9815,7 +10895,13 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
     if (!confirmed) return
     setBusy("ClearCompleted")
     try {
-      const result = await api<{ ok: boolean; message: string; jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; page?: number; total: number }>(`/api/shopify/fulfilment/jobs/clear-completed?page=${pageRef.current}&per_page=${PAGE_SIZE}`, { method: "POST" })
+      const query = new URLSearchParams({
+        page: String(pageRef.current),
+        per_page: String(PAGE_SIZE),
+        status: jobStatusFilter,
+      })
+      if (storeId) query.set("store_id", storeId)
+      const result = await api<{ ok: boolean; message: string; jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; page?: number; total: number }>(`/api/shopify/fulfilment/jobs/clear-completed?${query.toString()}`, { method: "POST" })
       setJobs(result.jobs || [])
       setJobStatusCounts(result.status_counts || {})
       setTotal(result.total || 0)
@@ -9824,6 +10910,17 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
         setPage(result.page)
       }
       onResult({ ok: result.ok, title: "Shopify Jobs Cleared", message: result.message })
+    } finally {
+      setBusy("")
+    }
+  }
+  async function refreshJobStatus(job: ShopifyFulfilmentJob) {
+    setBusy(`RefreshStatus-${job.id}`)
+    try {
+      const result = await api<{ ok: boolean; message: string; progress?: ShopifyFulfilmentProgress }>(`/api/shopify/fulfilment/jobs/${job.id}/refresh-status`, { method: "POST" })
+      if (result.progress) setProgress(result.progress)
+      await load()
+      onResult({ ok: result.ok, title: "Shopify Status Refreshed", message: result.message })
     } finally {
       setBusy("")
     }
@@ -10284,9 +11381,33 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
         <CardHeader className="gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <CardTitle>Jobs</CardTitle>
-            <CardDescription>{total.toLocaleString()} Shopify fulfilment job(s).</CardDescription>
+            <CardDescription>
+              {total.toLocaleString()} Shopify fulfilment job(s)
+              {attentionJobCount ? ` · ${attentionJobCount.toLocaleString()} need attention` : ""}.
+            </CardDescription>
           </div>
-          <PaginationControls page={page} total={total} onPage={setPage} disabled={Boolean(busy)} />
+          <div className="flex flex-wrap items-end gap-3">
+            <SelectField
+              className="w-[230px]"
+              label="Job View"
+              value={jobStatusFilter}
+              onChange={(value) => {
+                setJobStatusFilter(value)
+                pageRef.current = 1
+                setPage(1)
+              }}
+            >
+              <option value="attention">Needs attention</option>
+              <option value="all">All jobs</option>
+              <option value="amazon_placed">Amazon placed</option>
+              <option value="queued">Queued</option>
+              <option value="running">Running</option>
+              <option value="completed">Completed</option>
+              <option value="failed">Failed</option>
+              <option value="dead">Dead</option>
+            </SelectField>
+            <PaginationControls page={page} total={total} onPage={setPage} disabled={Boolean(busy)} />
+          </div>
         </CardHeader>
         <CardContent className="p-0">
           <Table>
@@ -10323,10 +11444,25 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                       <span className="text-muted-foreground">Not synced</span>
                     )}
                     {job.shopify_dest_name ? <div className="text-xs text-muted-foreground">{job.shopify_dest_name}</div> : null}
+                    {job.shopify_fulfillment_status || job.shopify_financial_status ? (
+                      <div className="mt-1 flex flex-wrap gap-1 text-xs text-muted-foreground">
+                        {job.shopify_fulfillment_status ? <span>Fulfilment: {job.shopify_fulfillment_status}</span> : null}
+                        {job.shopify_financial_status ? <span>Payment: {job.shopify_financial_status}</span> : null}
+                      </div>
+                    ) : null}
+                    {job.shopify_status_synced_at ? <div className="text-xs text-muted-foreground">Checked {formatDateTime(job.shopify_status_synced_at)}</div> : null}
                   </TableCell>
                   <TableCell>{job.store_name}</TableCell>
                   <TableCell><Badge variant="outline">{job.route?.toUpperCase()}</Badge></TableCell>
-                  <TableCell><StatusBadge value={job.status} /></TableCell>
+                  <TableCell>
+                    <div className="grid gap-1">
+                      <div className="flex flex-wrap gap-1">
+                        <StatusBadge value={job.status} />
+                        {job.needs_attention ? <Badge variant="outline" className="border-warning text-warning">Needs attention</Badge> : null}
+                      </div>
+                      {job.attention_reason ? <div className="max-w-[260px] text-xs text-warning">{job.attention_reason}</div> : null}
+                    </div>
+                  </TableCell>
                   <TableCell>{job.attempts}/{job.max_attempts}</TableCell>
                   <TableCell>{formatDateTime(job.updated_at || job.created_at)}</TableCell>
                   <TableCell className="max-w-md"><ErrorTooltip value={job.last_error} /></TableCell>
@@ -10340,6 +11476,11 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                       {job.shopify_order_id && ["completed", "failed", "dead"].includes(job.status) ? (
                         <Button size="sm" variant="warning" disabled={Boolean(busy)} onClick={() => repushJob(job)}>
                           {busy === `Repush-${job.id}` ? "Repushing..." : "Repush"}
+                        </Button>
+                      ) : null}
+                      {(job.shopify_order_id || job.status === "completed") ? (
+                        <Button size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => refreshJobStatus(job)}>
+                          {busy === `RefreshStatus-${job.id}` ? "Refreshing..." : "Refresh Status"}
                         </Button>
                       ) : null}
                     </div>
@@ -11455,14 +12596,18 @@ function SettingsPage({
               <Database className="size-4 text-muted-foreground" />
               <CardTitle>Database & Automation</CardTitle>
             </div>
-            <CardDescription>Postgres connection plus automatic order sync and Chrome fulfilment queue timing.</CardDescription>
+            <CardDescription>Postgres connection plus automatic Odoo order pulls from all stores and Chrome fulfilment queue timing.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4">
             <div className="grid gap-3 md:grid-cols-2">
               <TextField label="Postgres URL" type="password" value={settings.postgres_url || ""} onChange={(value) => setSetting("postgres_url", value)} />
-              <SelectField label="Auto Sync Orders" value={settings.autosync_interval_minutes || "0"} onChange={(value) => setSetting("autosync_interval_minutes", value)}>
+              <SelectField label="Auto Pull Orders From All Stores" value={settings.autosync_interval_minutes || "0"} onChange={(value) => setSetting("autosync_interval_minutes", value)}>
                 {["0", "15", "30", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
               </SelectField>
+              <SelectField label="Auto Pull Window" value={settings.pull_orders_days || "7"} onChange={(value) => setSetting("pull_orders_days", value)}>
+                {["1", "2", "3", "7", "14", "30", "60", "90"].map((value) => <option key={value} value={value}>Last {value} day{value === "1" ? "" : "s"}</option>)}
+              </SelectField>
+              <TextField label="Auto Pull Limit" value={settings.pull_orders_limit || "0"} onChange={(value) => setSetting("pull_orders_limit", value)} />
               <SelectField label="Auto Pull + Queue Chrome" value={settings.auto_chrome_fulfil_interval_minutes || "0"} onChange={(value) => setSetting("auto_chrome_fulfil_interval_minutes", value)}>
                 {["0", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
               </SelectField>
@@ -11478,12 +12623,18 @@ function SettingsPage({
               </SelectField>
               <TextField label="Odoo Pull Batch Size" value={settings.pull_orders_batch_size || "50"} onChange={(value) => setSetting("pull_orders_batch_size", value)} />
             </div>
-            <p className="text-xs text-muted-foreground">Order pulls read Odoo in batches and save each batch before moving to the next one. Use 50 unless Odoo starts throttling, then reduce it.</p>
+            <p className="text-xs text-muted-foreground">
+              Auto Pull Orders checks every configured store using this pull window, limit, and batch size. Limit 0 pulls every matching order in the selected day window.
+              {settings.autosync_last_run_at ? ` Last auto pull: ${formatDateTime(settings.autosync_last_run_at)}.` : ""}
+              {settings.autosync_last_message ? ` ${settings.autosync_last_message}` : ""}
+            </p>
             <div className="btn-list">
               <Button
                 onClick={() => saveSettingsGroup("Database & Automation", [
                   "postgres_url",
                   "autosync_interval_minutes",
+                  "pull_orders_days",
+                  "pull_orders_limit",
                   "auto_chrome_fulfil_interval_minutes",
                   "auto_chrome_fulfil_days",
                   "auto_chrome_fulfil_limit",

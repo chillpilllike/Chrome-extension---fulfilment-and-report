@@ -1221,7 +1221,7 @@
     position: fixed;
     top: 1.25rem;
     right: 1.25rem;
-    z-index: 120;
+    z-index: 2000;
     width: min(420px, calc(100vw - 2.5rem));
 }
 
@@ -1241,7 +1241,7 @@
     position: fixed;
     top: 1.25rem;
     right: 1.25rem;
-    z-index: 130;
+    z-index: 2000;
     width: min(460px, calc(100vw - 2.5rem));
 }
 
