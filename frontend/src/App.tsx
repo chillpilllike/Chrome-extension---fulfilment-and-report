@@ -5575,6 +5575,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   const scannerVideoRef = useRef<HTMLVideoElement | null>(null)
   const scannerControlsRef = useRef<IScannerControls | null>(null)
   const scannerReaderRef = useRef<BrowserMultiFormatReader | null>(null)
+  const scannerStreamRef = useRef<MediaStream | null>(null)
   const scannerLastCodeRef = useRef("")
   const scanResultRef = useRef<HTMLDivElement | null>(null)
 
@@ -5770,8 +5771,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       setBatchResults((current) => {
         const next = [...current, { code, message: result.message || "", ok: Boolean(result.matched), package: result.package, matches: result.matches }]
         if (next.length >= limit) {
-          scannerControlsRef.current?.stop()
-          scannerControlsRef.current = null
+          stopScannerStream()
           setScannerOpen(false)
           setBatchCameraMode(false)
           setScannerStatus(`Batch limit reached: ${limit} package(s).`)
@@ -5789,10 +5789,22 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
     }
   }
 
-  function stopCameraScanner() {
+  function stopScannerStream() {
     scannerControlsRef.current?.stop()
     scannerControlsRef.current = null
     scannerReaderRef.current = null
+    scannerStreamRef.current?.getTracks().forEach((track) => track.stop())
+    scannerStreamRef.current = null
+    if (scannerVideoRef.current) {
+      scannerVideoRef.current.pause()
+      scannerVideoRef.current.srcObject = null
+      scannerVideoRef.current.removeAttribute("src")
+      scannerVideoRef.current.load()
+    }
+  }
+
+  function stopCameraScanner() {
+    stopScannerStream()
     setScannerOpen(false)
     setBatchCameraMode(false)
     setScannerError("")
@@ -5811,24 +5823,69 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   useEffect(() => {
     if (!scannerOpen) return
     let cancelled = false
+    async function waitForScannerVideo() {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        if (scannerVideoRef.current) return scannerVideoRef.current
+        await new Promise((resolve) => window.setTimeout(resolve, 80))
+      }
+      return scannerVideoRef.current
+    }
     async function startScanner() {
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
           throw new Error("Camera access is not available in this browser.")
         }
+        const videoElement = await waitForScannerVideo()
+        if (!videoElement) {
+          throw new Error("Camera preview is not ready. Close scanner and try again.")
+        }
+        stopScannerStream()
+        videoElement.setAttribute("playsinline", "true")
+        videoElement.setAttribute("webkit-playsinline", "true")
+        videoElement.setAttribute("muted", "true")
+        videoElement.muted = true
+        videoElement.autoplay = true
+
         const reader = new BrowserMultiFormatReader()
         scannerReaderRef.current = reader
-        setScannerStatus("Point camera at the Amazon label barcode or QR code.")
-        const controls = await reader.decodeFromConstraints(
-          {
-            video: {
-              facingMode: { ideal: "environment" },
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-            },
-            audio: false,
+        setScannerStatus("Waiting for camera permission...")
+        const cameraConstraints: MediaStreamConstraints = {
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
           },
-          scannerVideoRef.current!,
+          audio: false,
+        }
+        const stream = await Promise.race([
+          navigator.mediaDevices.getUserMedia(cameraConstraints),
+          new Promise<never>((_, reject) => {
+            window.setTimeout(() => reject(new Error("Camera did not start. Close scanner, check browser camera permission, and try again.")), 10000)
+          }),
+        ])
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop())
+          return
+        }
+        scannerStreamRef.current = stream
+        videoElement.srcObject = stream
+        await videoElement.play()
+        if (!videoElement.videoWidth || !videoElement.videoHeight) {
+          await new Promise<void>((resolve) => {
+            const timeout = window.setTimeout(resolve, 800)
+            videoElement.addEventListener(
+              "loadedmetadata",
+              () => {
+                window.clearTimeout(timeout)
+                resolve()
+              },
+              { once: true },
+            )
+          })
+        }
+        setScannerStatus("Camera ready. Point at the Amazon label barcode or QR code.")
+        const controls = await reader.decodeFromVideoElement(
+          videoElement,
           (result) => {
             const text = result?.getText?.().trim()
             if (!text || scannerLastCodeRef.current === text) return
@@ -5839,8 +5896,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                 if (scannerLastCodeRef.current === text) scannerLastCodeRef.current = ""
               }, 1200)
             } else {
-              scannerControlsRef.current?.stop()
-              scannerControlsRef.current = null
+              stopScannerStream()
               setScannerOpen(false)
               setSearchConfirmation(`Scanned ${text}. Checking package...`)
               void submitScan(text)
@@ -5849,6 +5905,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
         )
         if (cancelled) {
           controls.stop()
+          stream.getTracks().forEach((track) => track.stop())
           return
         }
         scannerControlsRef.current = controls
@@ -5861,14 +5918,12 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
     void startScanner()
     return () => {
       cancelled = true
-      scannerControlsRef.current?.stop()
-      scannerControlsRef.current = null
-      scannerReaderRef.current = null
+      stopScannerStream()
     }
   }, [scannerOpen, batchCameraMode, batchLimit, scanEventPage, storeId])
 
   useEffect(() => () => {
-    scannerControlsRef.current?.stop()
+    stopScannerStream()
   }, [])
 
   async function placePackage(status = "sorted_holding") {
