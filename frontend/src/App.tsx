@@ -5660,12 +5660,11 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       })
       if (result.ambiguous && result.matches?.length) {
         setMatchedPackage(null)
-        setScanMatches(result.matches)
+        setScanMatches([...(result.matches || [])])
         setSuggestedTote("")
         const message = result.message || "Multiple packages matched. Select the correct package."
         setLastMessage(message)
         setSearchConfirmation(message)
-        onResult({ ok: true, title: "Multiple Matches", message })
       } else if (!result.matched || !result.package) {
         setMatchedPackage(null)
         setScanMatches([])
@@ -5673,7 +5672,6 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
         const message = result.message || "No match found."
         setLastMessage(message)
         setSearchConfirmation(message)
-        onResult({ ok: false, title: "Package Not Matched", message: `${message} Scan: ${code}` })
       } else {
         setMatchedPackage(result.package)
         setScanMatches([])
@@ -5983,7 +5981,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   }
   const submitScanEventSearch = () => {
     const nextQuery = scanEventQueryDraft.trim()
-    setScanEventNotice(nextQuery ? `Searching scan log for "${nextQuery}"...` : "Showing all scan log events.")
+    setScanEventNotice(nextQuery ? `Filtering saved scan log for "${nextQuery}". To match a package, use the large package scan box above.` : "Showing all scan log events.")
     if (nextQuery === scanEventQuery) {
       if (scanEventPage !== 1) setScanEventPage(1)
       return
@@ -6111,25 +6109,28 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               </button>
             ))}
           </div>
-          <form className="grid gap-2 md:grid-cols-[1fr_auto_auto]" onSubmit={scanPackage}>
-            <Input
-              ref={scanInputRef}
-              value={scanCode}
-              onChange={(event) => setScanCode(event.target.value)}
-              placeholder="Scan Amazon tracking, package, shipment, or order code"
-              className="h-14 text-lg font-semibold"
-              autoComplete="off"
-            />
+          <form className="grid gap-2 md:grid-cols-[1fr_auto_auto] md:items-end" onSubmit={scanPackage}>
+            <div className="grid gap-1">
+              <Label>Package scan / package search</Label>
+              <Input
+                ref={scanInputRef}
+                value={scanCode}
+                onChange={(event) => setScanCode(event.target.value)}
+                placeholder="Scan or type tracking code, package code, or last digits"
+                className="h-14 text-lg font-semibold"
+                autoComplete="off"
+              />
+            </div>
             <Button type="button" variant="outline" className="h-14 px-5" disabled={busy} onClick={() => openCameraScanner(false)}>
               <Camera className="size-5" />
               Camera
             </Button>
-            <Button className="h-14 px-6" disabled={busy || !scanCode.trim()}>
+            <Button type="submit" className="h-14 px-6" disabled={busy || !scanCode.trim()}>
               <Search className="size-5" />
               {busy ? "Scanning..." : "Scan"}
             </Button>
           </form>
-          <div ref={scanResultRef} className="grid gap-3">
+          <div ref={scanResultRef} className="sticky top-2 z-20 grid gap-3">
             {searchConfirmation ? (
               <div
                 role="status"
@@ -6655,11 +6656,11 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               onKeyDown={(event) => {
                 if (event.key === "Enter") submitScanEventSearch()
               }}
-              placeholder="Tracking, Amazon order, or order ref"
+              placeholder="Filter saved scan log only"
               className="h-9 w-56"
             />
             <Button type="button" variant="outline" size="sm" onClick={submitScanEventSearch}>
-              Search
+              Filter log
             </Button>
             {scanEventQuery || scanEventQueryDraft ? (
               <Button type="button" variant="outline" size="sm" onClick={clearScanEventSearch}>
