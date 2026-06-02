@@ -3,7 +3,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 45000;
 const AUTO_TRACKING_ALARM = "amazonTrackingAuto";
 const TRACKING_WATCHDOG_ALARM = "amazonTrackingWatchdog";
 const DEFAULT_AUTO_TRACKING_HOURS = 3;
-const TRACKING_STEP_TIMEOUT_MS = 45000;
+const TRACKING_STEP_TIMEOUT_MS = 30000;
 const RECENT_TRACKING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const ORDER_HISTORY_URL = "https://www.amazon.com/gp/css/order-history?ref_=abn_yadd_ad_your_orders";
 
@@ -125,7 +125,7 @@ async function clearWatchdogIfIdle() {
 }
 
 async function ensureWatchdog() {
-  chrome.alarms.create(TRACKING_WATCHDOG_ALARM, { periodInMinutes: 1 });
+  chrome.alarms.create(TRACKING_WATCHDOG_ALARM, { periodInMinutes: 0.5 });
 }
 
 async function log(message, windowId = null) {
@@ -718,6 +718,26 @@ async function advanceHistoryOrder(tracking, windowId, status = "checked") {
   await openHistoryCurrentOrder(windowId);
 }
 
+async function forceAdvanceHistoryOrder(message, windowId) {
+  const { tracking } = await getWindowState(windowId);
+  const order = tracking.currentOrder;
+  const messageOrderId = String(message.amazonOrderId || "").trim();
+  if (!tracking.running || tracking.source !== "history") {
+    return { ok: false, message: "Track all is not running." };
+  }
+  if (!order?.amazon_order_id) {
+    await openHistoryCurrentOrder(windowId);
+    return { ok: true, message: "Track all had no active order; opened the next saved item." };
+  }
+  if (messageOrderId && order.amazon_order_id !== messageOrderId) {
+    return { ok: true, ignored: true, message: `Ignored stale force-advance for ${messageOrderId}; active order is ${order.amazon_order_id}.` };
+  }
+  const status = String(message.status || "failed").trim() || "failed";
+  await log(`Force advancing Track all past ${order.amazon_order_id}: ${message.reason || status}.`, windowId);
+  await advanceHistoryOrder(tracking, windowId, status);
+  return { ok: true, message: `Advanced past ${order.amazon_order_id}.` };
+}
+
 async function handleHistoryTrackPage(message, windowId) {
   const { tracking } = await getWindowState(windowId);
   if (!tracking.running || tracking.source !== "history") return { ok: false, message: "Track all is not running." };
@@ -727,11 +747,30 @@ async function handleHistoryTrackPage(message, windowId) {
   const seen = new Set(tracking.seenOrderIds || []);
   const queue = Array.isArray(tracking.queue) ? tracking.queue : [];
   let added = 0;
+  let skippedCancelled = 0;
   const addedRawOrders = [];
   for (const rawOrder of message.orders || []) {
     const normalized = normalizeHistoryOrder(rawOrder);
     if (!normalized || seen.has(normalized.amazon_order_id)) continue;
     seen.add(normalized.amazon_order_id);
+    if (normalized.cancelled) {
+      skippedCancelled += 1;
+      tracking.completedOrderIds = [...(tracking.completedOrderIds || []), normalized.amazon_order_id];
+      rememberRecentCheck(normalized.amazon_order_id, "cancelled").catch(() => {});
+      api("/api/tracking/update", {
+        method: "POST",
+        body: JSON.stringify({
+          amazon_order_id: normalized.amazon_order_id,
+          amazon_order_url: normalized.amazon_order_url || orderUrl(normalized),
+          packages: [],
+          order_cancelled: true,
+          cancellation_message: normalized.status || "Cancelled order from Amazon order-history page.",
+        }),
+        timeoutMs: 8000,
+        retries: 0,
+      }).catch((error) => log(`Could not save cancelled history order ${normalized.amazon_order_id}: ${error.message}; skipped page open.`, windowId));
+      continue;
+    }
     addedRawOrders.push(rawOrder);
     queue.push({
       ...normalized,
@@ -748,9 +787,9 @@ async function handleHistoryTrackPage(message, windowId) {
   tracking.nextUrl = normalizeHistoryNextUrl(message.nextUrl || "", nextPage);
   tracking.pagesScanned = Number(tracking.pagesScanned || 0) + 1;
   tracking.lastActivityAt = Date.now();
-  tracking.lastMessage = `Scanned history page ${tracking.currentPage || ""}: ${added} order(s) queued; preparing matches in background.`;
+  tracking.lastMessage = `Scanned history page ${tracking.currentPage || ""}: ${added} order(s) queued${skippedCancelled ? `, ${skippedCancelled} cancelled skipped` : ""}; preparing matches in background.`;
   await saveTracking(tracking, windowId);
-  await log(`History page scanned: queued ${added} order(s); matching continues in background.`, windowId);
+  await log(`History page scanned: queued ${added} order(s)${skippedCancelled ? `, skipped ${skippedCancelled} cancelled order(s)` : ""}; matching continues in background.`, windowId);
   if (!tracking.currentOrder) await openHistoryCurrentOrder(windowId);
   if (addedRawOrders.length) {
     syncHistoryOrdersToAppBatch(addedRawOrders, windowId).catch((error) => log(`Batch Track all preparation failed: ${error.message}`, windowId));
@@ -1166,6 +1205,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "ORDER_PACKAGES") return handleOrderPackages(message, windowId);
     if (message.type === "PACKAGE_TRACKING") return handlePackageTracking(message, windowId);
     if (message.type === "ORDER_HISTORY_TRACK_ALL_PAGE") return handleHistoryTrackPage(message, windowId);
+    if (message.type === "FORCE_ADVANCE_HISTORY_ORDER") return forceAdvanceHistoryOrder(message, windowId);
     return { ok: false, message: "Unknown message." };
   })()
     .then((result) => sendResponse(result))

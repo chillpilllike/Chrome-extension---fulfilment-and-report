@@ -176,6 +176,10 @@ function isOrderHistoryPage() {
   return /\/(?:gp\/css\/order-history|gp\/your-account\/order-history|your-orders(?:\/orders?)?)(?:[/?#]|$)/i.test(location.href);
 }
 
+function isOrderDetailsLikePage() {
+  return /order-details|your-orders\/order|gp\/css\/summary|gp\/your-account\/order|gp\/your-account\/ship-track/i.test(location.href);
+}
+
 function recipientFromOrderHistoryText(text = "") {
   const value = String(text || "").replace(/\s+/g, " ").trim();
   const nutricityMatch = value.match(/\bNutricity\s+[A-Z]{2,5}\d{2,}(?:\s+[A-Za-z0-9]+){0,4}/i);
@@ -579,11 +583,26 @@ async function run() {
     }
     return;
   }
-  if (/order-details/i.test(location.href)) {
+  if (isOrderDetailsLikePage()) {
     const data = parseOrderDetails();
     if (!data.amazonOrderId) return;
-    showPanel("Nutricity tracking", `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`);
+    showPanel(
+      "Nutricity tracking",
+      data.orderCancelled
+        ? `Cancelled order detected for ${data.amazonOrderId}. Moving to next order.`
+        : `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`,
+    );
     const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data }, 15000);
+    if (data.orderCancelled) {
+      window.setTimeout(() => {
+        void send({
+          type: "FORCE_ADVANCE_HISTORY_ORDER",
+          amazonOrderId: data.amazonOrderId,
+          status: "cancelled",
+          reason: data.cancellationMessage || "Cancelled order page",
+        });
+      }, 5000);
+    }
     if (response?.ignored) {
       showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
     } else if (response && response.ok === false) {
@@ -602,11 +621,46 @@ if (!window.__nutricityTrackingRunning) {
 
 if (!window.__nutricityTrackAllWatcher) {
   window.__nutricityTrackAllWatcher = setInterval(async () => {
-    if (!extensionContextAlive || !isOrderHistoryPage()) return;
+    if (!extensionContextAlive) return;
     try {
       const state = await send({ type: "GET_STATE" });
-      if (state?.tracking?.running && state.tracking.source === "history") {
+      if (!(state?.tracking?.running && state.tracking.source === "history")) return;
+      if (isOrderHistoryPage()) {
         await scanOrderHistoryForTrackAll(state);
+        return;
+      }
+      if (isOrderDetailsLikePage()) {
+        const data = parseOrderDetails();
+        if (data.amazonOrderId && data.orderCancelled) {
+          const signature = `${state.tracking.startedAt || ""}|cancelled|${data.amazonOrderId}|${location.href}`;
+          if (window.__nutricityLastCancelledOrderSignature === signature) return;
+          window.__nutricityLastCancelledOrderSignature = signature;
+          showPanel("Nutricity tracking", `Cancelled order detected for ${data.amazonOrderId}. Moving to next order.`);
+          const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data }, 15000);
+          if (!response?.ok) {
+            await send({
+              type: "FORCE_ADVANCE_HISTORY_ORDER",
+              amazonOrderId: data.amazonOrderId,
+              status: "cancelled",
+              reason: data.cancellationMessage || "Cancelled order page",
+            });
+          }
+        }
+        return;
+      }
+      const cancellation = parseOrderCancellation();
+      const activeOrderId = state.tracking.currentOrder?.amazon_order_id || currentOrderId();
+      if (activeOrderId && cancellation.orderCancelled) {
+        const signature = `${state.tracking.startedAt || ""}|generic-cancelled|${activeOrderId}|${location.href}`;
+        if (window.__nutricityLastCancelledOrderSignature === signature) return;
+        window.__nutricityLastCancelledOrderSignature = signature;
+        showPanel("Nutricity tracking", `Cancelled order detected for ${activeOrderId}. Moving to next order.`);
+        await send({
+          type: "FORCE_ADVANCE_HISTORY_ORDER",
+          amazonOrderId: activeOrderId,
+          status: "cancelled",
+          reason: cancellation.cancellationMessage || "Cancelled order page",
+        });
       }
     } catch (_) {
       // The background service worker can sleep between scans; the next tick will retry.
