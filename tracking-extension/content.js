@@ -377,9 +377,9 @@ function parsePaymentRevision() {
 
 function parseOrderCancellation() {
   const alert = [...document.querySelectorAll(".a-alert-heading, .a-alert-content, .a-box-inner")]
-    .find((element) => /order has been cancelled|order was cancelled|this order has been canceled|this order has been cancelled/i.test(clean(element.textContent)));
+    .find((element) => /order has been cancell?ed|order was cancell?ed|this order has been cancell?ed|order cancell?ed|cancell?ed order/i.test(clean(element.textContent)));
   const pageText = clean(document.body.textContent || "");
-  const cancelled = Boolean(alert) || /this order has been cancelled|this order has been canceled/i.test(pageText);
+  const cancelled = Boolean(alert) || /order has been cancell?ed|order was cancell?ed|this order has been cancell?ed|order cancell?ed|cancell?ed order/i.test(pageText);
   return {
     orderCancelled: cancelled,
     cancellationMessage: cancelled ? clean(alert?.textContent || "This order has been cancelled.") : "",
@@ -583,7 +583,7 @@ async function run() {
     const data = parseOrderDetails();
     if (!data.amazonOrderId) return;
     showPanel("Nutricity tracking", `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`);
-    const response = await send({ type: "ORDER_PACKAGES", ...data });
+    const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data }, 15000);
     if (response?.ignored) {
       showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
     } else if (response && response.ok === false) {
