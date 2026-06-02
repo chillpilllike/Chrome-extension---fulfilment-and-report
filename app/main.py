@@ -63,6 +63,8 @@ from app.schemas import (
     ChromeTrackingUpdatePayload,
     CostlyApprovalPayload,
     DeleteLinesPayload,
+    DispatchPlacePayload,
+    DispatchScanPayload,
     EnginePayload,
     EpostBrowserlessRunPayload,
     EpostRefundPayload,
@@ -902,6 +904,41 @@ def init_db() -> None:
                 UNIQUE(folder, uid)
             );
 
+            CREATE TABLE IF NOT EXISTS amazon_dispatch_packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_code TEXT NOT NULL UNIQUE,
+                display_code TEXT NOT NULL,
+                amazon_order_id TEXT NOT NULL,
+                amazon_order_url TEXT,
+                store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+                odoo_order_id INTEGER,
+                odoo_order_name TEXT,
+                order_line_ids_json TEXT NOT NULL DEFAULT '[]',
+                package_index INTEGER NOT NULL DEFAULT 1,
+                package_status TEXT,
+                promise TEXT,
+                carrier TEXT,
+                tracking_url TEXT,
+                asins_json TEXT NOT NULL DEFAULT '[]',
+                products_json TEXT NOT NULL DEFAULT '[]',
+                destination_country_code TEXT,
+                destination_country_name TEXT,
+                dispatch_date TEXT,
+                destination_zone TEXT,
+                service TEXT NOT NULL DEFAULT 'STD',
+                priority TEXT NOT NULL DEFAULT 'N',
+                fulfilment_type TEXT NOT NULL DEFAULT 'STANDARD',
+                tote_code TEXT,
+                scan_status TEXT NOT NULL DEFAULT 'pending',
+                received_at TEXT,
+                placed_at TEXT,
+                last_scanned_at TEXT,
+                scan_count INTEGER NOT NULL DEFAULT 0,
+                exception_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS shopify_fulfilment_jobs (
                 id TEXT PRIMARY KEY,
                 store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
@@ -1104,6 +1141,11 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_amazon_otp_order ON amazon_otp_records(amazon_order_id)",
             "CREATE INDEX IF NOT EXISTS idx_amazon_otp_updated ON amazon_otp_records(updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_amazon_otp_email_type ON amazon_otp_email_uids(email_type, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_scan_code ON amazon_dispatch_packages(scan_code)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_order ON amazon_dispatch_packages(amazon_order_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_tote ON amazon_dispatch_packages(tote_code, scan_status)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_status_updated ON amazon_dispatch_packages(scan_status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_sorting ON amazon_dispatch_packages(dispatch_date, destination_zone, service, priority, fulfilment_type)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_fulfilment_jobs_status ON shopify_fulfilment_jobs(status, next_run_at, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_fulfilment_jobs_order ON shopify_fulfilment_jobs(store_id, odoo_order_name)",
             "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_jobs_status ON shopify_tracking_jobs(status, created_at)",
@@ -2962,6 +3004,321 @@ def amazon_products_from_tracking_payload(payload_text: str, fallback_asin: str 
             return matching_products
         add_product(fallback, asin_product_url(fallback), fallback_title)
     return products
+
+
+def normalize_dispatch_scan_code(value: Any) -> str:
+    text = clean_text(str(value or "")).upper()
+    if not text:
+        return ""
+    url_match = re.search(r"(?:TRACKING|TRACKINGID|TRACKING-ID|PACKAGEID|PACKAGE-ID|SHIPMENTID|SHIPMENT-ID|ORDERID|ORDER-ID)=([^&#\s]+)", text, re.IGNORECASE)
+    if url_match:
+        text = url_match.group(1)
+    text = html.unescape(text)
+    text = re.sub(r"[^A-Z0-9-]", "", text)
+    return text
+
+
+def dispatch_codes_from_package(package: dict[str, Any], amazon_order_id: str = "") -> list[tuple[str, str]]:
+    values: list[Any] = []
+    for key in (
+        "tracking_id",
+        "trackingId",
+        "tracking_number",
+        "trackingNumber",
+        "tracking_code",
+        "trackingCode",
+        "package_id",
+        "packageId",
+        "packageIdentifier",
+        "shipment_id",
+        "shipmentId",
+        "carrier_tracking",
+    ):
+        values.append(package.get(key))
+    url = clean_text(package.get("tracking_url"))
+    values.append(url)
+    for key in ("trackingId", "trackingID", "packageId", "packageID", "shipmentId", "shipmentID"):
+        match = re.search(rf"[?&#]{key}=([^&#]+)", url, re.IGNORECASE)
+        if match:
+            values.append(match.group(1))
+    if amazon_order_id:
+        values.append(amazon_order_id)
+    seen: set[str] = set()
+    codes: list[tuple[str, str]] = []
+    for raw in values:
+        display = clean_text(raw)
+        code = normalize_dispatch_scan_code(raw)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        codes.append((code, display or code))
+    return codes
+
+
+def dispatch_zone_from_country(code: str, name: str = "") -> str:
+    clean_code = clean_text(code).upper()
+    clean_name = clean_text(name).upper()
+    if clean_code in {"US", "CA", "AU", "NZ", "SG"}:
+        return clean_code
+    if clean_code in {"GB", "UK"}:
+        return "UK"
+    if clean_code in {"AE", "SA", "QA", "KW", "BH", "OM"}:
+        return f"GCC-{clean_code}"
+    eu_codes = {
+        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU",
+        "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+    }
+    if clean_code in eu_codes:
+        return f"EU-{clean_code}"
+    if clean_name:
+        normalized = re.sub(r"[^A-Z0-9]+", "-", clean_name).strip("-")
+        return normalized[:12] or "ROW"
+    return clean_code or "ROW"
+
+
+def dispatch_service_from_package(package: dict[str, Any]) -> str:
+    text = json.dumps(package, default=str).lower()
+    if any(word in text for word in ("expedited", "express", "priority")):
+        return "EXP"
+    return "STD"
+
+
+def dispatch_priority_from_package(package: dict[str, Any]) -> str:
+    text = json.dumps(package, default=str).lower()
+    if any(word in text for word in ("delayed", "late", "urgent", "today")):
+        return "U"
+    return "N"
+
+
+def dispatch_today_code() -> str:
+    try:
+        today = datetime.now(ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Kolkata"))).date()
+    except Exception:
+        today = datetime.now(timezone.utc).date()
+    return today.strftime("D%d")
+
+
+def dispatch_tote_prefix(row: dict[str, Any], ready: bool = True) -> str:
+    if not ready:
+        return f"HOLD-PARTIAL-{clean_text(row.get('destination_zone')) or 'ROW'}"
+    dispatch_day = clean_text(row.get("dispatch_date")) or dispatch_today_code()
+    return "-".join(
+        part
+        for part in [
+            dispatch_day,
+            clean_text(row.get("destination_zone")) or "ROW",
+            clean_text(row.get("service")) or "STD",
+            clean_text(row.get("priority")) or "N",
+            clean_text(row.get("fulfilment_type")) or "STANDARD",
+        ]
+        if part
+    )
+
+
+def suggested_dispatch_tote(conn: Any, row: dict[str, Any], ready: bool = True) -> str:
+    prefix = dispatch_tote_prefix(row, ready)
+    existing = conn.execute(
+        """
+        SELECT tote_code, COUNT(*) AS count
+        FROM amazon_dispatch_packages
+        WHERE tote_code LIKE ?
+        GROUP BY tote_code
+        ORDER BY tote_code
+        """,
+        (f"{prefix}-%",),
+    ).fetchall()
+    for tote in existing:
+        if int(tote["count"] or 0) < 40:
+            return clean_text(tote["tote_code"])
+    return f"{prefix}-{len(existing) + 1:02d}"
+
+
+def parse_tracking_packages(payload_text: str) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(payload_text or "[]")
+    except Exception:
+        parsed = []
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
+    order_id = clean_text(amazon_order_id)
+    if not order_id:
+        return 0
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM order_lines
+        WHERE amazon_order_id=?
+          AND COALESCE(order_engine, '') != 'third_party'
+        ORDER BY id
+        """,
+        (order_id,),
+    ).fetchall()
+    if not rows:
+        return 0
+    packages: list[dict[str, Any]] = []
+    seen_package_keys: set[str] = set()
+    for row in rows:
+        for package in parse_tracking_packages(row["tracking_payload"]):
+            codes = dispatch_codes_from_package(package, order_id)
+            key = "|".join(code for code, _display in codes) or json.dumps(package, sort_keys=True, default=str)[:300]
+            if key in seen_package_keys:
+                continue
+            seen_package_keys.add(key)
+            packages.append(package)
+    if not packages:
+        return 0
+    now = utc_now()
+    updated = 0
+    for index, package in enumerate(packages, start=1):
+        codes = dispatch_codes_from_package(package, order_id)
+        if not codes:
+            continue
+        matching_rows = [row for row in rows if package_matches_line(package, row)] or list(rows)
+        primary = matching_rows[0]
+        code, display_code = codes[0]
+        destination_code, destination_name, _label = destination_country_from_row(row_to_dict(primary))
+        dispatch_row = {
+            "destination_zone": dispatch_zone_from_country(destination_code, destination_name),
+            "dispatch_date": dispatch_today_code(),
+            "service": dispatch_service_from_package(package),
+            "priority": dispatch_priority_from_package(package),
+            "fulfilment_type": "STANDARD",
+        }
+        products = package.get("products") if isinstance(package.get("products"), list) else []
+        asins = package.get("asins") if isinstance(package.get("asins"), list) else []
+        if not asins:
+            asins = [product.get("asin") for product in products if isinstance(product, dict) and product.get("asin")]
+        conn.execute(
+            """
+            INSERT INTO amazon_dispatch_packages (
+                scan_code, display_code, amazon_order_id, amazon_order_url, store_id, odoo_order_id, odoo_order_name,
+                order_line_ids_json, package_index, package_status, promise, carrier, tracking_url, asins_json,
+                products_json, destination_country_code, destination_country_name, dispatch_date, destination_zone,
+                service, priority, fulfilment_type, scan_status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            ON CONFLICT(scan_code) DO UPDATE SET
+                display_code=excluded.display_code,
+                amazon_order_id=excluded.amazon_order_id,
+                amazon_order_url=COALESCE(NULLIF(excluded.amazon_order_url, ''), amazon_dispatch_packages.amazon_order_url),
+                store_id=excluded.store_id,
+                odoo_order_id=excluded.odoo_order_id,
+                odoo_order_name=excluded.odoo_order_name,
+                order_line_ids_json=excluded.order_line_ids_json,
+                package_index=excluded.package_index,
+                package_status=excluded.package_status,
+                promise=excluded.promise,
+                carrier=excluded.carrier,
+                tracking_url=COALESCE(NULLIF(excluded.tracking_url, ''), amazon_dispatch_packages.tracking_url),
+                asins_json=excluded.asins_json,
+                products_json=excluded.products_json,
+                destination_country_code=excluded.destination_country_code,
+                destination_country_name=excluded.destination_country_name,
+                dispatch_date=excluded.dispatch_date,
+                destination_zone=excluded.destination_zone,
+                service=excluded.service,
+                priority=excluded.priority,
+                fulfilment_type=excluded.fulfilment_type,
+                updated_at=excluded.updated_at
+            """,
+            (
+                code,
+                display_code,
+                order_id,
+                clean_text(primary["amazon_order_url"]) or order_line_amazon_url(order_id),
+                primary["store_id"],
+                primary["odoo_order_id"],
+                primary["odoo_order_name"],
+                json.dumps([int(row["id"]) for row in matching_rows]),
+                index,
+                clean_text(package.get("status") or package.get("order_status")),
+                clean_text(package.get("promise")),
+                clean_text(package.get("carrier")),
+                clean_text(package.get("tracking_url")),
+                json.dumps([normalize_asin(str(asin)) for asin in asins if normalize_asin(str(asin))]),
+                json.dumps(products[:12], default=str),
+                destination_code,
+                destination_name,
+                dispatch_row["dispatch_date"],
+                dispatch_row["destination_zone"],
+                dispatch_row["service"],
+                dispatch_row["priority"],
+                dispatch_row["fulfilment_type"],
+                now,
+                now,
+            ),
+        )
+        updated += 1
+        for alias_code, alias_display in codes[1:]:
+            conn.execute(
+                """
+                INSERT INTO amazon_dispatch_packages (
+                    scan_code, display_code, amazon_order_id, amazon_order_url, store_id, odoo_order_id, odoo_order_name,
+                    order_line_ids_json, package_index, package_status, promise, carrier, tracking_url, asins_json,
+                    products_json, destination_country_code, destination_country_name, dispatch_date, destination_zone,
+                    service, priority, fulfilment_type, scan_status, created_at, updated_at
+                )
+                SELECT ?, ?, amazon_order_id, amazon_order_url, store_id, odoo_order_id, odoo_order_name,
+                       order_line_ids_json, package_index, package_status, promise, carrier, tracking_url, asins_json,
+                       products_json, destination_country_code, destination_country_name, dispatch_date, destination_zone,
+                       service, priority, fulfilment_type, scan_status, ?, ?
+                FROM amazon_dispatch_packages
+                WHERE scan_code=?
+                ON CONFLICT(scan_code) DO NOTHING
+                """,
+                (alias_code, alias_display, now, now, code),
+            )
+    return updated
+
+
+def dispatch_package_payload(conn: Any, row: dict[str, Any]) -> dict[str, Any]:
+    data = row_to_dict(row)
+    for json_key in ("order_line_ids_json", "asins_json", "products_json"):
+        try:
+            data[json_key.replace("_json", "")] = json.loads(data.get(json_key) or "[]")
+        except Exception:
+            data[json_key.replace("_json", "")] = []
+    ready = dispatch_order_ready(conn, data)
+    data["suggested_tote"] = suggested_dispatch_tote(conn, data, ready)
+    data["order_ready"] = ready
+    data["remaining_packages"] = dispatch_remaining_packages(conn, data)
+    return data
+
+
+def dispatch_remaining_packages(conn: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, display_code, package_index, package_status, promise, scan_status, tote_code, last_scanned_at, placed_at
+        FROM amazon_dispatch_packages
+        WHERE store_id=?
+          AND odoo_order_id=?
+          AND amazon_order_id=?
+          AND id<>?
+        ORDER BY package_index, id
+        """,
+        (row.get("store_id"), row.get("odoo_order_id"), row.get("amazon_order_id"), row.get("id")),
+    ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def dispatch_order_ready(conn: Any, row: dict[str, Any]) -> bool:
+    result = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN scan_status IN ('received_unopened', 'sorted_holding', 'opened_verified', 'dispatched') THEN 1 ELSE 0 END) AS received
+        FROM amazon_dispatch_packages
+        WHERE store_id=?
+          AND odoo_order_id=?
+          AND amazon_order_id=?
+        """,
+        (row.get("store_id"), row.get("odoo_order_id"), row.get("amazon_order_id")),
+    ).fetchone()
+    total = int(result["total"] or 0) if result else 0
+    received = int(result["received"] or 0) if result else 0
+    return bool(total and received >= total)
 
 
 def list_addresses() -> list[dict[str, Any]]:
@@ -20276,6 +20633,155 @@ def api_dispatch_status_summary(store_id: Optional[int] = None) -> dict[str, Any
     return fast_page_cache_set(cache_key, {"ok": True, "summary": summary}, 20)
 
 
+@app.get("/api/dispatch-sorting/summary")
+def api_dispatch_sorting_summary(store_id: Optional[int] = None) -> dict[str, Any]:
+    with db() as conn:
+        rows = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT scan_status, COUNT(*) AS count
+                FROM amazon_dispatch_packages
+                WHERE (? IS NULL OR store_id=?)
+                GROUP BY scan_status
+                """,
+                (store_id, store_id),
+            ).fetchall()
+        )
+        totes = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT COALESCE(NULLIF(tote_code, ''), 'UNASSIGNED') AS tote_code,
+                       COUNT(*) AS count,
+                       MAX(updated_at) AS updated_at
+                FROM amazon_dispatch_packages
+                WHERE (? IS NULL OR store_id=?)
+                  AND COALESCE(tote_code, '') != ''
+                GROUP BY COALESCE(NULLIF(tote_code, ''), 'UNASSIGNED')
+                ORDER BY MAX(updated_at) DESC
+                LIMIT 30
+                """,
+                (store_id, store_id),
+            ).fetchall()
+        )
+        recent = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT id, display_code, amazon_order_id, odoo_order_name, destination_zone, tote_code,
+                       scan_status, last_scanned_at, placed_at, package_status
+                FROM amazon_dispatch_packages
+                WHERE (? IS NULL OR store_id=?)
+                  AND COALESCE(last_scanned_at, placed_at, updated_at) IS NOT NULL
+                ORDER BY COALESCE(last_scanned_at, placed_at, updated_at) DESC
+                LIMIT 20
+                """,
+                (store_id, store_id),
+            ).fetchall()
+        )
+    summary = {clean_text(row["scan_status"]) or "pending": int(row["count"] or 0) for row in rows}
+    return {"ok": True, "summary": summary, "totes": totes, "recent": recent}
+
+
+@app.post("/api/dispatch-sorting/rebuild")
+def api_dispatch_sorting_rebuild(store_id: Optional[int] = None) -> dict[str, Any]:
+    with db() as conn:
+        orders = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT DISTINCT amazon_order_id
+                FROM order_lines
+                WHERE COALESCE(amazon_order_id, '') != ''
+                  AND COALESCE(tracking_payload, '') != ''
+                  AND (? IS NULL OR store_id=?)
+                ORDER BY amazon_order_id
+                LIMIT 5000
+                """,
+                (store_id, store_id),
+            ).fetchall()
+        )
+        updated = 0
+        for order in orders:
+            updated += sync_dispatch_packages_for_order(conn, order["amazon_order_id"])
+    fast_page_cache_clear()
+    return {"ok": True, "orders": len(orders), "packages": updated, "message": f"Rebuilt dispatch scan index for {len(orders)} Amazon order(s)."}
+
+
+@app.post("/api/dispatch-sorting/scan")
+def api_dispatch_sorting_scan(payload: DispatchScanPayload) -> dict[str, Any]:
+    scan_code = normalize_dispatch_scan_code(payload.scan_code)
+    if not scan_code:
+        raise HTTPException(400, "scan_code is required")
+    now = utc_now()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM amazon_dispatch_packages
+            WHERE scan_code=?
+              AND (? IS NULL OR store_id=?)
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (scan_code, payload.store_id, payload.store_id),
+        ).fetchone()
+        if not row:
+            return {
+                "ok": True,
+                "matched": False,
+                "scan_code": scan_code,
+                "suggested_tote": "EXCEPTION-SCAN-01",
+                "message": "No matching Amazon package was found. Place it in the exception tote.",
+                "exception_reasons": ["not_found", "wrong_barcode", "old_order_not_backfilled", "damaged_label"],
+            }
+        next_status = row["scan_status"] if row["scan_status"] and row["scan_status"] != "pending" else "received_unopened"
+        conn.execute(
+            """
+            UPDATE amazon_dispatch_packages
+            SET scan_status=?,
+                received_at=COALESCE(received_at, ?),
+                last_scanned_at=?,
+                scan_count=scan_count+1,
+                updated_at=?
+            WHERE id=?
+            """,
+            (next_status, now, now, now, row["id"]),
+        )
+        updated = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (row["id"],)).fetchone()
+        package = dispatch_package_payload(conn, updated)
+    fast_page_cache_clear()
+    return {"ok": True, "matched": True, "package": package, "message": f"Matched {package['amazon_order_id']}. Place in {package['suggested_tote']}."}
+
+
+@app.post("/api/dispatch-sorting/packages/{package_id}/place")
+def api_dispatch_sorting_place(package_id: int, payload: DispatchPlacePayload) -> dict[str, Any]:
+    status = clean_text(payload.status) or "sorted_holding"
+    if status not in {"received_unopened", "sorted_holding", "opened_verified", "dispatched", "exception"}:
+        raise HTTPException(400, "Invalid dispatch package status")
+    now = utc_now()
+    tote_code = normalize_dispatch_scan_code(payload.tote_code) or clean_text(payload.tote_code).upper()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (package_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Dispatch package not found")
+        if not tote_code and status != "exception":
+            tote_code = suggested_dispatch_tote(conn, row_to_dict(row), dispatch_order_ready(conn, row_to_dict(row)))
+        conn.execute(
+            """
+            UPDATE amazon_dispatch_packages
+            SET tote_code=?,
+                scan_status=?,
+                exception_reason=?,
+                placed_at=CASE WHEN ?='sorted_holding' THEN COALESCE(placed_at, ?) ELSE placed_at END,
+                updated_at=?
+            WHERE id=?
+            """,
+            (tote_code, status, clean_text(payload.exception_reason), status, now, now, package_id),
+        )
+        updated = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (package_id,)).fetchone()
+        package = dispatch_package_payload(conn, updated)
+    fast_page_cache_clear()
+    return {"ok": True, "package": package, "message": f"Package moved to {package.get('tote_code') or status}."}
+
+
 @app.post("/api/tracking/update")
 def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
     amazon_order_id = clean_text(payload.amazon_order_id)
@@ -20549,6 +21055,8 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     updated_rows_for_index.append(updated_row)
     for updated_row in updated_rows_for_index:
         index_order_line(updated_row)
+    with db() as conn:
+        sync_dispatch_packages_for_order(conn, amazon_order_id)
     if delivered_flag:
         try:
             store = get_store(int(rows[0]["store_id"]))

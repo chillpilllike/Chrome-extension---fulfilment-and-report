@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import type { DragEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
+import type { DragEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
 import {
   IconAlertCircle as AlertCircle,
   IconBell as Bell,
   IconBuildingStore as StoreIcon,
+  IconCamera as Camera,
   IconCheck as Check,
   IconCircleCheck as CheckCircle2,
   IconChevronDown as ChevronDown,
@@ -33,6 +34,7 @@ import {
   IconUserCircle as UserCircle,
 } from "@tabler/icons-react"
 import { Popover } from "@base-ui/react/popover"
+import { BrowserMultiFormatReader, type IScannerControls } from "@zxing/browser"
 
 import { APP_VERSION } from "@/appVersion"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -61,6 +63,7 @@ const KNOWN_APP_PAGES = new Set([
   "pull-jobs",
   "chrome-queue",
   "tracking",
+  "dispatch-sorting",
   "dispatch-status",
   "payment-failed",
   "amazon-otp",
@@ -291,6 +294,65 @@ type TrackingOrder = {
   amazon_cancelled_at?: string
   amazon_cancelled_order_id?: string
   lines: OrderLine[]
+}
+
+type DispatchPackage = {
+  id: number
+  scan_code: string
+  display_code: string
+  amazon_order_id: string
+  amazon_order_url?: string
+  odoo_order_name: string
+  package_index: number
+  package_status: string
+  promise: string
+  carrier: string
+  tracking_url: string
+  asins: string[]
+  products: Array<{ asin?: string; title?: string; image_url?: string; url?: string }>
+  destination_country_code: string
+  destination_country_name: string
+  destination_zone: string
+  dispatch_date: string
+  service: string
+  priority: string
+  fulfilment_type: string
+  tote_code: string
+  suggested_tote: string
+  scan_status: string
+  received_at: string
+  placed_at: string
+  last_scanned_at: string
+  scan_count: number
+  order_ready: boolean
+  remaining_packages: Array<{
+    id: number
+    display_code: string
+    package_index: number
+    package_status: string
+    promise: string
+    scan_status: string
+    tote_code: string
+    last_scanned_at: string
+    placed_at: string
+  }>
+}
+
+type DispatchSortingSummary = {
+  summary: Record<string, number>
+  totes: Array<{ tote_code: string; count: number; updated_at: string }>
+  recent: Array<{
+    id: number
+    display_code: string
+    amazon_order_id: string
+    odoo_order_name: string
+    destination_zone: string
+    tote_code: string
+    scan_status: string
+    last_scanned_at: string
+    placed_at: string
+    package_status: string
+  }>
 }
 
 type PaymentFailure = {
@@ -657,6 +719,7 @@ const defaultUiCopy: UiCopy = {
   "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
   "chrome-queue": { title: "Chrome Queue", description: "Review Chrome extension jobs and release stale locks." },
   tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
+  "dispatch-sorting": { title: "Dispatch Sorting", description: "Scan Amazon packages, match orders instantly, and place them into totes." },
   "dispatch-status": { title: "Dispatch Status", description: "Track Odoo order to dispatch timing, ePost movement, and delay risk." },
   "payment-failed": { title: "Payment Failed", description: "Review Amazon orders that need payment revision." },
   "amazon-otp": { title: "Amazon OTP", description: "Match OTP emails to Amazon and Odoo orders." },
@@ -3587,6 +3650,7 @@ function App() {
       icon: PackageCheck,
       items: [
         ["tracking", "Amazon Tracking", PackageCheck],
+        ["dispatch-sorting", "Dispatch Sorting", PackageCheck],
         ["dispatch-status", "Dispatch Status", PackageCheck],
         ["payment-failed", "Payment Failed", AlertCircle],
         ["amazon-otp", "Amazon OTP", Bell],
@@ -3615,6 +3679,7 @@ function App() {
       icon: PackageCheck,
       items: [
         ["tracking", "Amazon Tracking", PackageCheck],
+        ["dispatch-sorting", "Dispatch Sorting", PackageCheck],
         ["fulfilment-pending", "Pending Dispatch", AlertCircle],
         ["dispatch-status", "Dispatch Status", PackageCheck],
         ["amazon-otp", "Amazon OTP", Bell],
@@ -4519,6 +4584,9 @@ function App() {
             onResult={setModal}
           />
         )}
+        {page === "dispatch-sorting" && (
+          <DispatchSortingPage storeId={storeId} onResult={setModal} />
+        )}
         {page === "amazon-otp" && (
           <AmazonOtpPage onResult={setModal} />
         )}
@@ -5226,6 +5294,384 @@ function StoresPage({ stores, onChanged, onResult }: { stores: Store[]; onChange
   )
 }
 
+function DispatchSortingPage({ storeId, onResult }: { storeId: string; onResult: (modal: ModalState) => void }) {
+  const [scanCode, setScanCode] = useState("")
+  const [matchedPackage, setMatchedPackage] = useState<DispatchPackage | null>(null)
+  const [suggestedTote, setSuggestedTote] = useState("")
+  const [summary, setSummary] = useState<DispatchSortingSummary>({ summary: {}, totes: [], recent: [] })
+  const [busy, setBusy] = useState(false)
+  const [lastMessage, setLastMessage] = useState("")
+  const [scannerOpen, setScannerOpen] = useState(false)
+  const [scannerError, setScannerError] = useState("")
+  const [scannerStatus, setScannerStatus] = useState("")
+  const scanInputRef = useRef<HTMLInputElement | null>(null)
+  const scannerVideoRef = useRef<HTMLVideoElement | null>(null)
+  const scannerControlsRef = useRef<IScannerControls | null>(null)
+  const scannerReaderRef = useRef<BrowserMultiFormatReader | null>(null)
+  const scannerLastCodeRef = useRef("")
+
+  async function refreshSummary() {
+    const query = new URLSearchParams()
+    if (storeId) query.set("store_id", storeId)
+    const result = await api<DispatchSortingSummary & { ok: boolean }>(`/api/dispatch-sorting/summary?${query.toString()}`)
+    setSummary({ summary: result.summary || {}, totes: result.totes || [], recent: result.recent || [] })
+  }
+
+  useEffect(() => {
+    refreshSummary().catch((error) => onResult({ ok: false, title: "Dispatch Summary Failed", message: String(error) }))
+  }, [storeId])
+
+  useEffect(() => {
+    scanInputRef.current?.focus()
+  }, [matchedPackage])
+
+  async function submitScan(rawCode: string) {
+    const code = rawCode.trim()
+    if (!code) return
+    scannerLastCodeRef.current = code
+    setScannerStatus(code)
+    setBusy(true)
+    try {
+      const result = await api<{ ok: boolean; matched: boolean; package?: DispatchPackage; suggested_tote?: string; message: string }>("/api/dispatch-sorting/scan", {
+        method: "POST",
+        body: JSON.stringify({ scan_code: code, store_id: storeId ? Number(storeId) : null }),
+      })
+      if (!result.matched || !result.package) {
+        setMatchedPackage(null)
+        setSuggestedTote(result.suggested_tote || "EXCEPTION-SCAN-01")
+        setLastMessage(result.message || "No match found.")
+        onResult({ ok: false, title: "Package Not Matched", message: `${result.message || "No match found."} Scan: ${code}` })
+      } else {
+        setMatchedPackage(result.package)
+        setSuggestedTote(result.package.suggested_tote || result.package.tote_code || "")
+        setLastMessage(result.message || "Package matched.")
+      }
+      setScanCode("")
+      await refreshSummary()
+    } catch (error) {
+      onResult({ ok: false, title: "Scan Failed", message: String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function scanPackage(event?: ReactFormEvent) {
+    event?.preventDefault()
+    await submitScan(scanCode)
+  }
+
+  function stopCameraScanner() {
+    scannerControlsRef.current?.stop()
+    scannerControlsRef.current = null
+    scannerReaderRef.current = null
+    setScannerOpen(false)
+    setScannerError("")
+    setScannerStatus("")
+    scanInputRef.current?.focus()
+  }
+
+  async function openCameraScanner() {
+    scannerLastCodeRef.current = ""
+    setScannerOpen(true)
+    setScannerError("")
+    setScannerStatus("Opening camera...")
+  }
+
+  useEffect(() => {
+    if (!scannerOpen) return
+    let cancelled = false
+    async function startScanner() {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("Camera access is not available in this browser.")
+        }
+        const reader = new BrowserMultiFormatReader()
+        scannerReaderRef.current = reader
+        setScannerStatus("Point camera at the Amazon label barcode or QR code.")
+        const controls = await reader.decodeFromConstraints(
+          {
+            video: {
+              facingMode: { ideal: "environment" },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+            audio: false,
+          },
+          scannerVideoRef.current!,
+          (result) => {
+            const text = result?.getText?.().trim()
+            if (!text || scannerLastCodeRef.current === text) return
+            scannerLastCodeRef.current = text
+            scannerControlsRef.current?.stop()
+            scannerControlsRef.current = null
+            setScannerOpen(false)
+            void submitScan(text)
+          },
+        )
+        if (cancelled) {
+          controls.stop()
+          return
+        }
+        scannerControlsRef.current = controls
+      } catch (error) {
+        if (cancelled) return
+        setScannerError(String(error instanceof Error ? error.message : error))
+        setScannerStatus("")
+      }
+    }
+    void startScanner()
+    return () => {
+      cancelled = true
+      scannerControlsRef.current?.stop()
+      scannerControlsRef.current = null
+      scannerReaderRef.current = null
+    }
+  }, [scannerOpen])
+
+  useEffect(() => () => {
+    scannerControlsRef.current?.stop()
+  }, [])
+
+  async function placePackage(status = "sorted_holding") {
+    if (!matchedPackage) return
+    setBusy(true)
+    try {
+      const result = await api<{ ok: boolean; package: DispatchPackage; message: string }>(`/api/dispatch-sorting/packages/${matchedPackage.id}/place`, {
+        method: "POST",
+        body: JSON.stringify({
+          tote_code: status === "exception" ? "EXCEPTION-SCAN-01" : suggestedTote,
+          status,
+          exception_reason: status === "exception" ? "manual_exception" : "",
+        }),
+      })
+      setMatchedPackage(result.package)
+      setSuggestedTote(result.package.tote_code || result.package.suggested_tote || suggestedTote)
+      setLastMessage(result.message || "Package updated.")
+      await refreshSummary()
+    } catch (error) {
+      onResult({ ok: false, title: "Place Package Failed", message: String(error) })
+    } finally {
+      setBusy(false)
+      scanInputRef.current?.focus()
+    }
+  }
+
+  async function rebuildIndex() {
+    setBusy(true)
+    try {
+      const query = new URLSearchParams()
+      if (storeId) query.set("store_id", storeId)
+      const result = await api<{ ok: boolean; message: string; orders: number; packages: number }>(`/api/dispatch-sorting/rebuild?${query.toString()}`, { method: "POST" })
+      await refreshSummary()
+      onResult({ ok: true, title: "Scan Index Rebuilt", message: result.message || `Indexed ${result.packages} package(s).` })
+    } catch (error) {
+      onResult({ ok: false, title: "Rebuild Failed", message: String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const counts = summary.summary || {}
+  const product = matchedPackage?.products?.[0]
+
+  return (
+    <div className="grid gap-4">
+      <div className="grid gap-3 md:grid-cols-4">
+        {[
+          ["Pending", counts.pending || 0],
+          ["Received", counts.received_unopened || 0],
+          ["Sorted", counts.sorted_holding || 0],
+          ["Exceptions", counts.exception || 0],
+        ].map(([label, value]) => (
+          <div key={String(label)} className="rounded border bg-white p-3">
+            <div className="text-xs font-medium uppercase text-muted-foreground">{label}</div>
+            <div className="mt-1 text-2xl font-semibold">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      <Card>
+        <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <CardTitle>Amazon Package Scan</CardTitle>
+            <CardDescription>Scan the Amazon label, match the app order, and place the unopened package into the assigned tote.</CardDescription>
+          </div>
+          <Button variant="outline" onClick={rebuildIndex} disabled={busy}>
+            <RefreshCw className="size-4" />
+            Rebuild scan index
+          </Button>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <form className="grid gap-2 md:grid-cols-[1fr_auto_auto]" onSubmit={scanPackage}>
+            <Input
+              ref={scanInputRef}
+              value={scanCode}
+              onChange={(event) => setScanCode(event.target.value)}
+              placeholder="Scan Amazon tracking, package, shipment, or order code"
+              className="h-14 text-lg font-semibold"
+              autoComplete="off"
+            />
+            <Button type="button" variant="outline" className="h-14 px-5" disabled={busy} onClick={openCameraScanner}>
+              <Camera className="size-5" />
+              Camera
+            </Button>
+            <Button className="h-14 px-6" disabled={busy || !scanCode.trim()}>
+              <Search className="size-5" />
+              Scan
+            </Button>
+          </form>
+          {lastMessage && (
+            <Alert variant={matchedPackage ? "default" : "destructive"}>
+              <AlertCircle className="size-4" />
+              <AlertTitle>{matchedPackage ? "Matched" : "Exception"}</AlertTitle>
+              <AlertDescription>{lastMessage}</AlertDescription>
+            </Alert>
+          )}
+
+          {matchedPackage && (
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(320px,.8fr)]">
+              <div className="rounded border bg-white p-4">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <div className="text-xs font-medium uppercase text-muted-foreground">Matched Amazon Order</div>
+                    <div className="mt-1 text-xl font-semibold">{matchedPackage.amazon_order_id}</div>
+                    <div className="mt-1 text-sm text-muted-foreground">{matchedPackage.odoo_order_name} · {matchedPackage.destination_zone || "ROW"} · package {matchedPackage.package_index}</div>
+                  </div>
+                  <StatusBadge value={matchedPackage.scan_status} />
+                </div>
+                <div className="mt-4 grid gap-3 md:grid-cols-[88px_1fr]">
+                  <div className="flex size-[88px] items-center justify-center overflow-hidden rounded border bg-muted">
+                    {product?.image_url ? <img src={product.image_url} alt="" className="h-full w-full object-contain" /> : <PackageCheck className="size-8 text-muted-foreground" />}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="font-medium">{product?.title || matchedPackage.package_status || "Amazon package"}</div>
+                    <div className="mt-1 text-sm text-muted-foreground">
+                      {matchedPackage.asins?.length ? `ASIN ${matchedPackage.asins.join(", ")}` : "ASIN not captured"}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Badge variant="outline">{matchedPackage.service || "STD"}</Badge>
+                      <Badge variant={matchedPackage.priority === "U" ? "destructive" : "outline"}>{matchedPackage.priority === "U" ? "Urgent" : "Normal"}</Badge>
+                      <Badge variant="outline">{matchedPackage.fulfilment_type || "STANDARD"}</Badge>
+                      <Badge variant={matchedPackage.order_ready ? "secondary" : "outline"}>{matchedPackage.order_ready ? "Order ready" : "Partial / waiting"}</Badge>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded border bg-white p-4">
+                <Label>Place in tote</Label>
+                <Input value={suggestedTote} onChange={(event) => setSuggestedTote(event.target.value.toUpperCase())} className="mt-2 h-12 font-mono text-lg font-semibold" />
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <Button disabled={busy || !suggestedTote.trim()} onClick={() => placePackage("sorted_holding")}>
+                    <Check className="size-4" />
+                    Placed
+                  </Button>
+                  <Button variant="outline" disabled={busy} onClick={() => placePackage("exception")}>
+                    <AlertCircle className="size-4" />
+                    Exception
+                  </Button>
+                </div>
+                <div className="mt-3 text-xs text-muted-foreground">
+                  Suggested from date, destination zone, service, priority, and fulfilment type.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {matchedPackage?.remaining_packages?.length ? (
+            <div className="rounded border bg-white">
+              <div className="border-b px-4 py-3 font-medium">Remaining packages for this Amazon order</div>
+              <div className="divide-y">
+                {matchedPackage.remaining_packages.map((pkg) => (
+                  <div key={pkg.id} className="grid gap-2 px-4 py-3 text-sm md:grid-cols-[80px_1fr_160px_180px] md:items-center">
+                    <div className="font-mono">Pkg {pkg.package_index}</div>
+                    <div className="min-w-0 truncate">{pkg.display_code || pkg.package_status || "Package"}</div>
+                    <StatusBadge value={pkg.scan_status} />
+                    <div className="font-mono text-xs text-muted-foreground">{pkg.tote_code || "Not placed"}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      <Dialog open={scannerOpen} onOpenChange={(open) => !open && stopCameraScanner()}>
+        <DialogContent className="max-w-xl p-0">
+          <DialogHeader className="border-b px-4 py-3">
+            <DialogTitle className="flex items-center gap-2">
+              <Camera className="size-5" />
+              Camera Scanner
+            </DialogTitle>
+            <DialogDescription>Point the phone camera at the Amazon label barcode or QR code.</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 p-4">
+            <div className="relative overflow-hidden rounded border bg-black">
+              <video
+                ref={scannerVideoRef}
+                className="aspect-[3/4] max-h-[70vh] w-full bg-black object-cover md:aspect-video"
+                muted
+                playsInline
+                autoPlay
+              />
+              <div className="pointer-events-none absolute inset-x-[12%] top-1/2 h-28 -translate-y-1/2 rounded border-2 border-white/90 shadow-[0_0_0_999px_rgba(0,0,0,0.32)]" />
+            </div>
+            {scannerError ? (
+              <Alert variant="destructive">
+                <AlertCircle className="size-4" />
+                <AlertTitle>Camera unavailable</AlertTitle>
+                <AlertDescription>{scannerError}</AlertDescription>
+              </Alert>
+            ) : (
+              <div className="rounded border bg-muted px-3 py-2 text-sm text-muted-foreground">
+                {scannerStatus || "Waiting for camera..."}
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2">
+              <Button variant="outline" onClick={stopCameraScanner}>
+                <X className="size-4" />
+                Close
+              </Button>
+              <Button type="button" onClick={() => scanInputRef.current?.focus()}>
+                <Search className="size-4" />
+                Manual input
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="rounded border bg-white">
+          <div className="border-b px-4 py-3 font-medium">Active totes</div>
+          <div className="divide-y">
+            {summary.totes.length ? summary.totes.map((tote) => (
+              <div key={tote.tote_code} className="flex items-center justify-between gap-3 px-4 py-3">
+                <div className="font-mono text-sm font-semibold">{tote.tote_code}</div>
+                <Badge variant="outline">{tote.count} package(s)</Badge>
+              </div>
+            )) : <div className="px-4 py-6 text-sm text-muted-foreground">No totes used yet.</div>}
+          </div>
+        </div>
+        <div className="rounded border bg-white">
+          <div className="border-b px-4 py-3 font-medium">Recent scans</div>
+          <div className="divide-y">
+            {summary.recent.length ? summary.recent.map((row) => (
+              <div key={`${row.id}-${row.scan_status}`} className="grid gap-1 px-4 py-3 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold">{row.odoo_order_name || row.amazon_order_id}</span>
+                  <StatusBadge value={row.scan_status} />
+                </div>
+                <div className="font-mono text-xs text-muted-foreground">{row.display_code} · {row.tote_code || "No tote"}</div>
+              </div>
+            )) : <div className="px-4 py-6 text-sm text-muted-foreground">No scans yet.</div>}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function TrackingPage({
   storeId,
   page,
@@ -5263,6 +5709,17 @@ function TrackingPage({
       if (trackingId && !values.includes(trackingId)) values.push(trackingId)
     })
     return values
+  }
+
+  async function copyTrackingNumber(trackingId: string) {
+    const value = String(trackingId || "").trim()
+    if (!value) return
+    const copied = await copyPlainText(value)
+    onResult({
+      ok: copied,
+      title: copied ? "Tracking Number Copied" : "Copy Failed",
+      message: copied ? value : "Clipboard copy is not available in this browser.",
+    })
   }
 
   async function refreshTracking() {
@@ -5387,25 +5844,54 @@ function TrackingPage({
                   </TableCell>
                   <TableCell><StatusBadge value={order.tracking_status || firstPackage.status || "Unknown"} /></TableCell>
                   <TableCell>{order.amazon_cancelled_at ? <Badge className="bg-red-100 text-red-700 hover:bg-red-100">Yes</Badge> : <Badge variant="outline">No</Badge>}</TableCell>
-                  <TableCell className="max-w-[220px]">
+                  <TableCell className="min-w-[240px] max-w-[380px]">
                     {trackingNumbers.length ? (
                       <div className="grid gap-1">
                         {trackingNumbers.map((trackingId) => (
-                          <span key={`${order.amazon_order_id}-${trackingId}`} className="truncate font-mono text-sm">
-                            {trackingId}
-                          </span>
+                          <div key={`${order.amazon_order_id}-${trackingId}`} className="flex min-w-0 items-start gap-2">
+                            <span className="break-all font-mono text-sm leading-5">{trackingId}</span>
+                            <button
+                              type="button"
+                              className="inline-flex size-6 flex-none items-center justify-center rounded border border-primary/25 bg-background text-primary transition-colors hover:border-primary hover:bg-primary/10"
+                              title={`Copy ${trackingId}`}
+                              aria-label={`Copy tracking number ${trackingId}`}
+                              onClick={() => copyTrackingNumber(trackingId)}
+                            >
+                              <Copy className="size-3.5" />
+                            </button>
+                          </div>
                         ))}
                       </div>
                     ) : <span className="text-muted-foreground">Pending</span>}
                   </TableCell>
-                  <TableCell className="max-w-[320px]">
+                  <TableCell className="min-w-[280px] max-w-[440px]">
                     {payloads.length ? (
                       <div className="grid gap-1 text-sm">
-                        {payloads.map((pkg: any, index: number) => (
-                          <a key={`${pkg.tracking_id || index}`} className="truncate text-primary underline-offset-4 hover:underline" href={pkg.tracking_url} target="_blank">
-                            {pkg.carrier || "Carrier"} {pkg.tracking_id || "tracking pending"}
-                          </a>
-                        ))}
+                        {payloads.map((pkg: any, index: number) => {
+                          const trackingId = String(pkg.tracking_id || pkg.trackingId || pkg.tracking_number || pkg.trackingNumber || "").trim()
+                          return (
+                            <div key={`${trackingId || index}`} className="flex min-w-0 items-start gap-2">
+                              <a className="break-all text-primary underline-offset-4 hover:underline" href={pkg.tracking_url} target="_blank">
+                                {pkg.carrier || "Carrier"} {trackingId || "tracking pending"}
+                              </a>
+                              {trackingId ? (
+                                <button
+                                  type="button"
+                                  className="inline-flex size-6 flex-none items-center justify-center rounded border border-primary/25 bg-background text-primary transition-colors hover:border-primary hover:bg-primary/10"
+                                  title={`Copy ${trackingId}`}
+                                  aria-label={`Copy tracking number ${trackingId}`}
+                                  onClick={(event) => {
+                                    event.preventDefault()
+                                    event.stopPropagation()
+                                    copyTrackingNumber(trackingId)
+                                  }}
+                                >
+                                  <Copy className="size-3.5" />
+                                </button>
+                              ) : null}
+                            </div>
+                          )
+                        })}
                       </div>
                     ) : <span className="text-muted-foreground">Pending extension scan</span>}
                   </TableCell>
@@ -5538,6 +6024,17 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
 
+  async function copyOtpTrackingNumber(trackingId: string) {
+    const value = String(trackingId || "").trim()
+    if (!value) return
+    const copied = await copyPlainText(value)
+    onResult({
+      ok: copied,
+      title: copied ? "Tracking Number Copied" : "Copy Failed",
+      message: copied ? value : "Clipboard copy is not available in this browser.",
+    })
+  }
+
   async function refreshOtp(nextQuery = query, nextPage = page) {
     setLoading(true)
     try {
@@ -5628,7 +6125,24 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
                 </TableCell>
                 <TableCell className="max-w-[280px]">
                   <div className="grid gap-1 text-sm">
-                    <span className="font-mono">{row.tracking_numbers || "Pending Chrome scan"}</span>
+                    {String(row.tracking_numbers || "").trim() ? (
+                      String(row.tracking_numbers || "").split(/\s*,\s*/).filter(Boolean).map((trackingId) => (
+                        <div key={`${row.amazon_order_id}-${trackingId}`} className="flex min-w-0 items-start gap-2">
+                          <span className="break-all font-mono">{trackingId}</span>
+                          <button
+                            type="button"
+                            className="inline-flex size-6 flex-none items-center justify-center rounded border border-primary/25 bg-background text-primary transition-colors hover:border-primary hover:bg-primary/10"
+                            title={`Copy ${trackingId}`}
+                            aria-label={`Copy tracking number ${trackingId}`}
+                            onClick={() => copyOtpTrackingNumber(trackingId)}
+                          >
+                            <Copy className="size-3.5" />
+                          </button>
+                        </div>
+                      ))
+                    ) : (
+                      <span className="text-muted-foreground">Pending Chrome scan</span>
+                    )}
                     <span className="text-muted-foreground">{row.carriers}</span>
                     {row.tracking_url ? <a className="text-primary underline-offset-4 hover:underline" href={row.tracking_url} target="_blank">Amazon tracking email link</a> : null}
                   </div>

@@ -118,6 +118,19 @@ class ChromeTrackingUpdatePayload(BaseModel):
     alert_html: str = ""
 
 
+class DispatchScanPayload(BaseModel):
+    scan_code: str
+    store_id: Optional[int] = None
+    operator: str = ""
+
+
+class DispatchPlacePayload(BaseModel):
+    tote_code: str = ""
+    status: str = "sorted_holding"
+    exception_reason: str = ""
+    operator: str = ""
+
+
 class AmazonHistoryOrderPayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
