@@ -10787,7 +10787,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [savingRouting, setSavingRouting] = useState(false)
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
-  const [jobStatusFilter, setJobStatusFilter] = useState("attention")
+  const [jobStatusFilter, setJobStatusFilter] = useState("all")
   const [jobStatusCounts, setJobStatusCounts] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState("")
   const pageRef = useRef(page)
