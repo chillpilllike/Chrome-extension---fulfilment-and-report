@@ -10832,18 +10832,20 @@ def normalize_payment_failure_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "open") -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
-    where = ["(? IS NULL OR store_id=?)"]
-    params: list[Any] = [store_id, store_id]
+    where: list[str] = []
+    params: list[Any] = []
+    if store_id is not None:
+        where.append("store_id=?")
+        params.append(store_id)
     if status and status != "all":
         where.append("status=?")
         params.append(status)
-    where_sql = " AND ".join(where)
+    where_sql = " AND ".join(where) if where else "1=1"
     with db() as conn:
-        total = int(conn.execute(f"SELECT COUNT(*) AS total FROM amazon_payment_failures WHERE {where_sql}", params).fetchone()["total"])
         rows = rows_to_dicts(
             conn.execute(
                 f"""
-                SELECT *
+                SELECT COUNT(*) OVER() AS total_count, *
                 FROM amazon_payment_failures
                 WHERE {where_sql}
                 ORDER BY status='open' DESC, detected_at DESC
@@ -10852,7 +10854,9 @@ def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page
                 params + [per_page, offset],
             ).fetchall()
         )
+    total = int(rows[0].get("total_count") or 0) if rows else 0
     for row in rows:
+        row.pop("total_count", None)
         normalize_payment_failure_row(row)
     return rows, total, page, per_page
 
@@ -17569,6 +17573,7 @@ def startup() -> None:
             threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
         threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
         threading.Thread(target=enqueue_app_pages_warm, daemon=True).start()
+        threading.Thread(target=lambda: api_tracking_payment_failures(page=1, per_page=20), daemon=True).start()
         _sync_thread_started = True
 
 
@@ -23743,10 +23748,11 @@ def api_tracking_payment_failures(store_id: Optional[int] = None, page: int = 1,
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
-    enqueue_payment_failure_cleanup()
     rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
     search_engine = "postgres"
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}, 60)
+    result = fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}, 300)
+    threading.Thread(target=enqueue_payment_failure_cleanup, daemon=True).start()
+    return result
 
 
 @app.post("/api/tracking/payment-failures/{amazon_order_id}/resolve")
