@@ -101,7 +101,7 @@ function updateModeNotice() {
     ? "Headless mode starts ePost extraction in the local app's background Chrome profile and reuses the same portal parser as normal mode."
     : "Normal mode opens the ePost portal in this Chrome window and extracts with the extension.";
   const auto = autoEpostEnabled.checked
-    ? ` Auto mode will check every ${Math.max(1, Math.min(720, Number(intervalHours.value || 24)))} hour(s).`
+    ? ` Auto mode will track all undelivered imported codes every ${Math.max(1, Math.min(720, Number(intervalHours.value || 24)))} hour(s).`
     : " Auto mode is off.";
   modeNotice.textContent = `${mode}${auto}`;
 }

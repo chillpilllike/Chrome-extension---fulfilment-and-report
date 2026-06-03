@@ -11626,7 +11626,7 @@ def epost_tracking_rows_by_ids(ids: list[int], stale_days: int = 10) -> list[dic
     return data
 
 
-def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None, hours: Optional[int] = None) -> list[dict[str, Any]]:
+def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None, hours: Optional[int] = None, include_recent: bool = False) -> list[dict[str, Any]]:
     if hours is not None:
         interval_seconds = max(3600, min(720 * 3600, int(float(hours or 24)) * 3600))
     else:
@@ -11637,6 +11637,9 @@ def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None, hours
     due = []
     for row in rows:
         if str(row.get("epost_status") or "").lower() == "delivered":
+            continue
+        if include_recent:
+            due.append(row)
             continue
         checked = str(row.get("last_checked_at") or "")
         if not checked:
@@ -21579,20 +21582,21 @@ def set_epost_browserless_progress(**updates: Any) -> dict[str, Any]:
     return dict(_EPOST_BROWSERLESS_PROGRESS)
 
 
-def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: int = 0, hours: Optional[int] = None) -> list[list[str]]:
-    rows = due_epost_tracking_rows(max(1, int(days or 1)), store_id, hours)
+def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: int = 0, hours: Optional[int] = None, include_recent: bool = False) -> list[list[str]]:
+    rows = due_epost_tracking_rows(max(1, int(days or 1)), store_id, hours, include_recent)
     codes = [clean_text(row.get("tracking_code")).upper() for row in rows if clean_text(row.get("tracking_code"))]
     batches = [codes[index:index + 25] for index in range(0, len(codes), 25)]
     return batches[: max_batches] if max_batches else batches
 
 
 class EpostBrowserlessSession:
-    def __init__(self, worker_id: str, store_id: Optional[int], interval_days: int, max_batches: int, interval_hours: Optional[int] = None) -> None:
+    def __init__(self, worker_id: str, store_id: Optional[int], interval_days: int, max_batches: int, interval_hours: Optional[int] = None, include_recent: bool = False) -> None:
         self.worker_id = worker_id
         self.store_id = store_id
         self.interval_days = max(1, int(interval_days or 1))
         self.interval_hours = max(1, int(interval_hours or self.interval_days * 24))
         self.max_batches = max(0, int(max_batches or 0))
+        self.include_recent = bool(include_recent)
         self.batches: list[list[str]] = []
         self.batch_index = 0
         self.submitted_batch_index: Optional[int] = None
@@ -21603,7 +21607,7 @@ class EpostBrowserlessSession:
         return bool(_EPOST_BROWSERLESS_PROGRESS.get("stop_requested"))
 
     def load_batches(self) -> list[list[str]]:
-        self.batches = epost_browserless_batches(self.interval_days, self.store_id, self.max_batches, self.interval_hours)
+        self.batches = epost_browserless_batches(self.interval_days, self.store_id, self.max_batches, self.interval_hours, self.include_recent)
         return self.batches
 
     def current_codes(self) -> list[str]:
@@ -21690,7 +21694,7 @@ def run_epost_browserless_payload(payload: EpostBrowserlessRunPayload) -> None:
     profile_dir.mkdir(parents=True, exist_ok=True)
     content_js = BASE_DIR / "epost-extension" / "content.js"
     content_css = BASE_DIR / "epost-extension" / "content.css"
-    session = EpostBrowserlessSession(worker_id, payload.store_id, payload.interval_days, payload.max_batches, payload.interval_hours)
+    session = EpostBrowserlessSession(worker_id, payload.store_id, payload.interval_days, payload.max_batches, payload.interval_hours, payload.include_recent)
     executable = chrome_browserless_executable()
     launch_args = [
         "--disable-blink-features=AutomationControlled",
@@ -21818,7 +21822,7 @@ def api_epost_browserless_run(payload: EpostBrowserlessRunPayload) -> dict[str, 
             message="Headless ePost could not start.",
         )
         return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
-    batches = epost_browserless_batches(payload.interval_days, payload.store_id, payload.max_batches, payload.interval_hours)
+    batches = epost_browserless_batches(payload.interval_days, payload.store_id, payload.max_batches, payload.interval_hours, payload.include_recent)
     if not batches:
         try:
             _EPOST_BROWSERLESS_LOCK.release()
@@ -24599,8 +24603,8 @@ def api_epost_sync(payload: EpostSyncPayload) -> dict[str, Any]:
 
 
 @app.get("/api/epost/due")
-def api_epost_due(days: int = 1, hours: Optional[int] = None, store_id: Optional[int] = None) -> dict[str, Any]:
-    return {"ok": True, "rows": due_epost_tracking_rows(days, store_id, hours)}
+def api_epost_due(days: int = 1, hours: Optional[int] = None, store_id: Optional[int] = None, include_recent: bool = False) -> dict[str, Any]:
+    return {"ok": True, "rows": due_epost_tracking_rows(days, store_id, hours, include_recent)}
 
 
 @app.post("/api/epost/update")

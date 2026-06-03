@@ -218,20 +218,22 @@ async function startScheduledEpost() {
     return { ok: true, resumed: true, progress: epostProgress(state.epostRun) };
   }
   await log(`Scheduled ePost tracking started; interval is every ${clampIntervalHours(state.intervalHours)} hour(s).`);
-  return startEpost(null);
+  return startEpost(null, { includeRecent: true, source: "auto" });
 }
 
-async function startEpost(windowId = null) {
+async function startEpost(windowId = null, options = {}) {
   const state = await getState();
-  if (state.headlessEpostMode) return startHeadlessEpost();
+  const includeRecent = options.includeRecent === true;
+  const source = options.source || "manual";
+  if (state.headlessEpostMode) return startHeadlessEpost({ includeRecent, source });
   await log("Starting visible ePost tracking.", windowId);
   try {
     const intervalHours = clampIntervalHours(state.intervalHours || (Number(state.intervalDays || 1) * 24));
     const dueDays = hoursToDueDays(intervalHours);
-    const payload = await api(`/api/epost/due?days=${encodeURIComponent(dueDays)}&hours=${encodeURIComponent(intervalHours)}`);
+    const payload = await api(`/api/epost/due?days=${encodeURIComponent(dueDays)}&hours=${encodeURIComponent(intervalHours)}${includeRecent ? "&include_recent=true" : ""}`);
     const recent = recentEpostSet(state.recentEpostChecks);
     const allRows = payload.rows || [];
-    const rows = allRows.filter((row) => !recent.has(String(row.tracking_code || "").trim().toUpperCase()));
+    const rows = includeRecent ? allRows : allRows.filter((row) => !recent.has(String(row.tracking_code || "").trim().toUpperCase()));
     const batches = chunk(rows.map((row) => row.tracking_code).filter(Boolean), 25);
     const epostRun = {
       running: true,
@@ -243,17 +245,20 @@ async function startEpost(windowId = null) {
       skippedRecentCount: allRows.length - rows.length,
       startedAt: Date.now(),
       lastActivityAt: Date.now(),
-      lastMessage: "ePost tracking started.",
+      lastMessage: includeRecent ? "ePost auto tracking started for all undelivered codes." : "ePost tracking started.",
+      includeRecent,
+      source,
     };
     if (!batches.length) {
       epostRun.running = false;
       await saveEpostRun(epostRun, windowId);
-      await log("No ePost tracking codes are due.", windowId);
-      return { ok: false, message: "No ePost tracking codes are due." };
+      const message = includeRecent ? "No undelivered ePost tracking codes found." : "No ePost tracking codes are due.";
+      await log(message, windowId);
+      return { ok: false, message };
     }
     await saveEpostRun(epostRun, windowId);
     await ensureEpostWatchdog();
-    await log(`Loaded ${rows.length} due ePost code(s) in ${batches.length} batch(es); skipped ${epostRun.skippedRecentCount} recently checked code(s).`, windowId);
+    await log(`Loaded ${rows.length} ${includeRecent ? "undelivered" : "due"} ePost code(s) in ${batches.length} batch(es); skipped ${epostRun.skippedRecentCount} recently checked code(s).`, windowId);
     await openTracker(windowId);
     await log("Opened ePost portal for visible tracking.", windowId);
     return { ok: true, message: `Tracking ${rows.length} ePost code(s).`, progress: epostProgress(epostRun) };
@@ -275,13 +280,18 @@ async function stopEpost(windowId) {
   return { ok: true, message: "Stopped." };
 }
 
-async function startHeadlessEpost() {
+async function startHeadlessEpost(options = {}) {
   const { intervalDays, intervalHours } = await getState();
   const hours = clampIntervalHours(intervalHours || (Number(intervalDays || 1) * 24));
   const dueDays = hoursToDueDays(hours);
   const result = await api("/api/epost/browserless/run", {
     method: "POST",
-    body: JSON.stringify({ worker_id: `epost-extension-${chrome.runtime.id || "local"}`, interval_days: dueDays, interval_hours: hours }),
+    body: JSON.stringify({
+      worker_id: `epost-extension-${chrome.runtime.id || "local"}`,
+      interval_days: dueDays,
+      interval_hours: hours,
+      include_recent: options.includeRecent === true,
+    }),
     timeoutMs: 10000,
   });
   await log(result.message || "Headless ePost started.");
