@@ -72,7 +72,7 @@ function canResumeTrackAll(tracking = {}) {
   if (tracking.source !== "history" || tracking.running) return false;
   const hasCurrent = Boolean(tracking.currentOrder?.amazon_order_id);
   const hasQueue = Array.isArray(tracking.queue) && tracking.queue.length > 0;
-  const hasMorePages = Boolean(tracking.nextUrl) && Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0);
+  const hasMorePages = Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0);
   return hasCurrent || hasQueue || hasMorePages;
 }
 
@@ -152,7 +152,7 @@ function stoppedTrackAllText(tracking = {}) {
   const completed = tracking.completedOrderIds?.length || 0;
   const failed = tracking.failedOrderIds?.length || 0;
   const page = tracking.currentPage || tracking.startPage || 1;
-  const nextPage = tracking.nextUrl && Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0) ? ` · next page ${Number(page) + 1}` : "";
+  const nextPage = Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0) ? ` · next page ${Number(page) + 1}` : "";
   const current = tracking.currentOrder?.amazon_order_id ? ` · current ${tracking.currentOrder.amazon_order_id}` : "";
   return `Stopped · Track all can resume from page ${page}${nextPage}${current} · queue ${queue} · checked ${completed} · failed ${failed}`;
 }

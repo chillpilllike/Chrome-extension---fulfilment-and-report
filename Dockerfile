@@ -26,12 +26,22 @@ FROM python:3.12-slim AS app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8000 \
+    WEB_CONCURRENCY=1 \
     APP_SECRET_KEY=change-this-in-coolify \
     ADMIN_ACCESS_TOKEN=change-this-in-coolify \
     MASTER_ADMIN_ACCESS_TOKEN=change-this-in-coolify \
     POSTGRES_URL= \
     DATABASE_URL= \
     POSTGRES_POOL_MAX=10 \
+    REDIS_URL=redis://default:aPw7vPnqfobUrhuTdR7dUNVNHnAMn9REdXYkWrw64HYBojJkAkRDLAEb0uQZmwBE@185.194.236.161:5465/0 \
+    DRAMATIQ_REDIS_URL=redis://default:aPw7vPnqfobUrhuTdR7dUNVNHnAMn9REdXYkWrw64HYBojJkAkRDLAEb0uQZmwBE@185.194.236.161:5465/0 \
+    REDIS_ENABLED=true \
+    DRAMATIQ_ENABLED=true \
+    REDIS_CONNECT_TIMEOUT=0.08 \
+    REDIS_SOCKET_TIMEOUT=0.12 \
+    DRAMATIQ_PROCESSES=1 \
+    DRAMATIQ_THREADS=8 \
+    FAST_PAGE_CACHE_MAX_ENTRIES=3000 \
     TYPESENSE_URL= \
     TYPESENSE_API_KEY= \
     TYPESENSE_ENABLED=false \
@@ -61,7 +71,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends bash ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=source /src/requirements.txt ./
@@ -75,4 +85,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"PORT\", \"8000\")}/health', timeout=5).read()"
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+CMD ["bash", "-lc", "set -euo pipefail; pids=(); shutdown() { for pid in \"${pids[@]:-}\"; do kill -TERM \"$pid\" 2>/dev/null || true; done; wait || true; }; trap shutdown TERM INT; if [ \"${DRAMATIQ_ENABLED:-true}\" != \"false\" ] && [ \"${DRAMATIQ_ENABLED:-true}\" != \"0\" ]; then dramatiq app.tasks --processes \"${DRAMATIQ_PROCESSES:-1}\" --threads \"${DRAMATIQ_THREADS:-8}\" & pids+=(\"$!\"); fi; uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-8000}\" --workers \"${WEB_CONCURRENCY:-1}\" & pids+=(\"$!\"); set +e; wait -n \"${pids[@]}\"; status=$?; set -e; shutdown; exit \"$status\""]

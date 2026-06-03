@@ -7,3 +7,5 @@ urllib3<2
 boto3==1.34.162
 psycopg2-binary==2.9.9
 playwright==1.52.0
+dramatiq[redis]==1.17.1
+redis==5.0.7

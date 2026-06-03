@@ -399,7 +399,12 @@ async function startTracking(windowId) {
   const { recentTrackingChecks } = await getState();
   const recent = recentCheckSet(recentTrackingChecks);
   const allOrders = (payload.orders || []).filter((order) => String(order.tracking_status || "").toLowerCase() !== "delivered");
-  const orders = allOrders.filter((order) => !recent.has(String(order.amazon_order_id || "").trim()));
+  let orders = allOrders.filter((order) => !recent.has(String(order.amazon_order_id || "").trim()));
+  let forcedRecentRescan = false;
+  if (!orders.length && allOrders.length) {
+    orders = allOrders;
+    forcedRecentRescan = true;
+  }
   const tracking = {
     running: true,
     orders,
@@ -408,16 +413,19 @@ async function startTracking(windowId) {
     packageIndex: 0,
     completedOrderIds: [],
     failedOrderIds: [],
-    skippedRecentCount: allOrders.length - orders.length,
+    skippedRecentCount: forcedRecentRescan ? 0 : allOrders.length - orders.length,
+    forcedRecentRescan,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
-    lastMessage: "Tracking started.",
+    lastMessage: forcedRecentRescan ? "Tracking started by rescanning recently checked orders." : "Tracking started.",
   };
   await saveTracking(tracking, windowId);
-  await log(`Loaded ${orders.length} Amazon order(s) for tracking; skipped ${tracking.skippedRecentCount} recently checked order(s).`, windowId);
+  await log(forcedRecentRescan
+    ? `Loaded ${orders.length} Amazon order(s) for tracking by rescanning recently checked orders.`
+    : `Loaded ${orders.length} Amazon order(s) for tracking; skipped ${tracking.skippedRecentCount} recently checked order(s).`, windowId);
   if (!orders.length) return { ok: false, message: "No Amazon orders need tracking." };
   await openCurrentOrder(windowId);
-  return { ok: true, message: `Started tracking ${orders.length} order(s).`, progress: trackingProgress(tracking) };
+  return { ok: true, message: forcedRecentRescan ? `Started tracking ${orders.length} recently checked order(s) again.` : `Started tracking ${orders.length} order(s).`, progress: trackingProgress(tracking) };
 }
 
 function normalizeHistoryOrder(order = {}) {
@@ -447,6 +455,9 @@ function normalizeHistoryOrder(order = {}) {
     items,
     asin_quantities: asinQuantities,
     cancelled: order.cancelled === true,
+    payment_revision_needed: order.paymentRevisionNeeded === true || order.payment_revision_needed === true,
+    payment_revision_url: String(order.paymentRevisionUrl || order.payment_revision_url || "").trim(),
+    page_text: String(order.pageText || order.page_text || "").trim(),
   };
 }
 
@@ -637,7 +648,7 @@ function canResumeHistoryTracking(tracking = {}) {
   if (tracking.source !== "history" || tracking.running) return false;
   const hasCurrent = Boolean(tracking.currentOrder?.amazon_order_id);
   const hasQueue = Array.isArray(tracking.queue) && tracking.queue.length > 0;
-  const hasMorePages = Boolean(tracking.nextUrl) && Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0);
+  const hasMorePages = Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0);
   return hasCurrent || hasQueue || hasMorePages;
 }
 
@@ -679,8 +690,8 @@ async function stopTracking(windowId) {
 
 async function maybeOpenNextHistoryPage(tracking, windowId) {
   const nextPage = Number(tracking.currentPage || tracking.startPage || 1) + 1;
-  if (tracking.nextUrl && Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 1)) {
-    tracking.nextUrl = normalizeHistoryNextUrl(tracking.nextUrl, nextPage);
+  if (Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 1)) {
+    tracking.nextUrl = normalizeHistoryNextUrl(tracking.nextUrl || orderHistoryUrl(nextPage), nextPage);
     tracking.currentPage = nextPage;
     tracking.lastActivityAt = Date.now();
     tracking.lastMessage = `Opening Amazon order-history page ${nextPage}.`;
@@ -826,10 +837,13 @@ async function handleHistoryTrackPage(message, windowId) {
   const queue = Array.isArray(tracking.queue) ? tracking.queue : [];
   let added = 0;
   let skippedCancelled = 0;
+  let skippedPaymentRevision = 0;
   const addedRawOrders = [];
   for (const rawOrder of message.orders || []) {
     const normalized = normalizeHistoryOrder(rawOrder);
-    if (!normalized || seen.has(normalized.amazon_order_id)) continue;
+    if (!normalized) continue;
+    const alreadySeen = seen.has(normalized.amazon_order_id);
+    if (alreadySeen && !normalized.cancelled && !normalized.payment_revision_needed) continue;
     seen.add(normalized.amazon_order_id);
     if (normalized.cancelled) {
       skippedCancelled += 1;
@@ -849,6 +863,25 @@ async function handleHistoryTrackPage(message, windowId) {
       }).catch((error) => log(`Could not save cancelled history order ${normalized.amazon_order_id}: ${error.message}; skipped page open.`, windowId));
       continue;
     }
+    if (normalized.payment_revision_needed) {
+      skippedPaymentRevision += 1;
+      tracking.completedOrderIds = [...(tracking.completedOrderIds || []), normalized.amazon_order_id];
+      rememberRecentCheck(normalized.amazon_order_id, "payment_revision").catch(() => {});
+      api("/api/tracking/update", {
+        method: "POST",
+        body: JSON.stringify({
+          amazon_order_id: normalized.amazon_order_id,
+          amazon_order_url: normalized.amazon_order_url || orderUrl(normalized),
+          packages: Array.isArray(rawOrder.packages) ? rawOrder.packages : [],
+          payment_revision_needed: true,
+          payment_revision_url: normalized.payment_revision_url || "",
+          page_text: normalized.page_text || normalized.status || "Payment revision needed. Please update your payment method.",
+        }),
+        timeoutMs: 12000,
+        retries: 0,
+      }).catch((error) => log(`Could not save payment revision history order ${normalized.amazon_order_id}: ${error.message}; skipped page open.`, windowId));
+      continue;
+    }
     addedRawOrders.push(rawOrder);
     queue.push({
       ...normalized,
@@ -865,9 +898,9 @@ async function handleHistoryTrackPage(message, windowId) {
   tracking.nextUrl = normalizeHistoryNextUrl(message.nextUrl || "", nextPage);
   tracking.pagesScanned = Number(tracking.pagesScanned || 0) + 1;
   tracking.lastActivityAt = Date.now();
-  tracking.lastMessage = `Scanned history page ${tracking.currentPage || ""}: ${added} order(s) queued${skippedCancelled ? `, ${skippedCancelled} cancelled skipped` : ""}; preparing matches in background.`;
+  tracking.lastMessage = `Scanned history page ${tracking.currentPage || ""}: ${added} order(s) queued${skippedCancelled ? `, ${skippedCancelled} cancelled skipped` : ""}${skippedPaymentRevision ? `, ${skippedPaymentRevision} payment revision reported` : ""}; preparing matches in background.`;
   await saveTracking(tracking, windowId);
-  await log(`History page scanned: queued ${added} order(s)${skippedCancelled ? `, skipped ${skippedCancelled} cancelled order(s)` : ""}; matching continues in background.`, windowId);
+  await log(`History page scanned: queued ${added} order(s)${skippedCancelled ? `, skipped ${skippedCancelled} cancelled order(s)` : ""}${skippedPaymentRevision ? `, reported ${skippedPaymentRevision} payment revision order(s)` : ""}; matching continues in background.`, windowId);
   if (!tracking.currentOrder) await openHistoryCurrentOrder(windowId);
   if (addedRawOrders.length) {
     syncHistoryOrdersToAppBatch(addedRawOrders, windowId).catch((error) => log(`Batch Track all preparation failed: ${error.message}`, windowId));
@@ -1006,6 +1039,35 @@ async function handleOrderPackages(message, windowId) {
   const historyResult = await handleHistoryOrderPackages(message, windowId);
   if (historyResult) return historyResult;
   const { tracking, headlessTrackingMode } = await getWindowState(windowId);
+  if ((message.paymentRevisionNeeded || message.orderCancelled) && (!tracking.running || tracking.orders?.[tracking.index]?.amazon_order_id !== message.amazonOrderId)) {
+    if (headlessTrackingMode && tracking.running) {
+      return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
+    }
+    const amazonOrderId = String(message.amazonOrderId || "").trim();
+    if (!amazonOrderId) return { ok: false, message: "Could not detect the Amazon order id on this order page." };
+    try {
+      await api("/api/tracking/update", {
+        method: "POST",
+        body: JSON.stringify({
+          amazon_order_id: amazonOrderId,
+          amazon_order_url: message.amazonOrderUrl || orderUrl({ amazon_order_id: amazonOrderId }),
+          packages: message.packages || [],
+          order_cancelled: Boolean(message.orderCancelled),
+          cancellation_message: message.cancellationMessage || "",
+          payment_revision_needed: Boolean(message.paymentRevisionNeeded),
+          payment_revision_url: message.paymentRevisionUrl || "",
+          page_text: message.pageText || "",
+        }),
+        timeoutMs: 12000,
+        retries: 0,
+      });
+      await log(`${message.orderCancelled ? "Cancelled order" : "Payment revision"} detected on standalone order page ${amazonOrderId}; posted to app.`, windowId);
+      return { ok: true, recovered: true, message: `${message.orderCancelled ? "Cancelled order" : "Payment revision"} posted to app for ${amazonOrderId}.` };
+    } catch (error) {
+      await log(`Could not save standalone ${message.orderCancelled ? "cancelled" : "payment revision"} status for ${amazonOrderId}: ${error.message}.`, windowId);
+      return { ok: false, message: error.message };
+    }
+  }
   if (!tracking.running) {
     await log(`Ignored Amazon order page ${message.amazonOrderId || "unknown"} because normal tracking is not running.`, windowId);
     if (headlessTrackingMode) {
@@ -1027,7 +1089,7 @@ async function handleOrderPackages(message, windowId) {
         method: "POST",
         body: JSON.stringify({
           amazon_order_id: order.amazon_order_id,
-          amazon_order_url: orderUrl(order),
+          amazon_order_url: message.amazonOrderUrl || orderUrl(order),
           packages: message.packages || [],
           order_cancelled: true,
           cancellation_message: message.cancellationMessage || "This order has been cancelled.",
@@ -1049,7 +1111,7 @@ async function handleOrderPackages(message, windowId) {
         method: "POST",
         body: JSON.stringify({
           amazon_order_id: order.amazon_order_id,
-          amazon_order_url: orderUrl(order),
+          amazon_order_url: message.amazonOrderUrl || orderUrl(order),
           packages: message.packages || [],
           payment_revision_needed: true,
           payment_revision_url: message.paymentRevisionUrl || "",

@@ -30,6 +30,16 @@ cd "/Users/amitsoni/Documents/Chrome extension - fulfilment and report/frontend"
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
+For production-like dispatch performance, run Redis and the Dramatiq worker in another terminal:
+
+```bash
+brew services start redis
+export REDIS_URL=redis://127.0.0.1:6379/0
+./scripts/run-dramatiq-worker.sh
+```
+
+Use a shared Redis URL in `.env` for team/production use so every app process and worker sees the same queue and hot cache. The worker handles dispatch scan-index rebuilds, per-order dispatch package syncing, stale payment-failure cleanup, and hot page warmups. Redis is also used for shared page cache and rebuild progress so refreshes do not wait on heavy SQL work.
+
 Open the shadcn UI at [http://127.0.0.1:5173](http://127.0.0.1:5173). The backend API runs at [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
 ## First Use

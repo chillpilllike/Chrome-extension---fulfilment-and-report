@@ -301,7 +301,20 @@ function orderCardStatus(card) {
     .map((node) => clean(node.textContent))
     .filter(Boolean)
     .filter((text) => !/order placed|order #|total|ship to|buy it again|view order details|invoice/i.test(text));
-  return statuses.find((text) => /arriv|deliver|ship|cancel|refund|return|unavailable/i.test(text)) || statuses[0] || "";
+  return statuses.find((text) => /arriv|deliver|ship|cancel|refund|return|unavailable|payment revision|update your payment/i.test(text)) || statuses[0] || "";
+}
+
+function orderCardPaymentRevision(card) {
+  const text = clean(card?.innerText || card?.textContent || "");
+  const reviseLink = card?.querySelector?.("a[href*='/cpe/revisepayments'], a[href*='revisepayments']");
+  const needed = /payment revision needed/i.test(text)
+    || /please update your payment method/i.test(text)
+    || /revise payment/i.test(clean(reviseLink?.textContent || ""));
+  return {
+    paymentRevisionNeeded: needed,
+    paymentRevisionUrl: reviseLink ? absoluteUrl(reviseLink.getAttribute("href") || "") : "",
+    pageText: needed ? text.slice(0, 2000) : "",
+  };
 }
 
 function orderCardItems(card) {
@@ -359,17 +372,20 @@ function extractHistoryTrackOrders() {
     if (!orderId || seen.has(orderId)) continue;
     seen.add(orderId);
     const items = orderCardItems(card);
+    const paymentRevision = orderCardPaymentRevision(card);
+    const status = paymentRevision.paymentRevisionNeeded ? "Payment revision needed" : orderCardStatus(card);
     orders.push({
       amazon_order_id: orderId,
       amazon_order_url: orderDetailsUrl(orderId),
       recipient: orderCardRecipient(card),
       order_date: orderCardDate(card),
-      status: orderCardStatus(card),
+      status,
       asins: items.map((item) => item.asin).filter(Boolean),
       items,
       products: items,
       packages: orderCardTrackingPackages(card, orderId),
-      cancelled: /cancel/i.test(orderCardStatus(card)),
+      cancelled: /cancel/i.test(status),
+      ...paymentRevision,
     });
   }
   return orders;
@@ -397,7 +413,7 @@ async function scanOrderHistoryForTrackAll(state = null) {
 
 function parsePaymentRevision() {
   const alertBlocks = [
-    ...document.querySelectorAll("[data-component='alerts'], .a-alert .a-box-inner, .a-alert-heading, .a-alert-content, .od-status-message"),
+    ...document.querySelectorAll("[data-component='alerts'], .a-alert .a-box-inner, .a-alert-heading, .a-alert-content, .od-status-message, .a-color-error.a-text-bold, #deliveryHasAnAlert, #deliveryItemList"),
   ];
   const matchedBlock = alertBlocks.find((element) => {
     const text = clean(element.textContent);
@@ -411,8 +427,11 @@ function parsePaymentRevision() {
     "",
   ).slice(0, 10000);
   const text = clean(matchedBlock?.textContent || scopedText);
-  const needed = Boolean(matchedBlock) || /payment revision needed/i.test(scopedText) || /please update your payment method/i.test(scopedText);
   const reviseLink = document.querySelector("a[href*='/cpe/revisepayments'], a[href*='revisepayments']");
+  const needed = Boolean(matchedBlock)
+    || /payment revision needed/i.test(scopedText)
+    || /please update your payment method/i.test(scopedText)
+    || /revise payment/i.test(clean(reviseLink?.textContent || ""));
   return {
     paymentRevisionNeeded: needed,
     paymentRevisionUrl: reviseLink ? absoluteUrl(reviseLink.getAttribute("href") || "") : "",
@@ -511,7 +530,7 @@ async function parseOrderDetails() {
   const orderRoot = document.querySelector("#orderDetails, [data-component='shipments'], .a-box-group") || document.body;
   const products = productsByAsin.size ? [...productsByAsin.values()] : productItemsFrom(orderRoot, 20);
   const orderStatus = clean(document.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
-  return { amazonOrderId, packages, products, orderStatus, ...promiseDetails(orderStatus), ...paymentRevision, ...cancellation };
+  return { amazonOrderId, amazonOrderUrl: location.href, packages, products, orderStatus, ...promiseDetails(orderStatus), ...paymentRevision, ...cancellation };
 }
 
 function parseCarrierAndTrackingId() {
@@ -662,6 +681,8 @@ async function run() {
       "Nutricity tracking",
       data.orderCancelled
         ? `Cancelled order detected for ${data.amazonOrderId}. Moving to next order.`
+        : data.paymentRevisionNeeded
+          ? `Payment revision needed for ${data.amazonOrderId}. Reporting to the app.`
         : `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`,
     );
     const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data }, 15000);

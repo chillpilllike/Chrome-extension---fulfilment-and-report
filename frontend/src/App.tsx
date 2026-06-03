@@ -299,7 +299,10 @@ type TrackingOrder = {
 type DispatchPackage = {
   id: number
   scan_code: string
+  canonical_scan_code?: string
   display_code: string
+  last_scanned_code?: string
+  scanned_codes?: string[]
   amazon_order_id: string
   amazon_order_url?: string
   odoo_order_name: string
@@ -333,6 +336,10 @@ type DispatchPackage = {
   related_parts?: Array<{
     id: number
     display_code: string
+    scan_code?: string
+    canonical_scan_code?: string
+    last_scanned_code?: string
+    scanned_codes?: string[]
     amazon_order_id: string
     odoo_order_name: string
     recipient_ref?: string
@@ -1598,6 +1605,27 @@ function dispatchDisplayText(value?: string) {
   }).replace(/\b(Today|Tomorrow|Later)-(\d{2}-\d{2})\b/gi, (_match, day: string, section: string) => {
     return `${day[0].toUpperCase()}${day.slice(1).toLowerCase()} ${section}`
   })
+}
+
+function normalizeCodeText(value?: string) {
+  return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9-]/g, "")
+}
+
+function DispatchPackageCodes({ pkg }: { pkg: Partial<DispatchPackage> }) {
+  const scanned = String(pkg.last_scanned_code || pkg.scanned_codes?.[0] || "").trim()
+  const tracking = String(pkg.canonical_scan_code || pkg.scan_code || pkg.display_code || "").trim()
+  const display = String(pkg.display_code || pkg.scan_code || "").trim()
+  const scannedNorm = normalizeCodeText(scanned)
+  const trackingNorm = normalizeCodeText(tracking)
+  if (scanned && tracking && scannedNorm && trackingNorm && scannedNorm !== trackingNorm) {
+    return (
+      <div className="mt-1 space-y-0.5 break-all font-mono text-xs text-muted-foreground">
+        <div>Scanned: {scanned}</div>
+        <div>Tracking: {tracking}</div>
+      </div>
+    )
+  }
+  return <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{display || tracking || "No scan code"}</div>
 }
 
 function dispatchOrderSection(value?: string) {
@@ -6237,7 +6265,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                           <Badge variant={pkg.priority === "U" ? "destructive" : "outline"}>{pkg.priority === "U" ? "Urgent" : "Normal"}</Badge>
                           <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready" : "Hold"}</Badge>
                         </div>
-                        <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
+                        <DispatchPackageCodes pkg={pkg} />
                         <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
                         <div className="mt-1 text-xs text-muted-foreground">Package {pkg.package_index || 1} · {pkg.package_status || pkg.promise || "Amazon package"}</div>
                       </div>
@@ -6678,7 +6706,9 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                             <StatusBadge value={pkg.scan_status} />
                             <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready for fulfilment" : "Hold"}</Badge>
                           </div>
-                          <div className="dispatch-rack-code mt-1 font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
+                          <div className="dispatch-rack-code">
+                            <DispatchPackageCodes pkg={pkg} />
+                          </div>
                           <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
                           <div className="mt-1 text-xs text-muted-foreground">{dispatchLocationCode(pkg) || "No rack"} · package {pkg.package_index || 1}</div>
                         </div>
@@ -6730,7 +6760,8 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                     <span className="font-semibold">{row.odoo_order_name || row.amazon_order_id}</span>
                     <StatusBadge value={row.scan_status} />
                   </div>
-                  <div className="font-mono text-xs text-muted-foreground">{row.display_code} · {dispatchLocationCode(row) || "No tote"}</div>
+                  <DispatchPackageCodes pkg={row} />
+                  <div className="text-xs text-muted-foreground">{dispatchLocationCode(row) || "No tote"}</div>
                   <div className="text-xs text-muted-foreground">
                     Scanned {Number(row.scan_count || 0).toLocaleString()} time{Number(row.scan_count || 0) === 1 ? "" : "s"}
                     {row.last_scanned_at ? ` · ${formatDateTime(row.last_scanned_at)}` : ""}
@@ -12723,11 +12754,20 @@ function SettingsPage({
               <Database className="size-4 text-muted-foreground" />
               <CardTitle>Database & Automation</CardTitle>
             </div>
-            <CardDescription>Postgres connection plus automatic Odoo order pulls from all stores and Chrome fulfilment queue timing.</CardDescription>
+            <CardDescription>Postgres, Redis cache, background worker, automatic Odoo pulls, and Chrome fulfilment queue timing.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4">
             <div className="grid gap-3 md:grid-cols-2">
               <TextField label="Postgres URL" type="password" value={settings.postgres_url || ""} onChange={(value) => setSetting("postgres_url", value)} />
+              <TextField label="Redis URL" type="password" value={settings.redis_url || ""} onChange={(value) => setSetting("redis_url", value)} />
+              <SelectField label="Redis Page Cache" value={settings.redis_enabled || "true"} onChange={(value) => setSetting("redis_enabled", value)}>
+                <option value="true">Enabled</option>
+                <option value="false">Disabled</option>
+              </SelectField>
+              <SelectField label="Dramatiq Background Worker" value={settings.dramatiq_enabled || "true"} onChange={(value) => setSetting("dramatiq_enabled", value)}>
+                <option value="true">Enabled</option>
+                <option value="false">Disabled</option>
+              </SelectField>
               <SelectField label="Auto Pull Orders From All Stores" value={settings.autosync_interval_minutes || "0"} onChange={(value) => setSetting("autosync_interval_minutes", value)}>
                 {["0", "15", "30", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
               </SelectField>
@@ -12758,8 +12798,11 @@ function SettingsPage({
             <div className="btn-list">
               <Button
                 onClick={() => saveSettingsGroup("Database & Automation", [
-                  "postgres_url",
-                  "autosync_interval_minutes",
+	                  "postgres_url",
+	                  "redis_url",
+	                  "redis_enabled",
+	                  "dramatiq_enabled",
+	                  "autosync_interval_minutes",
                   "pull_orders_days",
                   "pull_orders_limit",
                   "auto_chrome_fulfil_interval_minutes",
@@ -12771,10 +12814,11 @@ function SettingsPage({
                 ])}
                 disabled={savingServices === "Database & Automation"}
               >
-                {savingServices === "Database & Automation" ? "Saving..." : "Save Database"}
-              </Button>
-              <Button variant="outline" onClick={() => testService("postgres")}>Test Postgres</Button>
-            </div>
+	                {savingServices === "Database & Automation" ? "Saving..." : "Save Database"}
+	              </Button>
+	              <Button variant="outline" onClick={() => testService("postgres")}>Test Postgres</Button>
+	              <Button variant="outline" onClick={() => testService("redis")}>Test Redis</Button>
+	            </div>
           </CardContent>
         </Card>
 

@@ -46,6 +46,7 @@ from app.core.config import BASE_DIR, DEFAULT_SERVICE_SETTINGS, FRONTEND_DIST, e
 from app.core.time import utc_now
 from app.db.session import db
 from app.db import session as db_session
+from app import redis_support
 from app.schemas import (
     AddressPayload,
     AdminSettingsPayload,
@@ -187,6 +188,11 @@ _SERVICE_SETTINGS_CACHE_LOCK = threading.Lock()
 SERVICE_SETTINGS_CACHE_TTL_SECONDS = 300
 _FAST_PAGE_CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
 _FAST_PAGE_CACHE_LOCK = threading.Lock()
+_PAYMENT_FAILURE_CLEANUP_ENQUEUED_AT = 0.0
+_PAYMENT_FAILURE_CLEANUP_LOCK = threading.Lock()
+_CHROME_RECOVER_SUBMITTED_NONE_CACHE: dict[tuple[Optional[int], str], float] = {}
+_CHROME_RECOVER_SUBMITTED_NONE_LOCK = threading.Lock()
+FAST_PAGE_CACHE_MAX_ENTRIES = int(os.getenv("FAST_PAGE_CACHE_MAX_ENTRIES", "3000") or 3000)
 _DISPATCH_REBUILD_PROGRESS: dict[str, Any] = {
     "status": "idle",
     "total": 0,
@@ -204,7 +210,7 @@ _DISPATCH_REBUILD_PROGRESS: dict[str, Any] = {
     "error": "",
 }
 _DISPATCH_REBUILD_PROGRESS_LOCK = threading.Lock()
-FAST_PAGE_CACHE_TTL_SECONDS = 20
+FAST_PAGE_CACHE_TTL_SECONDS = 120
 _STORE_CACHE: dict[int, tuple[Store, float]] = {}
 _STORES_LIST_CACHE: tuple[list[dict[str, Any]], float] = ([], 0.0)
 _STORE_CACHE_LOCK = threading.Lock()
@@ -261,33 +267,167 @@ def fast_page_cache_get(key: tuple[Any, ...]) -> Any:
     now = time.monotonic()
     with _FAST_PAGE_CACHE_LOCK:
         cached = _FAST_PAGE_CACHE.get(key)
-        if not cached:
-            return None
-        expires_at, value = cached
-        if expires_at <= now:
+        if cached:
+            expires_at, value = cached
+            if expires_at > now:
+                return copy.deepcopy(value)
             _FAST_PAGE_CACHE.pop(key, None)
-            return None
-        return copy.deepcopy(value)
+    stale_value = redis_support.page_cache_get_stale(key)
+    if stale_value is not None:
+        with _FAST_PAGE_CACHE_LOCK:
+            if len(_FAST_PAGE_CACHE) > FAST_PAGE_CACHE_MAX_ENTRIES:
+                _FAST_PAGE_CACHE.clear()
+            _FAST_PAGE_CACHE[key] = (time.monotonic() + FAST_PAGE_CACHE_TTL_SECONDS, copy.deepcopy(stale_value))
+        return copy.deepcopy(stale_value)
+    if redis_support.stale_cache_enabled(key):
+        return None
+    redis_value = redis_support.page_cache_get(key)
+    if redis_value is not None:
+        with _FAST_PAGE_CACHE_LOCK:
+            if len(_FAST_PAGE_CACHE) > FAST_PAGE_CACHE_MAX_ENTRIES:
+                _FAST_PAGE_CACHE.clear()
+            _FAST_PAGE_CACHE[key] = (time.monotonic() + FAST_PAGE_CACHE_TTL_SECONDS, copy.deepcopy(redis_value))
+        return copy.deepcopy(redis_value)
+    return None
 
 
 def fast_page_cache_set(key: tuple[Any, ...], value: Any, ttl_seconds: int = FAST_PAGE_CACHE_TTL_SECONDS) -> Any:
     with _FAST_PAGE_CACHE_LOCK:
-        if len(_FAST_PAGE_CACHE) > 200:
+        if len(_FAST_PAGE_CACHE) > FAST_PAGE_CACHE_MAX_ENTRIES:
             _FAST_PAGE_CACHE.clear()
         _FAST_PAGE_CACHE[key] = (time.monotonic() + max(1, ttl_seconds), copy.deepcopy(value))
+    try:
+        cached_value = copy.deepcopy(value)
+        threading.Thread(
+            target=redis_support.page_cache_set,
+            args=(key, cached_value, ttl_seconds),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
     return value
 
 
 def fast_page_cache_clear() -> None:
+    redis_support.page_cache_clear()
     with _FAST_PAGE_CACHE_LOCK:
         _FAST_PAGE_CACHE.clear()
 
 
 def fast_page_cache_clear_matching(prefixes: set[str]) -> None:
+    if "orders" in prefixes:
+        prefixes = set(prefixes)
+        prefixes.update({"orders-count", "orders-condition-count"})
+    redis_support.page_cache_clear_matching(prefixes)
     with _FAST_PAGE_CACHE_LOCK:
         for key in list(_FAST_PAGE_CACHE):
             if key and clean_text(key[0]) in prefixes:
                 _FAST_PAGE_CACHE.pop(key, None)
+
+
+def enqueue_dispatch_order_sync(order_id: str) -> bool:
+    try:
+        from app.tasks import enqueue, sync_dispatch_order_task
+
+        return enqueue(sync_dispatch_order_task, order_id)
+    except Exception:
+        return False
+
+
+def enqueue_dispatch_rebuild(store_id: Optional[int] = None) -> bool:
+    try:
+        from app.tasks import enqueue, rebuild_dispatch_scan_index_task
+
+        return enqueue(rebuild_dispatch_scan_index_task, store_id)
+    except Exception:
+        return False
+
+
+def enqueue_payment_failure_cleanup(order_id: str = "") -> bool:
+    global _PAYMENT_FAILURE_CLEANUP_ENQUEUED_AT
+    if not clean_text(order_id):
+        now = time.monotonic()
+        with _PAYMENT_FAILURE_CLEANUP_LOCK:
+            if now - _PAYMENT_FAILURE_CLEANUP_ENQUEUED_AT < 60:
+                return True
+            _PAYMENT_FAILURE_CLEANUP_ENQUEUED_AT = now
+    try:
+        from app.tasks import cleanup_stale_payment_failures_task, enqueue
+
+        return enqueue(cleanup_stale_payment_failures_task, order_id)
+    except Exception:
+        return False
+
+
+def enqueue_dispatch_summary_warm(store_id: Optional[int] = None) -> bool:
+    try:
+        from app.tasks import enqueue, warm_dispatch_summary_task
+
+        return enqueue(warm_dispatch_summary_task, store_id)
+    except Exception:
+        return False
+
+
+def enqueue_app_pages_warm(store_id: Optional[int] = None) -> bool:
+    try:
+        from app.tasks import enqueue, warm_app_pages_task
+
+        return enqueue(warm_app_pages_task, store_id)
+    except Exception:
+        return False
+
+
+def warm_common_page_cache(store_id: Optional[int] = None) -> None:
+    try:
+        store_ids = [int(store["id"]) for store in list_stores()]
+    except Exception:
+        store_ids = []
+    store_targets: list[Optional[int]] = [store_id]
+    if store_id is None:
+        store_targets.extend(store_ids)
+    store_targets = list(dict.fromkeys(store_targets))
+
+    warm_calls: list[Any] = [
+        lambda: api_ui_copy(),
+        lambda: api_service_settings(),
+        lambda: api_pull_jobs(page=1, per_page=20),
+        lambda: api_exports(page=1, per_page=20),
+        lambda: api_accounting(page=1, per_page=20),
+        lambda: api_profit_loss(store_id=None, page=1, per_page=20),
+        lambda: api_costly(store_id=None, page=1, per_page=20),
+        lambda: api_amazon_otp(page=1, per_page=20),
+    ]
+    for target_store_id in store_targets:
+        warm_calls.extend([
+            lambda target_store_id=target_store_id: api_dashboard(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_order_countries(store_id=target_store_id),
+            lambda target_store_id=target_store_id: api_inventory(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_cancelled_orders(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_missing(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_back_in_stock(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_partial_fulfilments(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_bulk(store_id=target_store_id, page=1, per_page=20, days=2),
+            lambda target_store_id=target_store_id: api_duplicate_asins(store_id=target_store_id, page=1, per_page=20, days=2),
+            lambda target_store_id=target_store_id: api_tracking_fulfilment_pending(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_tracking_payment_failures(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_dispatch_status(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_dispatch_status_summary(store_id=target_store_id),
+            lambda target_store_id=target_store_id: api_epost_tracking(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_chrome_jobs(store_id=target_store_id, claim=False, job_limit=50),
+        ])
+        for warm_page in range(1, 11):
+            warm_calls.extend([
+                lambda target_store_id=target_store_id, warm_page=warm_page: api_orders(store_id=target_store_id, page=warm_page, per_page=20),
+                lambda target_store_id=target_store_id, warm_page=warm_page: api_tracking_orders(store_id=target_store_id, page=warm_page, per_page=20),
+                lambda target_store_id=target_store_id, warm_page=warm_page: api_dispatch_sorting_summary(store_id=target_store_id, scan_page=warm_page, scan_per_page=10, scan_q=""),
+            ])
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(warm_call) for warm_call in warm_calls]
+        for future in futures:
+            try:
+                future.result()
+            except Exception:
+                continue
 
 
 def _ensure_shopify_order_status_cache_table() -> None:
@@ -458,6 +598,7 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_order_lines_tracking_checked_order ON order_lines(store_id, amazon_order_id, tracking_checked_at DESC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND COALESCE(tracking_checked_at, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_queue ON order_lines(store_id, updated_at ASC, odoo_order_id DESC, id) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(amazon_group_key, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_worker ON order_lines(chrome_claimed_by, store_id, updated_at ASC) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_recover_submitted ON order_lines(chrome_claimed_by, amazon_status, store_id, odoo_order_date DESC, pulled_at DESC, created_at DESC, odoo_order_id DESC, id) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(amazon_group_key, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_group ON order_lines(amazon_group_key, id) WHERE order_engine='chrome'",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_expiry ON order_lines(chrome_claim_expires_at) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(chrome_claim_expires_at, '') != ''",
         # Reporting, accounting, and date windows.
@@ -951,6 +1092,8 @@ def init_db() -> None:
                 scan_code TEXT NOT NULL UNIQUE,
                 canonical_scan_code TEXT,
                 display_code TEXT NOT NULL,
+                last_scanned_code TEXT,
+                scanned_codes_json TEXT NOT NULL DEFAULT '[]',
                 amazon_order_id TEXT NOT NULL,
                 amazon_order_url TEXT,
                 store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
@@ -1193,6 +1336,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN canonical_scan_code TEXT")
         if "recipient_ref" not in existing_dispatch_cols:
             conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN recipient_ref TEXT")
+        if "last_scanned_code" not in existing_dispatch_cols:
+            conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN last_scanned_code TEXT")
+        if "scanned_codes_json" not in existing_dispatch_cols:
+            conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN scanned_codes_json TEXT NOT NULL DEFAULT '[]'")
         existing_scan_event_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_dispatch_scan_events)").fetchall()}
         for column, ddl in {
             "resolved_at": "ALTER TABLE amazon_dispatch_scan_events ADD COLUMN resolved_at TEXT",
@@ -1225,6 +1372,7 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_canonical_store ON amazon_dispatch_packages(canonical_scan_code, store_id, updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_upper_scan_code ON amazon_dispatch_packages(UPPER(scan_code))",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_upper_canonical_scan_code ON amazon_dispatch_packages(UPPER(canonical_scan_code))",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_upper_last_scanned_code ON amazon_dispatch_packages(UPPER(last_scanned_code))",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_store_odoo ON amazon_dispatch_packages(store_id, odoo_order_id, id)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_store_order_name_upper ON amazon_dispatch_packages(store_id, UPPER(odoo_order_name), id)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_tote ON amazon_dispatch_packages(tote_code, scan_status)",
@@ -1260,6 +1408,7 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_canonical ON amazon_dispatch_packages USING gin (UPPER(canonical_scan_code) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_display ON amazon_dispatch_packages USING gin (UPPER(display_code) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_tracking_url ON amazon_dispatch_packages USING gin (UPPER(tracking_url) gin_trgm_ops)",
+                "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_trgm_scanned_codes ON amazon_dispatch_packages USING gin (UPPER(scanned_codes_json) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_scan_events_trgm_scan_query ON amazon_dispatch_scan_events USING gin (UPPER(scan_query) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_scan_events_trgm_normalized ON amazon_dispatch_scan_events USING gin (UPPER(normalized_query) gin_trgm_ops)",
                 "CREATE INDEX IF NOT EXISTS idx_dispatch_scan_events_trgm_amazon ON amazon_dispatch_scan_events USING gin (UPPER(amazon_order_id) gin_trgm_ops)",
@@ -2227,6 +2376,26 @@ def amazon_history_lookup_records(payload: AmazonHistoryLookupPayload) -> list[d
     return list(by_id.values())[:80]
 
 
+def amazon_history_records_cache_key(prefix: str, records: list[dict[str, Any]]) -> tuple[Any, ...]:
+    normalized = [
+        {
+            "amazon_order_id": clean_text(record.get("amazon_order_id")),
+            "recipient": clean_text(record.get("recipient")),
+            "status": clean_text(record.get("status")),
+            "order_date": clean_text(record.get("order_date")),
+            "asins": sorted(normalize_asin(asin) for asin in record.get("asins") or [] if normalize_asin(asin)),
+            "asin_quantities": {
+                normalize_asin(asin): float(quantity or 0)
+                for asin, quantity in (record.get("asin_quantities") or {}).items()
+                if normalize_asin(asin)
+            },
+            "cancelled": bool(record.get("cancelled")),
+        }
+        for record in records
+    ]
+    return (prefix, json.dumps(normalized, sort_keys=True, separators=(",", ":")))
+
+
 def order_line_asin_aliases(row: dict[str, Any]) -> list[str]:
     aliases = [
         normalize_asin(row.get("asin") if "asin" in row.keys() else ""),
@@ -3175,6 +3344,36 @@ def dispatch_physical_package_key(row: dict[str, Any]) -> str:
     )
 
 
+def dispatch_scanned_codes(row: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    try:
+        parsed = json.loads(row.get("scanned_codes_json") or "[]")
+        if isinstance(parsed, list):
+            values.extend(clean_text(value) for value in parsed)
+    except Exception:
+        pass
+    for key in ("last_scanned_code",):
+        values.append(clean_text(row.get(key)))
+    seen: set[str] = set()
+    codes: list[str] = []
+    for value in values:
+        code = normalize_dispatch_scan_code(value)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        codes.append(value or code)
+    return codes
+
+
+def dispatch_merge_scanned_codes(row: dict[str, Any], scanned_code: str, scanned_display: str = "") -> str:
+    codes = dispatch_scanned_codes(row)
+    normalized_seen = {normalize_dispatch_scan_code(code) for code in codes}
+    normalized = normalize_dispatch_scan_code(scanned_code or scanned_display)
+    if normalized and normalized not in normalized_seen:
+        codes.insert(0, clean_text(scanned_display) or clean_text(scanned_code) or normalized)
+    return json.dumps(codes[:20])
+
+
 def dispatch_display_code_rank(value: Any) -> int:
     text = clean_text(value)
     upper = text.upper()
@@ -3341,6 +3540,17 @@ def dispatch_tote_prefix(row: dict[str, Any], ready: bool = True) -> str:
     return f"{label}-{order_range}"
 
 
+def dispatch_recipient_part_total(row: dict[str, Any]) -> int:
+    text = f"{clean_text(row.get('recipient_ref'))} {clean_text(row.get('display_code'))} {clean_text(row.get('odoo_order_name'))}"
+    match = re.search(r"\bpart\s*\d+\s*of\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return 1
+    try:
+        return max(1, int(match.group(1)))
+    except Exception:
+        return 1
+
+
 def suggested_dispatch_tote(conn: Any, row: dict[str, Any], ready: bool = True) -> str:
     return dispatch_tote_prefix(row, ready)
 
@@ -3359,17 +3569,22 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
     order_id = clean_text(amazon_order_id)
     if not order_id:
         return 0
+    if amazon_order_has_open_payment_failure(conn, order_id):
+        dispatch_clear_packages_for_amazon_order(conn, order_id)
+        return 0
     rows = conn.execute(
         """
         SELECT *
         FROM order_lines
         WHERE amazon_order_id=?
           AND COALESCE(order_engine, '') != 'third_party'
+          AND COALESCE(tracking_status, '') != 'Payment revision needed'
         ORDER BY id
         """,
         (order_id,),
     ).fetchall()
     if not rows:
+        dispatch_clear_packages_for_amazon_order(conn, order_id)
         return 0
     packages: list[dict[str, Any]] = []
     seen_package_keys: set[str] = set()
@@ -3638,12 +3853,20 @@ def sync_dispatch_packages_for_order_async(amazon_order_id: str) -> None:
     order_id = clean_text(amazon_order_id)
     if not order_id:
         return
+    if enqueue_dispatch_order_sync(order_id):
+        return
 
     def task() -> None:
         try:
             with db() as conn:
                 sync_dispatch_packages_for_order(conn, order_id)
-            fast_page_cache_clear()
+            fast_page_cache_clear_matching({
+                "dispatch-sorting-summary",
+                "dispatch-sorting-summary-base",
+                "dispatch-status",
+                "dispatch-status-summary",
+                "tracking-orders",
+            })
         except Exception:
             pass
 
@@ -3651,9 +3874,16 @@ def sync_dispatch_packages_for_order_async(amazon_order_id: str) -> None:
 
 
 def dispatch_rebuild_progress(**updates: Any) -> dict[str, Any]:
+    state_name = "dispatch-rebuild-progress"
     with _DISPATCH_REBUILD_PROGRESS_LOCK:
+        if not updates:
+            redis_state = redis_support.state_get(state_name)
+            if isinstance(redis_state, dict):
+                _DISPATCH_REBUILD_PROGRESS.update(redis_state)
+                return dict(_DISPATCH_REBUILD_PROGRESS)
         if updates:
             _DISPATCH_REBUILD_PROGRESS.update(updates)
+            redis_support.state_set(state_name, dict(_DISPATCH_REBUILD_PROGRESS), 24 * 60 * 60)
         return dict(_DISPATCH_REBUILD_PROGRESS)
 
 
@@ -3707,7 +3937,14 @@ def run_dispatch_rebuild_job(store_id: Optional[int] = None) -> None:
                         WHERE COALESCE(amazon_order_id, '') != ''
                           AND COALESCE(tracking_payload, '') != ''
                           AND COALESCE(order_engine, '') != 'third_party'
+                          AND COALESCE(tracking_status, '') != 'Payment revision needed'
                           AND (? IS NULL OR store_id=?)
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM amazon_payment_failures
+                              WHERE amazon_payment_failures.amazon_order_id=order_lines.amazon_order_id
+                                AND amazon_payment_failures.status='open'
+                          )
                         ORDER BY amazon_order_id
                         LIMIT 5000
                     )
@@ -3715,6 +3952,7 @@ def run_dispatch_rebuild_job(store_id: Optional[int] = None) -> None:
                     FROM order_lines
                     JOIN candidate_orders ON candidate_orders.amazon_order_id=order_lines.amazon_order_id
                     WHERE COALESCE(order_lines.order_engine, '') != 'third_party'
+                      AND COALESCE(order_lines.tracking_status, '') != 'Payment revision needed'
                     ORDER BY order_lines.amazon_order_id, order_lines.id
                     """,
                     (store_id, store_id),
@@ -3814,6 +4052,7 @@ def run_dispatch_rebuild_job(store_id: Optional[int] = None) -> None:
             "dispatch-status",
             "dispatch-status-summary",
         })
+        api_dispatch_sorting_summary(store_id=store_id, scan_page=1, scan_per_page=10, scan_q="")
         dispatch_rebuild_progress(
             status="completed",
             processed=total,
@@ -3843,9 +4082,10 @@ def dispatch_package_payload(conn: Any, row: dict[str, Any], include_related: bo
             data[json_key.replace("_json", "")] = json.loads(data.get(json_key) or "[]")
         except Exception:
             data[json_key.replace("_json", "")] = []
+    data["scanned_codes"] = dispatch_scanned_codes(data)
     if not include_related:
-        data["suggested_tote"] = data.get("tote_code") or dispatch_tote_prefix(data, True)
-        data["order_ready"] = True
+        data["suggested_tote"] = data.get("tote_code") or dispatch_tote_prefix(data, False)
+        data["order_ready"] = False
         data["remaining_packages"] = []
         return data
     data["remaining_packages"] = dispatch_remaining_packages(conn, data)
@@ -3859,6 +4099,30 @@ def dispatch_package_payload(conn: Any, row: dict[str, Any], include_related: bo
     data["rack_key"] = dispatch_rack_key_for_package(data)
     data["rack_label"] = dispatch_rack_label_for_package(data)
     return data
+
+
+def dispatch_light_package_for_summary(row: dict[str, Any]) -> dict[str, Any]:
+    package = dispatch_package_payload(None, row, include_related=False)
+    tote = clean_text(package.get("tote_code") or package.get("suggested_tote")).upper()
+    status = clean_text(package.get("scan_status"))
+    received = status in {"received_unopened", "sorted_holding", "opened_verified", "dispatched"}
+    single_package_order = dispatch_recipient_part_total(package) <= 1
+    package["all_parts_received"] = False
+    package["related_parts"] = []
+    package["order_ready"] = bool(received and single_package_order) or status == "dispatched"
+    if status == "exception":
+        package["suggested_tote"] = package.get("tote_code") or "EXCEPTION-SCAN-01"
+    elif package["order_ready"]:
+        package["suggested_tote"] = dispatch_tote_code_for_rack(package, "today")
+    elif tote.startswith("TOMORROW-"):
+        package["suggested_tote"] = package.get("tote_code") or package.get("suggested_tote")
+    elif tote.startswith(("TODAY-", "LATER-", "EXCEPTION-")):
+        package["suggested_tote"] = dispatch_tote_code_for_rack(package, "later")
+    else:
+        package["suggested_tote"] = dispatch_tote_code_for_rack(package, "later")
+    package["rack_key"] = dispatch_rack_key_for_package(package)
+    package["rack_label"] = dispatch_rack_label_for_package(package)
+    return package
 
 
 def dispatch_find_fragment_matches(conn: Any, fragment: str, store_id: Optional[int] = None, limit: int = 12) -> list[dict[str, Any]]:
@@ -3876,12 +4140,14 @@ def dispatch_find_fragment_matches(conn: Any, fragment: str, store_id: Optional[
             (
                 UPPER(COALESCE(scan_code, '')) LIKE ?
                 OR UPPER(COALESCE(canonical_scan_code, '')) LIKE ?
+                OR UPPER(COALESCE(last_scanned_code, '')) LIKE ?
+                OR UPPER(COALESCE(scanned_codes_json, '')) LIKE ?
                 OR UPPER(COALESCE(display_code, '')) LIKE ?
                 OR UPPER(COALESCE(tracking_url, '')) LIKE ?
             )
             """
         )
-        search_params.extend([pattern, pattern, pattern, pattern])
+        search_params.extend([pattern, pattern, pattern, pattern, pattern, pattern])
     rows = rows_to_dicts(
         conn.execute(
             f"""
@@ -3889,19 +4155,27 @@ def dispatch_find_fragment_matches(conn: Any, fragment: str, store_id: Optional[
             FROM amazon_dispatch_packages
             WHERE ({' OR '.join(where_parts)})
               AND (? IS NULL OR store_id=?)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM amazon_payment_failures
+                  WHERE amazon_payment_failures.amazon_order_id=amazon_dispatch_packages.amazon_order_id
+                    AND amazon_payment_failures.status='open'
+              )
             ORDER BY
               CASE
                 WHEN scan_code=? THEN 0
                 WHEN canonical_scan_code=? THEN 1
-                WHEN UPPER(COALESCE(scan_code, '')) LIKE ? THEN 2
-                WHEN UPPER(COALESCE(canonical_scan_code, '')) LIKE ? THEN 3
-                ELSE 4
+                WHEN last_scanned_code=? THEN 2
+                WHEN UPPER(COALESCE(scan_code, '')) LIKE ? THEN 3
+                WHEN UPPER(COALESCE(canonical_scan_code, '')) LIKE ? THEN 4
+                WHEN UPPER(COALESCE(last_scanned_code, '')) LIKE ? THEN 5
+                ELSE 6
               END,
               updated_at DESC,
               id DESC
             LIMIT ?
             """,
-            [*search_params, store_id, store_id, normalized, normalized, f"{normalized}%", f"{normalized}%", limit],
+            [*search_params, store_id, store_id, normalized, normalized, normalized, f"{normalized}%", f"{normalized}%", f"{normalized}%", limit],
         ).fetchall()
     )
     return dedupe_dispatch_package_rows(rows)[:limit]
@@ -3955,6 +4229,12 @@ def dispatch_rack_snapshot(conn: Any, store_id: Optional[int] = None) -> dict[st
           AND COALESCE(scan_status, '') != 'dispatched'
           AND COALESCE(scan_status, '') != 'pending'
           AND COALESCE(last_scanned_at, placed_at, '') != ''
+          AND NOT EXISTS (
+              SELECT 1
+              FROM amazon_payment_failures
+              WHERE amazon_payment_failures.amazon_order_id=amazon_dispatch_packages.amazon_order_id
+                AND amazon_payment_failures.status='open'
+          )
         ORDER BY COALESCE(last_scanned_at, placed_at, updated_at) DESC
         LIMIT 200
             """,
@@ -3963,7 +4243,7 @@ def dispatch_rack_snapshot(conn: Any, store_id: Optional[int] = None) -> dict[st
     )
     racks: dict[str, list[dict[str, Any]]] = {"today": [], "tomorrow": [], "later": [], "exception": []}
     for row in dedupe_dispatch_package_rows(rows):
-        package = dispatch_enrich_package_for_scan(conn, row)
+        package = dispatch_light_package_for_summary(row)
         rack = package["rack_key"]
         racks[rack].append(package)
     return {
@@ -4106,7 +4386,7 @@ def dedupe_dispatch_package_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
 def dispatch_remaining_packages(conn: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, scan_code, canonical_scan_code, display_code, amazon_order_id, store_id, odoo_order_id,
+        SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                order_line_ids_json, package_index, package_status, promise, scan_status, tote_code,
                last_scanned_at, placed_at, updated_at
         FROM amazon_dispatch_packages
@@ -4124,7 +4404,7 @@ def dispatch_remaining_packages(conn: Any, row: dict[str, Any]) -> list[dict[str
 def dispatch_order_packages(conn: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, scan_code, canonical_scan_code, display_code, amazon_order_id, store_id, odoo_order_id,
+        SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                odoo_order_name, order_line_ids_json, package_index, package_status, promise, scan_status, tote_code,
                last_scanned_at, placed_at, updated_at, scan_count
         FROM amazon_dispatch_packages
@@ -4201,7 +4481,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         ).fetchall())
         rows = rows_to_dicts(conn.execute(
             """
-            SELECT id, scan_code, canonical_scan_code, display_code, amazon_order_id, store_id, odoo_order_id,
+            SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                    odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
                    scan_status, tote_code, last_scanned_at, placed_at, updated_at, scan_count,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
@@ -4227,7 +4507,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         ).fetchall())
         rows = rows_to_dicts(conn.execute(
             """
-            SELECT id, scan_code, canonical_scan_code, display_code, amazon_order_id, store_id, odoo_order_id,
+            SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                    odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
                    scan_status, tote_code, last_scanned_at, placed_at, updated_at, scan_count,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
@@ -4426,22 +4706,48 @@ def dispatch_apply_matched_scan(conn: Any, row: dict[str, Any], query_text: str,
     now = utc_now()
     package_id = int(row["id"])
     next_status = row["scan_status"] if row["scan_status"] and row["scan_status"] != "pending" else "received_unopened"
-    updated = conn.execute(
+    canonical_code = normalize_dispatch_scan_code(row.get("canonical_scan_code")) or normalize_dispatch_scan_code(row.get("scan_code"))
+    scanned_codes_json = dispatch_merge_scanned_codes(row, scan_code, query_text)
+    conn.execute(
         """
         UPDATE amazon_dispatch_packages
         SET scan_status=?,
             received_at=COALESCE(received_at, ?),
             last_scanned_at=?,
+            last_scanned_code=?,
+            scanned_codes_json=?,
             scan_count=scan_count+1,
             updated_at=?
         WHERE id=?
-        RETURNING *
+           OR (COALESCE(canonical_scan_code, '') != '' AND canonical_scan_code=?)
+           OR (COALESCE(canonical_scan_code, '') = '' AND scan_code=?)
         """,
-        (next_status, now, now, now, package_id),
+        (next_status, now, now, scan_code, scanned_codes_json, now, package_id, canonical_code, canonical_code),
+    )
+    updated = conn.execute(
+        """
+        SELECT *
+        FROM amazon_dispatch_packages
+        WHERE id=?
+           OR (COALESCE(canonical_scan_code, '') != '' AND canonical_scan_code=?)
+           OR (COALESCE(canonical_scan_code, '') = '' AND scan_code=?)
+        ORDER BY
+          CASE WHEN id=? THEN 0 ELSE 1 END,
+          CASE WHEN scan_code=canonical_scan_code THEN 0 ELSE 1 END,
+          updated_at DESC,
+          id DESC
+        LIMIT 1
+        """,
+        (package_id, canonical_code, canonical_code, package_id),
     ).fetchone()
     status_changed = clean_text(row.get("scan_status")) in {"", "pending"}
     if status_changed:
-        fast_page_cache_clear()
+        fast_page_cache_clear_matching({
+            "dispatch-sorting-summary",
+            "dispatch-sorting-summary-base",
+            "dispatch-status",
+            "dispatch-status-summary",
+        })
     package = dispatch_enrich_package_for_scan(conn, updated)
     if package.get("recipient_ref") and not clean_text(updated.get("recipient_ref")):
         conn.execute("UPDATE amazon_dispatch_packages SET recipient_ref=?, updated_at=? WHERE id=?", (package["recipient_ref"], now, updated["id"]))
@@ -4463,6 +4769,7 @@ def dispatch_apply_matched_scan(conn: Any, row: dict[str, Any], query_text: str,
         "dispatch-status",
         "dispatch-status-summary",
     })
+    enqueue_dispatch_summary_warm(store_id)
     return package, message
 
 
@@ -4480,7 +4787,12 @@ def dispatch_record_matched_scan(package_id: int, query_text: str, scan_code: st
             if not row:
                 return
             dispatch_apply_matched_scan(conn, row, query_text, scan_code, store_id, result_count_prefix)
-        fast_page_cache_clear()
+        fast_page_cache_clear_matching({
+            "dispatch-sorting-summary",
+            "dispatch-sorting-summary-base",
+            "dispatch-status",
+            "dispatch-status-summary",
+        })
     except Exception:
         # Scan response has already returned; keep the dispatch desk moving.
         return
@@ -10356,6 +10668,122 @@ def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
 PAYMENT_REVISION_PATTERNS = ("payment revision needed", "please update your payment method")
 
 
+def dispatch_clear_packages_for_amazon_order(conn: Any, amazon_order_id: str) -> int:
+    order_id = clean_text(amazon_order_id)
+    if not order_id:
+        return 0
+    cursor = conn.execute("DELETE FROM amazon_dispatch_packages WHERE amazon_order_id=?", (order_id,))
+    return int(getattr(cursor, "rowcount", 0) or 0)
+
+
+def amazon_order_has_open_payment_failure(conn: Any, amazon_order_id: str) -> bool:
+    order_id = clean_text(amazon_order_id)
+    if not order_id:
+        return False
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM amazon_payment_failures
+        WHERE amazon_order_id=?
+          AND status='open'
+        LIMIT 1
+        """,
+        (order_id,),
+    ).fetchone()
+    return bool(row)
+
+
+def resolve_payment_failure_for_order(conn: Any, amazon_order_id: str, now: Optional[str] = None) -> int:
+    order_id = clean_text(amazon_order_id)
+    if not order_id:
+        return 0
+    now = now or utc_now()
+    cursor = conn.execute(
+        """
+        UPDATE amazon_payment_failures
+        SET status='resolved', resolved_at=COALESCE(resolved_at, ?), updated_at=?
+        WHERE amazon_order_id=?
+          AND status='open'
+        """,
+        (now, now, order_id),
+    )
+    conn.execute(
+        """
+        UPDATE order_lines
+        SET last_error=NULL,
+            tracking_status=CASE
+                WHEN tracking_status='Payment revision needed' THEN 'Ordered'
+                ELSE tracking_status
+            END,
+            updated_at=?
+        WHERE amazon_order_id=?
+          AND (
+              last_error='Payment revision needed. Please update your payment method.'
+              OR tracking_status='Payment revision needed'
+          )
+        """,
+        (now, order_id),
+    )
+    return int(getattr(cursor, "rowcount", 0) or 0)
+
+
+def cleanup_stale_payment_failures(conn: Any, amazon_order_id: str = "") -> int:
+    order_id = clean_text(amazon_order_id)
+    params: list[Any] = []
+    order_filter = ""
+    if order_id:
+        order_filter = "AND f.amazon_order_id=?"
+        params.append(order_id)
+    rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT f.amazon_order_id
+        FROM amazon_payment_failures f
+        WHERE f.status='open'
+          {order_filter}
+          AND EXISTS (
+              SELECT 1
+              FROM order_lines ol
+              WHERE ol.amazon_order_id=f.amazon_order_id
+                AND (
+                    LOWER(COALESCE(ol.tracking_status, '')) IN ('delivered', 'shipped', 'ordered')
+                    OR ol.state='delivered'
+                    OR COALESCE(ol.tracking_payload, '') NOT IN ('', '[]')
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM order_lines ol
+              WHERE ol.amazon_order_id=f.amazon_order_id
+                AND (
+                    ol.tracking_status='Payment revision needed'
+                    OR ol.last_error='Payment revision needed. Please update your payment method.'
+                )
+          )
+        """,
+        params,
+    ).fetchall())
+    cleaned = 0
+    now = utc_now()
+    for row in rows:
+        current_order_id = clean_text(row.get("amazon_order_id"))
+        if not current_order_id:
+            continue
+        cleaned += resolve_payment_failure_for_order(conn, current_order_id, now)
+        dispatch_clear_packages_for_amazon_order(conn, current_order_id)
+        failure_row = conn.execute("SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?", (current_order_id,)).fetchone()
+        if failure_row:
+            _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync("amazon_payment_failures", payment_failure_search_document(snapshot)))
+    if cleaned:
+        fast_page_cache_clear_matching({
+            "dispatch-sorting-summary",
+            "dispatch-sorting-summary-base",
+            "dispatch-status",
+            "dispatch-status-summary",
+            "tracking-orders",
+        })
+    return cleaned
+
+
 def iter_nested_strings(value: Any) -> list[str]:
     found: list[str] = []
     if isinstance(value, str):
@@ -12787,6 +13215,16 @@ def get_setting(key: str, default: str = "") -> str:
     return str(row["value"]) if row else default
 
 
+def get_settings_values(keys: list[str]) -> dict[str, str]:
+    clean_keys = [clean_text(key) for key in keys if clean_text(key)]
+    if not clean_keys:
+        return {}
+    placeholders = ",".join("?" for _ in clean_keys)
+    with db() as conn:
+        rows = conn.execute(f"SELECT key, value FROM app_settings WHERE key IN ({placeholders})", clean_keys).fetchall()
+    return {str(row["key"]): str(row["value"] or "") for row in rows}
+
+
 def set_setting(key: str, value: str) -> None:
     global _ADMIN_ACCESS_TOKEN_CACHE, _SERVICE_SETTINGS_CACHE
     with db() as conn:
@@ -12804,6 +13242,9 @@ def set_setting(key: str, value: str) -> None:
     if key in DEFAULT_SERVICE_SETTINGS:
         with _SERVICE_SETTINGS_CACHE_LOCK:
             _SERVICE_SETTINGS_CACHE = ({}, 0.0)
+    if key in {"redis_url", "redis_enabled", "dramatiq_enabled"}:
+        redis_support.reset_client()
+        fast_page_cache_clear()
 
 
 def get_ui_copy() -> dict[str, dict[str, str]]:
@@ -14119,7 +14560,7 @@ def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait:
     if wait:
         for store_id, order_names in groups.items():
             sync_shopify_status_for_order_names(store_id, sorted(order_names), force=True)
-        fast_page_cache_clear()
+        fast_page_cache_clear_matching({"dashboard", "orders"})
         return sum(len(order_names) for order_names in groups.values())
 
     queued_groups: dict[int, set[str]] = {}
@@ -14140,7 +14581,7 @@ def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait:
         try:
             for store_id, order_names in queued_groups.items():
                 sync_shopify_status_for_order_names(store_id, sorted(order_names), force=True)
-            fast_page_cache_clear()
+            fast_page_cache_clear_matching({"dashboard", "orders"})
         finally:
             with _SHOPIFY_STATUS_REFRESH_LOCK:
                 for key in queued_keys:
@@ -15885,6 +16326,11 @@ def set_service_settings(values: dict[str, str]) -> None:
             )
     with _SERVICE_SETTINGS_CACHE_LOCK:
         _SERVICE_SETTINGS_CACHE = ({}, 0.0)
+    if {"redis_url", "redis_enabled", "dramatiq_enabled"} & set(allowed):
+        redis_support.reset_client()
+        fast_page_cache_clear()
+    else:
+        fast_page_cache_clear_matching({"settings-services"})
 
 
 def send_email_alert(subject: str, message: str) -> None:
@@ -16518,22 +16964,29 @@ def order_lines_page_data(store_id: Optional[int] = None, page: int = 1, per_pag
     with db() as conn:
         rows = conn.execute(
             f"""
-            {order_line_search_select_sql(store_clause)}
+            SELECT {ORDER_LINE_PAGE_SELECT}
+            FROM order_lines
+            {store_clause}
             ORDER BY {order_by_sql}
             LIMIT ? OFFSET ?
             """,
             [*params, per_page, offset],
         ).fetchall()
-        total_row = conn.execute(
-            f"SELECT COUNT(*) AS total FROM order_lines {store_clause}",
-            params,
-        ).fetchone()
-        row_dicts = hydrate_order_line_rows(rows, conn=conn)
+        count_cache_key = ("orders-count", store_id, clean_text(country))
+        total = fast_page_cache_get(count_cache_key)
+        if total is None:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS total FROM order_lines {store_clause}",
+                params,
+            ).fetchone()
+            total = int(total_row["total"] if total_row else 0)
+            fast_page_cache_set(count_cache_key, total, 300)
+        row_dicts = hydrate_order_line_rows(rows, conn=conn, include_metrics=False, include_shopify=False)
     return {
         "rows": row_dicts,
         "page": page,
         "per_page": per_page,
-        "total": int(total_row["total"] if total_row else 0),
+        "total": int(total or 0),
     }
 
 
@@ -16552,22 +17005,29 @@ def order_lines_condition_page_data(
     with db() as conn:
         rows = conn.execute(
             f"""
-            {order_line_search_select_sql(where_sql)}
+            SELECT {ORDER_LINE_PAGE_SELECT}
+            FROM order_lines
+            {where_sql}
             ORDER BY {order_by_sql}
             LIMIT ? OFFSET ?
             """,
             [*params, per_page, offset],
         ).fetchall()
-        total_row = conn.execute(
-            f"SELECT COUNT(*) AS total FROM order_lines {where_sql}",
-            params,
-        ).fetchone()
-        row_dicts = hydrate_order_line_rows(rows, conn=conn)
+        count_cache_key = ("orders-condition-count", store_id, clean_text(condition), clean_text(country))
+        total = fast_page_cache_get(count_cache_key)
+        if total is None:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS total FROM order_lines {where_sql}",
+                params,
+            ).fetchone()
+            total = int(total_row["total"] if total_row else 0)
+            fast_page_cache_set(count_cache_key, total, 300)
+        row_dicts = hydrate_order_line_rows(rows, conn=conn, include_metrics=False, include_shopify=False)
     return {
         "rows": row_dicts,
         "page": page,
         "per_page": per_page,
-        "total": int(total_row["total"] if total_row else 0),
+        "total": int(total or 0),
     }
 
 
@@ -16593,12 +17053,134 @@ ORDER_LINE_SEARCH_COLUMNS = (
 )
 
 
-def hydrate_order_line_rows(rows: list[dict[str, Any]], stores: Optional[list[dict[str, Any]]] = None, conn: Optional[Any] = None) -> list[dict[str, Any]]:
+def enrich_order_line_page_metrics(conn: Any, rows: list[dict[str, Any]]) -> None:
+    if not conn or not rows:
+        return
+    metric_fields = ("duplicate_asin_count", "inventory_quantity", "odoo_order_distinct_asin_count")
+    if all(all(field in row for field in metric_fields) for row in rows):
+        return
+    for row in rows:
+        row.setdefault("duplicate_asin_count", 0)
+        row.setdefault("inventory_quantity", 0)
+        row.setdefault("odoo_order_distinct_asin_count", 0)
+
+    page_asins = sorted({
+        (int(row.get("store_id") or 0), clean_text(row.get("asin")))
+        for row in rows
+        if int(row.get("store_id") or 0) > 0 and clean_text(row.get("asin"))
+    })
+    if page_asins:
+        asin_store_ids = [store_id for store_id, _asin in page_asins]
+        asin_values = [asin for _store_id, asin in page_asins]
+        duplicate_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT duplicate_lines.store_id,
+                   duplicate_lines.asin,
+                   COUNT(*) AS duplicate_asin_count
+            FROM order_lines AS duplicate_lines
+            JOIN UNNEST(?::int[], ?::text[]) AS page_asins(store_id, asin)
+              ON page_asins.store_id=duplicate_lines.store_id
+             AND page_asins.asin=duplicate_lines.asin
+            WHERE COALESCE(duplicate_lines.amazon_order_id, '') = ''
+              AND COALESCE(duplicate_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            GROUP BY duplicate_lines.store_id, duplicate_lines.asin
+            """,
+            (asin_store_ids, asin_values),
+        ).fetchall())
+        duplicate_by_key = {
+            (int(row["store_id"]), clean_text(row["asin"])): int(row["duplicate_asin_count"] or 0)
+            for row in duplicate_rows
+        }
+        inventory_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT inventory_items.store_id,
+                   inventory_items.asin,
+                   SUM(inventory_items.quantity) AS inventory_quantity
+            FROM inventory_items
+            JOIN UNNEST(?::int[], ?::text[]) AS page_asins(store_id, asin)
+              ON page_asins.store_id=inventory_items.store_id
+             AND page_asins.asin=inventory_items.asin
+            WHERE inventory_items.status='available'
+            GROUP BY inventory_items.store_id, inventory_items.asin
+            """,
+            (asin_store_ids, asin_values),
+        ).fetchall())
+        inventory_by_key = {
+            (int(row["store_id"]), clean_text(row["asin"])): float(row["inventory_quantity"] or 0)
+            for row in inventory_rows
+        }
+        for row in rows:
+            key = (int(row.get("store_id") or 0), clean_text(row.get("asin")))
+            row["duplicate_asin_count"] = duplicate_by_key.get(key, 0)
+            row["inventory_quantity"] = inventory_by_key.get(key, 0)
+
+    order_keys = sorted({
+        (int(row.get("store_id") or 0), int(row.get("odoo_order_id") or 0))
+        for row in rows
+        if int(row.get("store_id") or 0) > 0 and int(row.get("odoo_order_id") or 0) > 0
+    })
+    if order_keys:
+        order_store_ids = [store_id for store_id, _order_id in order_keys]
+        order_ids = [order_id for _store_id, order_id in order_keys]
+        count_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT same_order_lines.store_id,
+                   same_order_lines.odoo_order_id,
+                   COUNT(DISTINCT same_order_lines.asin) AS odoo_order_distinct_asin_count
+            FROM order_lines AS same_order_lines
+            JOIN UNNEST(?::int[], ?::bigint[]) AS page_orders(store_id, odoo_order_id)
+              ON page_orders.store_id=same_order_lines.store_id
+             AND page_orders.odoo_order_id=same_order_lines.odoo_order_id
+            WHERE COALESCE(same_order_lines.asin, '') != ''
+              AND same_order_lines.state != 'missing'
+              AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            GROUP BY same_order_lines.store_id, same_order_lines.odoo_order_id
+            """,
+            (order_store_ids, order_ids),
+        ).fetchall())
+        counts_by_key = {
+            (int(row["store_id"]), int(row["odoo_order_id"])): int(row["odoo_order_distinct_asin_count"] or 0)
+            for row in count_rows
+        }
+        for row in rows:
+            key = (int(row.get("store_id") or 0), int(row.get("odoo_order_id") or 0))
+            row["odoo_order_distinct_asin_count"] = counts_by_key.get(key, 0)
+
+
+def hydrate_order_line_rows(
+    rows: list[dict[str, Any]],
+    stores: Optional[list[dict[str, Any]]] = None,
+    conn: Optional[Any] = None,
+    include_metrics: bool = True,
+    include_shopify: bool = True,
+) -> list[dict[str, Any]]:
     row_dicts = rows_to_dicts(rows)
+    for row in row_dicts:
+        row.setdefault("duplicate_asin_count", 0)
+        row.setdefault("inventory_quantity", 0)
+        row.setdefault("odoo_order_distinct_asin_count", 0)
+    if conn is not None and include_metrics:
+        enrich_order_line_page_metrics(conn, row_dicts)
+    if stores is None and conn is not None:
+        try:
+            stores = rows_to_dicts(conn.execute("SELECT * FROM stores ORDER BY name").fetchall())
+        except Exception:
+            stores = None
     stores = stores or rows_to_dicts(list_stores())
     stores_by_id = {store["id"]: store for store in stores}
     row_dicts = backfill_missing_order_dates(row_dicts)
-    attach_shopify_status_to_rows(row_dicts, conn)
+    if include_shopify:
+        attach_shopify_status_to_rows(row_dicts, conn)
+    else:
+        for row in row_dicts:
+            row.setdefault("shopify_order_id", "")
+            row.setdefault("shopify_order_name", "")
+            row.setdefault("shopify_order_url", "")
+            row.setdefault("shopify_financial_status", "")
+            row.setdefault("shopify_fulfillment_status", "")
+            row.setdefault("shopify_fulfillment_at", "")
+            row.setdefault("shopify_cancelled_at", "")
+            row.setdefault("shopify_synced_at", "")
     for row in row_dicts:
         store = stores_by_id.get(row.get("store_id"))
         row["store_name"] = store.get("name") if store else ""
@@ -16653,12 +17235,14 @@ def order_lines_by_ids(ids: list[int], stores: Optional[list[dict[str, Any]]] = 
             WITH matched(id, sort_order) AS (
                 SELECT * FROM UNNEST(?::int[]) WITH ORDINALITY
             )
-            {order_line_search_select_sql("JOIN matched ON matched.id = order_lines.id")}
+            SELECT {qualified_order_line_page_select("order_lines")}
+            FROM order_lines
+            JOIN matched ON matched.id = order_lines.id
             ORDER BY matched.sort_order
             """,
             (ids,),
         ).fetchall()
-    return hydrate_order_line_rows(rows, stores)
+        return hydrate_order_line_rows(rows, stores, conn=conn, include_metrics=False, include_shopify=False)
 
 
 def is_exact_order_reference_query(query: str) -> bool:
@@ -16983,12 +17567,18 @@ def startup() -> None:
         threading.Thread(target=amazon_otp_loop, daemon=True).start()
         if should_reindex_typesense:
             threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
+        threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
+        threading.Thread(target=enqueue_app_pages_warm, daemon=True).start()
         _sync_thread_started = True
 
 
 @app.get("/api/dashboard")
 def api_dashboard(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, sort_by: str = "odoo_order_date", sort_dir: str = "desc") -> dict[str, Any]:
-    return dashboard_data(store_id, page, per_page, sort_by, sort_dir)
+    cache_key = ("dashboard", store_id, page, per_page, clean_text(sort_by), clean_text(sort_dir))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    return fast_page_cache_set(cache_key, dashboard_data(store_id, page, per_page, sort_by, sort_dir), 90)
 
 
 @app.get("/api/system-diagnostics")
@@ -16998,22 +17588,26 @@ def api_system_diagnostics() -> dict[str, Any]:
 
 @app.get("/api/orders")
 def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "", q: str = "") -> dict[str, Any]:
+    cache_key = ("orders", store_id, page, per_page, clean_text(condition), clean_text(sort_by), clean_text(sort_dir), clean_text(country), clean_text(q))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     if clean_text(q):
         data = search_order_lines_sql(q, store_id, page, per_page, sort_by, sort_dir, condition, country)
         data["search_engine"] = "postgres"
-        return data
+        return fast_page_cache_set(cache_key, data, 45)
     filter_by, filtered = order_condition_filter(condition, store_id, country)
     if filtered and order_condition_uses_typesense(condition, country):
         try:
             result = typesense_search_order_lines("*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
             if result.get("enabled"):
-                return {
+                return fast_page_cache_set(cache_key, {
                     "rows": order_lines_by_ids([int(value) for value in result.get("ids") or []]),
                     "page": page,
                     "per_page": per_page,
                     "total": int(result.get("total") or 0),
                     "search_engine": "typesense",
-                }
+                }, 45)
         except Exception:
             pass
     if filtered:
@@ -17021,14 +17615,18 @@ def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 10
         data["search_engine"] = "postgres"
         if order_condition_uses_typesense(condition, country):
             data["search_warning"] = "Typesense filter unavailable; using Postgres fallback."
-        return data
+        return fast_page_cache_set(cache_key, data, 60)
     data = order_lines_page_data(store_id, page, per_page, sort_by, sort_dir, country)
     data["search_engine"] = "postgres"
-    return data
+    return fast_page_cache_set(cache_key, data, 90)
 
 
 @app.get("/api/orders/countries")
 def api_order_countries(store_id: Optional[int] = None) -> dict[str, Any]:
+    cache_key = ("order-countries", store_id)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     code_expr = destination_country_code_sql()
     name_expr = destination_country_name_sql()
     params: list[Any] = []
@@ -17061,7 +17659,7 @@ def api_order_countries(store_id: Optional[int] = None) -> dict[str, Any]:
         for row in rows
         if clean_text(row["code"])
     ]
-    return {"ok": True, "countries": countries}
+    return fast_page_cache_set(cache_key, {"ok": True, "countries": countries}, 300)
 
 
 @app.post("/api/settings/ordering-engine")
@@ -17073,10 +17671,15 @@ def api_save_ordering_engine(payload: EnginePayload) -> dict[str, Any]:
 
 @app.get("/api/settings/services")
 def api_service_settings() -> dict[str, Any]:
+    cache_key = ("settings-services",)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     settings = get_service_settings()
     masked = dict(settings)
     secret_keys = (
         "typesense_api_key",
+        "redis_url",
         "storage_s3_secret_access_key",
         "amazon_otp_imap_password",
         "openexchange_api_key",
@@ -17097,13 +17700,18 @@ def api_service_settings() -> dict[str, Any]:
     ):
         if masked.get(key):
             masked[key] = masked_json_list_setting(masked[key])
-    masked["amazon_otp_last_sync_at"] = get_setting("amazon_otp_last_sync_at", "")
-    masked["amazon_otp_last_sync_message"] = get_setting("amazon_otp_last_sync_message", "")
-    masked["openexchange_last_sync_at"] = get_setting("openexchange_last_sync_at", "")
-    masked["openexchange_last_sync_message"] = get_setting("openexchange_last_sync_message", "")
-    masked["autosync_last_run_at"] = get_setting("autosync_last_run_at", "")
-    masked["autosync_last_message"] = get_setting("autosync_last_message", "")
-    return {"ok": True, "settings": masked}
+    live_keys = [
+        "amazon_otp_last_sync_at",
+        "amazon_otp_last_sync_message",
+        "openexchange_last_sync_at",
+        "openexchange_last_sync_message",
+        "autosync_last_run_at",
+        "autosync_last_message",
+    ]
+    live_settings = get_settings_values(live_keys)
+    for key in live_keys:
+        masked[key] = live_settings.get(key, "")
+    return fast_page_cache_set(cache_key, {"ok": True, "settings": masked}, 120)
 
 
 @app.get("/api/settings/shopify-script-config")
@@ -17146,9 +17754,11 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
         else:
             values[key] = value
     set_service_settings(values)
+    fast_page_cache_clear_matching({"settings-services"})
     response = get_service_settings()
     for key in (
         "typesense_api_key",
+        "redis_url",
         "storage_s3_secret_access_key",
         "amazon_otp_imap_password",
         "openexchange_api_key",
@@ -17184,11 +17794,16 @@ def api_odoo_rpc_cache_status() -> dict[str, Any]:
 
 @app.get("/api/settings/ui-copy")
 def api_ui_copy() -> dict[str, Any]:
-    return {"ok": True, "copy": get_ui_copy()}
+    cache_key = ("settings-ui-copy",)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    return fast_page_cache_set(cache_key, {"ok": True, "copy": get_ui_copy()}, 300)
 
 
 @app.post("/api/settings/ui-copy")
 def api_save_ui_copy(payload: UiCopyPayload) -> dict[str, Any]:
+    fast_page_cache_clear_matching({"settings-ui-copy"})
     return {"ok": True, "copy": {payload.key: set_ui_copy(payload)}, "message": "Page text saved."}
 
 
@@ -17225,6 +17840,12 @@ def api_test_service(service: str) -> dict[str, Any]:
             conn = psycopg2.connect(settings["postgres_url"], connect_timeout=8)
             conn.close()
             return {"ok": True, "message": "Postgres connection successful."}
+        if service == "redis":
+            import redis  # type: ignore
+
+            client = redis.Redis.from_url(settings["redis_url"], socket_connect_timeout=8, socket_timeout=8)
+            pong = client.ping()
+            return {"ok": True, "message": f"Redis connection successful: {'PONG' if pong else 'connected'}."}
         if service == "s3":
             try:
                 import boto3  # type: ignore
@@ -17311,25 +17932,29 @@ def api_delete_backup(payload: BackupKeyPayload) -> dict[str, Any]:
 @app.get("/api/search")
 def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("search", clean_text(q), store_id, page, per_page, clean_text(condition), clean_text(sort_by), clean_text(sort_dir), clean_text(country))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     filter_by, filtered = order_condition_filter(condition, store_id, country)
     if not q.strip() and not filtered:
-        return dashboard_data(store_id, page, per_page, sort_by, sort_dir)
+        return fast_page_cache_set(cache_key, dashboard_data(store_id, page, per_page, sort_by, sort_dir), 60)
     exact_result = fast_exact_order_reference_search(q, store_id, page, per_page, sort_by, sort_dir, condition, country)
     if exact_result is not None:
-        return exact_result
+        return fast_page_cache_set(cache_key, exact_result, 60)
     try:
         if filtered and not order_condition_uses_typesense(condition, country):
             raise RuntimeError("Postgres filter required for this condition.")
         search_result = typesense_search_order_lines(q or "*", store_id, page, per_page, filter_by=filter_by, sort_by=sort_by, sort_dir=sort_dir)
         ids = list(search_result.get("ids") or [])
         if search_result.get("enabled"):
-            return {
+            return fast_page_cache_set(cache_key, {
                 "rows": order_lines_by_ids(ids),
                 "page": page,
                 "per_page": per_page,
                 "total": int(search_result.get("total") or 0),
                 "search_engine": "typesense",
-            }
+            }, 45)
         if filtered:
             raise HTTPException(503, "Typesense is required for order condition filters.")
         search_warning = "Typesense is disabled or not configured; using Postgres fallback."
@@ -17339,12 +17964,12 @@ def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_p
             fallback["search_engine"] = "postgres"
             if order_condition_uses_typesense(condition, country):
                 fallback["search_warning"] = f"Typesense order filter unavailable; using Postgres fallback: {exc}"
-            return fallback
+            return fast_page_cache_set(cache_key, fallback, 30)
         search_warning = str(exc)
     fallback = search_order_lines_sql(q, store_id, page, per_page, sort_by, sort_dir, condition, country)
     fallback["search_engine"] = "postgres"
     fallback["search_warning"] = search_warning
-    return fallback
+    return fast_page_cache_set(cache_key, fallback, 30)
 
 
 def autosync_loop() -> None:
@@ -17438,6 +18063,10 @@ def backup_loop() -> None:
 @app.get("/api/inventory")
 def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("inventory", store_id, page, per_page, clean_text(q))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     search_engine = "postgres"
     try:
         filters = ["status:!=used"]
@@ -17465,7 +18094,7 @@ def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int =
     for store in stores:
         if store.get("odoo_password"):
             store["odoo_password"] = "********"
-    return {
+    return fast_page_cache_set(cache_key, {
         "stores": stores,
         "current_store_id": store_id,
         "items": inventory_items_payload(items),
@@ -17473,19 +18102,23 @@ def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int =
         "per_page": per_page,
         "total": total,
         "search_engine": search_engine,
-    }
+    }, 90)
 
 
 @app.get("/api/cancelled-orders")
 def api_cancelled_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("cancelled-orders", store_id, page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     rows, total = list_cancelled_order_lines(store_id, page, per_page)
     stores = rows_to_dicts(list_stores())
     for store in stores:
         if store.get("odoo_password"):
             store["odoo_password"] = "********"
     data = cancelled_order_rows_payload(rows, stores)
-    return {"ok": True, "stores": stores, "rows": data, "page": page, "per_page": per_page, "total": total}
+    return fast_page_cache_set(cache_key, {"ok": True, "stores": stores, "rows": data, "page": page, "per_page": per_page, "total": total}, 90)
 
 
 @app.post("/api/cancelled-orders/sync")
@@ -17746,6 +18379,10 @@ def api_confirm_inventory_sent(inventory_id: int, payload: Optional[dict[str, An
 @app.get("/api/missing")
 def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("missing", store_id, page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     raw_rows, total = list_missing_order_lines(store_id, page, per_page)
     rows = rows_to_dicts(raw_rows)
     stores = rows_to_dicts(list_stores())
@@ -17756,7 +18393,7 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
         row["missing_asin_url"] = asin_product_url(row.get("missing_asin") or row.get("asin") or "")
         row["asin_url"] = asin_product_url(row.get("asin") or "")
         row["replacement_asin_url"] = asin_product_url(row.get("replacement_asin") or "")
-    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": "postgres"}
+    return fast_page_cache_set(cache_key, {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": "postgres"}, 90)
 
 
 def missing_asin_check_candidates(limit: int = 40) -> list[dict[str, Any]]:
@@ -17884,8 +18521,13 @@ def mark_back_in_stock_cancelled(line_id: int, asin: str, status: str, message: 
 
 @app.get("/api/back-in-stock")
 def api_back_in_stock(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("back-in-stock", store_id, page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     rows, total = back_in_stock_rows(store_id, page, per_page)
-    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total}
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total}, 60)
 
 
 @app.post("/api/back-in-stock/{availability_id}/approve")
@@ -17928,10 +18570,12 @@ def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
                 "UPDATE missing_asin_availability SET status=?, availability_message=?, last_checked_at=? WHERE id=?",
                 (f"odoo_{local_status}", f"Odoo order is already marked {local_status} in the app.", utc_now(), availability_id),
             )
-        return {"ok": False, "message": f"Odoo order is already marked {local_status}; nothing was queued.", "queued": 0}
+            fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders"})
+            return {"ok": False, "message": f"Odoo order is already marked {local_status}; nothing was queued.", "queued": 0}
     is_open, odoo_status, message = check_odoo_order_not_cancelled(int(record["store_id"]), int(record["odoo_order_id"] or 0))
     if not is_open:
         mark_back_in_stock_cancelled(line_id, asin, odoo_status, message)
+        fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders"})
         return {"ok": False, "message": f"{message} Nothing was queued.", "queued": 0}
     queued, _cleared, _blocked, _account, _details = queue_chrome_order_groups_fast(
         int(record["store_id"]),
@@ -17944,6 +18588,7 @@ def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
                 "UPDATE missing_asin_availability SET status=?, availability_message=?, last_checked_at=? WHERE id=?",
                 ("approval_failed", "Approval did not queue this line; it may already be queued, fulfilled, ignored, or blocked.", utc_now(), availability_id),
             )
+        fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders"})
         return {"ok": False, "message": "Could not queue this line; it may already be queued, fulfilled, ignored, or blocked.", "queued": 0}
     with db() as conn:
         conn.execute(
@@ -17966,6 +18611,7 @@ def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
         if updated:
             index_order_line(updated)
+    fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders"})
     return {"ok": True, "message": "Approved and queued for Chrome fulfilment.", "queued": queued}
 
 
@@ -17975,6 +18621,7 @@ def api_back_in_stock_delete(availability_id: int) -> dict[str, Any]:
         cursor = conn.execute("DELETE FROM missing_asin_availability WHERE id=?", (availability_id,))
     if cursor.rowcount <= 0:
         raise HTTPException(404, "Back-in-stock record not found.")
+    fast_page_cache_clear_matching({"back-in-stock"})
     return {"ok": True, "message": "Back-in-stock review row removed. No fulfilment action was taken."}
 
 
@@ -18048,6 +18695,10 @@ def api_chrome_missing_asin_report(payload: dict[str, Any]) -> dict[str, Any]:
 @app.get("/api/partial-fulfilments")
 def api_partial_fulfilments(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("partial-fulfilments", store_id, page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     raw_rows, total = list_partial_fulfilments(store_id, page, per_page)
     rows = [partial_fulfilment_to_dict(row) for row in raw_rows]
     stores = rows_to_dicts(list_stores())
@@ -18077,7 +18728,7 @@ def api_partial_fulfilments(store_id: Optional[int] = None, page: int = 1, per_p
             for asin in row.get("missing_asins") or []
             if asin
         }
-    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total}
+    return fast_page_cache_set(cache_key, {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total}, 90)
 
 
 @app.post("/api/partial-fulfilments/{partial_id}/processed")
@@ -18096,15 +18747,21 @@ def api_partial_fulfilment_processed(partial_id: int) -> dict[str, Any]:
         )
     if cursor.rowcount == 0:
         raise HTTPException(404, "Partial fulfilment was not found or is already processed.")
+    fast_page_cache_clear_matching({"partial-fulfilments"})
     return {"ok": True, "message": "Partial fulfilment marked processed."}
 
 
 @app.get("/api/duplicate-asins")
 def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page: int = 12, days: int = 2) -> dict[str, Any]:
     days = normalize_days_window(days)
+    page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("duplicate-asins", store_id, page, per_page, days)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     search_engine = "postgres"
     rows, total, page, per_page = duplicate_asin_groups(store_id, page, per_page, days)
-    return {
+    return fast_page_cache_set(cache_key, {
         "ok": True,
         "stores": rows_to_dicts(list_stores()),
         "current_store_id": store_id,
@@ -18114,7 +18771,7 @@ def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page:
         "total": total,
         "days": days,
         "search_engine": search_engine,
-    }
+    }, 90)
 
 
 @app.post("/api/lines/{line_id}/replacement")
@@ -18244,9 +18901,14 @@ def api_assign_missing_replacement(line_id: int, payload: ReplacementPayload) ->
 @app.get("/api/bulk")
 def api_bulk(store_id: Optional[int] = None, days: int = 2, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     days = normalize_days_window(days)
+    page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("bulk", store_id, days, page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     search_engine = "postgres"
     groups, total, page, per_page = paginate_values(bulk_opportunity_groups(store_id, days), page, per_page)
-    return {"ok": True, "stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days, "search_engine": search_engine}
+    return fast_page_cache_set(cache_key, {"ok": True, "stores": rows_to_dicts(list_stores()), "current_store_id": store_id, "groups": groups, "page": page, "per_page": per_page, "total": total, "days": days, "search_engine": search_engine}, 90)
 
 
 @app.post("/api/bulk/place")
@@ -18269,6 +18931,7 @@ def api_bulk_place(payload: BulkPlacePayload) -> dict[str, Any]:
             [payload.store_id, *payload.line_ids],
         ).fetchall()
         if not rows:
+            fast_page_cache_clear_matching({"bulk"})
             return {"ok": False, "message": "Those bulk rows are no longer available to order. Refreshing opportunities."}
         missing_orders = conn.execute(
             f"""
@@ -18294,6 +18957,7 @@ def api_bulk_place(payload: BulkPlacePayload) -> dict[str, Any]:
                         """,
                         (utc_now(), row["id"]),
                     )
+            fast_page_cache_clear_matching({"bulk", "missing", "dashboard", "orders"})
             return {"ok": False, "message": "Moved affected bulk rows to Missing because one of their Odoo orders also has a missing item."}
     eligible_line_ids = [int(row["id"]) for row in rows]
     ordered, skipped = place_orders(
@@ -18305,12 +18969,17 @@ def api_bulk_place(payload: BulkPlacePayload) -> dict[str, Any]:
         ordering_engine=payload.ordering_engine,
     )
     groups, total, page, per_page = paginate_values(bulk_opportunity_groups(payload.store_id), 1, 100)
+    fast_page_cache_clear_matching({"bulk", "chrome-jobs", "dashboard", "orders"})
     return {"ok": True, "message": f"Bulk order placed/queued for {ordered} line(s); skipped {skipped}.", "groups": groups, "page": page, "per_page": per_page, "total": total}
 
 
 @app.get("/api/costly")
 def api_costly(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("costly", store_id, page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     search_engine = "postgres"
     try:
         result = order_line_ids_for_state(store_id, "costly", page, per_page)
@@ -18330,7 +18999,7 @@ def api_costly(store_id: Optional[int] = None, page: int = 1, per_page: int = 10
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         row["asin_url"] = asin_product_url(row.get("asin") or "")
-    return {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
+    return fast_page_cache_set(cache_key, {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}, 90)
 
 
 @app.post("/api/costly/approve")
@@ -18390,6 +19059,10 @@ def api_profit_loss(
         cached = _PROFIT_LOSS_CACHE.get(cache_key)
         if cached and cached[0] > now:
             return json.loads(json.dumps(cached[1], default=str))
+    redis_cache_key = ("profit-loss", *cache_key)
+    redis_cached = fast_page_cache_get(redis_cache_key)
+    if redis_cached is not None:
+        return redis_cached
     candidate_order_names: Optional[list[str]] = None
     if q.strip():
         try:
@@ -18401,15 +19074,18 @@ def api_profit_loss(
     start_dt, end_dt, _resolved_month = date_range_from_params(period, month, start, end)
     start_text = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_text = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-    backfill_missing_profit_loss_order_dates(store_id)
-    backfill_missing_order_financials_for_profit_loss(store_id, start_text, end_text)
-    normalize_converted_profit_columns(store_id, start_text, end_text)
+    try:
+        backfill_missing_profit_loss_order_dates(store_id)
+        backfill_missing_order_financials_for_profit_loss(store_id, start_text, end_text)
+        normalize_converted_profit_columns(store_id, start_text, end_text)
+    except Exception:
+        pass
     result = profit_loss_data(store_id, period, month, start, end, q, page, per_page, candidate_order_names, amazon_ordered_only, profit_scope)
     with _PROFIT_LOSS_CACHE_LOCK:
         if len(_PROFIT_LOSS_CACHE) > 256:
             _PROFIT_LOSS_CACHE.clear()
         _PROFIT_LOSS_CACHE[cache_key] = (now + PROFIT_LOSS_CACHE_TTL_SECONDS, json.loads(json.dumps(result, default=str)))
-    return result
+    return fast_page_cache_set(redis_cache_key, result, PROFIT_LOSS_CACHE_TTL_SECONDS)
 
 
 @app.post("/api/profit-loss/manual-costs")
@@ -18477,6 +19153,10 @@ async def api_profit_loss_shipping_upload(
 @app.get("/api/accounting")
 def api_accounting(q: str = "", document_type: str = "all", tax_region: str = "all", page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    cache_key = ("accounting", clean_text(q), clean_text(document_type), clean_text(tax_region), page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         filters = []
         if document_type != "all":
@@ -18496,12 +19176,12 @@ def api_accounting(q: str = "", document_type: str = "all", tax_region: str = "a
             base = accounting_summary_page("", "all", "all", 1, 1)
             docs = sql_rows_by_ids("accounting_documents", list(result.get("ids") or []))
             base.update({"documents": docs, "page": page, "per_page": per_page, "total": int(result.get("total") or 0), "search_engine": "typesense"})
-            return base
+            return fast_page_cache_set(cache_key, base, 120)
     except Exception:
         pass
     data = accounting_summary_page(q, document_type, tax_region, page, per_page)
     data["search_engine"] = "postgres"
-    return data
+    return fast_page_cache_set(cache_key, data, 120)
 
 
 @app.post("/api/accounting/odoo-sync")
@@ -18790,6 +19470,10 @@ def api_pull_order_names(payload: dict[str, Any]) -> dict[str, Any]:
 @app.get("/api/pull/jobs")
 def api_pull_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, offset = pagination_bounds(page, per_page)
+    cache_key = ("pull-jobs", page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     with db() as conn:
         total = int(conn.execute("SELECT COUNT(*) AS count FROM pull_jobs").fetchone()["count"] or 0)
         rows = conn.execute(
@@ -18802,7 +19486,7 @@ def api_pull_jobs(page: int = 1, per_page: int = 100) -> dict[str, Any]:
             """,
             (per_page, offset),
         ).fetchall()
-    return {"ok": True, "jobs": rows_to_dicts(rows), "page": page, "per_page": per_page, "total": total}
+    return fast_page_cache_set(cache_key, {"ok": True, "jobs": rows_to_dicts(rows), "page": page, "per_page": per_page, "total": total}, 30)
 
 
 @app.post("/api/pull/jobs/{job_id}/cancel")
@@ -18826,6 +19510,7 @@ def api_cancel_pull_job(job_id: str) -> dict[str, Any]:
         row = conn.execute("SELECT pull_jobs.*, stores.name AS store_name FROM pull_jobs LEFT JOIN stores ON stores.id=pull_jobs.store_id WHERE pull_jobs.id=?", (clean_job_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Pull job not found.")
+    fast_page_cache_clear_matching({"pull-jobs"})
     if cursor.rowcount <= 0:
         return {"ok": True, "message": f"Pull job is already {row['status']}.", "job": row_to_dict(row)}
     return {"ok": True, "message": "Pull job stopped.", "job": row_to_dict(row)}
@@ -18849,6 +19534,7 @@ def api_clear_pull_jobs() -> dict[str, Any]:
             ("Cleared by user.", now, now),
         )
         conn.execute("DELETE FROM pull_jobs")
+    fast_page_cache_clear_matching({"pull-jobs"})
     return {
         "ok": True,
         "message": f"Cleared {total} pull job{'s' if total != 1 else ''}. {active} active job{'s' if active != 1 else ''} will stop on the next progress check.",
@@ -19157,12 +19843,12 @@ def api_shopify_orders_status_sync(payload: dict[str, Any]) -> dict[str, Any]:
 
         def worker() -> None:
             sync_shopify_status_for_order_names(store_id, order_names, force=force)
-            fast_page_cache_clear()
+            fast_page_cache_clear_matching({"dashboard", "orders"})
 
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "queued": len(order_names), "synced": 0, "rows": []}
     sync_shopify_status_for_order_names(store_id, order_names, force=bool(payload.get("force")))
-    fast_page_cache_clear()
+    fast_page_cache_clear_matching({"dashboard", "orders"})
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -19302,7 +19988,7 @@ def api_shopify_fulfilment_refresh_status(job_id: str) -> dict[str, Any]:
                 """,
                 (utc_now(), utc_now(), job_id),
             )
-    fast_page_cache_clear()
+    fast_page_cache_clear_matching({"shopify-fulfilment", "fulfilment-pending", "dashboard", "orders"})
     return {
         "ok": True,
         "message": f"Refreshed Shopify status for {order_name}.",
@@ -19509,6 +20195,10 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
     records = amazon_history_lookup_records(payload)
     if not records:
         return {"ok": True, "matches": {}, "unmatched": [], "not_found_url": "/amazon-order-history-unmatched"}
+    cache_key = amazon_history_records_cache_key("chrome-order-history-lookup", records)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     order_ids = [record["amazon_order_id"] for record in records if record["amazon_order_id"]]
     last_db_error: Exception | None = None
     for attempt in range(2):
@@ -19541,7 +20231,7 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
             match["order_date"] = record["order_date"]
             match["asins"] = record["asins"]
             match["asin_quantities"] = record["asin_quantities"]
-    return {
+    return fast_page_cache_set(cache_key, {
         "ok": True,
         "matches": matches,
         "suggestions": suggestions,
@@ -19549,7 +20239,7 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
         "direct_targets": sum(len(targets) for targets in direct_targets.values()),
         "unmatched": unmatched,
         "not_found_url": "/amazon-order-history-unmatched",
-    }
+    }, 300)
 
 
 @app.post("/api/chrome/order-history/odoo-direct")
@@ -19557,6 +20247,12 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
     records = amazon_history_lookup_records(payload)
     if not records:
         return {"ok": True, "odoo_direct": {}}
+    if not any(record.get("asins") or record.get("asin_quantities") for record in records):
+        return {"ok": True, "odoo_direct": {}}
+    cache_key = amazon_history_records_cache_key("chrome-order-history-odoo-direct", records)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     order_ids = [record["amazon_order_id"] for record in records if record["amazon_order_id"]]
     last_db_error: Exception | None = None
     for attempt in range(2):
@@ -19576,7 +20272,7 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
         raise last_db_error or RuntimeError("Amazon order-history direct Odoo lookup failed.")
     direct_odoo = amazon_history_direct_odoo_matches_from_targets(records, targets)
     amazon_history_apply_recipient_ref_card_asins(records, direct_odoo)
-    return {"ok": True, "odoo_direct": direct_odoo}
+    return fast_page_cache_set(cache_key, {"ok": True, "odoo_direct": direct_odoo}, 300)
 
 
 @app.get("/api/chrome/order-history/unmatched")
@@ -20820,7 +21516,11 @@ def api_tracking_browserless_status() -> dict[str, Any]:
 
 @app.get("/api/tracking/browserless/readiness")
 def api_tracking_browserless_readiness() -> dict[str, Any]:
-    return chrome_browserless_readiness()
+    cache_key = ("tracking-browserless-readiness",)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    return fast_page_cache_set(cache_key, chrome_browserless_readiness(), 300)
 
 
 def set_epost_browserless_progress(**updates: Any) -> dict[str, Any]:
@@ -21147,8 +21847,12 @@ def api_chrome_jobs(
             split_mixed_asin=split_mixed_asin,
         )
         return {"ok": True, "jobs": [job] if job else []}
+    cache_key = ("chrome-jobs", store_id, job_limit, bool(split_mixed_asin))
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     snapshot = chrome_queue_snapshot(store_id, limit=job_limit)
-    return {"ok": True, **snapshot}
+    return fast_page_cache_set(cache_key, {"ok": True, **snapshot}, 20)
 
 
 @app.get("/api/chrome/jobs/recover-submitted")
@@ -21159,6 +21863,11 @@ def api_chrome_recover_submitted_job(
     worker_id = clean_text(worker_id)[:120]
     if not worker_id:
         return {"ok": True, "job": None}
+    none_cache_key = (store_id, worker_id)
+    now_monotonic = time.monotonic()
+    with _CHROME_RECOVER_SUBMITTED_NONE_LOCK:
+        if _CHROME_RECOVER_SUBMITTED_NONE_CACHE.get(none_cache_key, 0) > now_monotonic:
+            return {"ok": True, "job": None}
     with db() as conn:
         rows = conn.execute(
             """
@@ -21178,6 +21887,10 @@ def api_chrome_recover_submitted_job(
             (worker_id, CHROME_ORDER_SUBMITTED_STATUS, store_id, store_id),
         ).fetchall()
         if not rows:
+            with _CHROME_RECOVER_SUBMITTED_NONE_LOCK:
+                if len(_CHROME_RECOVER_SUBMITTED_NONE_CACHE) > 500:
+                    _CHROME_RECOVER_SUBMITTED_NONE_CACHE.clear()
+                _CHROME_RECOVER_SUBMITTED_NONE_CACHE[none_cache_key] = time.monotonic() + 10
             return {"ok": True, "job": None}
         group_key = str(rows[0]["amazon_group_key"])
         expiry = chrome_job_lease_expiry()
@@ -22224,7 +22937,7 @@ def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page:
     if cached is not None:
         return cached
     orders, rows, total, page, per_page = paged_tracking_orders(store_id, status, q, page, per_page)
-    return fast_page_cache_set(cache_key, {"ok": True, "orders": orders, "rows": [], "page": page, "per_page": per_page, "total": total}, 15)
+    return fast_page_cache_set(cache_key, {"ok": True, "orders": orders, "rows": [], "page": page, "per_page": per_page, "total": total}, 60)
 
 
 @app.get("/api/tracking/fulfilment-pending")
@@ -22234,7 +22947,7 @@ def api_tracking_fulfilment_pending(store_id: Optional[int] = None, page: int = 
     if cached is not None:
         return cached
     rows, total, page, per_page = paged_delivered_unfulfilled_rows(store_id, page, per_page, q)
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": total}, 15)
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": total}, 90)
 
 
 @app.get("/api/dispatch-status")
@@ -22244,7 +22957,7 @@ def api_dispatch_status(store_id: Optional[int] = None, page: int = 1, per_page:
     if cached is not None:
         return cached
     rows, total, page, per_page, summary = dispatch_status_rows(store_id, status, q, page, per_page)
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "summary": summary}, 20)
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "summary": summary}, 120)
 
 
 @app.get("/api/dispatch-status/summary")
@@ -22254,7 +22967,7 @@ def api_dispatch_status_summary(store_id: Optional[int] = None) -> dict[str, Any
     if cached is not None:
         return cached
     _rows, _total, _page, _per_page, summary = dispatch_status_rows(store_id, "all", "", 1, 1)
-    return fast_page_cache_set(cache_key, {"ok": True, "summary": summary}, 20)
+    return fast_page_cache_set(cache_key, {"ok": True, "summary": summary}, 120)
 
 
 @app.get("/api/dispatch-sorting/summary")
@@ -22268,6 +22981,7 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
     if cached:
         return cached
     with db() as conn:
+        enqueue_payment_failure_cleanup()
         base_cache_key = ("dispatch-sorting-summary-base", store_id)
         base_cached = fast_page_cache_get(base_cache_key)
         if base_cached is not None:
@@ -22293,6 +23007,12 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
                             END AS scan_status
                         FROM amazon_dispatch_packages
                         WHERE (? IS NULL OR store_id=?)
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM amazon_payment_failures
+                              WHERE amazon_payment_failures.amazon_order_id=amazon_dispatch_packages.amazon_order_id
+                                AND amazon_payment_failures.status='open'
+                          )
                         GROUP BY package_key
                     )
                     GROUP BY scan_status
@@ -22303,13 +23023,19 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
             recent = rows_to_dicts(
                 conn.execute(
                     """
-                    SELECT id, scan_code, canonical_scan_code, display_code, amazon_order_id, store_id, odoo_order_id,
+                    SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                            odoo_order_name, recipient_ref, order_line_ids_json, package_index, destination_zone, tote_code,
                            scan_status, last_scanned_at, placed_at, package_status, scan_count, updated_at,
                            dispatch_date, service, priority, fulfilment_type, products_json, asins_json
                     FROM amazon_dispatch_packages
                     WHERE (? IS NULL OR store_id=?)
                       AND COALESCE(last_scanned_at, placed_at) IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM amazon_payment_failures
+                          WHERE amazon_payment_failures.amazon_order_id=amazon_dispatch_packages.amazon_order_id
+                            AND amazon_payment_failures.status='open'
+                      )
                     ORDER BY COALESCE(last_scanned_at, placed_at) DESC
                     LIMIT 200
                     """,
@@ -22320,7 +23046,7 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
             recent_deduped = dedupe_dispatch_package_rows(recent)[:20]
             rack_rows = {"today": [], "tomorrow": [], "later": [], "exception": []}
             for row in recent_deduped:
-                package = dispatch_enrich_package_for_scan(conn, row)
+                package = dispatch_light_package_for_summary(row)
                 rack_rows[package["rack_key"]].append(package)
             rack_snapshot = {
                 "summary": {key: len(value) for key, value in rack_rows.items()},
@@ -22330,7 +23056,7 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
                 "summary": summary,
                 "recent": recent_deduped,
                 "rack_snapshot": rack_snapshot,
-            }, 20)
+            }, 120)
         scan_event_where = "(? IS NULL OR e.store_id=? OR e.store_id IS NULL)"
         scan_event_params: list[Any] = [store_id, store_id]
         if scan_query:
@@ -22388,7 +23114,14 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
                        e.resolved_at, e.resolved_by, e.resolved_note, e.created_at,
                        p.products_json, p.asins_json
                 FROM amazon_dispatch_scan_events e
-                LEFT JOIN amazon_dispatch_packages p ON p.id=e.package_id
+                LEFT JOIN amazon_dispatch_packages p
+                  ON p.id=e.package_id
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM amazon_payment_failures
+                     WHERE amazon_payment_failures.amazon_order_id=p.amazon_order_id
+                       AND amazon_payment_failures.status='open'
+                 )
                 WHERE {scan_event_where}
                 ORDER BY e.created_at DESC
                 LIMIT ? OFFSET ?
@@ -22408,6 +23141,12 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
                 SELECT *
                 FROM amazon_dispatch_packages
                 WHERE id IN ({','.join('?' for _ in event_package_ids)})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM amazon_payment_failures
+                      WHERE amazon_payment_failures.amazon_order_id=amazon_dispatch_packages.amazon_order_id
+                        AND amazon_payment_failures.status='open'
+                  )
                 """,
                 event_package_ids,
             ).fetchall())
@@ -22432,7 +23171,7 @@ def api_dispatch_sorting_summary(store_id: Optional[int] = None, scan_page: int 
         "scan_events_per_page": scan_per_page,
         "scan_events_total": scan_events_total,
         "rack_snapshot": rack_snapshot,
-    }, 5)
+    }, 120)
 
 
 @app.post("/api/dispatch-sorting/rebuild")
@@ -22440,7 +23179,9 @@ def api_dispatch_sorting_rebuild(store_id: Optional[int] = None) -> dict[str, An
     progress = dispatch_rebuild_progress()
     if progress.get("status") == "running":
         return {"ok": True, "message": "Dispatch scan index rebuild is already running.", "progress": progress}
-    threading.Thread(target=run_dispatch_rebuild_job, args=(store_id,), daemon=True).start()
+    if not enqueue_dispatch_rebuild(store_id):
+        threading.Thread(target=run_dispatch_rebuild_job, args=(store_id,), daemon=True).start()
+    enqueue_dispatch_summary_warm(store_id)
     return {"ok": True, "message": "Dispatch scan index rebuild started.", "progress": dispatch_rebuild_progress(status="running")}
 
 
@@ -22486,7 +23227,12 @@ def api_dispatch_sorting_scan_event_resolve(event_id: int, payload: dict[str, An
             ),
         )
         updated = conn.execute("SELECT * FROM amazon_dispatch_scan_events WHERE id=?", (event_id,)).fetchone()
-    fast_page_cache_clear()
+    fast_page_cache_clear_matching({
+        "dispatch-sorting-summary",
+        "dispatch-sorting-summary-base",
+        "dispatch-status",
+        "dispatch-status-summary",
+    })
     return {"ok": True, "message": "Scan exception marked resolved.", "event": row_to_dict(updated)}
 
 
@@ -22496,6 +23242,8 @@ def api_dispatch_sorting_package(package_id: int) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (package_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Dispatch package not found")
+        if amazon_order_has_open_payment_failure(conn, row["amazon_order_id"]):
+            raise HTTPException(404, "Dispatch package is blocked by an open Amazon payment revision.")
         package = dispatch_enrich_package_for_scan(conn, row)
         message = dispatch_scan_message(package)
     return {"ok": True, "package": package, "message": message}
@@ -22509,28 +23257,41 @@ def api_dispatch_sorting_scan(payload: DispatchScanPayload) -> dict[str, Any]:
     query_text = clean_text(payload.scan_code)
     result_count_prefix = ""
     with db() as conn:
+        enqueue_payment_failure_cleanup()
         if payload.store_id is None:
             row = conn.execute(
                 """
                 SELECT *
                 FROM amazon_dispatch_packages
-                WHERE scan_code=?
+                WHERE (scan_code=? OR last_scanned_code=?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM amazon_payment_failures
+                      WHERE amazon_payment_failures.amazon_order_id=amazon_dispatch_packages.amazon_order_id
+                        AND amazon_payment_failures.status='open'
+                  )
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (scan_code,),
+                (scan_code, scan_code),
             ).fetchone()
         else:
             row = conn.execute(
                 """
                 SELECT *
                 FROM amazon_dispatch_packages
-                WHERE scan_code=?
+                WHERE (scan_code=? OR last_scanned_code=?)
                   AND store_id=?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM amazon_payment_failures
+                      WHERE amazon_payment_failures.amazon_order_id=amazon_dispatch_packages.amazon_order_id
+                        AND amazon_payment_failures.status='open'
+                  )
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (scan_code, payload.store_id),
+                (scan_code, scan_code, payload.store_id),
             ).fetchone()
         if not row:
             fragment_matches = dispatch_find_fragment_matches(conn, payload.scan_code, payload.store_id)
@@ -22598,6 +23359,8 @@ def api_dispatch_sorting_place(package_id: int, payload: DispatchPlacePayload) -
         row = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (package_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Dispatch package not found")
+        if amazon_order_has_open_payment_failure(conn, row["amazon_order_id"]):
+            raise HTTPException(400, "This package is blocked by an open Amazon payment revision. Resolve/check the payment before sorting.")
         if not tote_code and status != "exception":
             enriched = dispatch_enrich_package_for_scan(conn, row)
             tote_code = enriched.get("suggested_tote") or suggested_dispatch_tote(conn, row_to_dict(row), bool(enriched.get("order_ready")))
@@ -22620,7 +23383,13 @@ def api_dispatch_sorting_place(package_id: int, payload: DispatchPlacePayload) -
         )
         updated = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (package_id,)).fetchone()
         package = dispatch_package_payload(conn, updated)
-    fast_page_cache_clear()
+    fast_page_cache_clear_matching({
+        "dispatch-sorting-summary",
+        "dispatch-sorting-summary-base",
+        "dispatch-status",
+        "dispatch-status-summary",
+    })
+    enqueue_dispatch_summary_warm(package.get("store_id"))
     return {"ok": True, "package": package, "message": f"Package moved to {package.get('tote_code') or status}."}
 
 
@@ -22854,11 +23623,31 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
             failure_row = conn.execute("SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?", (amazon_order_id,)).fetchone()
             if failure_row:
                 _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync("amazon_payment_failures", payment_failure_search_document(snapshot)))
+            dispatch_clear_packages_for_amazon_order(conn, amazon_order_id)
+            fast_page_cache_clear_matching({
+                "dispatch-sorting-summary",
+                "dispatch-sorting-summary-base",
+                "dispatch-status",
+                "dispatch-status-summary",
+                "tracking-orders",
+            })
             send_email_alert_async(
                 f"Amazon payment revision needed: {amazon_order_id}",
                 f"Amazon order requires manual payment revision.\nAmazon order: {amazon_order_id}\nRevise payment: {revise_url or order_line_amazon_url(amazon_order_id)}\nOdoo orders: {', '.join(order_names)}",
             )
             return {"ok": True, "updated": len(rows), "tracking_status": "Payment revision needed", "payment_revision_needed": True}
+        resolved_payment_failure = resolve_payment_failure_for_order(conn, amazon_order_id, utc_now())
+        if resolved_payment_failure:
+            failure_row = conn.execute("SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?", (amazon_order_id,)).fetchone()
+            if failure_row:
+                _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync("amazon_payment_failures", payment_failure_search_document(snapshot)))
+            fast_page_cache_clear_matching({
+                "dispatch-sorting-summary",
+                "dispatch-sorting-summary-base",
+                "dispatch-status",
+                "dispatch-status-summary",
+                "tracking-orders",
+            })
         updated = 0
         updated_rows_for_index = []
         package_asins_present = any(package.get("asins") for package in packages)
@@ -22943,38 +23732,21 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                 OdooClient(store).post_order_note(order_id, note)
         except Exception:
             pass
-    return {"ok": True, "updated": updated, "tracking_status": status}
+    return {"ok": True, "updated": updated, "tracking_status": status, "payment_failure_resolved": bool(resolved_payment_failure)}
 
 
 @app.get("/api/tracking/payment-failures")
 def api_tracking_payment_failures(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "open") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
+    status = clean_text(status or "open")
+    cache_key = ("payment-failures", store_id, page, per_page, status)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    enqueue_payment_failure_cleanup()
+    rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
     search_engine = "postgres"
-    try:
-        filters = []
-        if store_id:
-            filters.append(f"store_id:={int(store_id)}")
-        if status:
-            filters.append(f"status:={clean_text(status)}")
-        result = typesense_search_documents(
-            "amazon_payment_failures",
-            "*",
-            "amazon_order_id,odoo_order_names,message,status",
-            filter_by=" && ".join(filters),
-            page=page,
-            per_page=per_page,
-            sort_by="updated_ts:desc",
-        )
-        if result.get("enabled"):
-            rows = sql_rows_by_ids("amazon_payment_failures", list(result.get("ids") or []), "amazon_order_id")
-            rows = [normalize_payment_failure_row(dict(row)) for row in rows]
-            total = int(result.get("total") or 0)
-            search_engine = "typesense"
-        else:
-            rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
-    except Exception:
-        rows, total, page, per_page = payment_failure_rows(store_id, page, per_page, status)
-    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}, 60)
 
 
 @app.post("/api/tracking/payment-failures/{amazon_order_id}/resolve")
@@ -22992,21 +23764,20 @@ def api_tracking_payment_failure_resolve(amazon_order_id: str) -> dict[str, Any]
             """,
             (now, now, amazon_order_id),
         )
-        conn.execute(
-            """
-            UPDATE order_lines
-            SET last_error=NULL, updated_at=?
-            WHERE amazon_order_id=?
-              AND last_error='Payment revision needed. Please update your payment method.'
-            """,
-            (now, amazon_order_id),
-        )
+        resolve_payment_failure_for_order(conn, amazon_order_id, now)
+        removed_scan_rows = dispatch_clear_packages_for_amazon_order(conn, amazon_order_id)
         failure_row = conn.execute("SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?", (amazon_order_id,)).fetchone()
     if cursor.rowcount == 0:
         raise HTTPException(404, "Payment failure record not found")
     if failure_row:
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync("amazon_payment_failures", payment_failure_search_document(snapshot)))
-    return {"ok": True, "message": f"Marked payment issue resolved for {amazon_order_id}."}
+    fast_page_cache_clear_matching({
+        "dispatch-sorting-summary",
+        "dispatch-sorting-summary-base",
+        "dispatch-status",
+        "dispatch-status-summary",
+    })
+    return {"ok": True, "message": f"Marked payment issue resolved for {amazon_order_id}. Removed {removed_scan_rows} stale dispatch scan row(s)."}
 
 
 @app.post("/api/manual-amazon/match")
@@ -23379,7 +24150,7 @@ def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: 
         rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
     except Exception:
         rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only}, 15)
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only}, 90)
 
 
 @app.post("/api/epost/tracking/{tracking_id}/refund")
@@ -23524,6 +24295,12 @@ def api_public_tracking(store_id: Optional[int] = None) -> dict[str, Any]:
 
 @app.get("/api/amazon-otp")
 def api_amazon_otp(q: str = "", page: int = 1, per_page: int = 100) -> dict[str, Any]:
+    page, per_page, _ = pagination_bounds(page, per_page)
+    q = clean_text(q)
+    cache_key = ("amazon-otp", q, page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     search_engine = "postgres"
     try:
         if q.strip():
@@ -23545,11 +24322,16 @@ def api_amazon_otp(q: str = "", page: int = 1, per_page: int = 100) -> dict[str,
     except Exception:
         rows = amazon_otp_rows(q)
     paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
-    return {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": paged_rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}, 90)
 
 
 @app.get("/api/public/amazon-otp")
 def api_public_amazon_otp(q: str = "") -> dict[str, Any]:
+    q = clean_text(q)
+    cache_key = ("public-amazon-otp", q)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
     rows = amazon_otp_rows(q)
     public_rows = [
         {
@@ -23565,7 +24347,7 @@ def api_public_amazon_otp(q: str = "") -> dict[str, Any]:
         }
         for row in rows
     ]
-    return {"ok": True, "rows": public_rows, "total": len(public_rows)}
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": public_rows, "total": len(public_rows)}, 90)
 
 
 def public_table_page(title: str, rows: list[dict[str, Any]]) -> HTMLResponse:
@@ -23842,13 +24624,18 @@ def api_create_export(payload: ExportCreatePayload) -> dict[str, Any]:
             ),
         )
     start_export_job(job_id)
+    fast_page_cache_clear_matching({"exports"})
     return {"ok": True, "job_id": job_id, "message": f"Export job started for {view.replace('_', ' ')}."}
 
 
 @app.get("/api/exports")
 def api_exports(page: int = 1, per_page: int = 100) -> dict[str, Any]:
-    cleanup_expired_exports()
     page, per_page, offset = pagination_bounds(page, per_page)
+    cache_key = ("exports", page, per_page)
+    cached = fast_page_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    cleanup_expired_exports()
     with db() as conn:
         total = int(conn.execute("SELECT COUNT(*) AS count FROM export_jobs").fetchone()["count"] or 0)
         jobs = rows_to_dicts(conn.execute(
@@ -23876,7 +24663,7 @@ def api_exports(page: int = 1, per_page: int = 100) -> dict[str, Any]:
         by_job.setdefault(str(file_row["job_id"]), []).append(file_row)
     for job in jobs:
         job["files"] = by_job.get(str(job["id"]), [])
-    return {"ok": True, "jobs": jobs, "page": page, "per_page": per_page, "total": total}
+    return fast_page_cache_set(cache_key, {"ok": True, "jobs": jobs, "page": page, "per_page": per_page, "total": total}, 30)
 
 
 @app.post("/api/exports/{job_id}/cancel")
@@ -23888,6 +24675,7 @@ def api_cancel_export(job_id: str) -> dict[str, Any]:
         if row["status"] in {"completed", "failed", "cancelled"}:
             return {"ok": True, "message": f"Export is already {row['status']}."}
         conn.execute("UPDATE export_jobs SET stop_requested=1, status='cancelling', updated_at=? WHERE id=?", (utc_now(), job_id))
+    fast_page_cache_clear_matching({"exports"})
     return {"ok": True, "message": "Export cancellation requested."}
 
 
