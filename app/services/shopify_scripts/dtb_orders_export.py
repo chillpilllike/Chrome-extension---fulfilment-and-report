@@ -448,24 +448,50 @@ def normalize_email(email: str | None) -> str | None:
     return e if "@" in e else None
 
 
-def normalize_phone(phone: str | None) -> str | None:
+COUNTRY_DIAL_CODES = {
+    "US": "1", "CA": "1",
+    "GB": "44", "UK": "44",
+    "AU": "61", "NZ": "64",
+    "IN": "91",
+    "IE": "353",
+    "DE": "49", "FR": "33", "IT": "39", "ES": "34", "NL": "31", "BE": "32",
+    "SE": "46", "NO": "47", "DK": "45", "FI": "358", "CH": "41", "AT": "43",
+    "AE": "971", "SA": "966", "SG": "65", "MY": "60", "HK": "852",
+}
+
+
+def _valid_e164(value: str | None) -> str | None:
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", value)
+    if len(digits) < 8 or len(digits) > 15:
+        return None
+    return "+" + digits
+
+
+def normalize_phone(phone: str | None, country_code: str | None = None) -> str | None:
     """Return phone in a Shopify-friendly E.164-like form or None.
-    Shopify often rejects non-E.164 values. We only keep numbers that start with '+' and have 8-15 digits.
-    Anything else is dropped to avoid 422 'phone is invalid'.
+    Shopify customer phone should be globally dialable, preferably E.164 (+countrycode...).
     """
     if not phone:
         return None
-    p = re.sub(r"[^\d+]", "", phone.strip())
+    raw = re.split(r"(?:ext\.?|x)\s*\d+$", str(phone).strip(), flags=re.I)[0]
+    p = re.sub(r"[^\d+]", "", raw)
     if not p:
         return None
     if p.startswith("00"):
         p = "+" + p[2:]
-    if not p.startswith("+"):
-        return None
+    if p.startswith("+"):
+        return _valid_e164(p)
     digits = re.sub(r"\D", "", p)
-    if len(digits) < 8 or len(digits) > 15:
+    dial = COUNTRY_DIAL_CODES.get((country_code or "").strip().upper())
+    if not dial:
         return None
-    return "+" + digits
+    if digits.startswith(dial) and len(digits) > len(dial) + 5:
+        return _valid_e164(digits)
+    if digits.startswith("0"):
+        digits = digits[1:]
+    return _valid_e164(dial + digits)
 
 
 
@@ -518,13 +544,13 @@ def _customer_phone_variants(payload: dict) -> list[str]:
     for value in _customer_phone_values(payload):
         raw = value.strip()
         digits = re.sub(r"\D", "", raw)
-        candidates = [raw]
+        normalized = normalize_phone(raw)
+        candidates = [normalized, raw]
         if digits:
-            candidates.append(digits)
+            if raw.startswith("+") or raw.startswith("00"):
+                candidates.append("+" + digits.lstrip("0"))
             if len(digits) == 11 and digits.startswith("1"):
-                candidates.append(digits[1:])
-            if raw.startswith("+"):
-                candidates.append(raw[1:])
+                candidates.append("+1" + digits[1:])
         for candidate in candidates:
             if candidate and candidate not in variants:
                 variants.append(candidate)
@@ -1977,7 +2003,7 @@ def build_order_payload(odoo: OdooClient, shop: ShopifyClient, state: StateDB, *
         email = normalize_email((billing_partner or {}).get("email") or (partner_main or {}).get("email"))
         raw_phone = ( (billing_partner or {}).get("phone") or (billing_partner or {}).get("mobile") or (partner_main or {}).get("phone") or (partner_main or {}).get("mobile") )
         raw_phone = (str(raw_phone).strip() if raw_phone is not None else None)
-        phone = normalize_phone(raw_phone)
+        phone = normalize_phone(raw_phone, (billing_country or {}).get("code") or (shipping_country or {}).get("code"))
         full_name = ((billing_partner or {}).get("name") or (partner_main or {}).get("name") or "").strip()
         first_name, last_name = split_name(full_name)
         default_addr = odoo_partner_to_shopify_address(billing_partner or partner_main, billing_country, odoo)
@@ -2303,7 +2329,7 @@ def sync_one_order_to_dest(odoo: OdooClient, shop: ShopifyClient, state: StateDB
             or (partner_main or {}).get("mobile")
         )
         raw_phone = (str(raw_phone).strip() if raw_phone is not None else None)
-        phone = normalize_phone(raw_phone)
+        phone = normalize_phone(raw_phone, (billing_country or {}).get("code") or (shipping_country or {}).get("code"))
 
     # Add customer phone details into order note/timeline (no customer notifications are sent)
     try:
