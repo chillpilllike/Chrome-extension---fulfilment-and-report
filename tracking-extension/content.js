@@ -1,3 +1,4 @@
+(() => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let extensionContextAlive = true;
@@ -33,6 +34,10 @@ async function sendWithTimeout(message, timeoutMs = 15000) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function logContent(message) {
+  return send({ type: "CONTENT_LOG", message }).catch(() => null);
 }
 
 function clean(text) {
@@ -109,10 +114,10 @@ function processingMessage(response, fallback) {
 
 async function waitForPageReady() {
   const started = Date.now();
-  while (document.readyState !== "complete" && Date.now() - started < 25000) {
+  while (document.readyState === "loading" && Date.now() - started < 5000) {
     await sleep(250);
   }
-  await sleep(1200);
+  await sleep(500);
 }
 
 function isTrackingPage() {
@@ -173,11 +178,16 @@ function orderDetailsUrl(orderId) {
 }
 
 function isOrderHistoryPage() {
-  return /\/(?:gp\/css\/order-history|gp\/your-account\/order-history|your-orders(?:\/orders?)?)(?:[/?#]|$)/i.test(location.href);
+  const path = location.pathname.replace(/\/+$/, "");
+  return /^\/gp\/css\/order-history$/i.test(path)
+    || /^\/gp\/your-account\/order-history$/i.test(path)
+    || /^\/your-orders(?:\/orders?)?$/i.test(path);
 }
 
 function isOrderDetailsLikePage() {
-  return /order-details|your-orders\/order|gp\/css\/summary|gp\/your-account\/order|gp\/your-account\/ship-track/i.test(location.href);
+  const path = location.pathname.replace(/\/+$/, "");
+  return /^\/your-orders\/order-details$/i.test(path)
+    || /order-details|your-orders\/order|gp\/css\/summary|gp\/your-account\/order|gp\/your-account\/ship-track/i.test(location.href);
 }
 
 function recipientFromOrderHistoryText(text = "") {
@@ -362,15 +372,21 @@ async function scanOrderHistoryForTrackAll(state = null) {
 
 function parsePaymentRevision() {
   const alertBlocks = [
-    ...document.querySelectorAll("[data-component='alerts'], .a-alert-heading, .a-alert-content, .a-box-inner, .od-status-message"),
+    ...document.querySelectorAll("[data-component='alerts'], .a-alert .a-box-inner, .a-alert-heading, .a-alert-content, .od-status-message"),
   ];
   const matchedBlock = alertBlocks.find((element) => {
     const text = clean(element.textContent);
     return /payment revision needed/i.test(text) || /please update your payment method/i.test(text);
   });
-  const pageText = clean(document.body.textContent || "");
-  const text = clean(matchedBlock?.textContent || pageText);
-  const needed = Boolean(matchedBlock) || /payment revision needed/i.test(pageText) || /please update your payment method/i.test(pageText);
+  const root = document.querySelector("#orderDetails, [data-component='shipments'], .a-box-group") || document.body;
+  const scopedText = clean(
+    matchedBlock?.textContent ||
+    alertBlocks.map((element) => element.textContent || "").join(" ") ||
+    root.textContent ||
+    "",
+  ).slice(0, 10000);
+  const text = clean(matchedBlock?.textContent || scopedText);
+  const needed = Boolean(matchedBlock) || /payment revision needed/i.test(scopedText) || /please update your payment method/i.test(scopedText);
   const reviseLink = document.querySelector("a[href*='/cpe/revisepayments'], a[href*='revisepayments']");
   return {
     paymentRevisionNeeded: needed,
@@ -380,10 +396,11 @@ function parsePaymentRevision() {
 }
 
 function parseOrderCancellation() {
-  const alert = [...document.querySelectorAll(".a-alert-heading, .a-alert-content, .a-box-inner")]
+  const alert = [...document.querySelectorAll(".a-alert-heading, .a-alert-content, .a-alert .a-box-inner")]
     .find((element) => /order has been cancell?ed|order was cancell?ed|this order has been cancell?ed|order cancell?ed|cancell?ed order/i.test(clean(element.textContent)));
-  const pageText = clean(document.body.textContent || "");
-  const cancelled = Boolean(alert) || /order has been cancell?ed|order was cancell?ed|this order has been cancell?ed|order cancell?ed|cancell?ed order/i.test(pageText);
+  const root = document.querySelector("#orderDetails, [data-component='shipments'], .a-box-group") || document.body;
+  const scopedText = clean(alert?.textContent || root.textContent || "").slice(0, 10000);
+  const cancelled = Boolean(alert) || /order has been cancell?ed|order was cancell?ed|this order has been cancell?ed|order cancell?ed|cancell?ed order/i.test(scopedText);
   return {
     orderCancelled: cancelled,
     cancellationMessage: cancelled ? clean(alert?.textContent || "This order has been cancelled.") : "",
@@ -394,10 +411,12 @@ function asinsFrom(root) {
   return productItemsFrom(root).map((item) => item.asin);
 }
 
-function productItemsFrom(root) {
+function productItemsFrom(root, limit = 50) {
   const products = [];
   const seen = new Set();
-  for (const link of [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]) {
+  if (!root) return products;
+  const links = [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")].slice(0, Math.max(1, Number(limit || 50)) * 4);
+  for (const link of links) {
     const href = link.getAttribute("href") || "";
     const match = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
     const asin = match ? match[1].toUpperCase() : "";
@@ -415,6 +434,7 @@ function productItemsFrom(root) {
       title,
       image_url: image ? absoluteUrl(image.getAttribute("data-a-hires") || image.getAttribute("src") || "") : "",
     });
+    if (products.length >= Number(limit || 50)) break;
   }
   return products;
 }
@@ -428,7 +448,7 @@ function shipmentRootForTrackingLink(link) {
   return link.closest(".a-box, [data-component='orderCard']") || document.body;
 }
 
-function parseOrderDetails() {
+async function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
   const paymentRevision = parsePaymentRevision();
   const cancellation = parseOrderCancellation();
@@ -447,7 +467,7 @@ function parseOrderDetails() {
     seen.add(href);
     const box = shipmentRootForTrackingLink(link);
     const status = clean(box.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
-    const products = productItemsFrom(box);
+    const products = productItemsFrom(box, 20);
     const asins = products.map((item) => item.asin);
     packages.push(withPromiseDetails({
       tracking_url: href,
@@ -457,7 +477,14 @@ function parseOrderDetails() {
       products,
     }));
   }
-  const products = productItemsFrom(document.body);
+  const productsByAsin = new Map();
+  for (const pkg of packages) {
+    for (const product of pkg.products || []) {
+      if (product.asin && !productsByAsin.has(product.asin)) productsByAsin.set(product.asin, product);
+    }
+  }
+  const orderRoot = document.querySelector("#orderDetails, [data-component='shipments'], .a-box-group") || document.body;
+  const products = productsByAsin.size ? [...productsByAsin.values()] : productItemsFrom(orderRoot, 20);
   const orderStatus = clean(document.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
   return { amazonOrderId, packages, products, orderStatus, ...promiseDetails(orderStatus), ...paymentRevision, ...cancellation };
 }
@@ -559,6 +586,17 @@ async function parseTrackingPage() {
 async function run() {
   if (!extensionContextAlive) return;
   if (!/amazon\.com$/i.test(location.hostname)) return;
+  const runSignature = location.href;
+  const now = Date.now();
+  if (
+    window.__nutricityLastRunSignature === runSignature
+    && now - Number(window.__nutricityLastRunAt || 0) < 15000
+  ) {
+    return;
+  }
+  window.__nutricityLastRunSignature = runSignature;
+  window.__nutricityLastRunAt = now;
+  showPanel("Nutricity tracking", `Scanning Amazon page: ${location.pathname}`);
   if (isTrackingPage()) {
     await waitForTrackingPageReady();
     const data = await parseTrackingPage();
@@ -584,7 +622,13 @@ async function run() {
     return;
   }
   if (isOrderDetailsLikePage()) {
-    const data = parseOrderDetails();
+    const data = await parseOrderDetails();
+    void logContent(`Order details parsed for ${data.amazonOrderId || "unknown"}: ${data.packages?.length || 0} package link(s), cancelled=${Boolean(data.orderCancelled)}, paymentRevision=${Boolean(data.paymentRevisionNeeded)}.`);
+    if (!data.amazonOrderId) {
+      const state = await send({ type: "GET_STATE" });
+      const activeOrder = state?.tracking?.currentOrder || state?.tracking?.orders?.[Number(state?.tracking?.index || 0)] || null;
+      data.amazonOrderId = activeOrder?.amazon_order_id || "";
+    }
     if (!data.amazonOrderId) return;
     showPanel(
       "Nutricity tracking",
@@ -612,10 +656,28 @@ async function run() {
   }
 }
 
-if (!window.__nutricityTrackingRunning) {
-  window.__nutricityTrackingRunning = true;
-  run().finally(() => {
-    window.__nutricityTrackingRunning = false;
+window.__nutricityTrackingRunning = true;
+run().catch((error) => {
+  showPanel("Nutricity tracking", `Content script error: ${error.message}`);
+  void logContent(`Content script error on ${location.href}: ${error.message}`);
+}).finally(() => {
+  window.__nutricityTrackingRunning = false;
+});
+
+if (!window.__nutricityRunContentListener) {
+  window.__nutricityRunContentListener = true;
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== "NUTRICITY_RUN_CONTENT") return false;
+    extensionContextAlive = true;
+    window.__nutricityTrackingRunning = true;
+    run().catch((error) => {
+      showPanel("Nutricity tracking", `Content script error: ${error.message}`);
+      void logContent(`Content script error on ${location.href}: ${error.message}`);
+    }).finally(() => {
+      window.__nutricityTrackingRunning = false;
+    });
+    sendResponse({ ok: true });
+    return false;
   });
 }
 
@@ -630,7 +692,7 @@ if (!window.__nutricityTrackAllWatcher) {
         return;
       }
       if (isOrderDetailsLikePage()) {
-        const data = parseOrderDetails();
+        const data = await parseOrderDetails();
         if (data.amazonOrderId && data.orderCancelled) {
           const signature = `${state.tracking.startedAt || ""}|cancelled|${data.amazonOrderId}|${location.href}`;
           if (window.__nutricityLastCancelledOrderSignature === signature) return;
@@ -667,3 +729,4 @@ if (!window.__nutricityTrackAllWatcher) {
     }
   }, 2500);
 }
+})();

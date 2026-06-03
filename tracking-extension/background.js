@@ -243,15 +243,76 @@ async function testConnection() {
   return { ok: true, message: `Connected to ${base}. Admin token accepted.` };
 }
 
+function isAmazonUrl(url = "") {
+  try {
+    const { hostname } = new URL(url);
+    return /(^|\.)amazon\.com$/i.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function waitForTabReadyForInjection(tabId, timeoutMs = 3500) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (tab = null) => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve(tab);
+    };
+    const listener = (updatedTabId, changeInfo, tab) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") finish(tab);
+    };
+    const timer = setTimeout(() => {
+      chrome.tabs.get(tabId).then((tab) => finish(tab)).catch(() => finish(null));
+    }, timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab?.status === "complete") finish(tab);
+    }).catch(() => {});
+  });
+}
+
+async function ensureAmazonContentScript(tabId, windowId) {
+  if (!tabId) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!isAmazonUrl(tab?.url || "")) return;
+  try {
+    await chrome.scripting.insertCSS({ target: { tabId }, files: ["content.css"] });
+  } catch (_) {
+    // CSS is helpful for the status panel but not required for tracking.
+  }
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    return;
+  } catch (error) {
+    await log(`Could not inject Amazon tracking content script: ${error.message}`, windowId);
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "NUTRICITY_RUN_CONTENT" });
+  } catch (error) {
+    await log(`Could not request Amazon content script run: ${error.message}`, windowId);
+  }
+}
+
 async function openUrl(url, windowId) {
   const query = windowId ? { active: true, windowId } : { active: true, currentWindow: true };
   const tabs = await chrome.tabs.query(query);
+  let tabId = null;
   if (tabs[0]?.id) {
     const sameUrl = tabs[0].url === url;
-    await chrome.tabs.update(tabs[0].id, { url, active: true });
-    if (sameUrl) await chrome.tabs.reload(tabs[0].id);
+    tabId = tabs[0].id;
+    await chrome.tabs.update(tabId, { url, active: true });
+    if (sameUrl) await chrome.tabs.reload(tabId);
   } else {
-    await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
+    const tab = await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
+    tabId = tab?.id || null;
+  }
+  if (tabId && isAmazonUrl(url)) {
+    await waitForTabReadyForInjection(tabId);
+    await ensureAmazonContentScript(tabId, windowId);
   }
 }
 
@@ -925,6 +986,7 @@ async function handleOrderPackages(message, windowId) {
   if (historyResult) return historyResult;
   const { tracking, headlessTrackingMode } = await getWindowState(windowId);
   if (!tracking.running) {
+    await log(`Ignored Amazon order page ${message.amazonOrderId || "unknown"} because normal tracking is not running.`, windowId);
     if (headlessTrackingMode) {
       return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
     }
@@ -932,6 +994,7 @@ async function handleOrderPackages(message, windowId) {
   }
   const order = tracking.orders[tracking.index];
   if (!order || order.amazon_order_id !== message.amazonOrderId) {
+    await log(`Ignored Amazon order page ${message.amazonOrderId || "unknown"}; active order is ${order?.amazon_order_id || "none"}.`, windowId);
     if (headlessTrackingMode) {
       return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
     }
@@ -960,17 +1023,23 @@ async function handleOrderPackages(message, windowId) {
     return { ok: true };
   }
   if (message.paymentRevisionNeeded) {
-    await api("/api/tracking/update", {
-      method: "POST",
-      body: JSON.stringify({
-        amazon_order_id: order.amazon_order_id,
-        amazon_order_url: orderUrl(order),
-        packages: message.packages || [],
-        payment_revision_needed: true,
-        payment_revision_url: message.paymentRevisionUrl || "",
-        page_text: message.pageText || "",
-      }),
-    });
+    try {
+      await api("/api/tracking/update", {
+        method: "POST",
+        body: JSON.stringify({
+          amazon_order_id: order.amazon_order_id,
+          amazon_order_url: orderUrl(order),
+          packages: message.packages || [],
+          payment_revision_needed: true,
+          payment_revision_url: message.paymentRevisionUrl || "",
+          page_text: message.pageText || "",
+        }),
+        timeoutMs: 12000,
+        retries: 0,
+      });
+    } catch (error) {
+      await log(`Could not save payment revision status for ${order.amazon_order_id}: ${error.message}; continuing.`, windowId);
+    }
     await log(`Payment revision needed for ${order.amazon_order_id}; posted to Payment Failed page.`, windowId);
     await advanceCurrentOrder(tracking, windowId, "payment_revision");
     return { ok: true };
@@ -981,6 +1050,7 @@ async function handleOrderPackages(message, windowId) {
   tracking.currentStep = "packages";
   tracking.lastMessage = `Found ${tracking.packages.length} package link(s) for ${order.amazon_order_id}.`;
   await saveTracking(tracking, windowId);
+  await log(`Order page parsed for ${order.amazon_order_id}: ${tracking.packages.length} package link(s).`, windowId);
   if (!tracking.packages.length) {
     const products = Array.isArray(message.products) ? message.products : [];
     await api("/api/tracking/update", {
@@ -998,6 +1068,8 @@ async function handleOrderPackages(message, windowId) {
           products,
         }],
       }),
+      timeoutMs: 8000,
+      retries: 0,
     });
     await log(`No tracking buttons found for ${order.amazon_order_id}; saved order-page status.`, windowId);
     await advanceCurrentOrder(tracking, windowId, "checked");
@@ -1008,7 +1080,10 @@ async function handleOrderPackages(message, windowId) {
   tracking.currentUrl = tracking.packages[0].tracking_url;
   tracking.lastActivityAt = Date.now();
   await saveTracking(tracking, windowId);
-  await openUrl(tracking.packages[0].tracking_url, windowId);
+  const nextUrl = tracking.packages[0].tracking_url;
+  setTimeout(() => {
+    openUrl(nextUrl, windowId).catch((error) => log(`Could not open tracking page for ${order.amazon_order_id}: ${error.message}`, windowId));
+  }, 0);
   return { ok: true };
 }
 
@@ -1052,7 +1127,10 @@ async function handlePackageTracking(message, windowId) {
     tracking.currentUrl = tracking.packages[tracking.packageIndex].tracking_url;
     tracking.lastActivityAt = Date.now();
     await saveTracking(tracking, windowId);
-    await openUrl(tracking.packages[tracking.packageIndex].tracking_url, windowId);
+    const nextUrl = tracking.packages[tracking.packageIndex].tracking_url;
+    setTimeout(() => {
+      openUrl(nextUrl, windowId).catch((error) => log(`Could not open next tracking page for ${order.amazon_order_id}: ${error.message}`, windowId));
+    }, 0);
     return { ok: true };
   }
   await api("/api/tracking/update", {
@@ -1175,6 +1253,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
     if (message.type === "GET_STATE") return getWindowState(windowId);
+    if (message.type === "CONTENT_LOG") {
+      await log(message.message || "Amazon content script reported activity.", windowId);
+      return { ok: true };
+    }
     if (message.type === "GET_PROGRESS") {
       const { tracking } = await getWindowState(windowId);
       return { ok: true, progress: trackingProgress(tracking) };

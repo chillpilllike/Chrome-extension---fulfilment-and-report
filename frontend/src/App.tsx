@@ -6610,12 +6610,12 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       </Dialog>
 
       <Dialog open={Boolean(rackDialog)} onOpenChange={(open) => !open && setRackDialog("")}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent className="max-w-4xl dispatch-rack-dialog">
           <DialogHeader>
             <DialogTitle>{rackDialogTitle} rack</DialogTitle>
             <DialogDescription>Packages currently scanned into this rack and not marked dispatched.</DialogDescription>
           </DialogHeader>
-          <div className="max-h-[70vh] overflow-auto rounded border">
+          <div className="dispatch-rack-scroll max-h-[70vh] overflow-auto rounded border">
             {rackDialogGroups.length ? rackDialogGroups.map(([groupName, packages]) => (
               <div key={groupName} className="border-b last:border-b-0">
                 <div className="flex items-center justify-between gap-3 bg-muted/40 px-4 py-2">
@@ -6626,19 +6626,19 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                   {packages.map((pkg) => {
                     const received = !["", "pending"].includes(String(pkg.scan_status || ""))
                     return (
-                      <div key={`${pkg.id}-${pkg.scan_status}`} style={{ display: "flex", alignItems: "center" }} className={cn("flex items-center gap-3 px-4 py-3 text-sm", received ? "bg-emerald-50/70" : "bg-white")}>
+                      <div key={`${pkg.id}-${pkg.scan_status}`} className={cn("dispatch-rack-row px-4 py-3 text-sm", received ? "bg-emerald-50/70" : "bg-white")}>
                         <DispatchProductThumbs images={dispatchProductImagesFrom(pkg)} onPreview={setImagePreview} size="sm" />
-                        <div className="min-w-0 flex-1">
+                        <div className="dispatch-rack-main min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="font-semibold">{pkg.recipient_ref || pkg.odoo_order_name || pkg.amazon_order_id}</span>
                             <StatusBadge value={pkg.scan_status} />
                             <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready for fulfilment" : "Hold"}</Badge>
                           </div>
-                          <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
+                          <div className="dispatch-rack-code mt-1 font-mono text-xs text-muted-foreground">{pkg.display_code || pkg.scan_code}</div>
                           <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
                           <div className="mt-1 text-xs text-muted-foreground">{dispatchLocationCode(pkg) || "No rack"} · package {pkg.package_index || 1}</div>
                         </div>
-                        <div className="ml-auto grid shrink-0 gap-2 text-right text-xs text-muted-foreground">
+                        <div className="dispatch-rack-actions grid shrink-0 gap-2 text-right text-xs text-muted-foreground">
                           <span>{pkg.last_scanned_at ? formatDateTime(pkg.last_scanned_at) : pkg.placed_at ? formatDateTime(pkg.placed_at) : "No scan time"}</span>
                           <div className="flex justify-end gap-2">
                             {rackDialog === "today" ? (

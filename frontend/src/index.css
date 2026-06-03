@@ -1475,7 +1475,7 @@
 .modal-backdrop.show {
     position: fixed;
     inset: 0;
-    z-index: 100;
+    z-index: 1990;
     background: rgba(24, 36, 51, .24);
     backdrop-filter: blur(2px);
 }
@@ -1483,7 +1483,7 @@
 .modal.show[data-slot="dialog-content"] {
     position: fixed;
     inset: 0;
-    z-index: 110;
+    z-index: 2000;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1512,6 +1512,58 @@
     opacity: 1;
     padding: 1.25rem;
     box-shadow: 0 1.5rem 4rem rgba(24, 36, 51, .2);
+}
+
+.dispatch-rack-dialog {
+    width: min(56rem, calc(100vw - 2rem)) !important;
+    max-width: min(56rem, calc(100vw - 2rem)) !important;
+}
+
+.dispatch-rack-scroll {
+    overscroll-behavior: contain;
+}
+
+.dispatch-rack-row {
+    display: grid;
+    grid-template-columns: 4.5rem minmax(0, 1fr);
+    align-items: start;
+    gap: .85rem;
+}
+
+.dispatch-rack-main {
+    min-width: 0;
+}
+
+.dispatch-rack-code {
+    overflow-wrap: anywhere;
+    word-break: normal;
+}
+
+.dispatch-rack-actions {
+    grid-column: 2;
+    min-width: 0;
+    width: 100%;
+    justify-items: start;
+    text-align: left;
+}
+
+.dispatch-rack-actions .btn {
+    min-width: 6.75rem;
+}
+
+@media (min-width: 900px) {
+    .dispatch-rack-row {
+        grid-template-columns: 4.5rem minmax(0, 1fr) auto;
+        align-items: center;
+    }
+
+    .dispatch-rack-actions {
+        grid-column: auto;
+        min-width: 12rem;
+        width: auto;
+        justify-items: end;
+        text-align: right;
+    }
 }
 
 .modal-header {
@@ -1768,6 +1820,105 @@
 }
 
 @media (max-width: 640px) {
+    .tabler-admin-shell .container-xl {
+        padding-inline: .75rem;
+    }
+
+    .tabler-admin-shell .navbar > .container-xl {
+        gap: .5rem;
+        min-height: auto;
+        padding-block: .65rem;
+    }
+
+    .tabler-admin-shell .navbar-brand-title {
+        font-size: 1rem;
+    }
+
+    .tabler-admin-shell .navbar-brand-subtitle {
+        display: none;
+    }
+
+    .tabler-admin-shell .navbar-tabs {
+        z-index: 40;
+    }
+
+    .tabler-admin-shell .navbar-tabs > .container-xl {
+        justify-content: flex-start;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+    }
+
+    .tabler-admin-shell .navbar-tabs > .container-xl::-webkit-scrollbar {
+        display: none;
+    }
+
+    .tabler-admin-shell .navbar-tabs .navbar-nav {
+        flex-wrap: nowrap;
+        min-width: max-content;
+    }
+
+    .tabler-admin-shell .nav-link {
+        min-height: 2rem;
+        padding: .4rem .6rem;
+        font-size: .875rem;
+    }
+
+    .modal.show[data-slot="dialog-content"] {
+        align-items: flex-start;
+        padding: .5rem;
+    }
+
+    .modal.show[data-slot="dialog-content"] .modal-dialog,
+    .dispatch-rack-dialog {
+        width: calc(100vw - 1rem) !important;
+        max-width: calc(100vw - 1rem) !important;
+        max-height: calc(100dvh - 1rem);
+        margin: 0;
+    }
+
+    .modal.show[data-slot="dialog-content"] .modal-content {
+        gap: .85rem;
+        padding: .85rem;
+    }
+
+    .modal-header {
+        padding-right: 2rem;
+    }
+
+    .dispatch-rack-scroll {
+        max-height: calc(100dvh - 10rem) !important;
+    }
+
+    .dispatch-rack-row {
+        grid-template-columns: 4rem minmax(0, 1fr);
+        align-items: start;
+        gap: .75rem;
+        padding-inline: .75rem !important;
+    }
+
+    .dispatch-rack-row [class*="size-"] {
+        max-width: 4rem;
+    }
+
+    .dispatch-rack-actions {
+        grid-column: 2;
+        min-width: 0;
+        width: 100%;
+        justify-items: start;
+        text-align: left;
+    }
+
+    .dispatch-rack-actions > div {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+    }
+
+    .dispatch-rack-actions .btn {
+        min-width: 0;
+        flex: 1 1 8rem;
+    }
+
     .app-version-badge {
         left: .5rem;
         bottom: .5rem;

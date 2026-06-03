@@ -2,14 +2,14 @@
   "manifest_version": 3,
   "name": "Nutricity Amazon Tracking",
   "description": "Tracks Amazon package progress for Nutricity orders and reports carrier/tracking updates to the local app.",
-  "version": "0.1.7",
+  "version": "0.1.28",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-  "permissions": ["storage", "tabs", "alarms"],
+  "permissions": ["storage", "tabs", "alarms", "scripting"],
   "host_permissions": [
     "http://*/*",
     "https://*/*",
