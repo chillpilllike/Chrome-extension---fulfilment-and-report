@@ -347,11 +347,14 @@ async function openCurrentOrder(windowId) {
   if (!tracking.running) return;
   const order = tracking.orders[tracking.index];
   if (!order) {
+    const checked = tracking.completedOrderIds?.length || 0;
+    const failed = tracking.failedOrderIds?.length || 0;
+    const skipped = Number(tracking.skippedRecentCount || 0);
     tracking.running = false;
     tracking.finishedAt = Date.now();
-    tracking.lastMessage = "Tracking complete.";
+    tracking.lastMessage = `Stopped because no more eligible open Amazon orders were left. All tracking codes scanned. Checked ${checked} order(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
     await saveTracking(tracking, windowId);
-    await log("Tracking complete. No more open Amazon orders.", windowId);
+    await log(`${tracking.lastMessage} No more open Amazon orders.`, windowId);
     await clearWatchdogIfIdle();
     return;
   }
@@ -688,9 +691,9 @@ async function maybeOpenNextHistoryPage(tracking, windowId) {
   }
   tracking.running = false;
   tracking.finishedAt = Date.now();
-  tracking.lastMessage = `Track all complete. Checked ${tracking.completedOrderIds?.length || 0} order(s).`;
+  tracking.lastMessage = `All tracking codes scanned. Track all checked ${tracking.completedOrderIds?.length || 0} order(s), failed ${tracking.failedOrderIds?.length || 0}.`;
   await saveTracking(tracking, windowId);
-  await log(`Track all complete. Checked ${tracking.completedOrderIds?.length || 0} order(s), failed ${tracking.failedOrderIds?.length || 0}.`, windowId);
+  await log(tracking.lastMessage, windowId);
   await clearWatchdogIfIdle();
   return false;
 }
@@ -781,11 +784,25 @@ async function advanceHistoryOrder(tracking, windowId, status = "checked") {
 
 async function forceAdvanceHistoryOrder(message, windowId) {
   const { tracking } = await getWindowState(windowId);
-  const order = tracking.currentOrder;
   const messageOrderId = String(message.amazonOrderId || "").trim();
-  if (!tracking.running || tracking.source !== "history") {
-    return { ok: false, message: "Track all is not running." };
+  if (!tracking.running) {
+    return { ok: false, message: "Tracking is not running." };
   }
+  if (tracking.source !== "history") {
+    const order = tracking.orders?.[Number(tracking.index || 0)];
+    if (!order?.amazon_order_id) {
+      await openCurrentOrder(windowId);
+      return { ok: true, message: "Tracking had no active order; opened the next saved item." };
+    }
+    if (messageOrderId && order.amazon_order_id !== messageOrderId) {
+      return { ok: true, ignored: true, message: `Ignored stale force-advance for ${messageOrderId}; active order is ${order.amazon_order_id}.` };
+    }
+    const status = String(message.status || "failed").trim() || "failed";
+    await log(`Force advancing tracking past ${order.amazon_order_id}: ${message.reason || status}.`, windowId);
+    await advanceCurrentOrder(tracking, windowId, status);
+    return { ok: true, message: `Advanced past ${order.amazon_order_id}.` };
+  }
+  const order = tracking.currentOrder;
   if (!order?.amazon_order_id) {
     await openHistoryCurrentOrder(windowId);
     return { ok: true, message: "Track all had no active order; opened the next saved item." };
@@ -913,6 +930,10 @@ async function handleHistoryPackageTracking(message, windowId) {
   const { tracking } = await getWindowState(windowId);
   const order = tracking.currentOrder;
   if (!tracking.running || tracking.source !== "history" || !order || order.amazon_order_id !== message.amazonOrderId) return null;
+  if (Number(order.packageIndex || 0) >= (order.packages || []).length && (order.capturedPackages || []).length) {
+    await log(`Ignored duplicate Track all package retry for ${order.amazon_order_id}; post is already in progress.`, windowId);
+    return { ok: true, duplicate: true, message: "Package retry ignored because this order is already posting." };
+  }
   const queuedPackage = order.packages?.[Number(order.packageIndex || 0)] || {};
   const pagePackage = message.package || {};
   const packageData = { ...queuedPackage, ...pagePackage };
@@ -1101,6 +1122,10 @@ async function handlePackageTracking(message, windowId) {
       return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
     }
     return postStandalonePackageTracking(message, windowId);
+  }
+  if (Number(tracking.packageIndex || 0) >= (tracking.packages || []).length && (tracking.packages || []).length) {
+    await log(`Ignored duplicate package retry for ${order.amazon_order_id}; post is already in progress.`, windowId);
+    return { ok: true, duplicate: true, message: "Package retry ignored because this order is already posting." };
   }
   const queuedPackage = tracking.packages[tracking.packageIndex] || {};
   const pagePackage = message.package || {};

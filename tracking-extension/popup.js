@@ -157,6 +157,24 @@ function stoppedTrackAllText(tracking = {}) {
   return `Stopped · Track all can resume from page ${page}${nextPage}${current} · queue ${queue} · checked ${completed} · failed ${failed}`;
 }
 
+function finalTrackingText(tracking = {}) {
+  const lastMessage = String(tracking.lastMessage || "").trim();
+  if (/stopped because/i.test(lastMessage)) {
+    return lastMessage;
+  }
+  if (tracking.finishedAt) {
+    const completed = tracking.completedOrderIds?.length || 0;
+    const failed = tracking.failedOrderIds?.length || 0;
+    const skipped = Number(tracking.skippedRecentCount || 0);
+    const mode = tracking.source === "history" ? " Track all" : "";
+    const reason = tracking.source === "history"
+      ? "Stopped because Track all finished the selected pages and queue."
+      : "Stopped because no more eligible open Amazon orders were left.";
+    return `${reason} All tracking codes scanned.${mode} Checked ${completed} order(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
+  }
+  return "Stopped";
+}
+
 function settingsPayload() {
   return {
     type: "SET_API_BASE",
@@ -182,14 +200,14 @@ async function refresh() {
       const headless = await send({ type: "GET_HEADLESS_TRACKING_STATUS" });
       const running = trackAllRunning || headlessRunning(headless.progress || {});
       setRunButtons(running, trackAllRunning, trackAllResumable);
-      applyStatusFromRefresh(trackAllRunning ? visibleProgressText(tracking) : trackAllResumable ? stoppedTrackAllText(tracking) : progressText(headless.progress || {}));
+      applyStatusFromRefresh(trackAllRunning ? visibleProgressText(tracking) : trackAllResumable ? stoppedTrackAllText(tracking) : tracking.finishedAt ? finalTrackingText(tracking) : progressText(headless.progress || {}));
     } catch (error) {
       setRunButtons(trackAllRunning, trackAllRunning, trackAllResumable);
       applyStatusFromRefresh(trackAllResumable ? stoppedTrackAllText(tracking) : error.message || "Could not load headless tracking status.");
     }
   } else {
     setRunButtons(tracking.running, trackAllRunning, trackAllResumable);
-    applyStatusFromRefresh(tracking.running ? visibleProgressText(tracking) : trackAllResumable ? stoppedTrackAllText(tracking) : "Stopped");
+    applyStatusFromRefresh(tracking.running ? visibleProgressText(tracking) : trackAllResumable ? stoppedTrackAllText(tracking) : finalTrackingText(tracking));
   }
   logsBox.innerHTML = "";
   for (const line of state.logs || []) {

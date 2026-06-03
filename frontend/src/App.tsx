@@ -378,6 +378,8 @@ type DispatchPackage = {
   }>
 }
 
+type DispatchRackKey = "today" | "tomorrow" | "later" | "exception"
+
 type DispatchSortingSummary = {
   summary: Record<string, number>
   totes: Array<{ tote_code: string; count: number; updated_at: string }>
@@ -5557,7 +5559,9 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   const [lastMessage, setLastMessage] = useState("")
   const [searchConfirmation, setSearchConfirmation] = useState("")
   const [scanEventNotice, setScanEventNotice] = useState("")
-  const [rackDialog, setRackDialog] = useState<"" | "today" | "tomorrow" | "later" | "exception">("")
+  const [rackDialog, setRackDialog] = useState<"" | DispatchRackKey>("")
+  const [moveRackPackageTarget, setMoveRackPackageTarget] = useState<DispatchPackage | null>(null)
+  const [moveRackSelection, setMoveRackSelection] = useState<DispatchRackKey>("later")
   const [scanEventPage, setScanEventPage] = useState(1)
   const [scanEventJumpPage, setScanEventJumpPage] = useState("1")
   const [scanEventQuery, setScanEventQuery] = useState("")
@@ -5974,12 +5978,18 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
     await updateRackPackage(pkg, "dispatched", dispatchLocationCode(pkg) || dispatchRackMoveCode(pkg, "today"), "Package Fulfilled")
   }
 
-  async function moveRackPackage(pkg: DispatchPackage) {
-    const target = window.prompt("Move to rack: today, tomorrow, later, or exception", String(pkg.rack_key || rackDialog || "later"))
-    const rack = String(target || "").trim().toLowerCase()
-    if (!["today", "tomorrow", "later", "exception"].includes(rack)) return
-    const typedRack = rack as "today" | "tomorrow" | "later" | "exception"
-    await updateRackPackage(pkg, typedRack === "exception" ? "exception" : "sorted_holding", dispatchRackMoveCode(pkg, typedRack), `Moved to ${typedRack}`)
+  function moveRackPackage(pkg: DispatchPackage) {
+    const currentRack = String(pkg.rack_key || rackDialog || "later").toLowerCase()
+    setMoveRackSelection((["today", "tomorrow", "later", "exception"].includes(currentRack) ? currentRack : "later") as DispatchRackKey)
+    setMoveRackPackageTarget(pkg)
+  }
+
+  async function confirmMoveRackPackage() {
+    if (!moveRackPackageTarget) return
+    const rack = moveRackSelection
+    const pkg = moveRackPackageTarget
+    setMoveRackPackageTarget(null)
+    await updateRackPackage(pkg, rack === "exception" ? "exception" : "sorted_holding", dispatchRackMoveCode(pkg, rack), `Moved to ${rack}`)
   }
 
   async function resolveScanEvent(eventId: number) {
@@ -6606,6 +6616,40 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               <img src={imagePreview.src} alt={imagePreview.title || "Amazon product"} className="max-h-[68vh] w-full object-contain" />
             ) : null}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(moveRackPackageTarget)} onOpenChange={(open) => !open && setMoveRackPackageTarget(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Move Package</DialogTitle>
+            <DialogDescription>
+              Select the rack where this package should be moved.
+            </DialogDescription>
+          </DialogHeader>
+          {moveRackPackageTarget ? (
+            <div className="grid gap-4">
+              <div className="rounded border bg-muted/30 px-3 py-2 text-sm">
+                <div className="font-semibold">{moveRackPackageTarget.recipient_ref || moveRackPackageTarget.odoo_order_name || moveRackPackageTarget.amazon_order_id || "Package"}</div>
+                <div className="mt-1 font-mono text-xs text-muted-foreground">{moveRackPackageTarget.display_code || moveRackPackageTarget.scan_code || "No scan code"}</div>
+              </div>
+              <SelectField label="Rack" value={moveRackSelection} onChange={(value) => setMoveRackSelection(value as DispatchRackKey)}>
+                <option value="today">Today rack</option>
+                <option value="tomorrow">Tomorrow rack</option>
+                <option value="later">Later / Hold rack</option>
+                <option value="exception">Exception rack</option>
+              </SelectField>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setMoveRackPackageTarget(null)}>
+              Cancel
+            </Button>
+            <Button type="button" disabled={busy || !moveRackPackageTarget} onClick={confirmMoveRackPackage}>
+              <ChevronRight className="size-4" />
+              Move
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

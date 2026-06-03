@@ -36,6 +36,31 @@ async function sendWithTimeout(message, timeoutMs = 15000) {
   }
 }
 
+async function nudgeStuckTrackingPage(data, reason = "tracking page timeout") {
+  const amazonOrderId = String(data?.amazonOrderId || "").trim();
+  if (!amazonOrderId) return;
+  window.setTimeout(async () => {
+    try {
+      const state = await send({ type: "GET_STATE" });
+      const activeOrderId = state?.tracking?.source === "history"
+        ? state?.tracking?.currentOrder?.amazon_order_id
+        : state?.tracking?.orders?.[Number(state?.tracking?.index || 0)]?.amazon_order_id;
+      if (!state?.tracking?.running || String(activeOrderId || "") !== amazonOrderId) return;
+      showPanel("Nutricity tracking", `Still waiting on ${amazonOrderId}. Retrying this tracking page.`);
+      const retry = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data, retry: true }, 20000);
+      if (retry?.ok || retry?.ignored) return;
+      await send({
+        type: "FORCE_ADVANCE_HISTORY_ORDER",
+        amazonOrderId,
+        status: "failed",
+        reason,
+      });
+    } catch (_) {
+      // The next watcher tick or background watchdog will continue the saved queue.
+    }
+  }, 14000);
+}
+
 function logContent(message) {
   return send({ type: "CONTENT_LOG", message }).catch(() => null);
 }
@@ -610,6 +635,9 @@ async function run() {
       showPanel("Nutricity tracking", `Synced tracking for ${data.amazonOrderId}: ${data.package.status}.${recovered}`);
     } else {
       showPanel("Nutricity tracking", processingMessage(response, "Captured the page, but could not post tracking to the app."));
+      if (response?.timedOut) {
+        await nudgeStuckTrackingPage(data, "Tracking page stayed busy after retry");
+      }
     }
     return;
   }
@@ -723,6 +751,27 @@ if (!window.__nutricityTrackAllWatcher) {
           status: "cancelled",
           reason: cancellation.cancellationMessage || "Cancelled order page",
         });
+      }
+      if (isTrackingPage()) {
+        const data = await parseTrackingPage();
+        const activeOrderId = state.tracking.currentOrder?.amazon_order_id || state.tracking.orders?.[Number(state.tracking.index || 0)]?.amazon_order_id || "";
+        if (!data.amazonOrderId || String(data.amazonOrderId) !== String(activeOrderId || "")) return;
+        const signature = `${state.tracking.startedAt || ""}|tracking|${data.amazonOrderId}|${location.href}|${state.tracking.lastActivityAt || ""}`;
+        if (window.__nutricityLastTrackingRetrySignature === signature) return;
+        const lastActivityAt = Number(state.tracking.lastActivityAt || state.tracking.updatedAt || 0);
+        if (lastActivityAt && Date.now() - lastActivityAt > 20000) {
+          window.__nutricityLastTrackingRetrySignature = signature;
+          showPanel("Nutricity tracking", `Retrying stalled tracking page for ${data.amazonOrderId}.`);
+          const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data, retry: true }, 20000);
+          if (!response?.ok && response?.timedOut) {
+            await send({
+              type: "FORCE_ADVANCE_HISTORY_ORDER",
+              amazonOrderId: data.amazonOrderId,
+              status: "failed",
+              reason: "Tracking page watcher retry timed out",
+            });
+          }
+        }
       }
     } catch (_) {
       // The background service worker can sleep between scans; the next tick will retry.
