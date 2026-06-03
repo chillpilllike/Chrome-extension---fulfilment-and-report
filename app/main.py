@@ -13844,7 +13844,10 @@ def complete_shopify_oauth_session(state_key: str, code: str) -> str:
             SET status='queued', last_error='', next_run_at=?, updated_at=?
             WHERE route=?
               AND status IN ('failed', 'dead')
-              AND COALESCE(last_error, '') LIKE 'Shopify OAuth token%'
+              AND (
+                    COALESCE(last_error, '') LIKE 'Shopify OAuth token%'
+                 OR COALESCE(last_error, '') LIKE '%HTTP 404%Not Found%'
+              )
             """,
             (utc_now(), utc_now(), route),
         )
@@ -14034,7 +14037,40 @@ def claim_shopify_fulfilment_job() -> Optional[dict[str, Any]]:
         ).fetchone()
 
 
+def recover_stale_shopify_not_found_jobs(route: str | None = None) -> int:
+    route_filter = clean_text(route).lower()
+    params: list[Any] = [utc_now(), utc_now()]
+    route_sql = ""
+    if route_filter in {"dtc", "dtb"}:
+        route_sql = "AND shopify_fulfilment_jobs.route=?"
+        params.append(route_filter)
+    with db() as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE shopify_fulfilment_jobs
+            SET status='queued',
+                attempts=0,
+                next_run_at=?,
+                last_error='',
+                locked_at=NULL,
+                updated_at=?
+            WHERE status IN ('failed', 'dead')
+              AND COALESCE(last_error, '') LIKE '%HTTP 404%Not Found%'
+              {route_sql}
+              AND EXISTS (
+                    SELECT 1
+                    FROM shopify_export_oauth_tokens
+                    WHERE shopify_export_oauth_tokens.state_scope=shopify_fulfilment_jobs.route
+                      AND COALESCE(shopify_export_oauth_tokens.access_token, '')!=''
+              )
+            """,
+            params,
+        )
+    return int(cursor.rowcount or 0)
+
+
 def due_shopify_fulfilment_job_count() -> int:
+    recover_stale_shopify_not_found_jobs()
     with db() as conn:
         return int(conn.execute(
             """
@@ -14486,8 +14522,9 @@ def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], f
                             mapped_order = shopify_order_by_id(shop, target["order_id"])
                             if mapped_order:
                                 candidates.append(mapped_order)
-                    orders = shopify_orders_by_name(shop, order_name, limit=10)
-                    candidates.extend(orders)
+                    if not candidates:
+                        orders = shopify_orders_by_name(shop, order_name, limit=10)
+                        candidates.extend(orders)
                     deduped: list[dict[str, Any]] = []
                     seen_order_ids: set[str] = set()
                     for order in candidates:
@@ -14552,7 +14589,7 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
 def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait: bool = False) -> int:
     groups: dict[int, set[str]] = {}
     for row in rows:
-        if clean_text(row.get("shopify_order_id")):
+        if clean_text(row.get("shopify_synced_at")) or clean_text(row.get("shopify_status_synced_at")):
             continue
         store_id = parse_optional_int(row.get("store_id"))
         order_name = clean_text(row.get("odoo_order_name")).upper()
@@ -15585,6 +15622,7 @@ def shopify_fulfilment_worker() -> None:
 
 
 def start_shopify_fulfilment_worker() -> dict[str, Any]:
+    recovered = recover_stale_shopify_not_found_jobs()
     total = due_shopify_fulfilment_job_count()
     settings = get_service_settings()
     concurrency = shopify_fulfilment_concurrency(settings)
@@ -15599,7 +15637,7 @@ def start_shopify_fulfilment_worker() -> dict[str, Any]:
         processed=0,
         current_order="",
         current_route="",
-        message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''} using {concurrency} concurrent push{'es' if concurrency != 1 else ''}.",
+        message=f"Shopify fulfilment worker started with {total} job{'s' if total != 1 else ''} using {concurrency} concurrent push{'es' if concurrency != 1 else ''}." + (f" Recovered {recovered} stale Shopify 404 job{'s' if recovered != 1 else ''}." if recovered else ""),
         started_at=utc_now() if total else "",
         completed_at="",
         error="",
@@ -15760,6 +15798,13 @@ def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str
         attention_reason = shopify_fulfilment_attention_reason(row)
         row["needs_attention"] = bool(attention_reason)
         row["attention_reason"] = attention_reason
+    linked_unsynced = [
+        row for row in result
+        if clean_text(row.get("shopify_order_id"))
+        and not clean_text(row.get("shopify_status_synced_at"))
+    ]
+    if linked_unsynced:
+        refresh_missing_shopify_status_for_rows(linked_unsynced)
     return result, total, page, per_page
 
 
