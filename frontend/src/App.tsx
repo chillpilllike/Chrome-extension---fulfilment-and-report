@@ -2009,8 +2009,43 @@ function StatusBadge({ value }: { value?: string }) {
 
 function copyPlainText(value: string) {
   const text = String(value || "").trim()
-  if (!text || typeof navigator === "undefined") return Promise.resolve(false)
-  return navigator.clipboard.writeText(text).then(() => true).catch(() => false)
+  if (!text || typeof window === "undefined" || typeof document === "undefined") return Promise.resolve(false)
+  const writeWithTextarea = () => {
+    const textarea = document.createElement("textarea")
+    textarea.value = text
+    textarea.setAttribute("readonly", "true")
+    textarea.style.position = "fixed"
+    textarea.style.top = "0"
+    textarea.style.left = "0"
+    textarea.style.width = "1px"
+    textarea.style.height = "1px"
+    textarea.style.opacity = "0"
+    textarea.style.pointerEvents = "none"
+    document.body.appendChild(textarea)
+    textarea.focus({ preventScroll: true })
+    textarea.select()
+    textarea.setSelectionRange(0, textarea.value.length)
+    let copied = false
+    try {
+      copied = document.execCommand("copy")
+    } catch {
+      copied = false
+    } finally {
+      document.body.removeChild(textarea)
+    }
+    return copied
+  }
+  return (async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+        return true
+      }
+    } catch {
+      // Some browsers expose navigator.clipboard but block it outside secure/user-gesture contexts.
+    }
+    return writeWithTextarea()
+  })()
 }
 
 function OdooOrderRef({
@@ -3767,11 +3802,11 @@ function App() {
   async function copyText(value: string, label: string) {
     const text = String(value || "").trim()
     if (!text) return
-    try {
-      await navigator.clipboard.writeText(text)
+    const copied = await copyPlainText(text)
+    if (copied) {
       setModal({ ok: true, title: "Copied", message: `${label} copied: ${text}` })
-    } catch (error) {
-      setModal({ ok: false, title: "Copy Failed", message: String(error) })
+    } else {
+      setModal({ ok: false, title: "Copy Failed", message: "Clipboard copy is not available in this browser." })
     }
   }
 
@@ -7992,27 +8027,13 @@ function EpostTrackingPage({
   }
   async function copyRefundDetails(row: EpostTrackingRow) {
     const details = refundDetails(row)
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(details)
-      } else {
-        const textarea = document.createElement("textarea")
-        textarea.value = details
-        textarea.setAttribute("readonly", "true")
-        textarea.style.position = "fixed"
-        textarea.style.opacity = "0"
-        document.body.appendChild(textarea)
-        textarea.select()
-        const copied = document.execCommand("copy")
-        document.body.removeChild(textarea)
-        if (!copied) throw new Error("Clipboard copy is not available in this browser.")
-      }
+    const copied = await copyPlainText(details)
+    if (copied) {
       onResult({ ok: true, title: "Refund Details Copied", message: "Shipment details copied to clipboard." })
       return true
-    } catch (error) {
-      onResult({ ok: false, title: "Copy Failed", message: String(error) })
-      return false
     }
+    onResult({ ok: false, title: "Copy Failed", message: "Clipboard copy is not available in this browser." })
+    return false
   }
   async function refresh() {
     setLoading(true)
