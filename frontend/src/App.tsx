@@ -1493,7 +1493,7 @@ function loadOrderColumns() {
   }
 }
 
-function formatDateTime(value?: string) {
+function formatDateTime(value?: string, options: { timeZone?: string; showTimeZone?: boolean } = {}) {
   if (!value) return ""
   const normalized = value.includes("T") ? value : value.replace(" ", "T")
   const hasTime = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(normalized)
@@ -1501,13 +1501,22 @@ function formatDateTime(value?: string) {
   const date = new Date(hasTime && !hasTimezone ? `${normalized}Z` : normalized)
   if (Number.isNaN(date.getTime())) return value
   return date.toLocaleString(undefined, {
-    timeZone: "America/New_York",
+    ...(options.timeZone ? { timeZone: options.timeZone } : {}),
     year: "numeric",
     month: "short",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    ...(options.showTimeZone ? { timeZoneName: "short" as const } : {}),
   })
+}
+
+function formatDispatchDateTime(value?: string) {
+  return formatDateTime(value, { timeZone: "America/New_York" })
+}
+
+function formatOrderDateTime(value?: string) {
+  return formatDateTime(value, { showTimeZone: true })
 }
 
 function formatFileSize(value?: number) {
@@ -1531,9 +1540,12 @@ function progressWidth(value?: number | null) {
 }
 
 function dispatchDayCode(offsetDays = 0) {
-  const date = new Date()
-  date.setDate(date.getDate() + offsetDays)
-  return `D${String(date.getDate()).padStart(2, "0")}`
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    day: "2-digit",
+  }).formatToParts(new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000))
+  const day = parts.find((part) => part.type === "day")?.value || String(new Date().getDate()).padStart(2, "0")
+  return `D${day}`
 }
 
 function dispatchDayLabel(value?: string) {
@@ -3794,7 +3806,7 @@ function App() {
           </button>
         )
       case "odoo_order_date":
-        return <span className="text-xs text-muted-foreground">{formatDateTime(row.odoo_order_date)}</span>
+        return <span className="text-xs text-muted-foreground">{formatOrderDateTime(row.odoo_order_date)}</span>
       case "destination_country":
         return row.destination_country ? (
           <Badge variant="outline">{row.destination_country}</Badge>
@@ -3802,9 +3814,9 @@ function App() {
           <span className="text-muted-foreground">-</span>
         )
       case "pulled_at":
-        return <span className="text-xs text-muted-foreground">{formatDateTime(row.pulled_at || row.created_at)}</span>
+        return <span className="text-xs text-muted-foreground">{formatOrderDateTime(row.pulled_at || row.created_at)}</span>
       case "ordered_at":
-        return <span className="text-xs text-muted-foreground">{formatDateTime(row.ordered_at)}</span>
+        return <span className="text-xs text-muted-foreground">{formatOrderDateTime(row.ordered_at)}</span>
       case "asin":
         return row.asin ? (
           row.replacement_asin ? (
@@ -6713,7 +6725,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                           <div className="mt-1 text-xs text-muted-foreground">{dispatchLocationCode(pkg) || "No rack"} · package {pkg.package_index || 1}</div>
                         </div>
                         <div className="dispatch-rack-actions grid shrink-0 gap-2 text-right text-xs text-muted-foreground">
-                          <span>{pkg.last_scanned_at ? formatDateTime(pkg.last_scanned_at) : pkg.placed_at ? formatDateTime(pkg.placed_at) : "No scan time"}</span>
+                          <span>{pkg.last_scanned_at ? formatDispatchDateTime(pkg.last_scanned_at) : pkg.placed_at ? formatDispatchDateTime(pkg.placed_at) : "No scan time"}</span>
                           <div className="flex justify-end gap-2">
                             {rackDialog === "today" ? (
                               <Button type="button" size="sm" disabled={busy} onClick={() => fulfillRackPackage(pkg)}>
@@ -6764,7 +6776,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                   <div className="text-xs text-muted-foreground">{dispatchLocationCode(row) || "No tote"}</div>
                   <div className="text-xs text-muted-foreground">
                     Scanned {Number(row.scan_count || 0).toLocaleString()} time{Number(row.scan_count || 0) === 1 ? "" : "s"}
-                    {row.last_scanned_at ? ` · ${formatDateTime(row.last_scanned_at)}` : ""}
+                    {row.last_scanned_at ? ` · ${formatDispatchDateTime(row.last_scanned_at)}` : ""}
                   </div>
                 </div>
               </div>
@@ -6830,7 +6842,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                       <Badge variant={isResolved ? "outline" : isException ? "destructive" : isMultiple ? "outline" : "secondary"}>
                         {isResolved ? "Resolved" : isException ? "Exception" : isMultiple ? "Multiple" : "Matched"}
                       </Badge>
-                      <span className="text-xs text-muted-foreground">{formatDateTime(event.created_at)}</span>
+                      <span className="text-xs text-muted-foreground">{formatDispatchDateTime(event.created_at)}</span>
                     </div>
                   </div>
                   <div className="mt-2 min-w-0">

@@ -223,7 +223,7 @@ async function startScheduledEpost() {
 
 async function startEpost(windowId = null, options = {}) {
   const state = await getState();
-  const includeRecent = options.includeRecent === true;
+  const includeRecent = options.includeRecent !== false;
   const source = options.source || "manual";
   if (state.headlessEpostMode) return startHeadlessEpost({ includeRecent, source });
   await log("Starting visible ePost tracking.", windowId);
@@ -245,7 +245,7 @@ async function startEpost(windowId = null, options = {}) {
       skippedRecentCount: allRows.length - rows.length,
       startedAt: Date.now(),
       lastActivityAt: Date.now(),
-      lastMessage: includeRecent ? "ePost auto tracking started for all undelivered codes." : "ePost tracking started.",
+      lastMessage: includeRecent ? "ePost tracking started for all undelivered codes." : "ePost tracking started.",
       includeRecent,
       source,
     };
@@ -290,7 +290,7 @@ async function startHeadlessEpost(options = {}) {
       worker_id: `epost-extension-${chrome.runtime.id || "local"}`,
       interval_days: dueDays,
       interval_hours: hours,
-      include_recent: options.includeRecent === true,
+      include_recent: options.includeRecent !== false,
     }),
     timeoutMs: 10000,
   });

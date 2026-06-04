@@ -6461,7 +6461,35 @@ def process_odoo_order_batch(
                 asin_from_note = extract_asin_from_notes(note, line.get("name") or "", order.get("note") or "")
                 asin = asin_from_reference or asin_from_note
                 if not normalize_asin(asin):
-                    invalid_line_ids.append(int(line["id"]))
+                    missing_reason = "Missing valid ASIN in Odoo product code/description; review the product mapping before Amazon fulfilment."
+                    pending_saves.append((
+                        order,
+                        {
+                            "asin": "",
+                            "quantity": float(line.get("product_uom_qty") or 1),
+                            "line_ids": [int(line["id"])],
+                            "raw_lines": [{"line": line, "product": product, "template": tmpl}],
+                            "product_id": product_id,
+                            "product_tmpl_id": tmpl_id,
+                            "product_name": line.get("name") or "",
+                            "default_code": default_code,
+                            "internal_note": note,
+                            "asin_from_reference": asin_from_reference,
+                            "asin_from_note": asin_from_note,
+                            "store_subtotal_native": line_native_total(line),
+                            "store_currency": currency,
+                            "store_currency_rate_to_usd": rate_to_usd,
+                            "store_delivery_native": 0,
+                            "store_discount_native": 0,
+                            "store_adjustment_native": 0,
+                            "store_total_native": line_native_total(line),
+                            "store_total_usd": line_native_total(line) * rate_to_usd,
+                            "store_unit_usd": (line_native_total(line) * rate_to_usd) / float(line.get("product_uom_qty") or 1),
+                            "order_adjustment_lines": adjustment_lines,
+                            "missing_asin_reason": missing_reason,
+                        },
+                        status_label,
+                    ))
                     continue
                 entry = combined_by_asin.setdefault(
                     asin,
@@ -6565,6 +6593,14 @@ def process_odoo_order_batch(
             preserved_state, preserved_last_error = preserved_order_line_refresh_state(preserved)
             if not combined_existing_rows:
                 new_record_count += 1
+            missing_asin_reason = clean_text(combined.get("missing_asin_reason"))
+            next_amazon_status = preserved["amazon_status"] if preserved else None
+            next_state = preserved_state
+            next_last_error = preserved_last_error
+            if missing_asin_reason and not (preserved and preserved["amazon_order_id"]):
+                next_amazon_status = "missing"
+                next_state = "missing"
+                next_last_error = missing_asin_reason
             raw = {
                 "order": order,
                 "combined_source_lines": combined["raw_lines"],
@@ -6606,12 +6642,12 @@ def process_odoo_order_batch(
                     preserved["amazon_account_id"] if preserved else None,
                     preserved["amazon_account_name"] if preserved else None,
                     preserved["amazon_group_key"] if preserved else None,
-                    preserved["amazon_status"] if preserved else None,
+                    next_amazon_status,
                     preserved["tracking_status"] if preserved else None,
                     preserved["tracking_payload"] if preserved else None,
                     preserved["tracking_checked_at"] if preserved else None,
-                    preserved_state,
-                    preserved_last_error,
+                    next_state,
+                    next_last_error,
                     ",".join(str(line_id) for line_id in source_line_ids),
                     len(source_line_ids),
                     json.dumps(raw, default=str),
@@ -8471,7 +8507,7 @@ def order_sort_sql(sort_by: str = "", sort_dir: str = "") -> str:
         "fulfilment_note": "COALESCE(fulfilment_note, '')",
         "last_error": "COALESCE(last_error, '')",
     }
-    expression = expressions.get(sort_key, "COALESCE(odoo_order_id, 0)")
+    expression = expressions.get(sort_key, "NULLIF(odoo_order_date, '')::timestamp")
     return f"{expression} {direction} {nulls}, COALESCE(odoo_order_id, 0) {direction}, asin ASC, id ASC"
 
 
@@ -11632,15 +11668,31 @@ def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None, hours
     else:
         days = max(0, min(30, int(days or 1)))
         interval_seconds = days * 86400
-    cutoff = time.time() - interval_seconds
-    rows = epost_tracking_rows(store_id)
+    cutoff_ts = time.time() - interval_seconds
+    params: list[Any] = [store_id, store_id]
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, store_id, odoo_order_name, amazon_order_id, tracking_code, tracking_url,
+                   status, last_update_at, location, destination, awb, last_checked_at,
+                   epost_status, updated_at
+            FROM epost_global_tracking
+            WHERE COALESCE(tracking_code, '') != ''
+              AND COALESCE(epost_status, '') != 'delivered'
+              AND (? IS NULL OR store_id=?)
+            ORDER BY
+              CASE WHEN epost_status='lost' THEN 0 ELSE 1 END,
+              last_checked_at IS NULL DESC,
+              last_checked_at ASC,
+              updated_at DESC
+            """,
+            params,
+        ).fetchall()
+    data = rows_to_dicts(rows)
+    if include_recent:
+        return data
     due = []
-    for row in rows:
-        if str(row.get("epost_status") or "").lower() == "delivered":
-            continue
-        if include_recent:
-            due.append(row)
-            continue
+    for row in data:
         checked = str(row.get("last_checked_at") or "")
         if not checked:
             due.append(row)
@@ -11649,7 +11701,7 @@ def due_epost_tracking_rows(days: int = 1, store_id: Optional[int] = None, hours
             checked_ts = datetime.fromisoformat(checked.replace("Z", "+00:00")).timestamp()
         except Exception:
             checked_ts = 0
-        if checked_ts <= cutoff:
+        if checked_ts <= cutoff_ts:
             due.append(row)
     return due
 
@@ -16864,7 +16916,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 SELECT * FROM stores ORDER BY name
             ),
             chosen AS (
-                SELECT COALESCE(?, (SELECT id FROM stores_cte LIMIT 1)) AS store_id
+                SELECT CAST(? AS INTEGER) AS store_id
             ),
             order_groups AS (
                 SELECT {order_group_select_sql(sort_by)}
@@ -17416,7 +17468,7 @@ def search_order_lines_sql(
     store_id: Optional[int],
     page: int = 1,
     per_page: int = 100,
-    sort_by: str = "odoo_order_date",
+    sort_by: str = "pulled_at",
     sort_dir: str = "desc",
     condition: str = "all",
     country: str = "",
@@ -18025,6 +18077,46 @@ def api_search(q: str = "", store_id: Optional[int] = None, page: int = 1, per_p
     return fast_page_cache_set(cache_key, fallback, 30)
 
 
+def setting_elapsed_seconds(key: str, default_seconds: float = 0.0) -> float:
+    parsed = parse_iso_date(get_setting(key, ""))
+    if not parsed:
+        return default_seconds
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
+def queue_auto_pull_jobs(days: int, limit: int, batch_size: int) -> dict[str, Any]:
+    stores = rows_to_dicts(list_stores())
+    with db() as conn:
+        mark_stale_pull_jobs(conn)
+        active_rows = conn.execute(
+            """
+            SELECT pull_jobs.*, stores.name AS store_name
+            FROM pull_jobs
+            LEFT JOIN stores ON stores.id = pull_jobs.store_id
+            WHERE pull_jobs.status IN ('queued', 'running')
+            ORDER BY pull_jobs.created_at ASC
+            """
+        ).fetchall()
+    if active_rows:
+        return {
+            "queued": 0,
+            "active": len(active_rows),
+            "stores": len(stores),
+            "message": f"Auto pull skipped because {len(active_rows)} pull job{'s' if len(active_rows) != 1 else ''} are already running.",
+        }
+    jobs = start_pull_jobs([int(store["id"]) for store in stores], days, limit, batch_size)
+    return {
+        "queued": len(jobs),
+        "active": 0,
+        "stores": len(stores),
+        "message": (
+            f"Auto queued {len(jobs)} pull job{'s' if len(jobs) != 1 else ''} "
+            f"for {len(stores)} store{'s' if len(stores) != 1 else ''} "
+            f"using last {days} day{'s' if days != 1 else ''}, limit {'all' if limit == 0 else limit}, batch size {batch_size}."
+        ),
+    }
+
+
 def autosync_loop() -> None:
     last_run = time.time()
     last_chrome_run = time.time()
@@ -18033,32 +18125,13 @@ def autosync_loop() -> None:
         try:
             settings = get_service_settings()
             interval = int(float(settings.get("autosync_interval_minutes") or 0))
-            if interval > 0 and time.time() - last_run >= interval * 60:
+            elapsed = max(time.time() - last_run, setting_elapsed_seconds("autosync_last_run_at", interval * 60))
+            if interval > 0 and elapsed >= interval * 60:
                 days = stored_pull_days(7)
                 limit = stored_pull_limit()
                 batch_size = stored_pull_batch_size()
-                pulled_count = 0
-                pulled_stores = 0
-                skipped_stores = 0
-                for store in list_stores():
-                    store_id = int(store["id"])
-                    count = fetch_odoo_lines_exclusive(get_store(store_id), days=days, limit=limit, batch_size=batch_size, wait=False)
-                    if count is None:
-                        skipped_stores += 1
-                        continue
-                    pulled_stores += 1
-                    pulled_count += int(count or 0)
-                if pulled_count:
-                    start_typesense_reindex_job()
-                set_setting(
-                    "autosync_last_message",
-                    (
-                        f"Auto pulled {pulled_count} new order-line record{'s' if pulled_count != 1 else ''} "
-                        f"from {pulled_stores} store{'s' if pulled_stores != 1 else ''} "
-                        f"using last {days} day{'s' if days != 1 else ''}, limit {'all' if limit == 0 else limit}."
-                        + (f" Skipped {skipped_stores} busy store{'s' if skipped_stores != 1 else ''}." if skipped_stores else "")
-                    ),
-                )
+                result = queue_auto_pull_jobs(days, limit, batch_size)
+                set_setting("autosync_last_message", result["message"])
                 set_setting("autosync_last_run_at", utc_now())
                 last_run = time.time()
             chrome_interval = int(float(settings.get("auto_chrome_fulfil_interval_minutes") or 0))
@@ -19381,8 +19454,10 @@ def run_pull_job(job_id: str) -> None:
                 (inserted, utc_now(), utc_now(), job_id),
             )
         if cursor.rowcount > 0:
+            fast_page_cache_clear_matching({"pull-jobs"})
             start_typesense_reindex_job()
     except PullJobCancelled:
+        fast_page_cache_clear_matching({"pull-jobs"})
         return
     except Exception as exc:
         with db() as conn:
@@ -19390,6 +19465,7 @@ def run_pull_job(job_id: str) -> None:
                 "UPDATE pull_jobs SET status='failed', error=?, updated_at=?, completed_at=? WHERE id=? AND status IN ('queued', 'running')",
                 (str(exc)[:1000], utc_now(), utc_now(), job_id),
             )
+        fast_page_cache_clear_matching({"pull-jobs"})
 
 
 def mark_stale_pull_jobs(conn: Any) -> int:
@@ -19414,20 +19490,39 @@ def mark_stale_pull_jobs(conn: Any) -> int:
     return cursor.rowcount
 
 
-def start_pull_job(store_id: int, days: int, limit: int, batch_size: int) -> dict[str, Any]:
-    job_id = uuid.uuid4().hex
+def pull_job_payload(job_id: str, store_id: int, days: int, limit: int, batch_size: int, now: str) -> dict[str, Any]:
+    return {"id": job_id, "store_id": store_id, "status": "queued", "days": days, "limit_value": limit, "batch_size": batch_size, "total_orders": 0, "processed_orders": 0, "inserted_records": 0, "error": "", "created_at": now, "updated_at": now, "completed_at": ""}
+
+
+def start_pull_jobs(store_ids: list[int], days: int, limit: int, batch_size: int) -> list[dict[str, Any]]:
+    normalized_store_ids = list(dict.fromkeys(int(store_id) for store_id in store_ids if int(store_id or 0) > 0))
+    if not normalized_store_ids:
+        return []
+    jobs: list[dict[str, Any]] = []
     now = utc_now()
     with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO pull_jobs
-            (id, store_id, status, days, limit_value, batch_size, total_orders, processed_orders, inserted_records, error, created_at, updated_at)
-            VALUES (?, ?, 'queued', ?, ?, ?, 0, 0, 0, '', ?, ?)
-            """,
-            (job_id, store_id, days, limit, batch_size, now, now),
-        )
-    threading.Thread(target=run_pull_job, args=(job_id,), daemon=True).start()
-    return {"id": job_id, "store_id": store_id, "status": "queued", "days": days, "limit_value": limit, "batch_size": batch_size, "total_orders": 0, "processed_orders": 0, "inserted_records": 0, "error": "", "created_at": now, "updated_at": now, "completed_at": ""}
+        for store_id in normalized_store_ids:
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO pull_jobs
+                (id, store_id, status, days, limit_value, batch_size, total_orders, processed_orders, inserted_records, error, created_at, updated_at)
+                VALUES (?, ?, 'queued', ?, ?, ?, 0, 0, 0, '', ?, ?)
+                """,
+                (job_id, store_id, days, limit, batch_size, now, now),
+            )
+            jobs.append(pull_job_payload(job_id, store_id, days, limit, batch_size, now))
+    fast_page_cache_clear_matching({"pull-jobs"})
+    for job in jobs:
+        threading.Thread(target=run_pull_job, args=(job["id"],), daemon=True).start()
+    return jobs
+
+
+def start_pull_job(store_id: int, days: int, limit: int, batch_size: int) -> dict[str, Any]:
+    jobs = start_pull_jobs([store_id], days, limit, batch_size)
+    if not jobs:
+        raise HTTPException(400, "Select at least one store to pull orders.")
+    return jobs[0]
 
 
 @app.post("/api/pull")
@@ -19461,7 +19556,7 @@ def api_pull_orders(payload: PullPayload) -> dict[str, Any]:
                 "jobs": jobs,
                 "defer_refresh": True,
             }
-    jobs = [start_pull_job(store_id, days, limit, batch_size) for store_id in store_ids]
+    jobs = start_pull_jobs(store_ids, days, limit, batch_size)
     message = f"Started {len(jobs)} background pull job{'s' if len(jobs) != 1 else ''}."
     return {"ok": True, "message": message, "jobs": jobs, "defer_refresh": True}
 
@@ -21582,7 +21677,7 @@ def set_epost_browserless_progress(**updates: Any) -> dict[str, Any]:
     return dict(_EPOST_BROWSERLESS_PROGRESS)
 
 
-def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: int = 0, hours: Optional[int] = None, include_recent: bool = False) -> list[list[str]]:
+def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: int = 0, hours: Optional[int] = None, include_recent: bool = True) -> list[list[str]]:
     rows = due_epost_tracking_rows(max(1, int(days or 1)), store_id, hours, include_recent)
     codes = [clean_text(row.get("tracking_code")).upper() for row in rows if clean_text(row.get("tracking_code"))]
     batches = [codes[index:index + 25] for index in range(0, len(codes), 25)]
@@ -21590,7 +21685,7 @@ def epost_browserless_batches(days: int, store_id: Optional[int], max_batches: i
 
 
 class EpostBrowserlessSession:
-    def __init__(self, worker_id: str, store_id: Optional[int], interval_days: int, max_batches: int, interval_hours: Optional[int] = None, include_recent: bool = False) -> None:
+    def __init__(self, worker_id: str, store_id: Optional[int], interval_days: int, max_batches: int, interval_hours: Optional[int] = None, include_recent: bool = True) -> None:
         self.worker_id = worker_id
         self.store_id = store_id
         self.interval_days = max(1, int(interval_days or 1))
@@ -21838,7 +21933,7 @@ def api_epost_browserless_run(payload: EpostBrowserlessRunPayload) -> dict[str, 
             current_batch="",
             completed_at=utc_now(),
             error="",
-            message="No ePost tracking codes are due.",
+            message="No undelivered ePost tracking codes found.",
         )
         return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
     progress = set_epost_browserless_progress(
@@ -24603,7 +24698,7 @@ def api_epost_sync(payload: EpostSyncPayload) -> dict[str, Any]:
 
 
 @app.get("/api/epost/due")
-def api_epost_due(days: int = 1, hours: Optional[int] = None, store_id: Optional[int] = None, include_recent: bool = False) -> dict[str, Any]:
+def api_epost_due(days: int = 1, hours: Optional[int] = None, store_id: Optional[int] = None, include_recent: bool = True) -> dict[str, Any]:
     return {"ok": True, "rows": due_epost_tracking_rows(days, store_id, hours, include_recent)}
 
 

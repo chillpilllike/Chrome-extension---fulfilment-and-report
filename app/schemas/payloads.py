@@ -197,7 +197,7 @@ class EpostBrowserlessRunPayload(BaseModel):
     interval_days: int = 1
     interval_hours: int = 24
     max_batches: int = 0
-    include_recent: bool = False
+    include_recent: bool = True
 
 
 class EpostTrackingUpdatePayload(BaseModel):
