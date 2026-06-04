@@ -11130,7 +11130,14 @@ def delivered_unfulfilled_rows(store_id: Optional[int] = None, q: str = "") -> l
     return rows
 
 
-def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> tuple[list[dict[str, Any]], int, int, int]:
+def paged_delivered_unfulfilled_rows(
+    store_id: Optional[int] = None,
+    page: int = 1,
+    per_page: int = 100,
+    q: str = "",
+    sort_by: str = "delivery_date",
+    sort_dir: str = "asc",
+) -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     search = clean_text(q)
     search_like = f"%{search}%" if search else None
@@ -11169,7 +11176,6 @@ def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int =
     """
     params = [store_id, store_id, search_like, search_like, search_like, search_like, search_like, search_like, search_like]
     with db() as conn:
-        total = int(conn.execute(f"SELECT COUNT(*) AS count FROM order_lines WHERE {where_sql}", params).fetchone()["count"] or 0)
         rows = conn.execute(
             f"""
             SELECT order_lines.id, order_lines.store_id, order_lines.odoo_order_id, order_lines.odoo_order_name,
@@ -11182,10 +11188,9 @@ def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int =
             FROM order_lines
             JOIN stores ON stores.id=order_lines.store_id
             WHERE {where_sql}
-            ORDER BY order_lines.tracking_checked_at DESC, order_lines.ordered_at DESC, order_lines.updated_at DESC
-            LIMIT ? OFFSET ?
+            ORDER BY order_lines.tracking_checked_at ASC, order_lines.ordered_at ASC, order_lines.updated_at ASC
             """,
-            [*params, per_page, offset],
+            params,
         ).fetchall()
     results: list[dict[str, Any]] = []
     for row in rows:
@@ -11214,6 +11219,40 @@ def paged_delivered_unfulfilled_rows(store_id: Optional[int] = None, page: int =
         )
         data.pop("store_odoo_url", None)
         results.append(data)
+    total = len(results)
+    sort_key = clean_text(sort_by).lower().replace("-", "_")
+    sort_direction = clean_text(sort_dir).lower()
+    reverse = sort_direction == "desc"
+
+    def sort_timestamp(value: Any) -> float:
+        parsed = parse_any_datetime(value)
+        if not parsed:
+            return 0.0
+        return parsed.timestamp()
+
+    def pending_sort_value(row: dict[str, Any]) -> tuple[Any, ...]:
+        delivered_dt = parse_any_datetime(row.get("amazon_delivered_at"))
+        delivered_fallback = parse_any_datetime(row.get("tracking_checked_at")) or parse_any_datetime(row.get("ordered_at")) or datetime.max.replace(tzinfo=timezone.utc)
+        delivered_value = delivered_dt or delivered_fallback
+        status_value = clean_text(row.get("tracking_status") or row.get("fulfilment_status") or "").lower()
+        known_delivery = 0 if delivered_dt else 1
+        delivery_ts = sort_timestamp(row.get("amazon_delivered_at"))
+        if sort_key == "delivery_date":
+            return (
+                known_delivery,
+                -delivery_ts if reverse else delivery_ts,
+                status_value,
+                clean_text(row.get("odoo_order_name")).upper(),
+                int(row.get("id") or 0),
+            )
+        if sort_key == "status":
+            return (status_value, delivered_value, clean_text(row.get("odoo_order_name")).upper(), int(row.get("id") or 0))
+        if sort_key == "checked_at":
+            return (parse_any_datetime(row.get("tracking_checked_at")) or datetime.max.replace(tzinfo=timezone.utc), delivered_value, int(row.get("id") or 0))
+        return (delivered_value, status_value, clean_text(row.get("odoo_order_name")).upper(), int(row.get("id") or 0))
+
+    results.sort(key=pending_sort_value, reverse=reverse if sort_key != "delivery_date" else False)
+    results = results[offset:offset + per_page]
     attach_shopify_status_to_rows(results)
     if any(not clean_text(row.get("shopify_order_id")) for row in results):
         unique_result_names = {clean_text(row.get("odoo_order_name")).upper() for row in results if clean_text(row.get("odoo_order_name"))}
@@ -12098,7 +12137,14 @@ def export_queryset(view: str, store_id: Optional[int], selected_ids: list[Union
             entry["lines"].append(row)
         data = list(grouped.values())
     elif view == "fulfilment_pending":
-        data = delivered_unfulfilled_rows(store_id, clean_text(str(filters.get("q") or "")))
+        data, _total, _page, _per_page = paged_delivered_unfulfilled_rows(
+            store_id,
+            1,
+            10000,
+            clean_text(str(filters.get("q") or "")),
+            clean_text(str(filters.get("sort_by") or "delivery_date")),
+            clean_text(str(filters.get("sort_dir") or "asc")),
+        )
     elif view == "bulk":
         days = int(filters.get("days") or 2)
         data = bulk_opportunity_groups(store_id, days)
@@ -23090,12 +23136,23 @@ def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page:
 
 
 @app.get("/api/tracking/fulfilment-pending")
-def api_tracking_fulfilment_pending(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> dict[str, Any]:
-    cache_key = ("fulfilment-pending", store_id, page, per_page, clean_text(q))
+def api_tracking_fulfilment_pending(
+    store_id: Optional[int] = None,
+    page: int = 1,
+    per_page: int = 100,
+    q: str = "",
+    sort_by: str = "delivery_date",
+    sort_dir: str = "asc",
+) -> dict[str, Any]:
+    sort_by = clean_text(sort_by).lower().replace("-", "_") or "delivery_date"
+    if sort_by not in {"delivery_date", "status", "checked_at"}:
+        sort_by = "delivery_date"
+    sort_dir = "desc" if clean_text(sort_dir).lower() == "desc" else "asc"
+    cache_key = ("fulfilment-pending", store_id, page, per_page, clean_text(q), sort_by, sort_dir)
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
-    rows, total, page, per_page = paged_delivered_unfulfilled_rows(store_id, page, per_page, q)
+    rows, total, page, per_page = paged_delivered_unfulfilled_rows(store_id, page, per_page, q, sort_by, sort_dir)
     return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": total}, 90)
 
 

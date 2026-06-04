@@ -2635,6 +2635,8 @@ function App() {
   const [fulfilmentPendingPage, setFulfilmentPendingPage] = useState(1)
   const [fulfilmentPendingTotal, setFulfilmentPendingTotal] = useState(0)
   const [fulfilmentPendingQuery, setFulfilmentPendingQuery] = useState("")
+  const [fulfilmentPendingSortBy, setFulfilmentPendingSortBy] = useState("delivery_date")
+  const [fulfilmentPendingSortDir, setFulfilmentPendingSortDir] = useState("asc")
   const [fulfilmentPendingLoading, setFulfilmentPendingLoading] = useState(false)
   const [dispatchRows, setDispatchRows] = useState<DispatchStatusRow[]>([])
   const [dispatchPage, setDispatchPage] = useState(1)
@@ -3289,14 +3291,14 @@ function App() {
   useEffect(() => {
     if (page !== "fulfilment-pending") return
     setFulfilmentPendingLoading(true)
-    api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim() })}`)
+    api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim(), sort_by: fulfilmentPendingSortBy, sort_dir: fulfilmentPendingSortDir })}`)
       .then((result) => {
         setFulfilmentPendingRows(result.rows)
         setFulfilmentPendingTotal(result.total || 0)
       })
       .catch((error) => setModal({ ok: false, title: "Fulfilment pending load failed", message: String(error) }))
       .finally(() => setFulfilmentPendingLoading(false))
-  }, [page, storeId, fulfilmentPendingPage, fulfilmentPendingQuery])
+  }, [page, storeId, fulfilmentPendingPage, fulfilmentPendingQuery, fulfilmentPendingSortBy, fulfilmentPendingSortDir])
 
   useEffect(() => {
     if (page !== "dispatch-status") return
@@ -4956,9 +4958,17 @@ function App() {
             page={fulfilmentPendingPage}
             total={fulfilmentPendingTotal}
             query={fulfilmentPendingQuery}
+            sortBy={fulfilmentPendingSortBy}
+            sortDir={fulfilmentPendingSortDir}
             loading={fulfilmentPendingLoading}
             onPage={setFulfilmentPendingPage}
             onQuery={(value) => { setFulfilmentPendingQuery(value); setFulfilmentPendingPage(1) }}
+            onSortBy={(value) => {
+              setFulfilmentPendingSortBy(value)
+              setFulfilmentPendingSortDir("asc")
+              setFulfilmentPendingPage(1)
+            }}
+            onSortDir={(value) => { setFulfilmentPendingSortDir(value); setFulfilmentPendingPage(1) }}
             selected={pendingSelected}
             selectAll={pendingSelectAll}
             onSelected={setPendingSelected}
@@ -4966,7 +4976,7 @@ function App() {
             onNavigate={setPage}
             onResult={setModal}
             onRefresh={async () => {
-              const result = await api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim() })}`)
+              const result = await api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim(), sort_by: fulfilmentPendingSortBy, sort_dir: fulfilmentPendingSortDir })}`)
               setFulfilmentPendingRows(result.rows)
               setFulfilmentPendingTotal(result.total || 0)
             }}
@@ -7651,9 +7661,13 @@ function FulfilmentPendingPage({
   page,
   total,
   query,
+  sortBy,
+  sortDir,
   loading: externalLoading,
   onPage,
   onQuery,
+  onSortBy,
+  onSortDir,
   selected,
   selectAll,
   onSelected,
@@ -7667,9 +7681,13 @@ function FulfilmentPendingPage({
   page: number
   total: number
   query: string
+  sortBy: string
+  sortDir: string
   loading: boolean
   onPage: (page: number) => void
   onQuery: (value: string) => void
+  onSortBy: (value: string) => void
+  onSortDir: (value: string) => void
   selected: number[]
   selectAll: boolean
   onSelected: (ids: number[]) => void
@@ -7766,6 +7784,15 @@ function FulfilmentPendingPage({
             <Label>Search</Label>
             <SearchBox value={query} onChange={onQuery} placeholder="Order, Amazon id, ASIN, product, carrier..." />
           </div>
+          <SelectField className="w-48" label="Sort by" value={sortBy} onChange={onSortBy}>
+            <option value="delivery_date">Delivered date</option>
+            <option value="status">Status</option>
+            <option value="checked_at">Checked date</option>
+          </SelectField>
+          <SelectField className="w-44" label="Direction" value={sortDir} onChange={onSortDir}>
+            <option value="asc">{sortBy === "status" ? "A-Z" : "Oldest first"}</option>
+            <option value="desc">{sortBy === "status" ? "Z-A" : "Newest first"}</option>
+          </SelectField>
           <Button variant="outline" onClick={refresh} disabled={isLoading || !storeId}>
             <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
             Refresh
@@ -7786,7 +7813,7 @@ function FulfilmentPendingPage({
       <div className="border-t px-6 py-3">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <ExportControls view="fulfilment_pending" storeId={storeId} columns={fulfilmentPendingExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ q: query.trim() }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+            <ExportControls view="fulfilment_pending" storeId={storeId} columns={fulfilmentPendingExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ q: query.trim(), sort_by: sortBy, sort_dir: sortDir }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
             <Button variant="outline" onClick={recheckSelectedShopifyOrders} disabled={isLoading || shopifyRecheckLoading || !selectedRows.length || !storeId}>
               <RefreshCw className={`size-4 ${shopifyRecheckLoading ? "animate-spin" : ""}`} />
               Recheck Shopify
