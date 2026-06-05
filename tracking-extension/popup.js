@@ -3,6 +3,8 @@ const adminToken = document.querySelector("#adminToken");
 const headlessTrackingMode = document.querySelector("#headlessTrackingMode");
 const autoTrackingEnabled = document.querySelector("#autoTrackingEnabled");
 const autoTrackingHours = document.querySelector("#autoTrackingHours");
+const singleAmazonOrderId = document.querySelector("#singleAmazonOrderId");
+const amazonOrderBatch = document.querySelector("#amazonOrderBatch");
 const trackAllStartPage = document.querySelector("#trackAllStartPage");
 const trackAllMaxPages = document.querySelector("#trackAllMaxPages");
 const modeNotice = document.querySelector("#modeNotice");
@@ -10,6 +12,8 @@ const statusBox = document.querySelector("#status");
 const logsBox = document.querySelector("#logs");
 const startButton = document.querySelector("#start");
 const stopButton = document.querySelector("#stop");
+const trackSingleOrderButton = document.querySelector("#trackSingleOrder");
+const trackQueuedOrdersButton = document.querySelector("#trackQueuedOrders");
 const trackAllButton = document.querySelector("#trackAll");
 const resumeTrackAllButton = document.querySelector("#resumeTrackAll");
 const stopTrackAllButton = document.querySelector("#stopTrackAll");
@@ -127,6 +131,14 @@ function progressText(progress = {}) {
 }
 
 function visibleProgressText(tracking = {}) {
+  if (tracking.source === "single" || tracking.source === "manual") {
+    const current = tracking.orders?.[Number(tracking.index || 0)]?.amazon_order_id || tracking.currentOrderId || tracking.singleOrderId || "";
+    const completed = tracking.completedOrderIds?.length || 0;
+    const failed = tracking.failedOrderIds?.length || 0;
+    const total = tracking.orders?.length || 0;
+    const label = total > 1 || tracking.source === "manual" ? "Tracking queued orders" : "Tracking one order";
+    return `${label}${current ? ` · current ${current}` : ""} · checked ${completed}/${total || completed + failed} · failed ${failed}`;
+  }
   if (tracking.source === "history") {
     const queue = tracking.queue?.length || 0;
     const completed = tracking.completedOrderIds?.length || 0;
@@ -166,9 +178,13 @@ function finalTrackingText(tracking = {}) {
     const completed = tracking.completedOrderIds?.length || 0;
     const failed = tracking.failedOrderIds?.length || 0;
     const skipped = Number(tracking.skippedRecentCount || 0);
-    const mode = tracking.source === "history" ? " Track all" : "";
+    const mode = tracking.source === "history" ? " Track all" : tracking.source === "single" ? " Single order" : tracking.source === "manual" ? " Queued orders" : "";
     const reason = tracking.source === "history"
       ? "Stopped because Track all finished the selected pages and queue."
+      : tracking.source === "single"
+        ? `Stopped because Amazon order ${tracking.singleOrderId || ""} finished.`
+      : tracking.source === "manual"
+        ? "Stopped because all queued Amazon orders finished."
       : "Stopped because no more eligible open Amazon orders were left.";
     return `${reason} All tracking codes scanned.${mode} Checked ${completed} order(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
   }
@@ -186,6 +202,11 @@ function settingsPayload() {
     trackAllStartPage: Number(trackAllStartPage.value || 1),
     trackAllMaxPages: Number(trackAllMaxPages.value || 202),
   };
+}
+
+function parseAmazonOrderIds(value) {
+  const matches = String(value || "").match(/\b\d{3}-\d{7}-\d{7}\b/g) || [];
+  return Array.from(new Set(matches.map((item) => item.trim()))).filter(Boolean);
 }
 
 async function refresh() {
@@ -255,6 +276,32 @@ document.querySelector("#start").addEventListener("click", async () => {
   const result = await send({ type: headlessTrackingMode.checked ? "START_HEADLESS_TRACKING" : "START_TRACKING" });
   if (result.ok !== false) setRunButtons(true);
   setResultStatus(result, "Started.", "Could not start.");
+});
+
+trackSingleOrderButton.addEventListener("click", async () => {
+  await send(settingsPayload());
+  settingsDirty = false;
+  const orderId = singleAmazonOrderId.value.trim();
+  if (!/^\d{3}-\d{7}-\d{7}$/.test(orderId)) {
+    setStatus("Enter a valid Amazon order number like 113-0000000-0000000.", "error", { hold: "forever" });
+    return;
+  }
+  const result = await send({ type: "START_SINGLE_ORDER_TRACKING", amazonOrderId: orderId });
+  if (result.ok !== false) setRunButtons(true);
+  setResultStatus(result, `Started tracking ${orderId}.`, "Could not start single-order tracking.");
+});
+
+trackQueuedOrdersButton.addEventListener("click", async () => {
+  await send(settingsPayload());
+  settingsDirty = false;
+  const orderIds = parseAmazonOrderIds(`${singleAmazonOrderId.value}\n${amazonOrderBatch.value}`);
+  if (!orderIds.length) {
+    setStatus("Paste at least one valid Amazon order number like 113-0000000-0000000.", "error", { hold: "forever" });
+    return;
+  }
+  const result = await send({ type: "START_MANUAL_ORDER_QUEUE_TRACKING", amazonOrderIds: orderIds });
+  if (result.ok !== false) setRunButtons(true);
+  setResultStatus(result, `Started tracking ${orderIds.length} queued order(s).`, "Could not start queued-order tracking.");
 });
 
 document.querySelector("#trackAll").addEventListener("click", async () => {

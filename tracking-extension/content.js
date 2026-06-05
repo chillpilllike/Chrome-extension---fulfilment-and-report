@@ -26,7 +26,7 @@ async function sendWithTimeout(message, timeoutMs = 15000) {
           resolve({
             ok: false,
             timedOut: true,
-            message: "The extension is still processing this page in the background. If it does not move shortly, press Stop and Resume Track all.",
+            message: "Syncing this Amazon tracking page with the app. This can take a moment when package matches are being repaired.",
           });
         }, timeoutMs);
       }),
@@ -69,6 +69,51 @@ function clean(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
 
+function cleanProductTitle(text) {
+  let value = String(text || "");
+  const altMatch = value.match(/\balt=(["'])(.*?)\1/i);
+  if (altMatch?.[2]) value = altMatch[2];
+  value = value
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+  return clean(value);
+}
+
+function physicalTrackingId(text) {
+  if (/^https?:\/\//i.test(clean(text))) return "";
+  const value = clean(text).toUpperCase().replace(/[^A-Z0-9-]/g, "");
+  if (/^TBA[A-Z0-9]+$/.test(value)) return value;
+  if (/^1Z[A-Z0-9]{12,24}$/.test(value)) return value;
+  if (/^SG\d{10,24}$/.test(value)) return value;
+  if (/^D\d{10,24}$/.test(value)) return value;
+  if (/^\d{12,30}$/.test(value)) return value;
+  return "";
+}
+
+function trackingIdFromText(text) {
+  const raw = clean(text);
+  const patterns = [
+    /\bTracking\s+(?:ID|number|#)\s*:?\s*([A-Z0-9-]{10,40})\b/i,
+    /\bCarrier\s+tracking\s+(?:ID|number|#)\s*:?\s*([A-Z0-9-]{10,40})\b/i,
+    /\b(?:USPS|UPS|FedEx|Amazon)\s+(?:tracking\s+)?(?:ID|number|#)\s*:?\s*([A-Z0-9-]{10,40})\b/i,
+    /\b(TBA[A-Z0-9]{8,30})\b/i,
+    /\b(1Z[A-Z0-9]{12,24})\b/i,
+    /\b(SG\d{10,24})\b/i,
+    /\b(D\d{10,24})\b/i,
+    /\b(\d{12,30})\b/,
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    const id = physicalTrackingId(match?.[1] || "");
+    if (id) return id;
+  }
+  return physicalTrackingId(raw);
+}
+
 function isoDate(date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -97,7 +142,7 @@ function promiseDetails(text) {
       const day = Number(monthMatch[2]);
       let year = Number(monthMatch[3] || base.getFullYear());
       expected = new Date(year, monthIndex, day);
-      if (!monthMatch[3] && expected < new Date(base.getFullYear(), base.getMonth(), base.getDate() - 1)) {
+      if (!/\bdelivered\b/i.test(promise) && !monthMatch[3] && expected < new Date(base.getFullYear(), base.getMonth(), base.getDate() - 1)) {
         year += 1;
         expected = new Date(year, monthIndex, day);
       }
@@ -151,7 +196,7 @@ function isTrackingPage() {
 
 async function waitForTrackingPageReady() {
   const started = Date.now();
-  while (Date.now() - started < 5000) {
+  while (Date.now() - started < 8000) {
     if (currentOrderId() && (document.querySelector(".pt-status-main-status, .pt-promise-main-slot, .delivery-card, .pt-delivery-card-wrapper, #primaryStatus") || /ordered|shipped|delivered|arriving/i.test(document.body?.innerText || ""))) {
       break;
     }
@@ -455,40 +500,99 @@ function asinsFrom(root) {
   return productItemsFrom(root).map((item) => item.asin);
 }
 
+function orderDetailsStatusFallback(root = document.body) {
+  const shipmentText = clean([...document.querySelectorAll("[data-component='shipments']")]
+    .map((node) => node.innerText || node.textContent || "")
+    .join(" "));
+  if (/cancel items/i.test(shipmentText) && /buy it again|view your subscribe|print packing slip|sold by/i.test(shipmentText)) return "Order received";
+  const text = clean(root?.innerText || root?.textContent || document.body?.innerText || "");
+  if (/cancel items/i.test(text) && /buy it again|view your subscribe|print packing slip|sold by/i.test(text)) return "Order received";
+  if (/order placed/i.test(text) && /ship to/i.test(text) && !/\b(track package|ship-track|out for delivery|delivered)\b/i.test(shipmentText)) return "Order received";
+  const statusMatch = text.match(/\b(Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|Out for delivery|Delivered(?:\s+\w+\s+\d{1,2})?|Shipped|Preparing for shipment|Not yet shipped|Order received|Running late|Delayed)\b/i);
+  if (statusMatch) return clean(statusMatch[1]);
+  return "";
+}
+
 function productItemsFrom(root, limit = 50) {
   const products = [];
   const seen = new Set();
   if (!root) return products;
-  const links = [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")].slice(0, Math.max(1, Number(limit || 50)) * 4);
-  for (const link of links) {
+
+  function productTitleCandidate(value) {
+    const text = cleanProductTitle(value);
+    if (!text) return "";
+    if (text.length < 4) return "";
+    if (/^\d+$/.test(text)) return "";
+    if (/^\$|^-\d+%|list price|out of 5 stars|buy it again|view your item|amazon business card/i.test(text)) return "";
+    return text;
+  }
+
+  function titleForProductBox(box, link, asin, image) {
+    const sameAsinLinks = [
+      ...box.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']"),
+      ...document.querySelectorAll(`a[href*='/${asin}']`),
+    ]
+      .filter((candidate) => {
+        const href = candidate.getAttribute("href") || "";
+        return new RegExp(`/(?:dp|gp/product)/${asin}`, "i").test(href);
+      });
+    const titleLink = sameAsinLinks.find((candidate) => productTitleCandidate(candidate.textContent));
+    const imageTitle = image ? (
+      productTitleCandidate(image.getAttribute("alt")) ||
+      productTitleCandidate(image.getAttribute("aria-label")) ||
+      productTitleCandidate(image.getAttribute("title"))
+    ) : "";
+    return (
+      productTitleCandidate(box.querySelector("[data-component='itemTitle'] a")?.textContent) ||
+      productTitleCandidate(titleLink?.textContent) ||
+      imageTitle ||
+      productTitleCandidate(link.getAttribute("aria-label")) ||
+      productTitleCandidate(link.getAttribute("title")) ||
+      productTitleCandidate(link.textContent)
+    );
+  }
+
+  function addFromBox(box) {
+    const link =
+      box.querySelector("[data-component='itemTitle'] a[href*='/dp/'], [data-component='itemTitle'] a[href*='/gp/product/']") ||
+      box.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
+    if (!link) return;
     const href = link.getAttribute("href") || "";
     const match = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
     const asin = match ? match[1].toUpperCase() : "";
-    if (!asin || seen.has(asin)) continue;
+    if (!asin || seen.has(asin)) return;
     seen.add(asin);
-    const itemBox = link.closest("[data-component='purchasedItems'], .a-fixed-left-grid, .a-row") || link.parentElement || root;
-    const image = itemBox.querySelector("img") || link.querySelector("img");
-    const title =
-      clean(link.textContent) ||
-      clean(image?.getAttribute("alt")) ||
-      clean(itemBox.querySelector("[data-component='itemTitle'] a")?.textContent);
+    const image = box.querySelector("img") || link.querySelector("img");
+    const title = titleForProductBox(box, link, asin, image);
     products.push({
       asin,
       url: absoluteUrl(href),
       title,
       image_url: image ? absoluteUrl(image.getAttribute("data-a-hires") || image.getAttribute("src") || "") : "",
     });
+  }
+
+  const itemBoxes = [...root.querySelectorAll("[data-component='purchasedItems']")];
+  for (const box of itemBoxes) {
+    addFromBox(box);
     if (products.length >= Number(limit || 50)) break;
+  }
+  if (products.length < Number(limit || 50)) {
+    const links = [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")].slice(0, Math.max(1, Number(limit || 50)) * 4);
+    for (const link of links) {
+      addFromBox(link.closest("[data-component='purchasedItems']") || link.closest(".a-fixed-left-grid") || link.parentElement || root);
+      if (products.length >= Number(limit || 50)) break;
+    }
   }
   return products;
 }
 
 function shipmentRootForTrackingLink(link) {
+  const shipmentComponent = link.closest("[data-component='shipments']");
+  if (shipmentComponent) return shipmentComponent;
   const rightGrid = link.closest("[data-component='shipmentsRightGrid'], [data-component='shipmentConnections']");
   const shipmentGrid = rightGrid?.closest(".a-fixed-right-grid-inner");
   if (shipmentGrid) return shipmentGrid;
-  const shipmentComponent = link.closest("[data-component='shipments']");
-  if (shipmentComponent) return shipmentComponent;
   return link.closest(".a-box, [data-component='orderCard']") || document.body;
 }
 
@@ -529,7 +633,13 @@ async function parseOrderDetails() {
   }
   const orderRoot = document.querySelector("#orderDetails, [data-component='shipments'], .a-box-group") || document.body;
   const products = productsByAsin.size ? [...productsByAsin.values()] : productItemsFrom(orderRoot, 20);
-  const orderStatus = clean(document.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
+  if (packages.length === 1 && products.length && !(packages[0].products || []).length) {
+    packages[0].products = products;
+    packages[0].asins = products.map((item) => item.asin).filter(Boolean);
+  }
+  const orderStatus =
+    clean(document.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent) ||
+    orderDetailsStatusFallback(orderRoot);
   return { amazonOrderId, amazonOrderUrl: location.href, packages, products, orderStatus, ...promiseDetails(orderStatus), ...paymentRevision, ...cancellation };
 }
 
@@ -542,20 +652,32 @@ function parseCarrierAndTrackingId() {
     clean(document.querySelector(".pt-delivery-card-trackingId")?.textContent) ||
     clean(document.querySelector(".tracking-event-trackingId-text h4")?.textContent);
   const trackingMatch = trackingText.match(/Tracking ID:\s*(.+)$/i);
-  return { carrier, tracking_id: trackingMatch ? trackingMatch[1].trim() : trackingText.replace(/^Tracking ID:\s*/i, "") };
+  const trackingId = trackingIdFromText(trackingMatch ? trackingMatch[1] : trackingText)
+    || trackingIdFromText(document.body?.innerText || "");
+  return { carrier, tracking_id: trackingId };
 }
 
 function parseStatus() {
-  return (
+  const pageText = clean(document.body?.innerText || "");
+  const headlineMatch = pageText.match(/\b(Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|Out for delivery|Delivered(?:\s+\w+\s+\d{1,2})?|Shipped|Delayed|Running late)\b/i);
+  const headline = headlineMatch ? clean(headlineMatch[1]) : "";
+  const selectedStatus = (
     clean(document.querySelector(".pt-status-main-status")?.textContent) ||
     clean(document.querySelector(".pt-promise-main-slot")?.textContent) ||
+    headline ||
     clean(document.querySelector(".od-status-message")?.textContent) ||
     "Unknown"
   );
+  if (/delivered/i.test(selectedStatus) && /\b(arriving|out for delivery|delayed|running late)\b/i.test(headline)) {
+    return headline;
+  }
+  return selectedStatus;
 }
 
 function parsePromise() {
-  return clean(document.querySelector(".pt-promise-main-slot")?.textContent);
+  const pageText = clean(document.body?.innerText || "");
+  const headlineMatch = pageText.match(/\b(Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\b/i);
+  return clean(document.querySelector(".pt-promise-main-slot")?.textContent) || (headlineMatch ? clean(headlineMatch[1]) : "");
 }
 
 function parseEvents() {
@@ -577,6 +699,18 @@ function parseEvents() {
     });
   }
   return events.filter((event) => event.message);
+}
+
+function relatedOrderIdsFromPage() {
+  const ids = new Set();
+  const text = clean(document.body?.innerText || "");
+  for (const match of text.matchAll(/\bOrder\s+ID\s+(\d{3}-\d{7}-\d{7})\b/gi)) {
+    ids.add(match[1]);
+  }
+  for (const match of location.href.matchAll(/\b\d{3}-\d{7}-\d{7}\b/g)) {
+    ids.add(match[0]);
+  }
+  return [...ids];
 }
 
 async function openTrackingEvents() {
@@ -609,9 +743,11 @@ async function parseTrackingPage() {
   const carrierInfo = parseCarrierAndTrackingId();
   const status = parseStatus();
   const deliveryCard = document.querySelector(".delivery-card, .pt-delivery-card-wrapper, #primaryStatus, #tracking-events-container") || document.body;
-  const products = productItemsFrom(deliveryCard);
+  const trackingProducts = productItemsFrom(deliveryCard);
+  const pageProductRoot = document.querySelector("#orderDetails, [data-component='shipments'], .a-box-group") || document.body;
+  const products = trackingProducts.length ? trackingProducts : productItemsFrom(pageProductRoot, 20);
   const hasTrackingIdentity = Boolean(clean(carrierInfo.carrier) || clean(carrierInfo.tracking_id));
-  const statusOnly = !hasTrackingIdentity && !events.length;
+  const statusOnly = !hasTrackingIdentity && !events.length && !products.length;
   const productAsins = products.map((item) => item.asin).filter(Boolean);
   const pkg = {
     ...carrierInfo,
@@ -620,9 +756,10 @@ async function parseTrackingPage() {
     latest_event: events[0] || null,
     events: events.slice(0, 20),
     tracking_url: location.href,
-    asins: statusOnly ? [] : productAsins.length ? productAsins : asinsFrom(deliveryCard),
+    asins: statusOnly ? [] : productAsins.length ? productAsins : asinsFrom(pageProductRoot),
     products: statusOnly ? [] : products,
     status_only: statusOnly,
+    related_amazon_order_ids: relatedOrderIdsFromPage(),
   };
   return { amazonOrderId, package: withPromiseDetails(pkg), ...paymentRevision };
 }
@@ -646,7 +783,7 @@ async function run() {
     const data = await parseTrackingPage();
     if (!data.amazonOrderId) return;
     showPanel("Nutricity tracking", `Capturing tracking for ${data.amazonOrderId}: ${data.package.status}.`);
-    const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data }, 12000);
+    const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data }, 45000);
     if (response?.ignored) {
       showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
     } else if (response?.ok) {
@@ -683,7 +820,9 @@ async function run() {
         ? `Cancelled order detected for ${data.amazonOrderId}. Moving to next order.`
         : data.paymentRevisionNeeded
           ? `Payment revision needed for ${data.amazonOrderId}. Reporting to the app.`
-        : `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`,
+        : data.packages.length
+          ? `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`
+          : `Captured order details for ${data.amazonOrderId}; no package tracking link yet.`,
     );
     const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data }, 15000);
     if (data.orderCancelled) {

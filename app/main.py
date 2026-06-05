@@ -24,7 +24,7 @@ import xmlrpc.client
 import xml.etree.ElementTree as ET
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urlparse, urlsplit
 from urllib.parse import quote_plus
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -81,6 +81,7 @@ from app.schemas import (
     PunchoutReturnUrlPayload,
     ReplacementPayload,
     ServiceSettingsPayload,
+    ShopifyFulfilmentPushPayload,
     StoreActionPayload,
     StorePayload,
     UiCopyPayload,
@@ -169,6 +170,7 @@ PUBLIC_API_PATHS = {
 }
 PUBLIC_POST_API_PATHS = {
     "/api/shopify/orders/status/sync",
+    "/api/tracking/update",
     "/api/dispatch-sorting/scan",
     "/api/dispatch-sorting/settings",
 }
@@ -318,6 +320,9 @@ def fast_page_cache_clear_matching(prefixes: set[str]) -> None:
     if "orders" in prefixes:
         prefixes = set(prefixes)
         prefixes.update({"orders-count", "orders-condition-count"})
+    if "fulfilment-pending" in prefixes:
+        prefixes = set(prefixes)
+        prefixes.add("fulfilment-pending-count")
     redis_support.page_cache_clear_matching(prefixes)
     with _FAST_PAGE_CACHE_LOCK:
         for key in list(_FAST_PAGE_CACHE):
@@ -408,7 +413,7 @@ def warm_common_page_cache(store_id: Optional[int] = None) -> None:
             lambda target_store_id=target_store_id: api_partial_fulfilments(store_id=target_store_id, page=1, per_page=20),
             lambda target_store_id=target_store_id: api_bulk(store_id=target_store_id, page=1, per_page=20, days=2),
             lambda target_store_id=target_store_id: api_duplicate_asins(store_id=target_store_id, page=1, per_page=20, days=2),
-            lambda target_store_id=target_store_id: api_tracking_fulfilment_pending(store_id=target_store_id, page=1, per_page=20),
+            lambda target_store_id=target_store_id: api_tracking_fulfilment_pending(store_id=target_store_id, page=1, per_page=30),
             lambda target_store_id=target_store_id: api_tracking_payment_failures(store_id=target_store_id, page=1, per_page=20),
             lambda target_store_id=target_store_id: api_dispatch_status(store_id=target_store_id, page=1, per_page=20),
             lambda target_store_id=target_store_id: api_dispatch_status_summary(store_id=target_store_id),
@@ -594,6 +599,7 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_spaid ON order_lines(store_id, supplier_part_auxiliary_id) WHERE COALESCE(supplier_part_auxiliary_id, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_ordered_tracking ON order_lines(store_id, tracking_checked_at ASC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_delivered_tracking ON order_lines(store_id, tracking_checked_at DESC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND (state='delivered' OR LOWER(COALESCE(tracking_status, ''))='delivered')",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_pending_delivered_global_asc ON order_lines(tracking_checked_at ASC, ordered_at ASC, updated_at ASC, id) WHERE COALESCE(amazon_order_id, '') != '' AND (state='delivered' OR LOWER(COALESCE(tracking_status, ''))='delivered')",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_tracking_active_order ON order_lines(store_id, amazon_order_id, tracking_checked_at ASC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND state IN ('ordered', 'dispatched')",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_tracking_checked_order ON order_lines(store_id, amazon_order_id, tracking_checked_at DESC, ordered_at DESC, updated_at DESC) WHERE COALESCE(amazon_order_id, '') != '' AND COALESCE(tracking_checked_at, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_queue ON order_lines(store_id, updated_at ASC, odoo_order_id DESC, id) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(amazon_group_key, '') != ''",
@@ -712,7 +718,11 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     allow_public_api = (request.method in {"GET", "HEAD"} and path in PUBLIC_API_PATHS) or (request.method == "POST" and path in PUBLIC_POST_API_PATHS)
     allow_public_dispatch_post = request.method == "POST" and path.startswith(PUBLIC_DISPATCH_POST_PREFIXES)
     allow_public_dispatch_get = request.method in {"GET", "HEAD"} and path.startswith(PUBLIC_DISPATCH_GET_PREFIXES)
-    if token and not allow_public_frontend and not allow_public_api and not allow_public_dispatch_post and not allow_public_dispatch_get and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
+    allow_public_image_get = request.method in {"GET", "HEAD"} and (
+        path.startswith("/api/inventory/asin-image/")
+        or bool(re.fullmatch(r"/api/inventory/\d+/image", path))
+    )
+    if token and not allow_public_frontend and not allow_public_api and not allow_public_dispatch_post and not allow_public_dispatch_get and not allow_public_image_get and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
         supplied = supplied_admin_access_token(request)
         if supplied != token and supplied != MASTER_ADMIN_ACCESS_TOKEN:
             return Response("Admin token required.", status_code=401)
@@ -885,6 +895,8 @@ def init_db() -> None:
                 amazon_order_id TEXT,
                 amazon_order_url TEXT,
                 amazon_account_name TEXT,
+                image_url TEXT,
+                image_source TEXT,
                 status TEXT NOT NULL DEFAULT 'incoming',
                 notes TEXT,
                 created_at TEXT NOT NULL,
@@ -1316,6 +1328,8 @@ def init_db() -> None:
             "reserved_at": "ALTER TABLE inventory_items ADD COLUMN reserved_at TEXT",
             "used_at": "ALTER TABLE inventory_items ADD COLUMN used_at TEXT",
             "manual_reference": "ALTER TABLE inventory_items ADD COLUMN manual_reference TEXT",
+            "image_url": "ALTER TABLE inventory_items ADD COLUMN image_url TEXT",
+            "image_source": "ALTER TABLE inventory_items ADD COLUMN image_source TEXT",
         }.items():
             existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(inventory_items)").fetchall()}
             if column not in existing_cols:
@@ -1374,7 +1388,9 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_upper_canonical_scan_code ON amazon_dispatch_packages(UPPER(canonical_scan_code))",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_upper_last_scanned_code ON amazon_dispatch_packages(UPPER(last_scanned_code))",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_store_odoo ON amazon_dispatch_packages(store_id, odoo_order_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_order_name ON amazon_dispatch_packages(odoo_order_name, amazon_order_id, package_index, id)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_store_order_name_upper ON amazon_dispatch_packages(store_id, UPPER(odoo_order_name), id)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_upper_order_name ON amazon_dispatch_packages(UPPER(odoo_order_name), amazon_order_id, package_index, id)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_tote ON amazon_dispatch_packages(tote_code, scan_status)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_status_updated ON amazon_dispatch_packages(scan_status, updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_packages_sorting ON amazon_dispatch_packages(dispatch_date, destination_zone, service, priority, fulfilment_type)",
@@ -2490,11 +2506,11 @@ def amazon_history_order_refs_from_text(value: Any) -> list[str]:
     refs = list(dict.fromkeys(match.group(0).upper() for match in ORDER_REF_RE.finditer(text)))
     refs.extend(
         f"{match.group(1).upper()}{match.group(2)}"
-        for match in re.finditer(r"\b([A-Z]{2,5}\d{2,})\s+(\d{1,4})\b", text, re.IGNORECASE)
+        for match in re.finditer(r"\b([A-Z]{1,8}\d{2,})\s+(\d{1,4})\b", text, re.IGNORECASE)
     )
     # Amazon sometimes compacts fulfilment labels into e.g. NC104194Pack.
     # Keep the Odoo order ref distinct from the pack-size suffix.
-    refs.extend(match.group(1).upper() for match in re.finditer(r"\b([A-Z]{2,5}\d{2,})(?:\d{1,4})\s*PACK\b", text, re.IGNORECASE))
+    refs.extend(match.group(1).upper() for match in re.finditer(r"\b([A-Z]{1,8}\d{2,})(?:\d{1,4})\s*PACK\b", text, re.IGNORECASE))
     return list(dict.fromkeys(refs))
 
 
@@ -3242,28 +3258,138 @@ def asin_product_url(asin: str) -> str:
     return f"https://www.amazon.com/dp/{quote_plus(asin)}" if asin else ""
 
 
-def amazon_products_from_tracking_payload(payload_text: str, fallback_asin: str = "", fallback_title: str = "") -> list[dict[str, str]]:
+def asin_image_url(asin: str) -> str:
+    asin = normalize_asin(asin)
+    if not asin:
+        return ""
+    return f"/api/inventory/asin-image/{quote_plus(asin)}"
+
+
+def amazon_product_page_image_url(asin: str) -> str:
+    asin = normalize_asin(asin)
+    if not asin:
+        return ""
     try:
-        packages = json.loads(payload_text or "[]")
+        response = requests.get(
+            asin_product_url(asin),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=12,
+        )
+        if response.status_code >= 400:
+            return ""
+        text = response.text or ""
+        dynamic_match = re.search(r'data-a-dynamic-image=["\'](\{.*?\})["\']', text, re.IGNORECASE)
+        if dynamic_match:
+            try:
+                dynamic_images = json.loads(html.unescape(dynamic_match.group(1)))
+                choices = []
+                for url, size in dynamic_images.items():
+                    if is_safe_amazon_image_url(url) and isinstance(size, list) and len(size) >= 2:
+                        try:
+                            choices.append((int(size[0]) * int(size[1]), url))
+                        except Exception:
+                            choices.append((0, url))
+                if choices:
+                    return sorted(choices, reverse=True)[0][1]
+            except Exception:
+                pass
+        patterns = [
+            r'data-old-hires=["\']([^"\']+)["\']',
+            r'id=["\']landingImage["\'][^>]+src=["\']([^"\']+)["\']',
+            r'["\']landingImage["\']\s*:\s*["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                url = html.unescape(match.group(1)).replace("\\/", "/")
+                if is_safe_amazon_image_url(url):
+                    return url
     except Exception:
-        packages = []
-    if isinstance(packages, dict):
-        packages = [packages]
-    if not isinstance(packages, list):
-        packages = []
+        return ""
+    return ""
+
+
+def is_safe_amazon_image_url(url: str) -> bool:
+    parsed = urlparse(clean_text(url))
+    host = parsed.netloc.lower()
+    return parsed.scheme in {"http", "https"} and (
+        host.endswith("media-amazon.com")
+        or host.endswith("ssl-images-amazon.com")
+        or host.endswith("images-amazon.com")
+    )
+
+
+def fetch_remote_image_response(url: str) -> Response:
+    if not is_safe_amazon_image_url(url):
+        raise HTTPException(404, "Inventory image not found.")
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Referer": "https://www.amazon.com/",
+        },
+        timeout=20,
+    )
+    content_type = clean_text(response.headers.get("content-type")).split(";", 1)[0].lower()
+    if response.status_code >= 400 or not content_type.startswith("image/") or not response.content:
+        raise HTTPException(404, "Inventory image not found.")
+    return Response(
+        content=response.content,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "Content-Length": str(len(response.content)),
+        },
+    )
+
+
+def useful_amazon_product_title(value: Any) -> str:
+    title = clean_text(value)
+    alt_match = re.search(r"\balt=(['\"])(.*?)\1", title, re.IGNORECASE)
+    if alt_match:
+        title = alt_match.group(2)
+    title = clean_text(re.sub(r"<[^>]+>", " ", html.unescape(title)))
+    if len(title) < 4:
+        return ""
+    if re.fullmatch(r"\d+", title):
+        return ""
+    if re.search(r"^\$|^-\d+%|list price|out of 5 stars|buy it again|view your item|amazon business card", title, re.IGNORECASE):
+        return ""
+    return title
+
+
+def amazon_products_from_tracking_payload(payload_text: str, fallback_asin: str = "", fallback_title: str = "") -> list[dict[str, str]]:
+    packages = parse_tracking_packages(payload_text)
     products: list[dict[str, str]] = []
     seen: set[str] = set()
 
     def add_product(asin_value: Any, url: str = "", title: str = "", image_url: str = "") -> None:
         asin = normalize_asin(str(asin_value or ""))
-        if not asin or asin in seen:
+        if not asin:
+            return
+        if asin in seen:
+            existing = next((product for product in products if product.get("asin") == asin), None)
+            if existing:
+                useful_title = useful_amazon_product_title(title)
+                if useful_title and not useful_amazon_product_title(existing.get("title")):
+                    existing["title"] = useful_title
+                if clean_text(image_url) and not clean_text(existing.get("image_url")):
+                    existing["image_url"] = clean_text(image_url)
+                if clean_text(url) and not clean_text(existing.get("url")):
+                    existing["url"] = clean_text(url)
             return
         seen.add(asin)
         products.append(
             {
                 "asin": asin,
                 "url": clean_text(url) or asin_product_url(asin),
-                "title": clean_text(title),
+                "title": useful_amazon_product_title(title),
                 "image_url": clean_text(image_url),
             }
         )
@@ -3274,27 +3400,96 @@ def amazon_products_from_tracking_payload(payload_text: str, fallback_asin: str 
         for product in package.get("products") or []:
             if isinstance(product, dict):
                 add_product(product.get("asin"), product.get("url"), product.get("title"), product.get("image_url"))
-        for asin in package.get("asins") or []:
-            add_product(asin)
-    fallback = normalize_asin(fallback_asin)
-    if fallback:
-        matching_products = [product for product in products if product.get("asin") == fallback]
-        if matching_products:
-            return matching_products
-        add_product(fallback, asin_product_url(fallback), fallback_title)
-    return products
+    return [
+        product
+        for product in products
+        if useful_amazon_product_title(product.get("title")) and clean_text(product.get("image_url"))
+    ]
 
 
 def normalize_dispatch_scan_code(value: Any) -> str:
     text = clean_text(str(value or "")).upper()
     if not text:
         return ""
-    url_match = re.search(r"(?:TRACKING|TRACKINGID|TRACKING-ID|PACKAGEID|PACKAGE-ID|SHIPMENTID|SHIPMENT-ID|ORDERID|ORDER-ID)=([^&#\s]+)", text, re.IGNORECASE)
+    url_match = re.search(r"(?:TRACKING|TRACKINGID|TRACKING-ID|PACKAGEID|PACKAGE-ID)=([^&#\s]+)", text, re.IGNORECASE)
     if url_match:
         text = url_match.group(1)
     text = html.unescape(text)
     text = re.sub(r"[^A-Z0-9-]", "", text)
     return text
+
+
+def dispatch_scan_code_is_physical(value: Any) -> bool:
+    code = normalize_dispatch_scan_code(value)
+    if not code:
+        return False
+    if re.fullmatch(r"TBA[A-Z0-9]+", code):
+        return True
+    if re.fullmatch(r"1Z[A-Z0-9]{12,24}", code):
+        return True
+    if re.fullmatch(r"SG\d{10,24}", code):
+        return True
+    if re.fullmatch(r"D\d{10,24}", code):
+        return True
+    if re.fullmatch(r"\d{12,30}", code):
+        return True
+    return False
+
+
+DISPATCH_PHYSICAL_SCAN_SQL = """
+(
+    scan_code ~ '^TBA[A-Z0-9]+$'
+    OR canonical_scan_code ~ '^TBA[A-Z0-9]+$'
+    OR scan_code ~ '^1Z[A-Z0-9]{12,24}$'
+    OR canonical_scan_code ~ '^1Z[A-Z0-9]{12,24}$'
+    OR scan_code ~ '^SG[0-9]{10,24}$'
+    OR canonical_scan_code ~ '^SG[0-9]{10,24}$'
+    OR scan_code ~ '^D[0-9]{10,24}$'
+    OR canonical_scan_code ~ '^D[0-9]{10,24}$'
+    OR scan_code ~ '^[0-9]{12,30}$'
+    OR canonical_scan_code ~ '^[0-9]{12,30}$'
+)
+"""
+
+DISPATCH_PHYSICAL_PRIMARY_SCAN_SQL = """
+(
+    scan_code ~ '^TBA[A-Z0-9]+$'
+    OR scan_code ~ '^1Z[A-Z0-9]{12,24}$'
+    OR scan_code ~ '^SG[0-9]{10,24}$'
+    OR scan_code ~ '^D[0-9]{10,24}$'
+    OR scan_code ~ '^[0-9]{12,30}$'
+)
+"""
+
+
+def package_tracking_id_is_physical(value: Any) -> bool:
+    code = normalize_dispatch_scan_code(value)
+    return bool(
+        re.fullmatch(r"TBA[A-Z0-9]+", code)
+        or re.fullmatch(r"1Z[A-Z0-9]{12,24}", code)
+        or re.fullmatch(r"SG\d{10,24}", code)
+        or re.fullmatch(r"D\d{10,24}", code)
+        or re.fullmatch(r"\d{12,30}", code)
+    )
+
+
+def sanitize_tracking_packages(packages: Any) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for raw_package in packages or []:
+        if not isinstance(raw_package, dict):
+            continue
+        package = dict(raw_package)
+        tracking_id = clean_text(package.get("tracking_id") or package.get("trackingId") or package.get("tracking_number") or package.get("trackingNumber"))
+        normalized_tracking_id = normalize_dispatch_scan_code(tracking_id)
+        if tracking_id and not package_tracking_id_is_physical(tracking_id):
+            package.pop("tracking_id", None)
+            package.pop("trackingId", None)
+            package.pop("tracking_number", None)
+            package.pop("trackingNumber", None)
+        elif normalized_tracking_id:
+            package["tracking_id"] = normalized_tracking_id
+        sanitized.append(package)
+    return sanitized
 
 
 def dispatch_codes_from_package(package: dict[str, Any], amazon_order_id: str = "") -> list[tuple[str, str]]:
@@ -3309,14 +3504,12 @@ def dispatch_codes_from_package(package: dict[str, Any], amazon_order_id: str = 
         "package_id",
         "packageId",
         "packageIdentifier",
-        "shipment_id",
-        "shipmentId",
         "carrier_tracking",
     ):
         values.append(package.get(key))
     url = clean_text(package.get("tracking_url"))
     values.append(url)
-    for key in ("trackingId", "trackingID", "packageId", "packageID", "shipmentId", "shipmentID"):
+    for key in ("trackingId", "trackingID", "packageId", "packageID", "orderId", "orderID"):
         match = re.search(rf"[?&#]{key}=([^&#]+)", url, re.IGNORECASE)
         if match:
             values.append(match.group(1))
@@ -3328,6 +3521,8 @@ def dispatch_codes_from_package(package: dict[str, Any], amazon_order_id: str = 
         display = clean_text(raw)
         code = normalize_dispatch_scan_code(raw)
         if not code or code in seen:
+            continue
+        if not dispatch_scan_code_is_physical(code):
             continue
         seen.add(code)
         codes.append((code, display or code))
@@ -3562,7 +3757,621 @@ def parse_tracking_packages(payload_text: str) -> list[dict[str, Any]]:
         parsed = []
     if isinstance(parsed, dict):
         parsed = [parsed]
-    return [item for item in parsed if isinstance(item, dict)]
+    if not isinstance(parsed, list):
+        parsed = []
+    return sanitize_tracking_packages(parsed)
+
+
+def dispatch_package_products(package: dict[str, Any]) -> list[dict[str, Any]]:
+    products = package.get("products") if isinstance(package.get("products"), list) else []
+    return [product for product in products if isinstance(product, dict)][:12]
+
+
+def dispatch_package_asins_and_products(package: dict[str, Any], matching_rows: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    products = dispatch_package_products(package)
+    product_asins = list(dict.fromkeys(
+        normalize_asin(str(product.get("asin")))
+        for product in products
+        if normalize_asin(str(product.get("asin")))
+    ))
+    raw_asins = package.get("asins") if isinstance(package.get("asins"), list) else []
+    package_asins = list(dict.fromkeys(
+        normalize_asin(str(asin))
+        for asin in raw_asins
+        if normalize_asin(str(asin))
+    ))
+    if not package_asins:
+        package_asins = product_asins
+    line_asins = list(dict.fromkeys(
+        asin
+        for row in matching_rows
+        for asin in order_line_asin_aliases(row)
+        if asin
+    ))
+    intersecting_asins = [asin for asin in package_asins if asin in set(line_asins)]
+    if intersecting_asins:
+        return intersecting_asins, [product for product in products if normalize_asin(str(product.get("asin"))) in set(intersecting_asins)]
+    if product_asins:
+        return product_asins, products
+    if len(package_asins) <= 5:
+        return package_asins, products
+    if line_asins:
+        return line_asins, products
+    return package_asins[:12], products
+
+
+def attach_dispatch_package_codes_to_pending_rows(conn: Any, rows: list[dict[str, Any]]) -> None:
+    line_ids = sorted({int(row.get("id") or 0) for row in rows if int(row.get("id") or 0) > 0})
+    order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in rows if clean_text(row.get("odoo_order_name"))})
+    if not line_ids or not order_names:
+        return
+    placeholders = ",".join("?" for _ in order_names)
+    dispatch_rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT id, amazon_order_id, tracking_url, scan_code, canonical_scan_code, display_code,
+               carrier, package_status, promise, asins_json, products_json, order_line_ids_json
+        FROM amazon_dispatch_packages
+        WHERE odoo_order_name IN ({placeholders})
+          AND COALESCE(order_line_ids_json, '') != ''
+        ORDER BY updated_at DESC, id DESC
+        """,
+        order_names,
+    ).fetchall())
+    line_id_set = set(line_ids)
+    packages_by_line_id: dict[int, list[dict[str, Any]]] = {}
+    for package in dispatch_rows:
+        physical_code = ""
+        for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code")):
+            if package_tracking_id_is_physical(value):
+                physical_code = normalize_dispatch_scan_code(value)
+                break
+        if not physical_code:
+            continue
+        display_values = [
+            clean_text(package.get("display_code")),
+            clean_text(package.get("scan_code")),
+            clean_text(package.get("canonical_scan_code")),
+            physical_code,
+        ]
+        display_code = max(display_values, key=dispatch_display_code_rank)
+        package = {
+            **package,
+            "physical_code": physical_code,
+            "physical_display_code": display_code or physical_code,
+            "asins": unique_normalized_asins(parse_json_list_value(package.get("asins_json"))),
+        }
+        for line_id in parse_json_list_value(package.get("order_line_ids_json")):
+            try:
+                parsed_line_id = int(line_id)
+                if parsed_line_id in line_id_set:
+                    packages_by_line_id.setdefault(parsed_line_id, []).append(package)
+            except Exception:
+                continue
+
+    def package_asins(package: dict[str, Any]) -> set[str]:
+        asins = set(unique_normalized_asins(package.get("asins") if isinstance(package.get("asins"), list) else []))
+        for product in package.get("products") or []:
+            if isinstance(product, dict):
+                asin = normalize_asin(product.get("asin"))
+                if asin:
+                    asins.add(asin)
+        return asins
+
+    def active_tracking_status(value: Any) -> bool:
+        return re.search(r"\b(arriving|out for delivery|not yet delivered|delivery attempted|running late|delayed|in transit|shipped|order received|ordered)\b", clean_text(value), re.IGNORECASE) is not None
+
+    for row in rows:
+        candidates = packages_by_line_id.get(int(row.get("id") or 0), [])
+        if not candidates:
+            continue
+        packages = parse_tracking_packages(row.get("tracking_payload") or "")
+        if not packages:
+            packages = [{}]
+        changed = False
+        for package in packages:
+            raw_tracking_id = clean_text(
+                package.get("tracking_id")
+                or package.get("trackingId")
+                or package.get("tracking_number")
+                or package.get("trackingNumber")
+            )
+            if package_tracking_id_is_physical(raw_tracking_id):
+                continue
+            package_url = clean_text(package.get("tracking_url"))
+            package_order_id = clean_text(package.get("amazon_order_id")) or clean_text(row.get("amazon_order_id"))
+            current_asins = package_asins(package)
+            ranked = sorted(
+                candidates,
+                key=lambda candidate: (
+                    0 if package_url and clean_text(candidate.get("tracking_url")) == package_url else 1,
+                    0 if package_order_id and clean_text(candidate.get("amazon_order_id")) == package_order_id else 1,
+                    0 if current_asins and current_asins.intersection(set(candidate.get("asins") or [])) else 1,
+                    -dispatch_display_code_rank(candidate.get("physical_display_code")),
+                ),
+            )
+            if package_url:
+                ranked = [candidate for candidate in ranked if clean_text(candidate.get("tracking_url")) == package_url]
+            elif package_order_id:
+                ranked = [candidate for candidate in ranked if clean_text(candidate.get("amazon_order_id")) == package_order_id]
+            if not ranked and len(candidates) == 1:
+                ranked = candidates
+            replacement = ranked[0] if ranked else None
+            if not replacement:
+                continue
+            package["tracking_id"] = replacement["physical_display_code"]
+            package["tracking_number"] = replacement["physical_display_code"]
+            package["tracking_url"] = package_url or clean_text(replacement.get("tracking_url"))
+            package["carrier"] = clean_text(package.get("carrier")) or clean_text(replacement.get("carrier"))
+            replacement_status = clean_text(replacement.get("package_status"))
+            row_status = clean_text(row.get("tracking_status"))
+            current_status = clean_text(package.get("status"))
+            if (
+                not current_status
+                or (tracking_package_delivered(package) and (active_tracking_status(replacement_status) or active_tracking_status(row_status)))
+            ):
+                package["status"] = replacement_status or row_status
+            package["promise"] = clean_text(replacement.get("promise")) or clean_text(package.get("promise"))
+            changed = True
+        if changed:
+            row["tracking_payload"] = json.dumps(packages, default=str)[:4000]
+
+
+def tracking_package_status_text(package: dict[str, Any]) -> str:
+    event_text = " ".join(
+        clean_text(event.get("message") if isinstance(event, dict) else event)
+        for event in (package.get("events") if isinstance(package.get("events"), list) else [])
+    )
+    latest_event = package.get("latest_event")
+    if isinstance(latest_event, dict):
+        event_text = f"{event_text} {clean_text(latest_event.get('message'))}"
+    elif latest_event:
+        event_text = f"{event_text} {clean_text(latest_event)}"
+    if tracking_package_delivered(package):
+        status = clean_text(package.get("status") or package.get("order_status") or package.get("delivery_status"))
+        return status if "delivered" in status.lower() else "Delivered"
+    return clean_text(package.get("status") or package.get("order_status") or package.get("delivery_status"))
+
+
+def tracking_package_promise_text(package: dict[str, Any]) -> str:
+    return clean_text(package.get("promise") or package.get("expected_delivery_display") or package.get("expected_delivery_date"))
+
+
+def tracking_package_delivered(package: dict[str, Any]) -> bool:
+    if not isinstance(package, dict):
+        return False
+    status_text = clean_text(package.get("status") or package.get("order_status") or package.get("delivery_status") or package.get("promise"))
+    if re.search(r"\b(arriving|out for delivery|not yet delivered|delivery attempted|running late|delayed|in transit)\b", status_text, re.IGNORECASE):
+        return False
+    if re.search(r"\bdelivered\b", status_text, re.IGNORECASE):
+        return True
+    event_messages: list[str] = []
+    latest_event = package.get("latest_event")
+    if isinstance(latest_event, dict):
+        event_messages.append(clean_text(latest_event.get("message")))
+    elif latest_event:
+        event_messages.append(clean_text(latest_event))
+    for event in package.get("events") if isinstance(package.get("events"), list) else []:
+        if isinstance(event, dict):
+            event_messages.append(clean_text(event.get("message")))
+        elif event:
+            event_messages.append(clean_text(event))
+    event_text = " ".join(event_messages)
+    return re.search(r"\b(package delivered|delivered to|was delivered|handed directly|left at|delivered in|delivered at)\b", event_text, re.IGNORECASE) is not None
+
+
+def tracking_status_rank(value: Any) -> int:
+    text = clean_text(value).lower()
+    if "delivered" in text:
+        return 4
+    if "out for delivery" in text:
+        return 3
+    if "shipped" in text or "transit" in text or "carrier" in text:
+        return 2
+    if "arriv" in text or "order received" in text or "ordered" in text or "delay" in text or "unavailable" in text:
+        return 1
+    return 0
+
+
+def tracking_package_active_pending(package: dict[str, Any]) -> str:
+    if not isinstance(package, dict):
+        return ""
+    status_text = clean_text(
+        " ".join(
+            clean_text(package.get(key))
+            for key in ("status", "order_status", "delivery_status", "promise")
+        )
+    )
+    lowered = status_text.lower()
+    if "out for delivery" in lowered:
+        return "Out for delivery"
+    if "arriving" in lowered:
+        return clean_text(package.get("promise") or package.get("status")) or "Arriving"
+    if "delayed" in lowered or "running late" in lowered:
+        return "Delayed"
+    if "in transit" in lowered or "shipped" in lowered:
+        return "Shipped"
+    if "order received" in lowered or "ordered" in lowered or "not shipped" in lowered:
+        return "Order received"
+    return ""
+
+
+def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, amazon_order_url: str, packages: list[dict[str, Any]]) -> tuple[int, list[int]]:
+    order_id = clean_text(amazon_order_id)
+    package_payloads = [package for package in packages if isinstance(package, dict)]
+    if not order_id or not package_payloads:
+        return 0, []
+    conn.execute(
+        f"""
+        DELETE FROM amazon_dispatch_packages
+        WHERE amazon_order_id=?
+          AND NOT COALESCE({DISPATCH_PHYSICAL_PRIMARY_SCAN_SQL}, FALSE)
+        """,
+        (order_id,),
+    )
+    existing_rows = rows_to_dicts(conn.execute(
+        "SELECT * FROM amazon_dispatch_packages WHERE amazon_order_id=? ORDER BY package_index, id",
+        (order_id,),
+    ).fetchall())
+    if not existing_rows:
+        return 0, []
+    now = utc_now()
+    by_code: dict[str, dict[str, Any]] = {}
+    fallback = package_payloads[0]
+    for package in package_payloads:
+        for code, _display in dispatch_codes_from_package(package, order_id):
+            by_code[code] = package
+    updated = 0
+    affected_line_ids: set[int] = set()
+    def package_line_ids(value: Any) -> list[int]:
+        try:
+            parsed = json.loads(value or "[]")
+        except Exception:
+            parsed = []
+        if not isinstance(parsed, list):
+            return []
+        line_ids: list[int] = []
+        for item in parsed:
+            try:
+                line_id = int(item)
+            except Exception:
+                continue
+            if line_id > 0:
+                line_ids.append(line_id)
+        return line_ids
+    all_line_ids = sorted({
+        line_id
+        for row in existing_rows
+        for line_id in package_line_ids(row.get("order_line_ids_json"))
+    })
+    lines_by_id: dict[int, dict[str, Any]] = {}
+    if all_line_ids:
+        line_rows = rows_to_dicts(conn.execute(
+            f"SELECT * FROM order_lines WHERE id IN ({','.join('?' for _ in all_line_ids)})",
+            all_line_ids,
+        ).fetchall())
+        lines_by_id = {int(row["id"]): row for row in line_rows if row.get("id")}
+    order_products_by_asin: dict[str, dict[str, Any]] = {}
+    for package in package_payloads:
+        for product in dispatch_package_products(package):
+            asin = normalize_asin(product.get("asin"))
+            if asin and asin not in order_products_by_asin:
+                order_products_by_asin[asin] = product
+    for row in existing_rows:
+        codes = [
+            normalize_dispatch_scan_code(row.get("scan_code")),
+            normalize_dispatch_scan_code(row.get("canonical_scan_code")),
+            normalize_dispatch_scan_code(row.get("display_code")),
+            normalize_dispatch_scan_code(row.get("tracking_url")),
+        ]
+        package = next((by_code[code] for code in codes if code and code in by_code), fallback)
+        incoming_status = tracking_package_status_text(package)
+        incoming_promise = tracking_package_promise_text(package)
+        row_line_ids = package_line_ids(row.get("order_line_ids_json"))
+        matching_rows = [lines_by_id[line_id] for line_id in row_line_ids if line_id in lines_by_id]
+        package_asins, package_products = dispatch_package_asins_and_products(package, matching_rows)
+        if not package_products and package_asins:
+            package_products = [
+                order_products_by_asin[asin]
+                for asin in package_asins
+                if asin in order_products_by_asin
+            ]
+        asins_json = json.dumps(package_asins, default=str)
+        products_json = json.dumps(package_products[:12], default=str)
+        current_text = " ".join([clean_text(row.get("package_status")), clean_text(row.get("promise"))])
+        incoming_text = " ".join([incoming_status, incoming_promise, json.dumps(package, default=str)[:1000]])
+        if tracking_status_rank(current_text) > tracking_status_rank(incoming_text):
+            continue
+        conn.execute(
+            """
+            UPDATE amazon_dispatch_packages
+            SET amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+                package_status=COALESCE(NULLIF(?, ''), package_status),
+                promise=COALESCE(NULLIF(?, ''), promise),
+                carrier=COALESCE(NULLIF(?, ''), carrier),
+                tracking_url=COALESCE(NULLIF(?, ''), tracking_url),
+                asins_json=CASE WHEN ? THEN ? ELSE asins_json END,
+                products_json=CASE WHEN ? THEN ? ELSE products_json END,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                clean_text(amazon_order_url),
+                incoming_status,
+                incoming_promise,
+                clean_text(package.get("carrier")),
+                clean_text(package.get("tracking_url")),
+                bool(package_asins),
+                asins_json,
+                bool(package_products),
+                products_json,
+                now,
+                row["id"],
+            ),
+        )
+        updated += 1
+        affected_line_ids.update(row_line_ids)
+    if updated:
+        aggregate_status = tracking_status_from_packages(package_payloads)
+        conn.execute(
+            """
+            UPDATE amazon_order_history_unmatched
+            SET amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+                status=COALESCE(NULLIF(?, ''), status),
+                last_seen_at=?,
+                resolved_at=NULL
+            WHERE amazon_order_id=?
+            """,
+            (
+                clean_text(amazon_order_url),
+                aggregate_status,
+                now,
+                order_id,
+            ),
+        )
+    return updated, sorted(affected_line_ids)
+
+
+def update_history_matched_order_from_tracking(conn: Any, amazon_order_id: str, amazon_order_url: str, packages: list[dict[str, Any]]) -> tuple[int, int]:
+    order_id = clean_text(amazon_order_id)
+    package_payloads = [package for package in packages if isinstance(package, dict)]
+    if not order_id or not package_payloads:
+        return 0, 0
+    history = conn.execute(
+        "SELECT * FROM amazon_order_history_unmatched WHERE amazon_order_id=?",
+        (order_id,),
+    ).fetchone()
+    if not history:
+        return 0, 0
+    refs = amazon_history_order_refs_from_text(history["recipient"] or "")
+    if not refs:
+        return 0, 0
+    package_asins = {
+        normalize_asin(asin)
+        for package in package_payloads
+        for asin in (package.get("asins") or [])
+        if normalize_asin(asin)
+    }
+    for package in package_payloads:
+        for product in package.get("products") or []:
+            if isinstance(product, dict):
+                asin = normalize_asin(product.get("asin"))
+                if asin:
+                    package_asins.add(asin)
+    if not package_asins:
+        try:
+            history_asins = json.loads(history["asins_json"] or "[]")
+        except Exception:
+            history_asins = []
+        package_asins = {normalize_asin(asin) for asin in history_asins if normalize_asin(asin)}
+    if not package_asins:
+        return 0, 0
+    placeholders = ",".join("?" for _ in refs)
+    candidate_rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT *
+        FROM order_lines
+        WHERE UPPER(odoo_order_name) IN ({placeholders})
+          AND COALESCE(order_engine, '') != 'third_party'
+        ORDER BY id
+        """,
+        [ref.upper() for ref in refs],
+    ).fetchall())
+    matched_rows = [
+        row for row in candidate_rows
+        if package_asins.intersection(set(order_line_asin_aliases(row)))
+    ]
+    if not matched_rows:
+        return 0, 0
+    now = utc_now()
+    line_status = tracking_status_from_packages(package_payloads)
+    line_delivered = line_status == "Delivered" and all(tracking_package_delivered(package) for package in package_payloads)
+    tracking_payload = json.dumps(package_payloads, default=str)[:4000]
+    for row in matched_rows:
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET amazon_order_id=?,
+                amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+                tracking_status=?,
+                tracking_payload=?,
+                tracking_checked_at=?,
+                state=CASE WHEN ? THEN 'delivered' WHEN state='delivered' THEN 'dispatched' ELSE state END,
+                last_error=NULL,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                order_id,
+                clean_text(amazon_order_url) or order_line_amazon_url(order_id),
+                line_status,
+                tracking_payload,
+                now,
+                bool(line_delivered),
+                now,
+                row["id"],
+            ),
+        )
+    refreshed_rows = rows_to_dicts(conn.execute(
+        f"SELECT * FROM order_lines WHERE id IN ({','.join('?' for _ in matched_rows)})",
+        [row["id"] for row in matched_rows],
+    ).fetchall())
+    for updated_row in refreshed_rows:
+        index_order_line(updated_row)
+        if line_delivered:
+            ensure_inventory_for_line(updated_row)
+    _order_id, values, package_count, _error = dispatch_bulk_package_rows_for_order(order_id, refreshed_rows, now)
+    bulk_upsert_dispatch_package_rows(conn, values)
+    conn.execute(
+        """
+        UPDATE amazon_order_history_unmatched
+        SET amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+            status=COALESCE(NULLIF(?, ''), status),
+            last_seen_at=?,
+            resolved_at=?
+        WHERE amazon_order_id=?
+        """,
+        (
+            clean_text(amazon_order_url) or order_line_amazon_url(order_id),
+            line_status,
+            now,
+            now,
+            order_id,
+        ),
+    )
+    return len(refreshed_rows), package_count
+
+
+def related_tracking_order_ids_from_packages(primary_order_id: str, packages: list[dict[str, Any]]) -> list[str]:
+    primary = clean_text(primary_order_id)
+    related: list[str] = []
+    seen = {primary}
+    for package in packages or []:
+        if not isinstance(package, dict):
+            continue
+        candidates = package.get("related_amazon_order_ids") or package.get("related_order_ids") or []
+        if isinstance(candidates, str):
+            candidates = re.findall(r"\b\d{3}-\d{7}-\d{7}\b", candidates)
+        for candidate in candidates:
+            order_id = clean_text(candidate)
+            if not re.fullmatch(r"\d{3}-\d{7}-\d{7}", order_id or ""):
+                continue
+            if order_id in seen:
+                continue
+            seen.add(order_id)
+            related.append(order_id)
+    return related
+
+
+def mark_history_tracking_order_status(conn: Any, amazon_order_id: str, amazon_order_url: str, packages: list[dict[str, Any]]) -> None:
+    order_id = clean_text(amazon_order_id)
+    if not order_id:
+        return
+    status = tracking_status_from_packages(packages)
+    now = utc_now()
+    resolved_at = now if status == "Delivered" else None
+    conn.execute(
+        """
+        UPDATE amazon_order_history_unmatched
+        SET amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+            status=COALESCE(NULLIF(?, ''), status),
+            last_seen_at=?,
+            resolved_at=?
+        WHERE amazon_order_id=?
+        """,
+        (
+            clean_text(amazon_order_url) or order_line_amazon_url(order_id),
+            status,
+            now,
+            resolved_at,
+            order_id,
+        ),
+    )
+
+
+def update_related_tracking_orders_from_packages(
+    conn: Any,
+    primary_order_id: str,
+    amazon_order_url: str,
+    packages: list[dict[str, Any]],
+) -> tuple[int, int]:
+    related_ids = related_tracking_order_ids_from_packages(primary_order_id, packages)
+    if not related_ids:
+        return 0, 0
+    now = utc_now()
+    status = tracking_status_from_packages(packages)
+    line_delivered = status == "Delivered" and all(tracking_package_delivered(package) for package in packages if isinstance(package, dict))
+    tracking_payload = json.dumps(packages, default=str)[:4000]
+    updated = 0
+    dispatch_packages = 0
+    for related_order_id in related_ids:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE amazon_order_id=?
+              AND state IN ('ordered', 'dispatched', 'delivered')
+              AND COALESCE(order_engine, '') != 'third_party'
+            ORDER BY id
+            """,
+            (related_order_id,),
+        ).fetchall())
+        if rows:
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_url=COALESCE(NULLIF(?, ''), amazon_order_url),
+                        tracking_status=?,
+                        tracking_payload=?,
+                        tracking_checked_at=?,
+                        state=CASE WHEN ? THEN 'delivered' WHEN state='delivered' THEN 'dispatched' ELSE state END,
+                        last_error=NULL,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        order_line_amazon_url(related_order_id),
+                        status,
+                        tracking_payload,
+                        now,
+                        bool(line_delivered),
+                        now,
+                        row["id"],
+                    ),
+                )
+            refreshed_rows = rows_to_dicts(conn.execute(
+                f"SELECT * FROM order_lines WHERE id IN ({','.join('?' for _ in rows)})",
+                [row["id"] for row in rows],
+            ).fetchall())
+            for updated_row in refreshed_rows:
+                index_order_line(updated_row)
+                if line_delivered:
+                    ensure_inventory_for_line(updated_row)
+            _order_id, values, package_count, _error = dispatch_bulk_package_rows_for_order(related_order_id, refreshed_rows, now)
+            bulk_upsert_dispatch_package_rows(conn, values)
+            mark_history_tracking_order_status(conn, related_order_id, order_line_amazon_url(related_order_id), packages)
+            updated += len(refreshed_rows)
+            dispatch_packages += package_count
+            continue
+        refreshed_packages, affected_line_ids = refresh_dispatch_packages_from_tracking(
+            conn,
+            related_order_id,
+            order_line_amazon_url(related_order_id),
+            packages,
+        )
+        if refreshed_packages:
+            dispatch_packages += refreshed_packages
+            updated += len(affected_line_ids)
+            continue
+        history_updated, history_packages = update_history_matched_order_from_tracking(
+            conn,
+            related_order_id,
+            order_line_amazon_url(related_order_id),
+            packages,
+        )
+        updated += history_updated
+        dispatch_packages += history_packages
+    return updated, dispatch_packages
 
 
 def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
@@ -3616,10 +4425,7 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
             "priority": dispatch_priority_from_package(package),
             "fulfilment_type": "STANDARD",
         }
-        products = package.get("products") if isinstance(package.get("products"), list) else []
-        asins = package.get("asins") if isinstance(package.get("asins"), list) else []
-        if not asins:
-            asins = [product.get("asin") for product in products if isinstance(product, dict) and product.get("asin")]
+        asins, products = dispatch_package_asins_and_products(package, rows_to_dicts(matching_rows))
         conn.execute(
             """
             INSERT INTO amazon_dispatch_packages (
@@ -3670,7 +4476,7 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
                 clean_text(package.get("promise")),
                 clean_text(package.get("carrier")),
                 clean_text(package.get("tracking_url")),
-                json.dumps([normalize_asin(str(asin)) for asin in asins if normalize_asin(str(asin))]),
+                json.dumps(asins),
                 json.dumps(products[:12], default=str),
                 destination_code,
                 destination_name,
@@ -3684,48 +4490,6 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
             ),
         )
         updated += 1
-        for alias_code, alias_display in codes[1:]:
-            conn.execute(
-                """
-                INSERT INTO amazon_dispatch_packages (
-                    scan_code, canonical_scan_code, display_code, amazon_order_id, amazon_order_url, store_id, odoo_order_id, odoo_order_name,
-                    recipient_ref, order_line_ids_json, package_index, package_status, promise, carrier, tracking_url, asins_json,
-                    products_json, destination_country_code, destination_country_name, dispatch_date, destination_zone,
-                    service, priority, fulfilment_type, scan_status, created_at, updated_at
-                )
-                SELECT ?, ?, ?, amazon_order_id, amazon_order_url, store_id, odoo_order_id, odoo_order_name,
-                       recipient_ref, order_line_ids_json, package_index, package_status, promise, carrier, tracking_url, asins_json,
-                       products_json, destination_country_code, destination_country_name, dispatch_date, destination_zone,
-                       service, priority, fulfilment_type, scan_status, ?, ?
-                FROM amazon_dispatch_packages
-                WHERE scan_code=?
-                ON CONFLICT(scan_code) DO UPDATE SET
-                    canonical_scan_code=excluded.canonical_scan_code,
-                    amazon_order_id=excluded.amazon_order_id,
-                    amazon_order_url=COALESCE(NULLIF(excluded.amazon_order_url, ''), amazon_dispatch_packages.amazon_order_url),
-                    store_id=excluded.store_id,
-                    odoo_order_id=excluded.odoo_order_id,
-                    odoo_order_name=excluded.odoo_order_name,
-                    recipient_ref=COALESCE(NULLIF(excluded.recipient_ref, ''), amazon_dispatch_packages.recipient_ref),
-                    order_line_ids_json=excluded.order_line_ids_json,
-                    package_index=excluded.package_index,
-                    package_status=excluded.package_status,
-                    promise=excluded.promise,
-                    carrier=excluded.carrier,
-                    tracking_url=COALESCE(NULLIF(excluded.tracking_url, ''), amazon_dispatch_packages.tracking_url),
-                    asins_json=excluded.asins_json,
-                    products_json=excluded.products_json,
-                    destination_country_code=excluded.destination_country_code,
-                    destination_country_name=excluded.destination_country_name,
-                    dispatch_date=excluded.dispatch_date,
-                    destination_zone=excluded.destination_zone,
-                    service=excluded.service,
-                    priority=excluded.priority,
-                    fulfilment_type=excluded.fulfilment_type,
-                    updated_at=excluded.updated_at
-                """,
-                (alias_code, code, alias_display, now, now, code),
-            )
     return updated
 
 
@@ -3758,10 +4522,7 @@ def dispatch_bulk_package_rows_for_order(order_id: str, rows: list[dict[str, Any
             code, display_code = codes[0]
             recipient_ref = dispatch_recipient_ref_from_rows(rows_to_dicts(matching_rows))
             destination_code, destination_name, _label = destination_country_from_row(row_to_dict(primary))
-            products = package.get("products") if isinstance(package.get("products"), list) else []
-            asins = package.get("asins") if isinstance(package.get("asins"), list) else []
-            if not asins:
-                asins = [product.get("asin") for product in products if isinstance(product, dict) and product.get("asin")]
+            asins, products = dispatch_package_asins_and_products(package, rows_to_dicts(matching_rows))
             base = (
                 order_id,
                 clean_text(primary.get("amazon_order_url")) or order_line_amazon_url(order_id),
@@ -3775,7 +4536,7 @@ def dispatch_bulk_package_rows_for_order(order_id: str, rows: list[dict[str, Any
                 clean_text(package.get("promise")),
                 clean_text(package.get("carrier")),
                 clean_text(package.get("tracking_url")),
-                json.dumps([normalize_asin(str(asin)) for asin in asins if normalize_asin(str(asin))]),
+                json.dumps(asins),
                 json.dumps(products[:12], default=str),
                 destination_code,
                 destination_name,
@@ -3790,8 +4551,6 @@ def dispatch_bulk_package_rows_for_order(order_id: str, rows: list[dict[str, Any
             )
             values.append((code, code, display_code, *base))
             package_count += 1
-            for alias_code, alias_display in codes[1:]:
-                values.append((alias_code, code, alias_display, *base))
         return order_id, values, package_count, ""
     except Exception as exc:
         return order_id, [], 0, str(exc)
@@ -4142,8 +4901,8 @@ def dispatch_find_fragment_matches(conn: Any, fragment: str, store_id: Optional[
                 OR UPPER(COALESCE(canonical_scan_code, '')) LIKE ?
                 OR UPPER(COALESCE(last_scanned_code, '')) LIKE ?
                 OR UPPER(COALESCE(scanned_codes_json, '')) LIKE ?
-                OR UPPER(COALESCE(display_code, '')) LIKE ?
-                OR UPPER(COALESCE(tracking_url, '')) LIKE ?
+                OR UPPER(COALESCE(amazon_order_id, '')) LIKE ?
+                OR UPPER(COALESCE(odoo_order_name, '')) LIKE ?
             )
             """
         )
@@ -4155,6 +4914,7 @@ def dispatch_find_fragment_matches(conn: Any, fragment: str, store_id: Optional[
             FROM amazon_dispatch_packages
             WHERE ({' OR '.join(where_parts)})
               AND (? IS NULL OR store_id=?)
+              AND {DISPATCH_PHYSICAL_SCAN_SQL}
               AND NOT EXISTS (
                   SELECT 1
                   FROM amazon_payment_failures
@@ -4388,6 +5148,7 @@ def dispatch_remaining_packages(conn: Any, row: dict[str, Any]) -> list[dict[str
         """
         SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                order_line_ids_json, package_index, package_status, promise, scan_status, tote_code,
+               asins_json, products_json,
                last_scanned_at, placed_at, updated_at
         FROM amazon_dispatch_packages
         WHERE store_id=?
@@ -4406,6 +5167,7 @@ def dispatch_order_packages(conn: Any, row: dict[str, Any]) -> list[dict[str, An
         """
         SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                odoo_order_name, order_line_ids_json, package_index, package_status, promise, scan_status, tote_code,
+               asins_json, products_json,
                last_scanned_at, placed_at, updated_at, scan_count
         FROM amazon_dispatch_packages
         WHERE store_id=?
@@ -4468,6 +5230,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
     store_id = package.get("store_id")
     odoo_order_id = package.get("odoo_order_id")
     odoo_order_name = clean_text(package.get("odoo_order_name"))
+    current_package_key = dispatch_physical_package_key(package)
     if odoo_order_id:
         line_rows = rows_to_dicts(conn.execute(
             """
@@ -4484,6 +5247,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
             SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                    odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
                    scan_status, tote_code, last_scanned_at, placed_at, updated_at, scan_count,
+                   asins_json, products_json,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
             FROM amazon_dispatch_packages
             WHERE store_id=? AND odoo_order_id=?
@@ -4510,6 +5274,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
             SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                    odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
                    scan_status, tote_code, last_scanned_at, placed_at, updated_at, scan_count,
+                   asins_json, products_json,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
             FROM amazon_dispatch_packages
             WHERE store_id=?
@@ -4524,6 +5289,8 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
     covered_line_ids: set[int] = set()
     for row in dedupe_dispatch_package_rows(rows):
         part = dispatch_package_payload(conn, row, include_related=False)
+        if current_package_key and dispatch_physical_package_key(part) == current_package_key:
+            part["id"] = package.get("id")
         part["recipient_ref"] = dispatch_recipient_ref_for_package(conn, part)
         part["rack_key"] = dispatch_rack_key_for_package(part)
         part["rack_label"] = dispatch_rack_label_for_package(part)
@@ -4603,6 +5370,8 @@ def cached_dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int
         "dispatch-related-parts",
         package.get("store_id"),
         package.get("odoo_order_id") or clean_text(package.get("odoo_order_name")).upper(),
+        package.get("id"),
+        dispatch_physical_package_key(package),
         limit,
     )
     cached = fast_page_cache_get(cache_key)
@@ -4838,6 +5607,102 @@ def list_inventory_items(store_id: Optional[int] = None, page: int = 1, per_page
     return rows, int(total)
 
 
+def inventory_product_images(items: list[dict[str, Any]], conn: Any) -> dict[int, dict[str, str]]:
+    item_ids = sorted({int(item.get("id") or 0) for item in items if int(item.get("id") or 0) > 0})
+    if not item_ids:
+        return {}
+    source_line_ids = sorted({int(item.get("order_line_id") or 0) for item in items if int(item.get("order_line_id") or 0) > 0})
+    reserved_line_ids = sorted({int(item.get("reserved_order_line_id") or 0) for item in items if int(item.get("reserved_order_line_id") or 0) > 0})
+    line_ids = sorted(set(source_line_ids + reserved_line_ids))
+    line_products_by_id: dict[int, list[dict[str, Any]]] = {}
+    if line_ids:
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT id, asin, product_name, tracking_payload
+            FROM order_lines
+            WHERE id IN ({",".join("?" for _ in line_ids)})
+            """,
+            line_ids,
+        ).fetchall())
+        for row in rows:
+            products = amazon_products_from_tracking_payload(row.get("tracking_payload") or "", row.get("asin") or "", row.get("product_name") or "")
+            if products:
+                line_products_by_id[int(row["id"])] = products
+    package_products_by_order: dict[tuple[int, str, str], list[dict[str, Any]]] = {}
+    order_keys = sorted({
+        (int(item.get("store_id") or 0), clean_text(item.get("amazon_order_id")), normalize_asin(item.get("asin")))
+        for item in items
+        if int(item.get("store_id") or 0) > 0 and clean_text(item.get("amazon_order_id")) and normalize_asin(item.get("asin"))
+    })
+    if order_keys:
+        clauses = []
+        params: list[Any] = []
+        for store_id, amazon_order_id, asin in order_keys:
+            clauses.append("(store_id=? AND amazon_order_id=? AND (asins_json ILIKE ? OR products_json ILIKE ?))")
+            params.extend([store_id, amazon_order_id, f"%{asin}%", f"%{asin}%"])
+        package_rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT store_id, amazon_order_id, asins_json, products_json
+            FROM amazon_dispatch_packages
+            WHERE {" OR ".join(clauses)}
+            ORDER BY updated_at DESC, id DESC
+            """,
+            params,
+        ).fetchall())
+        for row in package_rows:
+            products = [product for product in parse_json_list_value(row.get("products_json")) if isinstance(product, dict)]
+            for asin in unique_normalized_asins(parse_json_list_value(row.get("asins_json"))):
+                package_products_by_order.setdefault((int(row["store_id"]), clean_text(row.get("amazon_order_id")), asin), products)
+            for product in products:
+                asin = normalize_asin(product.get("asin"))
+                if asin:
+                    package_products_by_order.setdefault((int(row["store_id"]), clean_text(row.get("amazon_order_id")), asin), products)
+
+    images: dict[int, dict[str, str]] = {}
+    for item in items:
+        item_id = int(item.get("id") or 0)
+        asin = normalize_asin(item.get("asin"))
+        product_name = clean_text(item.get("product_name"))
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        stored_image_url = clean_text(item.get("image_url"))
+        if is_safe_amazon_image_url(stored_image_url):
+            candidates.append((
+                clean_text(item.get("image_source")) or "amazon_page",
+                {
+                    "asin": asin,
+                    "url": asin_product_url(asin),
+                    "title": product_name or asin,
+                    "image_url": stored_image_url,
+                },
+            ))
+        source_line_id = int(item.get("order_line_id") or 0)
+        reserved_line_id = int(item.get("reserved_order_line_id") or 0)
+        if source_line_id:
+            candidates.extend(("source_order", product) for product in line_products_by_id.get(source_line_id, []))
+        if reserved_line_id:
+            candidates.extend(("reserved_order", product) for product in line_products_by_id.get(reserved_line_id, []))
+        order_key = (int(item.get("store_id") or 0), clean_text(item.get("amazon_order_id")), asin)
+        candidates.extend(("dispatch_package", product) for product in package_products_by_order.get(order_key, []))
+        chosen: dict[str, Any] = {}
+        source = ""
+        for candidate_source, product in candidates:
+            product_asin = normalize_asin(product.get("asin"))
+            if asin and product_asin and product_asin != asin:
+                continue
+            if clean_text(product.get("image_url")):
+                chosen = product
+                source = candidate_source
+                break
+        image_url = clean_text(chosen.get("image_url")) if chosen else ""
+        images[item_id] = {
+            "image_url": image_url,
+            "image_source": source if image_url else "amazon_page",
+            "product_url": clean_text(chosen.get("url")) if chosen else asin_product_url(asin),
+            "image_title": useful_amazon_product_title(chosen.get("title") if chosen else "") or product_name or asin,
+        }
+    return images
+
+
 def inventory_items_payload(items: list[Any]) -> list[dict[str, Any]]:
     data = rows_to_dicts(items)
     reserved_ids = sorted({
@@ -4845,24 +5710,30 @@ def inventory_items_payload(items: list[Any]) -> list[dict[str, Any]]:
         for item in data
         if int(item.get("reserved_order_line_id") or 0)
     })
-    if not reserved_ids:
-        return data
     with db() as conn:
-        placeholders = ",".join("?" for _ in reserved_ids)
-        rows = rows_to_dicts(conn.execute(
-            f"SELECT id, store_id, odoo_order_id, odoo_order_name, product_name FROM order_lines WHERE id IN ({placeholders})",
-            reserved_ids,
-        ).fetchall())
-    lines_by_id = {int(row["id"]): row for row in rows}
+        image_by_item_id = inventory_product_images(data, conn)
+        lines_by_id: dict[int, dict[str, Any]] = {}
+        if reserved_ids:
+            placeholders = ",".join("?" for _ in reserved_ids)
+            rows = rows_to_dicts(conn.execute(
+                f"SELECT id, store_id, odoo_order_id, odoo_order_name, product_name FROM order_lines WHERE id IN ({placeholders})",
+                reserved_ids,
+            ).fetchall())
+            lines_by_id = {int(row["id"]): row for row in rows}
     stores_by_id = {int(store["id"]): store for store in rows_to_dicts(list_stores())}
     for item in data:
+        image = image_by_item_id.get(int(item.get("id") or 0), {})
+        item["image_url"] = f"/api/inventory/{int(item.get('id') or 0)}/image?v={quote_plus(clean_text(item.get('updated_at')))}"
+        item["remote_image_url"] = image.get("image_url") or ""
+        item["image_source"] = image.get("image_source") or "amazon_page"
+        item["image_title"] = image.get("image_title") or clean_text(item.get("product_name")) or clean_text(item.get("asin"))
+        item["asin_url"] = image.get("product_url") or asin_product_url(item.get("asin") or "")
         line = lines_by_id.get(int(item.get("reserved_order_line_id") or 0))
-        if not line:
-            continue
-        store = stores_by_id.get(int(line.get("store_id") or item.get("store_id") or 0))
-        item["reserved_odoo_order_name"] = line.get("odoo_order_name") or ""
-        item["reserved_odoo_order_url"] = odoo_order_admin_url(store, line.get("odoo_order_id")) if store else ""
-        item["reserved_product_name"] = line.get("product_name") or ""
+        if line:
+            store = stores_by_id.get(int(line.get("store_id") or item.get("store_id") or 0))
+            item["reserved_odoo_order_name"] = line.get("odoo_order_name") or ""
+            item["reserved_odoo_order_url"] = odoo_order_admin_url(store, line.get("odoo_order_id")) if store else ""
+            item["reserved_product_name"] = line.get("product_name") or ""
     return data
 
 
@@ -4961,6 +5832,7 @@ def reserve_inventory_for_line(line: dict[str, Any]) -> bool:
             """
             UPDATE order_lines
             SET state='inventory',
+                order_engine='inventory',
                 fulfilment_note=?,
                 last_error=NULL,
                 updated_at=?
@@ -10346,12 +11218,16 @@ def find_tracking_targets(payload: Any) -> list[tuple[str, str, str]]:
 
 def summarize_tracking(payloads: list[dict[str, Any]], fallback_details: dict[str, Any]) -> str:
     combined = json.dumps(payloads or fallback_details, default=str)
+    if re.search(r"\bout for delivery\b", combined, re.IGNORECASE):
+        return "Out for delivery"
+    if re.search(r"\barriving\b", combined, re.IGNORECASE):
+        return "Arriving"
     if re.search(r"\bdelivered\b", combined, re.IGNORECASE):
         return "Delivered"
-    if re.search(r"\b(out for delivery|in transit|shipped)\b", combined, re.IGNORECASE):
+    if re.search(r"\b(in transit|shipped)\b", combined, re.IGNORECASE):
         return "In transit"
-    if re.search(r"\b(ordered|not shipped|pending)\b", combined, re.IGNORECASE):
-        return "Ordered"
+    if re.search(r"\b(order received|ordered|not shipped|pending)\b", combined, re.IGNORECASE):
+        return "Order received"
     return "Unknown"
 
 
@@ -10368,12 +11244,23 @@ def tracking_status_from_packages(packages: list[dict[str, Any]]) -> str:
         if re.search(r"\barriv", promise, re.IGNORECASE):
             expected = expected_display or expected_date
             promise_statuses.append(f"{promise} (expected {expected})" if expected and expected.lower() not in promise.lower() else promise)
+    valid_packages = [package for package in packages if isinstance(package, dict)]
+    active_pending_statuses = [tracking_package_active_pending(package) for package in valid_packages]
+    active_pending_statuses = [status for status in active_pending_statuses if status]
     package_texts = [json.dumps(package, default=str).lower() for package in packages]
-    if all("delivered" in text for text in package_texts):
-        return "Delivered"
     text = " ".join(package_texts)
     if "delivery date currently unavailable" in text or "delivery date unavailable" in text:
         return "Delivery unavailable"
+    if "unable to get the tracking information" in text or "unable to load your order details" in text:
+        return "Tracking unavailable"
+    if "delayed" in text:
+        return "Delayed"
+    if active_pending_statuses:
+        if any(status == "Out for delivery" for status in active_pending_statuses):
+            return "Out for delivery"
+        return " / ".join(dict.fromkeys(active_pending_statuses))
+    if valid_packages and all(tracking_package_delivered(package) for package in valid_packages):
+        return "Delivered"
     if "out for delivery" in text:
         return "Out for delivery"
     if "shipped" in text or "carrier" in text or "transit" in text:
@@ -10382,8 +11269,8 @@ def tracking_status_from_packages(packages: list[dict[str, Any]]) -> str:
         return " / ".join(dict.fromkeys(promise_statuses))
     if "arriving" in text:
         return "Arriving"
-    if "ordered" in text or "not shipped" in text or "pending" in text:
-        return "Ordered"
+    if "order received" in text or "ordered" in text or "not shipped" in text or "pending" in text:
+        return "Order received"
     return "Unknown"
 
 
@@ -10439,17 +11326,12 @@ def parse_amazon_delivery_date_text(date_text: str, time_text: str = "", checked
 
 
 def amazon_delivery_info_from_payload(payload_text: str, checked_at: str = "") -> dict[str, str]:
-    try:
-        packages = json.loads(payload_text or "[]")
-    except Exception:
-        packages = []
-    if isinstance(packages, dict):
-        packages = [packages]
-    if not isinstance(packages, list):
-        packages = []
+    packages = parse_tracking_packages(payload_text)
     candidates: list[tuple[str, str, str]] = []
     for package in packages:
         if not isinstance(package, dict):
+            continue
+        if not tracking_package_delivered(package):
             continue
         for event in package.get("events") or []:
             if not isinstance(event, dict):
@@ -10699,6 +11581,23 @@ def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
     asins = {normalize_asin(str(value)) for value in package.get("asins") or []}
     line_asins = set(order_line_asin_aliases(line))
     return bool(asins and line_asins and line_asins.intersection(asins))
+
+
+def parse_json_list_value(value: Any) -> list[Any]:
+    try:
+        parsed = json.loads(value or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def unique_normalized_asins(values: list[Any]) -> list[str]:
+    asins: list[str] = []
+    for value in values:
+        asin = normalize_asin(str(value))
+        if asin and asin not in asins:
+            asins.append(asin)
+    return asins
 
 
 PAYMENT_REVISION_PATTERNS = ("payment revision needed", "please update your payment method")
@@ -11016,7 +11915,6 @@ def tracking_search_clause(q: str) -> tuple[str, list[Any]]:
             COALESCE(odoo_order_name, '') || ' ' ||
             COALESCE(CAST(odoo_order_id AS TEXT), '') || ' ' ||
             COALESCE(CAST(odoo_line_id AS TEXT), '') || ' ' ||
-            COALESCE(tracking_payload, '') || ' ' ||
             COALESCE(tracking_status, '') || ' ' ||
             COALESCE(asin, '') || ' ' ||
             COALESCE(product_name, '')
@@ -11125,9 +12023,1235 @@ def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active"
     return list(grouped.values()), data, total, page, per_page
 
 
+def amazon_history_tracking_orders_for_refresh(limit: int = 500) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM amazon_order_history_unmatched
+            WHERE COALESCE(amazon_order_id, '') != ''
+              AND COALESCE(recipient, '') != ''
+              AND (
+                LOWER(COALESCE(status, '')) NOT LIKE '%delivered%'
+                OR LOWER(COALESCE(status, '')) LIKE '%arriving today%'
+                OR LOWER(COALESCE(status, '')) LIKE '%arriving tomorrow%'
+                OR LOWER(COALESCE(status, '')) ~ 'arriving (monday|tuesday|wednesday|thursday|friday|saturday|sunday)'
+              )
+              AND LOWER(COALESCE(status, '')) NOT LIKE '%cancelled%'
+              AND LOWER(COALESCE(status, '')) NOT LIKE '%payment revision%'
+            ORDER BY last_seen_at ASC NULLS FIRST, first_seen_at ASC NULLS FIRST
+            LIMIT ?
+            """,
+            (max(1, min(2000, int(limit or 500))),),
+        ).fetchall())
+    orders: list[dict[str, Any]] = []
+    for row in rows:
+        refs = amazon_history_order_refs_from_text(row.get("recipient") or "")
+        try:
+            asins = [normalize_asin(asin) for asin in json.loads(row.get("asins_json") or "[]") if normalize_asin(asin)]
+        except Exception:
+            asins = []
+        orders.append({
+            "amazon_order_id": row.get("amazon_order_id") or "",
+            "amazon_order_url": row.get("amazon_order_url") or order_line_amazon_url(row.get("amazon_order_id") or ""),
+            "odoo_order_names": refs,
+            "lines": [],
+            "tracking_checked_at": row.get("last_seen_at") or "",
+            "tracking_status": row.get("status") or "",
+            "amazon_cancelled_at": "",
+            "amazon_cancelled_order_id": "",
+            "source": "amazon_order_history_unmatched",
+            "recipient": row.get("recipient") or "",
+            "asins": asins,
+            "products": [],
+            "items": [{"asin": asin, "quantity": 1} for asin in asins],
+        })
+    return orders
+
+
 def delivered_unfulfilled_rows(store_id: Optional[int] = None, q: str = "") -> list[dict[str, Any]]:
     rows, _total, _page, _per_page = paged_delivered_unfulfilled_rows(store_id, 1, 1000, q)
     return rows
+
+
+def attach_manual_amazon_order_associations(conn: Any, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in rows if clean_text(row.get("odoo_order_name"))})
+    if not order_names:
+        return
+    placeholders = ",".join("?" for _ in order_names)
+    package_rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT id, amazon_order_id, amazon_order_url, odoo_order_name, package_index,
+               package_status, promise, asins_json, products_json, order_line_ids_json,
+               scan_code, canonical_scan_code, display_code, tracking_url, carrier,
+               scan_status, received_at, last_scanned_at
+        FROM amazon_dispatch_packages
+        WHERE odoo_order_name IN ({placeholders})
+          AND COALESCE(amazon_order_id, '') != ''
+        ORDER BY odoo_order_name, amazon_order_id, package_index, id
+        """,
+        order_names,
+    ).fetchall())
+    history_rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT amazon_order_id, amazon_order_url, recipient, status, last_seen_at, order_date, asins_json
+        FROM amazon_order_history_unmatched
+        WHERE ({' OR '.join('UPPER(recipient) LIKE ?' for _ in order_names)})
+          AND COALESCE(amazon_order_id, '') != ''
+        ORDER BY last_seen_at DESC
+        """,
+        [f"%{name}%" for name in order_names],
+    ).fetchall()) if order_names else []
+    by_order_ref: dict[str, dict[str, dict[str, Any]]] = {}
+    line_asins_by_id: dict[int, list[str]] = {}
+
+    def parse_json_list(value: Any) -> list[Any]:
+        try:
+            parsed = json.loads(value or "[]")
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    def unique_asins(values: list[Any]) -> list[str]:
+        asins: list[str] = []
+        for value in values:
+            asin = normalize_asin(str(value))
+            if asin and asin not in asins:
+                asins.append(asin)
+        return asins
+
+    def clean_package_asins(package_products: list[Any], raw_asins: list[Any], order_line_ids: list[int]) -> list[str]:
+        product_asins = unique_asins([
+            product.get("asin")
+            for product in package_products
+            if isinstance(product, dict)
+        ])
+        package_asins = product_asins or unique_asins(raw_asins)
+        line_asins = list(dict.fromkeys(
+            asin
+            for line_id in order_line_ids
+            for asin in line_asins_by_id.get(int(line_id), [])
+            if asin
+        ))
+        intersecting = [asin for asin in package_asins if asin in set(line_asins)]
+        if intersecting:
+            return intersecting
+        if product_asins:
+            return product_asins
+        if len(package_asins) <= 5:
+            return package_asins
+        if line_asins:
+            return line_asins
+        return package_asins[:12]
+
+    def package_code_score(value: Any) -> tuple[int, int]:
+        text = clean_text(value)
+        if not text:
+            return (0, 0)
+        upper = text.upper()
+        if re.fullmatch(r"TBA[A-Z0-9]+", upper):
+            return (50, len(text))
+        if re.fullmatch(r"1Z[A-Z0-9]+", upper):
+            return (45, len(text))
+        if re.fullmatch(r"\d{12,}", text):
+            return (40, len(text))
+        if text.startswith("http://") or text.startswith("https://"):
+            return (5, -len(text))
+        if re.fullmatch(r"\d{3}-\d{7}-\d{7}", text):
+            return (3, len(text))
+        return (20, len(text))
+
+    def better_package_code(current: Any, incoming: Any) -> str:
+        current_text = clean_text(current)
+        incoming_text = clean_text(incoming)
+        if package_code_score(incoming_text) > package_code_score(current_text):
+            return incoming_text
+        return current_text
+
+    def package_identity_key(package: dict[str, Any]) -> str:
+        line_ids = ",".join(str(value) for value in sorted({
+            int(value)
+            for value in package.get("order_line_ids") or []
+            if str(value).isdigit()
+        }))
+        asins = ",".join(sorted({normalize_asin(value) for value in package.get("asins") or [] if normalize_asin(value)}))
+        tracking_url = clean_text(package.get("tracking_url"))
+        package_index = clean_text(package.get("package_index"))
+        if package_index:
+            return f"index:{package_index}|lines:{line_ids}|asins:{asins}"
+        if tracking_url:
+            return f"url:{tracking_url}|lines:{line_ids}|asins:{asins}"
+        return f"code:{clean_text(package.get('display_code') or package.get('scan_code')).upper()}|lines:{line_ids}|asins:{asins}"
+
+    def dedupe_order_packages(packages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: dict[str, dict[str, Any]] = {}
+        for package in packages:
+            key = package_identity_key(package)
+            existing = deduped.get(key)
+            if existing is None:
+                package["alternate_codes"] = []
+                deduped[key] = package
+                existing = package
+            for code_value in (package.get("display_code"), package.get("scan_code")):
+                code = clean_text(code_value)
+                if code and code not in existing.get("alternate_codes", []) and code not in {existing.get("display_code"), existing.get("scan_code")}:
+                    existing.setdefault("alternate_codes", []).append(code)
+            existing["display_code"] = better_package_code(existing.get("display_code"), package.get("display_code") or package.get("scan_code"))
+            existing["scan_code"] = better_package_code(existing.get("scan_code"), package.get("scan_code") or package.get("display_code"))
+            existing["tracking_url"] = clean_text(existing.get("tracking_url")) or clean_text(package.get("tracking_url"))
+            existing["carrier"] = clean_text(existing.get("carrier")) or clean_text(package.get("carrier"))
+            if tracking_status_rank(package.get("status")) >= tracking_status_rank(existing.get("status")):
+                existing["status"] = package.get("status") or existing.get("status") or ""
+            if tracking_status_rank(package.get("promise")) >= tracking_status_rank(existing.get("promise")):
+                existing["promise"] = package.get("promise") or existing.get("promise") or ""
+            existing_products = existing.get("products") or []
+            product_keys = {
+                clean_text(product.get("asin")) or clean_text(product.get("image_url")) or clean_text(product.get("title"))
+                for product in existing_products
+                if isinstance(product, dict)
+            }
+            for product in package.get("products") or []:
+                if not isinstance(product, dict):
+                    continue
+                product_key = clean_text(product.get("asin")) or clean_text(product.get("image_url")) or clean_text(product.get("title"))
+                if product_key and product_key in product_keys:
+                    continue
+                if product_key:
+                    product_keys.add(product_key)
+                existing_products.append(product)
+            existing["products"] = existing_products
+            existing["asins"] = list(dict.fromkeys([*(existing.get("asins") or []), *(package.get("asins") or [])]))
+        return sorted(
+            deduped.values(),
+            key=lambda item: (
+                int(item.get("package_index") or 0),
+                clean_text(item.get("display_code") or item.get("scan_code")).upper(),
+            ),
+        )
+
+    package_line_ids: set[int] = set()
+    for package in package_rows:
+        try:
+            package_line_ids.update(
+                int(value)
+                for value in parse_json_list(package.get("order_line_ids_json"))
+                if int(value or 0) > 0
+            )
+        except Exception:
+            pass
+    if package_line_ids:
+        ids = sorted(package_line_ids)
+        line_rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT id, asin, replacement_asin, asin_from_reference, asin_from_note, original_asin
+            FROM order_lines
+            WHERE id IN ({','.join('?' for _ in ids)})
+            """,
+            ids,
+        ).fetchall())
+        line_asins_by_id = {
+            int(line["id"]): order_line_asin_aliases(line)
+            for line in line_rows
+            if line.get("id")
+        }
+
+    def order_bucket(order_ref: str, amazon_order_id: str, amazon_order_url: str = "") -> dict[str, Any]:
+        ref = clean_text(order_ref).upper()
+        order_id = clean_text(amazon_order_id)
+        bucket = by_order_ref.setdefault(ref, {})
+        return bucket.setdefault(order_id, {
+            "amazon_order_id": order_id,
+            "amazon_order_url": clean_text(amazon_order_url) or order_line_amazon_url(order_id),
+            "recipient": "",
+            "status": "",
+            "order_date": "",
+            "asins": [],
+            "packages": [],
+            "sources": [],
+        })
+
+    def safe_history_status(status: Any, last_seen_at: Any) -> str:
+        text = clean_text(status)
+        if not text:
+            return ""
+        lowered = text.lower()
+        is_relative_arrival = (
+            "arriving today" in lowered
+            or "arriving tomorrow" in lowered
+            or bool(re.search(r"\barriving\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lowered))
+        )
+        if not is_relative_arrival:
+            return text
+        last_seen = parse_any_datetime(last_seen_at)
+        if not last_seen:
+            return "Tracking refresh needed"
+        if (datetime.now(timezone.utc) - last_seen.astimezone(timezone.utc)).total_seconds() > 18 * 3600:
+            return "Tracking refresh needed"
+        return text
+
+    for package in package_rows:
+        order_ref = clean_text(package.get("odoo_order_name")).upper()
+        amazon_order_id = clean_text(package.get("amazon_order_id"))
+        if not order_ref or not amazon_order_id:
+            continue
+        entry = order_bucket(order_ref, amazon_order_id, package.get("amazon_order_url"))
+        if "dispatch_package" not in entry["sources"]:
+            entry["sources"].append("dispatch_package")
+        package_status_text = clean_text(package.get("package_status") or package.get("promise"))
+        if package_status_text and tracking_status_rank(package_status_text) >= tracking_status_rank(entry.get("status")):
+            entry["status"] = package_status_text
+        package_products = parse_json_list(package.get("products_json"))
+        order_line_ids = []
+        for value in parse_json_list(package.get("order_line_ids_json")):
+            try:
+                order_line_ids.append(int(value))
+            except Exception:
+                pass
+        package_asins = clean_package_asins(package_products, parse_json_list(package.get("asins_json")), order_line_ids)
+        for asin in package_asins:
+            if asin not in entry["asins"]:
+                entry["asins"].append(asin)
+        entry["packages"].append({
+            "package_id": package.get("id"),
+            "package_index": package.get("package_index"),
+            "canonical_scan_code": package.get("canonical_scan_code") or "",
+            "scan_code": package.get("canonical_scan_code") if package_tracking_id_is_physical(package.get("canonical_scan_code")) else package.get("scan_code") or package.get("display_code"),
+            "display_code": package.get("display_code") or package.get("scan_code"),
+            "tracking_url": package.get("tracking_url") or "",
+            "carrier": package.get("carrier") or "",
+            "status": package.get("package_status") or package.get("promise") or "",
+            "promise": package.get("promise") or "",
+            "scan_status": package.get("scan_status") or "",
+            "received_at": package.get("received_at") or package.get("last_scanned_at") or "",
+            "asins": package_asins,
+            "products": package_products,
+            "order_line_ids": order_line_ids,
+        })
+
+    for order_bucket_items in by_order_ref.values():
+        for entry in order_bucket_items.values():
+            entry["packages"] = dedupe_order_packages(entry.get("packages") or [])
+
+    for history in history_rows:
+        refs = amazon_history_order_refs_from_text(history.get("recipient") or "")
+        for ref in refs:
+            order_ref = clean_text(ref).upper()
+            if order_ref not in by_order_ref and order_ref not in order_names:
+                continue
+            entry = order_bucket(order_ref, history.get("amazon_order_id"), history.get("amazon_order_url"))
+            if "amazon_history" not in entry["sources"]:
+                entry["sources"].append("amazon_history")
+            entry["recipient"] = entry["recipient"] or clean_text(history.get("recipient"))
+            entry["status"] = entry["status"] or safe_history_status(history.get("status"), history.get("last_seen_at"))
+            entry["order_date"] = entry["order_date"] or clean_text(history.get("order_date"))
+            history_asins = unique_asins(parse_json_list(history.get("asins_json")))
+            if history_asins:
+                entry["asins"] = history_asins
+
+    for row in rows:
+        order_ref = clean_text(row.get("odoo_order_name")).upper()
+        row_asin = normalize_asin(row.get("asin"))
+        row_id = int(row.get("id") or 0)
+        related = list((by_order_ref.get(order_ref) or {}).values())
+        related.sort(key=lambda item: (0 if row_asin and row_asin in (item.get("asins") or []) else 1, item.get("amazon_order_id") or ""))
+        matched = []
+        for item in related:
+            item_asins = set(item.get("asins") or [])
+            matching_packages = []
+            for package in item.get("packages") or []:
+                package_line_ids = {
+                    int(line_id)
+                    for line_id in package.get("order_line_ids") or []
+                    if str(line_id).isdigit()
+                }
+                package_asins = set(package.get("asins") or [])
+                if (row_id and row_id in package_line_ids) or (row_asin and row_asin in package_asins):
+                    matching_packages.append(package)
+            if (row_asin and row_asin in item_asins) or matching_packages:
+                matched_item = dict(item)
+                matched_item["packages"] = matching_packages or list(item.get("packages") or [])[:1]
+                clean_item_asins = list(item.get("asins") or [])
+                normalized_packages = []
+                for package in matched_item["packages"]:
+                    package_products = [
+                        product
+                        for product in package.get("products") or []
+                        if isinstance(product, dict)
+                    ]
+                    package_product_asins = unique_asins([product.get("asin") for product in package_products])
+                    normalized_packages.append({
+                        **package,
+                        "products": package_products,
+                        "asins": package_product_asins or clean_item_asins or list(package.get("asins") or []),
+                    })
+                matched_item["packages"] = normalized_packages
+                if row_asin:
+                    matched_item["matched_asins"] = [asin for asin in clean_item_asins if asin == row_asin]
+                matched.append(matched_item)
+        current_amazon_order_id = clean_text(row.get("amazon_order_id"))
+        row["related_amazon_orders"] = [
+            item for item in related
+            if clean_text(item.get("amazon_order_id")) != current_amazon_order_id
+        ]
+        row["asin_matched_amazon_orders"] = matched
+        different_matched = [
+            item
+            for item in matched
+            if clean_text(item.get("amazon_order_id")) and clean_text(item.get("amazon_order_id")) != current_amazon_order_id
+        ]
+        if different_matched:
+            primary = different_matched[0]
+            row["manual_matched_amazon_order_id"] = primary.get("amazon_order_id") or ""
+            row["manual_matched_amazon_order_url"] = primary.get("amazon_order_url") or ""
+            row["manual_matched_amazon_status"] = primary.get("status") or " / ".join(
+                clean_text(package.get("status"))
+                for package in primary.get("packages") or []
+                if clean_text(package.get("status"))
+            )
+
+
+def hydrate_pending_row_amazon_products_from_associations(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        existing = [
+            product for product in row.get("amazon_products") or []
+            if isinstance(product, dict) and normalize_asin(product.get("asin"))
+        ]
+        by_asin: dict[str, dict[str, Any]] = {normalize_asin(product.get("asin")): dict(product) for product in existing}
+        row_asin = normalize_asin(row.get("asin"))
+        current_order_id = clean_text(row.get("amazon_order_id"))
+        for product in row.get("amazon_captured_products") or []:
+            if not isinstance(product, dict):
+                continue
+            asin = normalize_asin(product.get("asin"))
+            if not asin or (row_asin and asin != row_asin):
+                continue
+            existing_product = by_asin.get(asin) or {"asin": asin, "url": asin_product_url(asin), "title": "", "image_url": ""}
+            title = useful_amazon_product_title(product.get("title"))
+            image_url = clean_text(product.get("image_url"))
+            url = clean_text(product.get("url"))
+            if title and not useful_amazon_product_title(existing_product.get("title")):
+                existing_product["title"] = title
+            if image_url and not clean_text(existing_product.get("image_url")):
+                existing_product["image_url"] = image_url
+            if url and not clean_text(existing_product.get("url")):
+                existing_product["url"] = url
+            by_asin[asin] = existing_product
+        for audit_item in row.get("pending_item_audit") or []:
+            if not isinstance(audit_item, dict):
+                continue
+            for product in audit_item.get("matched_products") or []:
+                if not isinstance(product, dict):
+                    continue
+                asin = normalize_asin(product.get("asin"))
+                if not asin or (row_asin and asin != row_asin):
+                    continue
+                existing_product = by_asin.get(asin) or {"asin": asin, "url": asin_product_url(asin), "title": "", "image_url": ""}
+                title = useful_amazon_product_title(product.get("title")) or clean_text(audit_item.get("product_name"))
+                image_url = clean_text(product.get("image_url"))
+                url = clean_text(product.get("url"))
+                if title and not useful_amazon_product_title(existing_product.get("title")):
+                    existing_product["title"] = title
+                if image_url and not clean_text(existing_product.get("image_url")):
+                    existing_product["image_url"] = image_url
+                if url and not clean_text(existing_product.get("url")):
+                    existing_product["url"] = url
+                by_asin[asin] = existing_product
+        association_sources = [
+            *(row.get("asin_matched_amazon_orders") or []),
+            *(row.get("related_amazon_orders") or []),
+        ]
+        for order in association_sources:
+            order_id = clean_text(order.get("amazon_order_id"))
+            for package in order.get("packages") or []:
+                package_products = [
+                    product for product in package.get("products") or []
+                    if isinstance(product, dict) and normalize_asin(product.get("asin"))
+                ]
+                package_asins = unique_normalized_asins(package.get("asins") or [])
+                for product in package_products:
+                    asin = normalize_asin(product.get("asin"))
+                    if not asin:
+                        continue
+                    if row_asin and asin != row_asin:
+                        continue
+                    existing_product = by_asin.get(asin) or {"asin": asin, "url": asin_product_url(asin), "title": "", "image_url": ""}
+                    title = useful_amazon_product_title(product.get("title"))
+                    image_url = clean_text(product.get("image_url"))
+                    url = clean_text(product.get("url"))
+                    if title and not useful_amazon_product_title(existing_product.get("title")):
+                        existing_product["title"] = title
+                    if image_url and not clean_text(existing_product.get("image_url")):
+                        existing_product["image_url"] = image_url
+                    if url and not clean_text(existing_product.get("url")):
+                        existing_product["url"] = url
+                    by_asin[asin] = existing_product
+                if row_asin and row_asin in package_asins and row_asin not in by_asin:
+                    by_asin[row_asin] = {"asin": row_asin, "url": asin_product_url(row_asin), "title": "", "image_url": ""}
+        products = list(by_asin.values())
+        if row_asin:
+            matching = [product for product in products if normalize_asin(product.get("asin")) == row_asin]
+            if matching:
+                products = matching
+        if products:
+            row["amazon_products"] = products
+            row["amazon_product_asins"] = ", ".join(product["asin"] for product in products if clean_text(product.get("asin")))
+
+
+def compact_pending_package_payload(package: Any) -> dict[str, Any]:
+    if not isinstance(package, dict):
+        return {}
+    package_status = tracking_package_status_text(package) or clean_text(package.get("status") or package.get("order_status"))
+    package_promise = clean_text(package.get("promise"))
+    if tracking_package_delivered(package):
+        package_status = "Delivered" if "delivered" not in package_status.lower() else package_status
+        if not package_promise or tracking_status_rank(package_promise) < tracking_status_rank("Delivered"):
+            package_promise = package_status
+    compact = {
+        "package_id": package.get("package_id"),
+        "package_index": package.get("package_index"),
+        "tracking_id": package.get("tracking_id") or package.get("tracking_number") or package.get("trackingNumber"),
+        "canonical_scan_code": package.get("canonical_scan_code"),
+        "scan_code": package.get("scan_code"),
+        "display_code": package.get("display_code"),
+        "tracking_url": package.get("tracking_url") or "",
+        "carrier": package.get("carrier") or "",
+        "status": package_status,
+        "promise": package_promise,
+        "latest_event": package.get("latest_event") if isinstance(package.get("latest_event"), dict) else None,
+        "asins": unique_normalized_asins(package.get("asins") or []),
+        "products": [
+            {
+                "asin": normalize_asin(product.get("asin")),
+                "image_url": clean_text(product.get("image_url")),
+                "title": useful_amazon_product_title(product.get("title")),
+                "url": clean_text(product.get("url")) or asin_product_url(normalize_asin(product.get("asin"))),
+            }
+            for product in (package.get("products") or [])
+            if isinstance(product, dict) and normalize_asin(product.get("asin"))
+        ][:12],
+        "order_line_ids": package.get("order_line_ids") if isinstance(package.get("order_line_ids"), list) else [],
+    }
+    if not compact["tracking_id"]:
+        compact.pop("tracking_id", None)
+    if not compact["latest_event"]:
+        compact.pop("latest_event", None)
+    return {key: value for key, value in compact.items() if value not in ("", None, [], {})}
+
+
+def compact_pending_dispatch_rows(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        try:
+            packages = parse_tracking_packages(row.get("tracking_payload") or "")
+        except Exception:
+            packages = []
+        row["tracking_payload"] = json.dumps([compact_pending_package_payload(package) for package in packages if isinstance(package, dict)], default=str)[:4000]
+        for order_key in ("related_amazon_orders", "asin_matched_amazon_orders"):
+            for order in row.get(order_key) or []:
+                order["packages"] = [
+                    compact_pending_package_payload(package)
+                    for package in (order.get("packages") or [])
+                    if isinstance(package, dict)
+                ]
+
+
+def attach_pending_dispatch_item_audit(conn: Any, rows: list[dict[str, Any]]) -> None:
+    order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in rows if clean_text(row.get("odoo_order_name"))})
+    if not order_names:
+        return
+    placeholders = ",".join("?" for _ in order_names)
+    line_rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT id, store_id, odoo_order_name, odoo_line_id, product_name, original_product_name,
+               quantity, state, tracking_status, tracking_checked_at,
+               asin, replacement_asin, replacement_product_name, replacement_note,
+               asin_from_reference, asin_from_note, original_asin, amazon_order_id,
+               amazon_order_url, tracking_payload
+        FROM order_lines
+        WHERE odoo_order_name IN ({placeholders})
+          AND COALESCE(amazon_order_id, '') != ''
+        ORDER BY odoo_order_name, id
+        """,
+        order_names,
+    ).fetchall())
+    lines_by_order: dict[str, list[dict[str, Any]]] = {}
+    for line in line_rows:
+        lines_by_order.setdefault(clean_text(line.get("odoo_order_name")).upper(), []).append(line)
+
+    package_rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT id, amazon_order_id, amazon_order_url, odoo_order_name, package_index,
+               package_status, promise, asins_json, products_json, order_line_ids_json,
+               scan_code, canonical_scan_code, display_code, tracking_url, carrier,
+               scan_status, received_at, last_scanned_at
+        FROM amazon_dispatch_packages
+        WHERE odoo_order_name IN ({placeholders})
+          AND COALESCE(amazon_order_id, '') != ''
+        ORDER BY odoo_order_name, amazon_order_id, package_index, id
+        """,
+        order_names,
+    ).fetchall())
+    packages_by_order_name: dict[str, list[dict[str, Any]]] = {}
+    for package in package_rows:
+        packages_by_order_name.setdefault(clean_text(package.get("odoo_order_name")).upper(), []).append(package)
+
+    def add_product(products_by_asin: dict[str, dict[str, str]], value: Any) -> None:
+        if isinstance(value, dict):
+            asin = normalize_asin(value.get("asin"))
+            if not asin:
+                return
+            existing = products_by_asin.setdefault(asin, {"asin": asin, "url": asin_product_url(asin), "title": "", "image_url": ""})
+            title = useful_amazon_product_title(value.get("title"))
+            image_url = clean_text(value.get("image_url"))
+            url = clean_text(value.get("url"))
+            if title and not useful_amazon_product_title(existing.get("title")):
+                existing["title"] = title
+            if image_url and not clean_text(existing.get("image_url")):
+                existing["image_url"] = image_url
+            if url and not clean_text(existing.get("url")):
+                existing["url"] = url
+            return
+        asin = normalize_asin(value)
+        if asin:
+            products_by_asin.setdefault(asin, {"asin": asin, "url": asin_product_url(asin), "title": "", "image_url": ""})
+
+    def add_packages(products_by_asin: dict[str, dict[str, str]], packages: Any) -> None:
+        for package in packages or []:
+            if not isinstance(package, dict):
+                continue
+            for product in package.get("products") or []:
+                add_product(products_by_asin, product)
+            for asin in package.get("asins") or []:
+                add_product(products_by_asin, asin)
+
+    def add_order_product(
+        products_by_asin: dict[str, dict[str, str]],
+        products_by_order: dict[str, dict[str, dict[str, str]]],
+        order_id: str,
+        value: Any,
+    ) -> None:
+        order_id = clean_text(order_id)
+        if not order_id:
+            return
+        asin = normalize_asin(value.get("asin")) if isinstance(value, dict) else normalize_asin(value)
+        if not asin:
+            return
+        add_product(products_by_asin, value)
+        product = products_by_asin.get(asin) or {"asin": asin, "url": asin_product_url(asin), "title": "", "image_url": ""}
+        existing = products_by_order.setdefault(order_id, {}).setdefault(asin, dict(product))
+        if useful_amazon_product_title(product.get("title")) and not useful_amazon_product_title(existing.get("title")):
+            existing["title"] = product.get("title") or ""
+        if clean_text(product.get("image_url")) and not clean_text(existing.get("image_url")):
+            existing["image_url"] = product.get("image_url") or ""
+        if clean_text(product.get("url")) and not clean_text(existing.get("url")):
+            existing["url"] = product.get("url") or ""
+
+    def add_order_packages(
+        products_by_asin: dict[str, dict[str, str]],
+        products_by_order: dict[str, dict[str, dict[str, str]]],
+        order_id: str,
+        packages: Any,
+    ) -> None:
+        for package in packages or []:
+            if not isinstance(package, dict):
+                continue
+            for product in package.get("products") or []:
+                add_order_product(products_by_asin, products_by_order, order_id, product)
+            for asin in package.get("asins") or []:
+                add_order_product(products_by_asin, products_by_order, order_id, asin)
+
+    def line_quantity(line: dict[str, Any]) -> float:
+        try:
+            return float(line.get("quantity") or 1)
+        except Exception:
+            return 1.0
+
+    def package_products(package: dict[str, Any]) -> list[dict[str, Any]]:
+        products: list[dict[str, Any]] = []
+        for product in parse_json_list_value(package.get("products_json")):
+            if not isinstance(product, dict):
+                continue
+            cleaned = dict(product)
+            cleaned["title"] = useful_amazon_product_title(cleaned.get("title"))
+            products.append(cleaned)
+        return products
+
+    def package_asins(package: dict[str, Any]) -> list[str]:
+        products = package_products(package)
+        product_asins = unique_normalized_asins([product.get("asin") for product in products])
+        return product_asins or unique_normalized_asins(parse_json_list_value(package.get("asins_json")))
+
+    def compact_package_row(package: dict[str, Any]) -> dict[str, Any]:
+        products = package_products(package)
+        return compact_pending_package_payload({
+            "package_id": package.get("id"),
+            "package_index": package.get("package_index"),
+            "canonical_scan_code": package.get("canonical_scan_code") or "",
+            "scan_code": package.get("canonical_scan_code") if package_tracking_id_is_physical(package.get("canonical_scan_code")) else package.get("scan_code") or package.get("display_code"),
+            "display_code": package.get("display_code") or package.get("scan_code"),
+            "tracking_url": package.get("tracking_url") or "",
+            "carrier": package.get("carrier") or "",
+            "status": package.get("package_status") or package.get("promise") or "",
+            "promise": package.get("promise") or "",
+            "scan_status": package.get("scan_status") or "",
+            "received_at": package.get("received_at") or package.get("last_scanned_at") or "",
+            "asins": package_asins(package),
+            "products": products,
+            "order_line_ids": parse_json_list_value(package.get("order_line_ids_json")),
+        })
+
+    for row in rows:
+        order_name = clean_text(row.get("odoo_order_name")).upper()
+        sibling_lines = lines_by_order.get(order_name) or []
+        products_by_asin: dict[str, dict[str, str]] = {}
+        products_by_order: dict[str, dict[str, dict[str, str]]] = {}
+        for sibling in sibling_lines:
+            sibling_order_id = clean_text(sibling.get("amazon_order_id"))
+            for product in amazon_products_from_tracking_payload(sibling.get("tracking_payload") or ""):
+                add_product(products_by_asin, product)
+                add_order_product(products_by_asin, products_by_order, sibling_order_id, product)
+            sibling_packages = parse_tracking_packages(sibling.get("tracking_payload") or "")
+            add_packages(products_by_asin, sibling_packages)
+            add_order_packages(products_by_asin, products_by_order, sibling_order_id, sibling_packages)
+        for product in row.get("amazon_products") or []:
+            add_product(products_by_asin, product)
+            add_order_product(products_by_asin, products_by_order, clean_text(row.get("amazon_order_id")), product)
+        for order in [*(row.get("asin_matched_amazon_orders") or []), *(row.get("related_amazon_orders") or [])]:
+            associated_order_id = clean_text(order.get("amazon_order_id"))
+            for asin in order.get("asins") or []:
+                add_product(products_by_asin, asin)
+                add_order_product(products_by_asin, products_by_order, associated_order_id, asin)
+            associated_packages = order.get("packages") or []
+            add_packages(products_by_asin, associated_packages)
+            add_order_packages(products_by_asin, products_by_order, associated_order_id, associated_packages)
+
+        captured_asins = set(products_by_asin.keys())
+        order_summaries: dict[str, dict[str, Any]] = {}
+        for line in sibling_lines:
+            order_id = clean_text(line.get("amazon_order_id"))
+            if not order_id:
+                continue
+            entry = order_summaries.setdefault(order_id, {
+                "amazon_order_id": order_id,
+                "amazon_order_url": clean_text(line.get("amazon_order_url")) or order_line_amazon_url(order_id),
+                "status": "",
+                "state": "",
+                "tracking_checked_at": "",
+                "recipient": "",
+                "expected_asins": [],
+                "captured_asins": [],
+                "line_ids": [],
+                "quantity": 0.0,
+                "packages": [],
+                "sources": ["order_line"],
+            })
+            status = clean_text(line.get("tracking_status") or line.get("state"))
+            if status and tracking_status_rank(status) >= tracking_status_rank(entry.get("status")):
+                entry["status"] = status
+            entry["state"] = clean_text(line.get("state")) or entry.get("state") or ""
+            entry["tracking_checked_at"] = clean_text(line.get("tracking_checked_at")) or entry.get("tracking_checked_at") or ""
+            entry["line_ids"].append(int(line.get("id") or 0))
+            entry["quantity"] = float(entry.get("quantity") or 0) + line_quantity(line)
+            for asin in order_line_asin_aliases(line):
+                if asin not in entry["expected_asins"]:
+                    entry["expected_asins"].append(asin)
+        for package in packages_by_order_name.get(order_name) or []:
+            order_id = clean_text(package.get("amazon_order_id"))
+            if not order_id:
+                continue
+            entry = order_summaries.setdefault(order_id, {
+                "amazon_order_id": order_id,
+                "amazon_order_url": clean_text(package.get("amazon_order_url")) or order_line_amazon_url(order_id),
+                "status": "",
+                "state": "",
+                "tracking_checked_at": "",
+                "recipient": clean_text(package.get("recipient_ref")),
+                "expected_asins": [],
+                "captured_asins": [],
+                "line_ids": [],
+                "quantity": 0.0,
+                "packages": [],
+                "sources": [],
+            })
+            if "dispatch_package" not in entry["sources"]:
+                entry["sources"].append("dispatch_package")
+            if clean_text(package.get("recipient_ref")) and not clean_text(entry.get("recipient")):
+                entry["recipient"] = clean_text(package.get("recipient_ref"))
+            package_status_text = clean_text(package.get("package_status") or package.get("promise"))
+            if package_status_text and tracking_status_rank(package_status_text) >= tracking_status_rank(entry.get("status")):
+                entry["status"] = package_status_text
+            current_package_asins = package_asins(package)
+            for product in package_products(package):
+                add_order_product(products_by_asin, products_by_order, order_id, product)
+            for asin in current_package_asins:
+                add_order_product(products_by_asin, products_by_order, order_id, asin)
+                if asin not in entry["captured_asins"]:
+                    entry["captured_asins"].append(asin)
+                if asin not in entry["expected_asins"]:
+                    entry["expected_asins"].append(asin)
+            compact = compact_package_row(package)
+            if compact:
+                def compact_key(item: dict[str, Any]) -> str:
+                    return "|".join([
+                        clean_text(item.get("tracking_url")),
+                        clean_text(item.get("package_index")),
+                        ",".join(unique_normalized_asins(item.get("asins") or [])),
+                    ])
+                existing_keys = {compact_key(item) for item in entry.get("packages") or [] if isinstance(item, dict)}
+                key = compact_key(compact)
+                if key not in existing_keys:
+                    entry.setdefault("packages", []).append(compact)
+        for associated_order in [*(row.get("asin_matched_amazon_orders") or []), *(row.get("related_amazon_orders") or [])]:
+            order_id = clean_text(associated_order.get("amazon_order_id"))
+            if not order_id:
+                continue
+            entry = order_summaries.setdefault(order_id, {
+                "amazon_order_id": order_id,
+                "amazon_order_url": clean_text(associated_order.get("amazon_order_url")) or order_line_amazon_url(order_id),
+                "status": "",
+                "state": "",
+                "tracking_checked_at": "",
+                "recipient": clean_text(associated_order.get("recipient")),
+                "expected_asins": [],
+                "captured_asins": [],
+                "line_ids": [],
+                "quantity": 0.0,
+                "packages": [],
+                "sources": [],
+            })
+            for source in associated_order.get("sources") or []:
+                source_text = clean_text(source)
+                if source_text and source_text not in entry["sources"]:
+                    entry["sources"].append(source_text)
+            if clean_text(associated_order.get("recipient")) and not clean_text(entry.get("recipient")):
+                entry["recipient"] = clean_text(associated_order.get("recipient"))
+            if not entry["sources"]:
+                entry["sources"].append("amazon_association")
+            status_text = clean_text(associated_order.get("status"))
+            if status_text and tracking_status_rank(status_text) >= tracking_status_rank(entry.get("status")):
+                entry["status"] = status_text
+            for asin in unique_normalized_asins(associated_order.get("asins") or []):
+                add_order_product(products_by_asin, products_by_order, order_id, asin)
+                if asin not in entry["captured_asins"]:
+                    entry["captured_asins"].append(asin)
+                if asin not in entry["expected_asins"]:
+                    entry["expected_asins"].append(asin)
+            for package in associated_order.get("packages") or []:
+                if not isinstance(package, dict):
+                    continue
+                compact = compact_pending_package_payload(package)
+                if not compact:
+                    continue
+                add_order_packages(products_by_asin, products_by_order, order_id, [compact])
+                existing_keys = {
+                    "|".join([
+                        clean_text(item.get("tracking_url")),
+                        clean_text(item.get("package_index")),
+                        ",".join(unique_normalized_asins(item.get("asins") or [])),
+                    ])
+                    for item in entry.get("packages") or []
+                    if isinstance(item, dict)
+                }
+                key = "|".join([
+                    clean_text(compact.get("tracking_url")),
+                    clean_text(compact.get("package_index")),
+                    ",".join(unique_normalized_asins(compact.get("asins") or [])),
+                ])
+                if key not in existing_keys:
+                    entry.setdefault("packages", []).append(compact)
+
+        audit_items: list[dict[str, Any]] = []
+        missing_items: list[dict[str, Any]] = []
+        replacement_items: list[dict[str, Any]] = []
+        quantity_mismatch_items: list[dict[str, Any]] = []
+        for line in sibling_lines:
+            primary_asin = normalize_asin(line.get("asin"))
+            replacement_asin = normalize_asin(line.get("replacement_asin"))
+            aliases = order_line_asin_aliases(line)
+            matched_asins = [asin for asin in aliases if asin in captured_asins]
+            line_order_id = clean_text(line.get("amazon_order_id"))
+            line_tracking_status = clean_text((order_summaries.get(line_order_id) or {}).get("status") or line.get("tracking_status") or line.get("state"))
+            status = "matched" if matched_asins else "missing_amazon_item_capture"
+            if replacement_asin and replacement_asin in matched_asins and primary_asin not in matched_asins:
+                status = "replacement_matched"
+            expected_quantity = line_quantity(line)
+            matched_quantity = expected_quantity if matched_asins else 0.0
+            if matched_asins and expected_quantity > 1:
+                status = "quantity_unverified"
+            if line_tracking_status and tracking_status_rank(line_tracking_status) < tracking_status_rank("delivered"):
+                status = "amazon_order_not_delivered"
+            item = {
+                "line_id": int(line.get("id") or 0),
+                "odoo_line_id": int(line.get("odoo_line_id") or 0),
+                "product_name": clean_text(line.get("replacement_product_name")) if replacement_asin and replacement_asin in matched_asins else clean_text(line.get("product_name") or line.get("original_product_name")),
+                "primary_asin": primary_asin,
+                "replacement_asin": replacement_asin,
+                "expected_asins": aliases,
+                "quantity": expected_quantity,
+                "matched_quantity": matched_quantity,
+                "matched_asins": matched_asins,
+                "matched_products": [products_by_asin[asin] for asin in matched_asins if asin in products_by_asin],
+                "amazon_order_id": line_order_id,
+                "amazon_order_url": clean_text(line.get("amazon_order_url")) or order_line_amazon_url(line_order_id),
+                "tracking_status": line_tracking_status,
+                "state": clean_text(line.get("state")),
+                "status": status,
+            }
+            for asin in matched_asins:
+                product = products_by_asin.get(asin)
+                if product is not None and not useful_amazon_product_title(product.get("title")) and clean_text(item.get("product_name")):
+                    product["title"] = clean_text(item.get("product_name"))
+            audit_items.append(item)
+            if status == "missing_amazon_item_capture":
+                missing_items.append(item)
+            elif status == "replacement_matched":
+                replacement_items.append(item)
+            elif status == "quantity_mismatch":
+                quantity_mismatch_items.append(item)
+
+        def package_has_captured_items(order_id: str, package: dict[str, Any]) -> bool:
+            if unique_normalized_asins((package or {}).get("asins") or []):
+                return True
+            if [
+                product for product in ((package or {}).get("products") or [])
+                if isinstance(product, dict) and normalize_asin(product.get("asin"))
+            ]:
+                return True
+            return bool(products_by_order.get(clean_text(order_id)))
+
+        package_without_items = any(
+            not package_has_captured_items(clean_text(order.get("amazon_order_id")), package)
+            for order in [*(row.get("asin_matched_amazon_orders") or []), *(row.get("related_amazon_orders") or [])]
+            for package in (order.get("packages") or [])
+            if isinstance(package, dict)
+        )
+        discrepancies: list[dict[str, Any]] = []
+        if missing_items:
+            discrepancies.append({
+                "severity": "high",
+                "type": "missing_amazon_item_match",
+                "message": "Amazon order/package is linked, but not every Odoo item ASIN is proven by captured Amazon item data.",
+                "missing_asins": [item.get("primary_asin") for item in missing_items if item.get("primary_asin")],
+                "line_ids": [item.get("line_id") for item in missing_items if item.get("line_id")],
+            })
+        if quantity_mismatch_items:
+            discrepancies.append({
+                "severity": "high",
+                "type": "amazon_quantity_unverified",
+                "message": "Amazon item ASIN is captured, but the ordered quantity still needs manual verification.",
+                "missing_asins": [item.get("primary_asin") for item in quantity_mismatch_items if item.get("primary_asin")],
+                "line_ids": [item.get("line_id") for item in quantity_mismatch_items if item.get("line_id")],
+            })
+        pending_orders = [
+            order
+            for order in order_summaries.values()
+            if clean_text(order.get("amazon_order_id"))
+        ]
+        for order in pending_orders:
+            order_id = clean_text(order.get("amazon_order_id"))
+            captured_order_asins = unique_normalized_asins(order.get("captured_asins") or [])
+            package_order_asins = unique_normalized_asins([
+                asin
+                for package in order.get("packages") or []
+                if isinstance(package, dict)
+                for asin in (package.get("asins") or [])
+            ])
+            product_order_asins = unique_normalized_asins((products_by_order.get(order_id) or {}).keys())
+            display_asins = product_order_asins or package_order_asins or captured_order_asins
+            order["captured_asins"] = unique_normalized_asins([*captured_order_asins, *package_order_asins, *product_order_asins])
+            order["display_asins"] = display_asins
+            order["expected_quantity"] = order.get("quantity") or 0.0
+            display_line_ids = {
+                int(line_id or 0)
+                for line_id in order.get("line_ids") or []
+                if int(line_id or 0) > 0
+            }
+            display_quantity = 0.0
+            if display_asins:
+                display_asin_set = set(display_asins)
+                for line in sibling_lines:
+                    try:
+                        line_id = int(line.get("id") or 0)
+                    except Exception:
+                        line_id = 0
+                    if display_line_ids and line_id not in display_line_ids:
+                        continue
+                    if any(asin in display_asin_set for asin in order_line_asin_aliases(line)):
+                        display_quantity += line_quantity(line)
+            if not display_quantity and display_asins:
+                display_quantity = float(len(display_asins))
+            order["display_quantity"] = display_quantity
+            order["quantity"] = display_quantity
+        not_delivered_orders = [
+            order for order in pending_orders
+            if not tracking_status_rank(order.get("status")) >= tracking_status_rank("delivered")
+        ]
+        if not_delivered_orders:
+            discrepancies.append({
+                "severity": "high",
+                "type": "other_amazon_order_not_delivered",
+                "message": "This Odoo order has another Amazon order that is not delivered yet or still needs attention.",
+                "amazon_order_ids": [order.get("amazon_order_id") for order in not_delivered_orders],
+            })
+        if package_without_items:
+            discrepancies.append({
+                "severity": "high",
+                "type": "amazon_package_without_items",
+                "message": "At least one matched Amazon package has tracking data but no captured Amazon ASIN/title/thumbnail.",
+            })
+        if replacement_items:
+            discrepancies.append({
+                "severity": "info",
+                "type": "replacement_asin_matched",
+                "message": "Replacement ASIN was captured on Amazon for one or more Odoo lines.",
+                "replacement_asins": [item.get("replacement_asin") for item in replacement_items if item.get("replacement_asin")],
+            })
+        row["pending_item_audit"] = audit_items
+        row["pending_discrepancies"] = discrepancies
+        row["amazon_captured_products"] = list(products_by_asin.values())
+        row["pending_amazon_orders"] = sorted(pending_orders, key=lambda item: clean_text(item.get("amazon_order_id")))
+
+
+def enrich_pending_dispatch_rows(
+    rows: list[dict[str, Any]],
+    *,
+    include_shopify_status: bool = True,
+    allow_background_shopify_refresh: bool = True,
+    wait_for_shopify_refresh: bool = False,
+) -> None:
+    if not rows:
+        return
+
+    def run_with_connection(callback: Callable[[Any, list[dict[str, Any]]], None]) -> None:
+        with db() as conn:
+            callback(conn, rows)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(run_with_connection, attach_dispatch_package_codes_to_pending_rows),
+            executor.submit(run_with_connection, attach_manual_amazon_order_associations),
+        ]
+        if include_shopify_status:
+            futures.append(executor.submit(attach_shopify_status_to_rows, rows))
+        for future in futures:
+            future.result()
+
+    with db() as conn:
+        attach_pending_dispatch_item_audit(conn, rows)
+    hydrate_pending_row_amazon_products_from_associations(rows)
+    compact_pending_dispatch_rows(rows)
+    if include_shopify_status and allow_background_shopify_refresh and any(not clean_text(row.get("shopify_order_id")) for row in rows):
+        refresh_missing_shopify_status_for_rows(rows, wait=wait_for_shopify_refresh)
+        if wait_for_shopify_refresh:
+            attach_shopify_status_to_rows(rows)
+
+
+_PENDING_ASIN_REPAIR_LOCK = threading.Lock()
+_PENDING_ASIN_REPAIR_LAST_RUN = 0.0
+_FULFILMENT_PENDING_CACHE_LOCKS: dict[tuple[Any, ...], threading.Lock] = {}
+_FULFILMENT_PENDING_CACHE_LOCKS_LOCK = threading.Lock()
+
+
+def fulfilment_pending_cache_lock(cache_key: tuple[Any, ...]) -> threading.Lock:
+    with _FULFILMENT_PENDING_CACHE_LOCKS_LOCK:
+        lock = _FULFILMENT_PENDING_CACHE_LOCKS.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _FULFILMENT_PENDING_CACHE_LOCKS[cache_key] = lock
+        return lock
+
+
+def dispatch_package_payload_for_line_repair(package: dict[str, Any], asin: str) -> dict[str, Any]:
+    products = [
+        product for product in parse_json_list_value(package.get("products_json"))
+        if isinstance(product, dict)
+    ]
+    asins = unique_normalized_asins(parse_json_list_value(package.get("asins_json")))
+    line_asin = normalize_asin(asin)
+    if line_asin and line_asin not in asins:
+        asins.append(line_asin)
+    return {
+        "carrier": clean_text(package.get("carrier")),
+        "tracking_id": clean_text(package.get("display_code") or package.get("scan_code")),
+        "status": clean_text(package.get("package_status") or package.get("promise")) or "Delivered",
+        "promise": clean_text(package.get("promise") or package.get("package_status")),
+        "tracking_url": clean_text(package.get("tracking_url")),
+        "asins": asins,
+        "products": products,
+    }
+
+
+def repair_pending_dispatch_asin_mismatches(store_id: Optional[int] = None, limit: int = 250) -> int:
+    if not _PENDING_ASIN_REPAIR_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        now = utc_now()
+        repaired = 0
+        with db() as conn:
+            candidates = rows_to_dicts(conn.execute(
+                """
+                WITH mismatch AS (
+                    SELECT *
+                    FROM order_lines
+                    WHERE COALESCE(asin, '') != ''
+                      AND COALESCE(odoo_order_name, '') != ''
+                      AND state IN ('ordered', 'dispatched', 'delivered')
+                      AND (? IS NULL OR store_id=?)
+                )
+                SELECT DISTINCT ON (mismatch.id)
+                    mismatch.id AS line_id,
+                    mismatch.asin AS line_asin,
+                    package.id AS package_id,
+                    package.scan_code,
+                    package.display_code,
+                    package.amazon_order_id AS package_amazon_order_id,
+                    package.amazon_order_url AS package_amazon_order_url,
+                    package.package_status,
+                    package.promise,
+                    package.carrier,
+                    package.tracking_url,
+                    package.asins_json,
+                    package.products_json
+                FROM mismatch
+                JOIN amazon_dispatch_packages package
+                  ON package.store_id=mismatch.store_id
+                 AND UPPER(package.odoo_order_name)=UPPER(mismatch.odoo_order_name)
+                 AND COALESCE(package.amazon_order_id, '') != ''
+                 AND package.amazon_order_id != COALESCE(mismatch.amazon_order_id, '')
+                 AND package.asins_json ILIKE ('%' || mismatch.asin || '%')
+                 AND (
+                    mismatch.tracking_status='ASIN mismatch'
+                    OR COALESCE(mismatch.amazon_order_id, '') = ''
+                    OR NOT (
+                        COALESCE(mismatch.tracking_payload, '') ILIKE ('%' || mismatch.asin || '%')
+                        AND COALESCE(mismatch.tracking_payload, '') ILIKE ('%' || COALESCE(mismatch.amazon_order_id, '') || '%')
+                    )
+                 )
+                ORDER BY mismatch.id,
+                    CASE
+                      WHEN LOWER(COALESCE(package.package_status, '') || ' ' || COALESCE(package.promise, '')) LIKE '%delivered%' THEN 0
+                      ELSE 1
+                    END,
+                    package.updated_at DESC,
+                    package.id DESC
+                LIMIT ?
+                """,
+                (store_id, store_id, max(1, int(limit or 250))),
+            ).fetchall())
+            for candidate in candidates:
+                line_asin = normalize_asin(candidate.get("line_asin"))
+                if not line_asin:
+                    continue
+                package_asins = set(unique_normalized_asins(parse_json_list_value(candidate.get("asins_json"))))
+                if line_asin not in package_asins:
+                    continue
+                package_payload = dispatch_package_payload_for_line_repair({
+                    "carrier": candidate.get("carrier"),
+                    "display_code": candidate.get("display_code"),
+                    "scan_code": candidate.get("scan_code"),
+                    "package_status": candidate.get("package_status"),
+                    "promise": candidate.get("promise"),
+                    "tracking_url": candidate.get("tracking_url"),
+                    "asins_json": candidate.get("asins_json"),
+                    "products_json": candidate.get("products_json"),
+                }, line_asin)
+                package_status = tracking_status_from_packages([package_payload])
+                line_delivered = tracking_package_delivered(package_payload)
+                new_order_id = clean_text(candidate.get("package_amazon_order_id"))
+                new_order_url = clean_text(candidate.get("package_amazon_order_url")) or order_line_amazon_url(new_order_id)
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_id=?,
+                        amazon_order_url=?,
+                        tracking_status=?,
+                        tracking_payload=?,
+                        tracking_checked_at=?,
+                        state=CASE WHEN ? THEN 'delivered' WHEN state='delivered' THEN 'dispatched' ELSE state END,
+                        last_error=NULL,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        new_order_id,
+                        new_order_url,
+                        package_status,
+                        json.dumps([package_payload], default=str)[:4000],
+                        now,
+                        bool(line_delivered),
+                        now,
+                        candidate["line_id"],
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE amazon_dispatch_packages
+                    SET order_line_ids_json=?,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (json.dumps([int(candidate["line_id"])]), now, candidate["package_id"]),
+                )
+                mark_history_tracking_order_status(conn, new_order_id, new_order_url, [package_payload])
+                repaired += 1
+        if repaired:
+            fast_page_cache_clear_matching({
+                "fulfilment-pending",
+                "tracking-orders",
+                "dispatch-status",
+                "dispatch-status-summary",
+                "dispatch-sorting-summary",
+                "dispatch-sorting-summary-base",
+            })
+            enqueue_dispatch_summary_warm(store_id)
+        return repaired
+    finally:
+        _PENDING_ASIN_REPAIR_LOCK.release()
+
+
+def maybe_repair_pending_dispatch_asin_mismatches(store_id: Optional[int] = None) -> None:
+    global _PENDING_ASIN_REPAIR_LAST_RUN
+    now = time.monotonic()
+    if now - _PENDING_ASIN_REPAIR_LAST_RUN < 120:
+        return
+    _PENDING_ASIN_REPAIR_LAST_RUN = now
+    threading.Thread(target=repair_pending_dispatch_asin_mismatches, args=(store_id,), daemon=True).start()
+
+
+PENDING_DISPATCH_READY_PART_SQL = """
+        (
+          EXISTS (
+            SELECT 1
+            FROM order_lines ready_line
+            WHERE ready_line.store_id=order_lines.store_id
+              AND UPPER(ready_line.odoo_order_name)=UPPER(order_lines.odoo_order_name)
+              AND COALESCE(ready_line.amazon_order_id, '') != ''
+              AND (
+                ready_line.state='delivered'
+                OR LOWER(COALESCE(ready_line.tracking_status, '')) = 'delivered'
+                OR LOWER(COALESCE(ready_line.tracking_status, '')) LIKE 'delivered %'
+                OR LOWER(COALESCE(ready_line.tracking_status, '')) LIKE 'arriving today%'
+                OR LOWER(COALESCE(ready_line.tracking_status, '')) = 'out for delivery'
+              )
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM amazon_dispatch_packages ready_package
+            WHERE ready_package.store_id=order_lines.store_id
+              AND UPPER(ready_package.odoo_order_name)=UPPER(order_lines.odoo_order_name)
+              AND COALESCE(ready_package.amazon_order_id, '') != ''
+              AND (
+                LOWER(COALESCE(ready_package.package_status, '')) LIKE '%delivered%'
+                OR LOWER(COALESCE(ready_package.promise, '')) LIKE '%delivered%'
+                OR LOWER(COALESCE(ready_package.package_status, '')) LIKE 'arriving today%'
+                OR LOWER(COALESCE(ready_package.promise, '')) LIKE 'arriving today%'
+                OR LOWER(COALESCE(ready_package.package_status, '')) = 'out for delivery'
+                OR LOWER(COALESCE(ready_package.promise, '')) = 'out for delivery'
+              )
+          )
+        )
+"""
 
 
 def paged_delivered_unfulfilled_rows(
@@ -11140,14 +13264,13 @@ def paged_delivered_unfulfilled_rows(
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     search = clean_text(q)
+    exact_order_ref_for_fast_path = search.upper() if ORDER_REF_RE.fullmatch(search.upper()) else ""
+    if exact_order_ref_for_fast_path:
+        return paged_delivered_unfulfilled_rows_for_exact_order_ref(store_id, page, per_page, exact_order_ref_for_fast_path, sort_by, sort_dir)
     search_like = f"%{search}%" if search else None
     where_sql = """
         COALESCE(order_lines.amazon_order_id, '') != ''
-        AND (
-          order_lines.state = 'delivered'
-          OR order_lines.tracking_status = 'Delivered'
-          OR LOWER(COALESCE(order_lines.tracking_status, '')) = 'delivered'
-        )
+        AND {ready_part_sql}
         AND (? IS NULL OR order_lines.store_id=?)
         AND NOT EXISTS (
           SELECT 1
@@ -11164,33 +13287,114 @@ def paged_delivered_unfulfilled_rows(
             AND COALESCE(fulfilled_shopify_order.cancelled_at, '') = ''
             AND UPPER(REPLACE(COALESCE(fulfilled_shopify_order.fulfillment_status, ''), ' ', '_')) IN ('FULFILLED', 'PARTIALLY_FULFILLED', 'PARTIAL')
         )
+    """.format(ready_part_sql=PENDING_DISPATCH_READY_PART_SQL)
+    params = [
+        store_id,
+        store_id,
+    ]
+    exact_order_ref = search.upper() if ORDER_REF_RE.fullmatch(search.upper()) else ""
+    exact_amazon_order_id = search if re.fullmatch(r"\d{3}-\d{7}-\d{7}", search) else ""
+    source_sql = "order_lines"
+    source_params: list[Any] = []
+    if exact_order_ref:
+        source_sql = "(SELECT * FROM order_lines WHERE odoo_order_name=? AND COALESCE(amazon_order_id, '') != '') order_lines"
+        source_params.append(exact_order_ref)
+    elif exact_amazon_order_id:
+        where_sql += """
         AND (
-          ? IS NULL
-          OR order_lines.odoo_order_name ILIKE ?
+          order_lines.amazon_order_id=?
+          OR EXISTS (
+            SELECT 1
+            FROM amazon_dispatch_packages search_package
+            WHERE search_package.store_id=order_lines.store_id
+              AND search_package.odoo_order_name=order_lines.odoo_order_name
+              AND search_package.amazon_order_id=?
+          )
+        )
+        """
+        params.extend([exact_amazon_order_id, exact_amazon_order_id])
+    elif search:
+        where_sql += """
+        AND (
+          order_lines.odoo_order_name ILIKE ?
           OR order_lines.amazon_order_id ILIKE ?
           OR order_lines.asin ILIKE ?
           OR order_lines.product_name ILIKE ?
-          OR order_lines.tracking_payload ILIKE ?
           OR order_lines.amazon_account_name ILIKE ?
+          OR EXISTS (
+            SELECT 1
+            FROM amazon_dispatch_packages search_package
+            WHERE search_package.store_id=order_lines.store_id
+              AND search_package.odoo_order_name=order_lines.odoo_order_name
+              AND (
+                search_package.amazon_order_id ILIKE ?
+                OR search_package.scan_code ILIKE ?
+                OR search_package.asins_json ILIKE ?
+                OR search_package.products_json ILIKE ?
+              )
+          )
         )
-    """
-    params = [store_id, store_id, search_like, search_like, search_like, search_like, search_like, search_like, search_like]
+        """
+        params.extend([
+            search_like,
+            search_like,
+            search_like,
+            search_like,
+            search_like,
+            search_like,
+            search_like,
+            search_like,
+            search_like,
+        ])
+    sort_sql = "order_lines.tracking_checked_at ASC, order_lines.ordered_at ASC, order_lines.updated_at ASC"
+    sort_key = clean_text(sort_by).lower().replace("-", "_")
+    sort_direction = clean_text(sort_dir).lower()
+    sql_sort_dir = "DESC" if sort_direction == "desc" else "ASC"
+    if sort_key == "status":
+        sort_sql = f"LOWER(COALESCE(order_lines.tracking_status, order_lines.state, '')) {sql_sort_dir}, order_lines.tracking_checked_at ASC, order_lines.updated_at ASC"
+    elif sort_key == "checked_at":
+        sort_sql = f"order_lines.tracking_checked_at {sql_sort_dir}, order_lines.updated_at {sql_sort_dir}"
+    elif sort_key == "delivery_date" and sort_direction == "desc":
+        sort_sql = "order_lines.tracking_checked_at DESC, order_lines.ordered_at DESC, order_lines.updated_at DESC"
     with db() as conn:
+        count_cache_key = (
+            "fulfilment-pending-count",
+            store_id,
+            clean_text(q),
+            sort_key,
+            sort_direction,
+        )
+        total = fast_page_cache_get(count_cache_key)
+        if total is None:
+            total_row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM {source_sql}
+                JOIN stores ON stores.id=order_lines.store_id
+                WHERE {where_sql}
+                """,
+                [*source_params, *params],
+            ).fetchone()
+            total = int((total_row or {}).get("count") or 0)
+            fast_page_cache_set(count_cache_key, total, 90)
         rows = conn.execute(
             f"""
             SELECT order_lines.id, order_lines.store_id, order_lines.odoo_order_id, order_lines.odoo_order_name,
                    order_lines.odoo_line_id, order_lines.odoo_order_state, order_lines.odoo_order_date,
                    order_lines.odoo_invoice_status, order_lines.odoo_status_label, order_lines.asin,
-                   order_lines.product_name, order_lines.state, order_lines.amazon_order_id,
+                   order_lines.asin_from_reference, order_lines.asin_from_note, order_lines.original_asin,
+                   order_lines.replacement_asin, order_lines.replacement_product_name, order_lines.replacement_note,
+                   order_lines.original_product_name, order_lines.product_name, order_lines.state, order_lines.amazon_order_id,
                    order_lines.amazon_order_url, order_lines.amazon_account_name, order_lines.tracking_status,
                    order_lines.tracking_payload, order_lines.tracking_checked_at, order_lines.ordered_at,
                    order_lines.updated_at, stores.name AS store_name, stores.odoo_url AS store_odoo_url
-            FROM order_lines
+            FROM {source_sql}
             JOIN stores ON stores.id=order_lines.store_id
             WHERE {where_sql}
-            ORDER BY order_lines.tracking_checked_at ASC, order_lines.ordered_at ASC, order_lines.updated_at ASC
+            ORDER BY {sort_sql}
+            LIMIT ? OFFSET ?
             """,
-            params,
+            [*source_params, *params, per_page, offset],
         ).fetchall()
     results: list[dict[str, Any]] = []
     for row in rows:
@@ -11199,17 +13403,25 @@ def paged_delivered_unfulfilled_rows(
         data["odoo_order_url"] = odoo_order_admin_url(store, row["odoo_order_id"]) if store else ""
         data["amazon_order_url"] = data.get("amazon_order_url") or order_line_amazon_url(row["amazon_order_id"])
         data["asin_url"] = asin_product_url(data.get("asin") or "")
+        data["tracking_payload"] = json.dumps(parse_tracking_packages(data.get("tracking_payload") or ""), default=str)[:4000]
         data["amazon_products"] = amazon_products_from_tracking_payload(
             data.get("tracking_payload") or "",
             data.get("asin") or "",
-            data.get("product_name") or "",
+            "",
         )
         data["amazon_product_asins"] = ", ".join(product["asin"] for product in data["amazon_products"])
         data.update(amazon_delivery_info_from_payload(data.get("tracking_payload") or "", data.get("tracking_checked_at") or ""))
+        delivered_for_dispatch = tracking_status_rank(
+            " ".join([clean_text(data.get("tracking_status")), clean_text(data.get("amazon_delivered_display"))])
+        ) >= tracking_status_rank("delivered")
         data.update(
             {
-                "fulfilment_status": "fulfilment pending",
-                "message": "Amazon delivered locally, but no Shopify tracking sync has been recorded for this Odoo order.",
+                "fulfilment_status": "fulfilment pending" if delivered_for_dispatch else "awaiting Amazon delivery",
+                "message": (
+                    "Amazon delivered locally, but no Shopify tracking sync has been recorded for this Odoo order."
+                    if delivered_for_dispatch
+                    else "Amazon order is linked but not delivered yet; keep tracking the expected arrival before dispatch."
+                ),
                 "picking_ids": [],
                 "picking_names": [],
                 "picking_states": [],
@@ -11219,9 +13431,55 @@ def paged_delivered_unfulfilled_rows(
         )
         data.pop("store_odoo_url", None)
         results.append(data)
-    total = len(results)
-    sort_key = clean_text(sort_by).lower().replace("-", "_")
-    sort_direction = clean_text(sort_dir).lower()
+    grouped_results: dict[tuple[Any, str, str], dict[str, Any]] = {}
+    for row in results:
+        key = (
+            row.get("store_id"),
+            clean_text(row.get("odoo_order_name")).upper(),
+            clean_text(row.get("amazon_order_id")),
+            normalize_asin(row.get("asin")),
+        )
+        existing = grouped_results.get(key)
+        if existing is None:
+            grouped_results[key] = row
+            continue
+        existing_rank = tracking_status_rank(
+            " ".join([clean_text(existing.get("tracking_status")), clean_text(existing.get("amazon_delivered_display"))])
+        )
+        row_rank = tracking_status_rank(
+            " ".join([clean_text(row.get("tracking_status")), clean_text(row.get("amazon_delivered_display"))])
+        )
+        keeper, extra = (row, existing) if row_rank > existing_rank else (existing, row)
+        products = []
+        seen_product_keys = set()
+        for source in (keeper, extra):
+            for product in source.get("amazon_products") or []:
+                product_key = clean_text(product.get("asin")) or clean_text(product.get("url")) or clean_text(product.get("title"))
+                if product_key and product_key in seen_product_keys:
+                    continue
+                if product_key:
+                    seen_product_keys.add(product_key)
+                products.append(product)
+        asins = []
+        for source in (keeper, extra):
+            for asin in re.split(r"[,\s]+", clean_text(source.get("amazon_product_asins") or source.get("asin"))):
+                normalized = normalize_asin(asin)
+                if normalized and normalized not in asins:
+                    asins.append(normalized)
+        if products:
+            keeper["amazon_products"] = products
+        if asins:
+            keeper["amazon_product_asins"] = ", ".join(asins)
+        names = [
+            clean_text(value)
+            for value in (keeper.get("product_name"), extra.get("product_name"))
+            if clean_text(value)
+        ]
+        unique_names = list(dict.fromkeys(names))
+        if len(unique_names) > 1:
+            keeper["product_name"] = " | ".join(unique_names)
+        grouped_results[key] = keeper
+    results = list(grouped_results.values())
     reverse = sort_direction == "desc"
 
     def sort_timestamp(value: Any) -> float:
@@ -11252,14 +13510,112 @@ def paged_delivered_unfulfilled_rows(
         return (delivered_value, status_value, clean_text(row.get("odoo_order_name")).upper(), int(row.get("id") or 0))
 
     results.sort(key=pending_sort_value, reverse=reverse if sort_key != "delivery_date" else False)
-    results = results[offset:offset + per_page]
-    attach_shopify_status_to_rows(results)
-    if any(not clean_text(row.get("shopify_order_id")) for row in results):
-        unique_result_names = {clean_text(row.get("odoo_order_name")).upper() for row in results if clean_text(row.get("odoo_order_name"))}
-        wait_for_refresh = bool(search and len(unique_result_names) <= 5)
-        refresh_missing_shopify_status_for_rows(results, wait=wait_for_refresh)
-        if wait_for_refresh:
-            attach_shopify_status_to_rows(results)
+    results = results[:per_page]
+    # Page reads should stay fast. Shopify live refreshes are queued in the background
+    # so changing pages does not wait on remote store checks.
+    enrich_pending_dispatch_rows(
+        results,
+        include_shopify_status=True,
+        allow_background_shopify_refresh=True,
+        wait_for_shopify_refresh=False,
+    )
+    return results, total, page, per_page
+
+
+def paged_delivered_unfulfilled_rows_for_exact_order_ref(
+    store_id: Optional[int],
+    page: int,
+    per_page: int,
+    order_ref: str,
+    sort_by: str = "delivery_date",
+    sort_dir: str = "asc",
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    order_ref = clean_text(order_ref).upper()
+    if not order_ref:
+        return [], 0, page, per_page
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT order_lines.id, order_lines.store_id, order_lines.odoo_order_id, order_lines.odoo_order_name,
+                   order_lines.odoo_line_id, order_lines.odoo_order_state, order_lines.odoo_order_date,
+                   order_lines.odoo_invoice_status, order_lines.odoo_status_label, order_lines.asin,
+                   order_lines.asin_from_reference, order_lines.asin_from_note, order_lines.original_asin,
+                   order_lines.replacement_asin, order_lines.replacement_product_name, order_lines.replacement_note,
+                   order_lines.original_product_name, order_lines.product_name, order_lines.state, order_lines.amazon_order_id,
+                   order_lines.amazon_order_url, order_lines.amazon_account_name, order_lines.tracking_status,
+                   order_lines.tracking_payload, order_lines.tracking_checked_at, order_lines.ordered_at,
+                   order_lines.updated_at, stores.name AS store_name, stores.odoo_url AS store_odoo_url
+            FROM order_lines
+            JOIN stores ON stores.id=order_lines.store_id
+            WHERE order_lines.odoo_order_name=?
+              AND COALESCE(order_lines.amazon_order_id, '') != ''
+              AND {ready_part_sql}
+              AND (? IS NULL OR order_lines.store_id=?)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM shopify_tracking_sync_log
+                JOIN stores tracking_store ON tracking_store.odoo_db=shopify_tracking_sync_log.odoo_db
+                WHERE tracking_store.id=order_lines.store_id
+                  AND shopify_tracking_sync_log.odoo_order=order_lines.odoo_order_name
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM shopify_order_status_cache fulfilled_shopify_order
+                WHERE fulfilled_shopify_order.store_id=order_lines.store_id
+                  AND UPPER(fulfilled_shopify_order.odoo_order_name)=UPPER(order_lines.odoo_order_name)
+                  AND COALESCE(fulfilled_shopify_order.cancelled_at, '') = ''
+                  AND UPPER(REPLACE(COALESCE(fulfilled_shopify_order.fulfillment_status, ''), ' ', '_')) IN ('FULFILLED', 'PARTIALLY_FULFILLED', 'PARTIAL')
+              )
+            ORDER BY order_lines.tracking_checked_at ASC, order_lines.ordered_at ASC, order_lines.updated_at ASC, order_lines.id ASC
+            """.format(ready_part_sql=PENDING_DISPATCH_READY_PART_SQL),
+            (order_ref, store_id, store_id),
+        ).fetchall())
+
+    filtered_rows = rows
+    total = len(filtered_rows)
+    page_rows = filtered_rows[offset:offset + per_page]
+    results: list[dict[str, Any]] = []
+    for row in page_rows:
+        data = dict(row)
+        store = {"id": row["store_id"], "name": row["store_name"], "odoo_url": row["store_odoo_url"]}
+        data["odoo_order_url"] = odoo_order_admin_url(store, row["odoo_order_id"]) if store else ""
+        data["amazon_order_url"] = data.get("amazon_order_url") or order_line_amazon_url(row["amazon_order_id"])
+        data["asin_url"] = asin_product_url(data.get("asin") or "")
+        data["tracking_payload"] = json.dumps(parse_tracking_packages(data.get("tracking_payload") or ""), default=str)[:4000]
+        data["amazon_products"] = amazon_products_from_tracking_payload(
+            data.get("tracking_payload") or "",
+            data.get("asin") or "",
+            "",
+        )
+        data["amazon_product_asins"] = ", ".join(product["asin"] for product in data["amazon_products"])
+        data.update(amazon_delivery_info_from_payload(data.get("tracking_payload") or "", data.get("tracking_checked_at") or ""))
+        delivered_for_dispatch = tracking_status_rank(
+            " ".join([clean_text(data.get("tracking_status")), clean_text(data.get("amazon_delivered_display"))])
+        ) >= tracking_status_rank("delivered")
+        data.update(
+            {
+                "fulfilment_status": "fulfilment pending" if delivered_for_dispatch else "awaiting Amazon delivery",
+                "message": (
+                    "Amazon delivered locally, but no Shopify tracking sync has been recorded for this Odoo order."
+                    if delivered_for_dispatch
+                    else "Amazon order is linked but not delivered yet; keep tracking the expected arrival before dispatch."
+                ),
+                "picking_ids": [],
+                "picking_names": [],
+                "picking_states": [],
+                "open_picking_ids": [],
+                "open_picking_names": [],
+            }
+        )
+        data.pop("store_odoo_url", None)
+        results.append(data)
+    enrich_pending_dispatch_rows(
+        results,
+        include_shopify_status=True,
+        allow_background_shopify_refresh=True,
+        wait_for_shopify_refresh=False,
+    )
     return results, total, page, per_page
 
 
@@ -14041,15 +16397,187 @@ def shopify_route_for_order(store_id: int, odoo_order_id: int) -> tuple[str, str
     return route, country_code or country_name
 
 
+def active_shopify_orders_for_odoo_order(store_id: int, order_name: str) -> list[dict[str, Any]]:
+    clean_order_name = clean_text(order_name).upper()
+    if not clean_order_name:
+        return []
+    matches: list[dict[str, Any]] = []
+    for route in ("dtc", "dtb"):
+        clients = shopify_clients_for_route(route)
+        for client in clients:
+            orders = [order for order in shopify_orders_by_name(client, clean_order_name, limit=10) if not order.get("cancelled_at")]
+            for order in orders:
+                upsert_shopify_order_status(store_id, route, client.name, client.shop, clean_order_name, order)
+                matches.append({
+                    **order,
+                    "route": route,
+                    "dest_name": client.name,
+                    "shop": client.shop,
+                })
+    return matches
+
+
+def force_enqueue_shopify_fulfilment_for_line_ids(store_id: int, line_ids: list[int]) -> dict[str, Any]:
+    selected_ids = sorted({int(line_id) for line_id in (line_ids or []) if int(line_id or 0) > 0})
+    if not selected_ids:
+        raise HTTPException(400, "Select at least one order line to push to Shopify.")
+    max_attempts = max(1, min(20, int(float(get_service_settings().get("shopify_job_max_attempts") or 5))))
+    now = utc_now()
+    queued = 0
+    skipped = 0
+    duplicate_messages: list[str] = []
+    error_messages: list[str] = []
+    queued_messages: list[str] = []
+    with db() as conn:
+        selected_ids = validate_line_ids_for_store(conn, store_id, selected_ids, "Push to Shopify")
+        store_row = conn.execute("SELECT odoo_db FROM stores WHERE id=?", (store_id,)).fetchone()
+        odoo_db = clean_text((store_row or {}).get("odoo_db"))
+        placeholders = ",".join("?" for _ in selected_ids)
+        selected_rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT id, store_id, odoo_order_id, odoo_order_name
+            FROM order_lines
+            WHERE id IN ({placeholders})
+            ORDER BY odoo_order_id, id
+            """,
+            selected_ids,
+        ).fetchall())
+        order_keys = sorted({
+            (int(row["odoo_order_id"]), clean_text(row.get("odoo_order_name")).upper())
+            for row in selected_rows
+            if row.get("odoo_order_id") and clean_text(row.get("odoo_order_name"))
+        })
+        if not order_keys:
+            raise HTTPException(400, "Selected rows do not include a valid Odoo order.")
+        for odoo_order_id, order_name in order_keys:
+            order_lines = rows_to_dicts(conn.execute(
+                """
+                SELECT *
+                FROM order_lines
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND UPPER(odoo_order_name)=?
+                ORDER BY id
+                """,
+                (store_id, odoo_order_id, order_name),
+            ).fetchall())
+            eligible_lines = [
+                row for row in order_lines
+                if (
+                    clean_text(row.get("amazon_order_id")) and clean_text(row.get("state")) in {"ordered", "dispatched", "delivered"}
+                ) or (
+                    clean_text(row.get("order_engine")) == "inventory" and clean_text(row.get("state")) in {"inventory", "delivered"}
+                )
+            ]
+            if not eligible_lines:
+                skipped += 1
+                error_messages.append(f"{order_name}: no Amazon-ordered or inventory-assigned line ready for Shopify.")
+                continue
+            try:
+                active_existing = active_shopify_orders_for_odoo_order(store_id, order_name)
+            except Exception as exc:
+                skipped += 1
+                error_messages.append(f"{order_name}: Shopify duplicate check failed: {str(exc)[:300]}")
+                continue
+            if active_existing:
+                skipped += 1
+                refs = ", ".join(
+                    sorted({
+                        f"{clean_text(order.get('route')).upper()} {clean_text(order.get('name')) or clean_text(order.get('id'))}"
+                        for order in active_existing
+                        if clean_text(order.get("name")) or clean_text(order.get("id"))
+                    })
+                )
+                duplicate_messages.append(f"{order_name}: already exists in Shopify ({refs or 'active order found'}).")
+                continue
+            route, country = shopify_route_for_order(store_id, odoo_order_id)
+            other_route = "dtc" if route == "dtb" else "dtb"
+            line_ids_for_order = sorted({int(row["id"]) for row in eligible_lines})
+            if odoo_db:
+                conn.execute(
+                    """
+                    DELETE FROM shopify_export_order_map
+                    WHERE src_order_key=?
+                      AND state_scope IN ('dtc', 'dtb')
+                    """,
+                    (f"{odoo_db}:{order_name}",),
+                )
+            conn.execute(
+                """
+                DELETE FROM shopify_fulfilment_jobs
+                WHERE store_id=?
+                  AND odoo_order_name=?
+                  AND route=?
+                  AND status NOT IN ('running', 'completed')
+                """,
+                (store_id, order_name, other_route),
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO shopify_fulfilment_jobs
+                (id, store_id, odoo_order_id, odoo_order_name, route, status, attempts, max_attempts,
+                 last_error, next_run_at, source_line_ids_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'amazon_placed', 0, ?, '', ?, ?, ?, ?)
+                ON CONFLICT(store_id, odoo_order_name, route) DO UPDATE SET
+                  status='amazon_placed',
+                  attempts=0,
+                  last_error='',
+                  next_run_at=excluded.next_run_at,
+                  completed_at=NULL,
+                  source_line_ids_json=excluded.source_line_ids_json,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    uuid.uuid4().hex,
+                    store_id,
+                    odoo_order_id,
+                    order_name,
+                    route,
+                    max_attempts,
+                    now,
+                    json.dumps(line_ids_for_order),
+                    now,
+                    now,
+                ),
+            )
+            queued += max(0, int(cursor.rowcount or 0))
+            note = f"Manual Shopify {route.upper()} push queued ({country or 'unknown country'}; duplicate checked DTC/DTB)"
+            conn.execute(
+                f"""
+                UPDATE order_lines
+                SET fulfilment_note=CASE
+                      WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                      WHEN fulfilment_note LIKE ? THEN fulfilment_note
+                      ELSE fulfilment_note || ' | ' || ?
+                    END,
+                    updated_at=?
+                WHERE id IN ({",".join("?" for _ in line_ids_for_order)})
+                """,
+                [note, f"%{note}%", note, utc_now(), *line_ids_for_order],
+            )
+            queued_messages.append(f"{order_name}: queued for Shopify {route.upper()}.")
+    fast_page_cache_clear_matching({"shopify-fulfilment", "fulfilment-pending", "dashboard", "orders"})
+    return {
+        "queued": queued,
+        "skipped": skipped,
+        "duplicates": duplicate_messages,
+        "errors": error_messages,
+        "details": queued_messages,
+    }
+
+
 def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
     settings = get_service_settings()
     if str(settings.get("shopify_auto_enqueue_enabled", "true")).lower() not in {"1", "true", "yes", "on"}:
         return 0
     grouped: dict[tuple[int, int, str], list[int]] = {}
     for row in rows:
-        if not row.get("amazon_order_id"):
+        engine = clean_text(row.get("order_engine"))
+        state = clean_text(row.get("state"))
+        is_inventory_fulfilment = engine == "inventory" and state in {"inventory", "delivered"}
+        if not is_inventory_fulfilment and not row.get("amazon_order_id"):
             continue
-        if clean_text(row.get("order_engine")) not in {"chrome", "rest", "cxml", "manual_amazon", "third_party"}:
+        if engine not in {"chrome", "rest", "cxml", "manual_amazon", "third_party", "inventory"}:
             continue
         grouped.setdefault((int(row["store_id"]), int(row["odoo_order_id"]), str(row["odoo_order_name"])), []).append(int(row["id"]))
     inserted = 0
@@ -14642,6 +17170,21 @@ def sync_shopify_status_for_order_names(store_id: int, order_names: list[str], f
                     continue
 
 
+_SHOPIFY_STATUS_CACHE_ENSURED = False
+_SHOPIFY_STATUS_CACHE_ENSURE_LOCK = threading.Lock()
+
+
+def ensure_shopify_order_status_cache_table_once() -> None:
+    global _SHOPIFY_STATUS_CACHE_ENSURED
+    if _SHOPIFY_STATUS_CACHE_ENSURED:
+        return
+    with _SHOPIFY_STATUS_CACHE_ENSURE_LOCK:
+        if _SHOPIFY_STATUS_CACHE_ENSURED:
+            return
+        ensure_shopify_order_status_cache_table()
+        _SHOPIFY_STATUS_CACHE_ENSURED = True
+
+
 def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any] = None) -> list[dict[str, Any]]:
     if not rows:
         return rows
@@ -14649,16 +17192,18 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
     order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in rows if clean_text(row.get("odoo_order_name"))})
     if not store_ids or not order_names:
         return rows
-    ensure_shopify_order_status_cache_table()
+    ensure_shopify_order_status_cache_table_once()
     def fetch_cached_status(active_conn: Any) -> list[dict[str, Any]]:
         return active_conn.execute(
             f"""
-            SELECT DISTINCT ON (store_id, UPPER(odoo_order_name))
-                   *
+            SELECT DISTINCT ON (store_id, odoo_order_name)
+                   store_id, odoo_order_name, shopify_order_id, shopify_order_name,
+                   shopify_order_url, financial_status, fulfillment_status,
+                   fulfillment_at, cancelled_at, synced_at
             FROM shopify_order_status_cache
             WHERE store_id = ANY(?::int[])
-              AND UPPER(odoo_order_name) = ANY(?::text[])
-            ORDER BY store_id, UPPER(odoo_order_name),
+              AND odoo_order_name = ANY(?::text[])
+            ORDER BY store_id, odoo_order_name,
                      CASE WHEN COALESCE(cancelled_at, '') = '' THEN 0 ELSE 1 END,
                      CASE WHEN fulfillment_status ILIKE '%FULFILLED%' THEN 0 ELSE 1 END,
                      synced_at DESC
@@ -14702,7 +17247,7 @@ def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait:
     if wait:
         for store_id, order_names in groups.items():
             sync_shopify_status_for_order_names(store_id, sorted(order_names), force=True)
-        fast_page_cache_clear_matching({"dashboard", "orders"})
+        fast_page_cache_clear_matching({"dashboard", "orders", "fulfilment-pending"})
         return sum(len(order_names) for order_names in groups.values())
 
     queued_groups: dict[int, set[str]] = {}
@@ -14723,7 +17268,7 @@ def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait:
         try:
             for store_id, order_names in queued_groups.items():
                 sync_shopify_status_for_order_names(store_id, sorted(order_names), force=True)
-            fast_page_cache_clear_matching({"dashboard", "orders"})
+                fast_page_cache_clear_matching({"dashboard", "orders", "fulfilment-pending"})
         finally:
             with _SHOPIFY_STATUS_REFRESH_LOCK:
                 for key in queued_keys:
@@ -15151,6 +17696,24 @@ def shopify_should_check_existing_order(job: dict[str, Any]) -> bool:
     order_name = clean_text(job.get("odoo_order_name")).upper()
     if order_name in SHOPIFY_FAST_EXPORT_EXCEPTIONS:
         return True
+    try:
+        line_ids = [int(line_id) for line_id in json.loads(clean_text(job.get("source_line_ids_json")) or "[]") if int(line_id or 0) > 0]
+    except Exception:
+        line_ids = []
+    if line_ids:
+        with db() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM order_lines
+                WHERE id IN ({",".join("?" for _ in line_ids)})
+                  AND order_engine='inventory'
+                LIMIT 1
+                """,
+                line_ids,
+            ).fetchone()
+        if row:
+            return True
     order_date = shopify_job_order_date(job)
     if not order_date:
         return True
@@ -17703,11 +20266,12 @@ def order_line_ids_for_state(store_id: Optional[int], state: str, page: int, per
 
 @app.on_event("startup")
 def startup() -> None:
-    global _sync_thread_started
+    global _sync_thread_started, _SHOPIFY_STATUS_CACHE_ENSURED
     if not _sync_thread_started:
         with db() as conn:
             conn.execute("SELECT 1")
         ensure_shopify_order_status_cache_table()
+        _SHOPIFY_STATUS_CACHE_ENSURED = True
         should_reindex_typesense = typesense_enabled() and get_setting("typesense_schema_version", "") != TYPESENSE_SCHEMA_VERSION
         threading.Thread(target=init_db, daemon=True).start()
         resume_interrupted_shopify_tracking_jobs()
@@ -17719,6 +20283,7 @@ def startup() -> None:
             threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
         threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
         threading.Thread(target=enqueue_app_pages_warm, daemon=True).start()
+        threading.Thread(target=lambda: api_tracking_fulfilment_pending(page=1, per_page=30), daemon=True).start()
         threading.Thread(target=lambda: api_tracking_payment_failures(page=1, per_page=20), daemon=True).start()
         _sync_thread_started = True
 
@@ -18235,7 +20800,7 @@ def backup_loop() -> None:
 @app.get("/api/inventory")
 def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
-    cache_key = ("inventory", store_id, page, per_page, clean_text(q))
+    cache_key = ("inventory-v2", store_id, page, per_page, clean_text(q))
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -18275,6 +20840,29 @@ def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int =
         "total": total,
         "search_engine": search_engine,
     }, 90)
+
+
+@app.get("/api/inventory/asin-image/{asin}")
+def api_inventory_asin_image(asin: str) -> Response:
+    image_url = amazon_product_page_image_url(asin)
+    if not image_url:
+        raise HTTPException(404, "Inventory image not found.")
+    return fetch_remote_image_response(image_url)
+
+
+@app.get("/api/inventory/{inventory_id}/image")
+def api_inventory_image(inventory_id: int) -> Response:
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        image = inventory_product_images([dict(item)], conn).get(int(inventory_id), {})
+    image_url = clean_text(image.get("image_url"))
+    if not image_url:
+        image_url = amazon_product_page_image_url(item["asin"])
+    if not image_url:
+        raise HTTPException(404, "Inventory image not found.")
+    return fetch_remote_image_response(image_url)
 
 
 @app.get("/api/cancelled-orders")
@@ -18366,6 +20954,7 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
         quantity = float(matched_line.get("quantity") or 0)
     if quantity <= 0:
         raise HTTPException(400, "Quantity must be greater than zero.")
+    page_image_url = amazon_product_page_image_url(asin)
     product_name = clean_text(payload.get("product_name")) or (clean_text(matched_line.get("product_name")) if matched_line else "")
     notes = clean_text(payload.get("notes"))
     amazon_order_url = clean_text(payload.get("amazon_order_url")) or (clean_text(matched_line.get("amazon_order_url")) if matched_line else "") or (order_line_amazon_url(amazon_order_id) if amazon_order_id else "")
@@ -18378,8 +20967,8 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             f"""
             INSERT INTO inventory_items
             (store_id, order_line_id, asin, quantity, product_name, source_odoo_order_id, source_odoo_order_name,
-             amazon_order_id, amazon_order_url, amazon_account_name, status, source_type, notes, manual_reference, created_at, updated_at)
-            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 'manual', ?, ?, ?, ?)
+             amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source, status, source_type, notes, manual_reference, created_at, updated_at)
+            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 'manual', ?, ?, ?, ?)
             RETURNING id
             """,
             (
@@ -18392,6 +20981,8 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 amazon_order_id,
                 amazon_order_url,
                 amazon_account_name,
+                page_image_url,
+                "amazon_page" if page_image_url else "",
                 notes,
                 manual_reference,
                 utc_now(),
@@ -18464,6 +21055,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             """
             UPDATE order_lines
             SET state='inventory',
+                order_engine='inventory',
                 fulfilment_note=?,
                 last_error=NULL,
                 updated_at=?
@@ -18477,6 +21069,9 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(updated_item) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
     if updated_line:
         index_order_line(updated_line)
+        queued = enqueue_shopify_fulfilment_for_rows([dict(updated_line)])
+        if queued:
+            start_shopify_fulfilment_worker()
     return {"ok": True, "message": f"Attached inventory item #{inventory_id} to {line['odoo_order_name']}. Confirm sent after manual verification.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
 
 
@@ -18530,6 +21125,7 @@ def api_confirm_inventory_sent(inventory_id: int, payload: Optional[dict[str, An
             """
             UPDATE order_lines
             SET state='delivered',
+                order_engine='inventory',
                 tracking_status='Inventory sent',
                 tracking_checked_at=?,
                 fulfilment_note=?,
@@ -18545,6 +21141,9 @@ def api_confirm_inventory_sent(inventory_id: int, payload: Optional[dict[str, An
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(updated_item) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
     if updated_line:
         index_order_line(updated_line)
+        queued = enqueue_shopify_fulfilment_for_rows([dict(updated_line)])
+        if queued:
+            start_shopify_fulfilment_worker()
     return {"ok": True, "message": f"Marked inventory sent for {line['odoo_order_name']}.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
 
 
@@ -19807,7 +22406,7 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
         allow_missing_spaid=payload.allow_missing_spaid,
         include_missing_asins=payload.include_missing_asins,
     )
-    if ordered:
+    if ordered or payload.line_ids:
         with db() as conn:
             line_filter = ""
             params: list[Any] = [payload.store_id]
@@ -19819,13 +22418,24 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
                 SELECT *
                 FROM order_lines
                 WHERE store_id=?
-                  AND COALESCE(amazon_order_id, '') != ''
-                  AND state IN ('ordered', 'dispatched', 'delivered')
+                  AND (
+                    (
+                      COALESCE(amazon_order_id, '') != ''
+                      AND order_engine IN ('chrome', 'rest', 'cxml', 'manual_amazon', 'third_party')
+                      AND state IN ('ordered', 'dispatched', 'delivered')
+                    )
+                    OR (
+                      order_engine='inventory'
+                      AND state IN ('inventory', 'delivered')
+                    )
+                  )
                   {line_filter}
                 """,
                 params,
             ).fetchall())
-        enqueue_shopify_fulfilment_for_rows(queued_rows)
+        queued = enqueue_shopify_fulfilment_for_rows(queued_rows)
+        if queued:
+            start_shopify_fulfilment_worker()
     details = selected_line_reasons(payload.store_id, payload.line_ids or None)
     account_type = "sandbox" if "sandbox." in str(account["api_base_url"]) else "production"
     data = dashboard_data(payload.store_id)
@@ -19964,9 +22574,17 @@ def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None, limit: int = 
             SELECT *
             FROM order_lines
             WHERE (? IS NULL OR store_id=?)
-              AND COALESCE(amazon_order_id, '') != ''
-              AND order_engine IN ('chrome', 'rest', 'cxml', 'manual_amazon', 'third_party')
-              AND state IN ('ordered', 'dispatched', 'delivered')
+              AND (
+                (
+                  COALESCE(amazon_order_id, '') != ''
+                  AND order_engine IN ('chrome', 'rest', 'cxml', 'manual_amazon', 'third_party')
+                  AND state IN ('ordered', 'dispatched', 'delivered')
+                )
+                OR (
+                  order_engine='inventory'
+                  AND state IN ('inventory', 'delivered')
+                )
+              )
             ORDER BY ordered_at DESC, updated_at DESC
             LIMIT ?
             """,
@@ -19974,6 +22592,32 @@ def api_shopify_fulfilment_enqueue(store_id: Optional[int] = None, limit: int = 
         ).fetchall())
     count = enqueue_shopify_fulfilment_for_rows(rows)
     return {"ok": True, "message": f"Queued or refreshed {count} Shopify fulfilment job(s).", "count": count, "progress": shopify_fulfilment_progress()}
+
+
+@app.post("/api/shopify/fulfilment/push-selected")
+def api_shopify_fulfilment_push_selected(payload: ShopifyFulfilmentPushPayload) -> dict[str, Any]:
+    result = force_enqueue_shopify_fulfilment_for_line_ids(payload.store_id, payload.line_ids)
+    if result["queued"]:
+        start_shopify_fulfilment_worker()
+    message_parts = []
+    if result["queued"]:
+        message_parts.append(f"Queued {result['queued']} selected Odoo order{'s' if result['queued'] != 1 else ''} for Shopify fulfilment.")
+    if result["duplicates"]:
+        message_parts.append(f"Skipped {len(result['duplicates'])} duplicate Shopify order{'s' if len(result['duplicates']) != 1 else ''}.")
+    if result["errors"]:
+        message_parts.append(f"Skipped {len(result['errors'])} order{'s' if len(result['errors']) != 1 else ''} that could not be verified or was not eligible.")
+    detail_messages = [*result["duplicates"], *result["errors"], *result["details"]]
+    if detail_messages:
+        message_parts.append("Details: " + " | ".join(detail_messages[:8]))
+    return {
+        "ok": bool(result["queued"]) and not result["errors"],
+        "message": " ".join(message_parts) or "No selected orders were queued.",
+        "count": result["queued"],
+        "skipped": result["skipped"],
+        "duplicates": result["duplicates"],
+        "errors": result["errors"],
+        "progress": shopify_fulfilment_progress(),
+    }
 
 
 @app.post("/api/shopify/fulfilment/run")
@@ -20037,12 +22681,12 @@ def api_shopify_orders_status_sync(payload: dict[str, Any]) -> dict[str, Any]:
 
         def worker() -> None:
             sync_shopify_status_for_order_names(store_id, order_names, force=force)
-            fast_page_cache_clear_matching({"dashboard", "orders"})
+            fast_page_cache_clear_matching({"dashboard", "orders", "fulfilment-pending"})
 
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "queued": len(order_names), "synced": 0, "rows": []}
     sync_shopify_status_for_order_names(store_id, order_names, force=bool(payload.get("force")))
-    fast_page_cache_clear_matching({"dashboard", "orders"})
+    fast_page_cache_clear_matching({"dashboard", "orders", "fulfilment-pending"})
     with db() as conn:
         rows = conn.execute(
             f"""
@@ -21332,6 +23976,29 @@ def tracking_browserless_order_url(order: dict[str, Any]) -> str:
     return clean_text(order.get("amazon_order_url")) or order_line_amazon_url(order_id)
 
 
+def browserless_tracking_orders(store_id: Optional[int] = None, status: str = "active") -> list[dict[str, Any]]:
+    orders: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 1
+    while True:
+        payload = api_tracking_orders(store_id=store_id, page=page, per_page=100, status=status)
+        batch = payload.get("orders") or []
+        for order in batch:
+            order_id = clean_text(order.get("amazon_order_id"))
+            if not order_id or order_id in seen:
+                continue
+            if clean_text(order.get("tracking_status")).lower() == "delivered":
+                continue
+            seen.add(order_id)
+            orders.append(order)
+        total = int(payload.get("total") or len(orders) or 0)
+        per_page = max(1, int(payload.get("per_page") or 100))
+        if not batch or page * per_page >= total:
+            break
+        page += 1
+    return orders
+
+
 class TrackingBrowserlessSession:
     def __init__(self, worker_id: str, store_id: Optional[int], max_orders: int) -> None:
         self.worker_id = worker_id
@@ -21349,11 +24016,7 @@ class TrackingBrowserlessSession:
         return bool(_TRACKING_BROWSERLESS_PROGRESS.get("stop_requested"))
 
     def load_orders(self) -> list[dict[str, Any]]:
-        payload = api_tracking_orders(self.store_id, page=1, per_page=1000, status="active")
-        orders = [
-            order for order in payload.get("orders") or []
-            if clean_text(order.get("tracking_status")).lower() != "delivered"
-        ]
+        orders = browserless_tracking_orders(self.store_id)
         if self.max_orders:
             orders = orders[: self.max_orders]
         self.orders = orders
@@ -21659,10 +24322,7 @@ def api_tracking_browserless_run(payload: ChromeTrackingBrowserlessRunPayload) -
             message="Headless tracking could not start.",
         )
         return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
-    orders = [
-        order for order in api_tracking_orders(payload.store_id, page=1, per_page=1000, status="active").get("orders") or []
-        if clean_text(order.get("tracking_status")).lower() != "delivered"
-    ]
+    orders = browserless_tracking_orders(payload.store_id)
     if payload.max_orders:
         orders = orders[: max(0, int(payload.max_orders or 0))]
     progress = set_tracking_browserless_progress(
@@ -23132,6 +25792,16 @@ def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page:
     if cached is not None:
         return cached
     orders, rows, total, page, per_page = paged_tracking_orders(store_id, status, q, page, per_page)
+    if page == 1 and clean_text(status).lower() in {"", "active"} and not clean_text(q):
+        seen_order_ids = {clean_text(order.get("amazon_order_id")) for order in orders}
+        appended_history_orders = 0
+        for history_order in amazon_history_tracking_orders_for_refresh():
+            order_id = clean_text(history_order.get("amazon_order_id"))
+            if order_id and order_id not in seen_order_ids:
+                orders.append(history_order)
+                seen_order_ids.add(order_id)
+                appended_history_orders += 1
+        total += appended_history_orders
     return fast_page_cache_set(cache_key, {"ok": True, "orders": orders, "rows": [], "page": page, "per_page": per_page, "total": total}, 60)
 
 
@@ -23144,6 +25814,8 @@ def api_tracking_fulfilment_pending(
     sort_by: str = "delivery_date",
     sort_dir: str = "asc",
 ) -> dict[str, Any]:
+    if page == 1 and not clean_text(q):
+        maybe_repair_pending_dispatch_asin_mismatches(store_id)
     sort_by = clean_text(sort_by).lower().replace("-", "_") or "delivery_date"
     if sort_by not in {"delivery_date", "status", "checked_at"}:
         sort_by = "delivery_date"
@@ -23152,8 +25824,13 @@ def api_tracking_fulfilment_pending(
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
-    rows, total, page, per_page = paged_delivered_unfulfilled_rows(store_id, page, per_page, q, sort_by, sort_dir)
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": total}, 90)
+    lock = fulfilment_pending_cache_lock(cache_key)
+    with lock:
+        cached = fast_page_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        rows, total, page, per_page = paged_delivered_unfulfilled_rows(store_id, page, per_page, q, sort_by, sort_dir)
+        return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": total}, 300)
 
 
 @app.get("/api/dispatch-status")
@@ -23466,10 +26143,11 @@ def api_dispatch_sorting_scan(payload: DispatchScanPayload) -> dict[str, Any]:
         enqueue_payment_failure_cleanup()
         if payload.store_id is None:
             row = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM amazon_dispatch_packages
                 WHERE (scan_code=? OR last_scanned_code=?)
+                  AND {DISPATCH_PHYSICAL_SCAN_SQL}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM amazon_payment_failures
@@ -23483,11 +26161,12 @@ def api_dispatch_sorting_scan(payload: DispatchScanPayload) -> dict[str, Any]:
             ).fetchone()
         else:
             row = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM amazon_dispatch_packages
                 WHERE (scan_code=? OR last_scanned_code=?)
                   AND store_id=?
+                  AND {DISPATCH_PHYSICAL_SCAN_SQL}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM amazon_payment_failures
@@ -23526,7 +26205,7 @@ def api_dispatch_sorting_scan(payload: DispatchScanPayload) -> dict[str, Any]:
                     "message": message,
                 }
         if not row:
-            message = f"0 results found for '{query_text}'. Place it in Exception rack."
+            message = f"0 known Amazon dispatched packages found for '{query_text}'. Place it in Exception rack."
             record_dispatch_scan_event(
                 conn,
                 scan_query=query_text,
@@ -23599,20 +26278,38 @@ def api_dispatch_sorting_place(package_id: int, payload: DispatchPlacePayload) -
     return {"ok": True, "package": package, "message": f"Package moved to {package.get('tote_code') or status}."}
 
 
+_TRACKING_UPDATE_LOCK = threading.RLock()
+
+
 @app.post("/api/tracking/update")
 def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
+    for attempt in range(3):
+        try:
+            with _TRACKING_UPDATE_LOCK:
+                return api_tracking_update_impl(payload)
+        except (db_session.psycopg2.errors.DeadlockDetected, db_session.psycopg2.OperationalError):
+            if attempt >= 2:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+    raise HTTPException(500, "Tracking update failed after retry")
+
+
+def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
     amazon_order_id = clean_text(payload.amazon_order_id)
     if not amazon_order_id:
         raise HTTPException(400, "amazon_order_id is required")
-    packages = payload.packages or []
+    packages = sanitize_tracking_packages(payload.packages or [])
     status = tracking_status_from_packages(packages)
     status_only_payload = bool(packages) and all(package.get("status_only") and not package.get("tracking_id") for package in packages)
     delivered_flag = status == "Delivered" and packages and all(
-        "delivered" in json.dumps(package, default=str).lower() for package in packages
+        tracking_package_delivered(package) for package in packages if isinstance(package, dict)
     )
     with db() as conn:
         if status_only_payload and not payload.order_cancelled and not payload_has_payment_revision(payload):
             now = utc_now()
+            line_delivered = status == "Delivered" and packages and all(
+                tracking_package_delivered(package) for package in packages if isinstance(package, dict)
+            )
             cursor = conn.execute(
                 """
                 UPDATE order_lines
@@ -23620,28 +26317,127 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     tracking_status=?,
                     tracking_payload=?,
                     tracking_checked_at=?,
-                    state='ordered',
+                    state=CASE WHEN ? THEN 'delivered' WHEN state='delivered' THEN 'dispatched' ELSE state END,
                     last_error=NULL,
                     updated_at=?
-                WHERE amazon_order_id=? AND state IN ('ordered', 'dispatched')
+                WHERE amazon_order_id=? AND state IN ('ordered', 'dispatched', 'delivered')
                 """,
                 (
                     clean_text(payload.amazon_order_url),
                     status,
                     json.dumps(packages, default=str)[:4000],
                     now,
+                    bool(line_delivered),
                     now,
                     amazon_order_id,
                 ),
             )
             if cursor.rowcount <= 0:
+                refreshed_packages, affected_line_ids = refresh_dispatch_packages_from_tracking(
+                    conn,
+                    amazon_order_id,
+                    clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                    packages,
+                )
+                if refreshed_packages:
+                    updated_line_rows = []
+                    for line_id in affected_line_ids:
+                        conn.execute(
+                            """
+                            UPDATE order_lines
+                            SET tracking_status=?,
+                                tracking_payload=?,
+                                tracking_checked_at=?,
+                                state=CASE WHEN ? THEN 'delivered' WHEN state='delivered' THEN 'dispatched' ELSE state END,
+                                last_error=NULL,
+                                updated_at=?
+                            WHERE id=?
+                            """,
+                            (
+                                status,
+                                json.dumps(packages, default=str)[:4000],
+                                now,
+                                bool(line_delivered),
+                                now,
+                                line_id,
+                            ),
+                        )
+                        updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+                        if updated_row:
+                            updated_line_rows.append(updated_row)
+                    for updated_row in updated_line_rows:
+                        index_order_line(updated_row)
+                        if line_delivered:
+                            ensure_inventory_for_line(updated_row)
+                    fast_page_cache_clear_matching({
+                        "dispatch-sorting-summary",
+                        "dispatch-sorting-summary-base",
+                        "dispatch-status",
+                        "dispatch-status-summary",
+                        "tracking-orders",
+                        "fulfilment-pending",
+                    })
+                    enqueue_dispatch_summary_warm(None)
+                    related_updated, related_packages = update_related_tracking_orders_from_packages(
+                        conn,
+                        amazon_order_id,
+                        clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                        packages,
+                    )
+                    return {
+                        "ok": True,
+                        "updated": len(updated_line_rows) + related_updated,
+                        "dispatch_packages_updated": refreshed_packages + related_packages,
+                        "tracking_status": status,
+                        "message": "Updated old/manual status-only Amazon tracking through dispatch package records.",
+                    }
+                history_updated, history_packages = update_history_matched_order_from_tracking(
+                    conn,
+                    amazon_order_id,
+                    clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                    packages,
+                )
+                if history_updated:
+                    fast_page_cache_clear_matching({
+                        "dispatch-sorting-summary",
+                        "dispatch-sorting-summary-base",
+                        "dispatch-status",
+                        "dispatch-status-summary",
+                        "tracking-orders",
+                        "fulfilment-pending",
+                    })
+                    enqueue_dispatch_summary_warm(None)
+                    related_updated, related_packages = update_related_tracking_orders_from_packages(
+                        conn,
+                        amazon_order_id,
+                        clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                        packages,
+                    )
+                    return {
+                        "ok": True,
+                        "updated": history_updated + related_updated,
+                        "dispatch_packages_updated": history_packages + related_packages,
+                        "tracking_status": status,
+                        "message": "Updated old/manual history Amazon tracking by recipient ref and ASIN.",
+                    }
                 raise HTTPException(404, "Tracked Amazon order not found")
-            return {"ok": True, "updated": cursor.rowcount, "tracking_status": status}
+            related_updated, related_packages = update_related_tracking_orders_from_packages(
+                conn,
+                amazon_order_id,
+                clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                packages,
+            )
+            return {
+                "ok": True,
+                "updated": cursor.rowcount + related_updated,
+                "tracking_status": status,
+                "related_dispatch_packages_updated": related_packages,
+            }
         rows = []
         for attempt in range(2):
             try:
                 rows = conn.execute(
-                    "SELECT * FROM order_lines WHERE amazon_order_id=? AND state IN ('ordered', 'dispatched')",
+                    "SELECT * FROM order_lines WHERE amazon_order_id=? AND state IN ('ordered', 'dispatched', 'delivered')",
                     (amazon_order_id,),
                 ).fetchall()
                 break
@@ -23651,6 +26447,69 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                 conn.rollback()
                 time.sleep(0.15)
         if not rows:
+            now = utc_now()
+            refreshed_packages, affected_line_ids = refresh_dispatch_packages_from_tracking(
+                conn,
+                amazon_order_id,
+                clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                packages,
+            )
+            if refreshed_packages:
+                line_status = tracking_status_from_packages(packages)
+                line_delivered = line_status == "Delivered" and packages and all(
+                    tracking_package_delivered(package) for package in packages if isinstance(package, dict)
+                )
+                updated_line_rows = []
+                for line_id in affected_line_ids:
+                    conn.execute(
+                        """
+                        UPDATE order_lines
+                        SET tracking_status=?,
+                            tracking_payload=?,
+                            tracking_checked_at=?,
+                            state=CASE WHEN ? THEN 'delivered' WHEN state='delivered' THEN 'dispatched' ELSE state END,
+                            last_error=NULL,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            line_status,
+                            json.dumps(packages, default=str)[:4000],
+                            now,
+                            bool(line_delivered),
+                            now,
+                            line_id,
+                        ),
+                    )
+                    updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+                    if updated_row:
+                        updated_line_rows.append(updated_row)
+                for updated_row in updated_line_rows:
+                    index_order_line(updated_row)
+                    if line_delivered:
+                        ensure_inventory_for_line(updated_row)
+                fast_page_cache_clear_matching({
+                    "dispatch-sorting-summary",
+                    "dispatch-sorting-summary-base",
+                    "dispatch-status",
+                    "dispatch-status-summary",
+                    "tracking-orders",
+                    "fulfilment-pending",
+                })
+                enqueue_dispatch_summary_warm(None)
+                related_updated, related_packages = update_related_tracking_orders_from_packages(
+                    conn,
+                    amazon_order_id,
+                    clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                    packages,
+                )
+                return {
+                    "ok": True,
+                    "updated": len(updated_line_rows) + related_updated,
+                    "dispatch_packages_updated": refreshed_packages + related_packages,
+                    "tracking_status": line_status,
+                    "message": "Updated old/manual Amazon order tracking through dispatch package records.",
+                }
             historical_rows = []
             if payload.order_cancelled:
                 historical_rows = conn.execute(
@@ -23711,6 +26570,35 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     "ignored": True,
                     "tracking_status": "Older Amazon cancellation ignored",
                     "message": f"Ignored cancelled historical Amazon order {amazon_order_id}; current/latest fulfilment was kept.",
+                }
+            history_updated, history_packages = update_history_matched_order_from_tracking(
+                conn,
+                amazon_order_id,
+                clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                packages,
+            )
+            if history_updated:
+                fast_page_cache_clear_matching({
+                    "dispatch-sorting-summary",
+                    "dispatch-sorting-summary-base",
+                    "dispatch-status",
+                    "dispatch-status-summary",
+                    "tracking-orders",
+                    "fulfilment-pending",
+                })
+                enqueue_dispatch_summary_warm(None)
+                related_updated, related_packages = update_related_tracking_orders_from_packages(
+                    conn,
+                    amazon_order_id,
+                    clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                    packages,
+                )
+                return {
+                    "ok": True,
+                    "updated": history_updated + related_updated,
+                    "dispatch_packages_updated": history_packages + related_packages,
+                    "tracking_status": tracking_status_from_packages(packages),
+                    "message": "Updated old/manual history Amazon tracking by recipient ref and ASIN.",
                 }
             raise HTTPException(404, "Tracked Amazon order not found")
         if payload.order_cancelled:
@@ -23867,7 +26755,7 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                 line_packages = packages
             line_status = tracking_status_from_packages(line_packages)
             line_delivered = line_status == "Delivered" and line_packages and all(
-                "delivered" in json.dumps(package, default=str).lower() for package in line_packages
+                tracking_package_delivered(package) for package in line_packages if isinstance(package, dict)
             )
             conn.execute(
                 """
@@ -23876,7 +26764,7 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     tracking_status=?,
                     tracking_payload=?,
                     tracking_checked_at=?,
-                    state=?,
+                    state=CASE WHEN ? THEN 'delivered' WHEN state='delivered' THEN 'dispatched' ELSE state END,
                     last_error=NULL,
                     updated_at=?
                 WHERE id=?
@@ -23886,7 +26774,7 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     line_status,
                     json.dumps(line_packages, default=str)[:4000],
                     utc_now(),
-                    "delivered" if line_delivered else "ordered",
+                    bool(line_delivered),
                     utc_now(),
                     row["id"],
                 ),
@@ -23928,8 +26816,31 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                     updated_rows_for_index.append(updated_row)
     for updated_row in updated_rows_for_index:
         index_order_line(updated_row)
+    related_updated = 0
+    related_packages = 0
     if packages and not status_only_payload:
+        with db() as conn:
+            refresh_dispatch_packages_from_tracking(
+                conn,
+                amazon_order_id,
+                clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                packages,
+            )
+            mark_history_tracking_order_status(
+                conn,
+                amazon_order_id,
+                clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                packages,
+            )
+            related_updated, related_packages = update_related_tracking_orders_from_packages(
+                conn,
+                amazon_order_id,
+                clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                packages,
+            )
         sync_dispatch_packages_for_order_async(amazon_order_id)
+        for related_order_id in related_tracking_order_ids_from_packages(amazon_order_id, packages):
+            sync_dispatch_packages_for_order_async(related_order_id)
     if delivered_flag:
         try:
             store = get_store(int(rows[0]["store_id"]))
@@ -23938,7 +26849,13 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
                 OdooClient(store).post_order_note(order_id, note)
         except Exception:
             pass
-    return {"ok": True, "updated": updated, "tracking_status": status, "payment_failure_resolved": bool(resolved_payment_failure)}
+    return {
+        "ok": True,
+        "updated": updated + related_updated,
+        "tracking_status": status,
+        "payment_failure_resolved": bool(resolved_payment_failure),
+        "related_dispatch_packages_updated": related_packages,
+    }
 
 
 @app.get("/api/tracking/payment-failures")

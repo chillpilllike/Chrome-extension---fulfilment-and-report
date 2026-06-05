@@ -480,12 +480,85 @@ function paymentFailureOrderNames(row: PaymentFailure): string[] {
   return []
 }
 
+type FulfilmentPendingAmazonAssociation = {
+  amazon_order_id: string
+  amazon_order_url?: string
+  recipient?: string
+  status?: string
+  order_date?: string
+  asins?: string[]
+  sources?: string[]
+  packages?: Array<{
+    package_index?: number | string
+    scan_code?: string
+    display_code?: string
+    alternate_codes?: string[]
+    tracking_url?: string
+    carrier?: string
+    status?: string
+    scan_status?: string
+    received_at?: string
+    asins?: string[]
+    products?: Array<{ asin?: string; url?: string; title?: string; image_url?: string }>
+    order_line_ids?: number[]
+  }>
+}
+
 type FulfilmentPendingRow = OrderLine & {
   store_name: string
   fulfilment_status: string
   message: string
   amazon_products?: Array<{ asin: string; url?: string; title?: string; image_url?: string }>
   amazon_product_asins?: string
+  amazon_captured_products?: Array<{ asin: string; url?: string; title?: string; image_url?: string }>
+  pending_amazon_orders?: Array<{
+    amazon_order_id: string
+    amazon_order_url?: string
+    recipient?: string
+    status?: string
+    state?: string
+    tracking_checked_at?: string
+    expected_asins?: string[]
+    captured_asins?: string[]
+    display_asins?: string[]
+    line_ids?: number[]
+    quantity?: number
+    display_quantity?: number
+    expected_quantity?: number
+    packages?: FulfilmentPendingAmazonAssociation["packages"]
+    sources?: string[]
+  }>
+  pending_item_audit?: Array<{
+    line_id: number
+    odoo_line_id?: number
+    product_name?: string
+    primary_asin?: string
+    replacement_asin?: string
+    expected_asins?: string[]
+    quantity?: number
+    matched_quantity?: number
+    matched_asins?: string[]
+    matched_products?: Array<{ asin: string; url?: string; title?: string; image_url?: string }>
+    amazon_order_id?: string
+    amazon_order_url?: string
+    tracking_status?: string
+    state?: string
+    status?: string
+  }>
+  pending_discrepancies?: Array<{
+    severity?: string
+    type?: string
+    message?: string
+    missing_asins?: string[]
+    line_ids?: number[]
+    replacement_asins?: string[]
+    amazon_order_ids?: string[]
+  }>
+  related_amazon_orders?: FulfilmentPendingAmazonAssociation[]
+  asin_matched_amazon_orders?: FulfilmentPendingAmazonAssociation[]
+  manual_matched_amazon_order_id?: string
+  manual_matched_amazon_order_url?: string
+  manual_matched_amazon_status?: string
   picking_names: string[]
   picking_states: string[]
   open_picking_names: string[]
@@ -650,8 +723,12 @@ type InventoryItem = {
   id: number
   store_id: number
   asin: string
+  asin_url?: string
   quantity: number
   product_name: string
+  image_url?: string
+  image_source?: string
+  image_title?: string
   source_odoo_order_name: string
   amazon_order_id: string
   amazon_order_url: string
@@ -935,6 +1012,7 @@ function notifyAdminAuthRequired() {
 const PAGE_SIZE = 100
 const ORDERS_PAGE_SIZE = 20
 const DUPLICATE_ASIN_PAGE_SIZE = 12
+const FULFILMENT_PENDING_PAGE_SIZE = 30
 
 const orderConditionOptions = [
   { value: "all", label: "All orders" },
@@ -2005,6 +2083,20 @@ function StatusBadge({ value }: { value?: string }) {
     return <Badge variant="outline" className="border-amber-400 bg-amber-50 text-amber-800">placed on Amazon / not synced</Badge>
   }
   return <Badge variant="outline">{status}</Badge>
+}
+
+function InventoryStatusBadge({ value }: { value?: string }) {
+  const status = String(value || "available").trim().toLowerCase()
+  if (status === "available") {
+    return <Badge className="border border-emerald-700 bg-emerald-600 text-white shadow-sm hover:bg-emerald-600">available</Badge>
+  }
+  if (status === "reserved") {
+    return <Badge className="border border-amber-700 bg-amber-500 text-amber-950 shadow-sm hover:bg-amber-500">reserved</Badge>
+  }
+  if (status === "used") {
+    return <Badge className="border border-slate-500 bg-slate-200 text-slate-900 shadow-sm hover:bg-slate-200">used</Badge>
+  }
+  return <Badge variant="outline" className="border-slate-500 bg-white text-slate-900">{status}</Badge>
 }
 
 function copyPlainText(value: string) {
@@ -3291,7 +3383,7 @@ function App() {
   useEffect(() => {
     if (page !== "fulfilment-pending") return
     setFulfilmentPendingLoading(true)
-    api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim(), sort_by: fulfilmentPendingSortBy, sort_dir: fulfilmentPendingSortDir })}`)
+    api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { per_page: FULFILMENT_PENDING_PAGE_SIZE, q: fulfilmentPendingQuery.trim(), sort_by: fulfilmentPendingSortBy, sort_dir: fulfilmentPendingSortDir })}`)
       .then((result) => {
         setFulfilmentPendingRows(result.rows)
         setFulfilmentPendingTotal(result.total || 0)
@@ -3574,6 +3666,17 @@ function App() {
           allow_missing_spaid: allowMissingSpaid,
           include_missing_asins: resendMissingAsins,
         }),
+      }),
+    )
+  }
+
+  function pushSelectedToShopify() {
+    const actionStoreId = selectedStoreIdForAction("Push to Shopify")
+    if (!actionStoreId) return
+    return runAction("Push to Shopify", () =>
+      api<{ ok?: boolean; message?: string }>("/api/shopify/fulfilment/push-selected", {
+        method: "POST",
+        body: JSON.stringify({ store_id: actionStoreId, line_ids: selected }),
       }),
     )
   }
@@ -4571,7 +4674,16 @@ function App() {
 	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
 	                      onClick={placeSelectedOrders}
 	                    >
+                      <ShoppingCart className="size-4" />
                       Place Selected
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+                      onClick={pushSelectedToShopify}
+                    >
+                      <PackageCheck className="size-4" />
+                      Push to Shopify
                     </Button>
 	                    <Button
 	                      variant="outline"
@@ -4976,7 +5088,7 @@ function App() {
             onNavigate={setPage}
             onResult={setModal}
             onRefresh={async () => {
-              const result = await api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { q: fulfilmentPendingQuery.trim(), sort_by: fulfilmentPendingSortBy, sort_dir: fulfilmentPendingSortDir })}`)
+              const result = await api<{ rows: FulfilmentPendingRow[]; total: number }>(`/api/tracking/fulfilment-pending${pagedQuery(storeId, fulfilmentPendingPage, { per_page: FULFILMENT_PENDING_PAGE_SIZE, q: fulfilmentPendingQuery.trim(), sort_by: fulfilmentPendingSortBy, sort_dir: fulfilmentPendingSortDir })}`)
               setFulfilmentPendingRows(result.rows)
               setFulfilmentPendingTotal(result.total || 0)
             }}
@@ -6908,7 +7020,8 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
                           {relatedEventParts.map((part) => {
                             const received = dispatchPartIsReceived(part)
                             return (
-                              <div key={`${event.id}-${part.id}`} className="grid gap-2 px-3 py-2 text-xs md:grid-cols-[minmax(180px,1fr)_130px_minmax(160px,1fr)_120px] md:items-center">
+                              <div key={`${event.id}-${part.id}`} className="grid gap-2 px-3 py-2 text-xs md:grid-cols-[56px_minmax(180px,1fr)_130px_minmax(160px,1fr)_120px] md:items-center">
+                                <DispatchProductThumbs images={dispatchProductImagesFrom(part)} onPreview={setImagePreview} size="sm" />
                                 <div className="font-semibold">{part.recipient_ref || part.odoo_order_name || "Related part"}</div>
                                 <Badge variant={received ? "secondary" : "outline"}>{part.scan_label || (received ? "Received / scanned" : "Not scanned yet")}</Badge>
                                 <div className="text-muted-foreground">{part.delivery_label || part.package_status || part.promise || "Delivery not captured"}</div>
@@ -7566,11 +7679,11 @@ function DispatchStatusPage({
           <PaginationControls page={page} total={total} onPage={onPage} disabled={loading} />
         </div>
       </div>
-      <CardContent className="p-0">
+      <CardContent className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-10">
+              <TableHead className="w-12">
                 <Checkbox
                   checked={rows.length > 0 && rows.every((row) => selected.includes(row.id))}
                   onCheckedChange={(checked) => {
@@ -7698,9 +7811,38 @@ function FulfilmentPendingPage({
 }) {
   const [loading, setLoading] = useState(false)
   const [shopifyRecheckLoading, setShopifyRecheckLoading] = useState(false)
+  const [imagePreview, setImagePreview] = useState<{ src: string; title: string; asin?: string } | null>(null)
   const isLoading = loading || externalLoading
   const selectionAnchor = useRef<number | null>(null)
   const selectedRows = rows.filter((row) => selected.includes(row.id))
+  const orderGroups = useMemo(() => {
+    const groups: Array<{ key: string; primary: FulfilmentPendingRow; rows: FulfilmentPendingRow[] }> = []
+    const byKey = new Map<string, { key: string; primary: FulfilmentPendingRow; rows: FulfilmentPendingRow[] }>()
+    rows.forEach((row) => {
+      const key = String(row.odoo_order_name || row.id).trim().toUpperCase() || String(row.id)
+      let group = byKey.get(key)
+      if (!group) {
+        group = { key, primary: row, rows: [] }
+        byKey.set(key, group)
+        groups.push(group)
+      }
+      group.rows.push(row)
+    })
+    return groups
+  }, [rows])
+  const groupedRowIds = orderGroups.flatMap((group) => group.rows.map((row) => row.id))
+  const duplicateLineCount = rows.length - orderGroups.length
+  function uniqueByValue<T>(items: T[], keyFn: (item: T) => string): T[] {
+    const seen = new Set<string>()
+    const unique: T[] = []
+    items.forEach((item) => {
+      const key = keyFn(item)
+      if (!key || seen.has(key)) return
+      seen.add(key)
+      unique.push(item)
+    })
+    return unique
+  }
   function rowPackages(row: FulfilmentPendingRow) {
     try {
       const parsed = JSON.parse(row.tracking_payload || "[]")
@@ -7709,30 +7851,304 @@ function FulfilmentPendingPage({
       return []
     }
   }
+  function matchedAmazonPackages(row: FulfilmentPendingRow) {
+    const packages: Array<any> = []
+    const seen = new Set<string>()
+    visibleMatchedAmazonOrders(row).forEach((order) => {
+      ;(order.packages || []).forEach((pkg) => {
+        const code = readablePackageCode(pkg)
+        const dedupeKey = [order.amazon_order_id, code || pkg.tracking_url || "", pkg.package_index ?? ""].join("|")
+        if (!code || seen.has(dedupeKey)) return
+        seen.add(dedupeKey)
+        packages.push({
+          ...pkg,
+          amazon_order_id: order.amazon_order_id,
+          amazon_order_url: order.amazon_order_url,
+          order_status: order.status,
+        })
+      })
+    })
+    return packages
+  }
+  function allAmazonAssociationPackages(row: FulfilmentPendingRow) {
+    const packages: Array<any> = []
+    const seen = new Set<string>()
+    ;[...(row.asin_matched_amazon_orders || []), ...(row.related_amazon_orders || [])].forEach((order) => {
+      ;(order.packages || []).forEach((pkg) => {
+        const code = readablePackageCode(pkg)
+        const dedupeKey = [order.amazon_order_id, code || pkg.tracking_url || "", pkg.package_index ?? ""].join("|")
+        if (seen.has(dedupeKey)) return
+        seen.add(dedupeKey)
+        packages.push({
+          ...pkg,
+          amazon_order_id: order.amazon_order_id,
+          amazon_order_url: order.amazon_order_url,
+          order_status: order.status,
+        })
+      })
+    })
+    return packages
+  }
+  function visibleMatchedAmazonOrders(row: FulfilmentPendingRow) {
+    const currentAmazonOrderId = String(row.amazon_order_id || "").trim()
+    return (row.asin_matched_amazon_orders || []).filter((order) => String(order.amazon_order_id || "").trim() !== currentAmazonOrderId)
+  }
+  function readablePackageCode(pkg: any) {
+    const values = [
+      pkg.canonical_scan_code,
+      pkg.canonicalScanCode,
+      pkg.display_code,
+      pkg.scan_code,
+      pkg.tracking_id,
+      pkg.trackingId,
+      pkg.tracking_number,
+      pkg.trackingNumber,
+      ...(Array.isArray(pkg.alternate_codes) ? pkg.alternate_codes : []),
+    ].map((value) => String(value || "").trim()).filter(Boolean)
+    const practicalCode = values.find((value) => /^TBA[A-Z0-9]+$/i.test(value) || /^1Z[A-Z0-9]{12,24}$/i.test(value) || /^SG\d{10,24}$/i.test(value) || /^D\d{10,24}$/i.test(value) || /^\d{12,}$/.test(value))
+    if (practicalCode) return practicalCode
+    return values.find((value) => !/^https?:\/\//i.test(value) && !/^\d{3}-\d{7}-\d{7}$/.test(value) && value.length >= 10) || ""
+  }
+  function packageStatusDisplay(pkg: any) {
+    const status = String(pkg?.status || pkg?.order_status || "").trim()
+    const promise = String(pkg?.promise || pkg?.expected_delivery_display || pkg?.expected_delivery_date || "").trim()
+    if (promise && (!status || /^shipped$/i.test(status) || /being processed|carrier facility/i.test(status))) return promise
+    if (status && promise && status.toLowerCase() !== promise.toLowerCase()) return `${status} · ${promise}`
+    return status || promise
+  }
+  function packageDisplayKey(pkg: any) {
+    return String(pkg.tracking_url || "").trim() || readablePackageCode(pkg) || [pkg.amazon_order_id || "", pkg.carrier || "", pkg.status || pkg.promise || "", pkg.package_index ?? ""].join("|")
+  }
+  function amazonOrderIdFromPackage(pkg: any) {
+    const explicit = String(pkg?.amazon_order_id || pkg?.amazonOrderId || pkg?.order_id || pkg?.orderId || "").trim()
+    if (explicit) return explicit
+    const trackingUrl = String(pkg?.tracking_url || pkg?.amazon_order_url || "").trim()
+    if (!trackingUrl) return ""
+    try {
+      const parsed = new URL(trackingUrl)
+      return String(parsed.searchParams.get("orderId") || parsed.searchParams.get("orderID") || "").trim()
+    } catch {
+      const match = trackingUrl.match(/[?&](?:orderId|orderID)=([^&#]+)/)
+      return match ? decodeURIComponent(match[1]).trim() : ""
+    }
+  }
+  function normalizedPendingAsin(value: unknown) {
+    return String(value || "").trim().toUpperCase()
+  }
+  function sequenceSortIndex(sequence: string[], orderId: unknown) {
+    const cleanOrderId = String(orderId || "").trim()
+    if (!cleanOrderId) return Number.MAX_SAFE_INTEGER
+    const index = sequence.indexOf(cleanOrderId)
+    return index === -1 ? Number.MAX_SAFE_INTEGER : index
+  }
+  function sortByAmazonOrderSequence<T>(items: T[], sequence: string[], getOrderId: (item: T) => unknown) {
+    return items
+      .map((item, index) => ({ item, index, sequenceIndex: sequenceSortIndex(sequence, getOrderId(item)) }))
+      .sort((left, right) => left.sequenceIndex - right.sequenceIndex || left.index - right.index)
+      .map((entry) => entry.item)
+  }
+  function productAmazonOrderIdFromAudit(product: { asin?: string; amazon_order_id?: string }, auditItems: any[]) {
+    const productOrderId = String(product.amazon_order_id || "").trim()
+    if (productOrderId) return productOrderId
+    const asin = normalizedPendingAsin(product.asin)
+    if (!asin) return ""
+    const auditItem = auditItems.find((item) => {
+      const itemAsins = [
+        item.primary_asin,
+        ...(Array.isArray(item.expected_asins) ? item.expected_asins : []),
+        ...(Array.isArray(item.matched_asins) ? item.matched_asins : []),
+        ...((item.matched_products || []).map((matchedProduct: any) => matchedProduct?.asin)),
+      ].map(normalizedPendingAsin).filter(Boolean)
+      return itemAsins.includes(asin)
+    })
+    return String(auditItem?.amazon_order_id || "").trim()
+  }
   function pendingAmazonProducts(row: FulfilmentPendingRow, packages: any[]) {
-    const products: Array<{ asin: string; url: string; title?: string; image_url?: string }> = []
+    const products: Array<{ asin: string; url: string; title?: string; image_url?: string; amazon_order_id?: string }> = []
     const seen = new Set<string>()
     const rowAsin = String(row.asin || "").trim().toUpperCase()
-    const addProduct = (value: any) => {
+    const addProduct = (value: any, amazonOrderId = "") => {
       const asin = String(value?.asin || value || "").trim().toUpperCase()
-      if (!asin || seen.has(asin)) return
+      if (!asin) return
+      if (seen.has(asin)) {
+        const existing = products.find((product) => product.asin === asin)
+        if (existing) {
+          const candidateTitle = usefulPendingProductTitle(value?.title)
+          if (candidateTitle && !usefulPendingProductTitle(existing.title)) existing.title = candidateTitle
+          const candidateImage = String(value?.image_url || value?.imageUrl || "").trim()
+          if (candidateImage && !existing.image_url) existing.image_url = candidateImage
+          const candidateUrl = String(value?.url || "").trim()
+          if (candidateUrl && (!existing.url || existing.url.includes("/dp/undefined"))) existing.url = candidateUrl
+          if (amazonOrderId && !existing.amazon_order_id) existing.amazon_order_id = amazonOrderId
+        }
+        return
+      }
       seen.add(asin)
       products.push({
         asin,
         url: String(value?.url || row.asin_url || `https://www.amazon.com/dp/${encodeURIComponent(asin)}`),
-        title: String(value?.title || (asin === row.asin ? row.product_name : "") || ""),
-        image_url: String(value?.image_url || ""),
+        title: String(value?.title || ""),
+        image_url: String(value?.image_url || value?.imageUrl || ""),
+        amazon_order_id: amazonOrderId || String(value?.amazon_order_id || value?.order_id || "").trim(),
       })
     }
-    ;(row.amazon_products || []).forEach(addProduct)
-    packages.forEach((pkg: any) => {
-      ;(pkg.products || []).forEach(addProduct)
-      ;(pkg.asins || []).forEach(addProduct)
+    ;(row.amazon_products || []).forEach((product) => addProduct(product))
+    ;(row.amazon_captured_products || []).forEach((product) => addProduct(product))
+    ;(row.pending_item_audit || []).forEach((item) => {
+      const auditAmazonOrderId = String(item.amazon_order_id || "").trim()
+      ;(item.matched_products || []).forEach((product) => addProduct({
+        ...product,
+        title: product.title || "",
+      }, auditAmazonOrderId))
+      if (item.primary_asin && item.matched_asins?.includes(item.primary_asin)) {
+        addProduct({
+          asin: item.primary_asin,
+          url: `https://www.amazon.com/dp/${encodeURIComponent(item.primary_asin)}`,
+        }, auditAmazonOrderId)
+      }
     })
-    addProduct({ asin: row.asin, url: row.asin_url, title: row.product_name })
+    packages.forEach((pkg: any) => {
+      const packageAmazonOrderId = amazonOrderIdFromPackage(pkg)
+      ;(pkg.products || []).forEach((product: any) => addProduct(product, packageAmazonOrderId))
+      ;(pkg.asins || []).forEach((asin: any) => addProduct(asin, packageAmazonOrderId))
+    })
+    ;(row.pending_amazon_orders || []).forEach((order) => {
+      const orderId = String(order.amazon_order_id || "").trim()
+      ;(order.packages || []).forEach((pkg: any) => {
+        const packageAmazonOrderId = amazonOrderIdFromPackage(pkg) || orderId
+        ;(pkg.products || []).forEach((product: any) => addProduct(product, packageAmazonOrderId))
+        ;(pkg.asins || []).forEach((asin: any) => addProduct(asin, packageAmazonOrderId))
+      })
+    })
+    matchedAmazonPackages(row).forEach((pkg: any) => {
+      const packageAmazonOrderId = amazonOrderIdFromPackage(pkg)
+      ;(pkg.products || []).forEach((product: any) => addProduct(product, packageAmazonOrderId))
+      ;(pkg.asins || []).forEach((asin: any) => addProduct(asin, packageAmazonOrderId))
+    })
+    allAmazonAssociationPackages(row).forEach((pkg: any) => {
+      if (!rowAsin) return
+      const packageAmazonOrderId = amazonOrderIdFromPackage(pkg)
+      const packageProductAsins = (pkg.products || [])
+        .map((product: any) => String(product?.asin || "").trim().toUpperCase())
+        .filter(Boolean)
+      const packageAsins = (pkg.asins || []).map((asin: any) => String(asin || "").trim().toUpperCase()).filter(Boolean)
+      if (![...packageProductAsins, ...packageAsins].includes(rowAsin)) return
+      ;(pkg.products || []).forEach((product: any) => {
+        if (String(product?.asin || "").trim().toUpperCase() === rowAsin) addProduct(product, packageAmazonOrderId)
+      })
+      if (packageAsins.includes(rowAsin)) addProduct(rowAsin, packageAmazonOrderId)
+    })
+    if (rowAsin && !products.length) addProduct(rowAsin)
+    if (row.asin_matched_amazon_orders?.length) return products
     if (!rowAsin) return products
     const matchingProducts = products.filter((product) => product.asin === rowAsin)
     return matchingProducts.length ? matchingProducts : products.slice(-1)
+  }
+  function pendingAmazonProductsForGroup(groupRows: FulfilmentPendingRow[]) {
+    const products: Array<{ asin: string; url: string; title?: string; image_url?: string; amazon_order_id?: string }> = []
+    const byAsin = new Map<string, { asin: string; url: string; title?: string; image_url?: string; amazon_order_id?: string }>()
+    groupRows.flatMap((item) => pendingAmazonProducts(item, rowPackages(item))).forEach((product) => {
+      const asin = normalizedPendingAsin(product.asin)
+      if (!asin) return
+      const existing = byAsin.get(asin)
+      if (!existing) {
+        const mergedProduct = { ...product, asin }
+        byAsin.set(asin, mergedProduct)
+        products.push(mergedProduct)
+        return
+      }
+      const candidateTitle = usefulPendingProductTitle(product.title)
+      if (candidateTitle && !usefulPendingProductTitle(existing.title)) existing.title = candidateTitle
+      if (product.image_url && !existing.image_url) existing.image_url = product.image_url
+      if (product.url && !existing.url) existing.url = product.url
+      if (product.amazon_order_id && !existing.amazon_order_id) existing.amazon_order_id = product.amazon_order_id
+    })
+    return products
+  }
+  function usefulPendingProductTitle(value: unknown) {
+    const title = String(value || "").trim()
+    if (title.length < 4) return ""
+    if (/^\d+$/.test(title)) return ""
+    if (/^\$|^-\d+%|list price|out of 5 stars|buy it again|view your item|amazon business card/i.test(title)) return ""
+    return title
+  }
+  function pendingStatusIsDelivered(value: unknown) {
+    return /\bdelivered\b/i.test(String(value || ""))
+  }
+  function pendingStatusBadge(value: unknown, options: { subtle?: boolean } = {}) {
+    const status = String(value || "").trim()
+    if (!status) return null
+    if (pendingStatusIsDelivered(status)) {
+      return (
+        <Badge variant="outline" className={`${options.subtle ? "" : "font-semibold"} border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-50`}>
+          {status}
+        </Badge>
+      )
+    }
+    return <Badge variant="destructive">{status}</Badge>
+  }
+  function visibleMatchedAmazonOrdersForGroup(groupRows: FulfilmentPendingRow[], shownAmazonOrderIds: Set<string> = new Set()) {
+    const currentIds = new Set(groupRows.map((item) => String(item.amazon_order_id || "").trim()).filter(Boolean))
+    return uniqueByValue(
+      groupRows
+        .flatMap((item) => visibleMatchedAmazonOrders(item))
+        .filter((order) => {
+          const orderId = String(order.amazon_order_id || "").trim()
+          return orderId && !currentIds.has(orderId) && !shownAmazonOrderIds.has(orderId)
+        }),
+      (order) => String(order.amazon_order_id || ""),
+    )
+  }
+  function relatedAmazonOrdersForGroup(groupRows: FulfilmentPendingRow[], visibleMatchedOrders: FulfilmentPendingAmazonAssociation[], shownAmazonOrderIds: Set<string> = new Set()) {
+    const matchedIds = new Set(visibleMatchedOrders.map((order) => String(order.amazon_order_id || "").trim()).filter(Boolean))
+    const currentIds = new Set(groupRows.map((item) => String(item.amazon_order_id || "").trim()).filter(Boolean))
+    return uniqueByValue(
+      groupRows.flatMap((item) => item.related_amazon_orders || []).filter((order) => {
+        const orderId = String(order.amazon_order_id || "").trim()
+        return orderId && !matchedIds.has(orderId) && !currentIds.has(orderId) && !shownAmazonOrderIds.has(orderId)
+      }),
+      (order) => String(order.amazon_order_id || ""),
+    )
+  }
+  function relatedOrderAsinSummary(order: FulfilmentPendingAmazonAssociation) {
+    return uniqueByValue([
+      ...(order.asins || []).map((asin) => ({ asin: String(asin || "").trim().toUpperCase(), image_url: "", title: "" })),
+      ...((order.packages || []).flatMap((pkg: any) => [
+        ...((pkg.products || []).map((product: any) => ({
+          asin: String(product?.asin || "").trim().toUpperCase(),
+          image_url: String(product?.image_url || ""),
+          title: String(product?.title || ""),
+        }))),
+        ...((pkg.asins || []).map((asin: any) => ({ asin: String(asin || "").trim().toUpperCase(), image_url: "", title: "" }))),
+      ])),
+    ].filter((product) => product.asin), (product) => product.asin)
+  }
+  function itemAuditForGroup(groupRows: FulfilmentPendingRow[]) {
+    return uniqueByValue(
+      groupRows.flatMap((item) => item.pending_item_audit || []),
+      (item) => String(item.line_id || item.odoo_line_id || item.primary_asin || item.product_name || ""),
+    )
+  }
+  function discrepanciesForGroup(groupRows: FulfilmentPendingRow[]) {
+    return uniqueByValue(
+      groupRows.flatMap((item) => item.pending_discrepancies || []),
+      (item) => [item.type || "", item.message || "", (item.missing_asins || []).join(","), (item.replacement_asins || []).join(",")].join("|"),
+    )
+  }
+  function matchedAmazonPackagesForGroup(groupRows: FulfilmentPendingRow[]) {
+    const currentIds = new Set(groupRows.map((item) => String(item.amazon_order_id || "").trim()).filter(Boolean))
+    return uniqueByValue(
+      groupRows
+        .flatMap((item) => matchedAmazonPackages(item))
+        .filter((pkg: any) => !currentIds.has(String(pkg.amazon_order_id || "").trim())),
+      (pkg: any) => packageDisplayKey(pkg),
+    )
+  }
+  function allAmazonAssociationPackagesForGroup(groupRows: FulfilmentPendingRow[]) {
+    return uniqueByValue(
+      groupRows.flatMap((item) => allAmazonAssociationPackages(item)),
+      (pkg: any) => packageDisplayKey(pkg),
+    )
   }
   async function copyPendingText(value: string, label: string) {
     const copied = await copyPlainText(value)
@@ -7773,11 +8189,12 @@ function FulfilmentPendingPage({
     }
   }
   return (
+    <>
     <Card>
       <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
-          <CardTitle>Amazon Delivered, Odoo Fulfilment Pending</CardTitle>
-          <CardDescription>Delivered Amazon orders that do not yet have a Shopify tracking sync recorded for the matching Odoo order.</CardDescription>
+          <CardTitle>Amazon Delivered or Due Today, Odoo Fulfilment Pending</CardTitle>
+          <CardDescription>Amazon orders with at least one delivered, arriving today, or out-for-delivery part and no Shopify tracking sync for the matching Odoo order.</CardDescription>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
           <div className="min-w-[280px]">
@@ -7801,12 +8218,12 @@ function FulfilmentPendingPage({
       </CardHeader>
       {isLoading ? (
         <div className="border-t px-6 py-3">
-          <div className="d-flex align-items-center justify-content-between gap-3 text-sm">
-            <span className="text-muted-foreground">Fetching delivered Amazon orders and dispatch sync status...</span>
-            <span className="text-muted-foreground">{rows.length ? `${rows.length} current result${rows.length === 1 ? "" : "s"}` : "checking"}</span>
-          </div>
-          <div className="progress mt-2">
-            <div className="progress-bar progress-bar-striped progress-bar-animated bg-primary" style={{ width: "100%" }} />
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <span className="inline-flex items-center gap-2 text-muted-foreground">
+              <span className="spinner-border spinner-border-sm text-primary" role="status" aria-label="Loading pending dispatch orders"></span>
+              Fetching delivered Amazon orders and dispatch sync status<span className="animated-dots"></span>
+            </span>
+            <span className="text-muted-foreground">{orderGroups.length ? `${orderGroups.length} order${orderGroups.length === 1 ? "" : "s"}` : "checking"}</span>
           </div>
         </div>
       ) : null}
@@ -7819,115 +8236,403 @@ function FulfilmentPendingPage({
               Recheck Shopify
             </Button>
           </div>
-          <PaginationControls page={page} total={total} onPage={onPage} disabled={isLoading} />
+          <div className="flex flex-col items-start gap-1 md:items-end">
+            {duplicateLineCount > 0 ? (
+              <span className="text-xs text-muted-foreground">
+                Showing {orderGroups.length} order{orderGroups.length === 1 ? "" : "s"} from {rows.length} line{rows.length === 1 ? "" : "s"} on this page.
+              </span>
+            ) : null}
+            <PaginationControls page={page} total={total} perPage={FULFILMENT_PENDING_PAGE_SIZE} onPage={onPage} disabled={isLoading} />
+          </div>
         </div>
       </div>
-      <CardContent className="p-0">
-        <Table>
+      <CardContent className="overflow-x-auto p-0">
+        <Table className="table-fixed" style={{ minWidth: 2430, width: 2430, tableLayout: "fixed" }}>
+          <colgroup>
+            <col style={{ width: 52 }} />
+            <col style={{ width: 120 }} />
+            <col style={{ width: 150 }} />
+            <col style={{ width: 170 }} />
+            <col style={{ width: 360 }} />
+            <col style={{ width: 380 }} />
+            <col style={{ width: 430 }} />
+            <col style={{ width: 230 }} />
+            <col style={{ width: 170 }} />
+            <col style={{ width: 150 }} />
+            <col style={{ width: 220 }} />
+          </colgroup>
           <TableHeader>
             <TableRow>
               <TableHead className="w-10">
                 <Checkbox
-                  checked={rows.length > 0 && rows.every((row) => selected.includes(row.id))}
+                  checked={groupedRowIds.length > 0 && groupedRowIds.every((id) => selected.includes(id))}
                   onCheckedChange={(checked) => {
                     onSelectAll(false)
-                    const ids = rows.map((row) => row.id)
+                    const ids = groupedRowIds
                     onSelected(checked ? Array.from(new Set([...selected, ...ids])) : selected.filter((id) => !ids.includes(id)))
                   }}
                 />
               </TableHead>
-              <TableHead>Store</TableHead>
-              <TableHead>Odoo Order</TableHead>
-              <TableHead>Shopify Order</TableHead>
-              <TableHead>Amazon Order</TableHead>
-              <TableHead>Product ASIN</TableHead>
-              <TableHead>Carrier / Tracking</TableHead>
-              <TableHead>Tracking</TableHead>
-              <TableHead>Odoo Pickings</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Message</TableHead>
+              <TableHead className="w-[120px]">Store</TableHead>
+              <TableHead className="w-[150px]">Odoo Order</TableHead>
+              <TableHead className="w-[170px]">Shopify Order</TableHead>
+              <TableHead className="w-[300px]">Amazon Order</TableHead>
+              <TableHead className="w-[330px]">Product ASIN</TableHead>
+              <TableHead className="w-[390px]">Carrier / Tracking</TableHead>
+              <TableHead className="w-[190px]">Tracking</TableHead>
+              <TableHead className="w-[170px]">Odoo Pickings</TableHead>
+              <TableHead className="w-[150px]">Status</TableHead>
+              <TableHead className="w-[190px]">Message</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.map((row) => {
-              const packages = rowPackages(row)
-              const amazonProducts = pendingAmazonProducts(row, packages)
+            {orderGroups.map((group) => {
+              const row = group.primary
+              const groupRows = group.rows
+              const groupIds = groupRows.map((item) => item.id)
+              const rawItemAudit = itemAuditForGroup(groupRows)
+              const auditedLineCount = uniqueByValue(
+                rawItemAudit
+                  .map((item) => Number(item.line_id || item.odoo_line_id || 0))
+                  .filter((lineId) => lineId > 0),
+                (lineId) => String(lineId),
+              ).length
+              const displayedLineCount = Math.max(groupRows.length, auditedLineCount)
+              const rowTrackingPackages = uniqueByValue(
+                groupRows.flatMap((item) => rowPackages(item)),
+                (pkg: any) => readablePackageCode(pkg) || [pkg.tracking_url || "", pkg.carrier || "", pkg.status || pkg.promise || ""].join("|"),
+              )
+              const associatedTrackingPackages = allAmazonAssociationPackagesForGroup(groupRows)
+              const rawPackages = uniqueByValue(
+                [...associatedTrackingPackages, ...rowTrackingPackages],
+                (pkg: any) => packageDisplayKey(pkg),
+              )
+              const rawAmazonOrders = uniqueByValue(
+                [
+                  ...groupRows.flatMap((item) => item.pending_amazon_orders || []).map((item) => ({
+                    id: String(item.amazon_order_id || "").trim(),
+                    url: item.amazon_order_url,
+                    recipient: item.recipient,
+                    status: item.status || item.state,
+                    expectedAsins: Array.isArray(item.display_asins) ? item.display_asins : item.captured_asins?.length ? item.captured_asins : item.expected_asins || [],
+                    quantity: item.display_quantity ?? item.quantity,
+                  })),
+                  ...groupRows.map((item) => ({
+                    id: String(item.amazon_order_id || "").trim(),
+                    url: item.amazon_order_url,
+                    recipient: "",
+                    status: item.tracking_status || item.state,
+                    expectedAsins: item.asin ? [String(item.asin).trim().toUpperCase()] : [],
+                    quantity: item.quantity,
+                  })),
+                ]
+                  .filter((item) => item.id),
+                (item) => item.id,
+              )
+              const amazonOrderSequence = uniqueByValue(
+                [
+                  ...rawAmazonOrders.map((order) => order.id),
+                  ...rawItemAudit.map((item) => String(item.amazon_order_id || "").trim()),
+                  ...rawPackages.map((pkg: any) => amazonOrderIdFromPackage(pkg)),
+                ].filter(Boolean),
+                (orderId) => String(orderId),
+              )
+              const amazonOrders = sortByAmazonOrderSequence(rawAmazonOrders, amazonOrderSequence, (order) => order.id)
+              const packages = sortByAmazonOrderSequence(rawPackages, amazonOrderSequence, (pkg: any) => amazonOrderIdFromPackage(pkg))
+              const shownAmazonOrderIds = new Set(amazonOrders.map((order) => order.id).filter(Boolean))
+              const visibleMatchedOrders = sortByAmazonOrderSequence(visibleMatchedAmazonOrdersForGroup(groupRows, shownAmazonOrderIds), amazonOrderSequence, (order) => order.amazon_order_id)
+              const matchedPackages = sortByAmazonOrderSequence(matchedAmazonPackagesForGroup(groupRows), amazonOrderSequence, (pkg: any) => amazonOrderIdFromPackage(pkg))
+              const normalPackageCodes = new Set(rowTrackingPackages.map((pkg: any) => readablePackageCode(pkg)).filter(Boolean))
+              const visibleMatchedPackages = matchedPackages.filter((pkg: any) => {
+                const code = readablePackageCode(pkg)
+                const packageOrderId = String(pkg.amazon_order_id || "").trim()
+                return code && !shownAmazonOrderIds.has(packageOrderId) && !normalPackageCodes.has(code) && !packages.some((packageItem: any) => readablePackageCode(packageItem) === code && String(packageItem.amazon_order_id || "") === packageOrderId)
+              })
+              const amazonProducts = sortByAmazonOrderSequence(pendingAmazonProductsForGroup(groupRows), amazonOrderSequence, (product) => productAmazonOrderIdFromAudit(product, rawItemAudit))
+              const completeAmazonProducts = sortByAmazonOrderSequence(
+                amazonProducts.filter((product) => usefulPendingProductTitle(product.title) && String(product.image_url || "").trim()),
+                amazonOrderSequence,
+                (product) => productAmazonOrderIdFromAudit(product, rawItemAudit),
+              )
+              const incompleteAmazonProducts = sortByAmazonOrderSequence(
+                amazonProducts.filter((product) => !usefulPendingProductTitle(product.title) || !String(product.image_url || "").trim()),
+                amazonOrderSequence,
+                (product) => productAmazonOrderIdFromAudit(product, rawItemAudit),
+              )
+              const itemAudit = sortByAmazonOrderSequence(rawItemAudit, amazonOrderSequence, (item) => item.amazon_order_id)
+              const discrepancies = discrepanciesForGroup(groupRows)
+              const otherRelatedOrders = sortByAmazonOrderSequence(relatedAmazonOrdersForGroup(groupRows, visibleMatchedOrders, shownAmazonOrderIds), amazonOrderSequence, (order) => order.amazon_order_id)
+              const shopifyOrders = uniqueByValue(
+                groupRows
+                  .map((item) => ({ name: item.shopify_order_name || item.shopify_order_id, url: item.shopify_order_url, cancelled: item.shopify_cancelled_at, status: item.shopify_fulfillment_status }))
+                  .filter((item) => item.name),
+                (item) => String(item.name),
+              )
+              const pickingRows = uniqueByValue(
+                groupRows.flatMap((item) => (item.picking_names || []).map((name, index) => ({
+                  name,
+                  state: item.picking_states?.[index] || "unknown",
+                  open: item.open_picking_names?.includes(name),
+                }))),
+                (item) => item.name,
+              )
+              const trackingStatuses = uniqueByValue(
+                groupRows.map((item) => item.tracking_status || "Delivered").filter(Boolean),
+                (item) => String(item),
+              )
+              const checkedAtValues = uniqueByValue(groupRows.map((item) => item.tracking_checked_at).filter(Boolean), (item) => String(item))
+              const deliveredAtValues = uniqueByValue(
+                groupRows
+                  .map((item) => item.amazon_delivered_display || formatDateTime(item.amazon_delivered_at))
+                  .filter(Boolean),
+                (item) => String(item),
+              )
+              const hasDiscrepancies = discrepancies.some((item) => item.severity !== "info")
+              const allVisibleStatusesDelivered = [
+                ...amazonOrders.map((order) => order.status),
+                ...trackingStatuses,
+              ].filter(Boolean).every((status) => pendingStatusIsDelivered(status))
               return (
-                <TableRow key={row.id} className="bg-destructive/5">
+                <TableRow key={group.key} className={hasDiscrepancies ? "bg-destructive/5" : allVisibleStatusesDelivered ? "bg-emerald-50/35" : ""}>
                     <TableCell>
                       <Checkbox
-                        checked={selected.includes(row.id)}
+                        checked={groupIds.every((id) => selected.includes(id))}
                         onCheckedChange={(checked, event) => {
                           onSelectAll(false)
                           const visibleIds = rows.map((item) => item.id)
-                          onSelected(rangeSelection(visibleIds, selected, row.id, Boolean(checked), event.shiftKey, selectionAnchor.current))
-                          selectionAnchor.current = row.id
+                          const anchorId = groupIds[0]
+                          if (event.shiftKey && anchorId) {
+                            onSelected(rangeSelection(visibleIds, selected, anchorId, Boolean(checked), true, selectionAnchor.current))
+                          } else {
+                            onSelected(Boolean(checked) ? Array.from(new Set([...selected, ...groupIds])) : selected.filter((id) => !groupIds.includes(id)))
+                          }
+                          selectionAnchor.current = anchorId
                         }}
                       />
                     </TableCell>
-                    <TableCell>{row.store_name}</TableCell>
-                    <TableCell>
+                    <TableCell className="align-top">{row.store_name}</TableCell>
+                    <TableCell className="align-top">
                       <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName="font-medium" />
+                      {displayedLineCount > 1 ? <Badge variant="outline" className="mt-1">{displayedLineCount} lines</Badge> : null}
                       <div className="text-xs text-muted-foreground">
                         {row.odoo_sale_state || "state unknown"} / {row.odoo_invoice_status || "invoice unknown"}
                       </div>
                     </TableCell>
-                    <TableCell>
-                      {row.shopify_order_url ? (
-                        <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.shopify_order_url} target="_blank" rel="noreferrer">
-                          {row.shopify_order_name || `#${row.shopify_order_id}`}
-                        </a>
-                      ) : row.shopify_order_name || row.shopify_order_id ? (
-                        <span className="font-mono text-sm">{row.shopify_order_name || `#${row.shopify_order_id}`}</span>
-                      ) : (
+                    <TableCell className="align-top">
+                      {shopifyOrders.length ? shopifyOrders.map((shopify) => (
+                        <div key={`${group.key}-shopify-${shopify.name}`} className="mb-1">
+                          {shopify.url ? (
+                            <a className="font-mono text-primary underline-offset-4 hover:underline" href={shopify.url} target="_blank" rel="noreferrer">
+                              {shopify.name}
+                            </a>
+                          ) : (
+                            <span className="font-mono text-sm">{shopify.name}</span>
+                          )}
+                          {shopify.cancelled ? (
+                            <div className="text-xs font-medium text-destructive">Cancelled</div>
+                          ) : shopify.status ? (
+                            <div className="text-xs text-muted-foreground">{shopify.status}</div>
+                          ) : null}
+                        </div>
+                      )) : (
                         <span className="text-muted-foreground">Not linked</span>
                       )}
-                      {row.shopify_cancelled_at ? (
-                        <div className="text-xs font-medium text-destructive">Cancelled</div>
-                      ) : row.shopify_fulfillment_status ? (
-                        <div className="text-xs text-muted-foreground">{row.shopify_fulfillment_status}</div>
+                    </TableCell>
+                    <TableCell className="align-top">
+                      <div className="grid gap-1">
+                        {amazonOrders.map((order) => (
+                          <div key={`${group.key}-amazon-${order.id}`} className="grid gap-0.5 rounded border bg-background p-1.5">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <a className="font-mono text-primary underline-offset-4 hover:underline" href={order.url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(order.id)}`} target="_blank">
+                                {order.id}
+                              </a>
+                              <Button size="icon-sm" variant="ghost" title="Copy Amazon order ID" onClick={() => copyPendingText(order.id, "Amazon order ID")}>
+                                <Copy className="size-4" />
+                              </Button>
+                            </div>
+                            <div className="flex min-w-0 flex-wrap items-center gap-1 text-xs text-muted-foreground">
+                              {pendingStatusBadge(order.status)}
+                              {order.quantity ? <span>qty {Number(order.quantity).toLocaleString()}</span> : null}
+                              {order.expectedAsins?.length ? <span className="break-all font-mono">{order.expectedAsins.join(", ")}</span> : null}
+                            </div>
+                            {order.recipient ? <div className="truncate text-[11px] text-muted-foreground">{order.recipient}</div> : null}
+                          </div>
+                        ))}
+                      </div>
+                      {visibleMatchedOrders.length ? (
+                        <div className="mt-2 grid gap-1 rounded border border-amber-200 bg-amber-50 p-2 text-xs">
+                          <div className="font-semibold text-amber-900">Matched Amazon orders</div>
+                          {visibleMatchedOrders.slice(0, 3).map((order) => (
+                            <div key={`${group.key}-matched-${order.amazon_order_id}`} className="grid gap-0.5">
+                              <div className="flex min-w-0 flex-wrap items-center gap-1">
+                                <a className="font-mono text-primary underline-offset-4 hover:underline" href={order.amazon_order_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(order.amazon_order_id)}`} target="_blank" rel="noreferrer">
+                                  {order.amazon_order_id}
+                                </a>
+                                {pendingStatusBadge(order.status, { subtle: true })}
+                              </div>
+                              {order.asins?.length ? <div className="break-words text-muted-foreground">ASIN: {order.asins.join(", ")}</div> : null}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                      {otherRelatedOrders.length ? (
+                        <div className="mt-2 grid gap-1 rounded border bg-muted/30 p-2 text-xs">
+                          <div className="font-semibold text-foreground">Other parts for {row.odoo_order_name}</div>
+                          {otherRelatedOrders.slice(0, 4).map((order) => {
+                            const orderAsins = relatedOrderAsinSummary(order)
+                            return (
+                              <div key={`${group.key}-related-${order.amazon_order_id}`} className="grid gap-1 border-t pt-1 first:border-t-0 first:pt-0">
+                                <div className="flex min-w-0 flex-wrap items-center gap-1">
+                                  <a className="font-mono text-primary underline-offset-4 hover:underline" href={order.amazon_order_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(order.amazon_order_id)}`} target="_blank" rel="noreferrer">
+                                    {order.amazon_order_id}
+                                  </a>
+                                  {pendingStatusBadge(order.status, { subtle: true })}
+                                </div>
+                                {orderAsins.length ? (
+                                  <div className="grid gap-1">
+                                    {orderAsins.slice(0, 3).map((product) => (
+                                      <div key={`${group.key}-related-${order.amazon_order_id}-${product.asin}`} className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+                                        {product.image_url ? <img className="size-6 rounded border bg-white object-contain" src={product.image_url} alt="" /> : null}
+                                        <span className="break-all font-mono">{product.asin}</span>
+                                        {product.title ? <span className="truncate">{product.title}</span> : null}
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : null}
+                              </div>
+                            )
+                          })}
+                          {otherRelatedOrders.length > 4 ? <div className="text-muted-foreground">+{otherRelatedOrders.length - 4} more related order{otherRelatedOrders.length - 4 === 1 ? "" : "s"}</div> : null}
+                        </div>
                       ) : null}
                     </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
-                          {row.amazon_order_id}
-                        </a>
-                        <Button size="icon-sm" variant="ghost" title="Copy Amazon order ID" onClick={() => copyPendingText(row.amazon_order_id, "Amazon order ID")}>
-                          <Copy className="size-4" />
-                        </Button>
-                      </div>
-                    </TableCell>
-                    <TableCell className="max-w-[320px]">
+                    <TableCell className="align-top">
                       <div className="grid gap-2">
-                        {amazonProducts.map((product) => (
-                          <div key={`${row.id}-${product.asin}`} className="flex min-w-0 items-center gap-2">
-                            {product.image_url ? (
-                              <img className="size-10 rounded border bg-white object-contain" src={product.image_url} alt="" />
+                        {discrepancies.length ? (
+                          <div className="grid gap-2 rounded border border-destructive/40 bg-destructive/5 p-2 text-xs">
+                            <div className="flex items-start gap-2 font-semibold text-destructive">
+                              <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                              <span>Amazon item match needs review</span>
+                            </div>
+                            {discrepancies.map((item, index) => (
+                              <div key={`${group.key}-discrepancy-${item.type || index}`} className="text-destructive">
+                                {item.message || "Amazon captured data does not prove every Odoo item ASIN."}
+                                {item.missing_asins?.length ? <span className="font-mono"> Missing: {item.missing_asins.join(", ")}</span> : null}
+                                {item.amazon_order_ids?.length ? <span className="font-mono"> Orders: {item.amazon_order_ids.join(", ")}</span> : null}
+                              </div>
+                            ))}
+                            {itemAudit.length ? (
+                              <div className="grid gap-1">
+                                {itemAudit.map((item) => {
+                                  const matchedProducts = item.matched_products || []
+                                  const matched = item.status === "matched" || item.status === "replacement_matched" || item.status === "quantity_unverified"
+                                  const quantityMismatch = item.status === "quantity_mismatch"
+                                  const quantityUnverified = item.status === "quantity_unverified"
+                                  const orderNotDelivered = item.status === "amazon_order_not_delivered"
+                                  const showProvenAmazonOrder = Boolean(item.amazon_order_id && (matched || quantityMismatch || quantityUnverified || orderNotDelivered))
+                                  const statusLabel = orderNotDelivered ? "order needs attention" : quantityMismatch ? "qty mismatch" : quantityUnverified ? "matched, qty verify" : matched ? (item.status === "replacement_matched" ? "replacement matched" : "matched") : "missing Amazon item"
+                                  const reviewProducts = matchedProducts
+                                  return (
+                                    <div key={`${group.key}-audit-${item.line_id || item.primary_asin}`} className="grid gap-1 rounded border bg-background p-1.5">
+                                      <div className="flex min-w-0 flex-wrap items-center gap-1">
+                                        <Badge variant={matched ? "secondary" : "destructive"}>{statusLabel}</Badge>
+                                        <span className="break-all font-mono">{(item.expected_asins || []).join(" / ") || item.primary_asin || "ASIN missing"}</span>
+                                        {item.quantity ? <span className="text-muted-foreground">qty {Number(item.quantity).toLocaleString()}</span> : null}
+                                        {item.matched_quantity ? <span className="text-muted-foreground">captured {Number(item.matched_quantity).toLocaleString()}</span> : null}
+                                      </div>
+                                      {showProvenAmazonOrder ? (
+                                        <div className="flex min-w-0 flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+                                          <span>Amazon:</span>
+                                          <a className="break-all font-mono text-primary underline-offset-4 hover:underline" href={item.amazon_order_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(item.amazon_order_id)}`} target="_blank" rel="noreferrer">
+                                            {item.amazon_order_id}
+                                          </a>
+                                          {pendingStatusBadge(item.tracking_status, { subtle: true })}
+                                        </div>
+                                      ) : item.amazon_order_id ? (
+                                        <div className="text-[11px] font-medium text-destructive">
+                                          No proven Amazon order captured for this Odoo ASIN. Last linked order {item.amazon_order_id} did not provide matching item proof.
+                                        </div>
+                                      ) : null}
+                                      <div className="line-clamp-2 text-[11px] leading-snug text-muted-foreground">Odoo: {item.product_name || "Product name unavailable"}</div>
+                                      {reviewProducts.length ? (
+                                        <div className="grid gap-1">
+                                          {reviewProducts.map((product) => (
+                                            <div key={`${group.key}-audit-product-${item.line_id}-${product.asin}`} className="grid min-w-0 grid-cols-[2rem_minmax(5.5rem,auto)_1fr] items-center gap-2">
+                                              {product.image_url ? (
+                                                <button
+                                                  type="button"
+                                                  className="size-7 shrink-0 overflow-hidden rounded border bg-white p-0 transition hover:border-primary focus:outline-none focus:ring-2 focus:ring-ring"
+                                                  title={`View larger image for ${product.asin}`}
+                                                  onClick={() => setImagePreview({ src: product.image_url || "", title: product.title || product.asin, asin: product.asin })}
+                                                >
+                                                  <img className="size-full object-contain" src={product.image_url} alt={product.title || product.asin} />
+                                                </button>
+                                              ) : (
+                                                <div className="flex size-7 shrink-0 items-center justify-center rounded border bg-muted text-[9px] font-semibold text-muted-foreground">
+                                                  ASIN
+                                                </div>
+                                              )}
+                                              <a className="whitespace-nowrap font-mono text-xs font-semibold text-primary underline-offset-4 hover:underline" href={product.url || `https://www.amazon.com/dp/${encodeURIComponent(product.asin)}`} target="_blank" rel="noreferrer">
+                                                {product.asin}
+                                              </a>
+                                              {product.title ? <span className="min-w-0 truncate text-[11px] text-muted-foreground">{product.title}</span> : null}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ) : orderNotDelivered ? (
+                                        <div className="text-[11px] text-destructive">Amazon title/thumbnail was not captured for this item on this Amazon order. Recapture this Amazon order detail page.</div>
+                                      ) : (
+                                        <div className="text-[11px] text-destructive">No Amazon ASIN/title/thumbnail captured for this Odoo item.</div>
+                                      )}
+                                    </div>
+                                  )
+                                })}
+                              </div>
                             ) : null}
+                          </div>
+                        ) : null}
+                        {completeAmazonProducts.map((product) => (
+                          <div key={`${group.key}-${product.asin}`} className="flex min-w-0 items-start gap-2 rounded border bg-background p-1.5">
+                            <button
+                              type="button"
+                              className="size-12 shrink-0 overflow-hidden rounded border bg-white p-0 transition hover:border-primary focus:outline-none focus:ring-2 focus:ring-ring"
+                              title={`View larger image for ${product.asin}`}
+                              onClick={() => setImagePreview({ src: product.image_url || "", title: product.title || product.asin, asin: product.asin })}
+                            >
+                              <img className="size-full object-contain" src={product.image_url} alt={product.title || product.asin} />
+                            </button>
                             <div className="min-w-0">
-                              <a className="font-mono text-primary underline-offset-4 hover:underline" href={product.url} target="_blank">
+                              <a className="font-mono text-sm font-semibold text-primary underline-offset-4 hover:underline" href={product.url} target="_blank">
                                 {product.asin}
                               </a>
-                              {product.title ? <div className="truncate text-xs text-muted-foreground">{product.title}</div> : null}
+                              <div className="line-clamp-2 text-[11px] leading-snug text-muted-foreground">{product.title}</div>
                             </div>
                           </div>
                         ))}
-                        {!amazonProducts.length ? <span className="text-muted-foreground">No ASIN captured</span> : null}
+                        {incompleteAmazonProducts.length ? (
+                          <div className="rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                            Recapture Amazon product detail for {incompleteAmazonProducts.map((product) => product.asin).join(", ")}.
+                          </div>
+                        ) : null}
+                        {!amazonProducts.length ? <span className="text-muted-foreground">No Amazon product captured</span> : null}
                       </div>
                     </TableCell>
-                    <TableCell className="min-w-[260px] max-w-[420px]">
+                    <TableCell className="align-top">
                       {packages.length ? (
                         <div className="grid gap-1 text-sm">
                           {packages.map((pkg: any, index: number) => {
-                            const trackingId = String(pkg.tracking_id || pkg.trackingId || pkg.tracking_number || pkg.trackingNumber || "").trim()
+                            const rawTrackingId = String(pkg.tracking_id || pkg.trackingId || pkg.tracking_number || pkg.trackingNumber || "").trim()
+                            const trackingId = readablePackageCode(pkg) || (/^https?:\/\//i.test(rawTrackingId) ? "" : rawTrackingId)
                             const latest = pkg.latest_event || {}
                             const latestMessage = [latest.date, latest.time, latest.message].filter(Boolean).join(" ")
+                            const packageStatus = packageStatusDisplay(pkg)
+                            const deliveredPackage = pendingStatusIsDelivered(packageStatus)
+                            const trackingLabel = trackingId || (pkg.tracking_url ? "No package ID yet" : "Amazon tracking page")
                             return (
-                              <div key={`${row.id}-${trackingId || index}`} className="grid gap-0.5">
+                              <div key={`${group.key}-${trackingId || index}`} className={`grid gap-0.5 rounded border p-1.5 ${deliveredPackage ? "border-emerald-200 bg-emerald-50/80" : "bg-background"}`}>
                                 <div className="flex min-w-0 items-start gap-2">
                                   <a className="break-all font-mono text-primary underline-offset-4 hover:underline" href={pkg.tracking_url || row.amazon_order_url} target="_blank">
-                                    {trackingId || "Amazon tracking page"}
+                                    {trackingLabel}
                                   </a>
                                   {trackingId ? (
                                     <Button size="icon-sm" variant="ghost" title="Copy Amazon tracking ID" onClick={() => copyPendingText(trackingId, "Amazon tracking ID")}>
@@ -7935,48 +8640,116 @@ function FulfilmentPendingPage({
                                     </Button>
                                   ) : null}
                                 </div>
-                                <span className="break-words text-xs text-muted-foreground">{pkg.carrier || "Amazon shipment"}</span>
+                                <div className="flex min-w-0 flex-wrap items-center gap-1 break-words text-xs text-muted-foreground">
+                                  {pendingStatusBadge(packageStatus, { subtle: true })}
+                                  <span>{[pkg.amazon_order_id, pkg.carrier || "Amazon shipment"].filter(Boolean).join(" · ")}</span>
+                                </div>
                                 {latestMessage ? <span className="break-words text-xs text-muted-foreground">{latestMessage}</span> : null}
                               </div>
                             )
                           })}
+                          {visibleMatchedPackages.length ? (
+                            <div className="mt-2 border-t pt-2">
+                              <div className="mb-1 text-xs font-semibold text-amber-800">Matched package codes</div>
+                              <div className="grid gap-1">
+                                {visibleMatchedPackages.map((pkg: any, index: number) => {
+                                  const code = readablePackageCode(pkg)
+                                  if (!code) return null
+                                  const packageStatus = packageStatusDisplay(pkg)
+                                  const deliveredPackage = pendingStatusIsDelivered(packageStatus)
+                                  return (
+                                    <div key={`${group.key}-matched-package-${code}-${index}`} className={`grid gap-0.5 rounded border p-1.5 ${deliveredPackage ? "border-emerald-200 bg-emerald-50/80" : "bg-background"}`}>
+                                      <div className="flex min-w-0 items-start gap-2">
+                                        <a className="break-all font-mono text-primary underline-offset-4 hover:underline" href={pkg.tracking_url || pkg.amazon_order_url || row.amazon_order_url} target="_blank">
+                                          {code}
+                                        </a>
+                                        <Button size="icon-sm" variant="ghost" title="Copy matched package code" onClick={() => copyPendingText(code, "Matched package code")}>
+                                          <Copy className="size-4" />
+                                        </Button>
+                                      </div>
+                                      <div className="flex min-w-0 flex-wrap items-center gap-1 break-words text-xs text-muted-foreground">
+                                        {pendingStatusBadge(packageStatus, { subtle: true })}
+                                        <span>{[pkg.amazon_order_id, pkg.carrier].filter(Boolean).join(" · ")}</span>
+                                      </div>
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          ) : null}
                         </div>
                       ) : (
-                        <a className="text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
-                          Amazon tracking page
-                        </a>
+                        <div className="grid gap-1 text-sm">
+                          {visibleMatchedPackages.length ? (
+                            visibleMatchedPackages.map((pkg: any, index: number) => {
+                              const code = readablePackageCode(pkg)
+                              if (!code) return null
+                              const packageStatus = packageStatusDisplay(pkg)
+                              const deliveredPackage = pendingStatusIsDelivered(packageStatus)
+                              return (
+                                <div key={`${group.key}-matched-only-package-${code}-${index}`} className={`grid gap-0.5 rounded border p-1.5 ${deliveredPackage ? "border-emerald-200 bg-emerald-50/80" : "bg-background"}`}>
+                                  <div className="flex min-w-0 items-start gap-2">
+                                    <a className="break-all font-mono text-primary underline-offset-4 hover:underline" href={pkg.tracking_url || pkg.amazon_order_url || row.amazon_order_url} target="_blank">
+                                      {code}
+                                    </a>
+                                    <Button size="icon-sm" variant="ghost" title="Copy matched package code" onClick={() => copyPendingText(code, "Matched package code")}>
+                                      <Copy className="size-4" />
+                                    </Button>
+                                  </div>
+                                  <div className="flex min-w-0 flex-wrap items-center gap-1 break-words text-xs text-muted-foreground">
+                                    {pendingStatusBadge(packageStatus, { subtle: true })}
+                                    <span>{[pkg.amazon_order_id, pkg.carrier].filter(Boolean).join(" · ")}</span>
+                                  </div>
+                                </div>
+                              )
+                            })
+                          ) : (
+                            <a className="text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
+                              No package ID yet
+                            </a>
+                          )}
+                        </div>
                       )}
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="align-top">
                       <div className="grid gap-1">
-                        <StatusBadge value={row.tracking_status || "Delivered"} />
-                        <span className="text-xs font-medium">
-                          Delivered: {row.amazon_delivered_display || formatDateTime(row.amazon_delivered_at) || "date unknown"}
-                        </span>
-                        <span className="text-xs text-muted-foreground">Checked: {formatDateTime(row.tracking_checked_at)}</span>
+                        {trackingStatuses.map((status) => <StatusBadge key={`${group.key}-status-${status}`} value={String(status)} />)}
+                        {deliveredAtValues.length ? (
+                          <span className="text-xs font-medium">
+                            Delivered: {String(deliveredAtValues[0])}
+                          </span>
+                        ) : null}
+                        {groupRows.map((item) => item.manual_matched_amazon_order_id && item.manual_matched_amazon_order_id !== item.amazon_order_id ? (
+                          <span key={`${group.key}-manual-${item.id}-${item.manual_matched_amazon_order_id}`} className="text-xs font-medium text-amber-700">
+                            Manual ASIN match: {item.manual_matched_amazon_status || "matched"} / {item.manual_matched_amazon_order_id}
+                          </span>
+                        ) : null)}
+                        {checkedAtValues.length ? <span className="text-xs text-muted-foreground">Checked: {formatDateTime(String(checkedAtValues[0]))}</span> : null}
                       </div>
                     </TableCell>
-                    <TableCell className="max-w-[320px]">
+                    <TableCell className="align-top">
                       <div className="grid gap-1 text-sm">
-                        {(row.picking_names || []).map((name, index) => (
-                          <span key={`${row.id}-${name}-${index}`} className={row.open_picking_names?.includes(name) ? "font-medium text-destructive" : "text-muted-foreground"}>
-                            {name}: {row.picking_states?.[index] || "unknown"}
+                        {pickingRows.map((picking) => (
+                          <span key={`${group.key}-${picking.name}`} className={picking.open ? "font-medium text-destructive" : "text-muted-foreground"}>
+                            {picking.name}: {picking.state}
                           </span>
                         ))}
-                        {!row.picking_names?.length && <span className="text-destructive">No pickings found</span>}
+                        {!pickingRows.length && <span className="text-destructive">No pickings found</span>}
                       </div>
                     </TableCell>
-                    <TableCell>
-                      <Badge variant="destructive">Fulfilment pending</Badge>
+                    <TableCell className="align-top">
+                      <Badge variant={allVisibleStatusesDelivered ? "destructive" : "secondary"}>
+                        {allVisibleStatusesDelivered ? "Fulfilment pending" : "Awaiting Amazon delivery"}
+                      </Badge>
                     </TableCell>
-                    <TableCell className="max-w-[360px]"><ErrorTooltip value={row.message} /></TableCell>
+                    <TableCell className="align-top"><ErrorTooltip value={row.message} /></TableCell>
                 </TableRow>
               )
             })}
             {!rows.length && (
               <TableRow>
                 <TableCell colSpan={11} className="py-8 text-center text-muted-foreground">
-                  No delivered Amazon orders are pending Odoo fulfilment.
+                  No delivered or due-today Amazon orders are pending Odoo fulfilment.
                 </TableCell>
               </TableRow>
             )}
@@ -7984,6 +8757,22 @@ function FulfilmentPendingPage({
         </Table>
       </CardContent>
     </Card>
+    <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>{imagePreview?.title || "Amazon product image"}</DialogTitle>
+          <DialogDescription>
+            {imagePreview?.asin ? `ASIN ${imagePreview.asin}` : "Product thumbnail from Amazon order details."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex max-h-[72vh] items-center justify-center overflow-hidden rounded border bg-white p-4">
+          {imagePreview?.src ? (
+            <img src={imagePreview.src} alt={imagePreview.title || "Amazon product"} className="max-h-[68vh] w-full object-contain" />
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
+    </>
   )
 }
 
@@ -8598,6 +9387,7 @@ function InventoryPage({
   onResult: (modal: ModalState) => void
 }) {
   const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
+  const [imagePreview, setImagePreview] = useState<{ src: string; title: string; asin?: string } | null>(null)
   async function addManualInventory() {
     try {
       const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>("/api/inventory", {
@@ -8645,6 +9435,7 @@ function InventoryPage({
   }
 
   return (
+    <>
     <div className="grid gap-5">
       <Card>
         <CardHeader>
@@ -8697,6 +9488,7 @@ function InventoryPage({
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead>Image</TableHead>
                 <TableHead>ASIN</TableHead>
                 <TableHead>Qty</TableHead>
                 <TableHead>Product</TableHead>
@@ -8712,7 +9504,28 @@ function InventoryPage({
               {rows.map((item) => (
                 <TableRow key={item.id}>
                   <TableCell>
-                    <a className="font-mono text-primary underline-offset-4 hover:underline" href={`https://www.amazon.com/dp/${item.asin}`} target="_blank">{item.asin}</a>
+                    {item.image_url ? (
+                      <button
+                        type="button"
+                        className="size-14 overflow-hidden rounded border bg-white p-0 transition hover:border-primary focus:outline-none focus:ring-2 focus:ring-ring"
+                        title={`View larger image for ${item.asin}`}
+                        onClick={() => setImagePreview({ src: item.image_url || "", title: item.image_title || item.product_name || item.asin, asin: item.asin })}
+                      >
+                        <img
+                          className="size-full object-contain"
+                          src={item.image_url}
+                          alt={item.image_title || item.product_name || item.asin}
+                        />
+                      </button>
+                    ) : (
+                      <div className="flex size-14 items-center justify-center rounded border bg-muted text-[10px] font-semibold text-muted-foreground">
+                        ASIN
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <a className="font-mono text-primary underline-offset-4 hover:underline" href={item.asin_url || `https://www.amazon.com/dp/${item.asin}`} target="_blank">{item.asin}</a>
+                    {item.image_source ? <div className="text-[11px] text-muted-foreground">{item.image_source === "amazon_page" ? "Amazon page image" : "Captured thumbnail"}</div> : null}
                   </TableCell>
                   <TableCell>{item.quantity}</TableCell>
                   <TableCell className="max-w-[360px] truncate">{item.product_name}</TableCell>
@@ -8738,7 +9551,7 @@ function InventoryPage({
                       </div>
                     ) : <span className="text-muted-foreground">Not attached</span>}
                   </TableCell>
-                  <TableCell><StatusBadge value={item.status} /></TableCell>
+                  <TableCell><InventoryStatusBadge value={item.status} /></TableCell>
                   <TableCell className="text-xs text-muted-foreground">{formatDateTime(item.updated_at)}</TableCell>
                   <TableCell className="text-right">
                     <div className="btn-list justify-end">
@@ -8759,7 +9572,7 @@ function InventoryPage({
               ))}
               {!rows.length && (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
+                  <TableCell colSpan={10} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
                 </TableRow>
               )}
             </TableBody>
@@ -8767,6 +9580,22 @@ function InventoryPage({
         </CardContent>
       </Card>
     </div>
+    <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>{imagePreview?.title || "Amazon product image"}</DialogTitle>
+          <DialogDescription>
+            {imagePreview?.asin ? `ASIN ${imagePreview.asin}` : "Product thumbnail from Amazon."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex max-h-[72vh] items-center justify-center overflow-hidden rounded border bg-white p-4">
+          {imagePreview?.src ? (
+            <img src={imagePreview.src} alt={imagePreview.title || "Amazon product"} className="max-h-[68vh] w-full object-contain" />
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
+    </>
   )
 }
 

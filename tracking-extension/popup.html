@@ -28,6 +28,21 @@
         Auto check every hours
         <input id="autoTrackingHours" type="number" min="1" max="168" step="1">
       </label>
+      <section class="single-order-panel">
+        <h2>Track Amazon order(s)</h2>
+        <label>
+          Amazon order number
+          <input id="singleAmazonOrderId" placeholder="113-0000000-0000000" spellcheck="false">
+        </label>
+        <label>
+          Queue several Amazon orders
+          <textarea id="amazonOrderBatch" placeholder="Paste one or many order numbers, separated by line, comma, or space." spellcheck="false"></textarea>
+        </label>
+        <div class="actions">
+          <button id="trackSingleOrder">Track order</button>
+          <button id="trackQueuedOrders" class="secondary">Track queued orders</button>
+        </div>
+      </section>
       <section class="track-all-panel">
         <h2>Track all from Amazon order history</h2>
         <div class="track-all-grid">

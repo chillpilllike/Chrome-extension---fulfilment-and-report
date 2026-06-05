@@ -91,7 +91,9 @@ function trackingProgress(tracking = {}) {
     skipped_recent: tracking.skippedRecentCount || 0,
     started_at: tracking.startedAt || null,
     last_activity_at: tracking.lastActivityAt || tracking.updatedAt || null,
-    message: tracking.running ? "Tracking is running." : "Tracking is stopped.",
+    message: tracking.running
+      ? tracking.source === "manual" ? "Queued-order tracking is running." : "Tracking is running."
+      : tracking.source === "manual" ? "Queued-order tracking is stopped." : "Tracking is stopped.",
   };
 }
 
@@ -111,6 +113,7 @@ function recentCheckSet(recentTrackingChecks = []) {
   return new Set(
     (recentTrackingChecks || [])
       .filter((item) => Number(item.checkedAt || 0) >= cutoff)
+      .filter((item) => !["failed", "unmatched"].includes(String(item.status || "").trim().toLowerCase()))
       .map((item) => String(item.amazon_order_id || "").trim())
       .filter(Boolean),
   );
@@ -146,8 +149,9 @@ async function api(path, options = {}) {
   const base = normalizeApiBase(apiBase);
   const requestPath = String(path || "").startsWith("/") ? path : `/${path}`;
   const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, headers = {}, retries = 1, ...fetchOptions } = options;
+  const maxRetries = Math.max(Number(retries || 0), requestPath === "/api/tracking/update" ? 2 : 0);
   let lastError = null;
-  for (let attempt = 0; attempt <= Number(retries || 0); attempt += 1) {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), Number(timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS));
     try {
@@ -158,12 +162,14 @@ async function api(path, options = {}) {
       });
       if (!response.ok) {
         const responseText = await response.text();
-        if (response.status >= 500 && attempt < Number(retries || 0)) {
-          lastError = new Error(responseText || response.statusText || "Server error");
+        const detail = responseText || response.statusText || "Request failed";
+        const message = `${response.status} ${response.statusText || "HTTP error"} at ${base}${requestPath}: ${detail}`;
+        if (response.status >= 500 && attempt < maxRetries) {
+          lastError = new Error(message);
           await new Promise((resolve) => setTimeout(resolve, 1200));
           continue;
         }
-        throw new Error(responseText || response.statusText);
+        throw new Error(message);
       }
       return response.json();
     } catch (error) {
@@ -171,7 +177,7 @@ async function api(path, options = {}) {
         ? new Error(`Local app request timed out after ${Math.round(Number(timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS) / 1000)}s.`)
         : error;
       if (error?.name === "AbortError") break;
-      if (!isConnectionError(error) || attempt >= Number(retries || 0)) break;
+      if (!isConnectionError(error) || attempt >= maxRetries) break;
       await new Promise((resolve) => setTimeout(resolve, 1200));
     } finally {
       clearTimeout(timeout);
@@ -320,6 +326,66 @@ function orderUrl(order) {
   return order.amazon_order_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(order.amazon_order_id)}`;
 }
 
+function physicalTrackingId(value) {
+  const text = String(value || "").trim();
+  if (/^https?:\/\//i.test(text)) return "";
+  const normalized = text.toUpperCase().replace(/[^A-Z0-9-]/g, "");
+  if (/^TBA[A-Z0-9]+$/.test(normalized)) return normalized;
+  if (/^1Z[A-Z0-9]{12,24}$/.test(normalized)) return normalized;
+  if (/^SG\d{10,24}$/.test(normalized)) return normalized;
+  if (/^D\d{10,24}$/.test(normalized)) return normalized;
+  if (/^\d{12,30}$/.test(normalized)) return normalized;
+  return "";
+}
+
+function sanitizePackageTrackingIdentity(packageData = {}) {
+  const trackingId = physicalTrackingId(
+    packageData.tracking_id ||
+    packageData.trackingId ||
+    packageData.tracking_number ||
+    packageData.trackingNumber
+  );
+  if (trackingId) {
+    packageData.tracking_id = trackingId;
+    return packageData;
+  }
+  delete packageData.tracking_id;
+  delete packageData.trackingId;
+  delete packageData.tracking_number;
+  delete packageData.trackingNumber;
+  return packageData;
+}
+
+function usefulAmazonProductTitle(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length < 6) return false;
+  if (/^[\d\W_]+$/.test(text)) return false;
+  return !/buy it again|return eligible|order placed|view item|amazon business card/i.test(text);
+}
+
+function mergePackageProducts(primary = [], secondary = []) {
+  const products = [];
+  const byAsin = new Map();
+  const add = (item = {}) => {
+    const asin = String(item.asin || "").trim().toUpperCase();
+    if (!asin) return;
+    const existing = byAsin.get(asin) || { asin };
+    const title = String(item.title || "").trim();
+    const imageUrl = String(item.image_url || item.imageUrl || "").trim();
+    const url = String(item.url || "").trim();
+    if (url && !existing.url) existing.url = url;
+    if (imageUrl && !existing.image_url) existing.image_url = imageUrl;
+    if (usefulAmazonProductTitle(title) && !usefulAmazonProductTitle(existing.title)) existing.title = title;
+    if (!byAsin.has(asin)) {
+      byAsin.set(asin, existing);
+      products.push(existing);
+    }
+  };
+  primary.forEach(add);
+  secondary.forEach(add);
+  return products;
+}
+
 function orderHistoryUrl(page = 1) {
   const pageNumber = Math.max(1, Math.round(Number(page || 1)));
   return `${ORDER_HISTORY_URL}#pagination/${pageNumber}/`;
@@ -352,7 +418,10 @@ async function openCurrentOrder(windowId) {
     const skipped = Number(tracking.skippedRecentCount || 0);
     tracking.running = false;
     tracking.finishedAt = Date.now();
-    tracking.lastMessage = `Stopped because no more eligible open Amazon orders were left. All tracking codes scanned. Checked ${checked} order(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
+    const doneReason = tracking.source === "manual"
+      ? "all queued Amazon orders finished"
+      : "no more eligible open Amazon orders were left";
+    tracking.lastMessage = `Stopped because ${doneReason}. All tracking codes scanned. Checked ${checked} order(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
     await saveTracking(tracking, windowId);
     await log(`${tracking.lastMessage} No more open Amazon orders.`, windowId);
     await clearWatchdogIfIdle();
@@ -395,7 +464,7 @@ async function advanceCurrentOrder(tracking, windowId, status = "checked") {
 async function startTracking(windowId) {
   const { headlessTrackingMode } = await getState();
   if (headlessTrackingMode) return startHeadlessTracking();
-  const payload = await api("/api/tracking/orders");
+  const payload = await fetchAllTrackingOrders();
   const { recentTrackingChecks } = await getState();
   const recent = recentCheckSet(recentTrackingChecks);
   const allOrders = (payload.orders || []).filter((order) => String(order.tracking_status || "").toLowerCase() !== "delivered");
@@ -426,6 +495,87 @@ async function startTracking(windowId) {
   if (!orders.length) return { ok: false, message: "No Amazon orders need tracking." };
   await openCurrentOrder(windowId);
   return { ok: true, message: forcedRecentRescan ? `Started tracking ${orders.length} recently checked order(s) again.` : `Started tracking ${orders.length} order(s).`, progress: trackingProgress(tracking) };
+}
+
+async function startSingleOrderTracking(windowId, amazonOrderId) {
+  const orderId = String(amazonOrderId || "").trim();
+  if (!/^\d{3}-\d{7}-\d{7}$/.test(orderId)) {
+    return { ok: false, message: "Enter a valid Amazon order number like 113-0000000-0000000." };
+  }
+  return startManualOrderQueueTracking(windowId, [orderId], "single");
+}
+
+function normalizeManualOrderIds(values = []) {
+  const ids = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const matches = String(value || "").match(/\b\d{3}-\d{7}-\d{7}\b/g) || [];
+    for (const raw of matches) {
+      const orderId = raw.trim();
+      if (!orderId || seen.has(orderId)) continue;
+      seen.add(orderId);
+      ids.push(orderId);
+    }
+  }
+  return ids;
+}
+
+async function startManualOrderQueueTracking(windowId, amazonOrderIds = [], source = "manual") {
+  const orderIds = normalizeManualOrderIds(amazonOrderIds);
+  if (!orderIds.length) {
+    return { ok: false, message: "Paste at least one valid Amazon order number like 113-0000000-0000000." };
+  }
+  const orders = orderIds.map((orderId) => ({
+    amazon_order_id: orderId,
+    amazon_order_url: orderUrl({ amazon_order_id: orderId }),
+  }));
+  const tracking = {
+    running: true,
+    source: source === "single" && orders.length === 1 ? "single" : "manual",
+    singleOrderId: orders.length === 1 ? orderIds[0] : "",
+    batchOrderIds: orderIds,
+    orders,
+    index: 0,
+    packages: [],
+    packageIndex: 0,
+    completedOrderIds: [],
+    failedOrderIds: [],
+    skippedRecentCount: 0,
+    startedAt: Date.now(),
+    lastActivityAt: Date.now(),
+    lastMessage: orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`,
+  };
+  await saveTracking(tracking, windowId);
+  await ensureWatchdog();
+  await log(orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`, windowId);
+  await openCurrentOrder(windowId);
+  return {
+    ok: true,
+    message: orders.length === 1 ? `Started tracking Amazon order ${orderIds[0]}.` : `Started tracking ${orders.length} queued Amazon orders.`,
+    progress: trackingProgress(tracking),
+  };
+}
+
+async function fetchAllTrackingOrders(status = "active") {
+  const perPage = 100;
+  let page = 1;
+  let total = 0;
+  const orders = [];
+  const seen = new Set();
+  while (page <= 200) {
+    const params = new URLSearchParams({ page: String(page), per_page: String(perPage), status });
+    const payload = await api(`/api/tracking/orders?${params.toString()}`, { timeoutMs: 30000 });
+    total = Number(payload.total || total || 0);
+    for (const order of payload.orders || []) {
+      const orderId = String(order.amazon_order_id || "").trim();
+      if (!orderId || seen.has(orderId)) continue;
+      seen.add(orderId);
+      orders.push(order);
+    }
+    if (!payload.orders?.length || page * perPage >= total) break;
+    page += 1;
+  }
+  return { ok: true, orders, total: Math.max(total, orders.length), page_count: page };
 }
 
 function normalizeHistoryOrder(order = {}) {
@@ -752,6 +902,7 @@ async function postHistoryOrderTracking(tracking, windowId, status = "checked") 
         amazon_order_id: order.amazon_order_id,
         amazon_order_url: order.amazon_order_url || orderUrl(order),
         packages: packages.length ? packages : [{
+          status_only: true,
           status: order.status || "Unknown",
           promise: order.status || "",
           expected_delivery_date: order.expected_delivery_date || "",
@@ -970,8 +1121,12 @@ async function handleHistoryPackageTracking(message, windowId) {
   const queuedPackage = order.packages?.[Number(order.packageIndex || 0)] || {};
   const pagePackage = message.package || {};
   const packageData = { ...queuedPackage, ...pagePackage };
+  sanitizePackageTrackingIdentity(packageData);
   if (Array.isArray(queuedPackage.asins) && queuedPackage.asins.length) packageData.asins = queuedPackage.asins;
-  if (Array.isArray(queuedPackage.products) && queuedPackage.products.length) packageData.products = queuedPackage.products;
+  packageData.products = mergePackageProducts(
+    Array.isArray(queuedPackage.products) ? queuedPackage.products : [],
+    Array.isArray(pagePackage.products) ? pagePackage.products : [],
+  );
   order.capturedPackages = Array.isArray(order.capturedPackages) ? order.capturedPackages : [];
   order.capturedPackages[Number(order.packageIndex || 0)] = packageData;
   order.packageIndex = Number(order.packageIndex || 0) + 1;
@@ -1069,11 +1224,28 @@ async function handleOrderPackages(message, windowId) {
     }
   }
   if (!tracking.running) {
-    await log(`Ignored Amazon order page ${message.amazonOrderId || "unknown"} because normal tracking is not running.`, windowId);
     if (headlessTrackingMode) {
       return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
     }
-    return { ok: false, message: "Normal tracking is not running. Press Start Tracking from the extension popup." };
+    const amazonOrderId = String(message.amazonOrderId || "").trim();
+    if (!amazonOrderId) return { ok: false, message: "Could not detect the Amazon order id on this order page." };
+    try {
+      await api("/api/tracking/update", {
+        method: "POST",
+        body: JSON.stringify({
+          amazon_order_id: amazonOrderId,
+          amazon_order_url: message.amazonOrderUrl || orderUrl({ amazon_order_id: amazonOrderId }),
+          packages: message.packages || [],
+        }),
+        timeoutMs: 18000,
+        retries: 0,
+      });
+      await log(`Standalone Amazon order page ${amazonOrderId} posted package/product metadata to the app.`, windowId);
+      return { ok: true, recovered: true, message: `Posted package/product metadata for ${amazonOrderId}.` };
+    } catch (error) {
+      await log(`Could not save standalone order page ${amazonOrderId}: ${error.message}.`, windowId);
+      return { ok: false, message: error.message };
+    }
   }
   const order = tracking.orders[tracking.index];
   if (!order || order.amazon_order_id !== message.amazonOrderId) {
@@ -1142,6 +1314,7 @@ async function handleOrderPackages(message, windowId) {
         amazon_order_id: order.amazon_order_id,
         amazon_order_url: orderUrl(order),
         packages: [{
+          status_only: true,
           status: message.orderStatus || "Unknown",
           promise: message.promise || "",
           expected_delivery_date: message.expected_delivery_date || "",
@@ -1174,15 +1347,10 @@ async function handlePackageTracking(message, windowId) {
   const historyResult = await handleHistoryPackageTracking(message, windowId);
   if (historyResult) return historyResult;
   const { tracking, headlessTrackingMode } = await getWindowState(windowId);
-  if (!tracking.running && headlessTrackingMode) {
-    return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
-  }
+  if (!tracking.running && headlessTrackingMode) return postStandalonePackageTracking(message, windowId);
   if (!tracking.running) return postStandalonePackageTracking(message, windowId);
   const order = tracking.orders[tracking.index];
   if (!order || order.amazon_order_id !== message.amazonOrderId) {
-    if (headlessTrackingMode) {
-      return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
-    }
     return postStandalonePackageTracking(message, windowId);
   }
   if (Number(tracking.packageIndex || 0) >= (tracking.packages || []).length && (tracking.packages || []).length) {
@@ -1192,12 +1360,14 @@ async function handlePackageTracking(message, windowId) {
   const queuedPackage = tracking.packages[tracking.packageIndex] || {};
   const pagePackage = message.package || {};
   const packageData = { ...queuedPackage, ...pagePackage };
+  sanitizePackageTrackingIdentity(packageData);
   if (Array.isArray(queuedPackage.asins) && queuedPackage.asins.length) {
     packageData.asins = queuedPackage.asins;
   }
-  if (Array.isArray(queuedPackage.products) && queuedPackage.products.length) {
-    packageData.products = queuedPackage.products;
-  }
+  packageData.products = mergePackageProducts(
+    Array.isArray(queuedPackage.products) ? queuedPackage.products : [],
+    Array.isArray(pagePackage.products) ? pagePackage.products : [],
+  );
   if (message.paymentRevisionNeeded) {
     packageData.payment_revision_needed = true;
     packageData.payment_revision_url = message.paymentRevisionUrl || "";
@@ -1245,6 +1415,7 @@ async function postStandalonePackageTracking(message, windowId) {
     return { ok: false, message: "No active tracking run matched this Amazon package page." };
   }
   const payloadPackage = { ...packageData, tracking_url: packageData.tracking_url || `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(amazonOrderId)}` };
+  sanitizePackageTrackingIdentity(payloadPackage);
   if (message.paymentRevisionNeeded) {
     payloadPackage.payment_revision_needed = true;
     payloadPackage.payment_revision_url = message.paymentRevisionUrl || "";
@@ -1350,19 +1521,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "SET_API_BASE") {
+      const previousState = await getState();
+      const wasAutoTrackingEnabled = previousState.autoTrackingEnabled === true;
+      const autoTrackingEnabled = message.autoTrackingEnabled === true;
+      const autoTrackingHours = clampAutoHours(message.autoTrackingHours);
       await chrome.storage.local.set({
         apiBase: normalizeApiBase(message.apiBase),
         adminToken: message.adminToken || "",
         headlessTrackingMode: message.headlessTrackingMode === true,
-        autoTrackingEnabled: message.autoTrackingEnabled === true,
-        autoTrackingHours: clampAutoHours(message.autoTrackingHours),
+        autoTrackingEnabled,
+        autoTrackingHours,
         trackAllStartPage: Math.max(1, Math.min(999, Math.round(Number(message.trackAllStartPage || 1)))),
         trackAllMaxPages: Math.max(1, Math.min(999, Math.round(Number(message.trackAllMaxPages || 202)))),
       });
-      await scheduleAutoTracking(message.autoTrackingEnabled === true, message.autoTrackingHours);
+      await scheduleAutoTracking(autoTrackingEnabled, autoTrackingHours);
+      if (autoTrackingEnabled && !wasAutoTrackingEnabled) {
+        const autoStart = await startAutoTracking();
+        const autoMessage = autoStart?.message || "Auto tracking started.";
+        const noOrders = /no amazon orders need tracking/i.test(autoMessage);
+        return {
+          ok: autoStart?.ok !== false || noOrders,
+          message: noOrders ? `Saved. ${autoMessage}` : autoMessage,
+          autoStarted: autoStart?.ok !== false,
+          progress: autoStart?.progress,
+        };
+      }
       return { ok: true };
     }
     if (message.type === "START_TRACKING") return startTracking(windowId);
+    if (message.type === "START_SINGLE_ORDER_TRACKING") return startSingleOrderTracking(windowId, message.amazonOrderId);
+    if (message.type === "START_MANUAL_ORDER_QUEUE_TRACKING") return startManualOrderQueueTracking(windowId, message.amazonOrderIds || [], "manual");
     if (message.type === "START_TRACK_ALL") return startTrackAll(windowId, message.startPage, message.maxPages);
     if (message.type === "RESUME_TRACK_ALL") return resumeTrackAll(windowId);
     if (message.type === "STOP_TRACKING") return stopTracking(windowId);

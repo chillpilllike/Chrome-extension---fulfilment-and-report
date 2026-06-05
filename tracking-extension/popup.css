@@ -37,6 +37,15 @@ input {
   font: inherit;
 }
 
+textarea {
+  min-height: 86px;
+  resize: vertical;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 7px 8px;
+  font: inherit;
+}
+
 .checkbox-row {
   grid-template-columns: 18px 1fr;
   align-items: center;
@@ -90,13 +99,22 @@ button[hidden] {
   display: none;
 }
 
+.single-order-panel,
 .track-all-panel {
   display: grid;
   gap: 10px;
-  border: 1px solid #fed7aa;
   border-radius: 8px;
-  background: #fff7ed;
   padding: 10px;
+}
+
+.single-order-panel {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+}
+
+.track-all-panel {
+  border: 1px solid #fed7aa;
+  background: #fff7ed;
 }
 
 .track-all-grid {

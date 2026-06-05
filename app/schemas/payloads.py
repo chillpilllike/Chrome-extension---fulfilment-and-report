@@ -73,6 +73,11 @@ class PlacePayload(BaseModel):
     include_missing_asins: bool = False
 
 
+class ShopifyFulfilmentPushPayload(BaseModel):
+    store_id: int
+    line_ids: list[int] = []
+
+
 class ChromeJobCompletePayload(BaseModel):
     amazon_order_id: str = ""
     amazon_order_url: str = ""
