@@ -115,6 +115,11 @@ class ChromeTrackingUpdatePayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
     packages: list[dict[str, Any]] = []
+    products: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+    recipient: str = ""
+    order_status: str = ""
+    order_date: str = ""
     payment_revision_needed: bool = False
     payment_revision_url: str = ""
     order_cancelled: bool = False
@@ -144,6 +149,7 @@ class AmazonHistoryOrderPayload(BaseModel):
     order_date: str = ""
     asins: list[str] = []
     items: list[dict[str, Any]] = []
+    products: list[dict[str, Any]] = []
     asin_quantities: dict[str, float] = {}
     cancelled: bool = False
 

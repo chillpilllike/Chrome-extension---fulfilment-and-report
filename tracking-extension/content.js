@@ -1,5 +1,8 @@
 (() => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const TRACKING_WATCHER_INTERVAL_MS = 15000;
+const TRACKING_RETRY_AFTER_MS = 120000;
+const ORDER_PAGE_RECHECK_AFTER_MS = 90000;
 
 let extensionContextAlive = true;
 
@@ -58,7 +61,7 @@ async function nudgeStuckTrackingPage(data, reason = "tracking page timeout") {
     } catch (_) {
       // The next watcher tick or background watchdog will continue the saved queue.
     }
-  }, 14000);
+  }, 45000);
 }
 
 function logContent(message) {
@@ -81,6 +84,15 @@ function cleanProductTitle(text) {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">");
   return clean(value);
+}
+
+function blockedProductCandidate(element) {
+  if (!element) return true;
+  if (element.closest?.("[aria-label*='Sponsored'], [data-cel-widget*='sponsored'], [data-csa-c-slot-id*='sponsored'], [class*='sponsored'], [id*='sponsored'], [id*='rhf'], [id*='ape_'], [id*='sp_']")) {
+    return true;
+  }
+  const text = clean(element.textContent || "").slice(0, 1500);
+  return /sponsored|advertisement|business credit account|amazon business card|customers also bought|related to this item|recommended for you|inspired by your|shop more deals|featured offer/i.test(text);
 }
 
 function physicalTrackingId(text) {
@@ -258,6 +270,36 @@ function isOrderDetailsLikePage() {
   const path = location.pathname.replace(/\/+$/, "");
   return /^\/your-orders\/order-details$/i.test(path)
     || /order-details|your-orders\/order|gp\/css\/summary|gp\/your-account\/order|gp\/your-account\/ship-track/i.test(location.href);
+}
+
+function isRelevantTrackingPage() {
+  return isTrackingPage() || isOrderHistoryPage() || isOrderDetailsLikePage();
+}
+
+function activeTrackingOrderId(state = {}) {
+  const tracking = state.tracking || {};
+  return tracking.currentOrder?.amazon_order_id || tracking.orders?.[Number(tracking.index || 0)]?.amazon_order_id || "";
+}
+
+function activeTrackingUrl(state = {}) {
+  return String(state.tracking?.currentUrl || "");
+}
+
+function currentPageMatchesActiveTracking(state = {}) {
+  if (!state?.tracking?.running) return false;
+  const activeUrl = activeTrackingUrl(state);
+  if (!activeUrl) return true;
+  try {
+    const active = new URL(activeUrl);
+    const here = new URL(location.href);
+    if (active.origin !== here.origin || active.pathname.replace(/\/+$/, "") !== here.pathname.replace(/\/+$/, "")) return false;
+    const activeOrder = active.searchParams.get("orderID") || active.searchParams.get("orderId") || "";
+    const hereOrder = here.searchParams.get("orderID") || here.searchParams.get("orderId") || "";
+    if (activeOrder && hereOrder && activeOrder !== hereOrder) return false;
+    return true;
+  } catch {
+    return true;
+  }
 }
 
 function recipientFromOrderHistoryText(text = "") {
@@ -523,14 +565,13 @@ function productItemsFrom(root, limit = 50) {
     if (!text) return "";
     if (text.length < 4) return "";
     if (/^\d+$/.test(text)) return "";
-    if (/^\$|^-\d+%|list price|out of 5 stars|buy it again|view your item|amazon business card/i.test(text)) return "";
+    if (/^\$|^-\d+%|list price|out of 5 stars|buy it again|view your item|amazon business card|business credit account|sponsored|advertisement/i.test(text)) return "";
     return text;
   }
 
   function titleForProductBox(box, link, asin, image) {
     const sameAsinLinks = [
       ...box.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']"),
-      ...document.querySelectorAll(`a[href*='/${asin}']`),
     ]
       .filter((candidate) => {
         const href = candidate.getAttribute("href") || "";
@@ -553,26 +594,35 @@ function productItemsFrom(root, limit = 50) {
   }
 
   function addFromBox(box) {
+    if (!box || blockedProductCandidate(box)) return;
     const link =
       box.querySelector("[data-component='itemTitle'] a[href*='/dp/'], [data-component='itemTitle'] a[href*='/gp/product/']") ||
       box.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
-    if (!link) return;
+    if (!link || blockedProductCandidate(link)) return;
     const href = link.getAttribute("href") || "";
     const match = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
     const asin = match ? match[1].toUpperCase() : "";
     if (!asin || seen.has(asin)) return;
-    seen.add(asin);
     const image = box.querySelector("img") || link.querySelector("img");
     const title = titleForProductBox(box, link, asin, image);
+    const imageUrl = image ? absoluteUrl(
+      image.getAttribute("data-a-hires") ||
+      image.getAttribute("data-src") ||
+      image.getAttribute("src") ||
+      "",
+    ) : "";
+    if (!title || !imageUrl) return;
+    seen.add(asin);
     products.push({
       asin,
       url: absoluteUrl(href),
       title,
-      image_url: image ? absoluteUrl(image.getAttribute("data-a-hires") || image.getAttribute("src") || "") : "",
+      image_url: imageUrl,
     });
   }
 
-  const itemBoxes = [...root.querySelectorAll("[data-component='purchasedItems']")];
+  const itemBoxes = [...root.querySelectorAll("[data-component='purchasedItems']")]
+    .filter((box) => !blockedProductCandidate(box));
   for (const box of itemBoxes) {
     addFromBox(box);
     if (products.length >= Number(limit || 50)) break;
@@ -580,7 +630,9 @@ function productItemsFrom(root, limit = 50) {
   if (products.length < Number(limit || 50)) {
     const links = [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")].slice(0, Math.max(1, Number(limit || 50)) * 4);
     for (const link of links) {
-      addFromBox(link.closest("[data-component='purchasedItems']") || link.closest(".a-fixed-left-grid") || link.parentElement || root);
+      const box = link.closest("[data-component='purchasedItems'], [data-component='item'], .od-item, .a-fixed-left-grid");
+      if (!box || !root.contains(box) || blockedProductCandidate(box)) continue;
+      addFromBox(box);
       if (products.length >= Number(limit || 50)) break;
     }
   }
@@ -618,6 +670,7 @@ async function parseOrderDetails() {
     const products = productItemsFrom(box, 20);
     const asins = products.map((item) => item.asin);
     packages.push(withPromiseDetails({
+      amazon_order_id: amazonOrderId,
       tracking_url: href,
       order_status: status,
       promise: status,
@@ -744,19 +797,19 @@ async function parseTrackingPage() {
   const status = parseStatus();
   const deliveryCard = document.querySelector(".delivery-card, .pt-delivery-card-wrapper, #primaryStatus, #tracking-events-container") || document.body;
   const trackingProducts = productItemsFrom(deliveryCard);
-  const pageProductRoot = document.querySelector("#orderDetails, [data-component='shipments'], .a-box-group") || document.body;
-  const products = trackingProducts.length ? trackingProducts : productItemsFrom(pageProductRoot, 20);
+  const products = trackingProducts;
   const hasTrackingIdentity = Boolean(clean(carrierInfo.carrier) || clean(carrierInfo.tracking_id));
   const statusOnly = !hasTrackingIdentity && !events.length && !products.length;
   const productAsins = products.map((item) => item.asin).filter(Boolean);
   const pkg = {
+    amazon_order_id: amazonOrderId,
     ...carrierInfo,
     status,
     promise: parsePromise() || status,
     latest_event: events[0] || null,
     events: events.slice(0, 20),
     tracking_url: location.href,
-    asins: statusOnly ? [] : productAsins.length ? productAsins : asinsFrom(pageProductRoot),
+    asins: statusOnly ? [] : productAsins,
     products: statusOnly ? [] : products,
     status_only: statusOnly,
     related_amazon_order_ids: relatedOrderIdsFromPage(),
@@ -767,6 +820,7 @@ async function parseTrackingPage() {
 async function run() {
   if (!extensionContextAlive) return;
   if (!/amazon\.com$/i.test(location.hostname)) return;
+  if (!isRelevantTrackingPage()) return;
   const runSignature = location.href;
   const now = Date.now();
   if (
@@ -779,6 +833,8 @@ async function run() {
   window.__nutricityLastRunAt = now;
   showPanel("Nutricity tracking", `Scanning Amazon page: ${location.pathname}`);
   if (isTrackingPage()) {
+    const state = await send({ type: "GET_STATE" });
+    if (!currentPageMatchesActiveTracking(state)) return;
     await waitForTrackingPageReady();
     const data = await parseTrackingPage();
     if (!data.amazonOrderId) return;
@@ -806,10 +862,11 @@ async function run() {
     return;
   }
   if (isOrderDetailsLikePage()) {
+    const state = await send({ type: "GET_STATE" });
+    if (state?.tracking?.running && !currentPageMatchesActiveTracking(state)) return;
     const data = await parseOrderDetails();
     void logContent(`Order details parsed for ${data.amazonOrderId || "unknown"}: ${data.packages?.length || 0} package link(s), cancelled=${Boolean(data.orderCancelled)}, paymentRevision=${Boolean(data.paymentRevisionNeeded)}.`);
     if (!data.amazonOrderId) {
-      const state = await send({ type: "GET_STATE" });
       const activeOrder = state?.tracking?.currentOrder || state?.tracking?.orders?.[Number(state?.tracking?.index || 0)] || null;
       data.amazonOrderId = activeOrder?.amazon_order_id || "";
     }
@@ -872,14 +929,23 @@ if (!window.__nutricityRunContentListener) {
 if (!window.__nutricityTrackAllWatcher) {
   window.__nutricityTrackAllWatcher = setInterval(async () => {
     if (!extensionContextAlive) return;
+    if (!isRelevantTrackingPage()) {
+      clearInterval(window.__nutricityTrackAllWatcher);
+      window.__nutricityTrackAllWatcher = null;
+      return;
+    }
     try {
       const state = await send({ type: "GET_STATE" });
       if (!(state?.tracking?.running && state.tracking.source === "history")) return;
+      if (!currentPageMatchesActiveTracking(state)) return;
       if (isOrderHistoryPage()) {
         await scanOrderHistoryForTrackAll(state);
         return;
       }
       if (isOrderDetailsLikePage()) {
+        const lastOrderPageCheckAt = Number(window.__nutricityLastOrderPageWatcherAt || 0);
+        if (Date.now() - lastOrderPageCheckAt < ORDER_PAGE_RECHECK_AFTER_MS) return;
+        window.__nutricityLastOrderPageWatcherAt = Date.now();
         const data = await parseOrderDetails();
         if (data.amazonOrderId && data.orderCancelled) {
           const signature = `${state.tracking.startedAt || ""}|cancelled|${data.amazonOrderId}|${location.href}`;
@@ -899,7 +965,7 @@ if (!window.__nutricityTrackAllWatcher) {
         return;
       }
       const cancellation = parseOrderCancellation();
-      const activeOrderId = state.tracking.currentOrder?.amazon_order_id || currentOrderId();
+      const activeOrderId = activeTrackingOrderId(state) || currentOrderId();
       if (activeOrderId && cancellation.orderCancelled) {
         const signature = `${state.tracking.startedAt || ""}|generic-cancelled|${activeOrderId}|${location.href}`;
         if (window.__nutricityLastCancelledOrderSignature === signature) return;
@@ -913,13 +979,13 @@ if (!window.__nutricityTrackAllWatcher) {
         });
       }
       if (isTrackingPage()) {
-        const data = await parseTrackingPage();
-        const activeOrderId = state.tracking.currentOrder?.amazon_order_id || state.tracking.orders?.[Number(state.tracking.index || 0)]?.amazon_order_id || "";
-        if (!data.amazonOrderId || String(data.amazonOrderId) !== String(activeOrderId || "")) return;
-        const signature = `${state.tracking.startedAt || ""}|tracking|${data.amazonOrderId}|${location.href}|${state.tracking.lastActivityAt || ""}`;
-        if (window.__nutricityLastTrackingRetrySignature === signature) return;
         const lastActivityAt = Number(state.tracking.lastActivityAt || state.tracking.updatedAt || 0);
-        if (lastActivityAt && Date.now() - lastActivityAt > 20000) {
+        if (lastActivityAt && Date.now() - lastActivityAt > TRACKING_RETRY_AFTER_MS) {
+          const data = await parseTrackingPage();
+          const activeOrderId = activeTrackingOrderId(state);
+          if (!data.amazonOrderId || String(data.amazonOrderId) !== String(activeOrderId || "")) return;
+          const signature = `${state.tracking.startedAt || ""}|tracking|${data.amazonOrderId}|${location.href}|${state.tracking.lastActivityAt || ""}`;
+          if (window.__nutricityLastTrackingRetrySignature === signature) return;
           window.__nutricityLastTrackingRetrySignature = signature;
           showPanel("Nutricity tracking", `Retrying stalled tracking page for ${data.amazonOrderId}.`);
           const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data, retry: true }, 20000);
@@ -936,6 +1002,6 @@ if (!window.__nutricityTrackAllWatcher) {
     } catch (_) {
       // The background service worker can sleep between scans; the next tick will retry.
     }
-  }, 2500);
+  }, TRACKING_WATCHER_INTERVAL_MS);
 }
 })();

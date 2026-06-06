@@ -48,6 +48,37 @@ async function saveEpostRun(epostRun, windowId) {
   await chrome.storage.local.set({ epostRunByWindow: { ...(epostRunByWindow || {}), [String(windowId)]: epostRun }, epostRun });
 }
 
+function stoppedEpostRun(run = {}, message = "ePost tracking stopped.") {
+  return {
+    ...(run || {}),
+    running: false,
+    submittedBatchIndex: null,
+    lastMessage: message,
+    stoppedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+}
+
+async function stopAutoEpostRuns(message = "ePost auto tracking is off; saved auto run stopped.") {
+  const state = await getState();
+  const updates = {};
+  const rootRun = state.epostRun || {};
+  if (rootRun.running && rootRun.source === "auto") {
+    updates.epostRun = stoppedEpostRun(rootRun, message);
+  }
+  const nextByWindow = { ...(state.epostRunByWindow || {}) };
+  let changedByWindow = false;
+  for (const [key, run] of Object.entries(nextByWindow)) {
+    if (run?.running && run.source === "auto") {
+      nextByWindow[key] = stoppedEpostRun(run, message);
+      changedByWindow = true;
+    }
+  }
+  if (changedByWindow) updates.epostRunByWindow = nextByWindow;
+  if (Object.keys(updates).length) await chrome.storage.local.set(updates);
+  await clearEpostWatchdogIfIdle();
+}
+
 function flatCodes(batches = []) {
   return (batches || []).flat().map((code) => String(code || "").trim().toUpperCase()).filter(Boolean);
 }
@@ -167,17 +198,33 @@ function chunk(items, size) {
   return chunks;
 }
 
+function isEpostTrackerUrl(url = "") {
+  try {
+    const parsed = new URL(url);
+    return /(^|\.)epgshipping\.com$/i.test(parsed.hostname) && /\/ParcelTracker\/HomePageTracker/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
 async function openTracker(windowId) {
   const url = `${TRACKER_URL}?nutricityBatch=${Date.now()}`;
   try {
-    const query = windowId ? { active: true, windowId } : { active: true, currentWindow: true };
-    const tabs = await chrome.tabs.query(query);
-    if (tabs[0]?.id) {
+    const activeQuery = windowId ? { active: true, windowId } : { active: true, currentWindow: true };
+    const tabs = await chrome.tabs.query(activeQuery);
+    if (tabs[0]?.id && isEpostTrackerUrl(tabs[0].url || "")) {
       await chrome.tabs.update(tabs[0].id, { url, active: true });
       return;
     }
+    const candidateQuery = windowId ? { windowId } : { currentWindow: true };
+    const candidates = await chrome.tabs.query(candidateQuery);
+    const reusable = candidates.find((tab) => tab.id && isEpostTrackerUrl(tab.url || ""));
+    if (reusable?.id) {
+      await chrome.tabs.update(reusable.id, { url, active: true });
+      return;
+    }
   } catch (error) {
-    await log(`Could not reuse active tab: ${error.message}`, windowId);
+    await log(`Could not reuse ePost tab: ${error.message}`, windowId);
   }
   await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
 }
@@ -210,7 +257,10 @@ async function restoreAlarm() {
 
 async function startScheduledEpost() {
   const state = await getState();
-  if (state.autoEpostEnabled !== true) return { ok: false, message: "ePost auto tracking is disabled." };
+  if (state.autoEpostEnabled !== true) {
+    await stopAutoEpostRuns();
+    return { ok: false, message: "ePost auto tracking is disabled." };
+  }
   if (state.epostRun?.running) {
     await log("Scheduled ePost tracking found an existing run; resuming from the saved batch.");
     await ensureEpostWatchdog();
@@ -271,10 +321,13 @@ async function startEpost(windowId = null, options = {}) {
 async function stopEpost(windowId) {
   const { headlessEpostMode } = await getState();
   if (headlessEpostMode) return stopHeadlessEpost();
-  const { epostRun } = await getWindowState(windowId);
-  epostRun.running = false;
-  epostRun.lastMessage = "ePost tracking stopped by user.";
-  await saveEpostRun(epostRun, windowId);
+  const state = await getState();
+  const stopped = stoppedEpostRun(state.epostRun || {}, "ePost tracking stopped by user.");
+  const nextByWindow = {};
+  for (const [key, run] of Object.entries(state.epostRunByWindow || {})) {
+    nextByWindow[key] = stoppedEpostRun(run, "ePost tracking stopped by user.");
+  }
+  await chrome.storage.local.set({ epostRun: stopped, epostRunByWindow: nextByWindow });
   await log("ePost tracking stopped.", windowId);
   await clearEpostWatchdogIfIdle();
   return { ok: true, message: "Stopped." };
@@ -401,6 +454,14 @@ async function handleResults(message, windowId) {
 
 async function skipStaleEpostBatch(epostRun, windowId) {
   if (!epostRun?.running) return false;
+  const { autoEpostEnabled } = await getState();
+  if (epostRun.source === "auto" && autoEpostEnabled !== true) {
+    const stopped = stoppedEpostRun(epostRun, "ePost auto tracking is off; watchdog stopped this saved auto run.");
+    await saveEpostRun(stopped, windowId);
+    await log("Stopped saved ePost auto run because auto tracking is off.", windowId);
+    await clearEpostWatchdogIfIdle();
+    return true;
+  }
   const lastActivityAt = Number(epostRun.lastActivityAt || epostRun.updatedAt || epostRun.startedAt || 0);
   if (!lastActivityAt || Date.now() - lastActivityAt < EPOST_STEP_TIMEOUT_MS) return false;
   const batchIndex = Number.isInteger(epostRun.submittedBatchIndex) ? epostRun.submittedBatchIndex : Number(epostRun.batchIndex || 0);
@@ -468,15 +529,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "TEST_CONNECTION") return testConnection();
     if (message.type === "SET_SETTINGS") {
       const intervalHours = clampIntervalHours(message.intervalHours ?? (Number(message.intervalDays || 1) * 24));
+      const autoEpostEnabled = message.autoEpostEnabled === true;
       await chrome.storage.local.set({
         apiBase: normalizeApiBase(message.apiBase),
         adminToken: message.adminToken || "",
         intervalDays: hoursToDueDays(intervalHours),
         intervalHours,
-        autoEpostEnabled: message.autoEpostEnabled === true,
+        autoEpostEnabled,
         headlessEpostMode: message.headlessEpostMode === true,
       });
-      await scheduleAlarm(message.autoEpostEnabled === true, intervalHours);
+      await scheduleAlarm(autoEpostEnabled, intervalHours);
+      if (!autoEpostEnabled) await stopAutoEpostRuns();
       return { ok: true };
     }
     if (message.type === "START_EPOST") return startEpost(windowId);

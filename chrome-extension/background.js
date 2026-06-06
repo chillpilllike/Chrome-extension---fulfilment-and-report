@@ -27,6 +27,7 @@ async function getSettings() {
     fulfilAvailableMixedAsin: false,
     splitMixedAsinOrders: true,
     browserlessOrderMode: false,
+    pauseBeforePlaceOrder: false,
     workerId: "",
     activeJob: null,
     activeJobsByWindow: {},
@@ -500,10 +501,18 @@ async function testConnection() {
   try {
     await api("/health", { timeoutMs: 8000 });
     await api("/api/settings/admin-access", { timeoutMs: 8000, headers: adminToken ? { "X-Admin-Token": adminToken } : {} });
+    const queue = await api("/api/chrome/jobs?claim=false&job_limit=12", { timeoutMs: 12000 });
+    const jobCount = Number(queue.job_count || queue.jobs?.length || 0);
+    const extraCounts = (queue.counts || [])
+      .filter((item) => item.state !== "submitted" && Number(item.count || 0) > 0)
+      .map((item) => `${item.count} ${item.state}`)
+      .join(", ");
+    const queueText = ` Chrome fulfilment jobs waiting: ${jobCount}.`;
+    const detailText = extraCounts ? ` Other non-queued lines: ${extraCounts}.` : "";
+    return { ok: true, message: `Connected to ${base}. Admin token accepted.${queueText}${detailText}` };
   } catch (error) {
     throw new Error(connectionErrorMessage(error, base));
   }
-  return { ok: true, message: `Connected to ${base}. Admin token accepted.` };
 }
 
 function tabOrigin(url = "") {
@@ -2661,6 +2670,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         fulfilAvailableMixedAsin: message.fulfilAvailableMixedAsin === true,
         splitMixedAsinOrders: message.splitMixedAsinOrders === true,
         browserlessOrderMode: message.browserlessOrderMode === true,
+        pauseBeforePlaceOrder: message.pauseBeforePlaceOrder === true,
       });
       return { ok: true };
     }

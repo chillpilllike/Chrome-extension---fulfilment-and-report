@@ -1283,14 +1283,25 @@ function checkoutLineItemTitle(groupView) {
 }
 
 function checkoutLineItemQuantity(groupView) {
-  const stepper = groupView?.querySelector?.("[name='stma-checkout-quantity-stepper'], [data-a-component='stepper']");
+  const stepper = groupView?.querySelector?.("[name='stma-checkout-quantity-stepper'], [data-a-component='stepper'], input[name='quantity'], input[data-testid='ItemSelectLineItemQuantityTextField'], input.quantity-input, [role='spinbutton']");
   const rawValue = stepper?.getAttribute?.("data-steppervalue")
     ?? stepper?.getAttribute?.("data-displaystring")
+    ?? stepper?.getAttribute?.("aria-valuenow")
+    ?? stepper?.value
     ?? stepper?.querySelector?.("[data-a-selector='inner-value']")?.textContent
     ?? (groupView?.innerText || groupView?.textContent || "").match(/Quantity:\s*(\d+)/i)?.[1]
     ?? "";
   const value = Number(String(rawValue).trim());
   return Number.isFinite(value) ? value : null;
+}
+
+function checkoutVisibleQuantityValues() {
+  return [
+    ...document.querySelectorAll("input[name='quantity'], input[data-testid='ItemSelectLineItemQuantityTextField'], input.quantity-input, [role='spinbutton'][name='quantity']"),
+  ]
+    .filter((element, index, all) => all.indexOf(element) === index && visible(element))
+    .map((element) => Number(String(element.value || element.getAttribute("aria-valuenow") || element.textContent || "").replace(/[^\d.]/g, "")))
+    .filter((value) => Number.isFinite(value) && value > 0);
 }
 
 function expectedCheckoutUnitCount(activeJob) {
@@ -1300,20 +1311,25 @@ function expectedCheckoutUnitCount(activeJob) {
 
 function checkoutSummaryUnitCount() {
   const groups = checkoutLineItemGroups(document);
-  if (groups.length > 1) {
+  if (groups.length) {
     return groups.reduce((sum, group) => sum + (checkoutLineItemQuantity(group) || 1), 0);
   }
+  const visibleQuantities = checkoutVisibleQuantityValues();
+  if (visibleQuantities.length) {
+    return visibleQuantities.reduce((sum, quantity) => sum + quantity, 0);
+  }
+  const summaryMatch = (document.body.innerText || document.body.textContent || "").match(/\bItems\s*\((\d+)\)\s*:/i);
+  if (summaryMatch) return Number(summaryMatch[1]);
   return null;
 }
 
 async function ensureCheckoutOnlyExpectedUnits(activeJob) {
   const expected = expectedCheckoutUnitCount(activeJob);
   const groups = checkoutLineItemGroups(document);
-  const expectedLines = Math.max(1, (activeJob.job?.items || []).length);
-  const actual = groups.length > expectedLines ? checkoutSummaryUnitCount() : null;
+  const actual = checkoutSummaryUnitCount();
   if (!expected || !Number.isFinite(actual) || actual <= expected) return true;
   const expectedAsins = Object.keys(expectedCartQuantities(activeJob) || {}).join(", ");
-  const message = `Amazon checkout shows ${actual} item unit(s), but this queued part only expects ${expected}${expectedAsins ? ` (${expectedAsins})` : ""}. The order was stopped before Place Order so mixed-ASIN split parts cannot be combined.`;
+  const message = `Amazon checkout shows ${actual} item unit(s), but this queued job only expects ${expected}${expectedAsins ? ` (${expectedAsins})` : ""}. The order was stopped before Place Order so the dispatch quantity is not over-ordered.`;
   showPanel("Checkout quantity mismatch", message, null, null);
   await send({
     type: "FAIL_JOB",
@@ -4473,6 +4489,8 @@ function findPlaceOrderButton() {
 }
 
 function checkoutQuantityFromPage() {
+  const visibleQuantities = checkoutVisibleQuantityValues();
+  if (visibleQuantities.length) return visibleQuantities.reduce((sum, quantity) => sum + quantity, 0);
   const text = (document.body.innerText || document.body.textContent || "").replace(/\s+/g, " ");
   const deleteStepperMatch = text.match(/(?:minimum quantity reached,\s*delete item|delete item)\s+(\d+)\s+\1\s+increase item quantity/i);
   if (deleteStepperMatch) return Number(deleteStepperMatch[1]);
@@ -4859,6 +4877,38 @@ async function pauseForManualCheckout(activeJob, message, nextStage = "checkout"
     "I did it manually, continue",
     () => continueAfterManualStep(activeJob, nextStage),
   );
+}
+
+async function pauseBeforeAmazonSubmitIfRequired(activeJob, approvalKey, message, nextStage = "checkout") {
+  const state = await getExtensionState();
+  if (state.pauseBeforePlaceOrder !== true || activeJob?.[approvalKey]) return false;
+  const next = {
+    ...activeJob,
+    paused: true,
+    pausedStage: nextStage,
+    stage: nextStage,
+    pauseBeforePlaceOrderAt: Date.now(),
+  };
+  await setActiveJob(next);
+  showPanel(
+    "Final step needs approval",
+    `${message} Review Amazon checkout, then click Place this order only when you are ready to submit the purchase.`,
+    "Place this order",
+    async () => {
+      const latest = await getActiveJob();
+      const approved = {
+        ...(latest || next),
+        [approvalKey]: Date.now(),
+        paused: false,
+        pausedStage: null,
+        stage: nextStage,
+      };
+      await setActiveJob(approved, { allowUnpause: true, allowStageRegression: true, reason: approvalKey });
+      showPanel("Nutricity checkout", "Approval recorded. Continuing to Amazon Place Order.", null, null);
+      setTimeout(runSafely, 250);
+    },
+  );
+  return true;
 }
 
 async function saveEditedAddress(activeJob, checkoutRecipient) {
@@ -5276,6 +5326,7 @@ async function handleCheckout(activeJob) {
     return;
   }
   if (!await ensurePreferredCheckoutPayment(activeJob)) return;
+  if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
 
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
@@ -5314,7 +5365,6 @@ async function handleCheckout(activeJob) {
       );
       return;
     }
-    if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
     const duplicateCheck = await send({ type: "CHECK_EXISTING_AMAZON_ORDER" });
     if (!duplicateCheck?.ok) {
       activeJob.paused = true;
@@ -5349,6 +5399,12 @@ async function handleCheckout(activeJob) {
       await reportAmazonOrders(activeJob, [rememberedOrder]);
       return;
     }
+    if (await pauseBeforeAmazonSubmitIfRequired(
+      activeJob,
+      "finalPlaceOrderApprovedAt",
+      `Amazon checkout is ready for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}.`,
+      "checkout",
+    )) return;
     showPanel("Final step", "Clicking Place your order now.", null, null);
     activeJob.placeOrderClickStartedAt = Date.now();
     await setActiveJob(activeJob);
@@ -5619,6 +5675,12 @@ async function handleAmazonDuplicateOrderPage(activeJob) {
     await pauseForManualCheckout(activeJob, "Amazon duplicate pending-order screen did not show a usable Place your order button.", "complete_pending");
     return;
   }
+  if (await pauseBeforeAmazonSubmitIfRequired(
+    activeJob,
+    "duplicatePlaceOrderApprovedAt",
+    `Amazon is asking to confirm a duplicate pending order for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}.`,
+    "complete_pending",
+  )) return;
   showPanel("Final step", "Amazon asked for duplicate-order confirmation. Clicking Place your order once.", null, null);
   if (!await protectBeforeAmazonSubmit(activeJob, "complete_pending")) return;
   activeJob.amazonDuplicateOrderConfirmed = true;
@@ -7393,6 +7455,7 @@ async function run() {
     const checkoutRecipient = recipientName(activeJob);
     if (!await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient)) return;
     if (!await ensurePreferredCheckoutPayment(activeJob)) return;
+    if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
     if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
     await handleCheckout(activeJob);
     return;

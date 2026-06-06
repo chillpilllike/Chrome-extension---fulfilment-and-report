@@ -5,6 +5,7 @@ const editExistingAddress = document.querySelector("#editExistingAddress");
 const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAsin");
 const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
 const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
+const pauseBeforePlaceOrder = document.querySelector("#pauseBeforePlaceOrder");
 const connectionNotice = document.querySelector("#connectionNotice");
 const modeNotice = document.querySelector("#modeNotice");
 const statusBox = document.querySelector("#status");
@@ -53,6 +54,7 @@ function hydrateSettingsValues(settings = {}) {
   fulfilAvailableMixedAsin.checked = settings.fulfilAvailableMixedAsin === true;
   splitMixedAsinOrders.checked = settings.splitMixedAsinOrders !== false;
   browserlessOrderMode.checked = settings.browserlessOrderMode === true;
+  pauseBeforePlaceOrder.checked = settings.pauseBeforePlaceOrder === true;
   updateModeNotice();
 }
 
@@ -64,7 +66,8 @@ function hasSettingsPayload(state) {
     Object.hasOwn(state, "editExistingAddress") ||
     Object.hasOwn(state, "fulfilAvailableMixedAsin") ||
     Object.hasOwn(state, "splitMixedAsinOrders") ||
-    Object.hasOwn(state, "browserlessOrderMode")
+    Object.hasOwn(state, "browserlessOrderMode") ||
+    Object.hasOwn(state, "pauseBeforePlaceOrder")
   ));
 }
 
@@ -78,8 +81,9 @@ function loadSavedSettings() {
       fulfilAvailableMixedAsin: false,
       splitMixedAsinOrders: true,
       browserlessOrderMode: false,
+      pauseBeforePlaceOrder: false,
     }, (settings) => {
-      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].includes(document.activeElement)) {
+      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].includes(document.activeElement)) {
         hydrateSettingsValues(settings);
         settingsHydrated = true;
       }
@@ -104,7 +108,7 @@ function registerControlWindow() {
   });
 }
 
-[apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].forEach((input) => {
+[apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].forEach((input) => {
   input.addEventListener("input", () => {
     settingsDirty = true;
   });
@@ -127,9 +131,22 @@ function updateModeNotice() {
 browserlessOrderMode.addEventListener("change", updateModeNotice);
 
 function syncSettingsInputs(state) {
-  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode].includes(document.activeElement)) return;
+  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].includes(document.activeElement)) return;
   hydrateSettingsValues(state);
   settingsHydrated = true;
+}
+
+function settingsPayload() {
+  return {
+    apiBase: apiBase.value.trim(),
+    adminToken: adminToken.value.trim(),
+    cardLast4Preference: cardLast4Preference.value.trim(),
+    editExistingAddress: editExistingAddress.checked,
+    fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked,
+    splitMixedAsinOrders: splitMixedAsinOrders.checked,
+    browserlessOrderMode: browserlessOrderMode.checked,
+    pauseBeforePlaceOrder: pauseBeforePlaceOrder.checked,
+  };
 }
 
 function setStatus(text) {
@@ -430,13 +447,13 @@ async function refresh() {
 }
 
 document.querySelector("#save").addEventListener("click", async () => {
-  const result = await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
+  const result = await send({ type: "SET_API_BASE", ...settingsPayload() });
   if (result.ok) settingsDirty = false;
   setStatus(result.ok ? "Saved." : result.message);
 });
 
 document.querySelector("#testConnection").addEventListener("click", async () => {
-  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
+  await send({ type: "SET_API_BASE", ...settingsPayload() });
   settingsDirty = false;
   const result = await send({ type: "TEST_CONNECTION" });
   if (result.ok) {
@@ -448,16 +465,21 @@ document.querySelector("#testConnection").addEventListener("click", async () => 
 });
 
 document.querySelector("#openHeadlessSession").addEventListener("click", async () => {
-  await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
+  await send({ type: "SET_API_BASE", ...settingsPayload() });
   settingsDirty = false;
   const result = await send({ type: "OPEN_BROWSERLESS_SESSION" });
   setStatus(result.message || (result.ok ? "Opened headless session." : "Could not open headless session."));
 });
 
+document.querySelector("#reloadExtension").addEventListener("click", () => {
+  setStatus("Reloading extension...");
+  setTimeout(() => chrome.runtime.reload(), 50);
+});
+
 document.querySelector("#start").addEventListener("click", async () => {
   setStatus(browserlessOrderMode.checked ? "Starting background order placement..." : "Starting next queued order...");
   try {
-    await send({ type: "SET_API_BASE", apiBase: apiBase.value.trim(), adminToken: adminToken.value.trim(), cardLast4Preference: cardLast4Preference.value.trim(), editExistingAddress: editExistingAddress.checked, fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked, splitMixedAsinOrders: splitMixedAsinOrders.checked, browserlessOrderMode: browserlessOrderMode.checked });
+    await send({ type: "SET_API_BASE", ...settingsPayload() });
     settingsDirty = false;
     await send({ type: "CLEAR_FORCE_STOP" });
     const result = await send({ type: browserlessOrderMode.checked ? "START_BROWSERLESS" : "START_NEXT" });

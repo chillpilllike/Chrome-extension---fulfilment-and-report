@@ -487,6 +487,7 @@ type FulfilmentPendingAmazonAssociation = {
   status?: string
   order_date?: string
   asins?: string[]
+  products?: Array<{ asin?: string; url?: string; title?: string; image_url?: string }>
   sources?: string[]
   packages?: Array<{
     package_index?: number | string
@@ -521,6 +522,7 @@ type FulfilmentPendingRow = OrderLine & {
     expected_asins?: string[]
     captured_asins?: string[]
     display_asins?: string[]
+    products?: Array<{ asin?: string; url?: string; title?: string; image_url?: string }>
     line_ids?: number[]
     quantity?: number
     display_quantity?: number
@@ -8014,6 +8016,7 @@ function FulfilmentPendingPage({
     })
     ;(row.pending_amazon_orders || []).forEach((order) => {
       const orderId = String(order.amazon_order_id || "").trim()
+      ;((order as any).products || []).forEach((product: any) => addProduct(product, orderId))
       ;(order.packages || []).forEach((pkg: any) => {
         const packageAmazonOrderId = amazonOrderIdFromPackage(pkg) || orderId
         ;(pkg.products || []).forEach((product: any) => addProduct(product, packageAmazonOrderId))
@@ -8024,6 +8027,10 @@ function FulfilmentPendingPage({
       const packageAmazonOrderId = amazonOrderIdFromPackage(pkg)
       ;(pkg.products || []).forEach((product: any) => addProduct(product, packageAmazonOrderId))
       ;(pkg.asins || []).forEach((asin: any) => addProduct(asin, packageAmazonOrderId))
+    })
+    ;[...(row.asin_matched_amazon_orders || []), ...(row.related_amazon_orders || [])].forEach((order: any) => {
+      const orderId = String(order.amazon_order_id || "").trim()
+      ;(order.products || []).forEach((product: any) => addProduct(product, orderId))
     })
     allAmazonAssociationPackages(row).forEach((pkg: any) => {
       if (!rowAsin) return
@@ -8073,7 +8080,9 @@ function FulfilmentPendingPage({
     return title
   }
   function pendingStatusIsDelivered(value: unknown) {
-    return /\bdelivered\b/i.test(String(value || ""))
+    const status = String(value || "")
+    if (/\b(not delivered|not yet delivered|undelivered|arriving|out for delivery|running late|delayed|in transit|shipped)\b/i.test(status)) return false
+    return /\bdelivered\b/i.test(status)
   }
   function pendingStatusBadge(value: unknown, options: { subtle?: boolean } = {}) {
     const status = String(value || "").trim()
@@ -8113,6 +8122,11 @@ function FulfilmentPendingPage({
   function relatedOrderAsinSummary(order: FulfilmentPendingAmazonAssociation) {
     return uniqueByValue([
       ...(order.asins || []).map((asin) => ({ asin: String(asin || "").trim().toUpperCase(), image_url: "", title: "" })),
+      ...((order.products || []).map((product: any) => ({
+        asin: String(product?.asin || "").trim().toUpperCase(),
+        image_url: String(product?.image_url || ""),
+        title: String(product?.title || ""),
+      }))),
       ...((order.packages || []).flatMap((pkg: any) => [
         ...((pkg.products || []).map((product: any) => ({
           asin: String(product?.asin || "").trim().toUpperCase(),
