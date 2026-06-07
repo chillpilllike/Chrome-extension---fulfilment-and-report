@@ -331,6 +331,24 @@ def fast_page_cache_clear_matching(prefixes: set[str]) -> None:
                 _FAST_PAGE_CACHE.pop(key, None)
 
 
+ORDER_PROGRESS_CACHE_PREFIXES = {
+    "chrome-jobs",
+    "dashboard",
+    "orders",
+    "fulfilment-pending",
+    "tracking-orders",
+    "dispatch-status",
+    "dispatch-status-summary",
+    "dispatch-sorting-summary",
+    "dispatch-sorting-summary-base",
+    "shopify-fulfilment",
+}
+
+
+def clear_order_progress_caches() -> None:
+    fast_page_cache_clear_matching(ORDER_PROGRESS_CACHE_PREFIXES)
+
+
 def enqueue_dispatch_order_sync(order_id: str) -> bool:
     try:
         from app.tasks import enqueue, sync_dispatch_order_task
@@ -8359,6 +8377,7 @@ def manual_amazon_match_followups(
             write_report(store_id)
     except Exception as exc:
         print(f"Manual Amazon match report refresh failed: {exc}", flush=True)
+    clear_order_progress_caches()
 
 
 def backfill_cxml_order_references() -> int:
@@ -25434,6 +25453,56 @@ def api_chrome_job_submitted(group_key: str, payload: ChromeJobHeartbeatPayload)
     return {"ok": True, "submitted": cursor.rowcount, "claim_expires_at": expiry}
 
 
+@app.get("/api/chrome/jobs/{group_key}/completion-status")
+def api_chrome_job_completion_status(group_key: str, line_ids: str = "") -> dict[str, Any]:
+    group_key = clean_text(group_key)
+    if not group_key:
+        raise HTTPException(400, "Chrome group key is required")
+    parsed_line_ids = sorted({
+        int(match.group(0))
+        for match in re.finditer(r"\d+", clean_text(line_ids))
+        if int(match.group(0)) > 0
+    })
+    params: list[Any] = [group_key]
+    line_filter = ""
+    if parsed_line_ids:
+        line_filter = f" AND id IN ({','.join('?' for _ in parsed_line_ids)})"
+        params.extend(parsed_line_ids)
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT id, odoo_order_name, asin, amazon_order_id, amazon_status, state,
+                   chrome_claimed_by, chrome_claim_expires_at, updated_at
+            FROM order_lines
+            WHERE amazon_group_key=?
+              AND order_engine='chrome'
+              {line_filter}
+            ORDER BY id
+            """,
+            params,
+        ).fetchall())
+    if not rows:
+        raise HTTPException(404, "Chrome job not found")
+    pending_rows = [row for row in rows if not clean_text(row.get("amazon_order_id"))]
+    amazon_order_ids = sorted({
+        clean_text(row.get("amazon_order_id"))
+        for row in rows
+        if clean_text(row.get("amazon_order_id"))
+    })
+    return {
+        "ok": True,
+        "group_key": group_key,
+        "line_ids": [int(row["id"]) for row in rows],
+        "completed": bool(rows) and not pending_rows,
+        "partial_completed": bool(amazon_order_ids) and bool(pending_rows),
+        "amazon_order_ids": amazon_order_ids,
+        "pending_line_ids": [int(row["id"]) for row in pending_rows],
+        "pending_count": len(pending_rows),
+        "claimed_by": clean_text(rows[0].get("chrome_claimed_by")),
+        "claim_expires_at": clean_text(rows[0].get("chrome_claim_expires_at")),
+    }
+
+
 @app.post("/api/chrome/jobs/{group_key}/release")
 def api_chrome_job_release(group_key: str, payload: ChromeJobHeartbeatPayload) -> dict[str, Any]:
     worker_id = clean_text(payload.worker_id)
@@ -26105,6 +26174,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                             write_report(store_id)
                     except Exception as exc:
                         print(f"Chrome complete report refresh after correction failed: {exc}", flush=True)
+                    clear_order_progress_caches()
                     return {
                         "ok": True,
                         "message": f"Chrome job {group_key} corrected from Amazon {', '.join(existing_ids) or 'UNKNOWN'} to {amazon_order_id}.",
@@ -26256,6 +26326,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                 updated_for_shopify.append(dict(updated))
                 ensure_inventory_for_line(updated)
                 index_order_line(updated)
+    clear_order_progress_caches()
     threading.Thread(
         target=chrome_complete_followups,
         args=(

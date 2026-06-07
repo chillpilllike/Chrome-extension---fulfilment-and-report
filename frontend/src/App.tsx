@@ -1860,8 +1860,9 @@ const emptyAccount: Omit<AmazonAccount, "id"> = {
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const adminToken = savedAdminToken()
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...(options.headers || {}) },
+    cache: "no-store",
     ...options,
+    headers: { "Content-Type": "application/json", ...(adminToken ? { "X-Admin-Token": adminToken } : {}), ...(options.headers || {}) },
   })
   if (!response.ok) {
     const text = await response.text()
@@ -1876,8 +1877,9 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 async function apiWithAdminToken<T>(path: string, token: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", "X-Admin-Token": token, ...(options.headers || {}) },
+    cache: "no-store",
     ...options,
+    headers: { "Content-Type": "application/json", "X-Admin-Token": token, ...(options.headers || {}) },
   })
   if (!response.ok) {
     const text = await response.text()

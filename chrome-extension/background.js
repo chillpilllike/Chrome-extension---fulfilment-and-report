@@ -684,12 +684,13 @@ async function refreshActiveJobFromQueue(windowId, force = false) {
     } catch (error) {
       const message = String(error.message || "");
       if (/lock is no longer owned|no longer active/i.test(message)) {
-        await clearStoredJobGroup(activeJob.job.group_key);
+        const verified = await clearJobIfBackendCompleted(activeJob, windowId, activeJob.reportedOrderId || "", "Verified submitted refresh after lock loss for");
+        if (verified.cleared) return verified.nextJob || null;
         await log(
-          `Cleared stale submitted active job ${activeJob.job.group_key}; the server lock is no longer active: ${message}`,
+          `Kept submitted active job ${activeJob.job.group_key}; lock was gone but app completion is not confirmed: ${message}`,
           windowId,
         );
-        return null;
+        return activeJob;
       }
       return activeJob;
     }
@@ -783,14 +784,45 @@ function jobWasSubmittedToAmazon(job) {
 function activeJobBlocksNext(activeJob) {
   if (!activeJob?.job?.group_key) return false;
   if (activeJob.stage === "cleanup_after_failure") return false;
-  if (
-    activeJob.stage === "reporting_complete" &&
-    activeJob.reportedOrderId &&
-    /lock is no longer owned|no longer active/i.test(String(activeJob.reportError || ""))
-  ) {
-    return false;
-  }
   return true;
+}
+
+function activeJobLineIds(activeJob) {
+  return (activeJob?.job?.line_ids || [])
+    .map((lineId) => Number(lineId || 0))
+    .filter((lineId) => Number.isFinite(lineId) && lineId > 0);
+}
+
+async function getChromeJobCompletionStatus(activeJob) {
+  const groupKey = activeJob?.job?.group_key || "";
+  if (!groupKey) return null;
+  const lineIds = activeJobLineIds(activeJob);
+  const query = lineIds.length ? `?line_ids=${encodeURIComponent(lineIds.join(","))}` : "";
+  return api(`/api/chrome/jobs/${encodeURIComponent(groupKey)}/completion-status${query}`, { timeoutMs: 12000 });
+}
+
+function completionStatusMatchesOrder(status, orderId = "") {
+  if (!status?.completed) return false;
+  const expectedOrderIds = String(orderId || "").match(/\b\d{3}-\d{7}-\d{7}\b/g) || [];
+  const orderIds = (status.amazon_order_ids || []).map((value) => String(value || "").trim()).filter(Boolean);
+  return !expectedOrderIds.length || !orderIds.length || expectedOrderIds.some((expected) => orderIds.includes(expected));
+}
+
+async function clearJobIfBackendCompleted(activeJob, windowId, orderId = "", reason = "") {
+  try {
+    const status = await getChromeJobCompletionStatus(activeJob);
+    if (!completionStatusMatchesOrder(status, orderId)) return { cleared: false, status };
+    await clearStoredJobGroup(activeJob.job.group_key);
+    await log(
+      `${reason || "Cleared completed Chrome job"} ${activeJob.job.group_key}; app has Amazon order ${status.amazon_order_ids?.join(", ") || orderId || "recorded"}.`,
+      windowId,
+    );
+    const nextJob = await claimNextJobInWindow(windowId);
+    return { cleared: true, status, nextJob };
+  } catch (error) {
+    await log(`Could not verify completion status for ${activeJob?.job?.group_key || "Chrome job"}: ${error.message}`, windowId);
+    return { cleared: false, error };
+  }
 }
 
 function activeJobServerLockReleased(activeJob, freshJob) {
@@ -1355,9 +1387,12 @@ async function recoverSubmittedJobInWindow(windowId) {
       } catch (error) {
         const message = String(error.message || "");
         if (/lock is no longer owned|no longer active/i.test(message)) {
-          await clearStoredJobGroup(activeJob.job.group_key);
-          await log(`Cleared stale submitted ${activeJob.job.group_key}; server recovery and heartbeat both say it is no longer active: ${message}`, windowId);
-          return { ok: true, recovered: false, activeJob: null };
+          const verified = await clearJobIfBackendCompleted(activeJob, windowId, activeJob.reportedOrderId || "", "Verified submitted recovery after lock loss for");
+          if (verified.cleared) {
+            return { ok: true, recovered: false, activeJob: verified.nextJob || null };
+          }
+          await log(`Kept submitted ${activeJob.job.group_key}; server recovery and heartbeat lost the lock, but app completion is not confirmed: ${message}`, windowId);
+          return { ok: true, recovered: false, activeJob };
         }
         await log(`Kept submitted ${activeJob.job.group_key} active; could not confirm server lock state: ${message}`, windowId);
       }
@@ -1916,18 +1951,30 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
       });
     } catch (error) {
       if (/lock is no longer owned|no longer active/i.test(String(error.message || "")) && orderId) {
-        await log(`Treating late completion for ${groupKey} as already reported after released lock.`, windowId);
-        await recordLastProcessed(activeJob, "placed", `Placed ${orderId}.`, { amazon_order_id: orderId });
-        await clearStoredJobGroup(groupKey);
-        const nextJob = await claimNextJobInWindow(windowId);
-        return {
-          ok: true,
-          already_reported: true,
-          amazon_order_id: orderId,
-          message: `Order ${orderId} was already reported; continuing queue.`,
-          next_job_started: Boolean(nextJob),
-          next_group_key: nextJob?.job?.group_key || "",
-        };
+        const verified = await clearJobIfBackendCompleted(activeJob, windowId, orderId, "Verified late completion after released lock for");
+        if (verified.cleared) {
+          await recordLastProcessed(activeJob, "placed", `Placed ${orderId}.`, { amazon_order_id: orderId });
+          return {
+            ok: true,
+            already_reported: true,
+            amazon_order_id: orderId,
+            message: `Order ${orderId} was already recorded in the app; continuing queue.`,
+            next_job_started: Boolean(verified.nextJob),
+            next_group_key: verified.nextJob?.job?.group_key || "",
+          };
+        }
+        const message = `Chrome found Amazon order ${orderId}, but the app did not confirm it was saved for ${groupKey}. Retry reporting before continuing.`;
+        activeJob.paused = true;
+        activeJob.pausedStage = "reporting_complete";
+        activeJob.reportError = message;
+        await setWindowJob(windowId, activeJob);
+        await diagnosticLog("Late completion was not cleared because the app did not confirm saved order lines.", {
+          windowId,
+          source: "background",
+          activeJob,
+          details: { amazon_order_id: orderId, group_key: groupKey, completion_status: verified.status || null },
+        });
+        return { ok: false, message, amazon_order_id: orderId, pending_completion: true };
       }
       throw error;
     }
@@ -2576,13 +2623,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } catch (error) {
           const message = String(error.message || "");
           if (/lock is no longer owned|no longer active|not found/i.test(message)) {
-            await clearStoredJobGroup(activeJob.job.group_key);
+            const verified = await clearJobIfBackendCompleted(activeJob, windowId, activeJob.reportedOrderId || "", "Verified reported job after heartbeat loss for");
+            if (verified.cleared) return { ok: true, activeJob: verified.nextJob || null };
             await log(
-              `Cleared completed active job ${activeJob.job.group_key}; server no longer has an active lock after reporting: ${message}`,
+              `Kept reported active job ${activeJob.job.group_key}; heartbeat was gone but the app did not confirm saved order lines: ${message}`,
               windowId,
             );
-            const nextJob = await claimNextJobInWindow(windowId);
-            return { ok: true, activeJob: nextJob || null };
+            return { ok: true, activeJob: (await getWindowState(windowId)).activeJob };
           }
           await log(`Completed-job lock check failed for ${activeJob.job.group_key}: ${message}`, windowId);
         }
@@ -2593,6 +2640,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } catch (error) {
           const message = String(error.message || "");
           if (/lock is no longer owned|no longer active/i.test(message)) {
+            if (orderSubmitStarted(activeJob)) {
+              const verified = await clearJobIfBackendCompleted(activeJob, windowId, activeJob.reportedOrderId || "", "Verified submitted job after heartbeat loss for");
+              if (verified.cleared) return { ok: true, activeJob: verified.nextJob || null };
+              await log(
+                `Kept submitted active job ${activeJob.job.group_key}; heartbeat was gone but completion is not confirmed: ${message}`,
+                windowId,
+              );
+              return { ok: true, activeJob: (await getWindowState(windowId)).activeJob };
+            }
             await clearStoredJobGroup(activeJob.job.group_key);
             await log(
               `Cleared stale active job ${activeJob.job.group_key}; heartbeat says the server lock is no longer active: ${message}`,
