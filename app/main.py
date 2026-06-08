@@ -12510,7 +12510,15 @@ def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active"
         if row.get("odoo_order_name") not in entry["odoo_order_names"]:
             entry["odoo_order_names"].append(row.get("odoo_order_name"))
         entry["lines"].append(row)
-    return list(grouped.values()), data, total, page, per_page
+    orders = list(grouped.values())
+    if clean_text(status).lower() in {"", "active"}:
+        orders = [
+            order
+            for order in orders
+            if not order.get("lines") or not all(order_line_currently_delivered(line) for line in order.get("lines") or [])
+        ]
+        total = len(orders) if total < len(orders) else max(0, total - (len(grouped) - len(orders)))
+    return orders, data, total, page, per_page
 
 
 def amazon_history_tracking_orders_for_refresh(limit: int = 500) -> list[dict[str, Any]]:
@@ -12536,6 +12544,8 @@ def amazon_history_tracking_orders_for_refresh(limit: int = 500) -> list[dict[st
         ).fetchall())
     orders: list[dict[str, Any]] = []
     for row in rows:
+        if tracking_status_rank(row.get("status")) >= tracking_status_rank("delivered"):
+            continue
         refs = amazon_history_order_refs_from_text(row.get("recipient") or "")
         try:
             asins = [normalize_asin(asin) for asin in json.loads(row.get("asins_json") or "[]") if normalize_asin(asin)]
@@ -24610,7 +24620,7 @@ def browserless_tracking_orders(store_id: Optional[int] = None, status: str = "a
             order_id = clean_text(order.get("amazon_order_id"))
             if not order_id or order_id in seen:
                 continue
-            if clean_text(order.get("tracking_status")).lower() == "delivered":
+            if tracking_status_rank(order.get("tracking_status")) >= tracking_status_rank("delivered"):
                 continue
             seen.add(order_id)
             orders.append(order)

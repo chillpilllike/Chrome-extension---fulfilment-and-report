@@ -270,12 +270,25 @@ document.querySelector("#checkHeadlessSignin").addEventListener("click", async (
   setResultStatus({ ...result, ok: result.ready !== false && result.ok !== false }, "Headless Amazon session is ready.", "Headless Amazon session is not ready.");
 });
 
+document.querySelector("#reloadExtension").addEventListener("click", () => {
+  setStatus("Reloading extension...", "info");
+  setTimeout(() => chrome.runtime.reload(), 50);
+});
+
 document.querySelector("#start").addEventListener("click", async () => {
   await send(settingsPayload());
   settingsDirty = false;
-  const result = await send({ type: headlessTrackingMode.checked ? "START_HEADLESS_TRACKING" : "START_TRACKING" });
-  if (result.ok !== false) setRunButtons(true);
-  setResultStatus(result, "Started.", "Could not start.");
+  const state = await send({ type: "GET_STATE" });
+  const shouldResumeTrackAll = !headlessTrackingMode.checked && canResumeTrackAll(state?.tracking || {});
+  const result = await send({
+    type: shouldResumeTrackAll
+      ? "RESUME_TRACK_ALL"
+      : headlessTrackingMode.checked
+        ? "START_HEADLESS_TRACKING"
+        : "START_TRACKING",
+  });
+  if (result.ok !== false) setRunButtons(true, shouldResumeTrackAll, false);
+  setResultStatus(result, shouldResumeTrackAll ? "Track all resumed." : "Started.", shouldResumeTrackAll ? "Could not resume Track all." : "Could not start.");
 });
 
 trackSingleOrderButton.addEventListener("click", async () => {
