@@ -168,6 +168,22 @@ input:focus, select:focus {
   box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.22);
 }
 
+textarea {
+  border: 1px solid var(--input);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+textarea:focus {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.22);
+}
+
 button, .button {
   min-height: 36px;
   display: inline-flex;
@@ -453,6 +469,32 @@ small {
 
 .panel input, .edit-card input {
   width: 100%;
+}
+
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.panel-head h2 {
+  margin-bottom: 0;
+}
+
+.store-copy-panel {
+  margin-bottom: 20px;
+}
+
+.copy-textarea {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre;
 }
 
 .edit-list {

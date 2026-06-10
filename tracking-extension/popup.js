@@ -130,6 +130,15 @@ function progressText(progress = {}) {
   return `${progress.message || "Headless tracking status loaded."} ${processed}/${total} processed${current}`;
 }
 
+function autoWaitingText(tracking = {}) {
+  const completed = tracking.completedOrderIds?.length || 0;
+  const failed = tracking.failedOrderIds?.length || 0;
+  const skipped = Number(tracking.skippedRecentCount || 0);
+  const hours = Math.max(1, Math.min(168, Number(autoTrackingHours.value || 3)));
+  const detail = `Checked ${completed} order(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
+  return `${tracking.lastMessage || "Amazon tracking complete."} Auto mode is enabled; waiting ${hours} hour(s) until the next scheduled tracking run. ${detail}`;
+}
+
 function visibleProgressText(tracking = {}) {
   if (tracking.source === "single" || tracking.source === "manual") {
     const current = tracking.orders?.[Number(tracking.index || 0)]?.amazon_order_id || tracking.currentOrderId || tracking.singleOrderId || "";
@@ -171,6 +180,10 @@ function stoppedTrackAllText(tracking = {}) {
 
 function finalTrackingText(tracking = {}) {
   const lastMessage = String(tracking.lastMessage || "").trim();
+  if (autoTrackingEnabled.checked && tracking.source === "auto") {
+    if (/waiting \d+ hour/i.test(lastMessage)) return lastMessage;
+    return autoWaitingText(tracking);
+  }
   if (/stopped because/i.test(lastMessage)) {
     return lastMessage;
   }
@@ -278,17 +291,13 @@ document.querySelector("#reloadExtension").addEventListener("click", () => {
 document.querySelector("#start").addEventListener("click", async () => {
   await send(settingsPayload());
   settingsDirty = false;
-  const state = await send({ type: "GET_STATE" });
-  const shouldResumeTrackAll = !headlessTrackingMode.checked && canResumeTrackAll(state?.tracking || {});
   const result = await send({
-    type: shouldResumeTrackAll
-      ? "RESUME_TRACK_ALL"
-      : headlessTrackingMode.checked
+    type: headlessTrackingMode.checked
         ? "START_HEADLESS_TRACKING"
         : "START_TRACKING",
   });
-  if (result.ok !== false) setRunButtons(true, shouldResumeTrackAll, false);
-  setResultStatus(result, shouldResumeTrackAll ? "Track all resumed." : "Started.", shouldResumeTrackAll ? "Could not resume Track all." : "Could not start.");
+  if (result.ok !== false) setRunButtons(true, false, false);
+  setResultStatus(result, "Started.", "Could not start.");
 });
 
 trackSingleOrderButton.addEventListener("click", async () => {

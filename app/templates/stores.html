@@ -11,6 +11,24 @@
   </div>
 </div>
 {% endif %}
+<section class="panel store-copy-panel">
+  <div class="panel-head">
+    <div>
+      <h2>Copy Odoo Store Connection Settings</h2>
+      <p>All connected Odoo stores in one text block.</p>
+    </div>
+    <button type="button" onclick="copyStoreSettings()">Copy All</button>
+  </div>
+  <textarea id="store-settings-copy" class="copy-textarea" readonly rows="{{ stores|length * 8 if stores else 8 }}">{% for store in stores %}Name: {{ store.name or "" }}
+Odoo URL: {{ store.odoo_url or "" }}
+Database: {{ store.odoo_db or "" }}
+User: {{ store.odoo_user or "" }}
+Password/API key: {{ store.odoo_password or "" }}
+Website ID: {{ store.website_id or "" }}{% if not loop.last %}
+
+{% endif %}{% endfor %}</textarea>
+  <small id="store-settings-copy-status">Click Copy All, or click inside the box to select the text manually.</small>
+</section>
 <section class="grid">
   <div>
     <h2>Configured Stores</h2>
@@ -87,4 +105,38 @@
   </div>
 </div>
 {% endfor %}
+<script>
+  async function copyStoreSettings() {
+    const textarea = document.getElementById("store-settings-copy")
+    const status = document.getElementById("store-settings-copy-status")
+    const text = textarea ? textarea.value.trim() : ""
+    if (!text) {
+      if (status) status.textContent = "No Odoo stores configured."
+      return
+    }
+    let copied = false
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text)
+        copied = true
+      }
+    } catch (error) {
+      copied = false
+    }
+    if (!copied && textarea) {
+      textarea.focus()
+      textarea.select()
+      try {
+        copied = document.execCommand("copy")
+      } catch (error) {
+        copied = false
+      }
+    }
+    if (status) status.textContent = copied ? "Odoo store connection settings copied." : "Copy failed. Select the text and copy manually."
+  }
+
+  document.getElementById("store-settings-copy")?.addEventListener("focus", function () {
+    this.select()
+  })
+</script>
 {% endblock %}

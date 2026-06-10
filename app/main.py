@@ -4360,25 +4360,36 @@ def tracking_package_delivered(package: dict[str, Any]) -> bool:
     return re.search(r"\b(package delivered|delivered to|was delivered|handed directly|left at|delivered in|delivered at)\b", event_text, re.IGNORECASE) is not None
 
 
+def delivered_status_text(value: Any) -> bool:
+    text = clean_text(value).lower()
+    if not text:
+        return False
+    if re.search(r"\b(not delivered|not yet delivered|undelivered)\b", text):
+        return False
+    return "delivered" in text
+
+
 def tracking_status_rank(value: Any) -> int:
     text = clean_text(value).lower()
+    if re.search(r"\b(not delivered|not yet delivered|undelivered)\b", text):
+        return 1
+    if "delivered" in text:
+        return 4
     if "out for delivery" in text:
+        return 3
+    if "delivery attempted" in text:
         return 3
     if "shipped" in text or "transit" in text or "carrier" in text:
         return 2
     if (
-        "not delivered" in text
-        or "not yet delivered" in text
-        or "undelivered" in text
-        or "arriv" in text
+        "arriv" in text
+        or "attempted" in text
         or "order received" in text
         or "ordered" in text
         or "delay" in text
         or "unavailable" in text
     ):
         return 1
-    if "delivered" in text:
-        return 4
     return 0
 
 
@@ -4399,6 +4410,8 @@ def order_line_currently_delivered(row: Any) -> bool:
 def tracking_package_active_pending(package: dict[str, Any]) -> str:
     if not isinstance(package, dict):
         return ""
+    if tracking_package_delivered(package):
+        return ""
     status_text = clean_text(
         " ".join(
             clean_text(package.get(key))
@@ -4408,6 +4421,8 @@ def tracking_package_active_pending(package: dict[str, Any]) -> str:
     lowered = status_text.lower()
     if "out for delivery" in lowered:
         return "Out for delivery"
+    if "delivery attempted" in lowered:
+        return clean_text(package.get("status") or package.get("delivery_status") or package.get("promise")) or "Delivery attempted"
     if "arriving" in lowered:
         return clean_text(package.get("promise") or package.get("status")) or "Arriving"
     if "delayed" in lowered or "running late" in lowered:
@@ -4537,6 +4552,7 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
     if updated:
         aggregate_status = tracking_status_from_packages(package_payloads)
         order_products = tracking_products_from_packages(package_payloads)
+        resolved_at = now if tracking_status_rank(aggregate_status) >= tracking_status_rank("delivered") else None
         conn.execute(
             """
             UPDATE amazon_order_history_unmatched
@@ -4545,7 +4561,7 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
                 asins_json=CASE WHEN ? THEN ? ELSE asins_json END,
                 items_json=CASE WHEN ? THEN ? ELSE items_json END,
                 last_seen_at=?,
-                resolved_at=NULL
+                resolved_at=?
             WHERE amazon_order_id=?
             """,
             (
@@ -4556,6 +4572,7 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
                 bool(order_products),
                 json.dumps(order_products, default=str),
                 now,
+                resolved_at,
                 order_id,
             ),
         )
@@ -4758,6 +4775,15 @@ def update_related_tracking_orders_from_packages(
     updated = 0
     dispatch_packages = 0
     for related_order_id in related_ids:
+        related_packages = [
+            package for package in packages
+            if isinstance(package, dict) and related_order_id in package_direct_amazon_order_ids(package)
+        ]
+        if not related_packages:
+            continue
+        related_status = tracking_status_from_packages(related_packages)
+        related_delivered = related_status == "Delivered" and all(tracking_package_delivered(package) for package in related_packages)
+        related_tracking_payload = tracking_payload_json_for_storage(related_packages)
         rows = rows_to_dicts(conn.execute(
             """
             SELECT *
@@ -4772,7 +4798,7 @@ def update_related_tracking_orders_from_packages(
         if rows:
             updated_row_ids: list[int] = []
             for row in rows:
-                if order_line_currently_delivered(row) and not line_delivered:
+                if order_line_currently_delivered(row) and not related_delivered:
                     continue
                 conn.execute(
                     """
@@ -4788,10 +4814,10 @@ def update_related_tracking_orders_from_packages(
                     """,
                     (
                         order_line_amazon_url(related_order_id),
-                        status,
-                        tracking_payload,
+                        related_status,
+                        related_tracking_payload,
                         now,
-                        bool(line_delivered),
+                        bool(related_delivered),
                         now,
                         row["id"],
                     ),
@@ -4805,11 +4831,11 @@ def update_related_tracking_orders_from_packages(
             ).fetchall())
             for updated_row in refreshed_rows:
                 index_order_line(updated_row)
-                if line_delivered:
+                if related_delivered:
                     ensure_inventory_for_line(updated_row)
             _order_id, values, package_count, _error = dispatch_bulk_package_rows_for_order(related_order_id, refreshed_rows, now)
             bulk_upsert_dispatch_package_rows(conn, values)
-            mark_history_tracking_order_status(conn, related_order_id, order_line_amazon_url(related_order_id), packages)
+            mark_history_tracking_order_status(conn, related_order_id, order_line_amazon_url(related_order_id), related_packages)
             updated += len(refreshed_rows)
             dispatch_packages += package_count
             continue
@@ -4817,7 +4843,7 @@ def update_related_tracking_orders_from_packages(
             conn,
             related_order_id,
             order_line_amazon_url(related_order_id),
-            packages,
+            related_packages,
         )
         if refreshed_packages:
             dispatch_packages += refreshed_packages
@@ -4827,7 +4853,7 @@ def update_related_tracking_orders_from_packages(
             conn,
             related_order_id,
             order_line_amazon_url(related_order_id),
-            packages,
+            related_packages,
         )
         updated += history_updated
         dispatch_packages += history_packages
@@ -5047,8 +5073,18 @@ def bulk_upsert_dispatch_package_rows(conn: Any, values: list[tuple[Any, ...]]) 
             recipient_ref=COALESCE(NULLIF(excluded.recipient_ref, ''), amazon_dispatch_packages.recipient_ref),
             order_line_ids_json=excluded.order_line_ids_json,
             package_index=excluded.package_index,
-            package_status=excluded.package_status,
-            promise=excluded.promise,
+            package_status=CASE
+                WHEN LOWER(COALESCE(amazon_dispatch_packages.package_status, '') || ' ' || COALESCE(amazon_dispatch_packages.promise, '')) LIKE '%delivered%'
+                 AND LOWER(COALESCE(excluded.package_status, '') || ' ' || COALESCE(excluded.promise, '')) NOT LIKE '%delivered%'
+                THEN amazon_dispatch_packages.package_status
+                ELSE excluded.package_status
+            END,
+            promise=CASE
+                WHEN LOWER(COALESCE(amazon_dispatch_packages.package_status, '') || ' ' || COALESCE(amazon_dispatch_packages.promise, '')) LIKE '%delivered%'
+                 AND LOWER(COALESCE(excluded.package_status, '') || ' ' || COALESCE(excluded.promise, '')) NOT LIKE '%delivered%'
+                THEN amazon_dispatch_packages.promise
+                ELSE excluded.promise
+            END,
             carrier=excluded.carrier,
             tracking_url=COALESCE(NULLIF(excluded.tracking_url, ''), amazon_dispatch_packages.tracking_url),
             asins_json=excluded.asins_json,
@@ -6392,6 +6428,13 @@ def normalize_pull_limit(limit: Any, default: int = 0) -> int:
 
 def stored_pull_limit() -> int:
     return normalize_pull_limit(get_setting("pull_orders_limit", get_service_settings().get("pull_orders_limit", "0")), 0)
+
+
+def auto_pull_limit(limit: Any) -> int:
+    normalized = normalize_pull_limit(limit, 0)
+    # A tiny scheduled limit silently misses confirmed paid orders. Keep limit 0
+    # as the safe automation default: pull every matching order in the window.
+    return 0 if normalized <= 1 else normalized
 
 
 def stored_pull_days(default: int = 7) -> int:
@@ -11693,6 +11736,8 @@ def summarize_tracking(payloads: list[dict[str, Any]], fallback_details: dict[st
         return "Out for delivery"
     if re.search(r"\barriving\b", combined, re.IGNORECASE):
         return "Arriving"
+    if re.search(r"\bdelivery attempted\b", combined, re.IGNORECASE):
+        return "Delivery attempted"
     if re.search(r"\bdelivered\b", combined, re.IGNORECASE):
         return "Delivered"
     if re.search(r"\b(in transit|shipped)\b", combined, re.IGNORECASE):
@@ -11724,12 +11769,12 @@ def tracking_status_from_packages(packages: list[dict[str, Any]]) -> str:
         return "Delivery unavailable"
     if "unable to get the tracking information" in text or "unable to load your order details" in text:
         return "Tracking unavailable"
-    if "delayed" in text:
-        return "Delayed"
     if active_pending_statuses:
         if any(status == "Out for delivery" for status in active_pending_statuses):
             return "Out for delivery"
         return " / ".join(dict.fromkeys(active_pending_statuses))
+    if "delayed" in text:
+        return "Delayed"
     if valid_packages and all(tracking_package_delivered(package) for package in valid_packages):
         return "Delivered"
     if "out for delivery" in text:
@@ -12347,7 +12392,9 @@ def tracking_rows(store_id: Optional[int] = None, status: str = "active", q: str
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         amazon_id = row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or ""
-        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(amazon_id)
+        amazon_url = clean_text(row.get("amazon_order_url"))
+        url_order_ids = set(AMAZON_ORDER_ID_PATTERN.findall(amazon_url))
+        row["amazon_order_url"] = amazon_url if amazon_url and (not url_order_ids or amazon_id in url_order_ids) else order_line_amazon_url(amazon_id)
         row["asin_url"] = asin_product_url(row.get("asin") or "")
     return data
 
@@ -12487,7 +12534,9 @@ def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active"
         store = stores_by_id.get(row.get("store_id"))
         row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
         amazon_id = row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or ""
-        row["amazon_order_url"] = row.get("amazon_order_url") or order_line_amazon_url(amazon_id)
+        amazon_url = clean_text(row.get("amazon_order_url"))
+        url_order_ids = set(AMAZON_ORDER_ID_PATTERN.findall(amazon_url))
+        row["amazon_order_url"] = amazon_url if amazon_url and (not url_order_ids or amazon_id in url_order_ids) else order_line_amazon_url(amazon_id)
         row["asin_url"] = asin_product_url(row.get("asin") or "")
     grouped: dict[str, dict[str, Any]] = {}
     for row in data:
@@ -12498,7 +12547,7 @@ def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active"
             order_id,
             {
                 "amazon_order_id": order_id,
-                "amazon_order_url": row.get("amazon_order_url") or order_line_amazon_url(order_id),
+                "amazon_order_url": order_line_amazon_url(order_id),
                 "odoo_order_names": [],
                 "lines": [],
                 "tracking_checked_at": row.get("tracking_checked_at") or "",
@@ -12572,6 +12621,86 @@ def amazon_history_tracking_orders_for_refresh(limit: int = 500) -> list[dict[st
             "asins": asins,
             "products": products,
             "items": products or [{"asin": asin, "quantity": 1} for asin in asins],
+        })
+    return orders
+
+
+def stale_dispatch_package_tracking_orders_for_refresh(limit: int = 500) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            WITH stale_orders AS (
+                SELECT
+                    package.amazon_order_id,
+                    MAX(COALESCE(NULLIF(package.amazon_order_url, ''), NULLIF(package.tracking_url, ''))) AS amazon_order_url,
+                    STRING_AGG(DISTINCT line.odoo_order_name, ',') AS odoo_order_names,
+                    MIN(NULLIF(package.updated_at, '')) AS oldest_package_update,
+                    MAX(COALESCE(package.package_status, '') || ' ' || COALESCE(package.promise, '')) AS package_status
+                FROM amazon_dispatch_packages package
+                JOIN order_lines line
+                  ON line.store_id=package.store_id
+                 AND UPPER(line.odoo_order_name)=UPPER(package.odoo_order_name)
+                 AND line.amazon_order_id=package.amazon_order_id
+                WHERE COALESCE(package.amazon_order_id, '') != ''
+                  AND COALESCE(line.order_engine, '') != 'third_party'
+                  AND (
+                    line.state='delivered'
+                    OR LOWER(COALESCE(line.tracking_status, ''))='delivered'
+                    OR LOWER(COALESCE(line.tracking_status, '')) LIKE 'delivered %'
+                  )
+                  AND NOT (
+                    LOWER(COALESCE(package.package_status, '') || ' ' || COALESCE(package.promise, '')) LIKE '%delivered%'
+                  )
+                  AND (
+                    LOWER(COALESCE(package.package_status, '')) LIKE '%arriv%'
+                    OR LOWER(COALESCE(package.promise, '')) LIKE '%arriv%'
+                    OR LOWER(COALESCE(package.package_status, '')) IN ('out for delivery', 'shipped', 'delayed')
+                    OR LOWER(COALESCE(package.promise, '')) IN ('out for delivery', 'shipped', 'delayed')
+                  )
+                GROUP BY package.amazon_order_id
+                ORDER BY MIN(NULLIF(package.updated_at, '')) ASC NULLS FIRST
+                LIMIT ?
+            )
+            SELECT *
+            FROM stale_orders
+            """,
+            (max(1, min(2000, int(limit or 500))),),
+        ).fetchall())
+        mismatched_payload_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT
+                amazon_order_id,
+                MAX(amazon_order_url) AS amazon_order_url,
+                STRING_AGG(DISTINCT odoo_order_name, ',') AS odoo_order_names,
+                MIN(NULLIF(tracking_checked_at, '')) AS oldest_package_update,
+                'Mismatched stored tracking payload' AS package_status
+            FROM order_lines
+            WHERE COALESCE(amazon_order_id, '') != ''
+              AND COALESCE(order_engine, '') != 'third_party'
+              AND COALESCE(tracking_payload, '') ~ '\\d{3}-\\d{7}-\\d{7}'
+              AND substring(tracking_payload from '\\d{3}-\\d{7}-\\d{7}') IS NOT NULL
+              AND substring(tracking_payload from '\\d{3}-\\d{7}-\\d{7}') != amazon_order_id
+            GROUP BY amazon_order_id
+            ORDER BY MIN(NULLIF(tracking_checked_at, '')) ASC NULLS FIRST
+            LIMIT ?
+            """,
+            (max(1, min(2000, int(limit or 500))),),
+        ).fetchall())
+    orders: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in [*rows, *mismatched_payload_rows]:
+        order_id = clean_text(row.get("amazon_order_id"))
+        if not order_id or order_id in seen:
+            continue
+        seen.add(order_id)
+        orders.append({
+            "amazon_order_id": order_id,
+            "amazon_order_url": clean_text(row.get("amazon_order_url")) or order_line_amazon_url(order_id),
+            "odoo_order_names": [name for name in clean_text(row.get("odoo_order_names")).split(",") if name],
+            "lines": [],
+            "tracking_checked_at": row.get("oldest_package_update") or "",
+            "tracking_status": clean_text(row.get("package_status")) or "Stale dispatch package",
+            "source": "stale_dispatch_package" if row in rows else "mismatched_tracking_payload",
         })
     return orders
 
@@ -12928,12 +13057,16 @@ def attach_manual_amazon_order_associations(conn: Any, rows: list[dict[str, Any]
 
 def hydrate_pending_row_amazon_products_from_associations(rows: list[dict[str, Any]]) -> None:
     for row in rows:
+        row_asin = normalize_asin(row.get("asin"))
         existing = [
             product for product in row.get("amazon_products") or []
-            if isinstance(product, dict) and normalize_asin(product.get("asin"))
+            if (
+                isinstance(product, dict)
+                and normalize_asin(product.get("asin"))
+                and (not row_asin or normalize_asin(product.get("asin")) == row_asin)
+            )
         ]
         by_asin: dict[str, dict[str, Any]] = {normalize_asin(product.get("asin")): dict(product) for product in existing}
-        row_asin = normalize_asin(row.get("asin"))
         current_order_id = clean_text(row.get("amazon_order_id"))
         for product in row.get("amazon_captured_products") or []:
             if not isinstance(product, dict):
@@ -13027,9 +13160,8 @@ def hydrate_pending_row_amazon_products_from_associations(rows: list[dict[str, A
             matching = [product for product in products if normalize_asin(product.get("asin")) == row_asin]
             if matching:
                 products = matching
-        if products:
-            row["amazon_products"] = products
-            row["amazon_product_asins"] = ", ".join(product["asin"] for product in products if clean_text(product.get("asin")))
+        row["amazon_products"] = products
+        row["amazon_product_asins"] = ", ".join(product["asin"] for product in products if clean_text(product.get("asin")))
 
 
 def compact_tracking_text(value: Any, max_length: int = 360) -> str:
@@ -13268,6 +13400,10 @@ def attach_pending_dispatch_item_audit(conn: Any, rows: list[dict[str, Any]]) ->
             for product in package.get("order_products") or []:
                 add_order_product(products_by_asin, products_by_order, order_id, product)
 
+    def package_belongs_to_order(package: dict[str, Any], order_id: str) -> bool:
+        direct_order_ids = package_direct_amazon_order_ids(package)
+        return not direct_order_ids or clean_text(order_id) in direct_order_ids
+
     def line_quantity(line: dict[str, Any]) -> float:
         try:
             return float(line.get("quantity") or 1)
@@ -13316,16 +13452,18 @@ def attach_pending_dispatch_item_audit(conn: Any, rows: list[dict[str, Any]]) ->
         for sibling in sibling_lines:
             sibling_order_id = clean_text(sibling.get("amazon_order_id"))
             sibling_allowed_asins = set(order_line_asin_aliases(sibling))
-            for product in amazon_products_from_tracking_payload(sibling.get("tracking_payload") or ""):
-                product_asin = normalize_asin(product.get("asin")) if isinstance(product, dict) else ""
-                if sibling_allowed_asins and product_asin not in sibling_allowed_asins:
-                    continue
-                add_product(products_by_asin, product)
-                add_order_product(products_by_asin, products_by_order, sibling_order_id, product)
             sibling_packages = parse_tracking_packages(sibling.get("tracking_payload") or "")
+            sibling_packages = [
+                package for package in sibling_packages
+                if isinstance(package, dict) and package_belongs_to_order(package, sibling_order_id)
+            ]
             add_packages(products_by_asin, sibling_packages)
             add_order_packages(products_by_asin, products_by_order, sibling_order_id, sibling_packages)
+        row_allowed_asins = set(order_line_asin_aliases(row))
         for product in row.get("amazon_products") or []:
+            product_asin = normalize_asin(product.get("asin")) if isinstance(product, dict) else normalize_asin(product)
+            if row_allowed_asins and product_asin not in row_allowed_asins:
+                continue
             add_product(products_by_asin, product)
             add_order_product(products_by_asin, products_by_order, clean_text(row.get("amazon_order_id")), product)
         for order in [*(row.get("asin_matched_amazon_orders") or []), *(row.get("related_amazon_orders") or [])]:
@@ -21365,7 +21503,7 @@ def autosync_loop() -> None:
             elapsed = max(time.time() - last_run, setting_elapsed_seconds("autosync_last_run_at", interval * 60))
             if interval > 0 and elapsed >= interval * 60:
                 days = stored_pull_days(7)
-                limit = stored_pull_limit()
+                limit = auto_pull_limit(stored_pull_limit())
                 batch_size = stored_pull_batch_size()
                 result = queue_auto_pull_jobs(days, limit, batch_size)
                 set_setting("autosync_last_message", result["message"])
@@ -26475,15 +26613,28 @@ def api_chrome_job_costly(group_key: str, payload: ChromeJobCostlyPayload) -> di
 
 
 @app.get("/api/tracking/orders")
-def api_tracking_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "active", q: str = "") -> dict[str, Any]:
-    cache_key = ("tracking-orders", store_id, page, per_page, clean_text(status), clean_text(q))
+def api_tracking_orders(
+    store_id: Optional[int] = None,
+    page: int = 1,
+    per_page: int = 100,
+    status: str = "active",
+    q: str = "",
+    include_history_refresh: bool = True,
+) -> dict[str, Any]:
+    cache_key = ("tracking-orders", store_id, page, per_page, clean_text(status), clean_text(q), bool(include_history_refresh))
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
     orders, rows, total, page, per_page = paged_tracking_orders(store_id, status, q, page, per_page)
-    if page == 1 and clean_text(status).lower() in {"", "active"} and not clean_text(q):
+    if include_history_refresh and page == 1 and clean_text(status).lower() in {"", "active"} and not clean_text(q):
         seen_order_ids = {clean_text(order.get("amazon_order_id")) for order in orders}
         appended_history_orders = 0
+        for stale_order in stale_dispatch_package_tracking_orders_for_refresh():
+            order_id = clean_text(stale_order.get("amazon_order_id"))
+            if order_id and order_id not in seen_order_ids:
+                orders.append(stale_order)
+                seen_order_ids.add(order_id)
+                appended_history_orders += 1
         for history_order in amazon_history_tracking_orders_for_refresh():
             order_id = clean_text(history_order.get("amazon_order_id"))
             if order_id and order_id not in seen_order_ids:

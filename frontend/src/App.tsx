@@ -5723,29 +5723,67 @@ function HomeDashboard({
 function StoresPage({ stores, onChanged, onResult }: { stores: Store[]; onChanged: () => Promise<void>; onResult: (modal: ModalState) => void }) {
   const [editing, setEditing] = useState<Store | null>(null)
   const [creating, setCreating] = useState(false)
+  const storeSettingsText = stores.map((store) => [
+    `Name: ${store.name || ""}`,
+    `Odoo URL: ${store.odoo_url || ""}`,
+    `Database: ${store.odoo_db || ""}`,
+    `User: ${store.odoo_user || ""}`,
+    `Password/API key: ${store.odoo_password || ""}`,
+    `Website ID: ${store.website_id || ""}`,
+  ].join("\n")).join("\n\n")
+  async function copyStoreSettings() {
+    const copied = await copyPlainText(storeSettingsText)
+    onResult({
+      ok: copied,
+      title: copied ? "Store Settings Copied" : "Copy Failed",
+      message: copied ? `${stores.length} Odoo store connection setting${stores.length === 1 ? "" : "s"} copied.` : "Clipboard copy is not available in this browser.",
+    })
+  }
   return (
-    <SettingsTable<Store>
-      title="Odoo Stores"
-      description="Add, edit, test, or remove Odoo websites."
-      rows={stores}
-      columns={["Name", "URL", "Database", "User", "Website ID"]}
-      renderRow={(store) => [store.name, store.odoo_url, store.odoo_db, store.odoo_user, store.website_id || ""]}
-      onAdd={() => setCreating(true)}
-      onEdit={setEditing}
-      onDelete={async (store) => {
-        try {
-          await api(`/api/stores/${store.id}`, { method: "DELETE" })
-          await onChanged()
-          onResult({ ok: true, title: "Store Deleted", message: `${store.name} was removed.` })
-        } catch (error) {
-          onResult({ ok: false, title: "Store Delete Failed", message: String(error) })
-        }
-      }}
-      onTest={async (store) => onResult({ title: "Test Store", ...(await api<{ ok: boolean; message: string }>(`/api/stores/${store.id}/test`, { method: "POST" })) })}
-    >
-      <StoreDialog open={creating} value={emptyStore} onClose={() => setCreating(false)} onSaved={onChanged} onResult={onResult} />
-      {editing && <StoreDialog open value={editing} id={editing.id} onClose={() => setEditing(null)} onSaved={onChanged} onResult={onResult} />}
-    </SettingsTable>
+    <div className="grid gap-4">
+      <Card>
+        <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <CardTitle>Copy Odoo Store Connection Settings</CardTitle>
+            <p className="mt-1 text-sm text-muted-foreground">All connected Odoo stores in one text block.</p>
+          </div>
+          <Button onClick={copyStoreSettings} disabled={!storeSettingsText}>
+            <Copy className="size-4" />
+            Copy All
+          </Button>
+        </CardHeader>
+        <CardContent>
+          <textarea
+            className="min-h-64 w-full resize-y rounded-md border border-input bg-background p-3 font-mono text-sm leading-6 text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/20"
+            readOnly
+            value={storeSettingsText || "No Odoo stores configured."}
+            onFocus={(event) => event.currentTarget.select()}
+          />
+        </CardContent>
+      </Card>
+      <SettingsTable<Store>
+        title="Odoo Stores"
+        description="Add, edit, test, or remove Odoo websites."
+        rows={stores}
+        columns={["Name", "URL", "Database", "User", "Website ID"]}
+        renderRow={(store) => [store.name, store.odoo_url, store.odoo_db, store.odoo_user, store.website_id || ""]}
+        onAdd={() => setCreating(true)}
+        onEdit={setEditing}
+        onDelete={async (store) => {
+          try {
+            await api(`/api/stores/${store.id}`, { method: "DELETE" })
+            await onChanged()
+            onResult({ ok: true, title: "Store Deleted", message: `${store.name} was removed.` })
+          } catch (error) {
+            onResult({ ok: false, title: "Store Delete Failed", message: String(error) })
+          }
+        }}
+        onTest={async (store) => onResult({ title: "Test Store", ...(await api<{ ok: boolean; message: string }>(`/api/stores/${store.id}/test`, { method: "POST" })) })}
+      >
+        <StoreDialog open={creating} value={emptyStore} onClose={() => setCreating(false)} onSaved={onChanged} onResult={onResult} />
+        {editing && <StoreDialog open value={editing} id={editing.id} onClose={() => setEditing(null)} onSaved={onChanged} onResult={onResult} />}
+      </SettingsTable>
+    </div>
   )
 }
 
@@ -13680,6 +13718,7 @@ function SettingsPage({
                 {["1", "2", "3", "7", "14", "30", "60", "90"].map((value) => <option key={value} value={value}>Last {value} day{value === "1" ? "" : "s"}</option>)}
               </SelectField>
               <TextField label="Auto Pull Limit" value={settings.pull_orders_limit || "0"} onChange={(value) => setSetting("pull_orders_limit", value)} />
+              <p className="text-xs text-muted-foreground md:col-span-2">Use 0 for normal auto pull so every confirmed paid order in the selected window is ingested. A limit is only for short diagnostics.</p>
               <SelectField label="Auto Pull + Queue Chrome" value={settings.auto_chrome_fulfil_interval_minutes || "0"} onChange={(value) => setSetting("auto_chrome_fulfil_interval_minutes", value)}>
                 {["0", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
               </SelectField>

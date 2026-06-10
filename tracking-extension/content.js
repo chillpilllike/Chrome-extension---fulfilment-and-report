@@ -285,6 +285,24 @@ function activeTrackingUrl(state = {}) {
   return String(state.tracking?.currentUrl || "");
 }
 
+function orderDetailsLikeUrl(value = "") {
+  try {
+    const url = new URL(value, location.href);
+    return /\/(your-orders\/order-details|your-orders\/order|gp\/your-account\/order|gp\/your-account\/order-details|gp\/css\/summary)/i.test(url.pathname);
+  } catch {
+    return /order-details|your-orders\/order|gp\/your-account\/order|gp\/css\/summary/i.test(String(value || ""));
+  }
+}
+
+function trackingLikeUrl(value = "") {
+  try {
+    const url = new URL(value, location.href);
+    return /\/(gp\/your-account\/ship-track|progress-tracker\/package)/i.test(url.pathname);
+  } catch {
+    return /ship-track|progress-tracker\/package/i.test(String(value || ""));
+  }
+}
+
 function currentPageMatchesActiveTracking(state = {}) {
   if (!state?.tracking?.running) return false;
   const activeUrl = activeTrackingUrl(state);
@@ -292,14 +310,28 @@ function currentPageMatchesActiveTracking(state = {}) {
   try {
     const active = new URL(activeUrl);
     const here = new URL(location.href);
-    if (active.origin !== here.origin || active.pathname.replace(/\/+$/, "") !== here.pathname.replace(/\/+$/, "")) return false;
+    if (active.origin !== here.origin) return false;
     const activeOrder = active.searchParams.get("orderID") || active.searchParams.get("orderId") || "";
     const hereOrder = here.searchParams.get("orderID") || here.searchParams.get("orderId") || "";
+    if (activeOrder && hereOrder && activeOrder === hereOrder && orderDetailsLikeUrl(active.href) && orderDetailsLikeUrl(here.href)) return true;
+    if (activeOrder && hereOrder && activeOrder === hereOrder && trackingLikeUrl(active.href) && trackingLikeUrl(here.href)) return true;
+    if (active.pathname.replace(/\/+$/, "") !== here.pathname.replace(/\/+$/, "")) return false;
     if (activeOrder && hereOrder && activeOrder !== hereOrder) return false;
     return true;
   } catch {
     return true;
   }
+}
+
+async function recoverActiveTrackingPage(state = {}, reason = "stale Amazon page") {
+  const activeOrderId = activeTrackingOrderId(state);
+  showPanel("Nutricity tracking", activeOrderId ? `Recovering active order ${activeOrderId}.` : "Recovering active tracking run.");
+  await send({
+    type: "RECOVER_ACTIVE_TRACKING_PAGE",
+    amazonOrderId: currentOrderId(),
+    pageUrl: location.href,
+    reason,
+  });
 }
 
 function recipientFromOrderHistoryText(text = "") {
@@ -451,6 +483,21 @@ function nextHistoryPageUrl() {
   return "";
 }
 
+function amazonHistoryUnavailableMessage() {
+  const text = clean(document.body?.innerText || "");
+  const unavailablePatterns = [
+    /there'?s a problem displaying some of your orders right now/i,
+    /problem displaying some of your orders/i,
+    /try refreshing this page/i,
+    /sorry[, ]+we are unable to display your orders/i,
+    /we're sorry[, ]+something went wrong/i,
+  ];
+  const matched = unavailablePatterns.find((pattern) => pattern.test(text));
+  if (!matched) return "";
+  const heading = clean(document.querySelector("h1, h2, h3, h4, .a-alert-heading, .a-alert-content")?.textContent || "");
+  return heading || "Amazon could not display this order-history page.";
+}
+
 function extractHistoryTrackOrders() {
   const seen = new Set();
   const orders = [];
@@ -482,6 +529,22 @@ async function scanOrderHistoryForTrackAll(state = null) {
   if (!isOrderHistoryPage()) return false;
   await waitForPageReady();
   const tracking = state?.tracking || {};
+  const unavailableMessage = amazonHistoryUnavailableMessage();
+  if (unavailableMessage) {
+    const runId = tracking.startedAt || tracking.resumedAt || "";
+    const signature = `${runId}|history-unavailable|${location.href}|${unavailableMessage}`;
+    if (window.__nutricityLastTrackAllHistorySignature === signature) return true;
+    window.__nutricityLastTrackAllHistorySignature = signature;
+    showPanel("Nutricity tracking", unavailableMessage);
+    const response = await send({
+      type: "ORDER_HISTORY_TRACK_ALL_PROBLEM",
+      pageUrl: location.href,
+      message: unavailableMessage,
+      runId,
+    });
+    if (response?.message) showPanel("Nutricity tracking", response.message);
+    return true;
+  }
   const orders = extractHistoryTrackOrders();
   const nextUrl = nextHistoryPageUrl();
   const runId = tracking.startedAt || tracking.resumedAt || "";
@@ -712,7 +775,7 @@ function parseCarrierAndTrackingId() {
 
 function parseStatus() {
   const pageText = clean(document.body?.innerText || "");
-  const headlineMatch = pageText.match(/\b(Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|Out for delivery|Delivered(?:\s+\w+\s+\d{1,2})?|Shipped|Delayed|Running late)\b/i);
+  const headlineMatch = pageText.match(/\b(Now expected by\s+\w+\s+\d{1,2}|Was expected\s+\w+\s+\d{1,2}|Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|Out for delivery|Delivery attempted(?:\s+\w+\s+\d{1,2})?|Delivered(?:\s+\w+\s+\d{1,2})?|Shipped|Delayed|Running late)\b/i);
   const headline = headlineMatch ? clean(headlineMatch[1]) : "";
   const selectedStatus = (
     clean(document.querySelector(".pt-status-main-status")?.textContent) ||
@@ -721,7 +784,7 @@ function parseStatus() {
     clean(document.querySelector(".od-status-message")?.textContent) ||
     "Unknown"
   );
-  if (/delivered/i.test(selectedStatus) && /\b(arriving|out for delivery|delayed|running late)\b/i.test(headline)) {
+  if (/delivered/i.test(selectedStatus) && /\b(arriving|out for delivery|delivery attempted|delayed|running late)\b/i.test(headline)) {
     return headline;
   }
   return selectedStatus;
@@ -729,7 +792,7 @@ function parseStatus() {
 
 function parsePromise() {
   const pageText = clean(document.body?.innerText || "");
-  const headlineMatch = pageText.match(/\b(Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\b/i);
+  const headlineMatch = pageText.match(/\b(Now expected by\s+\w+\s+\d{1,2}|Was expected\s+\w+\s+\d{1,2}|Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\b/i);
   return clean(document.querySelector(".pt-promise-main-slot")?.textContent) || (headlineMatch ? clean(headlineMatch[1]) : "");
 }
 
@@ -834,7 +897,10 @@ async function run() {
   showPanel("Nutricity tracking", `Scanning Amazon page: ${location.pathname}`);
   if (isTrackingPage()) {
     const state = await send({ type: "GET_STATE" });
-    if (!currentPageMatchesActiveTracking(state)) return;
+    if (!currentPageMatchesActiveTracking(state)) {
+      await recoverActiveTrackingPage(state, "tracking page did not match the active run");
+      return;
+    }
     await waitForTrackingPageReady();
     const data = await parseTrackingPage();
     if (!data.amazonOrderId) return;
@@ -863,7 +929,10 @@ async function run() {
   }
   if (isOrderDetailsLikePage()) {
     const state = await send({ type: "GET_STATE" });
-    if (state?.tracking?.running && !currentPageMatchesActiveTracking(state)) return;
+    if (state?.tracking?.running && !currentPageMatchesActiveTracking(state)) {
+      await recoverActiveTrackingPage(state, "order details page did not match the active run");
+      return;
+    }
     const data = await parseOrderDetails();
     void logContent(`Order details parsed for ${data.amazonOrderId || "unknown"}: ${data.packages?.length || 0} package link(s), cancelled=${Boolean(data.orderCancelled)}, paymentRevision=${Boolean(data.paymentRevisionNeeded)}.`);
     if (!data.amazonOrderId) {
@@ -937,7 +1006,10 @@ if (!window.__nutricityTrackAllWatcher) {
     try {
       const state = await send({ type: "GET_STATE" });
       if (!(state?.tracking?.running && state.tracking.source === "history")) return;
-      if (!currentPageMatchesActiveTracking(state)) return;
+      if (!currentPageMatchesActiveTracking(state)) {
+        await recoverActiveTrackingPage(state, "watcher page did not match the active Track all run");
+        return;
+      }
       if (isOrderHistoryPage()) {
         await scanOrderHistoryForTrackAll(state);
         return;

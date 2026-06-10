@@ -103,6 +103,11 @@ function epostProgress(epostRun = {}) {
   };
 }
 
+function epostAutoWaitMessage(label, hours, completed = 0, failed = 0, skipped = 0) {
+  const interval = clampIntervalHours(hours);
+  return `${label} All progress is done. Auto mode is enabled; waiting ${interval} hour(s) until the next scheduled ePost tracking run. Checked ${Number(completed || 0)} code(s), failed ${Number(failed || 0)}${Number(skipped || 0) ? `, skipped recent ${Number(skipped || 0)}` : ""}.`;
+}
+
 async function rememberRecentEpostCodes(codes, status = "checked") {
   const cleanCodes = (codes || []).map((code) => String(code || "").trim().toUpperCase()).filter(Boolean);
   if (!cleanCodes.length) return;
@@ -213,20 +218,20 @@ async function openTracker(windowId) {
     const activeQuery = windowId ? { active: true, windowId } : { active: true, currentWindow: true };
     const tabs = await chrome.tabs.query(activeQuery);
     if (tabs[0]?.id && isEpostTrackerUrl(tabs[0].url || "")) {
-      await chrome.tabs.update(tabs[0].id, { url, active: true });
+      await chrome.tabs.update(tabs[0].id, { url, active: false });
       return;
     }
     const candidateQuery = windowId ? { windowId } : { currentWindow: true };
     const candidates = await chrome.tabs.query(candidateQuery);
     const reusable = candidates.find((tab) => tab.id && isEpostTrackerUrl(tab.url || ""));
     if (reusable?.id) {
-      await chrome.tabs.update(reusable.id, { url, active: true });
+      await chrome.tabs.update(reusable.id, { url, active: false });
       return;
     }
   } catch (error) {
     await log(`Could not reuse ePost tab: ${error.message}`, windowId);
   }
-  await chrome.tabs.create({ url, active: true, ...(windowId ? { windowId } : {}) });
+  await chrome.tabs.create({ url, active: false, ...(windowId ? { windowId } : {}) });
 }
 
 function clampIntervalHours(value, fallback = DEFAULT_EPOST_AUTO_HOURS) {
@@ -301,10 +306,14 @@ async function startEpost(windowId = null, options = {}) {
     };
     if (!batches.length) {
       epostRun.running = false;
+      epostRun.finishedAt = Date.now();
+      epostRun.lastMessage = source === "auto" && state.autoEpostEnabled === true
+        ? epostAutoWaitMessage("No undelivered ePost tracking codes found.", intervalHours, 0, 0, epostRun.skippedRecentCount)
+        : includeRecent ? "No undelivered ePost tracking codes found." : "No ePost tracking codes are due.";
       await saveEpostRun(epostRun, windowId);
-      const message = includeRecent ? "No undelivered ePost tracking codes found." : "No ePost tracking codes are due.";
+      const message = epostRun.lastMessage;
       await log(message, windowId);
-      return { ok: false, message };
+      return { ok: source === "auto", message, progress: epostProgress(epostRun) };
     }
     await saveEpostRun(epostRun, windowId);
     await ensureEpostWatchdog();
@@ -423,6 +432,10 @@ async function handleResults(message, windowId) {
   if (epostRun.batchIndex >= epostRun.batches.length) {
     epostRun.running = false;
     epostRun.finishedAt = Date.now();
+    if (epostRun.source === "auto") {
+      const { intervalHours } = await getState();
+      epostRun.lastMessage = epostAutoWaitMessage("ePost tracking run complete.", intervalHours, epostRun.completedCodes?.length || 0, epostRun.failedCodes?.length || 0, epostRun.skippedRecentCount || 0);
+    }
     await saveEpostRun(epostRun, windowId);
     try {
       await api("/api/epost/update", {
@@ -476,6 +489,10 @@ async function skipStaleEpostBatch(epostRun, windowId) {
   if (epostRun.batchIndex >= (epostRun.batches?.length || 0)) {
     epostRun.running = false;
     epostRun.finishedAt = Date.now();
+    if (epostRun.source === "auto") {
+      const { intervalHours } = await getState();
+      epostRun.lastMessage = epostAutoWaitMessage("ePost tracking run complete after timeout recovery.", intervalHours, epostRun.completedCodes?.length || 0, epostRun.failedCodes?.length || 0, epostRun.skippedRecentCount || 0);
+    }
     await saveEpostRun(epostRun, windowId);
     await log("ePost tracking run complete after timeout recovery.", windowId);
     await clearEpostWatchdogIfIdle();

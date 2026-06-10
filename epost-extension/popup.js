@@ -125,6 +125,19 @@ function visibleProgressText(run = {}) {
   return `Running: batch ${processedBatches + 1}/${batches.length} · codes ${processedCodes}/${totalCodes} · current ${currentCodes} · checked ${completed} · failed ${failed}${skipped ? ` · skipped recent ${skipped}` : ""}`;
 }
 
+function finalRunText(run = {}) {
+  const lastMessage = String(run.lastMessage || "").trim();
+  if (autoEpostEnabled.checked && run.source === "auto") {
+    if (/waiting \d+ hour/i.test(lastMessage)) return lastMessage;
+    const completed = run.completedCodes?.length || 0;
+    const failed = run.failedCodes?.length || 0;
+    const skipped = Number(run.skippedRecentCount || 0);
+    const hours = Math.max(1, Math.min(720, Number(intervalHours.value || 24)));
+    return `${lastMessage || "ePost tracking complete."} Auto mode is enabled; waiting ${hours} hour(s) until the next scheduled ePost tracking run. Checked ${completed} code(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
+  }
+  return lastMessage || "Stopped";
+}
+
 function errorMessage(error) {
   return String(error?.message || error || "Unexpected extension error.");
 }
@@ -167,7 +180,7 @@ async function refresh() {
     }
   } else {
     setRunButtons(run.running);
-    applyStatusFromRefresh(run.running ? visibleProgressText(run) : "Stopped");
+    applyStatusFromRefresh(run.running ? visibleProgressText(run) : finalRunText(run));
   }
   logsBox.innerHTML = "";
   for (const line of state.logs || []) {
