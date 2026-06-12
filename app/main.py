@@ -10794,6 +10794,7 @@ def persist_chrome_order_groups(
                 chrome_claimed_by=NULL,
                 chrome_claimed_at=NULL,
                 chrome_claim_expires_at=NULL,
+                missing_asin=NULL,
                 last_error=NULL,
                 updated_at=?
             FROM queued
