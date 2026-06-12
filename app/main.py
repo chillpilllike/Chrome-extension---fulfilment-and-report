@@ -22576,7 +22576,7 @@ def api_bulk_place(payload: BulkPlacePayload) -> dict[str, Any]:
         amazon_account_id=payload.amazon_account_id,
         line_ids=eligible_line_ids,
         club=True,
-        ordering_engine=payload.ordering_engine,
+        ordering_engine=payload.ordering_engine or get_default_ordering_engine(),
     )
     groups, total, page, per_page = paginate_values(bulk_opportunity_groups(payload.store_id), 1, 100)
     fast_page_cache_clear_matching({"bulk", "chrome-jobs", "dashboard", "orders"})
@@ -29786,13 +29786,81 @@ def pull_orders(store_id: int = Form(...), days: int = Form(7), limit: int = For
     return RedirectResponse(f"/?store_id={store_id}", status_code=303)
 
 
+def enqueue_shopify_for_placed_scope(store_id: int, line_ids: Optional[list[int]] = None) -> int:
+    line_filter = ""
+    params: list[Any] = [store_id]
+    if line_ids:
+        selected_ids = sorted({int(line_id) for line_id in line_ids if int(line_id or 0) > 0})
+        if not selected_ids:
+            return 0
+        line_filter = f" AND id IN ({','.join('?' for _ in selected_ids)})"
+        params.extend(selected_ids)
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT *
+            FROM order_lines
+            WHERE store_id=?
+              AND (
+                (
+                  COALESCE(amazon_order_id, '') != ''
+                  AND order_engine IN ('chrome', 'rest', 'cxml', 'manual_amazon', 'third_party')
+                  AND state IN ('ordered', 'dispatched', 'delivered')
+                )
+                OR (
+                  order_engine='inventory'
+                  AND state IN ('inventory', 'delivered')
+                )
+              )
+              {line_filter}
+            """,
+            params,
+        ).fetchall())
+    queued = enqueue_shopify_fulfilment_for_rows(rows)
+    if queued:
+        start_shopify_fulfilment_worker()
+    return queued
+
+
+def place_orders_from_legacy_form(
+    store_id: int,
+    address_id: Optional[int] = None,
+    amazon_account_id: Optional[int] = None,
+    line_ids: Optional[list[int]] = None,
+    club: bool = False,
+) -> tuple[int, int]:
+    ordering_engine = get_default_ordering_engine()
+    if ordering_engine == "chrome":
+        queued, _cleared, blocked, _account, _details = queue_chrome_order_groups_fast(
+            store_id,
+            amazon_account_id=amazon_account_id,
+            address_id=address_id,
+            line_ids=line_ids or None,
+            club=club,
+        )
+        fast_page_cache_clear_matching({"chrome-jobs", "dashboard", "orders"})
+        return queued, blocked
+    ordered, skipped = place_orders(
+        store_id,
+        address_id=address_id,
+        amazon_account_id=amazon_account_id,
+        line_ids=line_ids or None,
+        club=club,
+        ordering_engine=ordering_engine,
+    )
+    if ordered or line_ids:
+        enqueue_shopify_for_placed_scope(store_id, line_ids)
+    fast_page_cache_clear_matching({"shopify-fulfilment", "fulfilment-pending", "dashboard", "orders"})
+    return ordered, skipped
+
+
 @app.post("/place")
 def place(
     store_id: int = Form(...),
     address_id: Optional[int] = Form(None),
     amazon_account_id: Optional[int] = Form(None),
 ) -> RedirectResponse:
-    place_orders(
+    place_orders_from_legacy_form(
         store_id,
         address_id=address_id,
         amazon_account_id=amazon_account_id,
@@ -29810,7 +29878,7 @@ def place_selected_lines(
 ) -> RedirectResponse:
     if line_ids:
         club = action == "club_place"
-        place_orders(
+        place_orders_from_legacy_form(
             store_id,
             address_id=address_id,
             amazon_account_id=amazon_account_id,

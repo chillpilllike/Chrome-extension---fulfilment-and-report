@@ -143,14 +143,14 @@ ODOO_SOURCES = [
     },
     {
         "name": "boostgo",
-        "url": "https://boostgoau.com",  # no trailing slash preferred
+        "url": "https://boostgo.com.au",  # no trailing slash preferred
         "db": "boostgo",
         "username": "admin",
         "password": os.getenv("ODOO_SCRIPT_PASSWORD", ""),
     },
     {
         "name": "espot",
-        "url": "https://espotau.com",  # no trailing slash preferred
+        "url": "https://espot.com.au",  # no trailing slash preferred
         "db": "espot",
         "username": "admin",
         "password": os.getenv("ODOO_SCRIPT_PASSWORD", ""),

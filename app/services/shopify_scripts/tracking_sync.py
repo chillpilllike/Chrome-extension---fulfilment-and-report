@@ -113,14 +113,14 @@ ODOO_DESTS = [
     },
     {
         "name": "Boostgo",
-        "url": "https://boostgoau.com",
+        "url": "https://boostgo.com.au",
         "db": "boostgo",
         "username": "admin",
         "password": os.getenv("ODOO_SCRIPT_PASSWORD", ""),
     },
     {
         "name": "Espot",
-        "url": "https://espotau.com",
+        "url": "https://espot.com.au",
         "db": "espot",
         "username": "admin",
         "password": os.getenv("ODOO_SCRIPT_PASSWORD", ""),

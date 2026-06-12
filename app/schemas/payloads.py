@@ -68,7 +68,7 @@ class PlacePayload(BaseModel):
     amazon_account_id: Optional[int] = None
     line_ids: list[int] = []
     club: bool = False
-    ordering_engine: str = "rest"
+    ordering_engine: str = ""
     allow_missing_spaid: bool = False
     include_missing_asins: bool = False
 
@@ -266,7 +266,7 @@ class BulkPlacePayload(BaseModel):
     line_ids: list[int]
     address_id: Optional[int] = None
     amazon_account_id: Optional[int] = None
-    ordering_engine: str = "rest"
+    ordering_engine: str = ""
 
 
 class CostlyApprovalPayload(BaseModel):
