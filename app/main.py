@@ -16905,58 +16905,86 @@ class PostgresShopifyTrackingStateDB:
     def __init__(self, _path: str = "", read_only: bool = False, *_args: Any, **_kwargs: Any) -> None:
         self.read_only = bool(read_only)
 
+    def _with_db_retry(self, operation: Callable[[], Any]) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return operation()
+            except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
+                last_error = exc
+                db_session.close_pool()
+                if attempt == 0:
+                    time.sleep(0.25)
+                    continue
+                raise
+        if last_error:
+            raise last_error
+        return None
+
     def get_token(self, shop: str) -> dict[str, Any] | None:
-        with db() as conn:
-            row = conn.execute(
-                "SELECT access_token, expires_at FROM shopify_tracking_token_cache WHERE shop=? LIMIT 1",
-                (shop,),
-            ).fetchone()
+        def operation() -> dict[str, Any] | None:
+            with db() as conn:
+                return conn.execute(
+                    "SELECT access_token, expires_at FROM shopify_tracking_token_cache WHERE shop=? LIMIT 1",
+                    (shop,),
+                ).fetchone()
+
+        row = self._with_db_retry(operation)
         return {"access_token": row["access_token"], "expires_at": row["expires_at"]} if row else None
 
     def set_token(self, shop: str, token: str, expires_at: int) -> None:
         if self.read_only:
             return
-        with db() as conn:
-            conn.execute(
-                """
-                INSERT INTO shopify_tracking_token_cache(shop, access_token, expires_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(shop) DO UPDATE SET
-                  access_token=excluded.access_token,
-                  expires_at=excluded.expires_at,
-                  updated_at=excluded.updated_at
-                """,
-                (shop, token, int(expires_at), int(time.time())),
-            )
+        def operation() -> None:
+            with db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO shopify_tracking_token_cache(shop, access_token, expires_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(shop) DO UPDATE SET
+                      access_token=excluded.access_token,
+                      expires_at=excluded.expires_at,
+                      updated_at=excluded.updated_at
+                    """,
+                    (shop, token, int(expires_at), int(time.time())),
+                )
+
+        self._with_db_retry(operation)
 
     def already_synced(self, src_shop: str, src_order_id: str, src_fulfillment_id: str) -> bool:
-        with db() as conn:
-            row = conn.execute(
-                """
-                SELECT 1
-                FROM shopify_tracking_sync_log
-                WHERE src_shop=? AND src_order_id=? AND src_fulfillment_id=?
-                LIMIT 1
-                """,
-                (src_shop, src_order_id, src_fulfillment_id),
-            ).fetchone()
+        def operation() -> dict[str, Any] | None:
+            with db() as conn:
+                return conn.execute(
+                    """
+                    SELECT 1
+                    FROM shopify_tracking_sync_log
+                    WHERE src_shop=? AND src_order_id=? AND src_fulfillment_id=?
+                    LIMIT 1
+                    """,
+                    (src_shop, src_order_id, src_fulfillment_id),
+                ).fetchone()
+
+        row = self._with_db_retry(operation)
         return row is not None
 
     def log_sync(self, src_shop: str, src_order_id: str, src_fulfillment_id: str, odoo_db: str, odoo_order: str) -> None:
         if self.read_only:
             return
-        with db() as conn:
-            conn.execute(
-                """
-                INSERT INTO shopify_tracking_sync_log(src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(src_shop, src_order_id, src_fulfillment_id) DO UPDATE SET
-                  odoo_db=excluded.odoo_db,
-                  odoo_order=excluded.odoo_order,
-                  synced_at=excluded.synced_at
-                """,
-                (src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, int(time.time())),
-            )
+        def operation() -> None:
+            with db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO shopify_tracking_sync_log(src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, synced_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(src_shop, src_order_id, src_fulfillment_id) DO UPDATE SET
+                      odoo_db=excluded.odoo_db,
+                      odoo_order=excluded.odoo_order,
+                      synced_at=excluded.synced_at
+                    """,
+                    (src_shop, src_order_id, src_fulfillment_id, odoo_db, odoo_order, int(time.time())),
+                )
+
+        self._with_db_retry(operation)
 
 
 def shopify_route_script_config(route: str) -> tuple[Any, str, str]:
@@ -19288,13 +19316,14 @@ def set_shopify_tracking_job_progress(job_id: str, progress: dict[str, Any]) -> 
     }
     with db() as conn:
         conn.execute(
-            "UPDATE shopify_tracking_jobs SET progress_json=?, updated_at=? WHERE id=?",
+            "UPDATE shopify_tracking_jobs SET progress_json=?, updated_at=? WHERE id=? AND status IN ('queued', 'running', 'cancel_requested')",
             (json.dumps(safe_progress), safe_progress["updated_at"], job_id),
         )
 
 
 SHOPIFY_TRACKING_ACTIVE_JOBS: set[str] = set()
 SHOPIFY_TRACKING_ACTIVE_LOCK = threading.Lock()
+SHOPIFY_TRACKING_HEARTBEAT_SECONDS = 30
 
 
 def shopify_tracking_job_cancel_requested(job_id: str) -> bool:
@@ -19330,6 +19359,24 @@ def mark_shopify_tracking_job_cancelled(job_id: str, message: str = "Tracking sy
             "UPDATE shopify_tracking_jobs SET status='cancelled', progress_json=?, last_error=?, completed_at=?, updated_at=? WHERE id=?",
             (json.dumps(progress), message, now, now, job_id),
         )
+
+
+def start_shopify_tracking_job_heartbeat(job_id: str, stop_event: threading.Event) -> threading.Thread:
+    def heartbeat() -> None:
+        while not stop_event.wait(SHOPIFY_TRACKING_HEARTBEAT_SECONDS):
+            try:
+                now = utc_now()
+                with db() as conn:
+                    row = conn.execute("SELECT status FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+                    if not row or row["status"] not in {"queued", "running", "cancel_requested"}:
+                        return
+                    conn.execute("UPDATE shopify_tracking_jobs SET updated_at=? WHERE id=?", (now, job_id))
+            except Exception:
+                continue
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    return thread
 
 
 def request_shopify_tracking_job_cancel(job_id: str, message: str = "Tracking sync cancelled by user.") -> None:
@@ -19409,6 +19456,8 @@ def request_shopify_tracking_job_cancel_fast(job_id: str, message: str = "Tracki
 
 def run_shopify_tracking_job(job_id: str) -> None:
     cancel_before_start = False
+    heartbeat_stop = threading.Event()
+    heartbeat_thread: Optional[threading.Thread] = None
     settings = get_service_settings()
     report_dir = BASE_DIR / "reports"
     report_dir.mkdir(exist_ok=True)
@@ -19453,6 +19502,7 @@ def run_shopify_tracking_job(job_id: str) -> None:
     if cancel_before_start:
         mark_shopify_tracking_job_cancelled(job_id)
         return
+    heartbeat_thread = start_shopify_tracking_job_heartbeat(job_id, heartbeat_stop)
     argv = [
         str(settings["shopify_tracking_script_path"]),
         "--from-date",
@@ -19470,6 +19520,40 @@ def run_shopify_tracking_job(job_id: str) -> None:
         argv.append("--skip-done-pickings")
     if not int(job["validate_deliveries"] or 1):
         argv.append("--no-validate-deliveries")
+    def fail_tracking_job(exc: BaseException) -> None:
+        error_text = str(exc)[:2000] or exc.__class__.__name__
+        now = utc_now()
+        progress = {
+            "status": "failed",
+            "total": 0,
+            "processed": 0,
+            "current_order": "",
+            "source": "",
+            "message": f"Shopify tracking sync failed: {error_text}",
+            "error": error_text,
+            "updated_at": now,
+            "counters": {},
+        }
+        with db() as conn:
+            existing = conn.execute("SELECT progress_json FROM shopify_tracking_jobs WHERE id=?", (job_id,)).fetchone()
+            if existing:
+                try:
+                    existing_progress = json.loads(existing["progress_json"] or "{}")
+                    if isinstance(existing_progress, dict):
+                        progress.update(existing_progress)
+                except Exception:
+                    pass
+            progress["status"] = "failed"
+            progress["current_order"] = ""
+            progress["message"] = f"Shopify tracking sync failed: {error_text}"
+            progress["error"] = error_text
+            progress["updated_at"] = now
+            conn.execute(
+                "UPDATE shopify_tracking_jobs SET status='failed', progress_json=?, last_error=?, completed_at=?, updated_at=? WHERE id=?",
+                (json.dumps(progress), error_text, now, now, job_id),
+            )
+        send_email_alert_async("Shopify tracking sync failed", f"Job: {job_id}\nError: {error_text}")
+
     try:
         module = load_external_script(settings["shopify_tracking_script_path"], f"shopify_tracking_{uuid.uuid4().hex}")
         apply_shopify_runtime_settings(module, "tracking", settings)
@@ -19524,25 +19608,16 @@ def run_shopify_tracking_job(job_id: str) -> None:
             if not int(job["dry_run"] or 0):
                 set_setting("shopify_tracking_last_success_at", progress["updated_at"])
     except SystemExit as exc:
-        error_text = f"Tracking script exited {exc.code}"
-        with db() as conn:
-            conn.execute(
-                "UPDATE shopify_tracking_jobs SET status='failed', progress_json=?, last_error=?, updated_at=? WHERE id=?",
-                (json.dumps({"status": "failed", "message": error_text, "error": error_text, "updated_at": utc_now()}), error_text, utc_now(), job_id),
-            )
-        send_email_alert_async("Shopify tracking sync failed", f"Job: {job_id}\nError: {error_text}")
+        fail_tracking_job(RuntimeError(f"Tracking script exited {exc.code}"))
     except BaseException as exc:
-        if exc.__class__.__name__ != "TrackingSyncCancelled":
-            raise
-        mark_shopify_tracking_job_cancelled(job_id, str(exc)[:2000] or "Tracking sync cancelled by user.")
-    except Exception as exc:
-        error_text = str(exc)[:2000]
-        with db() as conn:
-            conn.execute(
-                "UPDATE shopify_tracking_jobs SET status='failed', progress_json=?, last_error=?, updated_at=? WHERE id=?",
-                (json.dumps({"status": "failed", "message": f"Shopify tracking sync failed: {error_text}", "error": error_text, "updated_at": utc_now()}), error_text, utc_now(), job_id),
-            )
-        send_email_alert_async("Shopify tracking sync failed", f"Job: {job_id}\nError: {error_text}")
+        if exc.__class__.__name__ == "TrackingSyncCancelled":
+            mark_shopify_tracking_job_cancelled(job_id, str(exc)[:2000] or "Tracking sync cancelled by user.")
+        else:
+            fail_tracking_job(exc)
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_thread:
+            heartbeat_thread.join(timeout=1)
 
 
 def start_shopify_tracking_job(job_id: str) -> None:

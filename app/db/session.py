@@ -150,7 +150,24 @@ class PostgresConnection:
                                 connect_timeout=connect_timeout,
                                 options=f"-c statement_timeout={statement_timeout_ms} -c idle_in_transaction_session_timeout={statement_timeout_ms}",
                             )
-                return cls(_pool.getconn(), pooled=True)
+                raw = _pool.getconn()
+                if getattr(raw, "closed", 0) != 0:
+                    try:
+                        _pool.putconn(raw, close=True)
+                    except Exception:
+                        _reset_pool()
+                    raise psycopg2.InterfaceError("PostgreSQL pool returned a closed connection.")
+                try:
+                    with raw.cursor() as cursor:
+                        cursor.execute("SELECT 1")
+                    raw.rollback()
+                except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                    try:
+                        _pool.putconn(raw, close=True)
+                    except Exception:
+                        _reset_pool()
+                    raise
+                return cls(raw, pooled=True)
             except (pool.PoolError, psycopg2.OperationalError, psycopg2.InterfaceError) as error:
                 last_error = error
                 if isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError)):

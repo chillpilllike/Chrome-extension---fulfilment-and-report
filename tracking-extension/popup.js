@@ -14,6 +14,7 @@ const startButton = document.querySelector("#start");
 const stopButton = document.querySelector("#stop");
 const trackSingleOrderButton = document.querySelector("#trackSingleOrder");
 const trackQueuedOrdersButton = document.querySelector("#trackQueuedOrders");
+const recheckPaymentFailuresButton = document.querySelector("#recheckPaymentFailures");
 const trackAllButton = document.querySelector("#trackAll");
 const resumeTrackAllButton = document.querySelector("#resumeTrackAll");
 const stopTrackAllButton = document.querySelector("#stopTrackAll");
@@ -140,12 +141,12 @@ function autoWaitingText(tracking = {}) {
 }
 
 function visibleProgressText(tracking = {}) {
-  if (tracking.source === "single" || tracking.source === "manual") {
+  if (tracking.source === "single" || tracking.source === "manual" || tracking.source === "payment_recheck") {
     const current = tracking.orders?.[Number(tracking.index || 0)]?.amazon_order_id || tracking.currentOrderId || tracking.singleOrderId || "";
     const completed = tracking.completedOrderIds?.length || 0;
     const failed = tracking.failedOrderIds?.length || 0;
     const total = tracking.orders?.length || 0;
-    const label = total > 1 || tracking.source === "manual" ? "Tracking queued orders" : "Tracking one order";
+    const label = tracking.source === "payment_recheck" ? "Rechecking payment orders" : total > 1 || tracking.source === "manual" ? "Tracking queued orders" : "Tracking one order";
     return `${label}${current ? ` · current ${current}` : ""} · checked ${completed}/${total || completed + failed} · failed ${failed}`;
   }
   if (tracking.source === "history") {
@@ -191,11 +192,13 @@ function finalTrackingText(tracking = {}) {
     const completed = tracking.completedOrderIds?.length || 0;
     const failed = tracking.failedOrderIds?.length || 0;
     const skipped = Number(tracking.skippedRecentCount || 0);
-    const mode = tracking.source === "history" ? " Track all" : tracking.source === "single" ? " Single order" : tracking.source === "manual" ? " Queued orders" : "";
+    const mode = tracking.source === "history" ? " Track all" : tracking.source === "single" ? " Single order" : tracking.source === "payment_recheck" ? " Payment recheck" : tracking.source === "manual" ? " Queued orders" : "";
     const reason = tracking.source === "history"
       ? "Stopped because Track all finished the selected pages and queue."
       : tracking.source === "single"
         ? `Stopped because Amazon order ${tracking.singleOrderId || ""} finished.`
+      : tracking.source === "payment_recheck"
+        ? "Stopped because all open payment revision orders were rechecked."
       : tracking.source === "manual"
         ? "Stopped because all queued Amazon orders finished."
       : "Stopped because no more eligible open Amazon orders were left.";
@@ -324,6 +327,15 @@ trackQueuedOrdersButton.addEventListener("click", async () => {
   const result = await send({ type: "START_MANUAL_ORDER_QUEUE_TRACKING", amazonOrderIds: orderIds });
   if (result.ok !== false) setRunButtons(true);
   setResultStatus(result, `Started tracking ${orderIds.length} queued order(s).`, "Could not start queued-order tracking.");
+});
+
+recheckPaymentFailuresButton.addEventListener("click", async () => {
+  await send(settingsPayload());
+  settingsDirty = false;
+  setStatus("Loading open payment revision orders from the app...", "info");
+  const result = await send({ type: "START_PAYMENT_FAILURE_RECHECK" });
+  if (result.ok !== false && result.count) setRunButtons(true);
+  setResultStatus(result, `Started rechecking ${result.count || 0} payment revision order(s).`, "Could not start payment recheck.");
 });
 
 document.querySelector("#trackAll").addEventListener("click", async () => {

@@ -170,8 +170,8 @@ function trackingProgress(tracking = {}) {
     started_at: tracking.startedAt || null,
     last_activity_at: tracking.lastActivityAt || tracking.updatedAt || null,
     message: tracking.running
-      ? tracking.source === "manual" ? "Queued-order tracking is running." : "Tracking is running."
-      : tracking.source === "manual" ? "Queued-order tracking is stopped." : "Tracking is stopped.",
+      ? tracking.source === "payment_recheck" ? "Payment revision recheck is running." : tracking.source === "manual" ? "Queued-order tracking is running." : "Tracking is running."
+      : tracking.source === "payment_recheck" ? "Payment revision recheck is stopped." : tracking.source === "manual" ? "Queued-order tracking is stopped." : "Tracking is stopped.",
   };
 }
 
@@ -770,7 +770,9 @@ async function openCurrentOrder(windowId) {
     if (tracking.source === "auto" && state.autoTrackingEnabled === true) {
       tracking.lastMessage = autoWaitMessage("Amazon tracking complete.", state.autoTrackingHours, checked, failed, skipped ? `skipped recent ${skipped}` : "");
     } else {
-      const doneReason = tracking.source === "manual"
+      const doneReason = tracking.source === "payment_recheck"
+        ? "all open payment revision orders were rechecked"
+        : tracking.source === "manual"
         ? "all queued Amazon orders finished"
         : "no more eligible open Amazon orders were left";
       tracking.lastMessage = `Stopped because ${doneReason}. All tracking codes scanned. Checked ${checked} order(s), failed ${failed}${skipped ? `, skipped recent ${skipped}` : ""}.`;
@@ -895,6 +897,45 @@ function normalizeManualOrderIds(values = []) {
   return ids;
 }
 
+async function fetchOpenPaymentFailureOrders() {
+  const perPage = 100;
+  const orders = [];
+  const seen = new Set();
+  let total = 0;
+  for (let page = 1; page <= 100; page += 1) {
+    const params = new URLSearchParams({ status: "open", page: String(page), per_page: String(perPage) });
+    const payload = await api(`/api/tracking/payment-failures?${params.toString()}`, { timeoutMs: 30000, retries: 1 });
+    total = Number(payload.total || total || 0);
+    for (const row of payload.rows || []) {
+      const orderId = normalizeAmazonOrderId(row.amazon_order_id || "");
+      if (!orderId || seen.has(orderId)) continue;
+      seen.add(orderId);
+      orders.push({
+        amazon_order_id: orderId,
+        amazon_order_url: row.amazon_order_url || orderUrl({ amazon_order_id: orderId }),
+      });
+    }
+    if (!payload.rows?.length || page * perPage >= total) break;
+  }
+  return { orders, total: Math.max(total, orders.length) };
+}
+
+async function startPaymentFailureRecheck(windowId) {
+  const { orders, total } = await fetchOpenPaymentFailureOrders();
+  if (!orders.length) {
+    await log("Payment revision recheck found no open payment-failed Amazon orders.", windowId);
+    return { ok: true, count: 0, total, message: "No open payment revision orders found in the app." };
+  }
+  const result = await startManualOrderQueueTracking(windowId, orders.map((order) => order.amazon_order_id), "payment_recheck");
+  await log(`Payment revision recheck started for ${orders.length} open Amazon order(s).`, windowId);
+  return {
+    ...result,
+    count: orders.length,
+    total,
+    message: `Started payment revision recheck for ${orders.length} open Amazon order(s).`,
+  };
+}
+
 async function startManualOrderQueueTracking(windowId, amazonOrderIds = [], source = "manual") {
   const orderIds = normalizeManualOrderIds(amazonOrderIds);
   if (!orderIds.length) {
@@ -906,7 +947,7 @@ async function startManualOrderQueueTracking(windowId, amazonOrderIds = [], sour
   }));
   const tracking = {
     running: true,
-    source: source === "single" && orders.length === 1 ? "single" : "manual",
+    source: source === "single" && orders.length === 1 ? "single" : source === "payment_recheck" ? "payment_recheck" : "manual",
     singleOrderId: orders.length === 1 ? orderIds[0] : "",
     batchOrderIds: orderIds,
     orders,
@@ -920,15 +961,17 @@ async function startManualOrderQueueTracking(windowId, amazonOrderIds = [], sour
     trackingTabId: 0,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
-    lastMessage: orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`,
+    lastMessage: source === "payment_recheck"
+      ? `Payment revision recheck started for ${orders.length} Amazon orders.`
+      : orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`,
   };
   await saveTracking(tracking, windowId);
   await ensureWatchdog();
-  await log(orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`, windowId);
+  await log(source === "payment_recheck" ? `Payment revision recheck started for ${orders.length} Amazon orders.` : orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`, windowId);
   await openCurrentOrder(windowId);
   return {
     ok: true,
-    message: orders.length === 1 ? `Started tracking Amazon order ${orderIds[0]}.` : `Started tracking ${orders.length} queued Amazon orders.`,
+    message: source === "payment_recheck" ? `Started payment revision recheck for ${orders.length} Amazon orders.` : orders.length === 1 ? `Started tracking Amazon order ${orderIds[0]}.` : `Started tracking ${orders.length} queued Amazon orders.`,
     progress: trackingProgress(tracking),
   };
 }
@@ -2149,6 +2192,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "START_TRACKING") return startTracking(windowId);
     if (message.type === "START_SINGLE_ORDER_TRACKING") return startSingleOrderTracking(windowId, message.amazonOrderId);
     if (message.type === "START_MANUAL_ORDER_QUEUE_TRACKING") return startManualOrderQueueTracking(windowId, message.amazonOrderIds || [], "manual");
+    if (message.type === "START_PAYMENT_FAILURE_RECHECK") return startPaymentFailureRecheck(windowId);
     if (message.type === "START_TRACK_ALL") return startTrackAll(windowId, message.startPage, message.maxPages);
     if (message.type === "RESUME_TRACK_ALL") return resumeTrackAll(windowId);
     if (message.type === "STOP_TRACKING") return stopTracking(windowId);

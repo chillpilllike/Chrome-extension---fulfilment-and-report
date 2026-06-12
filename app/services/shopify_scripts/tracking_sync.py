@@ -78,6 +78,10 @@ class TrackingSyncCancelled(BaseException):
     pass
 
 
+class OdooDestinationUnavailable(Exception):
+    pass
+
+
 def check_cancelled():
     callback = CANCEL_CALLBACK
     if callback and callback():
@@ -109,14 +113,14 @@ ODOO_DESTS = [
     },
     {
         "name": "Boostgo",
-        "url": "https://boostgo.com.au",
+        "url": "https://boostgoau.com",
         "db": "boostgo",
         "username": "admin",
         "password": os.getenv("ODOO_SCRIPT_PASSWORD", ""),
     },
     {
         "name": "Espot",
-        "url": "https://espot.com.au",
+        "url": "https://espotau.com",
         "db": "espot",
         "username": "admin",
         "password": os.getenv("ODOO_SCRIPT_PASSWORD", ""),
@@ -1028,14 +1032,33 @@ def main():
 
     # Connect Odoo destinations
     odoo_by_db = {}
+    odoo_connect_errors = {}
     odoo_cfg_by_db = {o["db"]: o for o in ODOO_DESTS}
     for o in ODOO_DESTS:
+        check_cancelled()
+        db_name = o["db"]
+        emit_progress(
+            status="running",
+            source="",
+            total=0,
+            processed=0,
+            current_order="",
+            message=f"Connecting Odoo destination {db_name}.",
+            counters={},
+        )
         oc = OdooClient(o["url"], o["db"], o["username"], o["password"])
-        oc.connect()
-        odoo_by_db[o["db"]] = {"name": o.get("name", o["db"]), "url": o["url"], "client": oc}
+        try:
+            oc.connect()
+            odoo_by_db[db_name] = {"name": o.get("name", db_name), "url": o["url"], "client": oc}
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            odoo_connect_errors[db_name] = message
+            print(f"[WARN] Odoo destination unavailable: {db_name} ({o.get('name', db_name)}) -> {message}")
     worker_local = threading.local()
 
     def dest_meta_for_db(odoo_db: str) -> dict:
+        if odoo_db in odoo_connect_errors:
+            raise OdooDestinationUnavailable(odoo_connect_errors[odoo_db])
         if workers <= 1:
             return odoo_by_db[odoo_db]
         clients = getattr(worker_local, "odoo_by_db", None)
@@ -1045,7 +1068,12 @@ def main():
         if odoo_db not in clients:
             cfg = odoo_cfg_by_db[odoo_db]
             oc = OdooClient(cfg["url"], cfg["db"], cfg["username"], cfg["password"])
-            oc.connect()
+            try:
+                oc.connect()
+            except Exception as exc:
+                message = str(exc) or exc.__class__.__name__
+                odoo_connect_errors[odoo_db] = message
+                raise OdooDestinationUnavailable(message) from exc
             clients[odoo_db] = {"name": cfg.get("name", cfg["db"]), "url": cfg["url"], "client": oc}
         return clients[odoo_db]
 
@@ -1054,7 +1082,9 @@ def main():
     print("======================================================")
     print(f"Fulfillment createdAt filter: {start_dt.isoformat()}  ->  {end_dt.isoformat()}")
     print(f"Order updated_at fetch range: {from_ymd}  ->  {to_ymd}")
-    print(f"Odoo DBs: {len(ODOO_DESTS)} | Shopify SOURCE stores: {len(SHOPIFY_SOURCES)}")
+    print(f"Odoo DBs: {len(odoo_by_db)}/{len(ODOO_DESTS)} connected | Shopify SOURCE stores: {len(SHOPIFY_SOURCES)}")
+    if odoo_connect_errors:
+        print("Unavailable Odoo DBs: " + ", ".join(f"{db}: {err}" for db, err in sorted(odoo_connect_errors.items())))
     print(f"Dry-run (report-only): {dry_run}")
     print(f"Parallel workers: {workers}")
     print(f"Smart update DONE pickings: {'NO' if skip_done_pickings else 'YES'}")
@@ -1078,6 +1108,7 @@ def main():
         "skipped_missing_tags": 0,
         "skipped_exception_tags": 0,
         "skipped_odoo_db_missing": 0,
+        "skipped_odoo_connect_failed": 0,
         "skipped_odoo_order_not_found": 0,
         "skipped_odoo_order_ineligible": 0,
         "skipped_no_pickings": 0,
@@ -1187,6 +1218,24 @@ def main():
             odoo_db = v["odoo_db"]
             odoo_order = v["odoo_order"]
             if odoo_db not in odoo_by_db:
+                unavailable_error = odoo_connect_errors.get(odoo_db)
+                if unavailable_error:
+                    add_counter("skipped_odoo_connect_failed")
+                    append_csv_row(
+                        report_csv,
+                        {
+                            **base_row,
+                            "odoo_dest_name": odoo_cfg_by_db.get(odoo_db, {}).get("name", odoo_db),
+                            "odoo_url": odoo_cfg_by_db.get(odoo_db, {}).get("url", ""),
+                            "odoo_db": odoo_db,
+                            "odoo_order": odoo_order,
+                            "action": "SKIP",
+                            "result": "ODOO_CONNECT_FAILED",
+                            "message": f"Odoo destination could not be connected: {unavailable_error}",
+                        },
+                    )
+                    finish_current_order(src["shop"], current_order, f"Skipped Shopify order {current_order}: Odoo DB connection failed.")
+                    return
                 add_counter("skipped_odoo_db_missing")
                 append_csv_row(
                     report_csv,
