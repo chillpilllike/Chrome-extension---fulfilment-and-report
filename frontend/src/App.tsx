@@ -12615,9 +12615,15 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
     const counters = job.progress?.counters || job.counters || {}
     const added = Math.max(0, Number(counters.tracking_codes_added || 0))
     const wouldAdd = Math.max(0, Number(counters.tracking_codes_would_add || 0))
+    const alreadySynced = Math.max(0, Number(counters.skipped_already || 0))
+    const alreadyPresent = Math.max(0, Number(counters.skipped_no_update_needed || 0))
+    const fulfilled = Math.max(0, Number(counters.processed_fulfillments || 0))
+    const outOfRange = Math.max(0, Number(counters.skipped_out_of_range || 0))
+    const noTracking = Math.max(0, Number(counters.skipped_no_tracking || 0))
+    const trackingSeen = Math.max(0, fulfilled - outOfRange - noTracking)
     const percent = total ? Math.max(0, Math.min(100, Math.round((processed / total) * 100))) : job.status === "completed" ? 100 : 0
     const running = job.status === "running" || job.status === "queued" || job.status === "cancel_requested"
-    return { processed, total, percent, running, added, wouldAdd }
+    return { processed, total, percent, running, added, wouldAdd, alreadySynced, alreadyPresent, trackingSeen }
   }
   function reportName(path?: string) {
     if (!path) return ""
@@ -12755,6 +12761,11 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
                       <div className="mb-1 text-xs font-medium text-emerald-700">
                         New tracking codes added: {progress.added.toLocaleString()}
                         {job.dry_run ? <span className="text-muted-foreground"> · Would add: {progress.wouldAdd.toLocaleString()}</span> : null}
+                      </div>
+                      <div className="mb-1 text-xs text-muted-foreground">
+                        In-range tracking fulfillments: {progress.trackingSeen.toLocaleString()}
+                        {progress.alreadySynced ? <span> · Already synced: {progress.alreadySynced.toLocaleString()}</span> : null}
+                        {progress.alreadyPresent ? <span> · Already present in Odoo: {progress.alreadyPresent.toLocaleString()}</span> : null}
                       </div>
                       <div className="progress">
                         <div

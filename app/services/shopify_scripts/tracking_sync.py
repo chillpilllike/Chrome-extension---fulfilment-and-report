@@ -1280,11 +1280,6 @@ def main():
                     "odoo_order": odoo_order,
                 }
 
-                already_synced = False
-                if (not dry_run) and st.already_synced(src["shop"], src_order.get("id", ""), f_id):
-                    already_synced = True
-                    add_counter("skipped_already")
-
                 if not iso_in_range(f_created, start_dt, end_dt):
                     add_counter("skipped_out_of_range")
                     append_csv_row(
@@ -1315,6 +1310,11 @@ def main():
                         },
                     )
                     continue
+
+                already_synced = False
+                if (not dry_run) and st.already_synced(src["shop"], src_order.get("id", ""), f_id):
+                    already_synced = True
+                    add_counter("skipped_already")
 
                 tracking_numbers = [(t.get("number") or "").strip() for t in tracking_list if (t.get("number") or "").strip()]
                 tracking_companies = [(t.get("company") or "").strip() for t in tracking_list]
