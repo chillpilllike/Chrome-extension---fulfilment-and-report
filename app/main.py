@@ -5713,7 +5713,9 @@ def dispatch_part_quality(row: dict[str, Any]) -> tuple[int, int, str]:
 def collapse_dispatch_related_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for part in parts:
-        key = clean_text(part.get("recipient_ref")).upper()
+        key = dispatch_physical_package_key(part)
+        if not key:
+            key = f"{clean_text(part.get('recipient_ref')).upper()}|{clean_text(part.get('amazon_order_id')).upper()}|{clean_text(part.get('order_line_ids_json'))}"
         if not key:
             key = f"{clean_text(part.get('odoo_order_name')).upper()}|{dispatch_part_sort_key(part)[:2]}"
         existing = grouped.get(key)
@@ -5945,16 +5947,24 @@ def dispatch_scan_message(package: dict[str, Any], query_text: str = "", result_
     parts_suffix = ""
     part_detail_suffix = ""
     if len(package.get("related_parts") or []) > 1:
-        total_parts = len(package["related_parts"])
-        received_parts = sum(1 for part in package["related_parts"] if part.get("received"))
+        related_parts = package["related_parts"]
+        line_counts = []
+        for part in related_parts:
+            order_line_ids = part.get("order_line_ids") if isinstance(part.get("order_line_ids"), list) else parse_json_list_value(part.get("order_line_ids_json"))
+            line_counts.append(max(1, len(order_line_ids or [])))
+        total_parts = max(len(related_parts), sum(line_counts))
+        received_parts = sum(line_count for part, line_count in zip(related_parts, line_counts) if part.get("received"))
         parts_suffix = f" Parts received: {received_parts}/{total_parts}."
         if received_parts < total_parts:
             parts_suffix += " Keep related parts together until all arrive."
         part_details = []
-        for part in package["related_parts"]:
+        for part in related_parts:
             if int(part.get("id") or 0) == int(package.get("id") or 0):
                 continue
             label = clean_text(part.get("recipient_ref")) or clean_text(part.get("odoo_order_name")) or "Related part"
+            asins = [normalize_asin(str(asin)) for asin in (part.get("asins") or []) if normalize_asin(str(asin))]
+            if asins:
+                label = f"{label} ({', '.join(asins[:3])})"
             scan_label = clean_text(part.get("scan_label")) or ("Received / scanned" if part.get("received") else "Not scanned yet")
             delivery_label = clean_text(part.get("delivery_label")) or clean_text(part.get("package_status")) or "Delivery not captured"
             part_details.append(f"{label} | {scan_label} | {delivery_label}")
@@ -10717,6 +10727,79 @@ def block_selected_orders_with_existing_amazon_orders(conn: Any, store_id: int, 
     return [int(row["id"]) for row in allowed_ids], len(blocked)
 
 
+def block_lines_with_missing_asin_siblings(
+    conn: Any,
+    store_id: int,
+    lines: list[dict[str, Any]],
+    include_missing_asins: bool = False,
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    if include_missing_asins or not lines:
+        return lines, 0, []
+    order_ids = sorted({int(line.get("odoo_order_id") or 0) for line in lines if int(line.get("odoo_order_id") or 0) > 0})
+    if not order_ids:
+        return lines, 0, []
+    placeholders = ",".join("?" for _ in order_ids)
+    missing_rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT id, odoo_order_id, odoo_order_name, asin, missing_asin, state
+        FROM order_lines
+        WHERE store_id=?
+          AND odoo_order_id IN ({placeholders})
+          AND COALESCE(amazon_order_id, '') = ''
+          AND COALESCE(missing_asin, '') != ''
+          AND state NOT IN ('ordered', 'delivered', 'dispatched', 'inventory', 'ignored')
+        ORDER BY odoo_order_name, id
+        """,
+        [store_id, *order_ids],
+    ).fetchall())
+    if not missing_rows:
+        return lines, 0, []
+    blocked_by_order: dict[int, dict[str, Any]] = {}
+    for row in missing_rows:
+        order_id = int(row["odoo_order_id"])
+        entry = blocked_by_order.setdefault(order_id, {"name": row["odoo_order_name"], "asins": []})
+        asin = normalize_asin(row.get("missing_asin") or row.get("asin") or "")
+        if asin and asin not in entry["asins"]:
+            entry["asins"].append(asin)
+    blocked_order_ids = set(blocked_by_order)
+    now = utc_now()
+    for order_id, entry in blocked_by_order.items():
+        asin_text = ", ".join(entry["asins"]) or "another ASIN"
+        message = (
+            f"{entry['name']} has unavailable ASIN {asin_text}. "
+            "Process available items in mixed-ASIN orders is off, so no other item in this Odoo order was queued."
+        )
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET state=CASE
+                  WHEN COALESCE(missing_asin, '') != '' THEN 'missing'
+                  ELSE state
+                END,
+                amazon_status=CASE
+                  WHEN COALESCE(missing_asin, '') != '' THEN 'missing'
+                  ELSE amazon_status
+                END,
+                last_error=CASE
+                  WHEN COALESCE(last_error, '') = '' THEN ?
+                  ELSE last_error
+                END,
+                updated_at=?
+            WHERE store_id=?
+              AND odoo_order_id=?
+              AND COALESCE(amazon_order_id, '') = ''
+              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'inventory', 'ignored')
+            """,
+            (message, now, store_id, order_id),
+        )
+    filtered = [line for line in lines if int(line.get("odoo_order_id") or 0) not in blocked_order_ids]
+    messages = [
+        f"{entry['name']}: unavailable ASIN {', '.join(entry['asins']) or 'detected'} blocked mixed-ASIN partial processing"
+        for entry in blocked_by_order.values()
+    ]
+    return filtered, len(blocked_by_order), messages
+
+
 def chunked(items: list[Any], size: int) -> list[list[Any]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
 
@@ -10948,6 +11031,9 @@ def queue_chrome_order_groups_fast(
             lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
             blocked = date_blocked
             if lines:
+                lines, missing_blocked, _missing_messages = block_lines_with_missing_asin_siblings(conn, store_id, [dict(line) for line in lines], include_missing_asins)
+                blocked += missing_blocked
+            if lines:
                 lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines], live_sync=False)
                 blocked += shopify_blocked
             if not lines:
@@ -11025,6 +11111,9 @@ def queue_chrome_order_groups_fast(
         if lines:
             lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
             blocked += date_blocked
+        if lines:
+            lines, missing_blocked, _missing_messages = block_lines_with_missing_asin_siblings(conn, store_id, [dict(line) for line in lines], include_missing_asins)
+            blocked += missing_blocked
         if lines:
             lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
             blocked += shopify_blocked
@@ -11539,6 +11628,9 @@ def place_orders(
         if lines:
             lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
             failed += date_blocked
+        if lines:
+            lines, missing_blocked, _missing_messages = block_lines_with_missing_asin_siblings(conn, store_id, [dict(line) for line in lines], include_missing_asins)
+            failed += missing_blocked
         if lines:
             lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
             failed += shopify_blocked
