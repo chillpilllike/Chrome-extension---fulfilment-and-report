@@ -3,6 +3,7 @@
 .venv/
 data/
 reports/
+logs/
 *.sqlite
 __pycache__/
 *.pyc

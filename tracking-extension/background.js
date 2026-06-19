@@ -1362,6 +1362,16 @@ async function postHistoryOrderTracking(tracking, windowId, status = "checked") 
   }
 }
 
+function activeHistoryRedirectUrl(tracking = {}) {
+  const order = tracking.currentOrder || null;
+  if (String(tracking.currentUrl || "").trim()) return String(tracking.currentUrl).trim();
+  if (!order?.amazon_order_id) return "";
+  const packages = Array.isArray(order.packages) ? order.packages : [];
+  const packageIndex = Math.max(0, Number(order.packageIndex || 0));
+  const packageUrl = packages[packageIndex]?.tracking_url || packages[0]?.tracking_url || "";
+  return packageUrl || order.amazon_order_url || orderUrl(order);
+}
+
 async function advanceHistoryOrder(tracking, windowId, status = "checked") {
   const order = tracking.currentOrder;
   if (order?.amazon_order_id) {
@@ -1654,6 +1664,7 @@ async function recoverHistoryFromStalePackagePage(message, windowId) {
   tracking.lastMessage = activeOrderId
     ? `Ignored stale Amazon page ${pageOrderId || "unknown"}; reopening active Track all order ${activeOrderId}.`
     : `Ignored stale Amazon page ${pageOrderId || "unknown"}; opening the next Track all order.`;
+  const redirectUrl = activeHistoryRedirectUrl(tracking);
   await saveTracking(tracking, windowId);
   await log(tracking.lastMessage, windowId);
   await openHistoryCurrentOrder(windowId);
@@ -1661,6 +1672,7 @@ async function recoverHistoryFromStalePackagePage(message, windowId) {
     ok: true,
     ignored: true,
     recovering: true,
+    redirectUrl,
     message: activeOrderId
       ? `Ignored stale Amazon page; reopened active Track all order ${activeOrderId}.`
       : "Ignored stale Amazon page; opened the next Track all order.",
@@ -1932,9 +1944,16 @@ async function handlePackageTracking(message, windowId) {
   if (!tracking.running) return postStandalonePackageTracking(message, windowId);
   if (tracking.source === "history") {
     const activeOrderId = tracking.currentOrder?.amazon_order_id || "";
+    const redirectUrl = activeHistoryRedirectUrl(tracking);
     await log(`Ignored Amazon tracking page ${message.amazonOrderId || "unknown"}; reopening active Track all order ${activeOrderId || "next"}.`, windowId);
     await openHistoryCurrentOrder(windowId);
-    return { ok: true, ignored: true, recovering: true, message: activeOrderId ? `Ignored stale Amazon page; reopened active Track all order ${activeOrderId}.` : "Ignored stale Amazon page; opened the next Track all order." };
+    return {
+      ok: true,
+      ignored: true,
+      recovering: true,
+      redirectUrl,
+      message: activeOrderId ? `Ignored stale Amazon page; reopened active Track all order ${activeOrderId}.` : "Ignored stale Amazon page; opened the next Track all order.",
+    };
   }
   const order = tracking.orders[tracking.index];
   if (!order || order.amazon_order_id !== message.amazonOrderId) {
@@ -2095,6 +2114,7 @@ async function recoverActiveTrackingPage(message = {}, windowId = null) {
     : tracking.orders?.[Number(tracking.index || 0)]?.amazon_order_id || "";
   await log(`Recovering active tracking page${activeOrderId ? ` for ${activeOrderId}` : ""}; ignored ${message.amazonOrderId || "unknown"} at ${message.pageUrl || "unknown URL"}.`, windowId);
   tracking.lastActivityAt = Date.now();
+  const redirectUrl = tracking.source === "history" ? activeHistoryRedirectUrl(tracking) : String(tracking.currentUrl || "").trim();
   await saveTracking(tracking, windowId);
   if (tracking.source === "history") {
     await openHistoryCurrentOrder(windowId);
@@ -2104,6 +2124,7 @@ async function recoverActiveTrackingPage(message = {}, windowId = null) {
   return {
     ok: true,
     recovering: true,
+    redirectUrl,
     message: activeOrderId ? `Reopened active order ${activeOrderId}.` : "Reopened active tracking run.",
   };
 }

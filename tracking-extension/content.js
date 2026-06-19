@@ -6,37 +6,67 @@ const ORDER_PAGE_RECHECK_AFTER_MS = 90000;
 
 let extensionContextAlive = true;
 
-async function send(message) {
+function backgroundTimeoutMessage(message = {}) {
+  const type = String(message.type || "message");
+  return `Nutricity Tracking background did not respond to ${type}. Reload the extension or stop/start tracking if this keeps repeating.`;
+}
+
+async function send(message, timeoutMs = 12000) {
   if (!extensionContextAlive) return null;
-  try {
-    return await chrome.runtime.sendMessage(message);
-  } catch (error) {
-    if (/Extension context invalidated/i.test(String(error?.message || error))) {
-      extensionContextAlive = false;
-      return null;
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const finish = (callback) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      finish(() => resolve({
+        ok: false,
+        timedOut: true,
+        backgroundTimeout: true,
+        message: backgroundTimeoutMessage(message),
+      }));
+    }, Math.max(3000, Number(timeoutMs || 12000)));
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        const lastError = chrome.runtime.lastError;
+        finish(() => {
+          if (lastError) {
+            if (/Extension context invalidated/i.test(String(lastError.message || lastError))) {
+              extensionContextAlive = false;
+              resolve(null);
+              return;
+            }
+            resolve({ ok: false, message: lastError.message || String(lastError) });
+            return;
+          }
+          resolve(response);
+        });
+      });
+    } catch (error) {
+      finish(() => {
+        if (/Extension context invalidated/i.test(String(error?.message || error))) {
+          extensionContextAlive = false;
+          resolve(null);
+          return;
+        }
+        reject(error);
+      });
     }
-    throw error;
-  }
+  });
 }
 
 async function sendWithTimeout(message, timeoutMs = 15000) {
-  let timer = null;
-  try {
-    return await Promise.race([
-      send(message),
-      new Promise((resolve) => {
-        timer = setTimeout(() => {
-          resolve({
-            ok: false,
-            timedOut: true,
-            message: "Syncing this Amazon tracking page with the app. This can take a moment when package matches are being repaired.",
-          });
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
+  const response = await send(message, timeoutMs);
+  if (response?.timedOut) {
+    return {
+      ...response,
+      message: "Syncing this Amazon tracking page with the app. This can take a moment when package matches are being repaired.",
+    };
   }
+  return response;
 }
 
 async function nudgeStuckTrackingPage(data, reason = "tracking page timeout") {
@@ -202,6 +232,20 @@ async function waitForPageReady() {
   await sleep(500);
 }
 
+async function waitForOrderHistoryReady() {
+  await waitForPageReady();
+  const started = Date.now();
+  while (Date.now() - started < 12000) {
+    const text = document.body?.innerText || "";
+    const orderIds = text.match(/\b\d{3}-\d{7}-\d{7}\b/g) || [];
+    const detailLinks = document.querySelectorAll("a[href*='orderID='], a[href*='orderId='], a[href*='order-details']").length;
+    if (amazonHistoryUnavailableMessage()) break;
+    if (detailLinks > 0 && orderIds.length > 0 && /Order placed|Buy it again|View order details|Track package/i.test(text)) break;
+    await sleep(300);
+  }
+  await sleep(300);
+}
+
 function isTrackingPage() {
   return /ship-track|progress-tracker\/package/i.test(location.href);
 }
@@ -326,12 +370,23 @@ function currentPageMatchesActiveTracking(state = {}) {
 async function recoverActiveTrackingPage(state = {}, reason = "stale Amazon page") {
   const activeOrderId = activeTrackingOrderId(state);
   showPanel("Nutricity tracking", activeOrderId ? `Recovering active order ${activeOrderId}.` : "Recovering active tracking run.");
-  await send({
+  const response = await send({
     type: "RECOVER_ACTIVE_TRACKING_PAGE",
     amazonOrderId: currentOrderId(),
     pageUrl: location.href,
     reason,
   });
+  if (response?.redirectUrl && response.redirectUrl !== location.href) {
+    window.location.assign(response.redirectUrl);
+  }
+}
+
+function followRecoveryRedirect(response = {}) {
+  const redirectUrl = String(response?.redirectUrl || "").trim();
+  if (!redirectUrl || redirectUrl === location.href) return false;
+  showPanel("Nutricity tracking", response.message || "Recovering active tracking page.");
+  window.location.assign(redirectUrl);
+  return true;
 }
 
 function recipientFromOrderHistoryText(text = "") {
@@ -527,7 +582,7 @@ function extractHistoryTrackOrders() {
 
 async function scanOrderHistoryForTrackAll(state = null) {
   if (!isOrderHistoryPage()) return false;
-  await waitForPageReady();
+  await waitForOrderHistoryReady();
   const tracking = state?.tracking || {};
   const unavailableMessage = amazonHistoryUnavailableMessage();
   if (unavailableMessage) {
@@ -545,7 +600,13 @@ async function scanOrderHistoryForTrackAll(state = null) {
     if (response?.message) showPanel("Nutricity tracking", response.message);
     return true;
   }
-  const orders = extractHistoryTrackOrders();
+  let orders = extractHistoryTrackOrders();
+  if (!orders.length) {
+    showPanel("Nutricity tracking", "Amazon orders are still loading. Checking this history page again.");
+    await sleep(1800);
+    await waitForOrderHistoryReady();
+    orders = extractHistoryTrackOrders();
+  }
   const nextUrl = nextHistoryPageUrl();
   const runId = tracking.startedAt || tracking.resumedAt || "";
   const signature = `${runId}|${location.href}|${orders.map((order) => order.amazon_order_id).join(",")}`;
@@ -556,7 +617,14 @@ async function scanOrderHistoryForTrackAll(state = null) {
   if (response && response.ok === false) {
     showPanel("Nutricity tracking", responseError(response, "Could not send order-history page to the tracker."));
   } else if (response?.ok) {
-    showPanel("Nutricity tracking", `Queued ${response.added || orders.length} order(s). Preparing app matches in background.`);
+    const added = Number(response.added ?? orders.length);
+    if (added > 0) {
+      showPanel("Nutricity tracking", `Queued ${added} order(s). Preparing app matches in background.`);
+    } else if (orders.length > 0) {
+      showPanel("Nutricity tracking", `Found ${orders.length} order(s), but no new orders needed queueing on this page. Moving to the next step.`);
+    } else {
+      showPanel("Nutricity tracking", "No Amazon orders were ready on this page after retry. Moving to the next step.");
+    }
   }
   return true;
 }
@@ -897,6 +965,10 @@ async function run() {
   showPanel("Nutricity tracking", `Scanning Amazon page: ${location.pathname}`);
   if (isTrackingPage()) {
     const state = await send({ type: "GET_STATE" });
+    if (state?.timedOut) {
+      showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start tracking again.");
+      return;
+    }
     if (!currentPageMatchesActiveTracking(state)) {
       await recoverActiveTrackingPage(state, "tracking page did not match the active run");
       return;
@@ -906,6 +978,7 @@ async function run() {
     if (!data.amazonOrderId) return;
     showPanel("Nutricity tracking", `Capturing tracking for ${data.amazonOrderId}: ${data.package.status}.`);
     const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data }, 45000);
+    if (followRecoveryRedirect(response)) return;
     if (response?.ignored) {
       showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
     } else if (response?.ok) {
@@ -922,6 +995,10 @@ async function run() {
   await waitForPageReady();
   if (isOrderHistoryPage()) {
     const state = await send({ type: "GET_STATE" });
+    if (state?.timedOut) {
+      showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start Track all again.");
+      return;
+    }
     if (state?.tracking?.running && state.tracking.source === "history") {
       await scanOrderHistoryForTrackAll(state);
     }
@@ -929,6 +1006,10 @@ async function run() {
   }
   if (isOrderDetailsLikePage()) {
     const state = await send({ type: "GET_STATE" });
+    if (state?.timedOut) {
+      showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start tracking again.");
+      return;
+    }
     if (state?.tracking?.running && !currentPageMatchesActiveTracking(state)) {
       await recoverActiveTrackingPage(state, "order details page did not match the active run");
       return;
@@ -962,6 +1043,7 @@ async function run() {
       }, 5000);
     }
     if (response?.ignored) {
+      if (followRecoveryRedirect(response)) return;
       showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
     } else if (response && response.ok === false) {
       showPanel("Nutricity tracking", responseError(response, "Could not send package links to the app."));
@@ -1005,6 +1087,10 @@ if (!window.__nutricityTrackAllWatcher) {
     }
     try {
       const state = await send({ type: "GET_STATE" });
+      if (state?.timedOut) {
+        showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start Track all again.");
+        return;
+      }
       if (!(state?.tracking?.running && state.tracking.source === "history")) return;
       if (!currentPageMatchesActiveTracking(state)) {
         await recoverActiveTrackingPage(state, "watcher page did not match the active Track all run");

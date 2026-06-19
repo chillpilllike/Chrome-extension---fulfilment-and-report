@@ -164,6 +164,7 @@ PUBLIC_API_PATHS = {
     "/api/dispatch-status",
     "/api/dispatch-status/summary",
     "/api/dispatch-sorting/summary",
+    "/api/dispatch-sorting/lookup",
     "/api/dispatch-sorting/rebuild",
     "/api/dispatch-sorting/settings",
     "/api/amazon-otp",
@@ -5435,6 +5436,107 @@ def dispatch_find_fragment_matches(conn: Any, fragment: str, store_id: Optional[
         ).fetchall()
     )
     return dedupe_dispatch_package_rows(rows)[:limit]
+
+
+def dispatch_lookup_rows(conn: Any, query: str, store_id: Optional[int] = None, limit: int = 30) -> list[dict[str, Any]]:
+    normalized = normalize_dispatch_scan_code(query)
+    raw = clean_text(query).upper()
+    search_values = [value for value in dict.fromkeys([normalized, raw]) if len(value) >= 2]
+    if not search_values:
+        return []
+    where_parts: list[str] = []
+    params: list[Any] = []
+    for value in search_values:
+        contains = f"%{value}%"
+        prefix = f"{value}%"
+        where_parts.append(
+            """
+            (
+                UPPER(COALESCE(scan_code, '')) = ?
+                OR UPPER(COALESCE(canonical_scan_code, '')) = ?
+                OR UPPER(COALESCE(display_code, '')) = ?
+                OR UPPER(COALESCE(last_scanned_code, '')) = ?
+                OR UPPER(COALESCE(amazon_order_id, '')) = ?
+                OR UPPER(COALESCE(odoo_order_name, '')) = ?
+                OR UPPER(COALESCE(recipient_ref, '')) = ?
+                OR UPPER(COALESCE(scanned_codes_json, '')) LIKE ?
+                OR UPPER(COALESCE(scan_code, '')) LIKE ?
+                OR UPPER(COALESCE(canonical_scan_code, '')) LIKE ?
+                OR UPPER(COALESCE(display_code, '')) LIKE ?
+                OR UPPER(COALESCE(amazon_order_id, '')) LIKE ?
+                OR UPPER(COALESCE(odoo_order_name, '')) LIKE ?
+                OR UPPER(COALESCE(recipient_ref, '')) LIKE ?
+            )
+            """
+        )
+        params.extend([value, value, value, value, value, value, value, contains, prefix, prefix, prefix, prefix, prefix, contains])
+    exact = normalized or raw
+    rows = rows_to_dicts(conn.execute(
+        f"""
+        SELECT *
+        FROM amazon_dispatch_packages
+        WHERE ({' OR '.join(where_parts)})
+          AND (? IS NULL OR store_id=?)
+        ORDER BY
+          CASE
+            WHEN UPPER(COALESCE(scan_code, ''))=? THEN 0
+            WHEN UPPER(COALESCE(canonical_scan_code, ''))=? THEN 1
+            WHEN UPPER(COALESCE(display_code, ''))=? THEN 2
+            WHEN UPPER(COALESCE(amazon_order_id, ''))=? THEN 3
+            WHEN UPPER(COALESCE(odoo_order_name, ''))=? THEN 4
+            WHEN UPPER(COALESCE(recipient_ref, ''))=? THEN 5
+            ELSE 6
+          END,
+          package_index,
+          updated_at DESC,
+          id DESC
+        LIMIT ?
+        """,
+        [*params, store_id, store_id, exact, exact, exact, exact, exact, exact, max(1, min(100, int(limit or 30)))],
+    ).fetchall())
+    return dedupe_dispatch_package_rows(rows)[:limit]
+
+
+def dispatch_lookup_summary(matches: list[dict[str, Any]]) -> dict[str, Any]:
+    package_ids: set[int] = set()
+    amazon_orders: set[str] = set()
+    odoo_orders: set[str] = set()
+    total_parts = 0
+    received_parts = 0
+    delivered_parts = 0
+    pending_parts = 0
+    for package in matches:
+        for part in package.get("related_parts") or [package]:
+            part_id = int(part.get("id") or 0)
+            if part_id and part_id in package_ids:
+                continue
+            if part_id:
+                package_ids.add(part_id)
+            total_parts += 1
+            part_received = clean_text(part.get("scan_status")) not in {"", "pending"} or bool(part.get("received"))
+            if part_received:
+                received_parts += 1
+            delivery = f"{clean_text(part.get('delivery_label'))} {clean_text(part.get('package_status'))} {clean_text(part.get('promise'))}".lower()
+            if "delivered" in delivery:
+                delivered_parts += 1
+            elif not part_received:
+                pending_parts += 1
+            if clean_text(part.get("amazon_order_id")):
+                amazon_orders.add(clean_text(part.get("amazon_order_id")))
+            if clean_text(part.get("odoo_order_name")):
+                odoo_orders.add(clean_text(part.get("odoo_order_name")))
+    return {
+        "package_count": len(package_ids) or len(matches),
+        "match_count": len(matches),
+        "amazon_order_count": len(amazon_orders),
+        "odoo_order_count": len(odoo_orders),
+        "parts_total": total_parts,
+        "parts_received": received_parts,
+        "parts_delivered": delivered_parts,
+        "parts_pending": max(0, total_parts - received_parts),
+        "amazon_orders": sorted(amazon_orders),
+        "odoo_orders": sorted(odoo_orders),
+    }
 
 
 def record_dispatch_scan_event(
@@ -21200,24 +21302,32 @@ def order_line_ids_for_state(store_id: Optional[int], state: str, page: int, per
 def startup() -> None:
     global _sync_thread_started, _SHOPIFY_STATUS_CACHE_ENSURED
     if not _sync_thread_started:
-        with db() as conn:
-            conn.execute("SELECT 1")
-        ensure_shopify_order_status_cache_table()
-        _SHOPIFY_STATUS_CACHE_ENSURED = True
-        should_reindex_typesense = typesense_enabled() and get_setting("typesense_schema_version", "") != TYPESENSE_SCHEMA_VERSION
-        threading.Thread(target=init_db, daemon=True).start()
-        resume_interrupted_shopify_tracking_jobs()
-        threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
-        threading.Thread(target=autosync_loop, daemon=True).start()
-        threading.Thread(target=backup_loop, daemon=True).start()
-        threading.Thread(target=amazon_otp_loop, daemon=True).start()
-        if should_reindex_typesense:
-            threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
-        threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
-        threading.Thread(target=enqueue_app_pages_warm, daemon=True).start()
-        threading.Thread(target=lambda: api_tracking_fulfilment_pending(page=1, per_page=30), daemon=True).start()
-        threading.Thread(target=lambda: api_tracking_payment_failures(page=1, per_page=20), daemon=True).start()
         _sync_thread_started = True
+
+        def bootstrap_after_bind() -> None:
+            global _SHOPIFY_STATUS_CACHE_ENSURED
+            try:
+                with db() as conn:
+                    conn.execute("SELECT 1")
+                ensure_shopify_order_status_cache_table()
+                _SHOPIFY_STATUS_CACHE_ENSURED = True
+                should_reindex_typesense = typesense_enabled() and get_setting("typesense_schema_version", "") != TYPESENSE_SCHEMA_VERSION
+                threading.Thread(target=init_db, daemon=True).start()
+                resume_interrupted_shopify_tracking_jobs()
+                threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
+                threading.Thread(target=autosync_loop, daemon=True).start()
+                threading.Thread(target=backup_loop, daemon=True).start()
+                threading.Thread(target=amazon_otp_loop, daemon=True).start()
+                if should_reindex_typesense:
+                    threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
+                threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
+                threading.Thread(target=enqueue_app_pages_warm, daemon=True).start()
+                threading.Thread(target=lambda: api_tracking_fulfilment_pending(page=1, per_page=30), daemon=True).start()
+                threading.Thread(target=lambda: api_tracking_payment_failures(page=1, per_page=20), daemon=True).start()
+            except Exception as exc:
+                print(f"Startup background bootstrap failed: {exc}", flush=True)
+
+        threading.Thread(target=bootstrap_after_bind, daemon=True).start()
 
 
 @app.get("/api/dashboard")
@@ -27125,6 +27235,38 @@ def api_dispatch_sorting_scan_event_resolve(event_id: int, payload: dict[str, An
         "dispatch-status-summary",
     })
     return {"ok": True, "message": "Scan exception marked resolved.", "event": row_to_dict(updated)}
+
+
+@app.get("/api/dispatch-sorting/lookup")
+def api_dispatch_sorting_lookup(q: str = "", store_id: Optional[int] = None) -> dict[str, Any]:
+    query = clean_text(q)
+    if not query:
+        raise HTTPException(400, "q is required")
+    with db() as conn:
+        rows = dispatch_lookup_rows(conn, query, store_id, limit=30)
+        packages: list[dict[str, Any]] = []
+        for row in rows:
+            package = dispatch_enrich_package_for_scan(conn, row)
+            package["lookup_message"] = dispatch_scan_message(package, query_text=query)
+            packages.append(package)
+    summary = dispatch_lookup_summary(packages)
+    if not packages:
+        return {
+            "ok": True,
+            "matched": False,
+            "query": query,
+            "matches": [],
+            "summary": summary,
+            "message": f"No dispatch package or order was found for '{query}'. Nothing was marked scanned.",
+        }
+    return {
+        "ok": True,
+        "matched": True,
+        "query": query,
+        "matches": packages,
+        "summary": summary,
+        "message": f"Found {len(packages)} package match{'es' if len(packages) != 1 else ''} for '{query}'. Nothing was marked scanned.",
+    }
 
 
 @app.get("/api/dispatch-sorting/packages/{package_id}")

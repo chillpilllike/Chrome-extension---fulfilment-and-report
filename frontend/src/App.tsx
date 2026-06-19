@@ -435,6 +435,26 @@ type DispatchSortingSummary = {
   }>
 }
 
+type DispatchLookupResult = {
+  ok: boolean
+  matched: boolean
+  query: string
+  message: string
+  matches: DispatchPackage[]
+  summary: {
+    package_count: number
+    match_count: number
+    amazon_order_count: number
+    odoo_order_count: number
+    parts_total: number
+    parts_received: number
+    parts_delivered: number
+    parts_pending: number
+    amazon_orders: string[]
+    odoo_orders: string[]
+  }
+}
+
 type DispatchRebuildProgress = {
   status: string
   total: number
@@ -5791,9 +5811,12 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   const [scanCode, setScanCode] = useState("")
   const [matchedPackage, setMatchedPackage] = useState<DispatchPackage | null>(null)
   const [scanMatches, setScanMatches] = useState<DispatchPackage[]>([])
+  const [lookupQuery, setLookupQuery] = useState("")
+  const [lookupResult, setLookupResult] = useState<DispatchLookupResult | null>(null)
   const [suggestedTote, setSuggestedTote] = useState("")
   const [summary, setSummary] = useState<DispatchSortingSummary>({ summary: {}, totes: [], recent: [], scan_events: [] })
   const [busy, setBusy] = useState(false)
+  const [lookupBusy, setLookupBusy] = useState(false)
   const [rebuildProgress, setRebuildProgress] = useState<DispatchRebuildProgress | null>(null)
   const [lastMessage, setLastMessage] = useState("")
   const [searchConfirmation, setSearchConfirmation] = useState("")
@@ -5955,6 +5978,24 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   async function scanPackage(event?: ReactFormEvent) {
     event?.preventDefault()
     await submitScan(scanCode)
+  }
+
+  async function lookupDispatchInfo(event?: ReactFormEvent) {
+    event?.preventDefault()
+    const query = lookupQuery.trim()
+    if (!query) return
+    setLookupBusy(true)
+    try {
+      const params = new URLSearchParams({ q: query })
+      if (storeId) params.set("store_id", storeId)
+      const result = await api<DispatchLookupResult>(`/api/dispatch-sorting/lookup?${params.toString()}`)
+      setLookupResult(result)
+    } catch (error) {
+      setLookupResult(null)
+      onResult({ ok: false, title: "Lookup Failed", message: String(error) })
+    } finally {
+      setLookupBusy(false)
+    }
   }
 
   async function saveBatchLimit() {
@@ -6434,6 +6475,104 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               {busy ? "Scanning..." : "Scan"}
             </Button>
           </form>
+          <div className="rounded border bg-slate-50 p-4">
+            <form className="grid gap-2 md:grid-cols-[1fr_auto_auto] md:items-end" onSubmit={lookupDispatchInfo}>
+              <div className="grid gap-1">
+                <Label>Order/package info lookup</Label>
+                <Input
+                  value={lookupQuery}
+                  onChange={(event) => setLookupQuery(event.target.value)}
+                  placeholder="Type Odoo order, Amazon order, tracking code, or Part1of3 label text"
+                  className="h-12 font-semibold"
+                  autoComplete="off"
+                />
+              </div>
+              <Button type="submit" variant="outline" className="h-12 px-5" disabled={lookupBusy || !lookupQuery.trim()}>
+                <Search className="size-4" />
+                {lookupBusy ? "Looking..." : "Lookup info"}
+              </Button>
+              {lookupResult ? (
+                <Button type="button" variant="outline" className="h-12 px-5" onClick={() => setLookupResult(null)}>
+                  <X className="size-4" />
+                  Clear
+                </Button>
+              ) : null}
+            </form>
+            {lookupResult ? (
+              <div className={cn("mt-4 overflow-hidden rounded border bg-white", lookupResult.matched ? "border-blue-200" : "border-red-200")}>
+                <div className={cn("px-4 py-3", lookupResult.matched ? "bg-blue-50 text-blue-950" : "bg-red-50 text-red-900")}>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-semibold">{dispatchDisplayText(lookupResult.message)}</div>
+                    <Badge variant={lookupResult.matched ? "secondary" : "destructive"}>{lookupResult.matched ? "Info only" : "Not found"}</Badge>
+                  </div>
+                  {lookupResult.matched ? (
+                    <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                      <Badge variant="outline">{Number(lookupResult.summary.package_count || 0)} package{Number(lookupResult.summary.package_count || 0) === 1 ? "" : "s"}</Badge>
+                      <Badge variant="outline">{Number(lookupResult.summary.parts_received || 0)}/{Number(lookupResult.summary.parts_total || 0)} part{Number(lookupResult.summary.parts_total || 0) === 1 ? "" : "s"} scanned</Badge>
+                      <Badge variant="outline">{Number(lookupResult.summary.parts_delivered || 0)} delivered by Amazon</Badge>
+                      {lookupResult.summary.odoo_orders?.length ? <Badge variant="outline">{lookupResult.summary.odoo_orders.join(", ")}</Badge> : null}
+                    </div>
+                  ) : null}
+                </div>
+                {lookupResult.matches?.length ? (
+                  <div className="divide-y">
+                    {lookupResult.matches.map((pkg) => {
+                      const parts = pkg.related_parts?.length ? pkg.related_parts : [pkg]
+                      const receivedParts = parts.filter(dispatchPartIsReceived).length
+                      return (
+                        <div key={`${pkg.id}-${pkg.scan_code}`} className="grid gap-3 px-4 py-3 text-sm lg:grid-cols-[96px_minmax(0,1fr)]">
+                          <DispatchProductThumbs images={dispatchProductImagesFrom(pkg)} onPreview={setImagePreview} size="sm" />
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-semibold">{pkg.recipient_ref || pkg.odoo_order_name || pkg.amazon_order_id}</span>
+                              <StatusBadge value={pkg.scan_status || "pending"} />
+                              <Badge variant={pkg.order_ready ? "secondary" : "outline"}>{pkg.order_ready ? "Ready" : "Hold"}</Badge>
+                            </div>
+                            <DispatchPackageCodes pkg={pkg} />
+                            <DispatchOrderRefs orderRef={pkg.odoo_order_name} amazonOrderId={pkg.amazon_order_id} recipientRef={pkg.recipient_ref} />
+                            <div className="mt-2 grid gap-2 md:grid-cols-3">
+                              <div className="rounded bg-muted px-3 py-2">
+                                <div className="text-xs font-medium uppercase text-muted-foreground">Amazon status</div>
+                                <div className="mt-1 font-medium">{pkg.package_status || pkg.promise || "Delivery not captured"}</div>
+                              </div>
+                              <div className="rounded bg-muted px-3 py-2">
+                                <div className="text-xs font-medium uppercase text-muted-foreground">Dispatch location</div>
+                                <div className="mt-1 font-mono text-xs">{dispatchLocationCode(pkg) || "No rack yet"}</div>
+                              </div>
+                              <div className="rounded bg-muted px-3 py-2">
+                                <div className="text-xs font-medium uppercase text-muted-foreground">Other parts</div>
+                                <div className="mt-1 font-medium">{receivedParts}/{parts.length} scanned</div>
+                              </div>
+                            </div>
+                            <div className="mt-3 overflow-hidden rounded border">
+                              <div className="border-b bg-muted/40 px-3 py-2 text-xs font-semibold">Package parts for this order</div>
+                              <div className="divide-y">
+                                {parts.map((part) => {
+                                  const received = dispatchPartIsReceived(part)
+                                  return (
+                                    <div key={`${pkg.id}-${part.id}`} className={cn("grid gap-2 px-3 py-2 text-xs md:grid-cols-[64px_minmax(170px,1fr)_130px_minmax(170px,1fr)_130px] md:items-center", received ? "bg-emerald-50/70" : "bg-orange-50/50")}>
+                                      <DispatchProductThumbs images={dispatchProductImagesFrom(part)} onPreview={setImagePreview} size="sm" />
+                                      <div className="min-w-0">
+                                        <div className="font-semibold">{part.recipient_ref || part.odoo_order_name || "Related part"}</div>
+                                        <div className="break-all font-mono text-muted-foreground">{part.display_code || part.scan_code || "No package code"}</div>
+                                      </div>
+                                      <Badge variant={received ? "secondary" : "outline"}>{part.scan_label || (received ? "Scanned" : "Not scanned")}</Badge>
+                                      <div className="text-muted-foreground">{part.delivery_label || part.package_status || part.promise || "Delivery not captured"}</div>
+                                      <div className="font-mono text-muted-foreground">{dispatchLocationCode(part) || "No rack yet"}</div>
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
           <div ref={scanResultRef} className="sticky top-2 z-20 grid gap-3">
             {searchConfirmation ? (
               <div
