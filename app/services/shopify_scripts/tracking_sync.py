@@ -62,7 +62,7 @@ import re
 import os
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode, urlparse, parse_qs
 import hashlib
@@ -692,6 +692,28 @@ def parse_date_to_ymd(date_str: str) -> str:
     raise ValueError(f"Could not parse date: {date_str}")
 
 
+def parse_window_datetime(value: str, end_of_day: bool = False) -> datetime:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("Missing tracking sync window value.")
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", cleaned):
+        suffix = "T23:59:59+00:00" if end_of_day else "T00:00:00+00:00"
+        return datetime.fromisoformat(cleaned + suffix)
+    try:
+        parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        ymd = parse_date_to_ymd(cleaned)
+        suffix = "T23:59:59+00:00" if end_of_day else "T00:00:00+00:00"
+        return datetime.fromisoformat(ymd + suffix)
+
+
+def shopify_query_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def parse_iso_dt(iso_str: str):
     if not iso_str:
         return None
@@ -713,9 +735,9 @@ def iso_in_range(iso_str: str, start_dt: datetime, end_dt: datetime) -> bool:
 # ----------------------------
 
 
-def fetch_source_orders(src_shop: str, token: str, api_version: str, from_ymd: str, to_ymd: str, max_pages=250):
+def fetch_source_orders(src_shop: str, token: str, api_version: str, from_query: str, to_query: str, max_pages=250):
     cursor = None
-    q = f"updated_at:>={from_ymd} updated_at:<={to_ymd} (fulfillment_status:fulfilled OR fulfillment_status:shipped)"
+    q = f"updated_at:>={from_query} updated_at:<={to_query} (fulfillment_status:fulfilled OR fulfillment_status:shipped)"
     query = """
     query($first:Int!, $after:String, $q:String!) {
       orders(first:$first, after:$after, query:$q, reverse:true) {
@@ -999,15 +1021,14 @@ def main():
     ap.add_argument("--workers", type=int, default=int(os.getenv("SHOPIFY_TRACKING_WORKERS", "1") or "1"), help="Parallel order workers. Use 1 for serial processing.")
     args = ap.parse_args()
 
-    from_ymd = parse_date_to_ymd(args.from_date)
-    to_ymd = parse_date_to_ymd(args.to_date)
+    start_dt = parse_window_datetime(args.from_date)
+    end_dt = parse_window_datetime(args.to_date, end_of_day=True)
+    from_query = shopify_query_datetime(start_dt)
+    to_query = shopify_query_datetime(end_dt)
     dry_run = args.dry_run
     skip_done_pickings = args.skip_done_pickings
     validate_deliveries = (not args.no_validate_deliveries)
     workers = max(1, min(12, int(args.workers or 1)))
-
-    start_dt = datetime.fromisoformat(from_ymd + "T00:00:00+00:00")
-    end_dt = datetime.fromisoformat(to_ymd + "T23:59:59+00:00")
 
     report_csv = args.report_csv.strip() or f"odoo_tracking_sync_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
     ensure_csv_header(report_csv)
@@ -1081,7 +1102,7 @@ def main():
     print(" Odoo Tracking Sync (SMART v3.3) Shopify -> Odoo")
     print("======================================================")
     print(f"Fulfillment createdAt filter: {start_dt.isoformat()}  ->  {end_dt.isoformat()}")
-    print(f"Order updated_at fetch range: {from_ymd}  ->  {to_ymd}")
+    print(f"Order updated_at fetch range: {from_query}  ->  {to_query}")
     print(f"Odoo DBs: {len(odoo_by_db)}/{len(ODOO_DESTS)} connected | Shopify SOURCE stores: {len(SHOPIFY_SOURCES)}")
     if odoo_connect_errors:
         print("Unavailable Odoo DBs: " + ", ".join(f"{db}: {err}" for db, err in sorted(odoo_connect_errors.items())))
@@ -1142,7 +1163,7 @@ def main():
 
     for src in sources_auth:
         print(f"\n--- SOURCE: {src['name']} ({src['shop']}) ---")
-        source_orders = list(fetch_source_orders(src["shop"], src["token"], src["api_version"], from_ymd, to_ymd))
+        source_orders = list(fetch_source_orders(src["shop"], src["token"], src["api_version"], from_query, to_query))
         add_counter("total_orders", len(source_orders))
         emit_progress(
             status="running",

@@ -16645,6 +16645,10 @@ def get_settings_values(keys: list[str]) -> dict[str, str]:
     return {str(row["key"]): str(row["value"] or "") for row in rows}
 
 
+def app_setting_storage_value(value: Any) -> str:
+    return json.dumps(str(value or ""))
+
+
 def set_setting(key: str, value: str) -> None:
     global _ADMIN_ACCESS_TOKEN_CACHE, _SERVICE_SETTINGS_CACHE
     with db() as conn:
@@ -16654,7 +16658,7 @@ def set_setting(key: str, value: str) -> None:
             VALUES (?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
             """,
-            (key, value, utc_now()),
+            (key, app_setting_storage_value(value), utc_now()),
         )
     if key == "admin_access_token":
         with _ADMIN_ACCESS_TOKEN_CACHE_LOCK:
@@ -19974,14 +19978,14 @@ def ymd_from_iso_datetime(value: str) -> str:
         return cleaned[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", cleaned) else ""
 
 
-def tracking_schedule_days(schedule: str) -> int:
+def tracking_schedule_interval(schedule: str) -> timedelta:
     return {
-        "daily": 1,
-        "every_2_days": 2,
-        "every_3_days": 3,
-        "every_4_days": 4,
-        "weekly": 7,
-    }.get(clean_text(schedule), 0)
+        "daily": timedelta(days=1),
+        "every_2_days": timedelta(days=2),
+        "every_3_days": timedelta(days=3),
+        "every_4_days": timedelta(days=4),
+        "weekly": timedelta(days=7),
+    }.get(clean_text(schedule), timedelta(0))
 
 
 def has_active_shopify_tracking_job() -> bool:
@@ -19999,16 +20003,18 @@ def has_active_shopify_tracking_job() -> bool:
 def create_shopify_tracking_job(payload: dict[str, Any], queued_by: str = "manual") -> dict[str, Any]:
     settings = get_service_settings()
     today = datetime.now(timezone.utc).date()
+    now_dt = datetime.now(timezone.utc)
     from_days = max(1, min(365, int(float(settings.get("shopify_tracking_from_days") or 7))))
     requested_from = clean_text(payload.get("from_date"))
     requested_to = clean_text(payload.get("to_date"))
     incremental = bool(payload.get("incremental", True)) and not requested_from and not requested_to
     last_success_at = get_setting("shopify_tracking_last_success_at", "")
     if incremental and last_success_at:
-        from_date = ymd_from_iso_datetime(last_success_at) or (today - timedelta(days=from_days)).isoformat()
+        from_date = last_success_at
+        to_date = now_dt.isoformat()
     else:
         from_date = requested_from or (today - timedelta(days=from_days)).isoformat()
-    to_date = requested_to or today.isoformat()
+        to_date = requested_to or today.isoformat()
     dry_run = bool(payload.get("dry_run", False))
     skip_done = bool(payload.get("skip_done_pickings", str(settings.get("shopify_tracking_skip_done_pickings", "false")).lower() in {"1", "true", "yes", "on"}))
     validate = bool(payload.get("validate_deliveries", str(settings.get("shopify_tracking_validate_deliveries", "true")).lower() in {"1", "true", "yes", "on"}))
@@ -20023,7 +20029,6 @@ def create_shopify_tracking_job(payload: dict[str, Any], queued_by: str = "manua
             """,
             (job_id, from_date, to_date, 1 if dry_run else 0, 1 if skip_done else 0, 1 if validate else 0, utc_now(), utc_now()),
         )
-    start_shopify_tracking_job(job_id)
     if queued_by == "auto":
         message = f"Queued automatic tracking sync: {from_date} to {to_date}."
         set_setting("shopify_tracking_auto_last_run_at", utc_now())
@@ -20031,6 +20036,7 @@ def create_shopify_tracking_job(payload: dict[str, Any], queued_by: str = "manua
     else:
         mode_label = "new tracking since last successful sync" if incremental and last_success_at else "selected date range"
         message = f"Shopify tracking sync queued for {mode_label}: {from_date} to {to_date}."
+    start_shopify_tracking_job(job_id)
     return {
         "ok": True,
         "message": message,
@@ -20044,15 +20050,39 @@ def create_shopify_tracking_job(payload: dict[str, Any], queued_by: str = "manua
 
 
 def maybe_queue_scheduled_shopify_tracking(settings: dict[str, str]) -> None:
-    days = tracking_schedule_days(settings.get("shopify_tracking_auto_schedule", "off"))
-    if days <= 0:
+    interval = tracking_schedule_interval(settings.get("shopify_tracking_auto_schedule", "off"))
+    if interval <= timedelta(0):
         return
+    reconcile_stale_shopify_tracking_jobs()
     if has_active_shopify_tracking_job():
         return
     last_run = parse_utc_datetime(get_setting("shopify_tracking_auto_last_run_at", ""))
-    if last_run and datetime.now(timezone.utc) - last_run < timedelta(days=days):
+    if last_run and datetime.now(timezone.utc) - last_run < interval:
         return
     create_shopify_tracking_job({"incremental": True, "dry_run": False}, queued_by="auto")
+
+
+def run_scheduled_shopify_tracking_safely(settings: dict[str, str]) -> None:
+    try:
+        maybe_queue_scheduled_shopify_tracking(settings)
+    except Exception as exc:
+        message = f"Automatic Shopify tracking scheduler failed: {exc}"
+        set_setting("shopify_tracking_auto_last_message", message)
+        print(message, flush=True)
+
+
+def shopify_tracking_schedule_loop() -> None:
+    while True:
+        try:
+            run_scheduled_shopify_tracking_safely(get_service_settings())
+        except Exception as exc:
+            message = f"Automatic Shopify tracking scheduler failed: {exc}"
+            try:
+                set_setting("shopify_tracking_auto_last_message", message)
+            except Exception:
+                pass
+            print(message, flush=True)
+        time.sleep(60)
 
 
 def set_service_settings(values: dict[str, str]) -> None:
@@ -20069,7 +20099,7 @@ def set_service_settings(values: dict[str, str]) -> None:
                 VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                 """,
-                (key, value, now),
+                (key, app_setting_storage_value(value), now),
             )
     with _SERVICE_SETTINGS_CACHE_LOCK:
         _SERVICE_SETTINGS_CACHE = ({}, 0.0)
@@ -21312,6 +21342,7 @@ def startup() -> None:
                 ensure_shopify_order_status_cache_table()
                 _SHOPIFY_STATUS_CACHE_ENSURED = True
                 should_reindex_typesense = typesense_enabled() and get_setting("typesense_schema_version", "") != TYPESENSE_SCHEMA_VERSION
+                threading.Thread(target=shopify_tracking_schedule_loop, daemon=True).start()
                 threading.Thread(target=init_db, daemon=True).start()
                 resume_interrupted_shopify_tracking_jobs()
                 threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
@@ -21805,7 +21836,6 @@ def autosync_loop() -> None:
                 for store in list_stores():
                     sync_cancelled_orders_for_store(int(store["id"]), days=days)
                 last_cancelled_run = time.time()
-            maybe_queue_scheduled_shopify_tracking(settings)
         except Exception:
             pass
         time.sleep(60)
@@ -24052,10 +24082,26 @@ def api_shopify_tracking_create(payload: dict[str, Any]) -> dict[str, Any]:
 @app.post("/api/shopify/tracking/jobs/{job_id}/retry")
 def api_shopify_tracking_retry(job_id: str) -> dict[str, Any]:
     reconcile_stale_shopify_tracking_jobs()
+    now = utc_now()
+    progress = {
+        "status": "queued",
+        "total": 0,
+        "processed": 0,
+        "current_order": "",
+        "source": "",
+        "message": "Tracking sync retry queued.",
+        "updated_at": now,
+        "counters": {},
+    }
     with db() as conn:
         cursor = conn.execute(
-            "UPDATE shopify_tracking_jobs SET status='queued', last_error='', completed_at=NULL, updated_at=? WHERE id=? AND status IN ('failed', 'cancelled', 'stalled')",
-            (utc_now(), job_id),
+            """
+            UPDATE shopify_tracking_jobs
+            SET status='queued', attempts=0, progress_json=?, counters_json='{}',
+                last_error='', completed_at=NULL, updated_at=?
+            WHERE id=? AND status IN ('failed', 'cancelled', 'stalled')
+            """,
+            (json.dumps(progress), now, job_id),
         )
     if cursor.rowcount:
         start_shopify_tracking_job(job_id)

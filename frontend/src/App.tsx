@@ -13637,11 +13637,11 @@ function SettingsPage({
             <TextField label="Tracking Parallel Workers" value={settings.shopify_tracking_workers || "8"} onChange={(value) => setSetting("shopify_tracking_workers", value)} />
             <SelectField label="Tracking Auto Sync Schedule" value={settings.shopify_tracking_auto_schedule || "off"} onChange={(value) => setSetting("shopify_tracking_auto_schedule", value)}>
               <option value="off">Off</option>
-              <option value="daily">Daily</option>
-              <option value="every_2_days">Every 2 days</option>
-              <option value="every_3_days">Every 3 days</option>
-              <option value="every_4_days">Every 4 days</option>
-              <option value="weekly">Weekly</option>
+              <option value="daily">Daily from last success</option>
+              <option value="every_2_days">Every 2 days from last success</option>
+              <option value="every_3_days">Every 3 days from last success</option>
+              <option value="every_4_days">Every 4 days from last success</option>
+              <option value="weekly">Weekly from last success</option>
             </SelectField>
             <div className="rounded border bg-muted/20 p-3 text-sm text-muted-foreground">
               Automatic tracking last queued: {settings.shopify_tracking_auto_last_run_at ? formatDateTime(settings.shopify_tracking_auto_last_run_at) : "Never"}
