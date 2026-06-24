@@ -19804,8 +19804,34 @@ def run_shopify_tracking_job(job_id: str) -> None:
                 "UPDATE shopify_tracking_jobs SET status='completed', report_csv=?, progress_json=?, counters_json=?, last_error='', completed_at=?, updated_at=? WHERE id=?",
                 (report_csv, json.dumps(progress), json.dumps(counters), progress["updated_at"], progress["updated_at"], job_id),
             )
-            if not int(job["dry_run"] or 0):
+        if not int(job["dry_run"] or 0):
+            try:
                 set_setting("shopify_tracking_last_success_at", progress["updated_at"])
+            except Exception as exc:
+                warning = f"Tracking sync completed, but last success timestamp could not be saved: {exc}"
+                print(warning, flush=True)
+                try:
+                    with db() as conn:
+                        conn.execute(
+                            """
+                            INSERT INTO app_settings (key, value, updated_at)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                            """,
+                            ("shopify_tracking_last_success_at", app_setting_storage_value(progress["updated_at"]), progress["updated_at"]),
+                        )
+                except Exception as fallback_exc:
+                    warning = f"{warning}; fallback also failed: {fallback_exc}"
+                    try:
+                        progress["message"] = warning
+                        progress["last_success_warning"] = warning
+                        with db() as conn:
+                            conn.execute(
+                                "UPDATE shopify_tracking_jobs SET progress_json=?, last_error=?, updated_at=? WHERE id=?",
+                                (json.dumps(progress), warning[:2000], utc_now(), job_id),
+                            )
+                    except Exception:
+                        pass
     except SystemExit as exc:
         fail_tracking_job(RuntimeError(f"Tracking script exited {exc.code}"))
     except BaseException as exc:
