@@ -14433,6 +14433,16 @@ def paged_delivered_unfulfilled_rows(
             keeper["product_name"] = " | ".join(unique_names)
         grouped_results[key] = keeper
     results = list(grouped_results.values())
+    unmatched_shopify_rows = unmatched_shopify_pending_rows(store_id, q, page)
+    if unmatched_shopify_rows:
+        existing_amazon_ids = {clean_text(row.get("amazon_order_id")) for row in results if clean_text(row.get("amazon_order_id"))}
+        extra_rows = [
+            row for row in unmatched_shopify_rows
+            if clean_text(row.get("amazon_order_id")) not in existing_amazon_ids
+        ]
+        if extra_rows:
+            results.extend(extra_rows)
+            total += len(extra_rows)
     reverse = sort_direction == "desc"
 
     def sort_timestamp(value: Any) -> float:
@@ -14570,6 +14580,205 @@ def paged_delivered_unfulfilled_rows_for_exact_order_ref(
         wait_for_shopify_refresh=False,
     )
     return results, total, page, per_page
+
+
+def bare_shopify_order_number_from_recipient(value: Any) -> str:
+    text = clean_text(value)
+    match = re.search(r"\bNutricity\s+#?(\d{3,})\b", text, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def find_active_shopify_order_by_number(order_number: str) -> tuple[dict[str, Any], str, str, str]:
+    clean_number = clean_text(order_number).lstrip("#")
+    if not clean_number:
+        return {}, "", "", ""
+    for route in ("dtc", "dtb"):
+        try:
+            clients = shopify_clients_for_route(route)
+        except Exception:
+            continue
+        for client in clients:
+            try:
+                orders = shopify_orders_by_name(client, clean_number, limit=10)
+            except Exception:
+                orders = []
+            active = [order for order in orders if not clean_text(order.get("cancelled_at"))]
+            chosen = next((order for order in active if not shopify_order_is_fulfilled(order)), active[0] if active else None)
+            if chosen:
+                return chosen, route, client.name, client.shop
+    return {}, "", "", ""
+
+
+def unmatched_shopify_pending_rows(
+    store_id: Optional[int],
+    q: str = "",
+    page: int = 1,
+) -> list[dict[str, Any]]:
+    search = clean_text(q)
+    live_lookup_number = search.lstrip("#") if re.fullmatch(r"#?\d{3,}", search) else ""
+    if page != 1 and not live_lookup_number:
+        return []
+    stores = list_stores()
+    nutricity_store = next((store for store in stores if clean_text(store.get("name")).lower() == "nutricity usa"), stores[0] if stores else {})
+    fallback_store_id = int(store_id or nutricity_store.get("id") or 0)
+    if not fallback_store_id:
+        return []
+    params: list[Any] = [fallback_store_id, fallback_store_id]
+    search_sql = ""
+    if search:
+        search_like = f"%{search}%"
+        search_sql = """
+          AND (
+            amazon_order_id ILIKE ?
+            OR recipient ILIKE ?
+            OR status ILIKE ?
+            OR order_date ILIKE ?
+            OR items_json ILIKE ?
+          )
+        """
+        params.extend([search_like, search_like, search_like, search_like, search_like])
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT amazon_order_id, amazon_order_url, recipient, status, order_date,
+                   items_json, last_seen_at
+            FROM amazon_order_history_unmatched
+            WHERE resolved_at IS NULL
+              AND COALESCE(amazon_order_id, '') != ''
+              AND COALESCE(recipient, '') ILIKE 'Nutricity %'
+              AND (
+                LOWER(COALESCE(status, '')) LIKE '%delivered%'
+                OR LOWER(COALESCE(status, '')) LIKE 'arriving today%'
+                OR LOWER(COALESCE(status, '')) = 'out for delivery'
+              )
+              {search_sql}
+            ORDER BY last_seen_at DESC
+            LIMIT 50
+            """,
+            params[2:],
+        ).fetchall())
+        order_numbers = sorted({
+            bare_shopify_order_number_from_recipient(row.get("recipient"))
+            for row in rows
+            if bare_shopify_order_number_from_recipient(row.get("recipient"))
+        })
+        status_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT DISTINCT ON (odoo_order_name)
+                   odoo_order_name, route, dest_name, shop, shopify_order_id,
+                   shopify_order_name, shopify_order_url, financial_status,
+                   fulfillment_status, fulfillment_at, cancelled_at, synced_at
+            FROM shopify_order_status_cache
+            WHERE store_id=?
+              AND odoo_order_name = ANY(?::text[])
+            ORDER BY odoo_order_name,
+                     CASE WHEN COALESCE(cancelled_at, '') = '' THEN 0 ELSE 1 END,
+                     synced_at DESC
+            """,
+            (fallback_store_id, order_numbers or [""]),
+        ).fetchall()) if order_numbers else []
+    status_by_number = {clean_text(row.get("odoo_order_name")).lstrip("#"): row for row in status_rows}
+    if live_lookup_number and live_lookup_number not in status_by_number:
+        order, route, dest_name, shop = find_active_shopify_order_by_number(live_lookup_number)
+        if order:
+            upsert_shopify_order_status(fallback_store_id, route, dest_name, shop, live_lookup_number, order)
+            status_by_number[live_lookup_number] = {
+                "odoo_order_name": live_lookup_number,
+                "route": route,
+                "dest_name": dest_name,
+                "shop": shop,
+                "shopify_order_id": clean_text(order.get("id")),
+                "shopify_order_name": clean_text(order.get("name")) or f"#{live_lookup_number}",
+                "shopify_order_url": clean_text(order.get("url")) or shopify_admin_order_url(shop, order.get("id")),
+                "financial_status": clean_text(order.get("financial_status")),
+                "fulfillment_status": clean_text(order.get("fulfillment_status")) or "UNFULFILLED",
+                "fulfillment_at": clean_text(order.get("fulfillment_at")),
+                "cancelled_at": clean_text(order.get("cancelled_at")),
+                "synced_at": utc_now(),
+            }
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        number = bare_shopify_order_number_from_recipient(row.get("recipient"))
+        if not number:
+            continue
+        shopify_status = status_by_number.get(number) or {}
+        if not shopify_status or clean_text(shopify_status.get("cancelled_at")):
+            continue
+        if shopify_status_is_fulfilled(shopify_status.get("fulfillment_status")):
+            continue
+        try:
+            items = json.loads(row.get("items_json") or "[]")
+        except Exception:
+            items = []
+        products = normalize_amazon_product_items(items)
+        asins = [normalize_asin(item.get("asin")) for item in products if normalize_asin(item.get("asin"))]
+        synthetic_id = -int(re.sub(r"\D", "", row.get("amazon_order_id") or "0")[-9:] or "0")
+        results.append({
+            "id": synthetic_id,
+            "store_id": fallback_store_id,
+            "store_name": clean_text(nutricity_store.get("name")) or "Nutricity USA",
+            "odoo_order_id": None,
+            "odoo_order_name": f"Shopify #{number}",
+            "odoo_order_url": "",
+            "odoo_line_id": None,
+            "odoo_sale_state": "shopify only",
+            "odoo_order_state": "shopify only",
+            "odoo_invoice_status": "unfulfilled",
+            "odoo_status_label": "",
+            "asin": asins[0] if asins else "",
+            "asin_url": asin_product_url(asins[0]) if asins else "",
+            "quantity": sum(float(item.get("quantity") or 1) for item in products) if products else 1,
+            "product_name": useful_amazon_product_title((products[0] or {}).get("title")) if products else "",
+            "state": "delivered",
+            "amazon_order_id": clean_text(row.get("amazon_order_id")),
+            "amazon_order_url": clean_text(row.get("amazon_order_url")) or order_line_amazon_url(row.get("amazon_order_id")),
+            "amazon_account_name": "Amazon history",
+            "tracking_status": clean_text(row.get("status")) or "Delivered",
+            "tracking_payload": "[]",
+            "tracking_checked_at": clean_text(row.get("last_seen_at")),
+            "ordered_at": parse_amazon_order_placed_date(row.get("order_date")),
+            "updated_at": clean_text(row.get("last_seen_at")),
+            "amazon_products": products,
+            "amazon_product_asins": ", ".join(asins),
+            "pending_amazon_orders": [{
+                "amazon_order_id": clean_text(row.get("amazon_order_id")),
+                "amazon_order_url": clean_text(row.get("amazon_order_url")) or order_line_amazon_url(row.get("amazon_order_id")),
+                "recipient": clean_text(row.get("recipient")),
+                "status": clean_text(row.get("status")),
+                "expected_asins": asins,
+                "display_asins": asins,
+                "products": products,
+                "quantity": sum(float(item.get("quantity") or 1) for item in products) if products else 1,
+                "sources": ["amazon_order_history_unmatched"],
+            }],
+            "pending_item_audit": [],
+            "pending_discrepancies": [{
+                "severity": "warning",
+                "type": "shopify_only_unmatched_amazon",
+                "message": "Amazon order was captured from recipient name and Shopify is still unfulfilled, but no Odoo/order line is linked yet.",
+                "amazon_order_ids": [clean_text(row.get("amazon_order_id"))],
+            }],
+            "related_amazon_orders": [],
+            "asin_matched_amazon_orders": [],
+            "shopify_order_id": clean_text(shopify_status.get("shopify_order_id")),
+            "shopify_order_name": clean_text(shopify_status.get("shopify_order_name")) or f"#{number}",
+            "shopify_order_url": clean_text(shopify_status.get("shopify_order_url")),
+            "shopify_financial_status": clean_text(shopify_status.get("financial_status")),
+            "shopify_fulfillment_status": clean_text(shopify_status.get("fulfillment_status")) or "UNFULFILLED",
+            "shopify_fulfillment_at": clean_text(shopify_status.get("fulfillment_at")),
+            "shopify_cancelled_at": clean_text(shopify_status.get("cancelled_at")),
+            "shopify_synced_at": clean_text(shopify_status.get("synced_at")),
+            "fulfilment_status": "fulfilment pending",
+            "message": "Amazon delivered for a bare Shopify order number, but the Amazon order is not linked to Odoo/order lines yet.",
+            "picking_ids": [],
+            "picking_names": [],
+            "picking_states": [],
+            "open_picking_ids": [],
+            "open_picking_names": [],
+            "amazon_delivered_display": clean_text(row.get("status")),
+            "amazon_delivered_source": "amazon_order_history_unmatched",
+        })
+    return results
 
 
 def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2) -> int:
@@ -18212,6 +18421,12 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
     }
     for row in rows:
         cached = status_by_key.get((int(row.get("store_id") or 0), clean_text(row.get("odoo_order_name")).upper()))
+        if cached is None and (
+            clean_text(row.get("shopify_order_id"))
+            or clean_text(row.get("shopify_order_name"))
+            or clean_text(row.get("shopify_fulfillment_status"))
+        ):
+            continue
         row["shopify_order_id"] = clean_text((cached or {}).get("shopify_order_id"))
         row["shopify_order_name"] = clean_text((cached or {}).get("shopify_order_name"))
         row["shopify_order_url"] = clean_text((cached or {}).get("shopify_order_url"))
