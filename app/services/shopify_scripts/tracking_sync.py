@@ -1272,7 +1272,25 @@ def main():
                 finish_current_order(src["shop"], current_order, f"Skipped Shopify order {current_order}: Odoo DB not configured.")
                 return
 
-            dest_meta = dest_meta_for_db(odoo_db)
+            try:
+                dest_meta = dest_meta_for_db(odoo_db)
+            except OdooDestinationUnavailable as exc:
+                add_counter("skipped_odoo_connect_failed")
+                append_csv_row(
+                    report_csv,
+                    {
+                        **base_row,
+                        "odoo_dest_name": odoo_cfg_by_db.get(odoo_db, {}).get("name", odoo_db),
+                        "odoo_url": odoo_cfg_by_db.get(odoo_db, {}).get("url", ""),
+                        "odoo_db": odoo_db,
+                        "odoo_order": odoo_order,
+                        "action": "SKIP",
+                        "result": "ODOO_CONNECT_FAILED",
+                        "message": f"Odoo destination could not be connected: {exc}",
+                    },
+                )
+                finish_current_order(src["shop"], current_order, f"Skipped Shopify order {current_order}: Odoo DB connection failed.")
+                return
             oc = dest_meta["client"]
 
             fulfillments = src_order.get("fulfillments") or []
