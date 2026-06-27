@@ -28526,8 +28526,11 @@ def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: 
         return cached
     try:
         rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
-    except Exception:
-        rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ePost tracking rows are temporarily unavailable. Please refresh again shortly. {clean_error_message(exc)}",
+        ) from exc
     return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only}, 90)
 
 
