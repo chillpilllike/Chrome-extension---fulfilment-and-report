@@ -120,6 +120,7 @@ class ChromeTrackingUpdatePayload(BaseModel):
     recipient: str = ""
     order_status: str = ""
     order_date: str = ""
+    otp: str = ""
     payment_revision_needed: bool = False
     payment_revision_url: str = ""
     order_cancelled: bool = False

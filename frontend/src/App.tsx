@@ -7682,34 +7682,34 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
       <div className="border-t px-6 py-3">
         <PaginationControls page={page} total={total} onPage={setPage} disabled={loading} />
       </div>
-      <CardContent className="p-0">
-        <Table>
+      <CardContent className="overflow-x-auto p-0">
+        <Table className="min-w-[1580px] table-fixed">
           <TableHeader>
             <TableRow>
-              <TableHead>OTP</TableHead>
-              <TableHead>Tracking</TableHead>
-              <TableHead>Amazon Order</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Product</TableHead>
-              <TableHead>Recipient</TableHead>
-              <TableHead>Emails</TableHead>
+              <TableHead className="w-[140px]">OTP</TableHead>
+              <TableHead className="w-[250px]">Tracking</TableHead>
+              <TableHead className="w-[210px]">Amazon Order</TableHead>
+              <TableHead className="w-[170px]">Status</TableHead>
+              <TableHead className="w-[390px]">Product</TableHead>
+              <TableHead className="w-[240px]">Recipient</TableHead>
+              <TableHead className="w-[180px]">Emails</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {rows.map((row) => (
               <TableRow key={row.amazon_order_id}>
-                <TableCell>
-                  <div className="grid gap-1">
-                    <span className="font-mono text-lg font-semibold">{row.otp || "Pending"}</span>
-                    <StatusBadge value={row.match_status} />
+                <TableCell className="align-top">
+                  <div className="grid justify-items-start gap-1">
+                    <span className="whitespace-nowrap font-mono text-lg font-semibold">{row.otp || "Pending"}</span>
+                    <span className="whitespace-nowrap"><StatusBadge value={row.match_status} /></span>
                   </div>
                 </TableCell>
-                <TableCell className="max-w-[280px]">
+                <TableCell className="align-top">
                   <div className="grid gap-1 text-sm">
                     {String(row.tracking_numbers || "").trim() ? (
                       String(row.tracking_numbers || "").split(/\s*,\s*/).filter(Boolean).map((trackingId) => (
                         <div key={`${row.amazon_order_id}-${trackingId}`} className="flex min-w-0 items-start gap-2">
-                          <span className="break-all font-mono">{trackingId}</span>
+                          <span className="min-w-0 whitespace-nowrap font-mono leading-snug">{trackingId}</span>
                           <button
                             type="button"
                             className="inline-flex size-6 flex-none items-center justify-center rounded border border-primary/25 bg-background text-primary transition-colors hover:border-primary hover:bg-primary/10"
@@ -7726,28 +7726,28 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
                     ) : (
                       <span className="text-muted-foreground">Pending Chrome scan</span>
                     )}
-                    <span className="text-muted-foreground">{row.carriers}</span>
+                    {row.carriers ? <span className="truncate text-muted-foreground">{row.carriers}</span> : null}
                     {row.tracking_url ? <a className="text-primary underline-offset-4 hover:underline" href={row.tracking_url} target="_blank">Amazon tracking email link</a> : null}
                   </div>
                 </TableCell>
-                <TableCell>
+                <TableCell className="align-top">
                   <div className="grid gap-1">
-                    <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
+                    <a className="break-words font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
                       {row.amazon_order_id}
                     </a>
                     <OdooOrderRefs names={String(row.odoo_order_names || "").split(/\s*,\s*/)} className="text-xs text-muted-foreground" />
                   </div>
                 </TableCell>
-                <TableCell><StatusBadge value={row.tracking_status || "Unknown"} /></TableCell>
-                <TableCell className="max-w-[420px]">
-                  <div className="truncate">{row.product_summary}</div>
+                <TableCell className="align-top"><span className="whitespace-nowrap"><StatusBadge value={row.tracking_status || "Unknown"} /></span></TableCell>
+                <TableCell className="align-top">
+                  <div className="truncate" title={row.product_summary}>{row.product_summary}</div>
                   <div className="text-xs text-muted-foreground">{row.store_names}</div>
                 </TableCell>
-                <TableCell>{row.recipient}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">
-                  <div>OTP: {formatDateTime(row.otp_email_date)}</div>
-                  <div>Dispatch: {formatDateTime(row.dispatch_email_date)}</div>
-                  <div>Updated: {formatDateTime(row.updated_at)}</div>
+                <TableCell className="align-top"><div className="truncate" title={row.recipient}>{row.recipient}</div></TableCell>
+                <TableCell className="align-top text-xs text-muted-foreground">
+                  <div className="whitespace-nowrap">OTP: {formatDateTime(row.otp_email_date)}</div>
+                  <div className="whitespace-nowrap">Dispatch: {formatDateTime(row.dispatch_email_date)}</div>
+                  <div className="whitespace-nowrap">Updated: {formatDateTime(row.updated_at)}</div>
                 </TableCell>
               </TableRow>
             ))}

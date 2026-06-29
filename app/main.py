@@ -24,7 +24,7 @@ import xmlrpc.client
 import xml.etree.ElementTree as ET
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
-from urllib.parse import urlencode, urlparse, urlsplit
+from urllib.parse import parse_qs, urlencode, urlparse, urlsplit
 from urllib.parse import quote_plus
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -5103,6 +5103,137 @@ def bulk_upsert_dispatch_package_rows(conn: Any, values: list[tuple[Any, ...]]) 
         template="(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         page_size=1000,
     )
+
+
+def save_otp_tracking_dispatch_packages(
+    conn: Any,
+    amazon_order_id: str,
+    amazon_order_url: str,
+    packages: list[dict[str, Any]],
+) -> int:
+    order_id = clean_text(amazon_order_id)
+    if not order_id or not packages:
+        return 0
+    otp_row = conn.execute(
+        "SELECT * FROM amazon_otp_records WHERE amazon_order_id=?",
+        (order_id,),
+    ).fetchone()
+    if not otp_row:
+        return 0
+    now = utc_now()
+    values: list[tuple[Any, ...]] = []
+    for index, package in enumerate(packages, start=1):
+        codes = dispatch_codes_from_package(package, order_id)
+        if not codes:
+            continue
+        code, display_code = codes[0]
+        products = normalize_amazon_product_items(package.get("products") or [])
+        asins = unique_normalized_asins(package.get("asins") or [product.get("asin") for product in products])
+        values.append((
+            code,
+            code,
+            display_code,
+            order_id,
+            clean_text(amazon_order_url) or clean_text(otp_row["tracking_url"]) or order_line_amazon_url(order_id),
+            None,
+            None,
+            "",
+            clean_text(otp_row["recipient"]) or "Amazon OTP",
+            "[]",
+            index,
+            tracking_package_status_text(package),
+            tracking_package_promise_text(package),
+            clean_text(package.get("carrier")),
+            clean_text(package.get("tracking_url")) or clean_text(otp_row["tracking_url"]),
+            json.dumps(asins),
+            json.dumps(products[:12], default=str),
+            "",
+            "",
+            dispatch_today_code(),
+            "OTP",
+            dispatch_service_from_package(package),
+            dispatch_priority_from_package(package),
+            "OTP",
+            "pending",
+            now,
+            now,
+        ))
+    bulk_upsert_dispatch_package_rows(conn, values)
+    return len(values)
+
+
+def tracking_payload_otp(payload: ChromeTrackingUpdatePayload, packages: list[dict[str, Any]]) -> str:
+    for value in [payload.otp, *[package.get("otp") for package in packages if isinstance(package, dict)]]:
+        text = clean_text(value)
+        match = re.search(r"\b(\d{4,8})\b", text)
+        if match:
+            return match.group(1)
+    page_text = clean_text(payload.page_text)
+    match = re.search(r"\b(?:one[-\s]?time\s+password|otp)\s+(?:is|:)?\s*(\d{4,8})\b", page_text, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def upsert_amazon_otp_from_tracking_payload(
+    conn: Any,
+    amazon_order_id: str,
+    amazon_order_url: str,
+    otp: str,
+    packages: list[dict[str, Any]],
+) -> bool:
+    order_id = clean_text(amazon_order_id)
+    otp_code = clean_text(otp)
+    if not order_id or not otp_code:
+        return False
+    tracking_url = ""
+    shipment_id = ""
+    package_index = ""
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        tracking_url = tracking_url or clean_text(package.get("tracking_url"))
+        try:
+            url = urlparse(tracking_url)
+            query = parse_qs(url.query)
+            shipment_id = shipment_id or clean_text((query.get("shipmentId") or [""])[0])
+            package_index = package_index or clean_text((query.get("packageIndex") or [""])[0])
+        except Exception:
+            pass
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO amazon_otp_records
+          (amazon_order_id, otp, otp_required, tracking_url, shipment_id, package_index,
+           recipient, product_summary, otp_email_subject, otp_email_date,
+           dispatch_email_subject, dispatch_email_date, status, raw_json,
+           last_email_uid, last_synced_at, created_at, updated_at)
+        VALUES (?, ?, 1, ?, ?, ?, '', '', '', '', '', '', 'otp', ?, '', ?, ?, ?)
+        ON CONFLICT(amazon_order_id) DO UPDATE SET
+          otp=COALESCE(NULLIF(excluded.otp, ''), amazon_otp_records.otp),
+          otp_required=1,
+          tracking_url=COALESCE(NULLIF(excluded.tracking_url, ''), amazon_otp_records.tracking_url),
+          shipment_id=COALESCE(NULLIF(excluded.shipment_id, ''), amazon_otp_records.shipment_id),
+          package_index=COALESCE(NULLIF(excluded.package_index, ''), amazon_otp_records.package_index),
+          status='otp',
+          raw_json=COALESCE(NULLIF(excluded.raw_json, ''), amazon_otp_records.raw_json),
+          last_synced_at=excluded.last_synced_at,
+          updated_at=excluded.updated_at
+        """,
+        (
+            order_id,
+            otp_code,
+            tracking_url or clean_text(amazon_order_url) or order_line_amazon_url(order_id),
+            shipment_id,
+            package_index,
+            json_payload_for_storage({"source": "amazon_tracking_page", "otp": otp_code}),
+            now,
+            now,
+            now,
+        ),
+    )
+    updated = conn.execute("SELECT * FROM amazon_otp_records WHERE amazon_order_id=?", (order_id,)).fetchone()
+    if updated:
+        _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(updated) or {}: _index_named_document_sync("amazon_otp_records", amazon_otp_search_document(snapshot)))
+    return True
 
 
 def sync_dispatch_packages_for_order_async(amazon_order_id: str) -> None:
@@ -27800,6 +27931,15 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
         tracking_package_delivered(package) for package in packages if isinstance(package, dict)
     )
     with db() as conn:
+        otp_updated = upsert_amazon_otp_from_tracking_payload(
+            conn,
+            amazon_order_id,
+            clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+            tracking_payload_otp(payload, packages),
+            packages,
+        )
+        if otp_updated:
+            fast_page_cache_clear_matching({"amazon-otp", "public-amazon-otp"})
         if status_only_payload and not payload.order_cancelled and not payload_has_payment_revision(payload):
             now = utc_now()
             line_delivered = status == "Delivered" and packages and all(
@@ -27919,6 +28059,29 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                         "dispatch_packages_updated": history_packages + related_packages,
                         "tracking_status": status,
                         "message": "Updated old/manual history Amazon tracking by recipient ref and ASIN.",
+                    }
+                otp_packages = save_otp_tracking_dispatch_packages(
+                    conn,
+                    amazon_order_id,
+                    clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                    packages,
+                )
+                if otp_packages:
+                    fast_page_cache_clear_matching({"amazon-otp", "public-amazon-otp"})
+                    return {
+                        "ok": True,
+                        "updated": 0,
+                        "dispatch_packages_updated": otp_packages,
+                        "tracking_status": status,
+                        "message": "Saved Amazon OTP package tracking ID.",
+                    }
+                if otp_updated:
+                    return {
+                        "ok": True,
+                        "updated": 0,
+                        "dispatch_packages_updated": 0,
+                        "tracking_status": status,
+                        "message": "Saved Amazon OTP from tracking page.",
                     }
                 raise HTTPException(404, "Tracked Amazon order not found")
             related_updated, related_packages = update_related_tracking_orders_from_packages(
@@ -28117,6 +28280,29 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     "dispatch_packages_updated": history_packages + related_packages,
                     "tracking_status": tracking_status_from_packages(packages),
                     "message": "Updated old/manual history Amazon tracking by recipient ref and ASIN.",
+                }
+            otp_packages = save_otp_tracking_dispatch_packages(
+                conn,
+                amazon_order_id,
+                clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
+                packages,
+            )
+            if otp_packages:
+                fast_page_cache_clear_matching({"amazon-otp", "public-amazon-otp"})
+                return {
+                    "ok": True,
+                    "updated": 0,
+                    "dispatch_packages_updated": otp_packages,
+                    "tracking_status": tracking_status_from_packages(packages),
+                    "message": "Saved Amazon OTP package tracking ID.",
+                }
+            if otp_updated:
+                return {
+                    "ok": True,
+                    "updated": 0,
+                    "dispatch_packages_updated": 0,
+                    "tracking_status": tracking_status_from_packages(packages),
+                    "message": "Saved Amazon OTP from tracking page.",
                 }
             raise HTTPException(404, "Tracked Amazon order not found")
         if payload.order_cancelled:

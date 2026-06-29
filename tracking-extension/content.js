@@ -349,6 +349,9 @@ function trackingLikeUrl(value = "") {
 
 function currentPageMatchesActiveTracking(state = {}) {
   if (!state?.tracking?.running) return false;
+  const activeTabId = Number(state.tracking.trackingTabId || state.tracking.autoTrackingTabId || 0);
+  const senderTabId = Number(state.senderTabId || 0);
+  if (activeTabId && senderTabId && activeTabId !== senderTabId) return true;
   const activeUrl = activeTrackingUrl(state);
   if (!activeUrl) return true;
   try {
@@ -915,6 +918,26 @@ function shouldOpenTrackingEvents(status, carrierInfo = {}) {
   return /shipped|transit|out for delivery|delivered|delayed|attempted|carrier|tracking/i.test(status || "");
 }
 
+function parseOtpFromTrackingPage() {
+  const selectors = [
+    ".pt-notice-MAPS .a-alert-content",
+    ".map-banner-card .a-alert-content",
+    ".a-alert-content",
+  ];
+  for (const selector of selectors) {
+    for (const node of document.querySelectorAll(selector)) {
+      const text = clean(node.textContent || "");
+      const match = text.match(/\b(?:one[-\s]?time\s+password|otp)\s+(?:is|:)?\s*(\d{4,8})\b/i)
+        || text.match(/\bpassword\s+(?:is|:)\s*(\d{4,8})\b/i);
+      if (match?.[1]) return match[1];
+    }
+  }
+  const bodyText = clean(document.body?.innerText || "");
+  const match = bodyText.match(/\b(?:one[-\s]?time\s+password|otp)\s+(?:is|:)?\s*(\d{4,8})\b/i)
+    || bodyText.match(/\bpassword\s+(?:is|:)\s*(\d{4,8})\b/i);
+  return match?.[1] || "";
+}
+
 async function parseTrackingPage() {
   const initialStatus = parseStatus();
   const initialCarrierInfo = parseCarrierAndTrackingId();
@@ -926,6 +949,7 @@ async function parseTrackingPage() {
   const events = parseEvents();
   const carrierInfo = parseCarrierAndTrackingId();
   const status = parseStatus();
+  const otp = parseOtpFromTrackingPage();
   const deliveryCard = document.querySelector(".delivery-card, .pt-delivery-card-wrapper, #primaryStatus, #tracking-events-container") || document.body;
   const trackingProducts = productItemsFrom(deliveryCard);
   const products = trackingProducts;
@@ -943,9 +967,11 @@ async function parseTrackingPage() {
     asins: statusOnly ? [] : productAsins,
     products: statusOnly ? [] : products,
     status_only: statusOnly,
+    otp,
+    otp_required: Boolean(otp),
     related_amazon_order_ids: relatedOrderIdsFromPage(),
   };
-  return { amazonOrderId, package: withPromiseDetails(pkg), ...paymentRevision };
+  return { amazonOrderId, package: withPromiseDetails(pkg), otp, ...paymentRevision };
 }
 
 async function run() {

@@ -1334,6 +1334,7 @@ async function postHistoryOrderTracking(tracking, windowId, status = "checked") 
         recipient: order.recipient || "",
         order_status: order.status || "",
         order_date: order.order_date || "",
+        otp: packages.find((pkg) => pkg.otp)?.otp || "",
         products: order.products || order.items || [],
         items: order.items || order.products || [],
         packages: packages.length ? packages : [{
@@ -1629,6 +1630,10 @@ async function handleHistoryPackageTracking(message, windowId) {
     Array.isArray(queuedPackage.products) ? queuedPackage.products : [],
     Array.isArray(pagePackage.products) ? pagePackage.products : [],
   );
+  if (message.otp || pagePackage.otp) {
+    packageData.otp = message.otp || pagePackage.otp || "";
+    packageData.otp_required = true;
+  }
   order.capturedPackages = Array.isArray(order.capturedPackages) ? order.capturedPackages : [];
   order.capturedPackages[Number(order.packageIndex || 0)] = packageData;
   order.packageIndex = Number(order.packageIndex || 0) + 1;
@@ -1717,10 +1722,45 @@ async function openHeadlessSignin() {
   return result;
 }
 
-async function handleOrderPackages(message, windowId) {
+function messageFromActiveTrackingTab(tracking = {}, sender = {}) {
+  const activeTabId = Number(tracking.trackingTabId || tracking.autoTrackingTabId || 0);
+  const senderTabId = Number(sender?.tab?.id || 0);
+  return !activeTabId || !senderTabId || activeTabId === senderTabId;
+}
+
+async function handleOrderPackages(message, windowId, sender = {}) {
+  const { tracking, headlessTrackingMode } = await getWindowState(windowId);
+  const standaloneTab = tracking.running && !messageFromActiveTrackingTab(tracking, sender);
+  if (standaloneTab) {
+    const amazonOrderId = String(message.amazonOrderId || "").trim();
+    if (!amazonOrderId) return { ok: false, message: "Could not detect the Amazon order id on this order page." };
+    try {
+      await postGuardedTrackingUpdate(
+        amazonOrderId,
+        {
+          amazon_order_url: message.amazonOrderUrl || orderUrl({ amazon_order_id: amazonOrderId }),
+          recipient: message.recipient || "",
+          order_status: message.orderStatus || "",
+          products: message.products || [],
+          items: message.products || [],
+          packages: message.packages || [],
+        },
+        { timeoutMs: 18000, retries: 0 },
+        windowId,
+      );
+      await log(`Standalone Amazon order page ${amazonOrderId} posted while another tracking tab was running.`, windowId);
+      return { ok: true, recovered: true, message: `Posted package/product metadata for ${amazonOrderId}.` };
+    } catch (error) {
+      if (isTrackedOrderNotFoundError(error)) {
+        await logUnmatchedTrackingOrder(amazonOrderId, windowId, "standalone order page");
+        return { ok: true, ignored: true, unmatched: true, message: `Skipped ${amazonOrderId}; it is not linked in the app.` };
+      }
+      await log(`Could not save standalone order page ${amazonOrderId}: ${error.message}.`, windowId);
+      return { ok: false, message: error.message };
+    }
+  }
   const historyResult = await handleHistoryOrderPackages(message, windowId);
   if (historyResult) return historyResult;
-  const { tracking, headlessTrackingMode } = await getWindowState(windowId);
   if ((message.paymentRevisionNeeded || message.orderCancelled) && (!tracking.running || tracking.orders?.[tracking.index]?.amazon_order_id !== message.amazonOrderId)) {
     if (headlessTrackingMode && tracking.running) {
       return { ok: true, ignored: true, message: "Headless tracking mode is active; visible Amazon pages are ignored." };
@@ -1934,12 +1974,15 @@ async function handleOrderPackages(message, windowId) {
   return { ok: true };
 }
 
-async function handlePackageTracking(message, windowId) {
+async function handlePackageTracking(message, windowId, sender = {}) {
+  const { tracking, headlessTrackingMode } = await getWindowState(windowId);
+  if (tracking.running && !messageFromActiveTrackingTab(tracking, sender)) {
+    return postStandalonePackageTracking(message, windowId);
+  }
   const historyResult = await handleHistoryPackageTracking(message, windowId);
   if (historyResult) return historyResult;
   const historyRecovery = await recoverHistoryFromStalePackagePage(message, windowId);
   if (historyRecovery) return historyRecovery;
-  const { tracking, headlessTrackingMode } = await getWindowState(windowId);
   if (!tracking.running && headlessTrackingMode) return postStandalonePackageTracking(message, windowId);
   if (!tracking.running) return postStandalonePackageTracking(message, windowId);
   if (tracking.source === "history") {
@@ -1980,6 +2023,10 @@ async function handlePackageTracking(message, windowId) {
     packageData.payment_revision_url = message.paymentRevisionUrl || "";
     packageData.page_text = message.pageText || "";
   }
+  if (message.otp || pagePackage.otp) {
+    packageData.otp = message.otp || pagePackage.otp || "";
+    packageData.otp_required = true;
+  }
   tracking.packages[tracking.packageIndex] = packageData;
   tracking.packageIndex += 1;
   tracking.lastActivityAt = Date.now();
@@ -2005,6 +2052,7 @@ async function handlePackageTracking(message, windowId) {
         recipient: order.recipient || "",
         order_status: order.status || "",
         order_date: order.order_date || "",
+        otp: tracking.packages.find((pkg) => pkg.otp)?.otp || "",
         products: order.products || order.items || [],
         items: order.items || order.products || [],
         packages: tracking.packages,
@@ -2038,12 +2086,17 @@ async function postStandalonePackageTracking(message, windowId) {
     payloadPackage.payment_revision_url = message.paymentRevisionUrl || "";
     payloadPackage.page_text = message.pageText || "";
   }
+  if (message.otp || payloadPackage.otp) {
+    payloadPackage.otp = message.otp || payloadPackage.otp || "";
+    payloadPackage.otp_required = true;
+  }
   const statusOnly = Boolean(payloadPackage.status_only && !payloadPackage.tracking_id);
   try {
     await postGuardedTrackingUpdate(
       amazonOrderId,
       {
         amazon_order_url: `https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(amazonOrderId)}`,
+        otp: payloadPackage.otp || "",
         packages: [payloadPackage],
         payment_revision_needed: Boolean(payloadPackage.payment_revision_needed),
         payment_revision_url: payloadPackage.payment_revision_url || "",
@@ -2170,7 +2223,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
-    if (message.type === "GET_STATE") return getWindowState(windowId);
+    if (message.type === "GET_STATE") {
+      return { ...(await getWindowState(windowId)), senderTabId: Number(sender?.tab?.id || 0) || 0 };
+    }
     if (message.type === "CONTENT_LOG") {
       await log(message.message || "Amazon content script reported activity.", windowId);
       return { ok: true };
@@ -2222,8 +2277,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "GET_HEADLESS_TRACKING_STATUS") return headlessTrackingStatus();
     if (message.type === "CHECK_HEADLESS_TRACKING_READINESS") return headlessTrackingReadiness();
     if (message.type === "OPEN_HEADLESS_SIGNIN") return openHeadlessSignin();
-    if (message.type === "ORDER_PACKAGES") return handleOrderPackages(message, windowId);
-    if (message.type === "PACKAGE_TRACKING") return handlePackageTracking(message, windowId);
+    if (message.type === "ORDER_PACKAGES") return handleOrderPackages(message, windowId, sender);
+    if (message.type === "PACKAGE_TRACKING") return handlePackageTracking(message, windowId, sender);
     if (message.type === "ORDER_HISTORY_TRACK_ALL_PAGE") return handleHistoryTrackPage(message, windowId);
     if (message.type === "ORDER_HISTORY_TRACK_ALL_PROBLEM") return handleHistoryTrackProblem(message, windowId);
     if (message.type === "FORCE_ADVANCE_HISTORY_ORDER") return forceAdvanceHistoryOrder(message, windowId);
