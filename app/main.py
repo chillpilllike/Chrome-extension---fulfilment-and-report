@@ -20616,16 +20616,36 @@ def amazon_otp_rows(q: str = "", record_ids: Optional[set[int]] = None) -> list[
             LIMIT 500
             """
         ).fetchall()
-        lines = conn.execute(
-            """
-            SELECT amazon_order_id, odoo_order_name, store_id, tracking_status, tracking_payload, tracking_checked_at, state
-            FROM order_lines
-            WHERE COALESCE(amazon_order_id, '') != ''
-            """
-        ).fetchall()
+        otp_order_ids = sorted({clean_text(row["amazon_order_id"]) for row in records if clean_text(row["amazon_order_id"])})
+        lines = []
+        if otp_order_ids:
+            placeholders = ",".join("?" for _ in otp_order_ids)
+            lines = conn.execute(
+                f"""
+                SELECT amazon_order_id, odoo_order_name, store_id, tracking_status, tracking_payload, tracking_checked_at, state
+                FROM order_lines
+                WHERE amazon_order_id IN ({placeholders})
+                """,
+                otp_order_ids,
+            ).fetchall()
+        dispatch_packages = []
+        if otp_order_ids:
+            placeholders = ",".join("?" for _ in otp_order_ids)
+            dispatch_packages = conn.execute(
+                f"""
+                SELECT amazon_order_id, odoo_order_name, store_id, scan_code, display_code, canonical_scan_code,
+                       package_status, promise, carrier, tracking_url, updated_at
+                FROM amazon_dispatch_packages
+                WHERE amazon_order_id IN ({placeholders})
+                """,
+                otp_order_ids,
+            ).fetchall()
     lines_by_order: dict[str, list[dict[str, Any]]] = {}
     for line in rows_to_dicts(lines):
         lines_by_order.setdefault(clean_text(line.get("amazon_order_id")), []).append(line)
+    dispatch_packages_by_order: dict[str, list[dict[str, Any]]] = {}
+    for package in rows_to_dicts(dispatch_packages):
+        dispatch_packages_by_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
     stores = {int(store["id"]): store for store in list_stores()}
     results: list[dict[str, Any]] = []
     for record in rows_to_dicts(records):
@@ -20658,6 +20678,37 @@ def amazon_otp_rows(q: str = "", record_ids: Optional[set[int]] = None) -> list[
                             packages.append(package)
             except Exception:
                 pass
+        for dispatch_package in dispatch_packages_by_order.get(order_id, []):
+            odoo_name = clean_text(dispatch_package.get("odoo_order_name"))
+            if odoo_name and odoo_name not in odoo_order_names:
+                odoo_order_names.append(odoo_name)
+            status = clean_text(dispatch_package.get("package_status") or dispatch_package.get("promise"))
+            if status and status not in statuses:
+                statuses.append(status)
+            if dispatch_package.get("updated_at") and not checked_at:
+                checked_at = dispatch_package.get("updated_at")
+            store = stores.get(int(dispatch_package.get("store_id") or 0))
+            if store and store["name"] not in store_names:
+                store_names.append(store["name"])
+            tracking_candidates = [
+                dispatch_package.get("scan_code"),
+                dispatch_package.get("display_code"),
+                dispatch_package.get("canonical_scan_code"),
+            ]
+            tracking_id = ""
+            for candidate in tracking_candidates:
+                candidate_text = clean_text(candidate)
+                if candidate_text and candidate_text.lower() not in {"amazon tracking page", "tracking page"}:
+                    tracking_id = candidate_text
+                    break
+            package = {
+                "tracking_id": tracking_id,
+                "carrier": clean_text(dispatch_package.get("carrier")),
+                "status": status,
+                "tracking_url": clean_text(dispatch_package.get("tracking_url")),
+            }
+            if any(package.values()) and package not in packages:
+                packages.append(package)
         tracking_numbers = []
         carriers = []
         for package in packages:
@@ -28899,7 +28950,9 @@ def api_amazon_otp(q: str = "", page: int = 1, per_page: int = 100) -> dict[str,
         return cached
     search_engine = "postgres"
     try:
-        if q.strip():
+        if re.fullmatch(r"\d{3}-\d{7}-\d{7}", q.strip()):
+            rows = amazon_otp_rows(q)
+        elif q.strip():
             result = typesense_search_documents(
                 "amazon_otp_records",
                 q,

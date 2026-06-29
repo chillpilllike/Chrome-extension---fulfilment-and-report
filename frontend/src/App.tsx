@@ -7721,6 +7721,8 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
                           </button>
                         </div>
                       ))
+                    ) : row.tracking_url ? (
+                      <span className="text-muted-foreground">Amazon tracking email link captured</span>
                     ) : (
                       <span className="text-muted-foreground">Pending Chrome scan</span>
                     )}
