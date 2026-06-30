@@ -2767,6 +2767,7 @@ function App() {
   const [epostStatusFilter, setEpostStatusFilter] = useState("all")
   const [epostStaleDays, setEpostStaleDays] = useState("10")
   const [epostStaleOnly, setEpostStaleOnly] = useState(false)
+  const [epostQuery, setEpostQuery] = useState("")
   const [epostLoading, setEpostLoading] = useState(false)
   const epostRequestRef = useRef(0)
   const [trackingOrders] = useState<TrackingOrder[]>([])
@@ -3450,7 +3451,7 @@ function App() {
     if (page !== "epost") return
     const requestId = ++epostRequestRef.current
     setEpostLoading(true)
-    api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking${pagedQuery(storeId, epostPage, { status: epostStatusFilter, stale_days: epostStaleDays || "10", stale_only: epostStaleOnly ? "true" : "false" })}`)
+    api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking${pagedQuery(storeId, epostPage, { status: epostStatusFilter, stale_days: epostStaleDays || "10", stale_only: epostStaleOnly ? "true" : "false", q: epostQuery })}`)
       .then((result) => {
         if (requestId !== epostRequestRef.current) return
         setEpostRows(result.rows)
@@ -3460,7 +3461,7 @@ function App() {
       .finally(() => {
         if (requestId === epostRequestRef.current) setEpostLoading(false)
       })
-  }, [page, storeId, epostPage, epostStatusFilter, epostStaleDays, epostStaleOnly])
+  }, [page, storeId, epostPage, epostStatusFilter, epostStaleDays, epostStaleOnly, epostQuery])
 
   useEffect(() => {
     if (page !== "bulk" || !storeId) return
@@ -5144,11 +5145,13 @@ function App() {
             statusFilter={epostStatusFilter}
             staleDays={epostStaleDays}
             staleOnly={epostStaleOnly}
+            query={epostQuery}
             initialLoading={epostLoading}
             onPage={setEpostPage}
             onStatusFilter={(value) => { setEpostStatusFilter(value); setEpostStaleOnly(value === "suspected_lost"); setEpostPage(1) }}
             onStaleDays={(value) => { setEpostStaleDays(value); setEpostStatusFilter("suspected_lost"); setEpostStaleOnly(true); setEpostPage(1) }}
             onStaleOnly={(value) => { setEpostStaleOnly(value); if (value) setEpostStatusFilter("suspected_lost"); setEpostPage(1) }}
+            onQuery={(value) => { setEpostQuery(value); setEpostPage(1); setEpostSelectAll(false); setEpostSelected([]) }}
             selected={epostSelected}
             selectAll={epostSelectAll}
             onSelected={setEpostSelected}
@@ -8979,11 +8982,13 @@ function EpostTrackingPage({
   statusFilter,
   staleDays,
   staleOnly,
+  query,
   initialLoading,
   onPage,
   onStatusFilter,
   onStaleDays,
   onStaleOnly,
+  onQuery,
   selected,
   selectAll,
   onSelected,
@@ -8999,11 +9004,13 @@ function EpostTrackingPage({
   statusFilter: string
   staleDays: string
   staleOnly: boolean
+  query: string
   initialLoading: boolean
   onPage: (page: number) => void
   onStatusFilter: (value: string) => void
   onStaleDays: (value: string) => void
   onStaleOnly: (value: boolean) => void
+  onQuery: (value: string) => void
   selected: number[]
   selectAll: boolean
   onSelected: (ids: number[]) => void
@@ -9049,14 +9056,15 @@ function EpostTrackingPage({
   async function refresh() {
     setLoading(true)
     try {
-      const query = new URLSearchParams()
-      if (storeId) query.set("store_id", storeId)
-      query.set("page", String(page))
-      query.set("per_page", String(PAGE_SIZE))
-      query.set("status", statusFilter)
-      query.set("stale_days", staleDays || "10")
-      query.set("stale_only", staleOnly ? "true" : "false")
-      const result = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${query.toString()}`)
+      const params = new URLSearchParams()
+      if (storeId) params.set("store_id", storeId)
+      params.set("page", String(page))
+      params.set("per_page", String(PAGE_SIZE))
+      params.set("status", statusFilter)
+      params.set("stale_days", staleDays || "10")
+      params.set("stale_only", staleOnly ? "true" : "false")
+      if (query.trim()) params.set("q", query.trim())
+      const result = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${params.toString()}`)
       onRows(result.rows, result.total || 0)
     } catch (error) {
       onResult({ ok: false, title: "ePost Tracking Load Failed", message: String(error) })
@@ -9072,14 +9080,15 @@ function EpostTrackingPage({
         body: JSON.stringify({ store_id: Number(storeId), days: Number(syncDays || 2) }),
       })
       onPage(1)
-      const query = new URLSearchParams()
-      if (storeId) query.set("store_id", storeId)
-      query.set("page", "1")
-      query.set("per_page", String(PAGE_SIZE))
-      query.set("status", statusFilter)
-      query.set("stale_days", staleDays || "10")
-      query.set("stale_only", staleOnly ? "true" : "false")
-      const refreshed = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${query.toString()}`)
+      const params = new URLSearchParams()
+      if (storeId) params.set("store_id", storeId)
+      params.set("page", "1")
+      params.set("per_page", String(PAGE_SIZE))
+      params.set("status", statusFilter)
+      params.set("stale_days", staleDays || "10")
+      params.set("stale_only", staleOnly ? "true" : "false")
+      if (query.trim()) params.set("q", query.trim())
+      const refreshed = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${params.toString()}`)
       onRows(refreshed.rows, refreshed.total || 0)
       onResult({ ok: true, title: "ePost Sync", message: result.message })
     } catch (error) {
@@ -9143,6 +9152,15 @@ function EpostTrackingPage({
             <option value="lost">Lost</option>
             <option value="delivered">Delivered</option>
           </SelectField>
+          <div className="w-full min-w-[260px] md:w-[360px]">
+            <Label htmlFor="epost-search">Search</Label>
+            <SearchBox
+              className="w-full"
+              value={query}
+              onChange={onQuery}
+              placeholder="Any ePost field, order, tracking, AWB..."
+            />
+          </div>
           <div className="w-32">
             <Label htmlFor="epost-stale-days">Suspect after days</Label>
             <Input
@@ -9181,7 +9199,7 @@ function EpostTrackingPage({
       ) : null}
       <div className="border-t px-6 py-3">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <ExportControls view="epost" storeId={storeId} columns={epostExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ status: statusFilter, stale_days: staleDays || "10", stale_only: staleOnly ? "true" : "false" }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
+          <ExportControls view="epost" storeId={storeId} columns={epostExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ status: statusFilter, stale_days: staleDays || "10", stale_only: staleOnly ? "true" : "false", q: query }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
           <PaginationControls page={page} total={total} onPage={onPage} disabled={isLoading} />
         </div>
       </div>
@@ -12756,6 +12774,9 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
     const counters = job.progress?.counters || job.counters || {}
     const added = Math.max(0, Number(counters.tracking_codes_added || 0))
     const wouldAdd = Math.max(0, Number(counters.tracking_codes_would_add || 0))
+    const replaced = Math.max(0, Number(counters.tracking_codes_replaced || 0))
+    const wouldReplace = Math.max(0, Number(counters.tracking_codes_would_replace || 0))
+    const pickingsReplaced = Math.max(0, Number(counters.tracking_pickings_replaced || 0))
     const alreadySynced = Math.max(0, Number(counters.skipped_already || 0))
     const alreadyPresent = Math.max(0, Number(counters.skipped_no_update_needed || 0))
     const fulfilled = Math.max(0, Number(counters.processed_fulfillments || 0))
@@ -12764,7 +12785,7 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
     const trackingSeen = Math.max(0, fulfilled - outOfRange - noTracking)
     const percent = total ? Math.max(0, Math.min(100, Math.round((processed / total) * 100))) : job.status === "completed" ? 100 : 0
     const running = job.status === "running" || job.status === "queued" || job.status === "cancel_requested"
-    return { processed, total, percent, running, added, wouldAdd, alreadySynced, alreadyPresent, trackingSeen }
+    return { processed, total, percent, running, added, wouldAdd, replaced, wouldReplace, pickingsReplaced, alreadySynced, alreadyPresent, trackingSeen }
   }
   function reportName(path?: string) {
     if (!path) return ""
@@ -12902,6 +12923,11 @@ function ShopifyTrackingSyncPage({ onResult }: { onResult: (modal: ModalState) =
                       <div className="mb-1 text-xs font-medium text-emerald-700">
                         New tracking codes added: {progress.added.toLocaleString()}
                         {job.dry_run ? <span className="text-muted-foreground"> · Would add: {progress.wouldAdd.toLocaleString()}</span> : null}
+                      </div>
+                      <div className="mb-1 text-xs font-medium text-amber-700">
+                        Mismatched tracking codes replaced: {progress.replaced.toLocaleString()}
+                        {progress.pickingsReplaced ? <span className="text-muted-foreground"> · Pickings: {progress.pickingsReplaced.toLocaleString()}</span> : null}
+                        {job.dry_run ? <span className="text-muted-foreground"> · Would replace: {progress.wouldReplace.toLocaleString()}</span> : null}
                       </div>
                       <div className="mb-1 text-xs text-muted-foreground">
                         In-range tracking fulfillments: {progress.trackingSeen.toLocaleString()}

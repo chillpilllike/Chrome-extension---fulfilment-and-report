@@ -292,6 +292,10 @@ def merge_tracking_text(existing: str, desired: str) -> str:
             labels[key] = text
             merged.append(key)
     return ", ".join(labels[key] for key in merged)
+
+
+def has_tracking_text(value: str) -> bool:
+    return bool(tracking_parts(value))
 # ----------------------------
 # SQLite state (read-only support)
 # ----------------------------
@@ -1119,8 +1123,12 @@ def main():
         "synced": 0,
         "tracking_codes_added": 0,
         "tracking_codes_would_add": 0,
+        "tracking_codes_replaced": 0,
+        "tracking_codes_would_replace": 0,
         "tracking_pickings_updated": 0,
         "tracking_pickings_would_update": 0,
+        "tracking_pickings_replaced": 0,
+        "tracking_pickings_would_replace": 0,
         "validated": 0,
         "validation_failed": 0,
         "skipped_already": 0,
@@ -1436,6 +1444,7 @@ def main():
                     picking_existing = []
                     update_needed_ids = []
                     picking_existing_by_id = {}
+                    replacement_needed_ids = []
                     for p in pickings:
                         pid = p.get("id")
                         stt = p.get("state")
@@ -1450,6 +1459,8 @@ def main():
                             continue
                         if tracking_matches(existing, tracking_text):
                             continue
+                        if has_tracking_text(existing):
+                            replacement_needed_ids.append(str(pid))
                         update_needed_ids.append(str(pid))
 
                     if not update_needed_ids:
@@ -1516,18 +1527,25 @@ def main():
                     if dry_run:
                         updated_ids = update_needed_ids[:]  # what would update
                         if updated_ids:
-                            add_counter("tracking_codes_would_add", len(tracking_numbers))
+                            replacing_count = len([pid for pid in updated_ids if pid in replacement_needed_ids])
+                            adding_count = max(0, len(updated_ids) - replacing_count)
+                            add_counter("tracking_codes_would_add", len(tracking_numbers) * adding_count)
+                            add_counter("tracking_codes_would_replace", len(tracking_numbers) * replacing_count)
                             add_counter("tracking_pickings_would_update", len(updated_ids))
+                            add_counter("tracking_pickings_would_replace", replacing_count)
                     else:
                         for pid in update_needed_ids:
                             check_cancelled()
-                            merged_tracking_text = merge_tracking_text(picking_existing_by_id.get(str(pid), ""), tracking_text)
-                            ok = oc.write_picking_tracking(int(pid), merged_tracking_text, carrier_id=carrier_id, append_note=note_append)
+                            ok = oc.write_picking_tracking(int(pid), tracking_text, carrier_id=carrier_id, append_note=note_append)
                             if ok:
                                 updated_ids.append(pid)
                         if updated_ids:
-                            add_counter("tracking_codes_added", len(tracking_numbers))
+                            replacing_count = len([pid for pid in updated_ids if pid in replacement_needed_ids])
+                            adding_count = max(0, len(updated_ids) - replacing_count)
+                            add_counter("tracking_codes_added", len(tracking_numbers) * adding_count)
+                            add_counter("tracking_codes_replaced", len(tracking_numbers) * replacing_count)
                             add_counter("tracking_pickings_updated", len(updated_ids))
+                            add_counter("tracking_pickings_replaced", replacing_count)
 
                     validated_ids = []
                     validation_msgs = []
@@ -1561,6 +1579,15 @@ def main():
                         st.log_sync(src["shop"], src_order.get("id", ""), f_id, odoo_db, odoo_order)
 
                     add_counter("synced")
+                    action_message = (
+                        "Shopify tracking would replace mismatched Odoo tracking (strict TAG_DIRECT)"
+                        if dry_run and replacement_needed_ids
+                        else "Tracking would be written to Odoo pickings (strict TAG_DIRECT)"
+                        if dry_run
+                        else "Shopify tracking replaced mismatched Odoo tracking (strict TAG_DIRECT)"
+                        if replacement_needed_ids
+                        else "Tracking written to Odoo pickings (strict TAG_DIRECT)"
+                    )
                     append_csv_row(
                         report_csv,
                         {
@@ -1575,7 +1602,7 @@ def main():
                             "picking_update_needed_ids": ",".join(update_needed_ids),
                             "action": "DRYRUN_UPDATE" if dry_run else "UPDATE_PICKINGS",
                             "result": "OK",
-                            "message": "Tracking would be written to Odoo pickings (strict TAG_DIRECT)" if dry_run else "Tracking written to Odoo pickings (strict TAG_DIRECT)",
+                            "message": action_message,
                             "validated_picking_ids": ",".join(validated_ids) if (not dry_run and validate_deliveries) else "",
                             "validation_result": "OK" if (not dry_run and validate_deliveries and not validation_msgs) else ("PARTIAL" if (not dry_run and validate_deliveries and validation_msgs) else ""),
                             "validation_message": ";".join(validation_msgs)[:1000] if validation_msgs else ("Validated" if (not dry_run and validate_deliveries) else ""),

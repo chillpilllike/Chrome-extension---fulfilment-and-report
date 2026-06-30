@@ -727,6 +727,61 @@ def admin_access_bridge_response(request: Request) -> HTMLResponse:
     )
 
 
+def is_database_unavailable_error(exc: BaseException) -> bool:
+    if isinstance(exc, (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError, db_session.pool.PoolError)):
+        return True
+    text = str(exc).lower()
+    if "too many clients" in text or "could not get a postgresql connection" in text:
+        return True
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        return any(is_database_unavailable_error(child) for child in nested)
+    return False
+
+
+_DB_UNAVAILABLE_COOLDOWN_UNTIL = 0.0
+_DB_UNAVAILABLE_COOLDOWN_LOCK = threading.Lock()
+
+
+def database_unavailable_cooldown_active(request: Request) -> bool:
+    if request.url.path != "/api/chrome/jobs/recover-submitted":
+        return False
+    with _DB_UNAVAILABLE_COOLDOWN_LOCK:
+        return time.monotonic() < _DB_UNAVAILABLE_COOLDOWN_UNTIL
+
+
+def database_unavailable_response(request: Request, update_cooldown: bool = True) -> Response:
+    global _DB_UNAVAILABLE_COOLDOWN_UNTIL
+    db_session.close_pool()
+    if update_cooldown:
+        with _DB_UNAVAILABLE_COOLDOWN_LOCK:
+            _DB_UNAVAILABLE_COOLDOWN_UNTIL = time.monotonic() + 10
+    message = "Database is temporarily busy. Please retry in a minute."
+    if request.url.path.startswith("/api/"):
+        return Response(
+            json.dumps({"ok": False, "detail": message}),
+            status_code=503,
+            media_type="application/json",
+        )
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Database Busy</title>
+    <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+  </head>
+  <body>
+    <main class="container py-5">
+      <div class="alert alert-warning">{html.escape(message)}</div>
+    </main>
+  </body>
+</html>""",
+        status_code=503,
+    )
+
+
 @app.middleware("http")
 async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     token = effective_admin_access_token()
@@ -746,7 +801,14 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
         supplied = supplied_admin_access_token(request)
         if supplied != token and supplied != MASTER_ADMIN_ACCESS_TOKEN:
             return Response("Admin token required.", status_code=401)
-    return await call_next(request)
+    if database_unavailable_cooldown_active(request):
+        return database_unavailable_response(request, update_cooldown=False)
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        if is_database_unavailable_error(exc):
+            return database_unavailable_response(request)
+        raise
 
 
 def init_db() -> None:
@@ -15135,6 +15197,49 @@ def epost_tracking_rows(store_id: Optional[int] = None) -> list[dict[str, Any]]:
     return data
 
 
+def epost_tracking_row_matches_query(row: dict[str, Any], q: str) -> bool:
+    term = clean_text(q).lower()
+    if not term:
+        return True
+    term_digits = re.sub(r"\D+", "", term)
+    values: list[str] = []
+    for key, value in row.items():
+        if key == "events_json" or value is None:
+            continue
+        if isinstance(value, (dict, list, tuple)):
+            values.append(json.dumps(value, default=str))
+        else:
+            values.append(str(value))
+    searchable = " ".join(values).lower()
+    if term in searchable:
+        return True
+    searchable_digits = re.sub(r"\D+", "", searchable)
+    return bool(term_digits and term_digits in searchable_digits)
+
+
+def filter_epost_tracking_rows(
+    rows: list[dict[str, Any]],
+    status: str,
+    stale_days: int,
+    stale_only: bool,
+    q: str = "",
+) -> list[dict[str, Any]]:
+    status = clean_text(status or "all").lower()
+    for row in rows:
+        annotate_epost_staleness(row, stale_days)
+    if status == "pending":
+        rows = [row for row in rows if row.get("epost_status") not in {"delivered", "lost"}]
+    elif status in {"active", "not_delivered"}:
+        rows = [row for row in rows if row.get("epost_status") != "delivered"]
+    elif status in {"delivered", "lost"}:
+        rows = [row for row in rows if row.get("epost_status") == status]
+    if stale_only or status in {"suspected_lost", "stale"}:
+        rows = [row for row in rows if row.get("suspected_lost")]
+    if clean_text(q):
+        rows = [row for row in rows if epost_tracking_row_matches_query(row, q)]
+    return rows
+
+
 def paged_epost_tracking_rows(
     store_id: Optional[int] = None,
     page: int = 1,
@@ -15142,38 +15247,16 @@ def paged_epost_tracking_rows(
     status: str = "all",
     stale_days: int = 10,
     stale_only: bool = False,
+    q: str = "",
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     refresh_epost_lost_statuses(store_id)
     page, per_page, offset = pagination_bounds(page, per_page)
     status = clean_text(status or "all").lower()
     stale_days = max(1, min(90, int(stale_days or 10)))
-    if stale_only or status in {"suspected_lost", "stale"}:
-        with db() as conn:
-            rows = rows_to_dicts(conn.execute(
-                """
-                SELECT epost_global_tracking.*
-                FROM epost_global_tracking
-                WHERE (? IS NULL OR store_id=?)
-                ORDER BY
-                  CASE WHEN epost_status='lost' THEN 0 ELSE 1 END,
-                  CASE WHEN epost_status='delivered' THEN 1 ELSE 0 END,
-                  last_checked_at IS NULL DESC,
-                  last_checked_at ASC,
-                  updated_at DESC
-                """,
-                (store_id, store_id),
-            ).fetchall())
-        for row in rows:
-            annotate_epost_staleness(row, stale_days)
-        if status == "pending":
-            rows = [row for row in rows if row.get("epost_status") not in {"delivered", "lost"}]
-        elif status in {"active", "not_delivered"}:
-            rows = [row for row in rows if row.get("epost_status") != "delivered"]
-        elif status in {"delivered", "lost"}:
-            rows = [row for row in rows if row.get("epost_status") == status]
-        rows = [row for row in rows if row.get("suspected_lost")]
+    if clean_text(q) or stale_only or status in {"suspected_lost", "stale"}:
+        rows = filter_epost_tracking_rows(epost_tracking_rows(store_id), status, stale_days, stale_only, q)
         paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
-        return epost_tracking_rows_by_ids([int(row["id"]) for row in paged_rows], stale_days), total, page, per_page
+        return paged_rows, total, page, per_page
     status_clause = ""
     params: list[Any] = [store_id, store_id]
     if status == "pending":
@@ -15747,19 +15830,8 @@ def export_queryset(view: str, store_id: Optional[int], selected_ids: list[Union
         status = clean_text(str(filters.get("status") or "all"))
         stale_days = max(1, min(90, int(filters.get("stale_days") or 10)))
         stale_only = str(filters.get("stale_only") or "").strip().lower() in {"1", "true", "yes", "on"}
-        data = epost_tracking_rows(store_id)
-        for row in data:
-            annotate_epost_staleness(row, stale_days)
-        if status == "pending":
-            data = [row for row in data if row.get("epost_status") not in {"delivered", "lost"}]
-        elif status in {"active", "not_delivered"}:
-            data = [row for row in data if row.get("epost_status") != "delivered"]
-        elif status in {"suspected_lost", "stale"}:
-            data = [row for row in data if row.get("suspected_lost")]
-        elif status in {"delivered", "lost"}:
-            data = [row for row in data if row.get("epost_status") == status]
-        if stale_only:
-            data = [row for row in data if row.get("suspected_lost")]
+        query_text = clean_text(str(filters.get("q") or ""))
+        data = filter_epost_tracking_rows(epost_tracking_rows(store_id), status, stale_days, stale_only, query_text)
     elif view == "duplicate_tracking":
         data = duplicate_tracking_rows(store_id, clean_text(str(filters.get("q") or "")))
     elif view == "tracking":
@@ -17446,14 +17518,18 @@ class PostgresShopifyTrackingStateDB:
 
     def _with_db_retry(self, operation: Callable[[], Any]) -> Any:
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(5):
             try:
                 return operation()
-            except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
+            except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError, RuntimeError) as exc:
                 last_error = exc
+                text = str(exc).lower()
+                if "pool exhausted" in text or "connection pool exhausted" in text:
+                    time.sleep(0.35 * (attempt + 1))
+                    continue
                 db_session.close_pool()
-                if attempt == 0:
-                    time.sleep(0.25)
+                if attempt < 4:
+                    time.sleep(0.25 * (attempt + 1))
                     continue
                 raise
         if last_error:
@@ -17524,6 +17600,16 @@ class PostgresShopifyTrackingStateDB:
                 )
 
         self._with_db_retry(operation)
+
+
+def shopify_tracking_worker_count(settings: dict[str, str]) -> int:
+    requested = max(1, min(16, int(float(settings.get("shopify_tracking_workers") or 8))))
+    try:
+        pool_max = int(os.getenv("POSTGRES_POOL_MAX", "30") or 30)
+    except Exception:
+        pool_max = 30
+    db_safe_limit = max(1, pool_max - 2)
+    return max(1, min(requested, db_safe_limit, 4))
 
 
 def shopify_route_script_config(route: str) -> tuple[Any, str, str]:
@@ -18571,8 +18657,23 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
 
 def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait: bool = False) -> int:
     groups: dict[int, set[str]] = {}
+    now = datetime.now(timezone.utc)
     for row in rows:
-        if clean_text(row.get("shopify_synced_at")) or clean_text(row.get("shopify_status_synced_at")):
+        synced_at_text = clean_text(row.get("shopify_synced_at") or row.get("shopify_status_synced_at"))
+        status_text = clean_text(row.get("shopify_fulfillment_status")).lower()
+        cancelled_at = clean_text(row.get("shopify_cancelled_at"))
+        synced_at = parse_iso_date(synced_at_text)
+        stale_status = bool(
+            synced_at
+            and (now - synced_at).total_seconds() >= 1800
+            and not cancelled_at
+            and (
+                not status_text
+                or status_text in {"unfulfilled", "partial", "partially_fulfilled"}
+                or ("fulfilled" in status_text and not clean_text(row.get("shopify_fulfillment_at")))
+            )
+        )
+        if synced_at_text and not stale_status:
             continue
         store_id = parse_optional_int(row.get("store_id"))
         order_name = clean_text(row.get("odoo_order_name")).upper()
@@ -20057,7 +20158,7 @@ def run_shopify_tracking_job(job_id: str) -> None:
         "--report-csv",
         report_csv,
         "--workers",
-        str(max(1, min(16, int(float(settings.get("shopify_tracking_workers") or 8))))),
+        str(shopify_tracking_worker_count(settings)),
     ]
     if int(job["dry_run"] or 0):
         argv.append("--dry-run")
@@ -20853,6 +20954,14 @@ def amazon_otp_rows(q: str = "", record_ids: Optional[set[int]] = None) -> list[
         package_text = json.dumps(packages, default=str).lower()
         if order_lines and ("delivered" in status_text or "delivered" in package_text):
             continue
+        last_updated = max(
+            [value for value in [clean_text(record.get("updated_at")), clean_text(checked_at)] if value],
+            default=clean_text(record.get("updated_at")),
+        )
+        if record.get("otp"):
+            match_status = "matched" if tracking_numbers or record.get("tracking_url") else "needs tracking"
+        else:
+            match_status = "tracking captured" if tracking_numbers else "waiting for OTP"
         row = {
             **record,
             "store_names": ", ".join(store_names),
@@ -20862,8 +20971,9 @@ def amazon_otp_rows(q: str = "", record_ids: Optional[set[int]] = None) -> list[
             "tracking_numbers": ", ".join(tracking_numbers),
             "carriers": ", ".join(carriers),
             "package_count": len(packages),
+            "updated_at": last_updated,
             "amazon_order_url": order_line_amazon_url(order_id),
-            "match_status": "matched" if record.get("otp") and (tracking_numbers or record.get("tracking_url")) else "needs tracking" if record.get("otp") else "waiting for OTP",
+            "match_status": match_status,
         }
         searchable = " ".join(str(row.get(key) or "") for key in ("amazon_order_id", "otp", "tracking_numbers", "carriers", "odoo_order_names", "product_summary", "recipient")).lower()
         searchable_digits = re.sub(r"\D+", "", searchable)
@@ -28967,23 +29077,24 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/api/epost/tracking")
-def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", stale_days: int = 10, stale_only: bool = False) -> dict[str, Any]:
+def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", stale_days: int = 10, stale_only: bool = False, q: str = "") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
     status = clean_text(status or "all").lower()
     stale_days = max(1, min(90, int(stale_days or 10)))
+    q = clean_text(q)
     search_engine = "postgres"
-    cache_key = ("epost-tracking", store_id, page, per_page, status, stale_days, bool(stale_only))
+    cache_key = ("epost-tracking", store_id, page, per_page, status, stale_days, bool(stale_only), q)
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
     try:
-        rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only)
+        rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only, q)
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail=f"ePost tracking rows are temporarily unavailable. Please refresh again shortly. {clean_error_message(exc)}",
         ) from exc
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only}, 90)
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only, "q": q}, 90)
 
 
 @app.post("/api/epost/tracking/{tracking_id}/refund")
