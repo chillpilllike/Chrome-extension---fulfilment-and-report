@@ -547,7 +547,10 @@ def extract_customer_phone(
             fallback = "+" + fallback[2:]
         if fallback and not _valid_e164(fallback):
             fallback = ""
-        return raw, normalized or fallback or None
+        phone = normalized or fallback
+        if not phone:
+            continue
+        return raw, phone
     return None, None
 
 
@@ -569,6 +572,21 @@ def apply_order_phone(payload: dict, phone: str | None, raw_phone: str | None = 
         if phone != raw_phone and not any(item.get("name") == "Customer phone (E164)" for item in attrs if isinstance(item, dict)):
             attrs.append({"name": "Customer phone (E164)", "value": phone})
         order["note_attributes"] = attrs
+
+
+def drop_order_phone_fields(payload: dict) -> bool:
+    order = payload.get("order") if isinstance(payload, dict) else None
+    if not isinstance(order, dict):
+        return False
+    changed = order.pop("phone", None) is not None
+    for key in ("shipping_address", "billing_address"):
+        address = order.get(key)
+        if isinstance(address, dict):
+            changed = address.pop("phone", None) is not None or changed
+    customer = order.get("customer")
+    if isinstance(customer, dict):
+        changed = customer.pop("phone", None) is not None or changed
+    return changed
 
 
 
@@ -1580,6 +1598,9 @@ class ShopifyClient:
                         o["billing_address"].pop("province", None)
                 except Exception:
                     pass
+                resp = self._request("POST", self.rest_base + "orders.json", payload)
+            elif _shopify_error_is_invalid_phone(msg) and drop_order_phone_fields(payload):
+                log("WARN", f"{self.name}: Shopify rejected order phone; retrying order create without validated phone fields")
                 resp = self._request("POST", self.rest_base + "orders.json", payload)
             else:
                 raise
