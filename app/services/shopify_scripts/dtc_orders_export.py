@@ -533,16 +533,21 @@ def extract_customer_phone(
     for partner, country in candidates:
         if not partner:
             continue
-        raw = partner.get("phone") or partner.get("mobile")
+        raw_value = partner.get("phone") or partner.get("mobile")
+        if isinstance(raw_value, bool):
+            continue
+        raw = raw_value
         raw = str(raw).strip() if raw is not None else ""
-        if not raw:
+        if not raw or raw.lower() in {"false", "none", "null", "nan"}:
             continue
         cc = partner_country_code(partner, country)
         normalized = normalize_phone(raw, cc)
         fallback = re.sub(r"[^\d+]", "", raw)
         if fallback.startswith("00"):
             fallback = "+" + fallback[2:]
-        return raw, normalized or fallback or raw
+        if fallback and not _valid_e164(fallback):
+            fallback = ""
+        return raw, normalized or fallback or None
     return None, None
 
 
