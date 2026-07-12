@@ -449,7 +449,7 @@ def normalize_email(email: str | None) -> str | None:
 
 
 COUNTRY_DIAL_CODES = {
-    "US": "1", "CA": "1",
+    "US": "1", "CA": "1", "UM": "1", "PR": "1", "VI": "1", "GU": "1", "AS": "1", "MP": "1",
     "GB": "44", "UK": "44",
     "AU": "61", "NZ": "64",
     "IN": "91",
@@ -457,6 +457,12 @@ COUNTRY_DIAL_CODES = {
     "DE": "49", "FR": "33", "IT": "39", "ES": "34", "NL": "31", "BE": "32",
     "SE": "46", "NO": "47", "DK": "45", "FI": "358", "CH": "41", "AT": "43",
     "AE": "971", "SA": "966", "SG": "65", "MY": "60", "HK": "852",
+    "LT": "370", "SI": "386", "JP": "81", "RO": "40", "CL": "56", "TR": "90",
+    "CZ": "420", "PL": "48", "PT": "351", "GR": "30", "HU": "36", "HR": "385",
+    "BG": "359", "SK": "421", "EE": "372", "LV": "371", "LU": "352", "MT": "356",
+    "CY": "357", "IL": "972", "ZA": "27", "KR": "82", "TH": "66", "PH": "63",
+    "ID": "62", "VN": "84", "CN": "86", "TW": "886", "MX": "52", "BR": "55",
+    "AR": "54", "CO": "57", "PE": "51",
 }
 
 
@@ -492,6 +498,72 @@ def normalize_phone(phone: str | None, country_code: str | None = None) -> str |
     if digits.startswith("0"):
         digits = digits[1:]
     return _valid_e164(dial + digits)
+
+
+def partner_country_code(partner: dict | None, country: dict | None) -> str:
+    if country and country.get("code"):
+        return str(country.get("code") or "").strip().upper()
+    if partner and isinstance(partner.get("country_id"), (list, tuple)) and len(partner.get("country_id") or []) >= 2:
+        name = str(partner.get("country_id")[1] or "").strip().upper()
+        aliases = {
+            "USA MINOR OUTLYING ISLANDS": "UM",
+            "UNITED STATES": "US",
+            "UNITED STATES OF AMERICA": "US",
+            "UNITED KINGDOM": "GB",
+            "TÜRKIYE": "TR",
+            "TURKEY": "TR",
+        }
+        return aliases.get(name, "")
+    return ""
+
+
+def extract_customer_phone(
+    *,
+    billing_partner: dict | None,
+    shipping_partner: dict | None,
+    partner_main: dict | None,
+    billing_country: dict | None,
+    shipping_country: dict | None,
+) -> tuple[str | None, str | None]:
+    candidates = [
+        (shipping_partner, shipping_country),
+        (billing_partner, billing_country),
+        (partner_main, shipping_country or billing_country),
+    ]
+    for partner, country in candidates:
+        if not partner:
+            continue
+        raw = partner.get("phone") or partner.get("mobile")
+        raw = str(raw).strip() if raw is not None else ""
+        if not raw:
+            continue
+        cc = partner_country_code(partner, country)
+        normalized = normalize_phone(raw, cc)
+        fallback = re.sub(r"[^\d+]", "", raw)
+        if fallback.startswith("00"):
+            fallback = "+" + fallback[2:]
+        return raw, normalized or fallback or raw
+    return None, None
+
+
+def apply_order_phone(payload: dict, phone: str | None, raw_phone: str | None = None) -> None:
+    if not isinstance(payload, dict) or not phone:
+        return
+    order = payload.get("order")
+    if not isinstance(order, dict):
+        return
+    order["phone"] = phone
+    for key in ("shipping_address", "billing_address"):
+        address = order.get(key)
+        if isinstance(address, dict):
+            address["phone"] = phone
+    if raw_phone:
+        attrs = order.get("note_attributes") or []
+        if not any(item.get("name") == "Customer phone (raw)" for item in attrs if isinstance(item, dict)):
+            attrs.append({"name": "Customer phone (raw)", "value": raw_phone})
+        if phone != raw_phone and not any(item.get("name") == "Customer phone (E164)" for item in attrs if isinstance(item, dict)):
+            attrs.append({"name": "Customer phone (E164)", "value": phone})
+        order["note_attributes"] = attrs
 
 
 
@@ -2001,9 +2073,13 @@ def build_order_payload(odoo: OdooClient, shop: ShopifyClient, state: StateDB, *
             partner_main = odoo.get_partner(int(p_ref[0]))
 
         email = normalize_email((billing_partner or {}).get("email") or (partner_main or {}).get("email"))
-        raw_phone = ( (billing_partner or {}).get("phone") or (billing_partner or {}).get("mobile") or (partner_main or {}).get("phone") or (partner_main or {}).get("mobile") )
-        raw_phone = (str(raw_phone).strip() if raw_phone is not None else None)
-        phone = normalize_phone(raw_phone, (billing_country or {}).get("code") or (shipping_country or {}).get("code"))
+        raw_phone, phone = extract_customer_phone(
+            billing_partner=billing_partner,
+            shipping_partner=shipping_partner,
+            partner_main=partner_main,
+            billing_country=billing_country,
+            shipping_country=shipping_country,
+        )
         full_name = ((billing_partner or {}).get("name") or (partner_main or {}).get("name") or "").strip()
         first_name, last_name = split_name(full_name)
         default_addr = odoo_partner_to_shopify_address(billing_partner or partner_main, billing_country, odoo)
@@ -2172,6 +2248,20 @@ def build_order_payload(odoo: OdooClient, shop: ShopifyClient, state: StateDB, *
         payload["order"]["customer"] = {"id": int(customer_id)}
     if shipping_address:
         payload["order"]["shipping_address"] = shipping_address
+    if billing_address:
+        payload["order"]["billing_address"] = billing_address
+    order_raw_phone, order_phone = (
+        (GENERIC_CUSTOMER_PHONE, normalize_phone(GENERIC_CUSTOMER_PHONE))
+        if ASSIGN_TO_GENERIC_CUSTOMER
+        else extract_customer_phone(
+            billing_partner=billing_partner,
+            shipping_partner=shipping_partner,
+            partner_main=partner_main if "partner_main" in locals() else None,
+            billing_country=billing_country,
+            shipping_country=shipping_country,
+        )
+    )
+    apply_order_phone(payload, order_phone, order_raw_phone)
 
     # ✅ MUST BE INSIDE FUNCTION
     # Apply shipping method rules (sets order.shipping_lines during creation)
@@ -2184,8 +2274,6 @@ def build_order_payload(odoo: OdooClient, shop: ShopifyClient, state: StateDB, *
 
     if sl:
         payload["order"]["shipping_lines"] = sl
-        if billing_address:
-            payload["order"]["billing_address"] = billing_address
         if SET_SHOPIFY_ORDER_CURRENCY and currency and currency.get("name"):
             payload["order"]["currency"] = currency.get("name")
         if MARK_AS_PAID:
@@ -2320,16 +2408,14 @@ def sync_one_order_to_dest(odoo: OdooClient, shop: ShopifyClient, state: StateDB
         partner_main = None
         if isinstance(main_ref, (list, tuple)) and main_ref:
             partner_main = odoo.get_partner(int(main_ref[0]))
-        raw_phone = (
-            (billing_partner or {}).get("phone")
-            or (billing_partner or {}).get("mobile")
-            or (shipping_partner or {}).get("phone")
-            or (shipping_partner or {}).get("mobile")
-            or (partner_main or {}).get("phone")
-            or (partner_main or {}).get("mobile")
+        raw_phone, phone = extract_customer_phone(
+            billing_partner=billing_partner,
+            shipping_partner=shipping_partner,
+            partner_main=partner_main,
+            billing_country=billing_country,
+            shipping_country=shipping_country,
         )
-        raw_phone = (str(raw_phone).strip() if raw_phone is not None else None)
-        phone = normalize_phone(raw_phone, (billing_country or {}).get("code") or (shipping_country or {}).get("code"))
+    apply_order_phone(payload, phone, raw_phone)
 
     # Add customer phone details into order note/timeline (no customer notifications are sent)
     try:
@@ -2345,9 +2431,9 @@ def sync_one_order_to_dest(odoo: OdooClient, shop: ShopifyClient, state: StateDB
                 o["note"] = (note + "\n" + "\n".join(extra)).strip() if note else "\n".join(extra)
                 na = o.get("note_attributes") or []
                 # Keep them visible in order details
-                if raw_phone:
+                if raw_phone and not any(item.get("name") == "Customer phone (raw)" for item in na if isinstance(item, dict)):
                     na.append({"name": "Customer phone (raw)", "value": raw_phone})
-                if phone and phone != raw_phone:
+                if phone and phone != raw_phone and not any(item.get("name") == "Customer phone (E164)" for item in na if isinstance(item, dict)):
                     na.append({"name": "Customer phone (E164)", "value": phone})
                 o["note_attributes"] = na
     except Exception:
