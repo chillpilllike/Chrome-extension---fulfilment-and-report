@@ -805,7 +805,22 @@ class OdooClient:
             raise RuntimeError(f"Odoo auth failed db={self.db} user={self.username}")
 
     def execute(self, model, method, args, kwargs=None):
-        return self.models.execute_kw(self.db, self.uid, self.password, model, method, args, kwargs or {})
+        last_error = None
+        for attempt in range(1, 5):
+            try:
+                return self.models.execute_kw(self.db, self.uid, self.password, model, method, args, kwargs or {})
+            except xmlrpc.client.ProtocolError as exc:
+                last_error = exc
+                if exc.errcode not in {429, 500, 502, 503, 504} or attempt >= 4:
+                    raise
+            except (OSError, TimeoutError, ConnectionError) as exc:
+                last_error = exc
+                if attempt >= 4:
+                    raise
+            time.sleep(0.5 * attempt)
+        if last_error:
+            raise last_error
+        raise RuntimeError("Odoo XML-RPC call failed.")
 
     def find_sale_order_id_by_name(self, order_name: str):
         # NOTE: We intentionally search by exact name here. Eligibility checks happen separately.

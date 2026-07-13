@@ -17612,6 +17612,18 @@ def shopify_tracking_worker_count(settings: dict[str, str]) -> int:
     return max(1, min(requested, db_safe_limit, 4))
 
 
+def shopify_tracking_cursor_from_to_date(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return utc_now()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        return f"{text}T23:59:59+00:00"
+    parsed = parse_utc_datetime(text)
+    if parsed:
+        return parsed.astimezone(timezone.utc).isoformat()
+    return text
+
+
 def shopify_route_script_config(route: str) -> tuple[Any, str, str]:
     settings = get_service_settings()
     route = clean_text(route).lower()
@@ -20253,11 +20265,12 @@ def run_shopify_tracking_job(job_id: str) -> None:
             )
         if not int(job["dry_run"] or 0):
             try:
-                set_setting("shopify_tracking_last_success_at", progress["updated_at"])
+                set_setting("shopify_tracking_last_success_at", shopify_tracking_cursor_from_to_date(job["to_date"]))
             except Exception as exc:
                 warning = f"Tracking sync completed, but last success timestamp could not be saved: {exc}"
                 print(warning, flush=True)
                 try:
+                    success_cursor = shopify_tracking_cursor_from_to_date(job["to_date"])
                     with db() as conn:
                         conn.execute(
                             """
@@ -20265,7 +20278,7 @@ def run_shopify_tracking_job(job_id: str) -> None:
                             VALUES (?, ?, ?)
                             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                             """,
-                            ("shopify_tracking_last_success_at", app_setting_storage_value(progress["updated_at"]), progress["updated_at"]),
+                            ("shopify_tracking_last_success_at", app_setting_storage_value(success_cursor), progress["updated_at"]),
                         )
                 except Exception as fallback_exc:
                     warning = f"{warning}; fallback also failed: {fallback_exc}"
@@ -20483,7 +20496,12 @@ def create_shopify_tracking_job(payload: dict[str, Any], queued_by: str = "manua
     incremental = bool(payload.get("incremental", True)) and not requested_from and not requested_to
     last_success_at = get_setting("shopify_tracking_last_success_at", "")
     if incremental and last_success_at:
-        from_date = last_success_at
+        last_success_dt = parse_utc_datetime(last_success_at)
+        if last_success_dt:
+            overlap_minutes = max(0, min(1440, int(float(settings.get("shopify_tracking_incremental_overlap_minutes") or 180))))
+            from_date = (last_success_dt - timedelta(minutes=overlap_minutes)).astimezone(timezone.utc).isoformat()
+        else:
+            from_date = last_success_at
         to_date = now_dt.isoformat()
     else:
         from_date = requested_from or (today - timedelta(days=from_days)).isoformat()
