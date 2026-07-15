@@ -1005,6 +1005,21 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS fulfilment_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notification_key TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL DEFAULT 'info',
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                odoo_order_name TEXT,
+                amazon_order_id TEXT,
+                delivery_date TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                dismissed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS ui_copy (
                 key TEXT PRIMARY KEY,
                 title TEXT,
@@ -1519,6 +1534,7 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_shopify_tracking_sync_order ON shopify_tracking_sync_log(odoo_db, odoo_order)",
             "CREATE INDEX IF NOT EXISTS idx_odoo_chatter_note_log_lookup ON odoo_chatter_note_log(store_id, odoo_order_id, event_type, amazon_order_id)",
             "CREATE INDEX IF NOT EXISTS idx_partial_fulfilments_store_status ON partial_fulfilments(store_id, status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fulfilment_notifications_open ON fulfilment_notifications(dismissed, pinned DESC, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_missing_asin_availability_store_status ON missing_asin_availability(store_id, status, last_checked_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_missing_asin_availability_line ON missing_asin_availability(order_line_id, asin)",
         ):
@@ -29021,6 +29037,90 @@ def api_tracking_payment_failures(store_id: Optional[int] = None, page: int = 1,
     result = fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine}, 300)
     threading.Thread(target=enqueue_payment_failure_cleanup, daemon=True).start()
     return result
+
+
+@app.get("/api/notifications")
+def api_notifications(limit: int = 40) -> dict[str, Any]:
+    limit = max(1, min(int(limit or 40), 100))
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT id, notification_key, kind, title, message, odoo_order_name,
+                   amazon_order_id, delivery_date, pinned, dismissed, created_at, updated_at
+            FROM fulfilment_notifications
+            WHERE dismissed = 0
+            ORDER BY pinned DESC, created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall())
+    return {"ok": True, "notifications": rows, "count": len(rows)}
+
+
+@app.post("/api/notifications")
+async def api_create_notification(request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    notification_key = str(payload.get("notification_key") or "").strip()
+    title = str(payload.get("title") or "Notification").strip()
+    message = str(payload.get("message") or "").strip()
+    if not notification_key or not message:
+        raise HTTPException(status_code=422, detail="notification_key and message are required")
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO fulfilment_notifications
+                (notification_key, kind, title, message, odoo_order_name, amazon_order_id,
+                 delivery_date, pinned, dismissed, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+            ON CONFLICT(notification_key) DO UPDATE SET
+                kind=excluded.kind,
+                title=excluded.title,
+                message=excluded.message,
+                odoo_order_name=excluded.odoo_order_name,
+                amazon_order_id=excluded.amazon_order_id,
+                delivery_date=excluded.delivery_date,
+                updated_at=excluded.updated_at
+            """,
+            (
+                notification_key,
+                str(payload.get("kind") or "warning").strip() or "warning",
+                title,
+                message,
+                str(payload.get("odoo_order_name") or "").strip(),
+                str(payload.get("amazon_order_id") or "").strip(),
+                str(payload.get("delivery_date") or "").strip(),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM fulfilment_notifications WHERE notification_key=?",
+            (notification_key,),
+        ).fetchone()
+    return {"ok": True, "notification": dict(row) if row else None}
+
+
+@app.post("/api/notifications/{notification_id}/dismiss")
+def api_dismiss_notification(notification_id: int) -> dict[str, Any]:
+    with db() as conn:
+        conn.execute(
+            "UPDATE fulfilment_notifications SET dismissed=1, updated_at=? WHERE id=?",
+            (utc_now(), int(notification_id)),
+        )
+    return {"ok": True}
+
+
+@app.post("/api/notifications/{notification_id}/pin")
+async def api_pin_notification(notification_id: int, request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    pinned = 1 if bool(payload.get("pinned")) else 0
+    with db() as conn:
+        conn.execute(
+            "UPDATE fulfilment_notifications SET pinned=?, updated_at=? WHERE id=?",
+            (pinned, utc_now(), int(notification_id)),
+        )
+    return {"ok": True, "pinned": bool(pinned)}
 
 
 @app.post("/api/tracking/payment-failures/{amazon_order_id}/resolve")

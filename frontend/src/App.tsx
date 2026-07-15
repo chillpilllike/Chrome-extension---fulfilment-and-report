@@ -23,6 +23,7 @@ import {
   IconLock as Lock,
   IconMoon as Moon,
   IconPackage as PackageCheck,
+  IconPin,
   IconPlus as Plus,
   IconRefresh as RefreshCw,
   IconSearch as Search,
@@ -893,6 +894,19 @@ type DashboardData = {
 }
 
 type ModalState = { title: string; message: string; ok: boolean } | null
+
+type FulfilmentNotification = {
+  id: number
+  notification_key: string
+  kind: string
+  title: string
+  message: string
+  odoo_order_name?: string
+  amazon_order_id?: string
+  delivery_date?: string
+  pinned: number
+  created_at: string
+}
 
 const ADMIN_TOKEN_STORAGE_KEY = "admin_access_token"
 const PULL_DAYS_STORAGE_KEY = "pull_orders_days"
@@ -2849,6 +2863,8 @@ function App() {
   const [adminAccessOpen, setAdminAccessOpen] = useState(!savedAdminToken() && !pageAllowsPublicAccess(initialPage))
   const [adminAuthError, setAdminAuthError] = useState("")
   const [adminAuthBusy, setAdminAuthBusy] = useState(false)
+  const [notifications, setNotifications] = useState<FulfilmentNotification[]>([])
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [uiCopy, setUiCopy] = useState<UiCopy>({})
   const [editingCopyKey, setEditingCopyKey] = useState<string | null>(null)
   const shopifyStatusSyncKeyRef = useRef("")
@@ -2862,6 +2878,36 @@ function App() {
   const ordersProgressVersionRef = useRef("")
   const shopifyStatusCompletedRefreshRef = useRef("")
   const shopifyStatusForceSyncPollRef = useRef(false)
+  const currentPageIsPublic = pageAllowsPublicAccess(page)
+  const publicVisitor = currentPageIsPublic && !adminTokenSaved
+
+  async function refreshNotifications() {
+    if (publicVisitor) return
+    try {
+      const result = await api<{ notifications: FulfilmentNotification[] }>("/api/notifications?limit=40")
+      setNotifications(result.notifications || [])
+    } catch (_) {
+      // Notifications must never block the main fulfilment UI.
+    }
+  }
+
+  async function dismissNotification(id: number) {
+    await api(`/api/notifications/${id}/dismiss`, { method: "POST" })
+    setNotifications((current) => current.filter((item) => item.id !== id))
+  }
+
+  async function toggleNotificationPin(item: FulfilmentNotification) {
+    const pinned = !Boolean(item.pinned)
+    await api(`/api/notifications/${item.id}/pin`, { method: "POST", body: JSON.stringify({ pinned }) })
+    setNotifications((current) => current.map((row) => row.id === item.id ? { ...row, pinned: pinned ? 1 : 0 } : row).sort((left, right) => Number(right.pinned) - Number(left.pinned) || String(right.created_at).localeCompare(String(left.created_at))))
+  }
+
+  useEffect(() => {
+    if (publicVisitor) return
+    void refreshNotifications()
+    const timer = window.setInterval(() => void refreshNotifications(), 15000)
+    return () => window.clearInterval(timer)
+  }, [publicVisitor])
 
   function pagedQuery(nextStoreId: string, nextPage = 1, extra?: Record<string, string | number>) {
     const query = new URLSearchParams()
@@ -4198,8 +4244,6 @@ function App() {
       ],
     },
   ] as const
-  const currentPageIsPublic = pageAllowsPublicAccess(page)
-  const publicVisitor = currentPageIsPublic && !adminTokenSaved
   const publicNavGroups = [
     {
       key: "dispatch-team",
@@ -4339,10 +4383,34 @@ function App() {
             <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Day mode"><Sun className="size-5" /></button>
             <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Dark mode"><Moon className="size-5" /></button>
             {!publicVisitor && (
-              <button className="btn btn-icon relative" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Notifications">
-                <Bell className="size-5" />
-                {(missingRows.length + partialFulfilments.length + costlyRows.length + fulfilmentPendingRows.length) > 0 && <span className="absolute right-1 top-1 size-2 rounded-full bg-red" />}
-              </button>
+              <div className="notification-menu">
+                <button className="btn btn-icon relative" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Notifications" onClick={() => setNotificationsOpen((open) => !open)}>
+                  <Bell className="size-5" />
+                  {notifications.length > 0 && <span className="notification-count">{notifications.length > 99 ? "99+" : notifications.length}</span>}
+                </button>
+                {notificationsOpen && (
+                  <div className="notification-dropdown" role="dialog" aria-label="Notifications">
+                    <div className="notification-dropdown-header">
+                      <span>Notifications</span>
+                      <span className="text-xs text-muted-foreground">Click an item to clear it</span>
+                    </div>
+                    {notifications.length === 0 ? (
+                      <div className="notification-empty">No active notifications.</div>
+                    ) : notifications.map((item) => (
+                      <div key={item.id} className={`notification-item ${item.pinned ? "is-pinned" : ""}`} onClick={() => void dismissNotification(item.id)}>
+                        <div className="notification-item-top">
+                          <span className={`badge ${item.kind === "late_delivery" ? "bg-red-lt text-red" : "bg-blue-lt text-blue"}`}>{item.title}</span>
+                          <button type="button" className="btn btn-icon btn-sm" title={item.pinned ? "Unpin notification" : "Pin notification"} onClick={(event) => { event.stopPropagation(); void toggleNotificationPin(item) }}>
+                            <IconPin className={`size-4 ${item.pinned ? "text-blue" : "text-muted-foreground"}`} />
+                          </button>
+                        </div>
+                        <div className="notification-message">{item.message}</div>
+                        {item.odoo_order_name && <div className="notification-meta">Order: {item.odoo_order_name}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
             <button className={`btn btn-icon ${adminTokenSaved ? "text-green" : "text-yellow"}`} data-bs-toggle="tooltip" data-bs-placement="bottom" title={adminTokenSaved ? "Admin code saved on this PC" : "Enter admin code"} onClick={() => { setAdminAuthError(""); setAdminAccessOpen(true) }}>
               <Lock className="size-5" />

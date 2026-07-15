@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-05-29-universal-nutricity-ref-v1";
+const CONTENT_SCRIPT_BUILD = "2026-07-15-delivery-window-guard-v1";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -4488,6 +4488,98 @@ function findPlaceOrderButton() {
   });
 }
 
+const CHECKOUT_DELIVERY_LIMIT_DAYS = 4;
+
+function checkoutDeliveryPromiseText() {
+  const selectors = [
+    "h2.address-promise-text",
+    ".address-promise-text",
+    ".delivery-promise-text",
+    ".delivery-option-text",
+    "[data-testid*='delivery-promise' i]",
+    "[class*='delivery-promise' i]",
+  ];
+  const candidates = [...document.querySelectorAll(selectors.join(", "))]
+    .filter((element) => visible(element) && !element.closest?.("#nutricity-panel, .a-popover, .a-popover-preload"))
+    .map((element) => normalizedText(element.innerText || element.textContent || ""))
+    .filter((text) => text && /arriv|deliver|shipping|delivery/i.test(text) && text.length <= 300);
+  const unique = [...new Set(candidates)];
+  const month = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}\b/i;
+  const dated = unique.filter((text) => month.test(text) || /arriving\s+(?:today|tomorrow)|deliver(?:y|ing)?\s+(?:today|tomorrow)/i.test(text));
+  return (dated.length ? dated : unique).sort((left, right) => left.length - right.length)[0] || "";
+}
+
+function checkoutDeliveryPromise() {
+  const text = checkoutDeliveryPromiseText();
+  if (!text) return { text: "", earliest: null, latest: null, daysFromToday: null, late: false };
+  const monthPattern = "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?";
+  const matches = [...text.matchAll(new RegExp(`\\b(${monthPattern})\\.?\\s+(\\d{1,2})(?:,\\s*(\\d{4}))?`, "gi"))];
+  const today = new Date();
+  const dates = matches.map((match) => {
+    const year = Number(match[3] || today.getFullYear());
+    const month = new Date(`${match[1]} 1, ${year}`).getMonth();
+    const date = new Date(year, month, Number(match[2]));
+    if (!match[3] && date < new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1)) date.setFullYear(date.getFullYear() + 1);
+    return date;
+  }).filter((date) => Number.isFinite(date.getTime()));
+  if (!dates.length) {
+    const lower = text.toLowerCase();
+    if (/arriving\s+today|deliver(?:y|ing)?\s+today/.test(lower)) {
+      const todayOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      return { text, earliest: todayOnly, latest: todayOnly, daysFromToday: 0, late: false };
+    }
+    if (/arriving\s+tomorrow|deliver(?:y|ing)?\s+tomorrow/.test(lower)) {
+      const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+      return { text, earliest: tomorrow, latest: tomorrow, daysFromToday: 1, late: false };
+    }
+    return { text, earliest: null, latest: null, daysFromToday: null, late: false };
+  }
+  const earliest = new Date(Math.min(...dates.map((date) => date.getTime())));
+  const latest = new Date(Math.max(...dates.map((date) => date.getTime())));
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const daysFromToday = Math.ceil((earliest.getTime() - startOfToday.getTime()) / 86400000);
+  return {
+    text,
+    earliest,
+    latest,
+    daysFromToday,
+    late: daysFromToday > CHECKOUT_DELIVERY_LIMIT_DAYS,
+  };
+}
+
+async function rejectLateCheckout(activeJob, promise) {
+  const orderNames = Array.isArray(activeJob?.job?.order_names) ? activeJob.job.order_names.filter(Boolean) : [];
+  const orderLabel = orderNames.join(", ") || activeJob?.job?.recipient_name || activeJob?.job?.group_key || "Amazon checkout";
+  const earliest = promise.earliest?.toLocaleDateString?.("en-US", { month: "short", day: "numeric", year: "numeric" }) || "a date beyond the allowed window";
+  const message = `Skipped Amazon checkout for ${orderLabel}: delivery is promised for ${earliest}, which is ${promise.daysFromToday} day(s) away. The maximum allowed delivery window is ${CHECKOUT_DELIVERY_LIMIT_DAYS} days. Amazon promise: ${promise.text}`;
+  const notificationKey = `late-delivery:${activeJob?.job?.group_key || orderLabel}:${promise.earliest?.toISOString?.().slice(0, 10) || "unknown"}`;
+  try {
+    await contentApi("/api/notifications", {
+      method: "POST",
+      body: JSON.stringify({
+        notification_key: notificationKey,
+        kind: "late_delivery",
+        title: "Late Amazon delivery skipped",
+        message,
+        odoo_order_name: orderNames.join(", "),
+        delivery_date: promise.earliest?.toISOString?.() || "",
+      }),
+      timeoutMs: 15000,
+    });
+  } catch (error) {
+    sendDiagnostic("Could not save late-delivery notification.", { message: error?.message || String(error || "") }, "warn").catch(() => {});
+  }
+  showPanel("Late delivery skipped", message, null, null);
+  await send({
+    type: "FAIL_JOB",
+    message,
+    missingAsin: "",
+    missingLineId: null,
+    failureCode: "late_delivery",
+  });
+  return false;
+}
+
 function checkoutQuantityFromPage() {
   const visibleQuantities = checkoutVisibleQuantityValues();
   if (visibleQuantities.length) return visibleQuantities.reduce((sum, quantity) => sum + quantity, 0);
@@ -5328,6 +5420,12 @@ async function handleCheckout(activeJob) {
   if (!await ensurePreferredCheckoutPayment(activeJob)) return;
   if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
+
+  const deliveryPromise = checkoutDeliveryPromise();
+  if (deliveryPromise.late) {
+    await rejectLateCheckout(activeJob, deliveryPromise);
+    return;
+  }
 
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([
