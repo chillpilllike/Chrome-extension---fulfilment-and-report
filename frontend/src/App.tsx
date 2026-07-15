@@ -5469,7 +5469,7 @@ function App() {
         {editingReplacement && (
           <ReplacementDialog
             line={editingReplacement}
-            storeId={Number(storeId)}
+            storeId={Number(editingReplacement.store_id || storeId)}
             onClose={() => setEditingReplacement(null)}
             onSaved={async (message) => {
               setEditingReplacement(null)

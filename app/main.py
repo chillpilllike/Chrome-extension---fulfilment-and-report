@@ -23511,7 +23511,10 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, payload.store_id)).fetchone()
         if not row:
+            row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+        if not row:
             raise HTTPException(404, "Order line not found.")
+        effective_store_id = int(row["store_id"])
         if row["amazon_order_id"]:
             raise HTTPException(400, "Reset fulfilment before changing the ASIN on an already fulfilled line.")
         original_asin = row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"]
@@ -23544,12 +23547,12 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
                 replacement_name,
                 utc_now(),
                 line_id,
-                payload.store_id,
+                effective_store_id,
             ),
         )
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     try:
-        store = get_store(payload.store_id)
+        store = get_store(effective_store_id)
         note = (
             "Replacement item assigned in fulfilment app.<br/>"
             f"Original ASIN: <a href=\"{asin_product_url(original_asin)}\" target=\"_blank\">{original_asin}</a><br/>"
@@ -23590,11 +23593,14 @@ def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, An
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, store_id)).fetchone()
         if not row:
+            row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+        if not row:
             raise HTTPException(404, "Order line not found.")
+        effective_store_id = int(row["store_id"])
         original_asin = normalize_asin(row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"])
         if not original_asin:
             raise HTTPException(400, "Could not find the original ASIN for this line.")
-        original_product_name = original_product_name_for_line(store_id, row) or clean_text(row["product_name"] or "")
+        original_product_name = original_product_name_for_line(effective_store_id, row) or clean_text(row["product_name"] or "")
         conn.execute(
             """
             UPDATE order_lines
@@ -23613,7 +23619,7 @@ def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, An
                 updated_at=?
             WHERE id=? AND store_id=?
             """,
-            (original_asin, original_product_name, now, line_id, store_id),
+            (original_asin, original_product_name, now, line_id, effective_store_id),
         )
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     if updated:
