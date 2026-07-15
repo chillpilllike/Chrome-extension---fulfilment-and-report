@@ -2891,7 +2891,9 @@ function App() {
     }
   }
 
-  async function dismissNotification(id: number) {
+  async function dismissNotification(item: FulfilmentNotification) {
+    if (item.pinned) return
+    const id = item.id
     await api(`/api/notifications/${id}/dismiss`, { method: "POST" })
     setNotifications((current) => current.filter((item) => item.id !== id))
   }
@@ -3676,6 +3678,17 @@ function App() {
   const sortedRows = filteredRows
   const visibleOrderColumns = orderColumns.filter((column) => column.visible !== false)
   const orderExportColumns = visibleOrderColumns.map((column) => ({ key: column.key === "store" ? "store_name" : column.key === "odoo_order" ? "odoo_order_name" : column.key === "product" ? "product_name" : column.key === "reference" ? "default_code" : column.key === "qty" ? "quantity" : column.key === "odoo_status" ? "odoo_status_label" : column.key === "amazon_account" ? "amazon_account_name" : column.key === "tracking" ? "tracking_status" : column.key === "amazon_order" ? "amazon_order_id" : column.key === "shopify_order" ? "shopify_order_name" : column.key === "shopify_fulfillment" ? "shopify_fulfillment_status" : column.key === "shopify_fulfillment_at" ? "shopify_fulfillment_at" : column.key === "comments" ? "fulfilment_note" : column.key === "error" ? "last_error" : column.key, label: column.label }))
+  const orderGroupKey = (row: OrderLine) => `${Number(row.store_id || 0)}:${String(row.odoo_order_name || row.odoo_order_id || "").trim()}`
+  const visibleOrderGroups = useMemo(() => {
+    const groups = new Map<string, OrderLine[]>()
+    sortedRows.forEach((row) => {
+      const key = orderGroupKey(row)
+      if (!key.endsWith(":")) groups.set(key, [...(groups.get(key) || []), row])
+    })
+    return groups
+  }, [sortedRows])
+  const rowsInSameVisibleOrder = (row: OrderLine) => visibleOrderGroups.get(orderGroupKey(row)) || [row]
+  const rowHasVisibleOrderGroup = (row: OrderLine) => rowsInSameVisibleOrder(row).length > 1
   rows.forEach((row) => {
     if (selected.includes(row.id)) selectedOrderRowsRef.current.set(row.id, row)
   })
@@ -3715,6 +3728,8 @@ function App() {
     setOrdersSelectAll(false)
     selectedOrderRowsRef.current.set(row.id, row)
     const visibleIds = sortedRows.map((item) => item.id)
+    const sameOrderRows = rowsInSameVisibleOrder(row)
+    const sameOrderIds = sameOrderRows.map((item) => item.id)
     const previousAnchor = ordersSelectionAnchor.current
     setSelected((current) => {
       const anchor = previousAnchor ?? current[current.length - 1] ?? null
@@ -3727,12 +3742,16 @@ function App() {
         const rowStoreId = Number(row.store_id || 0)
         if (rowStoreId && knownStoreIds.length && !knownStoreIds.includes(rowStoreId)) {
           selectedOrderRowsRef.current.clear()
-          selectedOrderRowsRef.current.set(row.id, row)
+          sameOrderRows.forEach((item) => selectedOrderRowsRef.current.set(item.id, item))
           ordersSelectionAnchor.current = row.id
-          return [row.id]
+          return sameOrderIds
         }
       }
-      const next = rangeSelection(visibleIds, current, row.id, shouldCheck, shiftKey, anchor)
+      const next = shiftKey
+        ? rangeSelection(visibleIds, current, row.id, shouldCheck, true, anchor)
+        : shouldCheck
+          ? Array.from(new Set([...current, ...sameOrderIds]))
+          : current.filter((id) => id !== row.id)
       sortedRows.forEach((item) => {
         if (next.includes(item.id)) selectedOrderRowsRef.current.set(item.id, item)
         else if (visibleIds.includes(item.id)) selectedOrderRowsRef.current.delete(item.id)
@@ -4397,7 +4416,7 @@ function App() {
                     {notifications.length === 0 ? (
                       <div className="notification-empty">No active notifications.</div>
                     ) : notifications.map((item) => (
-                      <div key={item.id} className={`notification-item ${item.pinned ? "is-pinned" : ""}`} onClick={() => void dismissNotification(item.id)}>
+                      <div key={item.id} className={`notification-item ${item.pinned ? "is-pinned" : ""}`} onClick={() => void dismissNotification(item)}>
                         <div className="notification-item-top">
                           <span className={`badge ${item.kind === "late_delivery" ? "bg-red-lt text-red" : "bg-blue-lt text-blue"}`}>{item.title}</span>
                           <button type="button" className="btn btn-icon btn-sm" title={item.pinned ? "Unpin notification" : "Pin notification"} onClick={(event) => { event.stopPropagation(); void toggleNotificationPin(item) }}>
@@ -5060,7 +5079,7 @@ function App() {
                             ? ""
                             : ["cancelled", "refunded"].includes(row.odoo_status_label)
                             ? "bg-destructive/5"
-                            : Number(row.odoo_order_distinct_asin_count || 0) > 1
+                            : rowHasVisibleOrderGroup(row) || Number(row.odoo_order_distinct_asin_count || 0) > 1
                               ? "bg-parrot-green-lt"
                               : "",
                           ].filter(Boolean).join(" ")

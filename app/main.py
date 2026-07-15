@@ -29104,11 +29104,17 @@ async def api_create_notification(request: Request) -> dict[str, Any]:
 @app.post("/api/notifications/{notification_id}/dismiss")
 def api_dismiss_notification(notification_id: int) -> dict[str, Any]:
     with db() as conn:
-        conn.execute(
+        row = conn.execute(
+            "SELECT pinned FROM fulfilment_notifications WHERE id=?",
+            (int(notification_id),),
+        ).fetchone()
+        if row and int(row["pinned"] or 0):
+            return {"ok": True, "dismissed": False, "pinned": True}
+        updated = conn.execute(
             "UPDATE fulfilment_notifications SET dismissed=1, updated_at=? WHERE id=?",
             (utc_now(), int(notification_id)),
         )
-    return {"ok": True}
+    return {"ok": True, "dismissed": bool(updated.rowcount)}
 
 
 @app.post("/api/notifications/{notification_id}/pin")

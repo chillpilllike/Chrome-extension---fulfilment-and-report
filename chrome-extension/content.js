@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-07-15-delivery-window-guard-v1";
+const CONTENT_SCRIPT_BUILD = "2026-07-15-delivery-window-guard-v2";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -4501,7 +4501,8 @@ function checkoutDeliveryPromiseText() {
   ];
   const candidates = [...document.querySelectorAll(selectors.join(", "))]
     .filter((element) => visible(element) && !element.closest?.("#nutricity-panel, .a-popover, .a-popover-preload"))
-    .map((element) => normalizedText(element.innerText || element.textContent || ""))
+    .slice(0, 80)
+    .map((element) => normalizedText(element.textContent || ""))
     .filter((text) => text && /arriv|deliver|shipping|delivery/i.test(text) && text.length <= 300);
   const unique = [...new Set(candidates)];
   const month = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}\b/i;
@@ -4578,6 +4579,36 @@ async function rejectLateCheckout(activeJob, promise) {
     failureCode: "late_delivery",
   });
   return false;
+}
+
+async function checkoutDeliveryWindowIsAllowed(activeJob) {
+  const promise = await waitUntil(() => {
+    const parsed = checkoutDeliveryPromise();
+    return parsed.text || null;
+  }, 5000, 500) || checkoutDeliveryPromise();
+  if (!promise.text) {
+    sendDiagnostic("Checkout delivery promise was not visible; continuing without the four-day guard.", {
+      order: activeJobOrderLabel(activeJob) || activeJob?.job?.group_key || "",
+      url: location.href,
+    }, "warn").catch(() => {});
+    showPanel("Nutricity checkout", "Delivery date was not visible yet. Continuing checkout.", null, null);
+    return true;
+  }
+  if (promise.daysFromToday === null || promise.daysFromToday === undefined) {
+    sendDiagnostic("Checkout delivery promise could not be parsed; continuing checkout.", {
+      promise: promise.text,
+      order: activeJobOrderLabel(activeJob) || activeJob?.job?.group_key || "",
+      url: location.href,
+    }, "warn").catch(() => {});
+    showPanel("Nutricity checkout", `Delivery text found but date was unreadable: ${promise.text}. Continuing checkout.`, null, null);
+    return true;
+  }
+  if (promise.late) {
+    await rejectLateCheckout(activeJob, promise);
+    return false;
+  }
+  showPanel("Nutricity checkout", `Delivery window accepted: ${promise.text}`, null, null);
+  return true;
 }
 
 function checkoutQuantityFromPage() {
@@ -5421,12 +5452,6 @@ async function handleCheckout(activeJob) {
   if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
 
-  const deliveryPromise = checkoutDeliveryPromise();
-  if (deliveryPromise.late) {
-    await rejectLateCheckout(activeJob, deliveryPromise);
-    return;
-  }
-
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([
       "input#placeOrder:not([disabled])",
@@ -5437,6 +5462,7 @@ async function handleCheckout(activeJob) {
     ], 5000)
     || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
+    if (!await checkoutDeliveryWindowIsAllowed(activeJob)) return;
     if (!checkoutDeliveryRecipientMatches(checkoutRecipient) && !checkoutRecipientConfirmed(checkoutRecipient)) {
       const deliveredTo = checkoutDeliveryRecipientText() || "unknown recipient";
       await pauseForManualCheckout(

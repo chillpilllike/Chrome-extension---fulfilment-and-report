@@ -73,6 +73,7 @@
           item.appendChild(meta);
         }
         item.addEventListener("click", async () => {
+          if (row.pinned) return;
           await api(`/api/notifications/${row.id}/dismiss`, { method: "POST" });
           refresh(dropdown);
         });
