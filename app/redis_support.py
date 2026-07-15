@@ -19,7 +19,19 @@ _VERSION_CACHE_TTL_SECONDS = float(os.getenv("REDIS_VERSION_CACHE_TTL", "5") or 
 _SETTING_CACHE: dict[str, tuple[str, float]] = {}
 _SETTING_CACHE_TTL_SECONDS = float(os.getenv("REDIS_SETTING_CACHE_TTL", "30") or 30)
 _STALE_CACHE_TTL_SECONDS = int(float(os.getenv("REDIS_STALE_CACHE_TTL", "3600") or 3600))
-_STALE_DISABLED_PREFIXES = {"settings-services"}
+_STALE_DISABLED_PREFIXES = {
+    "settings-services",
+    "dashboard",
+    "orders",
+    "orders-count",
+    "orders-condition-count",
+    "search",
+    "chrome-jobs",
+    "shopify-fulfilment",
+    "fulfilment-pending",
+    "fulfilment-pending-count",
+    "tracking-orders",
+}
 
 
 def postgres_setting(name: str) -> str:
@@ -196,6 +208,8 @@ def page_cache_clear() -> None:
     try:
         version = str(client.incr(_GLOBAL_VERSION_KEY))
         _VERSION_CACHE[_GLOBAL_VERSION_KEY] = (version, time.monotonic() + _VERSION_CACHE_TTL_SECONDS)
+        for key in client.scan_iter(f"{_STALE_CACHE_PREFIX}*"):
+            client.delete(key)
     except Exception:
         note_redis_failure()
         return
@@ -208,14 +222,22 @@ def page_cache_clear_matching(prefixes: set[str]) -> None:
     try:
         pipe = client.pipeline()
         keys: list[str] = []
+        version_result_indexes: list[int] = []
+        command_index = 0
         for prefix in prefixes:
             if prefix:
                 key = f"{_PREFIX_VERSION_KEY}{prefix}"
                 keys.append(key)
+                version_result_indexes.append(command_index)
                 pipe.incr(key)
+                command_index += 1
+                for stale_key in client.scan_iter(f"{_STALE_CACHE_PREFIX}{prefix}:*"):
+                    pipe.delete(stale_key)
+                    command_index += 1
         versions = pipe.execute()
         now = time.monotonic()
-        for key, version in zip(keys, versions):
+        for key, result_index in zip(keys, version_result_indexes):
+            version = versions[result_index] if result_index < len(versions) else "1"
             _VERSION_CACHE[key] = (str(version or "1"), now + _VERSION_CACHE_TTL_SECONDS)
     except Exception:
         note_redis_failure()
