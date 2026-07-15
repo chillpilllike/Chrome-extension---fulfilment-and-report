@@ -5471,14 +5471,21 @@ function App() {
             line={editingReplacement}
             storeId={Number(editingReplacement.store_id || storeId)}
             onClose={() => setEditingReplacement(null)}
-            onSaved={async (message) => {
+            onSaved={async (message, row) => {
               setEditingReplacement(null)
+              if (row) {
+                setOrderRows((current) => current.map((item) => item.id === row.id ? { ...item, ...row } : item))
+                setData((current) => current ? {
+                  ...current,
+                  rows: (current.rows || []).map((item) => item.id === row.id ? { ...item, ...row } : item),
+                } : current)
+                selectedOrderRowsRef.current.set(row.id, row)
+              }
               const result = await api<{ rows: OrderLine[]; total: number }>(`/api/missing${pagedQuery(storeId, missingPage)}`)
               setMissingRows(result.rows)
               setMissingTotal(result.total || 0)
-	              await refresh()
-	              setModal({ ok: true, title: message.toLowerCase().includes("reset") ? "Replacement Reset" : "Replacement Assigned", message })
-	            }}
+              setModal({ ok: true, title: message.toLowerCase().includes("reset") ? "Replacement Reset" : "Replacement Assigned", message })
+            }}
             onResult={setModal}
           />
         )}
@@ -11619,7 +11626,7 @@ function ReplacementDialog({
   line: OrderLine
   storeId: number
   onClose: () => void
-  onSaved: (message: string) => Promise<void>
+  onSaved: (message: string, row?: OrderLine) => Promise<void>
   onResult: (modal: ModalState) => void
 }) {
   const [asin, setAsin] = useState("")
@@ -11648,11 +11655,11 @@ function ReplacementDialog({
             onClick={async () => {
               try {
                 setResetting(true)
-                const result = await api<{ ok: boolean; message: string }>(`/api/lines/${line.id}/replacement/reset`, {
+                const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement/reset`, {
                   method: "POST",
                   body: JSON.stringify({ store_id: storeId }),
                 })
-                await onSaved(result.message)
+                await onSaved(result.message, result.row)
               } catch (error) {
                 onResult({ ok: false, title: "Replacement Reset Failed", message: String(error) })
               } finally {
@@ -11670,11 +11677,11 @@ function ReplacementDialog({
             onClick={async () => {
               try {
                 setSaving(true)
-                const result = await api<{ ok: boolean; message: string }>(`/api/lines/${line.id}/replacement`, {
+                const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement`, {
                   method: "POST",
                   body: JSON.stringify({ store_id: storeId, asin, note }),
                 })
-                await onSaved(result.message)
+                await onSaved(result.message, result.row)
               } catch (error) {
                 onResult({ ok: false, title: "Replacement Save Failed", message: String(error) })
               } finally {

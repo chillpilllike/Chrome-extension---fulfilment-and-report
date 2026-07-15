@@ -11051,9 +11051,11 @@ def block_lines_with_missing_asin_siblings(
     store_id: int,
     lines: list[dict[str, Any]],
     include_missing_asins: bool = False,
+    allow_missing_line_ids: Optional[set[int]] = None,
 ) -> tuple[list[dict[str, Any]], int, list[str]]:
     if include_missing_asins or not lines:
         return lines, 0, []
+    allow_missing_line_ids = allow_missing_line_ids or set()
     order_ids = sorted({int(line.get("odoo_order_id") or 0) for line in lines if int(line.get("odoo_order_id") or 0) > 0})
     if not order_ids:
         return lines, 0, []
@@ -11071,6 +11073,8 @@ def block_lines_with_missing_asin_siblings(
         """,
         [store_id, *order_ids],
     ).fetchall())
+    if allow_missing_line_ids:
+        missing_rows = [row for row in missing_rows if int(row.get("id") or 0) not in allow_missing_line_ids]
     if not missing_rows:
         return lines, 0, []
     blocked_by_order: dict[int, dict[str, Any]] = {}
@@ -11251,6 +11255,7 @@ def queue_chrome_order_groups_fast(
         selected_ids = sorted({int(line_id) for line_id in (line_ids or []) if int(line_id or 0) > 0})
         if selected_scope and not selected_ids:
             return 0, 0, 0, {}, []
+        selected_id_set = set(selected_ids)
         cleared_count = 0
         if not selected_scope:
             cleared_cursor = conn.execute(
@@ -11342,7 +11347,7 @@ def queue_chrome_order_groups_fast(
                 if row.get("asin")
                 and not clean_text(row.get("amazon_order_id"))
                 and clean_text(row.get("state")) not in {"ordered", "delivered", "dispatched", "costly", "inventory", "ignored"}
-                and (include_missing_asins or clean_text(row.get("state")) != "missing")
+                and (include_missing_asins or clean_text(row.get("state")) != "missing" or int(row.get("id") or 0) in selected_id_set)
                 and clean_text(row.get("odoo_status_label")) not in {"cancelled", "refunded"}
             ]
             if not lines:
@@ -11350,7 +11355,7 @@ def queue_chrome_order_groups_fast(
             lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
             blocked = date_blocked
             if lines:
-                lines, missing_blocked, _missing_messages = block_lines_with_missing_asin_siblings(conn, store_id, [dict(line) for line in lines], include_missing_asins)
+                lines, missing_blocked, _missing_messages = block_lines_with_missing_asin_siblings(conn, store_id, [dict(line) for line in lines], include_missing_asins, selected_id_set)
                 blocked += missing_blocked
             if lines:
                 lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines], live_sync=False)
@@ -11364,6 +11369,8 @@ def queue_chrome_order_groups_fast(
                 for line in lines:
                     grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
             queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
+            if queued:
+                fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "missing", "back-in-stock"})
             return queued, cleared_count, blocked, account, details
 
         line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, selected_ids if selected_scope else None, include_missing_asins)
@@ -11447,6 +11454,8 @@ def queue_chrome_order_groups_fast(
                 grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
 
         queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
+        if queued:
+            fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "missing", "back-in-stock"})
         return queued, cleared_count, blocked, account, details
 
 
@@ -23566,6 +23575,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
         pass
     if updated:
         index_order_line(updated)
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
     return {"ok": True, "message": f"Replacement {replacement_asin} assigned and marked ready to queue.", "row": row_to_dict(updated)}
 
 
@@ -23624,6 +23634,7 @@ def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, An
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     if updated:
         index_order_line(updated)
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
     return {"ok": True, "message": f"Replacement ASIN reset to original {original_asin}.", "row": row_to_dict(updated)}
 
 
