@@ -30366,10 +30366,24 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
         selected_ids = validate_line_ids_for_store(conn, payload.store_id, payload.line_ids, "Reset selected")
         placeholders = ",".join("?" for _ in selected_ids)
         selected_rows = conn.execute(
-            f"SELECT store_id, odoo_order_id FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
+            f"""
+            SELECT id, store_id, odoo_order_id, odoo_order_name, amazon_order_id
+            FROM order_lines
+            WHERE store_id=? AND id IN ({placeholders})
+            """,
             [payload.store_id, *selected_ids],
         ).fetchall()
         tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in selected_rows}
+        selected_order_names = {
+            (int(row["store_id"]), int(row["odoo_order_id"]), clean_text(row["odoo_order_name"]))
+            for row in selected_rows
+            if clean_text(row["odoo_order_name"])
+        }
+        previous_amazon_order_ids = [
+            clean_text(row["amazon_order_id"])
+            for row in selected_rows
+            if clean_text(row["amazon_order_id"])
+        ]
         # Resetting fulfilment must not remove replacement ASIN decisions.
         # Those fields are only changed by the manual replacement action on the orders page.
         cursor = conn.execute(
@@ -30413,6 +30427,43 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             """,
             selected_ids,
         )
+        stale_shopify_jobs = 0
+        stale_shopify_maps = 0
+        stale_shopify_status = 0
+        stale_dispatch_packages = 0
+        for amazon_order_id in dict.fromkeys(previous_amazon_order_ids):
+            stale_dispatch_packages += dispatch_clear_packages_for_amazon_order(conn, amazon_order_id)
+        for reset_store_id, reset_odoo_order_id, reset_order_name in selected_order_names:
+            remaining = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM order_lines
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND (
+                    COALESCE(amazon_order_id, '') != ''
+                    OR state IN ('ordered', 'dispatched', 'delivered', 'inventory')
+                  )
+                """,
+                (reset_store_id, reset_odoo_order_id),
+            ).fetchone()
+            if int((remaining or {}).get("count") or 0) > 0:
+                continue
+            stale_shopify_jobs += conn.execute(
+                "DELETE FROM shopify_fulfilment_jobs WHERE store_id=? AND odoo_order_id=?",
+                (reset_store_id, reset_odoo_order_id),
+            ).rowcount
+            stale_shopify_status += conn.execute(
+                "DELETE FROM shopify_order_status_cache WHERE store_id=? AND UPPER(odoo_order_name)=UPPER(?)",
+                (reset_store_id, reset_order_name),
+            ).rowcount
+            store_row = conn.execute("SELECT odoo_db FROM stores WHERE id=?", (reset_store_id,)).fetchone()
+            source_key = f"{clean_text((store_row or {}).get('odoo_db'))}:{reset_order_name}" if store_row else ""
+            if source_key.strip(":"):
+                stale_shopify_maps += conn.execute(
+                    "DELETE FROM shopify_export_order_map WHERE src_order_key=?",
+                    (source_key,),
+                ).rowcount
         updated_rows = conn.execute(
             f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
             [payload.store_id, *selected_ids],
@@ -30420,8 +30471,17 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
     for updated in updated_rows:
         index_order_line(updated)
     threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "shopify-fulfilment", "fulfilment-pending", "tracking-orders"})
     data = dashboard_data(payload.store_id)
-    data["message"] = f"Reset {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} to fresh pulled status. Replacement ASINs were preserved."
+    cleanup_notes = []
+    if stale_shopify_jobs:
+        cleanup_notes.append(f"removed {stale_shopify_jobs} stale Shopify fulfilment job{'s' if stale_shopify_jobs != 1 else ''}")
+    if stale_shopify_maps or stale_shopify_status:
+        cleanup_notes.append("cleared stale Shopify link/status cache")
+    if stale_dispatch_packages:
+        cleanup_notes.append(f"cleared {stale_dispatch_packages} stale dispatch package row{'s' if stale_dispatch_packages != 1 else ''}")
+    cleanup_suffix = f" Also {'; '.join(cleanup_notes)}." if cleanup_notes else ""
+    data["message"] = f"Reset {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} to fresh pulled status. Replacement ASINs were preserved.{cleanup_suffix}"
     return data
 
 
