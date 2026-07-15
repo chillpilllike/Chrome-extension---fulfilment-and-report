@@ -53,6 +53,7 @@ function syncSettingsInputs(state) {
 async function resolveTargetWindowId() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   targetWindowId = tabs[0]?.windowId || targetWindowId;
+  return tabs[0] || null;
 }
 
 function send(message) {
@@ -176,7 +177,7 @@ function stoppedTrackAllText(tracking = {}) {
   const page = tracking.currentPage || tracking.startPage || 1;
   const nextPage = Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 0) ? ` · next page ${Number(page) + 1}` : "";
   const current = tracking.currentOrder?.amazon_order_id ? ` · current ${tracking.currentOrder.amazon_order_id}` : "";
-  return `Stopped · Track all can resume from page ${page}${nextPage}${current} · queue ${queue} · checked ${completed} · failed ${failed}`;
+  return `Stopped · Resume Track all continues from page ${page}${nextPage}${current}; Track all starts fresh from the selected page · queue ${queue} · checked ${completed} · failed ${failed}`;
 }
 
 function finalTrackingText(tracking = {}) {
@@ -339,15 +340,17 @@ recheckPaymentFailuresButton.addEventListener("click", async () => {
 });
 
 document.querySelector("#trackAll").addEventListener("click", async () => {
+  const activeTab = await resolveTargetWindowId();
   await send(settingsPayload());
   settingsDirty = false;
   const result = await send({
     type: "START_TRACK_ALL",
     startPage: Number(trackAllStartPage.value || 1),
     maxPages: Number(trackAllMaxPages.value || 202),
+    startUrl: activeTab?.url || "",
   });
   if (result.ok !== false) setRunButtons(true, true, false);
-  setResultStatus(result, "Track all started.", "Could not start Track all.");
+  setResultStatus(result, "Fresh Track all started.", "Could not start Track all.");
 });
 
 document.querySelector("#resumeTrackAll").addEventListener("click", async () => {

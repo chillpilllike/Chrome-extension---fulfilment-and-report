@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} · Track Order</title>
+    <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+    <link rel="stylesheet" href="/static/styles.css?v=8">
+  </head>
+  <body class="customer-track-body">
+    <main class="customer-track-page">
+      <section class="customer-track-hero">
+        <div class="customer-track-brand">
+          <span class="customer-track-mark">{{ title[:1] }}</span>
+          <span>{{ title }}</span>
+        </div>
+        <h1>Track Order</h1>
+        <form class="customer-track-form" method="get" action="/track-order/{{ slug }}">
+          <input type="hidden" name="store_id" value="{{ store_id or '' }}">
+          <label for="track-query">Order or tracking number</label>
+          <div class="customer-track-search">
+            <input id="track-query" name="q" value="{{ query }}" autocomplete="off" placeholder="NC10686 or EPG011111600019162" autofocus>
+            <button>Track</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="customer-track-results">
+        {% if searched and not rows %}
+        <div class="customer-track-empty">
+          <h2>No tracking found</h2>
+          <p>Check the number and try again.</p>
+        </div>
+        {% endif %}
+
+        {% for row in rows %}
+        <article class="customer-track-card">
+          <div class="customer-track-card-head">
+            <div>
+              <span>Order</span>
+              <h2>{{ row.odoo_order_name or row.odoo_order_id }}</h2>
+            </div>
+            <span class="customer-track-status">{{ row.status or row.epost_status or "In transit" }}</span>
+          </div>
+          <div class="customer-track-grid">
+            <div>
+              <span>Carrier</span>
+              <strong>{{ row.final_mile_carrier or "Preparing" }}</strong>
+            </div>
+            <div>
+              <span>Final mile tracking</span>
+              <strong class="font-monospace">{{ row.final_mile_tracking_number or "Preparing" }}</strong>
+            </div>
+            <div>
+              <span>EPG tracking</span>
+              <a href="{{ row.tracking_url }}" target="_blank" rel="noopener">{{ row.tracking_code }}</a>
+            </div>
+            <div>
+              <span>Last update</span>
+              <strong>{{ row.final_mile_checked_at or row.last_checked_at or row.updated_at }}</strong>
+            </div>
+          </div>
+          {% if row.final_mile_tracking_url %}
+          <a class="customer-track-button" href="{{ row.final_mile_tracking_url }}" target="_blank" rel="noopener">Track via Carrier</a>
+          {% else %}
+          <a class="customer-track-button secondary" href="{{ row.tracking_url }}" target="_blank" rel="noopener">Track via EPG</a>
+          {% endif %}
+        </article>
+        {% endfor %}
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <h2>{{ title }}</h2>
+      <p>{{ store.name if store else "No store selected" }}{% if store and store.odoo_url %} · {{ store.odoo_url }}{% endif %}</p>
+    </div>
+    <form method="post" action="/track-orders/{{ slug }}/sync-latest">
+      <input type="hidden" name="store_id" value="{{ store_id or '' }}">
+      <button>Sync Latest Order</button>
+    </form>
+  </div>
+  {% if message %}
+  <div class="notice {{ status or 'ok' }}">{{ message }}</div>
+  {% endif %}
+  <form method="get" action="/track-orders/{{ slug }}" class="inline-form">
+    <label>Website</label>
+    <select name="store_id" onchange="this.form.submit()">
+      {% for item in stores %}
+      <option value="{{ item.id }}" {% if store_id and item.id == store_id %}selected{% endif %}>{{ item.name }} · {{ item.odoo_url }}</option>
+      {% endfor %}
+    </select>
+    <input type="hidden" name="page" value="1">
+    <button>Load</button>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <h2>Final Mile Tracking</h2>
+      <p>{{ total }} order tracking row{{ "" if total == 1 else "s" }}</p>
+    </div>
+    <div class="pagination-summary">Page {{ page }} of {{ total_pages }}</div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Order Number</th>
+          <th>Carrier</th>
+          <th>Final Mile Tracking</th>
+          <th>Track</th>
+          <th>EPG Code</th>
+          <th>Status</th>
+          <th>Updated</th>
+          <th>Sync</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>
+            {% if row.odoo_order_url %}
+            <a href="{{ row.odoo_order_url }}" target="_blank" rel="noopener">{{ row.odoo_order_name or row.odoo_order_id }}</a>
+            {% else %}
+            {{ row.odoo_order_name or row.odoo_order_id or "" }}
+            {% endif %}
+          </td>
+          <td>{{ row.final_mile_carrier or "Pending" }}</td>
+          <td class="font-monospace">{{ row.final_mile_tracking_number or "Pending" }}</td>
+          <td>
+            {% if row.final_mile_tracking_url %}
+            <a class="button-link" href="{{ row.final_mile_tracking_url }}" target="_blank" rel="noopener">Track</a>
+            {% else %}
+            <span class="text-muted">Pending</span>
+            {% endif %}
+          </td>
+          <td>
+            <a href="{{ row.tracking_url }}" target="_blank" rel="noopener">{{ row.tracking_code }}</a>
+          </td>
+          <td>{{ row.status or row.epost_status }}</td>
+          <td>{{ row.final_mile_checked_at or row.last_checked_at or row.updated_at }}</td>
+          <td>
+            <form method="post" action="/track-orders/{{ slug }}/{{ row.id }}/sync">
+              <input type="hidden" name="store_id" value="{{ store_id or '' }}">
+              <input type="hidden" name="page" value="{{ page }}">
+              <button>Sync</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="8">No EPG tracking rows found for this website yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pagination-bar">
+    {% if page > 1 %}
+    <a class="button-link" href="/track-orders/{{ slug }}?store_id={{ store_id or '' }}&page={{ page - 1 }}&per_page={{ per_page }}">Previous</a>
+    {% endif %}
+    {% if page < total_pages %}
+    <a class="button-link" href="/track-orders/{{ slug }}?store_id={{ store_id or '' }}&page={{ page + 1 }}&per_page={{ per_page }}">Next</a>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

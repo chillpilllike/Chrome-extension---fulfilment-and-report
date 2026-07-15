@@ -25,6 +25,7 @@
           <nav class="navbar-nav">
             <a class="nav-link {% if path == '/legacy' %}active{% endif %}" href="/legacy">Orders</a>
             <a class="nav-link {% if path == '/stores' %}active{% endif %}" href="/stores">Stores</a>
+            <a class="nav-link {% if path.startswith('/track-orders') %}active{% endif %}" href="/track-orders/nutricity-com-au">Track Orders</a>
             <a class="nav-link {% if path == '/addresses' %}active{% endif %}" href="/addresses">Addresses</a>
             <a class="nav-link {% if path == '/amazon-accounts' %}active{% endif %}" href="/amazon-accounts">Amazon Accounts</a>
             <a class="nav-link {% if path == '/inventory' %}active{% endif %}" href="/inventory">Inventory</a>

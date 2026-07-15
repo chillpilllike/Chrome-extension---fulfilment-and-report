@@ -2859,6 +2859,7 @@ function App() {
   const ordersPageCacheRef = useRef<Map<string, { rows: OrderLine[]; page: number; per_page: number; total: number; cachedAt: number }>>(new Map())
   const selectedOrderRowsRef = useRef<Map<number, OrderLine>>(new Map())
   const ordersPageRef = useRef(ordersPage)
+  const ordersProgressVersionRef = useRef("")
   const shopifyStatusCompletedRefreshRef = useRef("")
   const shopifyStatusForceSyncPollRef = useRef(false)
 
@@ -3270,6 +3271,35 @@ function App() {
   }, [page, storeId])
 
   useEffect(() => {
+    if (page !== "orders" || !savedAdminToken()) return
+    let cancelled = false
+    const poll = () => {
+      const query = storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""
+      api<{ version?: string; chrome_version?: string; chrome_submitted?: number; chrome_locked?: number }>(`/api/orders/progress-version${query}`)
+        .then((result) => {
+          if (cancelled) return
+          const version = `${result.version || ""}|${result.chrome_version || ""}|${result.chrome_submitted || 0}|${result.chrome_locked || 0}`
+          if (!ordersProgressVersionRef.current) {
+            ordersProgressVersionRef.current = version
+            return
+          }
+          if (version && version !== ordersProgressVersionRef.current) {
+            ordersProgressVersionRef.current = version
+            ordersPageCacheRef.current.clear()
+            refreshOrdersPage(storeId, ordersPageRef.current, { silent: true }).catch(() => undefined)
+          }
+        })
+        .catch(() => undefined)
+    }
+    poll()
+    const timer = window.setInterval(poll, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [page, storeId])
+
+  useEffect(() => {
     if (page !== "home" || !data || !savedAdminToken()) return
     let cancelled = false
     const loadSystem = () => {
@@ -3486,7 +3516,18 @@ function App() {
 
   useEffect(() => {
     if (page !== "chrome-queue") return
-    refreshChromeQueue().catch((error) => setModal({ ok: false, title: "Chrome queue load failed", message: String(error) }))
+    let cancelled = false
+    const load = () => {
+      refreshChromeQueue().catch((error) => {
+        if (!cancelled) setModal({ ok: false, title: "Chrome queue load failed", message: String(error) })
+      })
+    }
+    load()
+    const timer = window.setInterval(load, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
   }, [page, storeId])
 
   useEffect(() => {
@@ -3600,9 +3641,24 @@ function App() {
   const selectedStoreIds = Array.from(new Set(selectedRows.map((row) => Number(row.store_id || 0)).filter(Boolean)))
   const selectedActionStoreId = selected.length > 0 && selectedRows.length === selected.length && selectedStoreIds.length === 1 ? selectedStoreIds[0] : null
   const canRunSelectedStoreAction = Boolean(selected.length && selectedActionStoreId)
+  const selectedActionDisabledReason = selected.length
+    ? selectedRows.length !== selected.length
+      ? "Some selected rows are no longer loaded. Clear and select the order again."
+      : selectedStoreIds.length > 1
+        ? "Selected rows are from multiple stores. Select one store's rows before placing."
+        : ""
+    : ""
   const selectedClubName = selectedRows.length
     ? `Nutricity ${Array.from(new Set(selectedRows.map((row) => row.odoo_order_name))).join(" ")}`
     : ""
+
+  useEffect(() => {
+    if (!selected.length) return
+    setSelected((current) => {
+      const next = current.filter((id) => currentRowsById.has(id) || selectedOrderRowsRef.current.has(id))
+      return next.length === current.length ? current : next
+    })
+  }, [currentRowsById, selected.length])
 
   function isSelectionControlClick(event: MouseEvent<HTMLElement>) {
     const target = event.target
@@ -3617,6 +3673,19 @@ function App() {
     setSelected((current) => {
       const anchor = previousAnchor ?? current[current.length - 1] ?? null
       const shouldCheck = checked ?? !current.includes(row.id)
+      if (shouldCheck) {
+        const knownRows = current
+          .map((id) => currentRowsById.get(id) || selectedOrderRowsRef.current.get(id))
+          .filter((item): item is OrderLine => Boolean(item))
+        const knownStoreIds = Array.from(new Set(knownRows.map((item) => Number(item.store_id || 0)).filter(Boolean)))
+        const rowStoreId = Number(row.store_id || 0)
+        if (rowStoreId && knownStoreIds.length && !knownStoreIds.includes(rowStoreId)) {
+          selectedOrderRowsRef.current.clear()
+          selectedOrderRowsRef.current.set(row.id, row)
+          ordersSelectionAnchor.current = row.id
+          return [row.id]
+        }
+      }
       const next = rangeSelection(visibleIds, current, row.id, shouldCheck, shiftKey, anchor)
       sortedRows.forEach((item) => {
         if (next.includes(item.id)) selectedOrderRowsRef.current.set(item.id, item)
@@ -4778,6 +4847,7 @@ function App() {
                 )}
                 <PaginationControls page={ordersPage} total={ordersTotal} perPage={ORDERS_PAGE_SIZE} onPage={setOrdersPage} disabled={Boolean(busy)} label="rows" />
                 {selectedClubName && <p className="text-sm text-muted-foreground">Clubbed recipient: {selectedClubName}</p>}
+                {selectedActionDisabledReason && <p className="text-sm text-destructive">{selectedActionDisabledReason}</p>}
                 {orderingEngine === "cxml" && (
                   <label className="flex items-center gap-2 text-sm text-muted-foreground">
                     <Checkbox checked={allowMissingSpaid} onCheckedChange={(checked) => setAllowMissingSpaid(Boolean(checked))} />
@@ -4980,6 +5050,7 @@ function App() {
                     <div className="flex items-center gap-3">
                       <Badge variant="secondary" className="px-3 py-1 text-sm">{selected.length.toLocaleString()} selected</Badge>
                       {selectedClubName ? <span className="hidden max-w-xl truncate text-sm text-muted-foreground lg:block">{selectedClubName}</span> : null}
+                      {selectedActionDisabledReason ? <span className="hidden max-w-xl truncate text-sm text-destructive lg:block">{selectedActionDisabledReason}</span> : null}
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
 	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={placeSelectedOrders}>

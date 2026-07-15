@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+  <template id="track_order_page" name="Track Order">
+    <t t-call="website.layout">
+      <div id="wrap" class="oe_structure">
+        <section class="container py-5">
+          <div class="row justify-content-center">
+            <div class="col-12">
+              <h1 class="mb-3">Track Order</h1>
+              <p class="text-muted mb-4">Track recent orders and final mile carrier links in one place.</p>
+              <form action="/track-order" method="get" class="card p-3 p-md-4 mb-4">
+                <label for="track_order_query" class="form-label fw-semibold">Search order or tracking number</label>
+                <div class="input-group input-group-lg">
+                  <input id="track_order_query" name="q" class="form-control" t-att-value="query" placeholder="Order number or EPG tracking code" autocomplete="off"/>
+                  <button class="btn btn-primary" type="submit">Search</button>
+                </div>
+              </form>
+
+              <t t-if="error">
+                <div class="alert alert-warning" role="alert">
+                  <t t-esc="error"/>
+                </div>
+              </t>
+
+              <t t-if="searched and not rows and not error">
+                <div class="alert alert-info" role="alert">
+                  No tracking details found. Please check the number and try again.
+                </div>
+              </t>
+
+              <div class="d-flex flex-column flex-md-row justify-content-between gap-2 align-items-md-center mb-3">
+                <div class="text-muted">
+                  Showing <t t-esc="len(rows)"/> of <t t-esc="total"/> tracking records
+                </div>
+                <div class="text-muted">
+                  Page <t t-esc="page"/> of <t t-esc="total_pages"/>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="table-responsive">
+                  <table class="table table-hover align-middle mb-0">
+                    <thead>
+                      <tr>
+                        <th>Order Number</th>
+                        <th>Carrier</th>
+                        <th>Final Mile Tracking</th>
+                        <th>Status</th>
+                        <th>Last Update</th>
+                        <th class="text-end">Track</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <t t-foreach="rows" t-as="row">
+                        <tr>
+                          <td class="fw-semibold"><t t-esc="row.get('order_number')"/></td>
+                          <td><t t-esc="row.get('carrier') or 'Preparing'"/></td>
+                          <td>
+                            <div class="fw-semibold"><t t-esc="row.get('final_mile_tracking_number') or 'Preparing'"/></div>
+                            <t t-if="row.get('epg_tracking_code')">
+                              <a class="small" t-att-href="row.get('epg_tracking_url')" target="_blank" rel="noopener">
+                                <t t-esc="row.get('epg_tracking_code')"/>
+                              </a>
+                            </t>
+                          </td>
+                          <td><span class="badge text-bg-light"><t t-esc="row.get('status') or 'In transit'"/></span></td>
+                          <td><t t-esc="row.get('last_update')"/></td>
+                          <td class="text-end">
+                            <t t-if="row.get('final_mile_tracking_url')">
+                              <a class="btn btn-sm btn-primary" t-att-href="row.get('final_mile_tracking_url')" target="_blank" rel="noopener">Track</a>
+                            </t>
+                            <t t-elif="row.get('epg_tracking_url')">
+                              <a class="btn btn-sm btn-outline-primary" t-att-href="row.get('epg_tracking_url')" target="_blank" rel="noopener">Track</a>
+                            </t>
+                          </td>
+                        </tr>
+                      </t>
+                      <t t-if="not rows and not error">
+                        <tr>
+                          <td colspan="6" class="text-center text-muted py-5">No tracking records found.</td>
+                        </tr>
+                      </t>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <nav t-if="total_pages &gt; 1" class="d-flex justify-content-between align-items-center mt-4" aria-label="Track order pagination">
+                <t t-set="query_suffix" t-value="'&amp;q=%s' % query if query else ''"/>
+                <t t-if="page &gt; 1">
+                  <a class="btn btn-outline-primary" t-att-href="'/track-order?page=%s%s' % (page - 1, query_suffix)">Previous</a>
+                </t>
+                <t t-else="">
+                  <span/>
+                </t>
+                <span class="text-muted">Page <t t-esc="page"/> of <t t-esc="total_pages"/></span>
+                <t t-if="page &lt; total_pages">
+                  <a class="btn btn-outline-primary" t-att-href="'/track-order?page=%s%s' % (page + 1, query_suffix)">Next</a>
+                </t>
+                <t t-else="">
+                  <span/>
+                </t>
+              </nav>
+            </div>
+          </div>
+        </section>
+      </div>
+    </t>
+  </template>
+</odoo>

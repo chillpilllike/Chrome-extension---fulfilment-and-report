@@ -156,7 +156,7 @@ _PROFIT_LOSS_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
 _PROFIT_LOSS_CACHE_LOCK = threading.Lock()
 PROFIT_LOSS_CACHE_TTL_SECONDS = 90
 TYPESENSE_SCHEMA_VERSION = "4"
-PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/assets", "/static", "/health", "/favicon")
+PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/track-order", "/track-orders", "/assets", "/static", "/health", "/favicon")
 PUBLIC_FRONTEND_PATHS = {"/tracking", "/fulfilment-pending", "/dispatch-status", "/dispatch-sorting", "/amazon-otp", "/epost"}
 PUBLIC_API_PATHS = {
     "/api/tracking/orders",
@@ -1030,6 +1030,10 @@ def init_db() -> None:
                 location TEXT,
                 destination TEXT,
                 awb TEXT,
+                final_mile_tracking_number TEXT,
+                final_mile_tracking_url TEXT,
+                final_mile_carrier TEXT,
+                final_mile_checked_at TEXT,
                 events_json TEXT,
                 last_checked_at TEXT,
                 epost_status TEXT NOT NULL DEFAULT 'pending',
@@ -1437,6 +1441,10 @@ def init_db() -> None:
             "refund_status": "ALTER TABLE epost_global_tracking ADD COLUMN refund_status TEXT NOT NULL DEFAULT ''",
             "refund_claimed_at": "ALTER TABLE epost_global_tracking ADD COLUMN refund_claimed_at TEXT",
             "refund_received_at": "ALTER TABLE epost_global_tracking ADD COLUMN refund_received_at TEXT",
+            "final_mile_tracking_number": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_tracking_number TEXT",
+            "final_mile_tracking_url": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_tracking_url TEXT",
+            "final_mile_carrier": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_carrier TEXT",
+            "final_mile_checked_at": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_checked_at TEXT",
         }.items():
             if column not in existing_epost_cols:
                 conn.execute(ddl)
@@ -15084,6 +15092,269 @@ def epost_status_from_update(status: str, last_update_at: Any, fallback_at: Any 
     return "pending"
 
 
+def carrier_name_from_tracking_url(url: str) -> str:
+    host = urlparse(clean_text(url)).netloc.lower()
+    if "aramex" in host:
+        return "Aramex"
+    if "dhl" in host:
+        return "DHL"
+    if "fedex" in host:
+        return "FedEx"
+    if "ups" in host:
+        return "UPS"
+    if "usps" in host:
+        return "USPS"
+    if "auspost" in host or "australiapost" in host:
+        return "Australia Post"
+    if "fleetoptics" in host:
+        return "FleetOptics"
+    name = host.replace("www.", "").split(".")[0].replace("-", " ").strip()
+    return name.title() if name else ""
+
+
+def extract_epg_final_mile_details(html_text: str) -> dict[str, str]:
+    text = html.unescape(str(html_text or ""))
+    tracking_url = ""
+    for match in re.findall(r"RedirectUrl\('([^']+)'\)", text):
+        candidate = clean_text(match)
+        if candidate and not tracking_url:
+            tracking_url = candidate
+    tracking_number = ""
+    number_match = re.search(
+        r"Final\s+Mile\s+Carrier\s+Tracking\s+Number.*?<span[^>]*>\s*([^<]+)\s*</span>",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if number_match:
+        tracking_number = clean_text(number_match.group(1))
+    if not tracking_number and tracking_url:
+        parsed = urlparse(tracking_url)
+        query = parse_qs(parsed.query)
+        for key in ("ShipmentNumber", "shipmentNumber", "trackingNumber", "tracking", "id"):
+            value = query.get(key)
+            if value and clean_text(value[0]):
+                tracking_number = clean_text(value[0])
+                break
+    return {
+        "final_mile_tracking_number": tracking_number,
+        "final_mile_tracking_url": tracking_url,
+        "final_mile_carrier": carrier_name_from_tracking_url(tracking_url),
+    }
+
+
+def fetch_epg_final_mile_details(tracking_code: str) -> dict[str, str]:
+    code = clean_text(tracking_code).upper()
+    if not re.fullmatch(r"EPG[0-9A-Z]+", code):
+        return {}
+    session = requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://epgtrack.com/{code}",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    response = session.post(
+        "https://epgtrack.com/TrackingShipment/ShipmentData",
+        data={"id": code},
+        headers=headers,
+        timeout=25,
+    )
+    response.raise_for_status()
+    details = extract_epg_final_mile_details(response.text)
+    return {key: clean_text(value) for key, value in details.items()}
+
+
+def refresh_epost_final_mile_tracking(row_id: int) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, tracking_code FROM epost_global_tracking WHERE id=?",
+            (row_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tracking row not found.")
+    details = fetch_epg_final_mile_details(row["tracking_code"])
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE epost_global_tracking
+            SET final_mile_tracking_number=?,
+                final_mile_tracking_url=?,
+                final_mile_carrier=?,
+                final_mile_checked_at=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                details.get("final_mile_tracking_number") or "",
+                details.get("final_mile_tracking_url") or "",
+                details.get("final_mile_carrier") or "",
+                now,
+                now,
+                row_id,
+            ),
+        )
+    return {"ok": True, "row_id": row_id, **details}
+
+
+def default_track_order_store_id(slug: str) -> Optional[int]:
+    cleaned = clean_text(slug).lower()
+    stores = list_stores()
+    if cleaned == "nutricity-com-au":
+        for store in stores:
+            text = f"{store.get('name', '')} {store.get('odoo_url', '')}".lower()
+            if "nutricity.com.au" in text or "nutricity australia" in text:
+                return int(store["id"])
+        for store in stores:
+            if "nutricity" in f"{store.get('name', '')} {store.get('odoo_url', '')}".lower():
+                return int(store["id"])
+    return int(stores[0]["id"]) if stores else None
+
+
+def track_order_page_title(slug: str, store: Optional[dict[str, Any]]) -> str:
+    if clean_text(slug).lower() == "nutricity-com-au":
+        return "Nutricity Australia Track Orders"
+    return f"{store.get('name') if store else 'Website'} Track Orders"
+
+
+def customer_track_order_page_title(slug: str, store: Optional[dict[str, Any]]) -> str:
+    if clean_text(slug).lower() == "nutricity-com-au":
+        return "Nutricity Australia"
+    return clean_text(store.get("name") if store else "") or "Track Order"
+
+
+def track_order_rows(store_id: Optional[int], page: int = 1, per_page: int = 50) -> tuple[list[dict[str, Any]], int, int, int]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    with db() as conn:
+        total = int(conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM epost_global_tracking
+            WHERE (? IS NULL OR store_id=?)
+            """,
+            (store_id, store_id),
+        ).fetchone()["count"] or 0)
+        rows = conn.execute(
+            """
+            SELECT epost_global_tracking.*, stores.name AS store_name, stores.odoo_url
+            FROM epost_global_tracking
+            JOIN stores ON stores.id=epost_global_tracking.store_id
+            WHERE (? IS NULL OR epost_global_tracking.store_id=?)
+            ORDER BY
+              COALESCE(epost_global_tracking.odoo_order_id, 0) DESC,
+              epost_global_tracking.created_at DESC,
+              epost_global_tracking.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (store_id, store_id, per_page, offset),
+        ).fetchall()
+    data = rows_to_dicts(rows)
+    stores = {int(store["id"]): store for store in list_stores()}
+    for row in data:
+        store = stores.get(int(row["store_id"]))
+        row["tracking_url"] = row.get("tracking_url") or f"https://epgtrack.com/{row.get('tracking_code')}"
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        row["final_mile_carrier"] = clean_text(row.get("final_mile_carrier")) or carrier_name_from_tracking_url(row.get("final_mile_tracking_url") or "")
+    return data, total, page, per_page
+
+
+def latest_track_order_row_id(store_id: Optional[int]) -> Optional[int]:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM epost_global_tracking
+            WHERE (? IS NULL OR store_id=?)
+            ORDER BY COALESCE(odoo_order_id, 0) DESC, created_at DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (store_id, store_id),
+        ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def customer_track_order_rows(store_id: Optional[int], query: str) -> list[dict[str, Any]]:
+    term = clean_text(query).upper()
+    if not term or len(term) < 4:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT epost_global_tracking.*, stores.name AS store_name, stores.odoo_url
+            FROM epost_global_tracking
+            JOIN stores ON stores.id=epost_global_tracking.store_id
+            WHERE (? IS NULL OR epost_global_tracking.store_id=?)
+              AND (
+                UPPER(epost_global_tracking.odoo_order_name)=?
+                OR UPPER(epost_global_tracking.tracking_code)=?
+                OR UPPER(COALESCE(epost_global_tracking.final_mile_tracking_number, ''))=?
+              )
+            ORDER BY COALESCE(epost_global_tracking.odoo_order_id, 0) DESC, epost_global_tracking.updated_at DESC
+            LIMIT 10
+            """,
+            (store_id, store_id, term, term, term),
+        ).fetchall()
+    data = rows_to_dicts(rows)
+    for row in data:
+        if not clean_text(row.get("final_mile_tracking_number")) and clean_text(row.get("tracking_code")):
+            try:
+                refresh_epost_final_mile_tracking(int(row["id"]))
+            except Exception:
+                pass
+    if data and any(not clean_text(row.get("final_mile_tracking_number")) for row in data):
+        with db() as conn:
+            refreshed = conn.execute(
+                """
+                SELECT epost_global_tracking.*, stores.name AS store_name, stores.odoo_url
+                FROM epost_global_tracking
+                JOIN stores ON stores.id=epost_global_tracking.store_id
+                WHERE epost_global_tracking.id = ANY(?::int[])
+                ORDER BY COALESCE(epost_global_tracking.odoo_order_id, 0) DESC, epost_global_tracking.updated_at DESC
+                """,
+                ([int(row["id"]) for row in data],),
+            ).fetchall()
+        data = rows_to_dicts(refreshed)
+    stores = {int(store["id"]): store for store in list_stores()}
+    for row in data:
+        store = stores.get(int(row["store_id"]))
+        row["tracking_url"] = row.get("tracking_url") or f"https://epgtrack.com/{row.get('tracking_code')}"
+        row["odoo_order_url"] = odoo_order_admin_url(store, row.get("odoo_order_id")) if store else ""
+        row["final_mile_carrier"] = clean_text(row.get("final_mile_carrier")) or carrier_name_from_tracking_url(row.get("final_mile_tracking_url") or "")
+    return data
+
+
+def public_track_order_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "order_number": row.get("odoo_order_name") or row.get("odoo_order_id") or "",
+        "carrier": row.get("final_mile_carrier") or "",
+        "final_mile_tracking_number": row.get("final_mile_tracking_number") or "",
+        "final_mile_tracking_url": row.get("final_mile_tracking_url") or "",
+        "epg_tracking_code": row.get("tracking_code") or "",
+        "epg_tracking_url": row.get("tracking_url") or "",
+        "status": row.get("status") or row.get("epost_status") or "",
+        "last_update": row.get("final_mile_checked_at") or row.get("last_checked_at") or row.get("updated_at") or "",
+    }
+
+
+def customer_track_order_public_rows(store_id: Optional[int], query: str) -> list[dict[str, Any]]:
+    return [public_track_order_row(row) for row in customer_track_order_rows(store_id, query)]
+
+
+def public_track_order_rows(
+    store_id: Optional[int],
+    page: int = 1,
+    per_page: int = 25,
+    q: str = "",
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    query = clean_text(q)
+    if query:
+        rows = customer_track_order_public_rows(store_id, query)
+        paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
+        return paged_rows, total, page, per_page
+    rows, total, page, per_page = track_order_rows(store_id, page, per_page)
+    return [public_track_order_row(row) for row in rows], total, page, per_page
+    return public_rows
+
+
 def annotate_epost_staleness(row: dict[str, Any], stale_days: int = 10) -> None:
     threshold = max(1, min(90, int(stale_days or 10)))
     update_dt = parse_epost_datetime(row.get("last_update_at")) or parse_epost_datetime(row.get("created_at"))
@@ -21926,9 +22197,51 @@ def api_system_diagnostics() -> dict[str, Any]:
     return system_diagnostics()
 
 
+def order_lines_progress_snapshot(store_id: Optional[int] = None) -> dict[str, Any]:
+    with db() as conn:
+        latest = conn.execute(
+            """
+            SELECT updated_at
+            FROM order_lines
+            WHERE (? IS NULL OR store_id=?)
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            (store_id, store_id),
+        ).fetchone()
+        chrome = conn.execute(
+            """
+            SELECT
+              COUNT(*) FILTER (
+                WHERE order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '')=''
+                  AND COALESCE(amazon_group_key, '')!=''
+              ) AS submitted,
+              COUNT(*) FILTER (
+                WHERE order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '')=''
+                  AND COALESCE(chrome_claimed_by, '')!=''
+              ) AS locked,
+              MAX(updated_at) FILTER (WHERE order_engine='chrome') AS chrome_updated_at
+            FROM order_lines
+            WHERE (? IS NULL OR store_id=?)
+            """,
+            (store_id, store_id),
+        ).fetchone()
+    return {
+        "version": clean_text((latest or {}).get("updated_at")),
+        "chrome_version": clean_text((chrome or {}).get("chrome_updated_at")),
+        "chrome_submitted": int((chrome or {}).get("submitted") or 0),
+        "chrome_locked": int((chrome or {}).get("locked") or 0),
+    }
+
+
 @app.get("/api/orders")
 def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, condition: str = "all", sort_by: str = "odoo_order_date", sort_dir: str = "desc", country: str = "", q: str = "") -> dict[str, Any]:
-    cache_key = ("orders", store_id, page, per_page, clean_text(condition), clean_text(sort_by), clean_text(sort_dir), clean_text(country), clean_text(q))
+    progress = order_lines_progress_snapshot(store_id)
+    cache_key = ("orders", store_id, page, per_page, clean_text(condition), clean_text(sort_by), clean_text(sort_dir), clean_text(country), clean_text(q), progress.get("version"), progress.get("chrome_version"), progress.get("chrome_submitted"), progress.get("chrome_locked"))
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -21959,6 +22272,11 @@ def api_orders(store_id: Optional[int] = None, page: int = 1, per_page: int = 10
     data = order_lines_page_data(store_id, page, per_page, sort_by, sort_dir, country)
     data["search_engine"] = "postgres"
     return fast_page_cache_set(cache_key, data, 90)
+
+
+@app.get("/api/orders/progress-version")
+def api_orders_progress_version(store_id: Optional[int] = None) -> dict[str, Any]:
+    return {"ok": True, "store_id": store_id, **order_lines_progress_snapshot(store_id)}
 
 
 @app.get("/api/orders/countries")
@@ -26348,12 +26666,8 @@ def api_chrome_jobs(
             split_mixed_asin=split_mixed_asin,
         )
         return {"ok": True, "jobs": [job] if job else []}
-    cache_key = ("chrome-jobs", store_id, job_limit, bool(split_mixed_asin))
-    cached = fast_page_cache_get(cache_key)
-    if cached is not None:
-        return cached
     snapshot = chrome_queue_snapshot(store_id, limit=job_limit)
-    return fast_page_cache_set(cache_key, {"ok": True, **snapshot}, 20)
+    return {"ok": True, **snapshot}
 
 
 @app.get("/api/chrome/jobs/recover-submitted")
@@ -29255,6 +29569,44 @@ def api_public_tracking(store_id: Optional[int] = None) -> dict[str, Any]:
     return {"ok": True, "rows": public_rows, "total": len(public_rows)}
 
 
+@app.get("/api/public/track-order/{slug}")
+def api_public_track_order(slug: str, q: str = "", store_id: Optional[int] = None) -> dict[str, Any]:
+    target_store_id = store_id or default_track_order_store_id(slug)
+    query = clean_text(q)
+    rows = customer_track_order_public_rows(target_store_id, query) if query else []
+    return {
+        "ok": True,
+        "slug": slug,
+        "query": query,
+        "store_id": target_store_id,
+        "rows": rows,
+        "total": len(rows),
+    }
+
+
+@app.get("/api/public/track-orders/{slug}")
+def api_public_track_orders(
+    slug: str,
+    q: str = "",
+    store_id: Optional[int] = None,
+    page: int = 1,
+    per_page: int = 25,
+) -> dict[str, Any]:
+    target_store_id = store_id or default_track_order_store_id(slug)
+    rows, total, page, per_page = public_track_order_rows(target_store_id, page, per_page, q)
+    return {
+        "ok": True,
+        "slug": slug,
+        "query": clean_text(q),
+        "store_id": target_store_id,
+        "rows": rows,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": max(1, (total + per_page - 1) // per_page),
+    }
+
+
 @app.get("/api/amazon-otp")
 def api_amazon_otp(q: str = "", page: int = 1, per_page: int = 100) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
@@ -29347,6 +29699,108 @@ def public_pending_page(store_id: Optional[int] = None) -> HTMLResponse:
 @app.get("/public/tracking", response_class=HTMLResponse)
 def public_tracking_page(store_id: Optional[int] = None) -> HTMLResponse:
     return public_table_page("Amazon Tracking", api_public_tracking(store_id)["rows"])
+
+
+@app.get("/track-order/{slug}", response_class=HTMLResponse)
+def customer_track_order_page(
+    request: Request,
+    slug: str,
+    q: str = "",
+    store_id: Optional[int] = None,
+) -> HTMLResponse:
+    target_store_id = store_id or default_track_order_store_id(slug)
+    stores = rows_to_dicts(list_stores())
+    store = next((item for item in stores if int(item["id"]) == int(target_store_id or 0)), None)
+    query = clean_text(q)
+    rows = customer_track_order_rows(target_store_id, query) if query else []
+    return templates.TemplateResponse(
+        "customer_track_order.html",
+        {
+            "request": request,
+            "slug": slug,
+            "title": customer_track_order_page_title(slug, store),
+            "store": store,
+            "store_id": target_store_id,
+            "query": query,
+            "rows": rows,
+            "searched": bool(query),
+        },
+    )
+
+
+@app.get("/track-orders/{slug}", response_class=HTMLResponse)
+def track_orders_page(
+    request: Request,
+    slug: str,
+    store_id: Optional[int] = None,
+    page: int = 1,
+    per_page: int = 50,
+    message: str = "",
+    status: str = "",
+) -> HTMLResponse:
+    target_store_id = store_id or default_track_order_store_id(slug)
+    stores = rows_to_dicts(list_stores())
+    store = next((item for item in stores if int(item["id"]) == int(target_store_id or 0)), None)
+    rows, total, page, per_page = track_order_rows(target_store_id, page, per_page)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    return templates.TemplateResponse(
+        "track_orders.html",
+        {
+            "request": request,
+            "slug": slug,
+            "title": track_order_page_title(slug, store),
+            "stores": stores,
+            "store": store,
+            "store_id": target_store_id,
+            "rows": rows,
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "total_pages": total_pages,
+            "message": message,
+            "status": status,
+        },
+    )
+
+
+@app.post("/track-orders/{slug}/sync-latest")
+def track_orders_sync_latest(slug: str, store_id: Optional[int] = Form(None)) -> RedirectResponse:
+    target_store_id = int(store_id) if store_id else default_track_order_store_id(slug)
+    synced = sync_epost_tracking_from_odoo(target_store_id, 30) if target_store_id else 0
+    row_id = latest_track_order_row_id(target_store_id)
+    status = "ok"
+    if not row_id:
+        message = "No EPG tracking rows found for this website yet."
+    else:
+        try:
+            details = refresh_epost_final_mile_tracking(row_id)
+            number = details.get("final_mile_tracking_number") or "not found"
+            carrier = details.get("final_mile_carrier") or "carrier not found"
+            message = f"Synced {synced} EPG code(s). Latest row final-mile result: {carrier} {number}."
+        except Exception as exc:
+            status = "error"
+            message = f"Synced {synced} EPG code(s), but final-mile extraction failed: {clean_error_message(exc)}"
+    return RedirectResponse(
+        f"/track-orders/{quote_plus(slug)}?store_id={target_store_id or ''}&status={quote_plus(status)}&message={quote_plus(message)}",
+        status_code=303,
+    )
+
+
+@app.post("/track-orders/{slug}/{tracking_id}/sync")
+def track_orders_sync_row(slug: str, tracking_id: int, store_id: Optional[int] = Form(None), page: int = Form(1)) -> RedirectResponse:
+    status = "ok"
+    try:
+        details = refresh_epost_final_mile_tracking(tracking_id)
+        number = details.get("final_mile_tracking_number") or "not found"
+        carrier = details.get("final_mile_carrier") or "carrier not found"
+        message = f"Final-mile result: {carrier} {number}."
+    except Exception as exc:
+        status = "error"
+        message = f"Final-mile extraction failed: {clean_error_message(exc)}"
+    return RedirectResponse(
+        f"/track-orders/{quote_plus(slug)}?store_id={store_id or ''}&page={page}&status={quote_plus(status)}&message={quote_plus(message)}",
+        status_code=303,
+    )
 
 
 @app.get("/public/amazon-otp", response_class=HTMLResponse)

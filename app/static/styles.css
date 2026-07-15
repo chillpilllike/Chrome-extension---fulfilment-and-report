@@ -623,6 +623,215 @@ small {
   width: auto;
 }
 
+.inline-form,
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.inline-form select {
+  min-width: min(420px, 100%);
+}
+
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--primary);
+  color: white;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.button-link:hover {
+  color: white;
+  text-decoration: none;
+}
+
+.pagination-summary {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.text-muted {
+  color: var(--muted);
+}
+
+.customer-track-body {
+  min-height: 100vh;
+  margin: 0;
+  background: #f7faf9;
+  color: #10231d;
+}
+
+.customer-track-page {
+  width: min(960px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 42px 0;
+}
+
+.customer-track-hero {
+  display: grid;
+  gap: 22px;
+  padding: 28px 0 24px;
+}
+
+.customer-track-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: #1b5a49;
+  font-weight: 800;
+}
+
+.customer-track-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #1b5a49;
+  color: #fff;
+}
+
+.customer-track-hero h1 {
+  margin: 0;
+  color: #10231d;
+  font-size: 42px;
+  line-height: 1.1;
+}
+
+.customer-track-form {
+  display: grid;
+  gap: 8px;
+  width: min(680px, 100%);
+}
+
+.customer-track-form label,
+.customer-track-grid span,
+.customer-track-card-head span {
+  color: #61706a;
+  font-size: 13px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.customer-track-search {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+}
+
+.customer-track-search input {
+  min-height: 50px;
+  border: 1px solid #cfd9d4;
+  border-radius: 8px;
+  padding: 0 14px;
+  background: #fff;
+  color: #10231d;
+  font-size: 16px;
+}
+
+.customer-track-search button,
+.customer-track-button {
+  min-height: 50px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 20px;
+  background: #1b5a49;
+  color: #fff;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.customer-track-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+}
+
+.customer-track-button:hover {
+  color: #fff;
+  text-decoration: none;
+}
+
+.customer-track-button.secondary {
+  background: #34506b;
+}
+
+.customer-track-results {
+  display: grid;
+  gap: 16px;
+}
+
+.customer-track-card,
+.customer-track-empty {
+  border: 1px solid #dce5e1;
+  border-radius: 8px;
+  background: #fff;
+  padding: 22px;
+  box-shadow: 0 12px 28px rgba(16, 35, 29, 0.08);
+}
+
+.customer-track-card {
+  display: grid;
+  gap: 20px;
+}
+
+.customer-track-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.customer-track-card-head h2,
+.customer-track-empty h2 {
+  margin: 4px 0 0;
+  color: #10231d;
+  font-size: 28px;
+}
+
+.customer-track-status {
+  max-width: 320px;
+  border-radius: 999px;
+  background: #eaf4f0;
+  padding: 8px 12px;
+  color: #1b5a49 !important;
+  text-align: right;
+  text-transform: none !important;
+}
+
+.customer-track-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.customer-track-grid div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.customer-track-grid strong,
+.customer-track-grid a {
+  overflow-wrap: anywhere;
+  color: #10231d;
+}
+
+.customer-track-empty p {
+  margin: 8px 0 0;
+  color: #61706a;
+}
+
 @media (max-width: 900px) {
   header, main {
     padding-left: 16px;
@@ -644,5 +853,28 @@ small {
   .toolbar-form,
   .selected-actions {
     flex-wrap: wrap;
+  }
+
+  .customer-track-page {
+    width: min(100% - 24px, 960px);
+    padding: 24px 0;
+  }
+
+  .customer-track-hero h1 {
+    font-size: 34px;
+  }
+
+  .customer-track-search,
+  .customer-track-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .customer-track-card-head {
+    display: grid;
+  }
+
+  .customer-track-status {
+    max-width: none;
+    text-align: left;
   }
 }

@@ -392,6 +392,18 @@ function followRecoveryRedirect(response = {}) {
   return true;
 }
 
+function trackAllProgressMessage(tracking = {}) {
+  if (!(tracking?.running && tracking.source === "history")) return "";
+  const completed = Number(tracking.completedOrderIds?.length || 0);
+  const failed = Number(tracking.failedOrderIds?.length || 0);
+  const queue = Number(tracking.queue?.length || 0);
+  const page = tracking.currentPage ? `page ${tracking.currentPage}` : "order history";
+  const currentOrder = tracking.currentOrder?.amazon_order_id || tracking.currentOrderId || "";
+  const lastMessage = clean(tracking.lastMessage || "");
+  const current = currentOrder ? ` Current ${currentOrder}.` : "";
+  return `${lastMessage || `Track all is running on ${page}.`}${current} Queue ${queue}; checked ${completed}; failed ${failed}.`;
+}
+
 function recipientFromOrderHistoryText(text = "") {
   const value = String(text || "").replace(/\s+/g, " ").trim();
   const nutricityMatch = value.match(/\bNutricity\s+[A-Z]{2,5}\d{2,}(?:\s+[A-Za-z0-9]+){0,4}/i);
@@ -535,8 +547,13 @@ function orderCardTrackingPackages(card, orderId) {
 }
 
 function nextHistoryPageUrl() {
-  const next = [...document.querySelectorAll("li.a-last a[href*='pagination/next'], a[href*='#pagination/next']")]
-    .find((link) => visible(link));
+  const next = [...document.querySelectorAll("li.a-last a, .a-pagination .a-last a")]
+    .find((link) => {
+      if (!visible(link)) return false;
+      const parentText = clean(link.closest("li")?.textContent || link.textContent || "");
+      const href = link.getAttribute("href") || link.href || "";
+      return /\bnext\b|→/.test(parentText.toLowerCase()) || /pagination\/next|startIndex=/i.test(href);
+    });
   if (next) return absoluteUrl(next.getAttribute("href") || next.href || "");
   return "";
 }
@@ -989,8 +1006,23 @@ async function run() {
   window.__nutricityLastRunSignature = runSignature;
   window.__nutricityLastRunAt = now;
   showPanel("Nutricity tracking", `Scanning Amazon page: ${location.pathname}`);
+  const initialState = await send({ type: "GET_STATE" });
+  if (!extensionContextAlive || initialState == null) {
+    showPanel("Nutricity tracking", "Extension was reloaded while this Amazon page was open. Refresh this Amazon tab, then start or resume tracking.");
+    return;
+  }
+  if (initialState?.timedOut) {
+    showPanel("Nutricity tracking", initialState.message || "Nutricity Tracking background did not respond. Reload the extension and start tracking again.");
+    return;
+  }
+  if (initialState?.tracking?.running && initialState.tracking.source === "history") {
+    const progressMessage = trackAllProgressMessage(initialState.tracking);
+    if (progressMessage) showPanel("Nutricity tracking", progressMessage);
+  } else if (isOrderHistoryPage()) {
+    showPanel("Nutricity tracking", "No active Track all run. Open Nutricity Tracking and start Track all from this Amazon order-history page.");
+  }
   if (isTrackingPage()) {
-    const state = await send({ type: "GET_STATE" });
+    const state = initialState;
     if (state?.timedOut) {
       showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start tracking again.");
       return;
@@ -1020,7 +1052,7 @@ async function run() {
   }
   await waitForPageReady();
   if (isOrderHistoryPage()) {
-    const state = await send({ type: "GET_STATE" });
+    const state = initialState;
     if (state?.timedOut) {
       showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start Track all again.");
       return;
@@ -1031,7 +1063,7 @@ async function run() {
     return;
   }
   if (isOrderDetailsLikePage()) {
-    const state = await send({ type: "GET_STATE" });
+    const state = initialState;
     if (state?.timedOut) {
       showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start tracking again.");
       return;
@@ -1118,6 +1150,8 @@ if (!window.__nutricityTrackAllWatcher) {
         return;
       }
       if (!(state?.tracking?.running && state.tracking.source === "history")) return;
+      const progressMessage = trackAllProgressMessage(state.tracking);
+      if (progressMessage) showPanel("Nutricity tracking", progressMessage);
       if (!currentPageMatchesActiveTracking(state)) {
         await recoverActiveTrackingPage(state, "watcher page did not match the active Track all run");
         return;

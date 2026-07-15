@@ -6,6 +6,7 @@ const DEFAULT_AUTO_TRACKING_HOURS = 3;
 const TRACKING_STEP_TIMEOUT_MS = 90000;
 const RECENT_TRACKING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const ORDER_HISTORY_URL = "https://www.amazon.com/gp/css/order-history?ref_=abn_yadd_ad_your_orders";
+const ORDER_HISTORY_PATH_RE = /\/(gp\/css\/order-history|gp\/your-account\/order-history|your-orders\/orders?)\/?$/i;
 const AMAZON_ORDER_ID_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
 async function getState() {
@@ -93,6 +94,19 @@ async function saveTracking(tracking, windowId) {
   if (staleRunningSave) return;
   tracking.updatedAt = Date.now();
   await chrome.storage.local.set({ trackingByWindow: { ...(trackingByWindow || {}), [key]: tracking }, tracking });
+}
+
+async function saveFreshTrackAllRun(tracking, windowId) {
+  tracking.updatedAt = Date.now();
+  const state = await getState();
+  const updates = { tracking };
+  if (windowId) {
+    updates.trackingByWindow = {
+      ...(state.trackingByWindow || {}),
+      [String(windowId)]: tracking,
+    };
+  }
+  await chrome.storage.local.set(updates);
 }
 
 function stoppedTrackingRun(run = {}, message = "Amazon tracking stopped.") {
@@ -739,6 +753,15 @@ function orderHistoryUrl(page = 1) {
   return `${ORDER_HISTORY_URL}#pagination/${pageNumber}/`;
 }
 
+function isAmazonOrderHistoryUrl(value = "") {
+  try {
+    const url = new URL(String(value || ""), ORDER_HISTORY_URL);
+    return /(^|\.)amazon\.com$/i.test(url.hostname) && ORDER_HISTORY_PATH_RE.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
 function normalizeHistoryNextUrl(nextUrl = "", nextPage = 1) {
   const raw = String(nextUrl || "").trim();
   if (!raw) return "";
@@ -747,9 +770,10 @@ function normalizeHistoryNextUrl(nextUrl = "", nextPage = 1) {
   }
   try {
     const url = new URL(raw, ORDER_HISTORY_URL);
-    if (/amazon\.com$/i.test(url.hostname) && /pagination\/next/i.test(url.hash)) {
+    if (/(^|\.)amazon\.com$/i.test(url.hostname) && /pagination\/next/i.test(url.hash)) {
       return orderHistoryUrl(nextPage);
     }
+    if (isAmazonOrderHistoryUrl(url.href)) return url.href;
     return url.href;
   } catch {
     return raw;
@@ -1195,9 +1219,10 @@ async function syncHistoryOrdersToAppBatch(rawOrders, windowId) {
   return { matched, prepared };
 }
 
-async function startTrackAll(windowId, startPage = 1, maxPages = 202) {
+async function startTrackAll(windowId, startPage = 1, maxPages = 202, startUrl = "") {
   const page = Math.max(1, Math.round(Number(startPage || 1)));
   const pages = Math.max(1, Math.min(999, Math.round(Number(maxPages || 202))));
+  const firstUrl = isAmazonOrderHistoryUrl(startUrl) ? String(startUrl || "").trim() : orderHistoryUrl(page);
   const tracking = {
     running: true,
     source: "history",
@@ -1216,13 +1241,13 @@ async function startTrackAll(windowId, startPage = 1, maxPages = 202) {
     trackingTabId: 0,
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
-    lastMessage: `Track all started from order-history page ${page}.`,
+    lastMessage: `Fresh Track all started from order-history page ${page}.`,
   };
-  await saveTracking(tracking, windowId);
+  await saveFreshTrackAllRun(tracking, windowId);
   await ensureWatchdog();
-  await log(`Track all started from Amazon order-history page ${page}; max pages ${pages}.`, windowId);
-  await openTrackingRunUrl(tracking, windowId, orderHistoryUrl(page));
-  return { ok: true, message: `Track all started from page ${page}.`, progress: trackingProgress(tracking) };
+  await log(`Fresh Track all started from Amazon order-history page ${page}; max pages ${pages}.`, windowId);
+  await openTrackingRunUrl(tracking, windowId, firstUrl);
+  return { ok: true, message: `Fresh Track all started from page ${page}.`, progress: trackingProgress(tracking) };
 }
 
 function canResumeHistoryTracking(tracking = {}) {
@@ -1271,8 +1296,18 @@ async function stopTracking(windowId) {
 
 async function maybeOpenNextHistoryPage(tracking, windowId) {
   const nextPage = Number(tracking.currentPage || tracking.startPage || 1) + 1;
+  const savedNextUrl = normalizeHistoryNextUrl(tracking.nextUrl || "", nextPage);
+  if (Number(tracking.pagesScanned || 0) > 0 && !savedNextUrl) {
+    tracking.running = false;
+    tracking.finishedAt = Date.now();
+    tracking.lastMessage = `All tracking codes scanned. Track all reached the last Amazon order-history page; checked ${tracking.completedOrderIds?.length || 0} order(s), failed ${tracking.failedOrderIds?.length || 0}.`;
+    await saveTracking(tracking, windowId);
+    await log(tracking.lastMessage, windowId);
+    await clearWatchdogIfIdle();
+    return false;
+  }
   if (Number(tracking.pagesScanned || 0) < Number(tracking.maxPages || 1)) {
-    tracking.nextUrl = normalizeHistoryNextUrl(tracking.nextUrl || orderHistoryUrl(nextPage), nextPage);
+    tracking.nextUrl = savedNextUrl || orderHistoryUrl(nextPage);
     tracking.currentPage = nextPage;
     tracking.lastActivityAt = Date.now();
     tracking.lastMessage = `Opening Amazon order-history page ${nextPage}.`;
@@ -2269,7 +2304,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "START_SINGLE_ORDER_TRACKING") return startSingleOrderTracking(windowId, message.amazonOrderId);
     if (message.type === "START_MANUAL_ORDER_QUEUE_TRACKING") return startManualOrderQueueTracking(windowId, message.amazonOrderIds || [], "manual");
     if (message.type === "START_PAYMENT_FAILURE_RECHECK") return startPaymentFailureRecheck(windowId);
-    if (message.type === "START_TRACK_ALL") return startTrackAll(windowId, message.startPage, message.maxPages);
+    if (message.type === "START_TRACK_ALL") return startTrackAll(windowId, message.startPage, message.maxPages, message.startUrl);
     if (message.type === "RESUME_TRACK_ALL") return resumeTrackAll(windowId);
     if (message.type === "STOP_TRACKING") return stopTracking(windowId);
     if (message.type === "START_HEADLESS_TRACKING") return startHeadlessTracking();
