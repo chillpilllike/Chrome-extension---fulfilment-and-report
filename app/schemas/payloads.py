@@ -178,6 +178,9 @@ class ManualFulfilmentPayload(BaseModel):
     reference: str = ""
     url: str = ""
     third_party: bool = False
+    total_cost: float = 0
+    update_odoo_product_asin: bool = False
+    replacement_asin: str = ""
 
 
 class ChromeJobHeartbeatPayload(BaseModel):
@@ -218,7 +221,7 @@ class EpostTrackingUpdatePayload(BaseModel):
 
 class EpostSyncPayload(BaseModel):
     store_id: Optional[int] = None
-    days: int = 2
+    days: int = 30
 
 
 class EpostRefundPayload(BaseModel):
@@ -260,6 +263,7 @@ class ReplacementPayload(BaseModel):
     store_id: int
     asin: str
     note: str = ""
+    update_odoo_product_asin: bool = False
 
 
 class BulkPlacePayload(BaseModel):

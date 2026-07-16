@@ -24,8 +24,7 @@ import xmlrpc.client
 import xml.etree.ElementTree as ET
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
-from urllib.parse import parse_qs, urlencode, urlparse, urlsplit
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlencode, urlparse, urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -88,7 +87,7 @@ from app.schemas import (
 )
 from app.services.amazon import amz_date, normalize_amazon_endpoint
 from app.services.amazon_otp import imap_connect, imap_search_since, parse_amazon_email
-from app.services.asin import decode_asin_reference, extract_asin_from_notes, normalize_asin, strip_html
+from app.services.asin import decode_asin_reference, encode_asin, extract_asin_from_notes, normalize_asin, strip_html
 
 
 AMAZON_ORDER_RE = re.compile(r"\b(?:AMAZON|Amazon)\s+order\s*:\s*([A-Z0-9-]+)", re.IGNORECASE)
@@ -562,6 +561,7 @@ _EPOST_BROWSERLESS_PROGRESS: dict[str, Any] = {
     "completed_at": "",
     "error": "",
 }
+_DATABASE_BACKUP_LOCK = threading.Lock()
 BACKUP_PROGRESS_STALE_SECONDS = 30 * 60
 FRONTEND_SHELL_PATHS = {
     "/",
@@ -12041,6 +12041,18 @@ def place_orders(
                         )
                 cxml_state = "ordered" if response.get("confirmed") else "submitted"
                 update_lines_after_order(group_lines, amazon_order_id, None, amazon_account, cxml_state, external_id, "cxml")
+                threading.Thread(
+                    target=sync_amazon_order_products_to_odoo,
+                    args=(
+                        [dict(line) for line in group_lines],
+                        {
+                            normalize_asin(line["asin"]): {"purchased_asin": normalize_asin(line["asin"])}
+                            for line in group_lines
+                            if normalize_asin(line["asin"])
+                        },
+                    ),
+                    daemon=True,
+                ).start()
                 note = (
                     f"Amazon cXML {'clubbed ' if club else ''}order {'confirmed' if response.get('confirmed') else 'submitted, confirmation pending'}: {amazon_order_id}<br/>"
                     f"ASINs: {', '.join(dict.fromkeys(str(line['asin']) for line in group_lines))}<br/>"
@@ -12107,6 +12119,18 @@ def place_orders(
                 external_id,
                 "rest",
             )
+            threading.Thread(
+                target=sync_amazon_order_products_to_odoo,
+                args=(
+                    [dict(line) for line in group_lines],
+                    {
+                        normalize_asin(line["asin"]): {"purchased_asin": normalize_asin(line["asin"])}
+                        for line in group_lines
+                        if normalize_asin(line["asin"])
+                    },
+                ),
+                daemon=True,
+            ).start()
             note = (
                 f"Amazon {'clubbed ' if club else ''}order: <a href=\"{amazon_url}\" target=\"_blank\">{amazon_order_id}</a><br/>"
                 f"ASINs: {', '.join(dict.fromkeys(str(line['asin']) for line in group_lines))}<br/>"
@@ -15029,7 +15053,7 @@ def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2)
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               AND (? IS NULL OR store_id=?)
             ORDER BY CASE WHEN COALESCE(amazon_order_id, '') != '' THEN 0 ELSE 1 END, updated_at DESC
-            LIMIT 5000
+            LIMIT 50000
             """,
             (store_id, store_id),
         ).fetchall()
@@ -15043,60 +15067,68 @@ def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2)
         except Exception:
             continue
     synced = 0
-    with db() as conn:
-        for store_row in stores.values():
-            if store_id is not None and int(store_row["id"]) != int(store_id):
+    for store_row in stores.values():
+        if store_id is not None and int(store_row["id"]) != int(store_id):
+            continue
+        try:
+            client = OdooClient(get_store(int(store_row["id"])))
+            tracks = client.epost_tracking_since(days, limit=5000)
+        except Exception:
+            continue
+        values: list[tuple[Any, ...]] = []
+        for track in tracks:
+            code = clean_text(track.get("tracking_code")).upper()
+            if not code:
                 continue
-            try:
-                client = OdooClient(get_store(int(store_row["id"])))
-                tracks = client.epost_tracking_since(days)
-            except Exception:
-                continue
-            for track in tracks:
-                code = clean_text(track.get("tracking_code")).upper()
-                if not code:
-                    continue
-                odoo_order_id = track.get("odoo_order_id")
-                local_row = None
-                if odoo_order_id:
-                    try:
-                        local_row = local_by_order.get((int(store_row["id"]), int(odoo_order_id)))
-                    except Exception:
-                        local_row = None
-                now = utc_now()
-                conn.execute(
-                    """
-                    INSERT INTO epost_global_tracking
-                    (store_id, order_line_id, odoo_order_id, odoo_order_name, amazon_order_id, amazon_order_url,
-                     picking_id, picking_name, tracking_code, tracking_url, epost_status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-                    ON CONFLICT(store_id, tracking_code) DO UPDATE SET
-                        order_line_id=COALESCE(epost_global_tracking.order_line_id, excluded.order_line_id),
-                        odoo_order_id=excluded.odoo_order_id,
-                        odoo_order_name=excluded.odoo_order_name,
-                        amazon_order_id=COALESCE(NULLIF(epost_global_tracking.amazon_order_id, ''), excluded.amazon_order_id),
-                        amazon_order_url=COALESCE(NULLIF(epost_global_tracking.amazon_order_url, ''), excluded.amazon_order_url),
-                        picking_id=excluded.picking_id,
-                        picking_name=excluded.picking_name,
-                        tracking_url=excluded.tracking_url,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        int(store_row["id"]),
-                        local_row["id"] if local_row else None,
-                        odoo_order_id,
-                        track.get("odoo_order_name") or "",
-                        (local_row["amazon_order_id"] or "") if local_row else "",
-                        (local_row["amazon_order_url"] or "") if local_row else "",
-                        track.get("picking_id"),
-                        track.get("picking_name") or "",
-                        code,
-                        f"https://epgtrack.com/{code}",
-                        now,
-                        now,
-                    ),
+            odoo_order_id = track.get("odoo_order_id")
+            local_row = None
+            if odoo_order_id:
+                try:
+                    local_row = local_by_order.get((int(store_row["id"]), int(odoo_order_id)))
+                except Exception:
+                    local_row = None
+            now = utc_now()
+            values.append(
+                (
+                    int(store_row["id"]),
+                    local_row["id"] if local_row else None,
+                    odoo_order_id,
+                    track.get("odoo_order_name") or "",
+                    (local_row["amazon_order_id"] or "") if local_row else "",
+                    (local_row["amazon_order_url"] or "") if local_row else "",
+                    track.get("picking_id"),
+                    track.get("picking_name") or "",
+                    code,
+                    f"https://epgtrack.com/{code}",
+                    now,
+                    now,
                 )
-                synced += 1
+            )
+        if not values:
+            continue
+        with db() as conn:
+            conn.execute_values(
+                """
+                INSERT INTO epost_global_tracking
+                (store_id, order_line_id, odoo_order_id, odoo_order_name, amazon_order_id, amazon_order_url,
+                 picking_id, picking_name, tracking_code, tracking_url, epost_status, created_at, updated_at)
+                VALUES ?
+                ON CONFLICT(store_id, tracking_code) DO UPDATE SET
+                    order_line_id=COALESCE(epost_global_tracking.order_line_id, excluded.order_line_id),
+                    odoo_order_id=excluded.odoo_order_id,
+                    odoo_order_name=excluded.odoo_order_name,
+                    amazon_order_id=COALESCE(NULLIF(epost_global_tracking.amazon_order_id, ''), excluded.amazon_order_id),
+                    amazon_order_url=COALESCE(NULLIF(epost_global_tracking.amazon_order_url, ''), excluded.amazon_order_url),
+                    picking_id=excluded.picking_id,
+                    picking_name=excluded.picking_name,
+                    tracking_url=excluded.tracking_url,
+                    updated_at=excluded.updated_at
+                """,
+                values,
+                template="(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                page_size=500,
+            )
+            synced += len(values)
     return synced
 
 
@@ -15118,7 +15150,7 @@ def parse_epost_datetime(value: Any) -> Optional[datetime]:
 
 
 def epost_status_from_update(status: str, last_update_at: Any, fallback_at: Any = None) -> str:
-    if re.search(r"\bdelivered\b", status or "", re.IGNORECASE):
+    if re.search(r"\b(delivered|recipient collected|collected by recipient|successfully delivered)\b", status or "", re.IGNORECASE):
         return "delivered"
     update_dt = parse_epost_datetime(last_update_at) or parse_epost_datetime(fallback_at)
     if update_dt and datetime.now(timezone.utc) - update_dt >= timedelta(days=12):
@@ -16279,9 +16311,9 @@ def backup_s3_client() -> Optional[Any]:
     return boto3.client(
         "s3",
         endpoint_url=s3_endpoint_base(endpoint),
-        region_name=settings["storage_s3_region"] or "auto",
-        aws_access_key_id=settings["storage_s3_access_key_id"],
-        aws_secret_access_key=settings["storage_s3_secret_access_key"],
+        region_name=settings.get("backup_s3_region") or settings.get("storage_s3_region") or "auto",
+        aws_access_key_id=settings.get("backup_s3_access_key_id") or settings.get("storage_s3_access_key_id"),
+        aws_secret_access_key=settings.get("backup_s3_secret_access_key") or settings.get("storage_s3_secret_access_key"),
     )
 
 
@@ -16325,23 +16357,91 @@ def list_database_backups() -> list[dict[str, Any]]:
     return sorted(items, key=lambda item: item.get("last_modified") or "", reverse=True)
 
 
-def run_checked(command: list[str], timeout: int) -> None:
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+def delete_expired_database_backups(retention_days: int = 7) -> int:
+    client, bucket = require_backup_client()
+    retention_days = max(1, min(365, int(retention_days or 7)))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    expired_keys: list[str] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix="postgres-backups/"):
+        for obj in page.get("Contents", []):
+            key = clean_text(obj.get("Key"))
+            modified = obj.get("LastModified")
+            if not key.endswith(".dump") or not isinstance(modified, datetime):
+                continue
+            if modified.tzinfo is None:
+                modified = modified.replace(tzinfo=timezone.utc)
+            if modified < cutoff:
+                expired_keys.append(key)
+    for start in range(0, len(expired_keys), 1000):
+        client.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": key} for key in expired_keys[start:start + 1000]], "Quiet": True},
+        )
+    return len(expired_keys)
+
+
+def run_checked(command: list[str], timeout: int, env: Optional[dict[str, str]] = None) -> None:
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False, env=env)
     if result.returncode != 0:
         message = (result.stderr or result.stdout or "Command failed.").strip()
         raise RuntimeError(message[-1200:])
 
 
-def create_database_backup() -> dict[str, Any]:
+def postgres_client_tool(name: str) -> str:
+    override = clean_text(os.getenv(f"{name.upper()}_PATH"))
+    if override and Path(override).is_file():
+        return override
+    candidates = [
+        path
+        for pattern in (
+            f"/opt/homebrew/opt/postgresql@*/bin/{name}",
+            f"/usr/lib/postgresql/*/bin/{name}",
+        )
+        for path in Path("/").glob(pattern.lstrip("/"))
+        if path.is_file()
+    ]
+    discovered = shutil.which(name)
+    if discovered:
+        candidates.append(Path(discovered))
+
+    def client_version(path: Path) -> tuple[int, ...]:
+        match = re.search(r"(?:postgresql@|postgresql/)(\d+(?:\.\d+)*)", str(path))
+        return tuple(int(part) for part in match.group(1).split(".")) if match else (0,)
+
+    if candidates:
+        return str(max(dict.fromkeys(candidates), key=client_version))
+    return ""
+
+
+def postgres_command_connection(postgres_url: str) -> tuple[str, dict[str, str]]:
+    parsed = urlsplit(postgres_url)
+    if not parsed.hostname or parsed.password is None:
+        return postgres_url, os.environ.copy()
+    username = quote(unquote(parsed.username or ""), safe="")
+    hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    port = f":{parsed.port}" if parsed.port else ""
+    netloc = f"{username}@{hostname}{port}" if username else f"{hostname}{port}"
+    safe_url = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    env = os.environ.copy()
+    env["PGPASSWORD"] = unquote(parsed.password)
+    return safe_url, env
+
+
+def _create_database_backup() -> dict[str, Any]:
     settings = get_service_settings()
     postgres_url = active_postgres_url(settings)
     if not postgres_url:
         raise RuntimeError("Postgres URL is required before backup can run.")
-    pg_dump = shutil.which("pg_dump")
+    pg_dump = postgres_client_tool("pg_dump")
     if not pg_dump:
         raise RuntimeError("pg_dump is not installed in this app environment.")
+    pg_restore = postgres_client_tool("pg_restore")
+    if not pg_restore:
+        raise RuntimeError("pg_restore is not installed in this app environment.")
     client, bucket = require_backup_client()
     key = backup_key_for_now(postgres_url)
+    command_url, command_env = postgres_command_connection(postgres_url)
     set_backup_progress(
         status="running",
         percent=5,
@@ -16354,8 +16454,14 @@ def create_database_backup() -> dict[str, Any]:
     )
     with tempfile.NamedTemporaryFile(suffix=".dump") as dump_file:
         set_backup_progress(status="running", percent=20, message="Dumping Postgres database with pg_dump.")
-        run_checked([pg_dump, "--format=custom", "--no-owner", "--no-acl", "--file", dump_file.name, postgres_url], timeout=20 * 60)
+        run_checked(
+            [pg_dump, "--format=custom", "--no-owner", "--no-acl", "--file", dump_file.name, command_url],
+            timeout=2 * 60 * 60,
+            env=command_env,
+        )
         size = Path(dump_file.name).stat().st_size
+        set_backup_progress(status="running", percent=65, message="Validating the Postgres backup archive.", backup_size=size)
+        run_checked([pg_restore, "--list", dump_file.name], timeout=5 * 60)
         set_backup_progress(status="running", percent=70, message=f"Postgres dump complete. Uploading {size:,} bytes to Cloudflare R2.", backup_size=size)
         client.upload_file(
             dump_file.name,
@@ -16364,11 +16470,27 @@ def create_database_backup() -> dict[str, Any]:
             ExtraArgs={"ContentType": "application/octet-stream", "Metadata": {"created-by": "nutricity-app", "kind": "postgres"}},
         )
         set_backup_progress(status="running", percent=92, message="Upload complete. Refreshing backup list.", backup_size=size)
-    set_backup_progress(status="completed", percent=100, message=f"Backup uploaded to Cloudflare R2: {key.rsplit('/', 1)[-1]}.", completed_at=utc_now(), backup_size=size)
-    return {"key": key, "name": key.rsplit("/", 1)[-1], "size": size}
+    retention_days = max(1, min(365, int(float(settings.get("backup_retention_days") or 7))))
+    deleted = delete_expired_database_backups(retention_days)
+    completed_at = utc_now()
+    retention_message = f" Removed {deleted} backup(s) older than {retention_days} day(s)." if deleted else f" Retention checked: {retention_days} days."
+    message = f"Backup uploaded to Cloudflare R2: {key.rsplit('/', 1)[-1]}.{retention_message}"
+    set_backup_progress(status="completed", percent=100, message=message, completed_at=completed_at, backup_size=size)
+    set_setting("database_backup_last_run_at", completed_at)
+    set_setting("database_backup_last_message", message)
+    return {"key": key, "name": key.rsplit("/", 1)[-1], "size": size, "expired_deleted": deleted}
 
 
-def restore_database_backup(key: str) -> dict[str, Any]:
+def create_database_backup() -> dict[str, Any]:
+    if not _DATABASE_BACKUP_LOCK.acquire(blocking=False):
+        raise RuntimeError("A database backup or restore is already running.")
+    try:
+        return _create_database_backup()
+    finally:
+        _DATABASE_BACKUP_LOCK.release()
+
+
+def _restore_database_backup(key: str) -> dict[str, Any]:
     clean_key = clean_text(key)
     if not clean_key.startswith("postgres-backups/") or not clean_key.endswith(".dump"):
         raise RuntimeError("Select a valid Postgres backup.")
@@ -16376,10 +16498,11 @@ def restore_database_backup(key: str) -> dict[str, Any]:
     postgres_url = active_postgres_url(settings)
     if not postgres_url:
         raise RuntimeError("Postgres URL is required before restore can run.")
-    pg_restore = shutil.which("pg_restore")
+    pg_restore = postgres_client_tool("pg_restore")
     if not pg_restore:
         raise RuntimeError("pg_restore is not installed in this app environment.")
     client, bucket = require_backup_client()
+    command_url, command_env = postgres_command_connection(postgres_url)
     with tempfile.NamedTemporaryFile(suffix=".dump") as dump_file:
         client.download_file(bucket, clean_key, dump_file.name)
         db_session.close_pool()
@@ -16388,15 +16511,29 @@ def restore_database_backup(key: str) -> dict[str, Any]:
                 pg_restore,
                 "--clean",
                 "--if-exists",
+                "--single-transaction",
+                "--exit-on-error",
                 "--no-owner",
                 "--no-acl",
                 "--dbname",
-                postgres_url,
+                command_url,
                 dump_file.name,
             ],
-            timeout=30 * 60,
+            timeout=2 * 60 * 60,
+            env=command_env,
         )
+        db_session.close_pool()
+        fast_page_cache_clear()
     return {"key": clean_key, "name": clean_key.rsplit("/", 1)[-1]}
+
+
+def restore_database_backup(key: str) -> dict[str, Any]:
+    if not _DATABASE_BACKUP_LOCK.acquire(blocking=False):
+        raise RuntimeError("A database backup or restore is already running.")
+    try:
+        return _restore_database_backup(key)
+    finally:
+        _DATABASE_BACKUP_LOCK.release()
 
 
 def delete_database_backup(key: str) -> dict[str, Any]:
@@ -21920,7 +22057,15 @@ def fast_exact_order_reference_search(
                    total_match.count AS _total_count,
                    0 AS duplicate_asin_count,
                    0 AS inventory_quantity,
-                   0 AS odoo_order_distinct_asin_count,
+                   COALESCE((
+                       SELECT COUNT(DISTINCT same_order_lines.asin)
+                       FROM order_lines AS same_order_lines
+                       WHERE same_order_lines.store_id = filtered_order_lines.store_id
+                         AND same_order_lines.odoo_order_id = filtered_order_lines.odoo_order_id
+                         AND COALESCE(same_order_lines.asin, '') != ''
+                         AND same_order_lines.state != 'missing'
+                         AND COALESCE(same_order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                   ), 0) AS odoo_order_distinct_asin_count,
                    stores.name AS _store_name,
                    stores.odoo_url AS _store_odoo_url,
                    stores.odoo_db AS _store_odoo_db,
@@ -22373,6 +22518,7 @@ def api_service_settings() -> dict[str, Any]:
         "typesense_api_key",
         "redis_url",
         "storage_s3_secret_access_key",
+        "backup_s3_secret_access_key",
         "amazon_otp_imap_password",
         "openexchange_api_key",
         "email_smtp_password",
@@ -22399,6 +22545,8 @@ def api_service_settings() -> dict[str, Any]:
         "openexchange_last_sync_message",
         "autosync_last_run_at",
         "autosync_last_message",
+        "database_backup_last_run_at",
+        "database_backup_last_message",
     ]
     live_settings = get_settings_values(live_keys)
     for key in live_keys:
@@ -22452,6 +22600,7 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
         "typesense_api_key",
         "redis_url",
         "storage_s3_secret_access_key",
+        "backup_s3_secret_access_key",
         "amazon_otp_imap_password",
         "openexchange_api_key",
         "email_smtp_password",
@@ -22745,7 +22894,13 @@ def autosync_loop() -> None:
 
 
 def s3_endpoint_base(endpoint: str) -> str:
-    return str(endpoint or "").rstrip("/").rsplit("/", 1)[0]
+    value = clean_text(endpoint).rstrip("/")
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    path = parsed.path.rstrip("/")
+    parent_path = path.rsplit("/", 1)[0] if path else ""
+    return f"{parsed.scheme}://{parsed.netloc}{parent_path}"
 
 
 def verify_product_storage() -> str:
@@ -22758,17 +22913,18 @@ def verify_product_storage() -> str:
 
 
 def backup_loop() -> None:
-    last_run = 0.0
     while True:
         try:
             cleanup_expired_exports()
             settings = get_service_settings()
             interval = int(float(settings.get("backup_interval_minutes") or 0))
-            if interval > 0 and time.time() - last_run >= interval * 60:
+            elapsed = setting_elapsed_seconds("database_backup_last_run_at", interval * 60)
+            if interval > 0 and elapsed >= interval * 60:
                 create_database_backup()
-                last_run = time.time()
-        except Exception:
-            pass
+        except Exception as exc:
+            message = f"Scheduled database backup failed: {exc}"
+            set_setting("database_backup_last_message", message)
+            set_backup_progress(status="failed", percent=0, message=message, completed_at=utc_now(), error=str(exc))
         time.sleep(60)
 
 
@@ -23608,6 +23764,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if not replacement_asin:
         raise HTTPException(400, "Replacement ASIN must be a valid 10-character ASIN.")
     title = fetch_amazon_product_title(replacement_asin)
+    odoo_asin_update: Optional[dict[str, Any]] = None
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, payload.store_id)).fetchone()
         if not row:
@@ -23617,6 +23774,12 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
         effective_store_id = int(row["store_id"])
         if row["amazon_order_id"]:
             raise HTTPException(400, "Reset fulfilment before changing the ASIN on an already fulfilled line.")
+        if payload.update_odoo_product_asin:
+            odoo_asin_update = update_replacement_asin_in_odoo(
+                effective_store_id,
+                [dict(row)],
+                replacement_asin,
+            )
         original_asin = row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"]
         replacement_name = title or f"Replacement ASIN {replacement_asin}"
         conn.execute(
@@ -23650,6 +23813,25 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
                 effective_store_id,
             ),
         )
+        if odoo_asin_update:
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET default_code=?,
+                    internal_note=?,
+                    asin_from_reference=?,
+                    updated_at=?
+                WHERE id=? AND store_id=?
+                """,
+                (
+                    replacement_asin,
+                    odoo_asin_update["internal_note"],
+                    replacement_asin,
+                    utc_now(),
+                    line_id,
+                    effective_store_id,
+                ),
+            )
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     try:
         store = get_store(effective_store_id)
@@ -23667,7 +23849,10 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if updated:
         index_order_line(updated)
     fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
-    return {"ok": True, "message": f"Replacement {replacement_asin} assigned and marked ready to queue.", "row": row_to_dict(updated)}
+    message = f"Replacement {replacement_asin} assigned and marked ready to queue."
+    if odoo_asin_update:
+        message += f" Odoo product reference and Internal Notes were updated with {replacement_asin}."
+    return {"ok": True, "message": message, "row": row_to_dict(updated)}
 
 
 def original_product_name_for_line(store_id: int, row: Any) -> str:
@@ -27424,6 +27609,289 @@ def api_chrome_force_clear_queue(store_id: Optional[int] = None) -> dict[str, An
     return {"ok": True, "cleared": cursor.rowcount, "protected": protected, "message": message}
 
 
+def amazon_asin_internal_note(current: Any, asin: str) -> str:
+    current_text = str(current or "").strip()
+    normalized_asin = normalize_asin(asin)
+    if not normalized_asin:
+        return current_text
+    explicit_asins = {
+        normalize_asin(match)
+        for match in re.findall(r"Amazon\s+ASIN\s*:\s*([A-Z0-9]{10})", current_text, re.IGNORECASE)
+        if normalize_asin(match)
+    }
+    if normalized_asin in explicit_asins:
+        return current_text
+    asin_line = f"<p>Amazon ASIN: {html.escape(normalized_asin)}</p>"
+    return f"{current_text}\n{asin_line}".strip()
+
+
+def update_replacement_asin_in_odoo(
+    store_id: int,
+    selected_rows: list[dict[str, Any]],
+    replacement_asin: str,
+) -> dict[str, Any]:
+    asin = normalize_asin(replacement_asin)
+    if not asin:
+        raise HTTPException(400, "Enter a valid 10-character replacement ASIN before updating Odoo.")
+    if len(selected_rows) != 1:
+        raise HTTPException(
+            400,
+            "Select exactly one order line when updating an Odoo product replacement ASIN.",
+        )
+    row = selected_rows[0]
+    odoo_line_ids = source_odoo_line_ids(row)
+    if len(odoo_line_ids) != 1:
+        raise HTTPException(400, "The selected row must point to exactly one Odoo order line.")
+    try:
+        odoo = OdooClient(get_store(int(store_id)))
+        order_line_fields = odoo.existing_fields("sale.order.line", ["id", "product_id"])
+        odoo_lines = odoo.read("sale.order.line", odoo_line_ids, order_line_fields)
+        product_ids = sorted({
+            int(line["product_id"][0])
+            for line in odoo_lines
+            if line.get("product_id")
+        })
+        if len(product_ids) != 1:
+            raise HTTPException(400, "The selected Odoo order line does not point to exactly one product.")
+        product_id = product_ids[0]
+        product_fields = odoo.existing_fields(
+            "product.product",
+            ["id", "display_name", "default_code", "description", "product_tmpl_id"],
+        )
+        if "default_code" not in product_fields or "description" not in product_fields:
+            raise HTTPException(400, "Odoo product reference or internal notes are unavailable for this product.")
+        products = odoo.read("product.product", [product_id], product_fields)
+        if not products:
+            raise HTTPException(404, "The selected Odoo product was not found.")
+        product = products[0]
+        duplicates = odoo.execute(
+            "product.product",
+            "search_read",
+            [[("default_code", "=ilike", asin), ("id", "!=", product_id)]],
+            {
+                "fields": [field for field in ("id", "display_name", "default_code") if field in product_fields],
+                "limit": 5,
+                "context": {"active_test": False},
+            },
+        )
+        if duplicates:
+            duplicate = duplicates[0]
+            duplicate_name = clean_text(duplicate.get("display_name")) or f"product {duplicate.get('id')}"
+            raise HTTPException(
+                409,
+                f"Odoo cannot have the same reference number on more than one product. "
+                f"Reference {asin} already exists on {duplicate_name}. The product was not updated.",
+            )
+        current_reference = clean_text(product.get("default_code"))
+        current_note = product.get("description") or ""
+        next_note = amazon_asin_internal_note(current_note, asin)
+        values: dict[str, Any] = {}
+        if current_reference.upper() != asin:
+            # This is intentionally the plain/decoded ASIN. Replacement ASINs
+            # are promoted only through the explicit manual checkbox.
+            values["default_code"] = asin
+        if next_note != str(current_note or "").strip():
+            values["description"] = next_note
+        if values and not odoo.write("product.product", [product_id], values):
+            raise RuntimeError("Odoo rejected the product update.")
+        return {
+            "asin": asin,
+            "product_id": product_id,
+            "product_name": clean_text(product.get("display_name")),
+            "previous_reference": current_reference,
+            "reference_updated": "default_code" in values,
+            "note_updated": "description" in values,
+            "internal_note": next_note,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        detail = clean_error_message(exc)[:500]
+        lowered = detail.lower()
+        if any(token in lowered for token in ("default_code", "reference", "unique", "already exists", "already used")):
+            raise HTTPException(
+                409,
+                f"Odoo cannot have the same reference number on more than one product. "
+                f"Reference {asin} was not saved. Odoo warning: {detail}",
+            ) from exc
+        raise HTTPException(502, f"Odoo product ASIN update failed. The product was not updated. {detail}") from exc
+
+
+def amazon_product_cost_in_store_currency(row: dict[str, Any], pricing: dict[str, Any]) -> float:
+    try:
+        ordered_quantity = float(row.get("quantity") or pricing.get("ordered_quantity") or 1)
+    except (TypeError, ValueError):
+        ordered_quantity = 1.0
+    try:
+        amazon_total = float(pricing.get("amazon_total_price") or 0)
+    except (TypeError, ValueError):
+        amazon_total = 0.0
+    try:
+        amazon_unit = float(pricing.get("amazon_unit_price") or 0)
+    except (TypeError, ValueError):
+        amazon_unit = 0.0
+    unit_cost_usd = (amazon_total / ordered_quantity) if amazon_total > 0 and ordered_quantity > 0 else amazon_unit
+    if unit_cost_usd <= 0:
+        return 0.0
+    try:
+        rate_to_usd = float(row.get("store_currency_rate_to_usd") or 1)
+    except (TypeError, ValueError):
+        rate_to_usd = 1.0
+    if rate_to_usd <= 0:
+        rate_to_usd = 1.0
+    return round(unit_cost_usd / rate_to_usd, 4)
+
+
+def source_odoo_line_ids(row: dict[str, Any]) -> list[int]:
+    values = re.findall(r"\d+", clean_text(row.get("source_odoo_line_ids")))
+    if not values and row.get("odoo_line_id"):
+        values = [str(row["odoo_line_id"])]
+    return sorted({int(value) for value in values if int(value) > 0})
+
+
+def sync_amazon_order_products_to_odoo(
+    rows: list[dict[str, Any]],
+    pricing_by_asin: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    summary = {
+        "products": 0,
+        "notes": 0,
+        "references": 0,
+        "costs": 0,
+        "sales_prices": 0,
+        "replacement_skipped": 0,
+        "errors": 0,
+    }
+    rows_by_store: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            rows_by_store.setdefault(int(row["store_id"]), []).append(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+    for store_id, store_rows in rows_by_store.items():
+        try:
+            odoo = OdooClient(get_store(store_id))
+            line_plan: dict[int, dict[str, Any]] = {}
+            for row in store_rows:
+                requested_asin = normalize_asin(row.get("asin") or "")
+                pricing = pricing_by_asin.get(requested_asin, {})
+                purchased_asin = normalize_asin(pricing.get("purchased_asin") or requested_asin)
+                if not purchased_asin:
+                    continue
+                if requested_asin and purchased_asin != requested_asin:
+                    # A replacement is an order-specific customer offer. Never
+                    # promote its ASIN or cost into the original Odoo product.
+                    summary["replacement_skipped"] += 1
+                    continue
+                plan = {
+                    "asin": purchased_asin,
+                    "cost": amazon_product_cost_in_store_currency(row, pricing),
+                }
+                for line_id in source_odoo_line_ids(row):
+                    line_plan[line_id] = plan
+            if not line_plan:
+                continue
+            order_line_fields = odoo.existing_fields("sale.order.line", ["id", "product_id", "product_uom_qty"])
+            order_lines = odoo.read("sale.order.line", sorted(line_plan), order_line_fields)
+            product_ids = sorted({
+                int(line["product_id"][0])
+                for line in order_lines
+                if line.get("product_id") and int(line["id"]) in line_plan
+            })
+            product_fields = odoo.existing_fields(
+                "product.product",
+                ["id", "product_tmpl_id", "default_code", "standard_price", "list_price"],
+            )
+            products = {
+                int(product["id"]): product
+                for product in odoo.read("product.product", product_ids, product_fields)
+            }
+            template_ids = sorted({
+                int(product["product_tmpl_id"][0])
+                for product in products.values()
+                if product.get("product_tmpl_id")
+            })
+            template_fields = odoo.existing_fields(
+                "product.template",
+                ["id", "description", "default_code", "list_price"],
+            )
+            templates = {
+                int(template["id"]): template
+                for template in odoo.read("product.template", template_ids, template_fields)
+            }
+            plans_by_product: dict[int, dict[str, Any]] = {}
+            for line in order_lines:
+                line_id = int(line["id"])
+                plan = line_plan.get(line_id)
+                if not plan or not line.get("product_id"):
+                    continue
+                product_id = int(line["product_id"][0])
+                product_plan = plans_by_product.setdefault(
+                    product_id,
+                    {"asins": [], "weighted_cost": 0.0, "cost_quantity": 0.0},
+                )
+                if plan["asin"] not in product_plan["asins"]:
+                    product_plan["asins"].append(plan["asin"])
+                cost = float(plan.get("cost") or 0)
+                try:
+                    quantity = max(0.0, float(line.get("product_uom_qty") or 1))
+                except (TypeError, ValueError):
+                    quantity = 1.0
+                if cost > 0 and quantity > 0:
+                    product_plan["weighted_cost"] += cost * quantity
+                    product_plan["cost_quantity"] += quantity
+            for product_id, plan in plans_by_product.items():
+                product = products.get(product_id, {})
+                template_id = many2one_id(product.get("product_tmpl_id"))
+                template = templates.get(template_id or 0, {})
+                asins = [asin for asin in plan["asins"] if normalize_asin(asin)]
+                if not asins:
+                    continue
+                asin = asins[0]
+                try:
+                    product_values: dict[str, Any] = {}
+                    template_values: dict[str, Any] = {}
+                    current_reference = clean_text(product.get("default_code") or template.get("default_code") or "")
+                    if not current_reference and "default_code" in product_fields:
+                        product_values["default_code"] = encode_asin(asin)
+                    if plan["cost_quantity"] > 0 and "standard_price" in product_fields:
+                        next_cost = round(
+                            float(plan["weighted_cost"]) / float(plan["cost_quantity"]),
+                            4,
+                        )
+                        product_values["standard_price"] = next_cost
+                        try:
+                            current_sales_price = float(template.get("list_price") or product.get("list_price") or 0)
+                        except (TypeError, ValueError):
+                            current_sales_price = 0.0
+                        if template_id and "list_price" in template_fields and next_cost > current_sales_price:
+                            template_values["list_price"] = round(next_cost * 1.35, 2)
+                    if product_values:
+                        odoo.write("product.product", [product_id], product_values)
+                        if "default_code" in product_values:
+                            summary["references"] += 1
+                        if "standard_price" in product_values:
+                            summary["costs"] += 1
+                    if template_id and "description" in template_fields:
+                        current_note = template.get("description") or ""
+                        next_note = amazon_asin_internal_note(current_note, asin)
+                        if next_note != str(current_note or "").strip():
+                            template_values["description"] = next_note
+                            summary["notes"] += 1
+                    if template_id and template_values:
+                        odoo.write("product.template", [template_id], template_values)
+                        if "list_price" in template_values:
+                            summary["sales_prices"] += 1
+                    summary["products"] += 1
+                except Exception as exc:
+                    summary["errors"] += 1
+                    print(f"Amazon product metadata sync failed for store={store_id} product={product_id}: {exc}", flush=True)
+        except Exception as exc:
+            summary["errors"] += 1
+            print(f"Amazon product metadata sync failed for store={store_id}: {exc}", flush=True)
+    return summary
+
+
 def chrome_complete_followups(
     rows: list[dict[str, Any]],
     updated_for_shopify: list[dict[str, Any]],
@@ -27432,6 +27900,11 @@ def chrome_complete_followups(
     amazon_order_url: str,
     chrome_account_name: str,
 ) -> None:
+    try:
+        summary = sync_amazon_order_products_to_odoo(rows, pricing_by_asin)
+        print(f"Chrome complete Odoo product sync: {summary}", flush=True)
+    except Exception as exc:
+        print(f"Chrome complete Odoo product sync failed: {exc}", flush=True)
     try:
         queued = enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
         if queued:
@@ -29449,24 +29922,31 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
 
 
 @app.post("/api/lines/manual-fulfilment")
-def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
-    store_id = int(payload.get("store_id") or 0)
-    line_ids = [int(line_id) for line_id in (payload.get("line_ids") or []) if int(line_id or 0) > 0]
-    reference = clean_text(payload.get("reference"))
-    url = clean_text(payload.get("url"))
-    third_party = bool(payload.get("third_party"))
-    total_cost = float(payload.get("total_cost") or 0)
+def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, Any]:
+    store_id = int(payload.store_id or 0)
+    line_ids = [int(line_id) for line_id in (payload.line_ids or []) if int(line_id or 0) > 0]
+    reference = clean_text(payload.reference)
+    url = clean_text(payload.url)
+    third_party = bool(payload.third_party)
+    total_cost = float(payload.total_cost or 0)
+    update_odoo_product_asin = bool(payload.update_odoo_product_asin)
+    replacement_asin = normalize_asin(payload.replacement_asin)
     if not line_ids:
         raise HTTPException(400, "Select at least one order line.")
     if not reference and not url:
         raise HTTPException(400, "Enter an Amazon order ID, third-party order number, or URL.")
     if third_party and total_cost <= 0:
         raise HTTPException(400, "Enter the third-party order cost for profit/loss.")
+    if update_odoo_product_asin and third_party:
+        raise HTTPException(400, "Odoo replacement ASIN updates are available only for manual Amazon fulfilment.")
+    if update_odoo_product_asin and not replacement_asin:
+        raise HTTPException(400, "Enter a valid 10-character replacement ASIN before updating Odoo.")
     with db() as conn:
         selected_ids = validate_line_ids_for_store(conn, store_id, line_ids, "Manual fulfilment")
     placeholders = ",".join("?" for _ in selected_ids)
     now = utc_now()
     updated_for_shopify: list[dict[str, Any]] = []
+    odoo_asin_update: Optional[dict[str, Any]] = None
     with db() as conn:
         selected_rows = rows_to_dicts(conn.execute(
             f"""
@@ -29512,6 +29992,42 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
                 409,
                 "Blocked because matching Shopify order is already fulfilled. "
                 + (" | ".join(shopify_messages) if shopify_messages else "The customer may have received it."),
+            )
+        if update_odoo_product_asin:
+            allowed_row_ids = {int(row["id"]) for row in rows}
+            if int(selected_rows[0]["id"]) not in allowed_row_ids:
+                raise HTTPException(409, "The selected line is blocked and its Odoo product was not updated.")
+            odoo_asin_update = update_replacement_asin_in_odoo(
+                store_id,
+                selected_rows,
+                replacement_asin,
+            )
+            selected_row_id = int(selected_rows[0]["id"])
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET original_asin=COALESCE(NULLIF(original_asin, ''), NULLIF(asin, '')),
+                    replacement_asin=?,
+                    replacement_note=?,
+                    replacement_assigned_at=COALESCE(replacement_assigned_at, ?),
+                    asin=?,
+                    asin_from_reference=?,
+                    default_code=?,
+                    internal_note=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    replacement_asin,
+                    f"Manually promoted replacement ASIN {replacement_asin} to the Odoo product.",
+                    now,
+                    replacement_asin,
+                    replacement_asin,
+                    replacement_asin,
+                    odoo_asin_update["internal_note"],
+                    now,
+                    selected_row_id,
+                ),
             )
         total_store_value = sum(order_line_store_total(row) for row in rows)
         third_party_cost_by_id: dict[int, float] = {}
@@ -29619,6 +30135,11 @@ def api_manual_line_fulfilment(payload: dict[str, Any]) -> dict[str, Any]:
     data = dashboard_data(store_id)
     mode = "third-party" if third_party else "manual Amazon"
     data["message"] = f"Marked {len(rows)} line(s) across {len({row['odoo_order_name'] for row in rows})} Odoo order(s) as {mode} fulfilled."
+    if odoo_asin_update:
+        data["message"] += (
+            f" Updated Odoo product reference and internal notes with replacement ASIN "
+            f"{odoo_asin_update['asin']}."
+        )
     return data
 
 
@@ -30166,6 +30687,7 @@ def api_epost_sync(payload: EpostSyncPayload) -> dict[str, Any]:
     store_id = int(payload.store_id) if payload.store_id else None
     synced = sync_epost_tracking_from_odoo(store_id, days)
     if synced:
+        fast_page_cache_clear_matching({"epost-tracking", "duplicate-tracking"})
         start_typesense_reindex_job()
     rows, total, page, per_page = paged_epost_tracking_rows(store_id, 1, 100, "all")
     return {

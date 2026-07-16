@@ -1,39 +1,37 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { DragEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
-import {
-  IconAlertCircle as AlertCircle,
-  IconBell as Bell,
-  IconBuildingStore as StoreIcon,
-  IconCamera as Camera,
-  IconCheck as Check,
-  IconCircleCheck as CheckCircle2,
-  IconChevronDown as ChevronDown,
-  IconChevronLeft as ChevronLeft,
-  IconChevronRight as ChevronRight,
-  IconColumns3 as Columns3,
-  IconCopy as Copy,
-  IconX as X,
-  IconDatabase as Database,
-  IconDownload as Download,
-  IconEdit as Edit,
-  IconExternalLink as ExternalLink,
-  IconGripVertical as GripVertical,
-  IconHome as Home,
-  IconLink as Link,
-  IconLock as Lock,
-  IconMoon as Moon,
-  IconPackage as PackageCheck,
-  IconPin,
-  IconPlus as Plus,
-  IconRefresh as RefreshCw,
-  IconSearch as Search,
-  IconSettings as Settings,
-  IconSun as Sun,
-  IconShoppingCart as ShoppingCart,
-  IconTrash as Trash2,
-  IconLogout as Logout,
-  IconUserCircle as UserCircle,
-} from "@tabler/icons-react"
+import AlertCircle from "@tabler/icons-react/dist/esm/icons/IconAlertCircle.mjs"
+import Bell from "@tabler/icons-react/dist/esm/icons/IconBell.mjs"
+import StoreIcon from "@tabler/icons-react/dist/esm/icons/IconBuildingStore.mjs"
+import Camera from "@tabler/icons-react/dist/esm/icons/IconCamera.mjs"
+import Check from "@tabler/icons-react/dist/esm/icons/IconCheck.mjs"
+import CheckCircle2 from "@tabler/icons-react/dist/esm/icons/IconCircleCheck.mjs"
+import ChevronDown from "@tabler/icons-react/dist/esm/icons/IconChevronDown.mjs"
+import ChevronLeft from "@tabler/icons-react/dist/esm/icons/IconChevronLeft.mjs"
+import ChevronRight from "@tabler/icons-react/dist/esm/icons/IconChevronRight.mjs"
+import Columns3 from "@tabler/icons-react/dist/esm/icons/IconColumns3.mjs"
+import Copy from "@tabler/icons-react/dist/esm/icons/IconCopy.mjs"
+import X from "@tabler/icons-react/dist/esm/icons/IconX.mjs"
+import Database from "@tabler/icons-react/dist/esm/icons/IconDatabase.mjs"
+import Download from "@tabler/icons-react/dist/esm/icons/IconDownload.mjs"
+import Edit from "@tabler/icons-react/dist/esm/icons/IconEdit.mjs"
+import ExternalLink from "@tabler/icons-react/dist/esm/icons/IconExternalLink.mjs"
+import GripVertical from "@tabler/icons-react/dist/esm/icons/IconGripVertical.mjs"
+import Home from "@tabler/icons-react/dist/esm/icons/IconHome.mjs"
+import Link from "@tabler/icons-react/dist/esm/icons/IconLink.mjs"
+import Lock from "@tabler/icons-react/dist/esm/icons/IconLock.mjs"
+import Moon from "@tabler/icons-react/dist/esm/icons/IconMoon.mjs"
+import PackageCheck from "@tabler/icons-react/dist/esm/icons/IconPackage.mjs"
+import IconPin from "@tabler/icons-react/dist/esm/icons/IconPin.mjs"
+import Plus from "@tabler/icons-react/dist/esm/icons/IconPlus.mjs"
+import RefreshCw from "@tabler/icons-react/dist/esm/icons/IconRefresh.mjs"
+import Search from "@tabler/icons-react/dist/esm/icons/IconSearch.mjs"
+import Settings from "@tabler/icons-react/dist/esm/icons/IconSettings.mjs"
+import Sun from "@tabler/icons-react/dist/esm/icons/IconSun.mjs"
+import ShoppingCart from "@tabler/icons-react/dist/esm/icons/IconShoppingCart.mjs"
+import Trash2 from "@tabler/icons-react/dist/esm/icons/IconTrash.mjs"
+import Logout from "@tabler/icons-react/dist/esm/icons/IconLogout.mjs"
+import UserCircle from "@tabler/icons-react/dist/esm/icons/IconUserCircle.mjs"
 import { Popover } from "@base-ui/react/popover"
 import { BrowserMultiFormatReader, type IScannerControls } from "@zxing/browser"
 
@@ -1900,11 +1898,18 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   })
   if (!response.ok) {
     const text = await response.text()
+    let message = text || response.statusText
+    try {
+      const parsed = JSON.parse(text)
+      if (typeof parsed?.detail === "string") message = parsed.detail
+    } catch {
+      // Keep the original response when it is not JSON.
+    }
     if (response.status === 401) {
       notifyAdminAuthRequired()
-      throw new AdminAuthError(text || "Admin access code required.")
+      throw new AdminAuthError(message || "Admin access code required.")
     }
-    throw new Error(text || response.statusText)
+    throw new Error(message)
   }
   return response.json()
 }
@@ -1917,10 +1922,17 @@ async function apiWithAdminToken<T>(path: string, token: string, options: Reques
   })
   if (!response.ok) {
     const text = await response.text()
-    if (response.status === 401) {
-      throw new AdminAuthError(text || "Admin access code required.")
+    let message = text || response.statusText
+    try {
+      const parsed = JSON.parse(text)
+      if (typeof parsed?.detail === "string") message = parsed.detail
+    } catch {
+      // Keep the original response when it is not JSON.
     }
-    throw new Error(text || response.statusText)
+    if (response.status === 401) {
+      throw new AdminAuthError(message || "Admin access code required.")
+    }
+    throw new Error(message)
   }
   return response.json()
 }
@@ -2397,18 +2409,29 @@ function UiCopyDialog({
 function ManualFulfilmentDialog({
   open,
   selectedCount,
+  suggestedReplacementAsin,
   onClose,
   onSubmit,
 }: {
   open: boolean
   selectedCount: number
+  suggestedReplacementAsin: string
   onClose: () => void
-  onSubmit: (payload: { reference: string; url: string; third_party: boolean; total_cost: number }) => Promise<void>
+  onSubmit: (payload: {
+    reference: string
+    url: string
+    third_party: boolean
+    total_cost: number
+    update_odoo_product_asin: boolean
+    replacement_asin: string
+  }) => Promise<void>
 }) {
   const [thirdParty, setThirdParty] = useState(false)
   const [reference, setReference] = useState("")
   const [url, setUrl] = useState("")
   const [totalCost, setTotalCost] = useState("")
+  const [updateOdooProductAsin, setUpdateOdooProductAsin] = useState(false)
+  const [replacementAsin, setReplacementAsin] = useState("")
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     if (!open) return
@@ -2416,10 +2439,15 @@ function ManualFulfilmentDialog({
     setReference("")
     setUrl("")
     setTotalCost("")
+    setUpdateOdooProductAsin(false)
+    setReplacementAsin(suggestedReplacementAsin)
     setBusy(false)
-  }, [open])
+  }, [open, suggestedReplacementAsin])
   const costValue = Number(totalCost || 0)
-  const canSave = thirdParty ? Boolean(reference.trim() || url.trim()) && costValue > 0 : Boolean(reference.trim())
+  const normalizedReplacementAsin = replacementAsin.trim().toUpperCase()
+  const replacementAsinValid = /^[A-Z0-9]{10}$/.test(normalizedReplacementAsin) && /\d/.test(normalizedReplacementAsin)
+  const fulfilmentValid = thirdParty ? Boolean(reference.trim() || url.trim()) && costValue > 0 : Boolean(reference.trim())
+  const canSave = fulfilmentValid && (!updateOdooProductAsin || (selectedCount === 1 && replacementAsinValid))
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
       <DialogContent>
@@ -2436,7 +2464,13 @@ function ManualFulfilmentDialog({
             <AlertDescription>The app will apply this to the open lines in the selected Odoo order(s).</AlertDescription>
           </Alert>
           <label className="form-check w-fit cursor-pointer">
-            <Checkbox checked={thirdParty} onCheckedChange={(checked) => setThirdParty(Boolean(checked))} />
+            <Checkbox
+              checked={thirdParty}
+              onCheckedChange={(checked) => {
+                setThirdParty(Boolean(checked))
+                if (checked) setUpdateOdooProductAsin(false)
+              }}
+            />
             <span className="form-check-label">Fulfilled at third party</span>
           </label>
           <TextField
@@ -2457,6 +2491,32 @@ function ManualFulfilmentDialog({
               onChange={setTotalCost}
             />
           )}
+          {!thirdParty && (
+            <div className="grid gap-3 rounded-md border border-amber-200 bg-amber-50/70 p-3">
+              <label className="form-check cursor-pointer">
+                <Checkbox
+                  checked={updateOdooProductAsin}
+                  onCheckedChange={(checked) => setUpdateOdooProductAsin(Boolean(checked))}
+                />
+                <span className="form-check-label">Update replacement ASIN on the Odoo product</span>
+              </label>
+              {updateOdooProductAsin && (
+                <>
+                  <TextField
+                    label="Replacement ASIN"
+                    value={replacementAsin}
+                    onChange={(value) => setReplacementAsin(value.toUpperCase())}
+                  />
+                  <p className="text-xs text-amber-900">
+                    Select exactly one line. The plain ASIN will replace the Odoo product reference and be added to Internal Notes.
+                    Use this only when Amazon permanently changed the product—not for a customer-specific alternative.
+                  </p>
+                  {selectedCount !== 1 ? <p className="text-xs font-medium text-destructive">Select exactly one order line to update its Odoo product.</p> : null}
+                  {replacementAsin && !replacementAsinValid ? <p className="text-xs font-medium text-destructive">Enter a valid 10-character ASIN.</p> : null}
+                </>
+              )}
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
@@ -2465,7 +2525,14 @@ function ManualFulfilmentDialog({
             onClick={async () => {
               setBusy(true)
               try {
-                await onSubmit({ reference, url, third_party: thirdParty, total_cost: costValue })
+                await onSubmit({
+                  reference,
+                  url,
+                  third_party: thirdParty,
+                  total_cost: costValue,
+                  update_odoo_product_asin: updateOdooProductAsin,
+                  replacement_asin: normalizedReplacementAsin,
+                })
               } finally {
                 setBusy(false)
               }
@@ -3697,6 +3764,12 @@ function App() {
   const selectedRows = selected
     .map((id) => currentRowsById.get(id) || selectedOrderRowsRef.current.get(id))
     .filter((row): row is OrderLine => Boolean(row))
+  const selectedReplacementAsins = Array.from(new Set(
+    selectedRows
+      .map((row) => String(row.replacement_asin || "").trim().toUpperCase())
+      .filter(Boolean),
+  ))
+  const suggestedManualReplacementAsin = selectedReplacementAsins.length === 1 ? selectedReplacementAsins[0] : ""
   const selectedStoreIds = Array.from(new Set(selectedRows.map((row) => Number(row.store_id || 0)).filter(Boolean)))
   const selectedActionStoreId = selected.length > 0 && selectedRows.length === selected.length && selectedStoreIds.length === 1 ? selectedStoreIds[0] : null
   const canRunSelectedStoreAction = Boolean(selected.length && selectedActionStoreId)
@@ -4305,6 +4378,7 @@ function App() {
       <ManualFulfilmentDialog
         open={manualFulfilmentOpen}
         selectedCount={selected.length}
+        suggestedReplacementAsin={suggestedManualReplacementAsin}
         onClose={() => setManualFulfilmentOpen(false)}
 	        onSubmit={async (payload) => {
 	          const actionStoreId = selectedStoreIdForAction("Manual Fulfilment")
@@ -5077,10 +5151,10 @@ function App() {
                             ? "bg-red-50"
                             : isMissingOrderLine(row)
                             ? "order-row-missing"
-                            : isAmazonDeliveredLine(row)
-                            ? ""
                             : rowHasVisibleOrderGroup(row) || Number(row.odoo_order_distinct_asin_count || 0) > 1
                               ? "bg-parrot-green-lt"
+                              : isAmazonDeliveredLine(row)
+                              ? ""
                               : "",
                           ].filter(Boolean).join(" ")
                         }
@@ -11631,11 +11705,13 @@ function ReplacementDialog({
 }) {
   const [asin, setAsin] = useState("")
   const [note, setNote] = useState("")
+  const [updateOdooProductAsin, setUpdateOdooProductAsin] = useState(false)
   const [saving, setSaving] = useState(false)
   const [resetting, setResetting] = useState(false)
   useEffect(() => {
     setAsin(line.replacement_asin || "")
     setNote(line.replacement_note || "")
+    setUpdateOdooProductAsin(false)
   }, [line])
   return (
     <Dialog open onOpenChange={(next) => !next && onClose()}>
@@ -11647,6 +11723,19 @@ function ReplacementDialog({
         <div className="form-fieldset grid gap-3">
           <TextField label="Replacement ASIN" value={asin} onChange={(value) => setAsin(value.toUpperCase())} />
           <TextField label="Internal note" value={note} onChange={setNote} />
+          <div className="grid gap-2 rounded-md border border-amber-200 bg-amber-50/70 p-3">
+            <label className="form-check cursor-pointer">
+              <Checkbox
+                checked={updateOdooProductAsin}
+                onCheckedChange={(checked) => setUpdateOdooProductAsin(Boolean(checked))}
+              />
+              <span className="form-check-label">Update this replacement ASIN on the Odoo product</span>
+            </label>
+            <p className="text-xs text-amber-900">
+              When checked, the plain ASIN becomes the Odoo product reference and is added to Internal Notes.
+              Leave this unchecked for a customer-specific alternative product.
+            </p>
+          </div>
         </div>
         <DialogFooter className="gap-2 sm:justify-between">
           <Button
@@ -11679,7 +11768,12 @@ function ReplacementDialog({
                 setSaving(true)
                 const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement`, {
                   method: "POST",
-                  body: JSON.stringify({ store_id: storeId, asin, note }),
+                  body: JSON.stringify({
+                    store_id: storeId,
+                    asin,
+                    note,
+                    update_odoo_product_asin: updateOdooProductAsin,
+                  }),
                 })
                 await onSaved(result.message, result.row)
               } catch (error) {
@@ -14186,8 +14280,13 @@ function SettingsPage({
             <div className="grid gap-3 md:grid-cols-2">
               <TextField label="Backup Endpoint" value={settings.backup_s3_endpoint || ""} onChange={(value) => setSetting("backup_s3_endpoint", value)} />
               <TextField label="Backup Bucket" value={settings.backup_s3_bucket || ""} onChange={(value) => setSetting("backup_s3_bucket", value)} />
+              <TextField label="Backup Access Key" value={settings.backup_s3_access_key_id || ""} onChange={(value) => setSetting("backup_s3_access_key_id", value)} />
+              <TextField label="Backup Secret Key" type="password" value={settings.backup_s3_secret_access_key || ""} onChange={(value) => setSetting("backup_s3_secret_access_key", value)} />
               <SelectField label="Backup Interval" value={settings.backup_interval_minutes || "0"} onChange={(value) => setSetting("backup_interval_minutes", value)}>
                 {["0", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
+              </SelectField>
+              <SelectField label="Cloud Retention" value={settings.backup_retention_days || "7"} onChange={(value) => setSetting("backup_retention_days", value)}>
+                {["1", "3", "7", "14", "30"].map((value) => <option key={value} value={value}>{value} day{value === "1" ? "" : "s"}</option>)}
               </SelectField>
             </div>
             <SelectField label="Restore From Backup" value={selectedBackupKey} onChange={setSelectedBackupKey}>
@@ -14203,7 +14302,10 @@ function SettingsPage({
                 onClick={() => saveSettingsGroup("Backups", [
                   "backup_s3_endpoint",
                   "backup_s3_bucket",
+                  "backup_s3_access_key_id",
+                  "backup_s3_secret_access_key",
                   "backup_interval_minutes",
+                  "backup_retention_days",
                 ])}
                 disabled={savingServices === "Backups"}
               >
@@ -14251,7 +14353,7 @@ function SettingsPage({
               </div>
             ) : null}
             <p className="text-xs text-muted-foreground">
-              Restore downloads the selected R2 dump and replaces the current Postgres schema/data using pg_restore.
+              Automatic backups run every {intervalLabel(settings.backup_interval_minutes || "0")}. Backups older than {settings.backup_retention_days || "7"} days are deleted from R2 after each successful backup. Restore downloads the selected R2 dump and replaces the current Postgres schema/data using pg_restore.
             </p>
           </CardContent>
         </Card>

@@ -7,12 +7,16 @@ import re
 
 ASIN_SECRET = b"NUTRICITY-KEY"
 ASIN_RE = re.compile(r"\b[A-Z0-9]{10}\b")
-ASIN_FALSE_POSITIVES = {"SUPPLEMENT"}
+ASIN_FALSE_POSITIVES = {"CONDITIONS", "SUPPLEMENT"}
 
 
 def normalize_asin(value: str) -> str:
     value = str(value or "").strip().upper()
     if value in ASIN_FALSE_POSITIVES:
+        return ""
+    # Real ASINs contain at least one digit. Requiring one prevents ordinary
+    # ten-letter words in product/order notes from becoming fulfilment keys.
+    if not any(char.isdigit() for char in value):
         return ""
     return value if ASIN_RE.fullmatch(value) else ""
 
@@ -47,7 +51,9 @@ def extract_asin_from_notes(*values: str) -> str:
     if explicit:
         return normalize_asin(explicit.group(1))
     for match in ASIN_RE.findall(combined.upper()):
-        return normalize_asin(match)
+        asin = normalize_asin(match)
+        if asin:
+            return asin
     return ""
 
 

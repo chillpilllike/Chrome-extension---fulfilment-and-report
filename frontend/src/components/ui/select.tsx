@@ -4,7 +4,9 @@ import * as React from "react"
 import { Select as SelectPrimitive } from "@base-ui/react/select"
 
 import { cn } from "@/lib/utils"
-import { IconCheck, IconChevronDown, IconChevronUp } from "@tabler/icons-react"
+import IconCheck from "@tabler/icons-react/dist/esm/icons/IconCheck.mjs"
+import IconChevronDown from "@tabler/icons-react/dist/esm/icons/IconChevronDown.mjs"
+import IconChevronUp from "@tabler/icons-react/dist/esm/icons/IconChevronUp.mjs"
 
 const Select = SelectPrimitive.Root
 
