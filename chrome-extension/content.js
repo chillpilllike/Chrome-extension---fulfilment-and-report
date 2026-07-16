@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-07-15-delivery-window-guard-v2";
+const CONTENT_SCRIPT_BUILD = "2026-07-16-multi-item-cart-v1";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -1492,7 +1492,9 @@ function cartActiveItems() {
   const activeCart = document.querySelector("#sc-active-cart");
   if (!activeCart || !visible(activeCart)) return [];
   const candidates = [
-    ...activeCart.querySelectorAll("[data-itemtype='active'], .sc-list-item, [data-name='Active Items'] [role='listitem']"),
+    ...activeCart.querySelectorAll(
+      "[data-itemtype='active'], .sc-list-item, [data-asin], [data-name='Active Items'] [role='listitem']",
+    ),
   ];
 
   const seen = new Set();
