@@ -11705,11 +11705,13 @@ function ReplacementDialog({
 }) {
   const [asin, setAsin] = useState("")
   const [note, setNote] = useState("")
+  const [updateOdooProductAsin, setUpdateOdooProductAsin] = useState(false)
   const [saving, setSaving] = useState(false)
   const [resetting, setResetting] = useState(false)
   useEffect(() => {
     setAsin(line.replacement_asin || "")
     setNote(line.replacement_note || "")
+    setUpdateOdooProductAsin(false)
   }, [line])
   return (
     <Dialog open onOpenChange={(next) => !next && onClose()}>
@@ -11721,6 +11723,19 @@ function ReplacementDialog({
         <div className="form-fieldset grid gap-3">
           <TextField label="Replacement ASIN" value={asin} onChange={(value) => setAsin(value.toUpperCase())} />
           <TextField label="Internal note" value={note} onChange={setNote} />
+          <div className="grid gap-2 rounded-md border border-amber-200 bg-amber-50/70 p-3">
+            <label className="form-check cursor-pointer">
+              <Checkbox
+                checked={updateOdooProductAsin}
+                onCheckedChange={(checked) => setUpdateOdooProductAsin(Boolean(checked))}
+              />
+              <span className="form-check-label">Update this replacement ASIN on the Odoo product</span>
+            </label>
+            <p className="text-xs text-amber-900">
+              When checked, the plain ASIN becomes the Odoo product reference and is added to Internal Notes.
+              Leave this unchecked for a customer-specific alternative product.
+            </p>
+          </div>
         </div>
         <DialogFooter className="gap-2 sm:justify-between">
           <Button
@@ -11753,7 +11768,12 @@ function ReplacementDialog({
                 setSaving(true)
                 const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement`, {
                   method: "POST",
-                  body: JSON.stringify({ store_id: storeId, asin, note }),
+                  body: JSON.stringify({
+                    store_id: storeId,
+                    asin,
+                    note,
+                    update_odoo_product_asin: updateOdooProductAsin,
+                  }),
                 })
                 await onSaved(result.message, result.row)
               } catch (error) {

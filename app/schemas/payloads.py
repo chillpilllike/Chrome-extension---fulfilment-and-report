@@ -263,6 +263,7 @@ class ReplacementPayload(BaseModel):
     store_id: int
     asin: str
     note: str = ""
+    update_odoo_product_asin: bool = False
 
 
 class BulkPlacePayload(BaseModel):

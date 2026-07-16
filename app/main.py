@@ -23764,6 +23764,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if not replacement_asin:
         raise HTTPException(400, "Replacement ASIN must be a valid 10-character ASIN.")
     title = fetch_amazon_product_title(replacement_asin)
+    odoo_asin_update: Optional[dict[str, Any]] = None
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, payload.store_id)).fetchone()
         if not row:
@@ -23773,6 +23774,12 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
         effective_store_id = int(row["store_id"])
         if row["amazon_order_id"]:
             raise HTTPException(400, "Reset fulfilment before changing the ASIN on an already fulfilled line.")
+        if payload.update_odoo_product_asin:
+            odoo_asin_update = update_replacement_asin_in_odoo(
+                effective_store_id,
+                [dict(row)],
+                replacement_asin,
+            )
         original_asin = row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"]
         replacement_name = title or f"Replacement ASIN {replacement_asin}"
         conn.execute(
@@ -23806,6 +23813,25 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
                 effective_store_id,
             ),
         )
+        if odoo_asin_update:
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET default_code=?,
+                    internal_note=?,
+                    asin_from_reference=?,
+                    updated_at=?
+                WHERE id=? AND store_id=?
+                """,
+                (
+                    replacement_asin,
+                    odoo_asin_update["internal_note"],
+                    replacement_asin,
+                    utc_now(),
+                    line_id,
+                    effective_store_id,
+                ),
+            )
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     try:
         store = get_store(effective_store_id)
@@ -23823,7 +23849,10 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if updated:
         index_order_line(updated)
     fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
-    return {"ok": True, "message": f"Replacement {replacement_asin} assigned and marked ready to queue.", "row": row_to_dict(updated)}
+    message = f"Replacement {replacement_asin} assigned and marked ready to queue."
+    if odoo_asin_update:
+        message += f" Odoo product reference and Internal Notes were updated with {replacement_asin}."
+    return {"ok": True, "message": message, "row": row_to_dict(updated)}
 
 
 def original_product_name_for_line(store_id: int, row: Any) -> str:
@@ -27596,7 +27625,7 @@ def amazon_asin_internal_note(current: Any, asin: str) -> str:
     return f"{current_text}\n{asin_line}".strip()
 
 
-def update_manual_replacement_asin_in_odoo(
+def update_replacement_asin_in_odoo(
     store_id: int,
     selected_rows: list[dict[str, Any]],
     replacement_asin: str,
@@ -29968,7 +29997,7 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
             allowed_row_ids = {int(row["id"]) for row in rows}
             if int(selected_rows[0]["id"]) not in allowed_row_ids:
                 raise HTTPException(409, "The selected line is blocked and its Odoo product was not updated.")
-            odoo_asin_update = update_manual_replacement_asin_in_odoo(
+            odoo_asin_update = update_replacement_asin_in_odoo(
                 store_id,
                 selected_rows,
                 replacement_asin,
