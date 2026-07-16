@@ -7969,12 +7969,20 @@ def save_combined_order_line(
                 odoo_order_date=excluded.odoo_order_date,
                 product_id=excluded.product_id,
                 product_tmpl_id=excluded.product_tmpl_id,
-                product_name=excluded.product_name,
+                product_name=CASE
+                    WHEN COALESCE(order_lines.replacement_asin, '') != ''
+                        THEN COALESCE(NULLIF(order_lines.replacement_product_name, ''), order_lines.product_name)
+                    ELSE excluded.product_name
+                END,
                 default_code=excluded.default_code,
                 internal_note=excluded.internal_note,
                 asin_from_reference=excluded.asin_from_reference,
                 asin_from_note=excluded.asin_from_note,
-                asin=excluded.asin,
+                asin=CASE
+                    WHEN COALESCE(order_lines.replacement_asin, '') != ''
+                        THEN order_lines.replacement_asin
+                    ELSE excluded.asin
+                END,
                 supplier_part_auxiliary_id=COALESCE(NULLIF(order_lines.supplier_part_auxiliary_id, ''), excluded.supplier_part_auxiliary_id),
                 quantity=excluded.quantity,
                 store_unit_price=excluded.store_unit_price,
@@ -8414,12 +8422,20 @@ def process_odoo_order_batch(
                     odoo_order_date=excluded.odoo_order_date,
                     product_id=excluded.product_id,
                     product_tmpl_id=excluded.product_tmpl_id,
-                    product_name=excluded.product_name,
+                    product_name=CASE
+                        WHEN COALESCE(order_lines.replacement_asin, '') != ''
+                            THEN COALESCE(NULLIF(order_lines.replacement_product_name, ''), order_lines.product_name)
+                        ELSE excluded.product_name
+                    END,
                     default_code=excluded.default_code,
                     internal_note=excluded.internal_note,
                     asin_from_reference=excluded.asin_from_reference,
                     asin_from_note=excluded.asin_from_note,
-                    asin=excluded.asin,
+                    asin=CASE
+                        WHEN COALESCE(order_lines.replacement_asin, '') != ''
+                            THEN order_lines.replacement_asin
+                        ELSE excluded.asin
+                    END,
                     supplier_part_auxiliary_id=COALESCE(NULLIF(order_lines.supplier_part_auxiliary_id, ''), excluded.supplier_part_auxiliary_id),
                     quantity=excluded.quantity,
                     store_unit_price=excluded.store_unit_price,
