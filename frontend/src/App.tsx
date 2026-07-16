@@ -5066,7 +5066,9 @@ function App() {
                           [
                             "cursor-pointer",
                             selected.includes(row.id) ? "outline outline-1 -outline-offset-1 outline-primary/35" : "",
-                            row.state === "ignored"
+                            ["cancelled", "refunded"].includes((row.odoo_status_label || "").toLowerCase())
+                              ? "order-row-cancelled-refunded"
+                            : row.state === "ignored"
                               ? "bg-slate-50 opacity-75 [&_td:not(:first-child)]:line-through [&_td:not(:first-child)]:text-muted-foreground"
                               : "",
                             isLimitPurchaseLine(row)
@@ -5077,8 +5079,6 @@ function App() {
                             ? "order-row-missing"
                             : isAmazonDeliveredLine(row)
                             ? ""
-                            : ["cancelled", "refunded"].includes(row.odoo_status_label)
-                            ? "bg-destructive/5"
                             : rowHasVisibleOrderGroup(row) || Number(row.odoo_order_distinct_asin_count || 0) > 1
                               ? "bg-parrot-green-lt"
                               : "",
@@ -9186,7 +9186,7 @@ function EpostTrackingPage({
 }) {
   const [loading, setLoading] = useState(false)
   const isLoading = loading || initialLoading
-  const [syncDays, setSyncDays] = useState("2")
+  const [syncDays, setSyncDays] = useState("30")
   const selectionAnchor = useRef<number | null>(null)
   function refundDetails(row: EpostTrackingRow) {
     return [
@@ -9242,7 +9242,7 @@ function EpostTrackingPage({
     try {
       const result = await api<{ ok: boolean; message: string; rows: EpostTrackingRow[] }>("/api/epost/sync", {
         method: "POST",
-        body: JSON.stringify({ store_id: Number(storeId), days: Number(syncDays || 2) }),
+        body: JSON.stringify({ store_id: Number(storeId) || null, days: Number(syncDays || 30) }),
       })
       onPage(1)
       const params = new URLSearchParams()

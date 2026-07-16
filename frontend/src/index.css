@@ -654,6 +654,18 @@
     background: #ffe4e6;
 }
 
+.tabler-admin-shell tr.order-row-cancelled-refunded > *,
+.tabler-admin-shell tr.order-row-cancelled-refunded:hover > * {
+    background: #7f1d1d;
+    color: #ffffff;
+}
+
+.tabler-admin-shell tr.order-row-cancelled-refunded a,
+.tabler-admin-shell tr.order-row-cancelled-refunded button:not([role="checkbox"]),
+.tabler-admin-shell tr.order-row-cancelled-refunded [class*="text-"] {
+    color: #ffffff;
+}
+
 .tabler-admin-shell tr.bg-parrot-green-lt > * {
     background: #effddd;
 }
