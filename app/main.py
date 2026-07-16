@@ -1922,6 +1922,13 @@ class OdooClient:
         return self.execute(model, "search_read", [domain], kwargs)
 
     def write(self, model: str, ids: list[int], vals: dict[str, Any]) -> bool:
+        protected_product_fields = {"default_code", "description", "standard_price", "list_price"}
+        blocked_fields = protected_product_fields.intersection(vals) if model in {"product.product", "product.template"} else set()
+        if blocked_fields:
+            raise RuntimeError(
+                "Direct Odoo product metadata updates are disabled in the fulfilment app "
+                f"(blocked fields: {', '.join(sorted(blocked_fields))})."
+            )
         return bool(self.execute(model, "write", [ids, vals]))
 
     def read(self, model: str, ids: list[int], fields: list[str]) -> list[dict[str, Any]]:
@@ -12041,18 +12048,6 @@ def place_orders(
                         )
                 cxml_state = "ordered" if response.get("confirmed") else "submitted"
                 update_lines_after_order(group_lines, amazon_order_id, None, amazon_account, cxml_state, external_id, "cxml")
-                threading.Thread(
-                    target=sync_amazon_order_products_to_odoo,
-                    args=(
-                        [dict(line) for line in group_lines],
-                        {
-                            normalize_asin(line["asin"]): {"purchased_asin": normalize_asin(line["asin"])}
-                            for line in group_lines
-                            if normalize_asin(line["asin"])
-                        },
-                    ),
-                    daemon=True,
-                ).start()
                 note = (
                     f"Amazon cXML {'clubbed ' if club else ''}order {'confirmed' if response.get('confirmed') else 'submitted, confirmation pending'}: {amazon_order_id}<br/>"
                     f"ASINs: {', '.join(dict.fromkeys(str(line['asin']) for line in group_lines))}<br/>"
@@ -12119,18 +12114,6 @@ def place_orders(
                 external_id,
                 "rest",
             )
-            threading.Thread(
-                target=sync_amazon_order_products_to_odoo,
-                args=(
-                    [dict(line) for line in group_lines],
-                    {
-                        normalize_asin(line["asin"]): {"purchased_asin": normalize_asin(line["asin"])}
-                        for line in group_lines
-                        if normalize_asin(line["asin"])
-                    },
-                ),
-                daemon=True,
-            ).start()
             note = (
                 f"Amazon {'clubbed ' if club else ''}order: <a href=\"{amazon_url}\" target=\"_blank\">{amazon_order_id}</a><br/>"
                 f"ASINs: {', '.join(dict.fromkeys(str(line['asin']) for line in group_lines))}<br/>"
@@ -23764,7 +23747,6 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if not replacement_asin:
         raise HTTPException(400, "Replacement ASIN must be a valid 10-character ASIN.")
     title = fetch_amazon_product_title(replacement_asin)
-    odoo_asin_update: Optional[dict[str, Any]] = None
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, payload.store_id)).fetchone()
         if not row:
@@ -23774,12 +23756,6 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
         effective_store_id = int(row["store_id"])
         if row["amazon_order_id"]:
             raise HTTPException(400, "Reset fulfilment before changing the ASIN on an already fulfilled line.")
-        if payload.update_odoo_product_asin:
-            odoo_asin_update = update_replacement_asin_in_odoo(
-                effective_store_id,
-                [dict(row)],
-                replacement_asin,
-            )
         original_asin = row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"]
         replacement_name = title or f"Replacement ASIN {replacement_asin}"
         conn.execute(
@@ -23813,25 +23789,6 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
                 effective_store_id,
             ),
         )
-        if odoo_asin_update:
-            conn.execute(
-                """
-                UPDATE order_lines
-                SET default_code=?,
-                    internal_note=?,
-                    asin_from_reference=?,
-                    updated_at=?
-                WHERE id=? AND store_id=?
-                """,
-                (
-                    replacement_asin,
-                    odoo_asin_update["internal_note"],
-                    replacement_asin,
-                    utc_now(),
-                    line_id,
-                    effective_store_id,
-                ),
-            )
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     try:
         store = get_store(effective_store_id)
@@ -23849,10 +23806,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     if updated:
         index_order_line(updated)
     fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
-    message = f"Replacement {replacement_asin} assigned and marked ready to queue."
-    if odoo_asin_update:
-        message += f" Odoo product reference and Internal Notes were updated with {replacement_asin}."
-    return {"ok": True, "message": message, "row": row_to_dict(updated)}
+    return {"ok": True, "message": f"Replacement {replacement_asin} assigned and marked ready to queue.", "row": row_to_dict(updated)}
 
 
 def original_product_name_for_line(store_id: int, row: Any) -> str:
@@ -27901,11 +27855,6 @@ def chrome_complete_followups(
     chrome_account_name: str,
 ) -> None:
     try:
-        summary = sync_amazon_order_products_to_odoo(rows, pricing_by_asin)
-        print(f"Chrome complete Odoo product sync: {summary}", flush=True)
-    except Exception as exc:
-        print(f"Chrome complete Odoo product sync failed: {exc}", flush=True)
-    try:
         queued = enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
         if queued:
             start_shopify_fulfilment_worker()
@@ -29929,24 +29878,17 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
     url = clean_text(payload.url)
     third_party = bool(payload.third_party)
     total_cost = float(payload.total_cost or 0)
-    update_odoo_product_asin = bool(payload.update_odoo_product_asin)
-    replacement_asin = normalize_asin(payload.replacement_asin)
     if not line_ids:
         raise HTTPException(400, "Select at least one order line.")
     if not reference and not url:
         raise HTTPException(400, "Enter an Amazon order ID, third-party order number, or URL.")
     if third_party and total_cost <= 0:
         raise HTTPException(400, "Enter the third-party order cost for profit/loss.")
-    if update_odoo_product_asin and third_party:
-        raise HTTPException(400, "Odoo replacement ASIN updates are available only for manual Amazon fulfilment.")
-    if update_odoo_product_asin and not replacement_asin:
-        raise HTTPException(400, "Enter a valid 10-character replacement ASIN before updating Odoo.")
     with db() as conn:
         selected_ids = validate_line_ids_for_store(conn, store_id, line_ids, "Manual fulfilment")
     placeholders = ",".join("?" for _ in selected_ids)
     now = utc_now()
     updated_for_shopify: list[dict[str, Any]] = []
-    odoo_asin_update: Optional[dict[str, Any]] = None
     with db() as conn:
         selected_rows = rows_to_dicts(conn.execute(
             f"""
@@ -29992,42 +29934,6 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
                 409,
                 "Blocked because matching Shopify order is already fulfilled. "
                 + (" | ".join(shopify_messages) if shopify_messages else "The customer may have received it."),
-            )
-        if update_odoo_product_asin:
-            allowed_row_ids = {int(row["id"]) for row in rows}
-            if int(selected_rows[0]["id"]) not in allowed_row_ids:
-                raise HTTPException(409, "The selected line is blocked and its Odoo product was not updated.")
-            odoo_asin_update = update_replacement_asin_in_odoo(
-                store_id,
-                selected_rows,
-                replacement_asin,
-            )
-            selected_row_id = int(selected_rows[0]["id"])
-            conn.execute(
-                """
-                UPDATE order_lines
-                SET original_asin=COALESCE(NULLIF(original_asin, ''), NULLIF(asin, '')),
-                    replacement_asin=?,
-                    replacement_note=?,
-                    replacement_assigned_at=COALESCE(replacement_assigned_at, ?),
-                    asin=?,
-                    asin_from_reference=?,
-                    default_code=?,
-                    internal_note=?,
-                    updated_at=?
-                WHERE id=?
-                """,
-                (
-                    replacement_asin,
-                    f"Manually promoted replacement ASIN {replacement_asin} to the Odoo product.",
-                    now,
-                    replacement_asin,
-                    replacement_asin,
-                    replacement_asin,
-                    odoo_asin_update["internal_note"],
-                    now,
-                    selected_row_id,
-                ),
             )
         total_store_value = sum(order_line_store_total(row) for row in rows)
         third_party_cost_by_id: dict[int, float] = {}
@@ -30135,11 +30041,6 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
     data = dashboard_data(store_id)
     mode = "third-party" if third_party else "manual Amazon"
     data["message"] = f"Marked {len(rows)} line(s) across {len({row['odoo_order_name'] for row in rows})} Odoo order(s) as {mode} fulfilled."
-    if odoo_asin_update:
-        data["message"] += (
-            f" Updated Odoo product reference and internal notes with replacement ASIN "
-            f"{odoo_asin_update['asin']}."
-        )
     return data
 
 

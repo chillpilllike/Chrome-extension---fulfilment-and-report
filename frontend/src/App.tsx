@@ -2409,29 +2409,23 @@ function UiCopyDialog({
 function ManualFulfilmentDialog({
   open,
   selectedCount,
-  suggestedReplacementAsin,
   onClose,
   onSubmit,
 }: {
   open: boolean
   selectedCount: number
-  suggestedReplacementAsin: string
   onClose: () => void
   onSubmit: (payload: {
     reference: string
     url: string
     third_party: boolean
     total_cost: number
-    update_odoo_product_asin: boolean
-    replacement_asin: string
   }) => Promise<void>
 }) {
   const [thirdParty, setThirdParty] = useState(false)
   const [reference, setReference] = useState("")
   const [url, setUrl] = useState("")
   const [totalCost, setTotalCost] = useState("")
-  const [updateOdooProductAsin, setUpdateOdooProductAsin] = useState(false)
-  const [replacementAsin, setReplacementAsin] = useState("")
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     if (!open) return
@@ -2439,15 +2433,10 @@ function ManualFulfilmentDialog({
     setReference("")
     setUrl("")
     setTotalCost("")
-    setUpdateOdooProductAsin(false)
-    setReplacementAsin(suggestedReplacementAsin)
     setBusy(false)
-  }, [open, suggestedReplacementAsin])
+  }, [open])
   const costValue = Number(totalCost || 0)
-  const normalizedReplacementAsin = replacementAsin.trim().toUpperCase()
-  const replacementAsinValid = /^[A-Z0-9]{10}$/.test(normalizedReplacementAsin) && /\d/.test(normalizedReplacementAsin)
-  const fulfilmentValid = thirdParty ? Boolean(reference.trim() || url.trim()) && costValue > 0 : Boolean(reference.trim())
-  const canSave = fulfilmentValid && (!updateOdooProductAsin || (selectedCount === 1 && replacementAsinValid))
+  const canSave = thirdParty ? Boolean(reference.trim() || url.trim()) && costValue > 0 : Boolean(reference.trim())
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
       <DialogContent>
@@ -2466,10 +2455,7 @@ function ManualFulfilmentDialog({
           <label className="form-check w-fit cursor-pointer">
             <Checkbox
               checked={thirdParty}
-              onCheckedChange={(checked) => {
-                setThirdParty(Boolean(checked))
-                if (checked) setUpdateOdooProductAsin(false)
-              }}
+              onCheckedChange={(checked) => setThirdParty(Boolean(checked))}
             />
             <span className="form-check-label">Fulfilled at third party</span>
           </label>
@@ -2491,32 +2477,6 @@ function ManualFulfilmentDialog({
               onChange={setTotalCost}
             />
           )}
-          {!thirdParty && (
-            <div className="grid gap-3 rounded-md border border-amber-200 bg-amber-50/70 p-3">
-              <label className="form-check cursor-pointer">
-                <Checkbox
-                  checked={updateOdooProductAsin}
-                  onCheckedChange={(checked) => setUpdateOdooProductAsin(Boolean(checked))}
-                />
-                <span className="form-check-label">Update replacement ASIN on the Odoo product</span>
-              </label>
-              {updateOdooProductAsin && (
-                <>
-                  <TextField
-                    label="Replacement ASIN"
-                    value={replacementAsin}
-                    onChange={(value) => setReplacementAsin(value.toUpperCase())}
-                  />
-                  <p className="text-xs text-amber-900">
-                    Select exactly one line. The plain ASIN will replace the Odoo product reference and be added to Internal Notes.
-                    Use this only when Amazon permanently changed the product—not for a customer-specific alternative.
-                  </p>
-                  {selectedCount !== 1 ? <p className="text-xs font-medium text-destructive">Select exactly one order line to update its Odoo product.</p> : null}
-                  {replacementAsin && !replacementAsinValid ? <p className="text-xs font-medium text-destructive">Enter a valid 10-character ASIN.</p> : null}
-                </>
-              )}
-            </div>
-          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
@@ -2530,8 +2490,6 @@ function ManualFulfilmentDialog({
                   url,
                   third_party: thirdParty,
                   total_cost: costValue,
-                  update_odoo_product_asin: updateOdooProductAsin,
-                  replacement_asin: normalizedReplacementAsin,
                 })
               } finally {
                 setBusy(false)
@@ -3764,12 +3722,6 @@ function App() {
   const selectedRows = selected
     .map((id) => currentRowsById.get(id) || selectedOrderRowsRef.current.get(id))
     .filter((row): row is OrderLine => Boolean(row))
-  const selectedReplacementAsins = Array.from(new Set(
-    selectedRows
-      .map((row) => String(row.replacement_asin || "").trim().toUpperCase())
-      .filter(Boolean),
-  ))
-  const suggestedManualReplacementAsin = selectedReplacementAsins.length === 1 ? selectedReplacementAsins[0] : ""
   const selectedStoreIds = Array.from(new Set(selectedRows.map((row) => Number(row.store_id || 0)).filter(Boolean)))
   const selectedActionStoreId = selected.length > 0 && selectedRows.length === selected.length && selectedStoreIds.length === 1 ? selectedStoreIds[0] : null
   const canRunSelectedStoreAction = Boolean(selected.length && selectedActionStoreId)
@@ -4378,7 +4330,6 @@ function App() {
       <ManualFulfilmentDialog
         open={manualFulfilmentOpen}
         selectedCount={selected.length}
-        suggestedReplacementAsin={suggestedManualReplacementAsin}
         onClose={() => setManualFulfilmentOpen(false)}
 	        onSubmit={async (payload) => {
 	          const actionStoreId = selectedStoreIdForAction("Manual Fulfilment")
@@ -11705,13 +11656,11 @@ function ReplacementDialog({
 }) {
   const [asin, setAsin] = useState("")
   const [note, setNote] = useState("")
-  const [updateOdooProductAsin, setUpdateOdooProductAsin] = useState(false)
   const [saving, setSaving] = useState(false)
   const [resetting, setResetting] = useState(false)
   useEffect(() => {
     setAsin(line.replacement_asin || "")
     setNote(line.replacement_note || "")
-    setUpdateOdooProductAsin(false)
   }, [line])
   return (
     <Dialog open onOpenChange={(next) => !next && onClose()}>
@@ -11723,19 +11672,6 @@ function ReplacementDialog({
         <div className="form-fieldset grid gap-3">
           <TextField label="Replacement ASIN" value={asin} onChange={(value) => setAsin(value.toUpperCase())} />
           <TextField label="Internal note" value={note} onChange={setNote} />
-          <div className="grid gap-2 rounded-md border border-amber-200 bg-amber-50/70 p-3">
-            <label className="form-check cursor-pointer">
-              <Checkbox
-                checked={updateOdooProductAsin}
-                onCheckedChange={(checked) => setUpdateOdooProductAsin(Boolean(checked))}
-              />
-              <span className="form-check-label">Update this replacement ASIN on the Odoo product</span>
-            </label>
-            <p className="text-xs text-amber-900">
-              When checked, the plain ASIN becomes the Odoo product reference and is added to Internal Notes.
-              Leave this unchecked for a customer-specific alternative product.
-            </p>
-          </div>
         </div>
         <DialogFooter className="gap-2 sm:justify-between">
           <Button
@@ -11768,12 +11704,7 @@ function ReplacementDialog({
                 setSaving(true)
                 const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement`, {
                   method: "POST",
-                  body: JSON.stringify({
-                    store_id: storeId,
-                    asin,
-                    note,
-                    update_odoo_product_asin: updateOdooProductAsin,
-                  }),
+                  body: JSON.stringify({ store_id: storeId, asin, note }),
                 })
                 await onSaved(result.message, result.row)
               } catch (error) {
