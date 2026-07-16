@@ -2,6 +2,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const TRACKER_URL = "https://portal.epgshipping.com/ParcelTracker/HomePageTracker";
 
 let extensionContextAlive = true;
+const MAX_PAGE_RETRIES = 6;
 
 async function send(message) {
   if (!extensionContextAlive) return null;
@@ -30,6 +31,22 @@ function showPanel(title, message) {
   panel.innerHTML = `<strong></strong><div></div>`;
   panel.querySelector("strong").textContent = title;
   panel.querySelector("div").textContent = message;
+}
+
+function retryPageRun(message, delayMs = 5000) {
+  window.__nutricityEpostRetries = Number(window.__nutricityEpostRetries || 0) + 1;
+  if (window.__nutricityEpostRetries > MAX_PAGE_RETRIES) {
+    showPanel("Nutricity ePost", `${message} Retried ${MAX_PAGE_RETRIES} time(s); watchdog will move this batch if it remains stuck.`);
+    return;
+  }
+  showPanel("Nutricity ePost", `${message} Retrying ${window.__nutricityEpostRetries}/${MAX_PAGE_RETRIES}.`);
+  setTimeout(() => {
+    if (window.__nutricityEpostRunning) return;
+    window.__nutricityEpostRunning = true;
+    run().finally(() => {
+      window.__nutricityEpostRunning = false;
+    });
+  }, delayMs);
 }
 
 function setFieldValue(field, value) {
@@ -93,11 +110,13 @@ async function waitForMatchingResults(codes, timeoutMs = 30000) {
   while (Date.now() - started < timeoutMs) {
     if (document.querySelector("#TableParcelTracker tbody tr")) {
       await selectAllRows();
-      if (sameCodeSet(visibleResultCodes(), codes)) return true;
+      const coverage = resultCoverage(codes);
+      if (coverage.exact) return coverage;
+      if (coverage.hasRequestedCode && coverage.hasLookupError) return coverage;
     }
     await sleep(500);
   }
-  return false;
+  return null;
 }
 
 async function selectAllRows() {
@@ -158,6 +177,25 @@ function visibleResultCodes() {
   return parseResults().map((result) => result.tracking_code);
 }
 
+function resultCoverage(codes) {
+  const requested = codes.map((code) => String(code || "").trim().toUpperCase()).filter(Boolean);
+  const requestedSet = new Set(requested);
+  const results = parseResults();
+  const visible = results.map((result) => result.tracking_code).filter(Boolean);
+  const visibleSet = new Set(visible);
+  const matched = requested.filter((code) => visibleSet.has(code));
+  const unexpected = visible.filter((code) => !requestedSet.has(code));
+  const hasLookupError = results.some((result) => /error locating tracking number|tracking number not found|unable to locate/i.test(result.status || ""));
+  return {
+    exact: requested.length === visible.length && requested.every((code) => visibleSet.has(code)),
+    hasRequestedCode: matched.length > 0,
+    matched,
+    missing: requested.filter((code) => !visibleSet.has(code)),
+    unexpected,
+    hasLookupError,
+  };
+}
+
 function sameCodeSet(left, right) {
   const a = left.map((code) => String(code || "").trim().toUpperCase()).filter(Boolean).sort();
   const b = right.map((code) => String(code || "").trim().toUpperCase()).filter(Boolean).sort();
@@ -187,10 +225,20 @@ async function run() {
   if (!codes.length) return;
   if (submitted) {
     showPanel("Nutricity ePost", `Waiting for submitted batch ${Number(batchIndex) + 1} results.`);
-    if (await waitForMatchingResults(codes, 30000)) {
+    const coverage = await waitForMatchingResults(codes, 30000);
+    if (coverage) {
+      window.__nutricityEpostRetries = 0;
+      if (!coverage.exact) {
+        showPanel("Nutricity ePost", `ePost returned lookup error result(s); capturing ${coverage.matched.length} matched code(s) and moving on.`);
+        await sleep(600);
+      }
       await captureResults(batchIndex);
     } else {
-      showPanel("Nutricity ePost", `Submitted batch ${Number(batchIndex) + 1} results are not visible yet.`);
+      const currentCoverage = resultCoverage(codes);
+      const detail = currentCoverage.unexpected.length
+        ? ` Visible codes belong to another batch: ${currentCoverage.unexpected.slice(0, 3).join(", ")}.`
+        : "";
+      retryPageRun(`Submitted batch ${Number(batchIndex) + 1} results are not visible yet.${detail}`);
     }
     return;
   }
@@ -226,7 +274,10 @@ async function run() {
   }
   button.click();
   if (await waitForResults()) {
+    window.__nutricityEpostRetries = 0;
     await captureResults(batchIndex);
+  } else {
+    retryPageRun(`No ePost result table appeared after submitting batch ${Number(batchIndex) + 1}.`);
   }
 }
 

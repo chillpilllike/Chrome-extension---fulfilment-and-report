@@ -219,6 +219,7 @@ async function openTracker(windowId) {
     const tabs = await chrome.tabs.query(activeQuery);
     if (tabs[0]?.id && isEpostTrackerUrl(tabs[0].url || "")) {
       await chrome.tabs.update(tabs[0].id, { url, active: false });
+      await closeExtraEpostTrackerTabs(tabs[0].id, windowId);
       return;
     }
     const candidateQuery = windowId ? { windowId } : { currentWindow: true };
@@ -226,12 +227,30 @@ async function openTracker(windowId) {
     const reusable = candidates.find((tab) => tab.id && isEpostTrackerUrl(tab.url || ""));
     if (reusable?.id) {
       await chrome.tabs.update(reusable.id, { url, active: false });
+      await closeExtraEpostTrackerTabs(reusable.id, windowId);
       return;
     }
   } catch (error) {
     await log(`Could not reuse ePost tab: ${error.message}`, windowId);
   }
-  await chrome.tabs.create({ url, active: false, ...(windowId ? { windowId } : {}) });
+  const created = await chrome.tabs.create({ url, active: false, ...(windowId ? { windowId } : {}) });
+  if (created?.id) await closeExtraEpostTrackerTabs(created.id, windowId);
+}
+
+async function closeExtraEpostTrackerTabs(keepTabId, windowId) {
+  try {
+    const candidateQuery = windowId ? { windowId } : { currentWindow: true };
+    const candidates = await chrome.tabs.query(candidateQuery);
+    const extras = candidates
+      .filter((tab) => tab.id && tab.id !== keepTabId && isEpostTrackerUrl(tab.url || ""))
+      .map((tab) => tab.id);
+    if (extras.length) {
+      await chrome.tabs.remove(extras);
+      await log(`Closed ${extras.length} stale ePost tracker tab${extras.length === 1 ? "" : "s"}.`, windowId);
+    }
+  } catch (error) {
+    await log(`Could not close stale ePost tracker tab: ${error.message}`, windowId);
+  }
 }
 
 function clampIntervalHours(value, fallback = DEFAULT_EPOST_AUTO_HOURS) {
