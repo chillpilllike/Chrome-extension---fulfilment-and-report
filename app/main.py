@@ -10939,7 +10939,7 @@ def ensure_chrome_job_owner(conn: Any, group_key: str, worker_id: str) -> None:
         raise HTTPException(409, "Chrome job is locked by another extension instance.")
 
 
-def expand_line_ids_to_full_chrome_orders(
+def normalize_selected_chrome_line_ids(
     conn: Any,
     store_id: int,
     line_ids: Optional[list[int]],
@@ -10950,36 +10950,18 @@ def expand_line_ids_to_full_chrome_orders(
     selected_ids = sorted({int(line_id) for line_id in line_ids if int(line_id or 0) > 0})
     if not selected_ids:
         return []
-    selected_orders = conn.execute(
-        f"""
-        SELECT DISTINCT odoo_order_id
-        FROM order_lines
-        WHERE store_id=?
-          AND id IN ({','.join('?' for _ in selected_ids)})
-          AND state != 'ignored'
-        """,
-        [store_id, *selected_ids],
-    ).fetchall()
-    order_ids = sorted({int(row["odoo_order_id"]) for row in selected_orders})
-    if not order_ids:
-        return []
-    sibling_rows = conn.execute(
+    selected_rows = conn.execute(
         f"""
         SELECT id
         FROM order_lines
         WHERE store_id=?
-          AND odoo_order_id IN ({','.join('?' for _ in order_ids)})
-          AND asin IS NOT NULL AND asin != ''
-          AND COALESCE(amazon_order_id, '') = ''
-          AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory', 'ignored')
-          AND (? = 1 OR state != 'missing')
-          AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-        ORDER BY odoo_order_id DESC, id ASC
+          AND id IN ({','.join('?' for _ in selected_ids)})
+          AND state != 'ignored'
+        ORDER BY id
         """,
-        [store_id, *order_ids, 1 if include_missing_asins else 0],
+        [store_id, *selected_ids],
     ).fetchall()
-    expanded_ids = sorted({int(row["id"]) for row in sibling_rows})
-    return expanded_ids
+    return [int(row["id"]) for row in selected_rows]
 
 
 def block_selected_orders_with_existing_amazon_orders(conn: Any, store_id: int, line_ids: Optional[list[int]]) -> tuple[Optional[list[int]], int]:
@@ -11323,48 +11305,19 @@ def queue_chrome_order_groups_fast(
                 SELECT *
                 FROM order_lines
                 WHERE store_id=?
-                  AND odoo_order_id IN (
-                    SELECT DISTINCT odoo_order_id
-                    FROM order_lines
-                    WHERE store_id=?
-                      AND id IN ({','.join('?' for _ in selected_ids)})
-                      AND state != 'ignored'
-                  )
-                ORDER BY odoo_order_id DESC, id ASC
+                  AND id IN ({','.join('?' for _ in selected_ids)})
+                ORDER BY id ASC
                 """,
-                [store_id, store_id, *selected_ids],
+                [store_id, *selected_ids],
             ).fetchall()
             if not selected_order_rows:
                 return 0, cleared_count, 0, account, []
-            blocked_by_order: dict[int, dict[str, Any]] = {}
-            for row in selected_order_rows:
-                amazon_order_id = clean_text(row.get("amazon_order_id"))
-                if not amazon_order_id:
-                    continue
-                order_id = int(row["odoo_order_id"])
-                entry = blocked_by_order.setdefault(order_id, {"name": row["odoo_order_name"], "orders": []})
-                if amazon_order_id not in entry["orders"]:
-                    entry["orders"].append(amazon_order_id)
-            if blocked_by_order:
-                now = utc_now()
-                for order_id, entry in blocked_by_order.items():
-                    amazon_orders = ", ".join(entry["orders"]) or "an existing Amazon order"
-                    message = (
-                        f"{entry['name']} already has Amazon order {amazon_orders}. "
-                        "Reset fulfilment before sending again to avoid a duplicate Amazon order."
-                    )
-                    conn.execute(
-                        """
-                        UPDATE order_lines
-                        SET state=CASE WHEN COALESCE(amazon_order_id, '') = '' THEN 'error' ELSE state END,
-                            last_error=?,
-                            updated_at=?
-                        WHERE store_id=?
-                          AND odoo_order_id=?
-                        """,
-                        (message, now, store_id, order_id),
-                    )
-                return 0, cleared_count, len(blocked_by_order), account, []
+            skipped_selected = sum(
+                1
+                for row in selected_order_rows
+                if clean_text(row.get("amazon_order_id"))
+                or clean_text(row.get("state")) in {"ordered", "delivered", "dispatched", "costly", "inventory", "ignored"}
+            )
             lines = [
                 row for row in selected_order_rows
                 if row.get("asin")
@@ -11374,12 +11327,9 @@ def queue_chrome_order_groups_fast(
                 and clean_text(row.get("odoo_status_label")) not in {"cancelled", "refunded"}
             ]
             if not lines:
-                return 0, cleared_count, 0, account, []
+                return 0, cleared_count, skipped_selected, account, []
             lines, date_blocked, _date_messages = block_lines_before_min_odoo_order_date(conn, [dict(line) for line in lines])
-            blocked = date_blocked
-            if lines:
-                lines, missing_blocked, _missing_messages = block_lines_with_missing_asin_siblings(conn, store_id, [dict(line) for line in lines], include_missing_asins, selected_id_set)
-                blocked += missing_blocked
+            blocked = skipped_selected + date_blocked
             if lines:
                 lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines], live_sync=False)
                 blocked += shopify_blocked
@@ -11399,7 +11349,7 @@ def queue_chrome_order_groups_fast(
                 fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "missing", "back-in-stock"})
             return queued, cleared_count, blocked, account, details
 
-        line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, selected_ids if selected_scope else None, include_missing_asins)
+        line_ids = normalize_selected_chrome_line_ids(conn, store_id, selected_ids if selected_scope else None, include_missing_asins)
         line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
         if line_ids is not None and not line_ids:
             return 0, cleared_count, blocked, account, []
@@ -11930,7 +11880,7 @@ def place_orders(
     failed = 0
     with db() as conn:
         if ordering_engine == "chrome":
-            line_ids = expand_line_ids_to_full_chrome_orders(conn, store_id, line_ids, include_missing_asins)
+            line_ids = normalize_selected_chrome_line_ids(conn, store_id, line_ids, include_missing_asins)
         line_ids, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, line_ids)
         failed += blocked
         if line_ids is not None and not line_ids:

@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-07-16-multi-item-cart-v2";
+const CONTENT_SCRIPT_BUILD = "2026-07-17-no-duplicate-add-v8";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -1335,15 +1335,66 @@ function checkoutSummaryUnitCount() {
   if (visibleQuantities.length) {
     return visibleQuantities.reduce((sum, quantity) => sum + quantity, 0);
   }
-  const summaryMatch = (document.body.innerText || document.body.textContent || "").match(/\bItems\s*\((\d+)\)\s*:/i);
-  if (summaryMatch) return Number(summaryMatch[1]);
+  const summaryRoots = [
+    ...document.querySelectorAll(
+      "#subtotals-marketplace-table, #order-summary, #checkout-summary, [data-testid*='order-summary' i], [class*='order-summary' i]",
+    ),
+  ].filter(visible);
+  const summaryTexts = [
+    ...summaryRoots.map((element) => element.innerText || element.textContent || ""),
+    document.body.innerText || document.body.textContent || "",
+  ];
+  for (const text of summaryTexts) {
+    const summaryMatch =
+      String(text).match(/\bItems?\s*\((\d+)\)/i)
+      || String(text).match(/\bItems?\s*:\s*(\d+)\b/i)
+      || String(text).match(/\bSubtotal\s*\((\d+)\s+items?\)/i);
+    if (summaryMatch) return Number(summaryMatch[1]);
+  }
   return null;
+}
+
+function cartVerificationMatches(activeJob) {
+  const verification = activeJob?.cartVerification;
+  if (!verification || verification.group_key !== activeJob?.job?.group_key) return false;
+  const verifiedAt = Number(verification.verified_at || 0);
+  if (!verifiedAt || Date.now() - verifiedAt > 30 * 60 * 1000) return false;
+  const expected = expectedCartQuantities(activeJob);
+  const verified = verification.quantities && typeof verification.quantities === "object"
+    ? verification.quantities
+    : {};
+  const expectedKeys = Object.keys(expected).sort();
+  const verifiedKeys = Object.keys(verified).sort();
+  if (expectedKeys.length !== verifiedKeys.length) return false;
+  return expectedKeys.every((asin, index) => (
+    asin === verifiedKeys[index]
+    && Number(expected[asin]) === Number(verified[asin])
+  ));
+}
+
+function isAmazonBusinessPage() {
+  const text = String(document.body?.innerText || document.body?.textContent || "").toLowerCase();
+  return (
+    text.includes("prime business")
+    || text.includes("amazon business")
+    || text.includes("account for ")
+    || Boolean(document.querySelector("[href*='businessprime'], [href*='amazonbusiness'], [aria-label*='Amazon Business' i]"))
+  );
 }
 
 async function ensureCheckoutOnlyExpectedUnits(activeJob) {
   const expected = expectedCheckoutUnitCount(activeJob);
   const actual = checkoutSummaryUnitCount();
   if (!expected || (Number.isFinite(actual) && actual === expected)) return true;
+  if (
+    !Number.isFinite(actual)
+    && (
+      expected === 1
+      || (isAmazonBusinessPage() && cartVerificationMatches(activeJob))
+    )
+  ) {
+    return true;
+  }
   const expectedAsins = Object.keys(expectedCartQuantities(activeJob) || {}).join(", ");
   const actualLabel = Number.isFinite(actual)
     ? `${actual < expected ? "only " : ""}${actual} item unit(s)`
@@ -1571,6 +1622,15 @@ function markCheckoutStarted(activeJob) {
   }
 }
 
+function clearCheckoutStarted(activeJob) {
+  activeJob.checkoutStartedAt = null;
+  try {
+    sessionStorage.removeItem(checkoutMarkerKey(activeJob));
+  } catch {
+    // State storage still clears the marker when session storage is unavailable.
+  }
+}
+
 function itemWasAdded(activeJob) {
   if (activeJob?.addClickedAt || Object.keys(activeJob?.pricing || {}).length) return true;
   try {
@@ -1612,19 +1672,12 @@ function cartItemAsin(item) {
 
 function expectedCartQuantities(activeJob) {
   const expected = {};
-  const pricing = Object.values(activeJob.pricing || {});
-  if (pricing.length) {
-    for (const item of pricing) {
-      const asin = String(item.purchased_asin || item.asin || "").toUpperCase();
-      if (!asin) continue;
-      expected[asin] = (expected[asin] || 0) + Number(item.quantity || 1);
-    }
-    return expected;
-  }
   for (const item of activeJob.job?.items || []) {
-    const asin = String(item.asin || "").toUpperCase();
+    const originalAsin = String(item.asin || "").toUpperCase();
+    const pricing = activeJob.pricing?.[originalAsin] || activeJob.pricing?.[item.asin] || null;
+    const asin = String(pricing?.purchased_asin || originalAsin).toUpperCase();
     if (!asin) continue;
-    expected[asin] = (expected[asin] || 0) + Number(item.quantity || 1);
+    expected[asin] = (expected[asin] || 0) + Number(pricing?.quantity || item.quantity || 1);
   }
   return expected;
 }
@@ -1662,7 +1715,7 @@ function smartWagonAddedCartState(activeJob, expected) {
 function verifyCartQuantities(activeJob) {
   const activeCart = document.querySelector("#sc-active-cart");
   const expected = expectedCartQuantities(activeJob);
-  if (!Object.keys(expected).length) return { ok: true };
+  if (!Object.keys(expected).length) return { ok: true, exact: false };
   const items = cartActiveItems();
   if ((!activeCart || !visible(activeCart)) && !items.length) {
     const smartWagon = smartWagonAddedCartState(activeJob, expected);
@@ -1694,10 +1747,10 @@ function verifyCartQuantities(activeJob) {
     actual[asin] = (actual[asin] || 0) + cartItemQuantity(item);
   }
   if (!Object.keys(actual).length && items.length && unknownItems.length) {
-    return { ok: true, warning: `Could not read ASIN from Amazon cart markup. Found ${items.length} active cart item(s), so checkout was not blocked.` };
+    return { ok: true, exact: false, warning: `Could not read ASIN from Amazon cart markup. Found ${items.length} active cart item(s), so checkout was not blocked.` };
   }
   const mismatches = Object.entries(expected).filter(([asin, quantity]) => Number(actual[asin] || 0) !== Number(quantity));
-  if (!mismatches.length) return { ok: true };
+  if (!mismatches.length) return { ok: true, exact: true, quantities: actual };
   const details = mismatches.map(([asin, quantity]) => {
     const expectedQuantity = Number(quantity);
     const actualQuantity = Number(actual[asin] || 0);
@@ -1712,6 +1765,22 @@ function verifyCartQuantities(activeJob) {
     .map(([asin, quantity]) => `${asin} expected ${quantity}, cart has ${actual[asin] || 0}`)
     .join("; ");
   return { ok: false, message, mismatches: details };
+}
+
+function cartQuantityForAsin(asin) {
+  const expectedAsin = String(asin || "").trim().toUpperCase();
+  if (!expectedAsin) return 0;
+  return cartActiveItems().reduce((total, item) => (
+    cartItemAsin(item) === expectedAsin ? total + cartItemQuantity(item) : total
+  ), 0);
+}
+
+function shouldRetryVerifiedCartAfterCheckout(activeJob, cartCheck) {
+  return (
+    cartCheck?.ok === true
+    && cartCheck?.exact === true
+    && Number(activeJob?.cartAfterCheckoutRetryCount || 0) < 1
+  );
 }
 
 function lineIdForAsin(activeJob, asin) {
@@ -3301,6 +3370,69 @@ async function handleSubscribeCheckout(activeJob) {
 }
 
 async function handleCart(activeJob) {
+  const nextIndex = Number(activeJob.itemIndex || 0) + 1;
+  const itemCount = Array.isArray(activeJob.job?.items) ? activeJob.job.items.length : 0;
+  const shouldVerifyCurrentItemBeforeContinuing = (
+    !checkoutWasStarted(activeJob)
+    && !["clear_cart", "cleanup_after_failure"].includes(String(activeJob.stage || ""))
+    && nextIndex < itemCount
+    && itemWasAdded(activeJob)
+  );
+  if (shouldVerifyCurrentItemBeforeContinuing && /\/cart\/smart-wagon/i.test(location.pathname)) {
+    showPanel("Nutricity fulfilment", "Opening the full Amazon cart to verify this line item before adding the next selected item.", null, null);
+    location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
+    return;
+  }
+  if (shouldVerifyCurrentItemBeforeContinuing) {
+    await waitForElement(["#sc-active-cart", "#sc-empty-cart"], 15000);
+    const currentItem = activeJob.job.items[Number(activeJob.itemIndex || 0)];
+    const purchaseItem = selectedVariantItem(activeJob, currentItem);
+    const expectedAsin = String(purchaseItem?.asin || currentItem?.asin || "").toUpperCase();
+    const expectedQuantity = Math.max(1, Math.round(Number(purchaseItem?.quantity || currentItem?.quantity || 1)));
+    const actualQuantity = cartQuantityForAsin(expectedAsin);
+    if (actualQuantity < expectedQuantity) {
+      const retryKey = `verify:${Number(activeJob.itemIndex || 0)}:${expectedAsin}`;
+      const retries = activeJob.cartAddVerificationRetries && typeof activeJob.cartAddVerificationRetries === "object"
+        ? activeJob.cartAddVerificationRetries
+        : {};
+      const retryCount = Number(retries[retryKey] || 0);
+      if (retryCount < 1) {
+        activeJob.cartAddVerificationRetries = { ...retries, [retryKey]: retryCount + 1 };
+        activeJob.stage = "cart";
+        await setActiveJob(activeJob, { reason: "recheck_unverified_cart_add" });
+        showPanel(
+          "Rechecking Amazon cart",
+          `ASIN ${expectedAsin} is not readable in the active cart yet. Reloading the cart once without clicking Add to cart again.`,
+          null,
+          null,
+        );
+        await sleep(1500);
+        location.reload();
+        return;
+      }
+      const message = `Could not verify ASIN ${expectedAsin} in the Amazon cart after reloading it. Expected ${expectedQuantity}, cart has ${actualQuantity}. Checkout was stopped without clicking Add to cart a second time.`;
+      showPanel("Cart verification needs review", message, null, null);
+      await send({
+        type: "FAIL_JOB",
+        message,
+        missingAsin: "",
+        missingLineId: null,
+        failureCode: "cart_verification_failed",
+        requestedQuantity: expectedQuantity,
+        fulfilledQuantity: actualQuantity,
+        availableQuantity: null,
+      });
+      return;
+    }
+    showPanel(
+      "Nutricity fulfilment",
+      `Verified ${expectedAsin} in the active cart after item ${Number(activeJob.itemIndex || 0) + 1} of ${itemCount}. Continuing with the next selected line item.`,
+      null,
+      null,
+    );
+    await navigateToNext(activeJob);
+    return;
+  }
   if (/\/cart\/smart-wagon/i.test(location.pathname)) {
     showPanel("Nutricity fulfilment", "Opening full Amazon cart before verifying this order.", null, null);
     location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
@@ -3360,6 +3492,31 @@ async function handleCart(activeJob) {
   if (!cartCheck.ok) {
     const mismatch = (cartCheck.mismatches || [])[0];
     const missingAsin = mismatch?.asin || "";
+    if (mismatch && Number(mismatch.actual || 0) <= 0 && (activeJob.job?.items || []).length > 1) {
+      const missingIndex = (activeJob.job.items || []).findIndex((entry) => {
+        const requestedAsin = String(entry.asin || "").toUpperCase();
+        const purchasedAsin = String(activeJob.pricing?.[requestedAsin]?.purchased_asin || requestedAsin).toUpperCase();
+        return purchasedAsin === String(missingAsin || "").toUpperCase();
+      });
+      const retryKey = `final-verify:${missingIndex}:${missingAsin}`;
+      const retries = activeJob.cartAddVerificationRetries && typeof activeJob.cartAddVerificationRetries === "object"
+        ? activeJob.cartAddVerificationRetries
+        : {};
+      if (missingIndex >= 0 && Number(retries[retryKey] || 0) < 1) {
+        activeJob.cartAddVerificationRetries = { ...retries, [retryKey]: Number(retries[retryKey] || 0) + 1 };
+        activeJob.stage = "cart";
+        await setActiveJob(activeJob, { reason: "recheck_missing_final_cart_item" });
+        showPanel(
+          "Rechecking complete cart",
+          `ASIN ${missingAsin} is not readable in the complete cart yet. Reloading the cart once without clicking Add to cart again.`,
+          null,
+          null,
+        );
+        await sleep(1500);
+        location.reload();
+        return;
+      }
+    }
     if (mismatch?.mismatch_type === "missing_from_cart") {
       const message = `Amazon cart stayed empty after Add to cart for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart showed 0. This may be a cart timing or parser issue, so the order was paused as an error instead of moved to Missing ASINs.`;
       showPanel("Cart verification needs review", message, null, null);
@@ -3447,6 +3604,14 @@ async function handleCart(activeJob) {
     showPanel("Nutricity fulfilment", cartCheck.warning, null, null);
     await sleep(1800);
   }
+  activeJob.cartVerification = cartCheck.exact === true
+    ? {
+        group_key: activeJob.job?.group_key || "",
+        quantities: { ...(cartCheck.quantities || {}) },
+        verified_at: Date.now(),
+      }
+    : null;
+  await setActiveJob(activeJob);
   showPanel("Nutricity fulfilment", "Cart ready. Proceeding to checkout.", null, null);
   let clicked = false;
   const checkoutInput = await waitForElement([
@@ -5532,6 +5697,10 @@ async function handleCheckout(activeJob) {
 }
 
 function extractOrderId() {
+  for (const key of ["orderID", "orderId"]) {
+    const value = String(new URLSearchParams(location.search).get(key) || "").trim();
+    if (/^\d{3}-\d{7}-\d{7}$/.test(value)) return value;
+  }
   const text = document.body.innerText || "";
   const patterns = [
     /order(?:\s*#|\s*number|\s*id)?\s*[:#]?\s*([0-9]{3}-[0-9]{7}-[0-9]{7})/i,
@@ -7645,6 +7814,33 @@ async function run() {
       await handleOrderHistory(activeJob);
     } else if (/\/cart/i.test(location.pathname)) {
       if (checkoutWasStarted(activeJob) && !["clear_cart", "cleanup_after_failure"].includes(activeJob.stage)) {
+        const cartCheck = verifyCartQuantities(activeJob);
+        const retryCount = Number(activeJob.cartAfterCheckoutRetryCount || 0);
+        if (shouldRetryVerifiedCartAfterCheckout(activeJob, cartCheck)) {
+          activeJob.cartAfterCheckoutRetryCount = retryCount + 1;
+          activeJob.stage = "cart";
+          activeJob.paused = false;
+          activeJob.pausedStage = null;
+          clearCheckoutStarted(activeJob);
+          await setActiveJob(activeJob, {
+            allowUnpause: true,
+            allowStageRegression: true,
+            reason: "retry_verified_cart_after_checkout_return",
+          });
+          await sendDiagnostic("Amazon Business returned to a verified cart during checkout; retrying checkout once.", {
+            group_key: activeJob.job?.group_key || "",
+            quantities: cartCheck.quantities || {},
+            retry_count: activeJob.cartAfterCheckoutRetryCount,
+          }, "warn");
+          showPanel(
+            "Retrying checkout",
+            "Amazon returned to the cart, but the complete expected order is still present. Retrying checkout once.",
+            null,
+            null,
+          );
+          await handleCart(activeJob);
+          return;
+        }
         const message = `Amazon returned to the cart after checkout had already started for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}. The extension stopped this job as a Chrome error instead of marking it Missing so the next order cannot inherit a stale cart page.`;
         showPanel("Checkout returned to cart", message, null, null);
         await send({

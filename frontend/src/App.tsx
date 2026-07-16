@@ -3753,8 +3753,6 @@ function App() {
     setOrdersSelectAll(false)
     selectedOrderRowsRef.current.set(row.id, row)
     const visibleIds = sortedRows.map((item) => item.id)
-    const sameOrderRows = rowsInSameVisibleOrder(row)
-    const sameOrderIds = sameOrderRows.map((item) => item.id)
     const previousAnchor = ordersSelectionAnchor.current
     setSelected((current) => {
       const anchor = previousAnchor ?? current[current.length - 1] ?? null
@@ -3767,15 +3765,15 @@ function App() {
         const rowStoreId = Number(row.store_id || 0)
         if (rowStoreId && knownStoreIds.length && !knownStoreIds.includes(rowStoreId)) {
           selectedOrderRowsRef.current.clear()
-          sameOrderRows.forEach((item) => selectedOrderRowsRef.current.set(item.id, item))
+          selectedOrderRowsRef.current.set(row.id, row)
           ordersSelectionAnchor.current = row.id
-          return sameOrderIds
+          return [row.id]
         }
       }
       const next = shiftKey
         ? rangeSelection(visibleIds, current, row.id, shouldCheck, true, anchor)
         : shouldCheck
-          ? Array.from(new Set([...current, ...sameOrderIds]))
+          ? Array.from(new Set([...current, row.id]))
           : current.filter((id) => id !== row.id)
       sortedRows.forEach((item) => {
         if (next.includes(item.id)) selectedOrderRowsRef.current.set(item.id, item)
@@ -5117,7 +5115,7 @@ function App() {
                             type="button"
                             role="checkbox"
                             aria-checked={selected.includes(row.id)}
-                            aria-label={`Select order ${row.odoo_order_name}`}
+                            aria-label={`Select line ${row.asin || row.id} from order ${row.odoo_order_name}`}
                             data-checked={selected.includes(row.id) ? "true" : undefined}
                             className={cn(
                               "flex size-4 items-center justify-center rounded border border-input bg-background text-primary-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",

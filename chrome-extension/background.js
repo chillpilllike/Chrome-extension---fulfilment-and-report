@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-07-16-multi-item-cart-v2";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-07-17-no-duplicate-add-v8";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -76,7 +76,10 @@ async function getWindowState(windowId) {
   const state = await getSettings();
   const key = String(windowId || "");
   const windowJob = windowId ? state.activeJobsByWindow?.[key] || null : state.activeJob;
-  const fallbackSubmittedJob = windowId && !windowJob && orderSubmitStarted(state.activeJob)
+  const fallbackSubmittedJob = windowId
+    && !windowJob
+    && Number(state.activeJob?.targetWindowId || 0) === Number(windowId)
+    && orderSubmitStarted(state.activeJob)
     ? state.activeJob
     : null;
   return {
@@ -1716,6 +1719,66 @@ function isAmazonThankYouUrl(url = "") {
   return /^https:\/\/(?:www\.)?amazon\.com\/gp\/buy\/thankyou\/handlers\/display\.html/i.test(String(url || ""));
 }
 
+function amazonOrderIdFromUrl(url = "") {
+  try {
+    const parsed = new URL(String(url || ""));
+    for (const key of ["orderID", "orderId"]) {
+      const value = String(parsed.searchParams.get(key) || "").trim();
+      if (/^\d{3}-\d{7}-\d{7}$/.test(value)) return value;
+    }
+  } catch {
+    // A malformed or partial URL cannot provide a trusted Amazon order ID.
+  }
+  return "";
+}
+
+async function transferSubmittedJobToThankYouWindow(tab = {}) {
+  const windowId = Number(tab.windowId || 0) || null;
+  if (!windowId || !isAmazonThankYouUrl(tab.url || "")) return null;
+  const state = await getSettings();
+  const current = state.activeJobsByWindow?.[String(windowId)] || null;
+  const submittedJobs = [
+    ...Object.values(state.activeJobsByWindow || {}),
+    state.activeJob,
+  ].filter((job, index, jobs) => (
+    job?.job?.group_key
+    && orderSubmitStarted(job)
+    && jobs.findIndex((candidate) => candidate?.job?.group_key === job.job.group_key) === index
+  ));
+  const source = current && orderSubmitStarted(current)
+    ? current
+    : submittedJobs.length === 1
+      ? submittedJobs[0]
+      : null;
+  if (!source?.job?.group_key) return null;
+
+  const orderId = amazonOrderIdFromUrl(tab.url || "");
+  const transferred = {
+    ...source,
+    targetWindowId: windowId,
+    stage: orderId ? "complete_pending" : "find_order_id",
+    paused: false,
+    pausedStage: null,
+    amazonSubmittedAt: source.amazonSubmittedAt || Date.now(),
+    amazonConfirmationUrl: tab.url || source.amazonConfirmationUrl || "",
+    confirmationOrderId: orderId || source.confirmationOrderId || "",
+  };
+  await setWindowJob(windowId, transferred);
+  await diagnosticLog("Attached submitted job to Amazon thank-you window.", {
+    windowId,
+    activeJob: transferred,
+    source: "background",
+    level: "warn",
+    page: { url: tab.url || "", title: tab.title || "", tabId: tab.id || null, windowId },
+    details: {
+      group_key: transferred.job.group_key,
+      confirmation_order_id: orderId,
+      previous_window_id: source.targetWindowId || null,
+    },
+  });
+  return transferred;
+}
+
 async function recoverBlankThankYouTab(tab = {}) {
   const windowId = Number(tab.windowId || 0) || null;
   const { activeJob } = await getWindowState(windowId);
@@ -2523,6 +2586,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!url || !/^https:\/\/(?:www\.)?amazon\.com\//i.test(url)) return;
   (async () => {
     if (isAmazonThankYouUrl(url)) {
+      const transferred = await transferSubmittedJobToThankYouWindow({ ...tab, id: tabId, url });
+      if (transferred) {
+        if (changeInfo.status === "complete" || amazonOrderIdFromUrl(url)) {
+          await injectContentScriptWhenReady(tabId);
+        }
+        return;
+      }
       if (await recoverBlankThankYouTab({ ...tab, id: tabId, url })) return;
     }
     if (changeInfo.status !== "complete") return;
