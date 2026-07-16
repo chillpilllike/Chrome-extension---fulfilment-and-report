@@ -11360,6 +11360,9 @@ def queue_chrome_order_groups_fast(
             if lines:
                 lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines], live_sync=False)
                 blocked += shopify_blocked
+            if lines:
+                lines, odoo_blocked, _odoo_messages = filter_lines_by_live_odoo_status(conn, store_id, [dict(line) for line in lines])
+                blocked += odoo_blocked
             if not lines:
                 return 0, cleared_count, blocked, account, []
             grouped: dict[str, list[dict[str, Any]]] = {}
@@ -11443,6 +11446,9 @@ def queue_chrome_order_groups_fast(
         if lines:
             lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
             blocked += shopify_blocked
+        if lines:
+            lines, odoo_blocked, _odoo_messages = filter_lines_by_live_odoo_status(conn, store_id, [dict(line) for line in lines])
+            blocked += odoo_blocked
         if not lines:
             return 0, cleared_count, blocked, account, []
 
@@ -11962,6 +11968,9 @@ def place_orders(
         if lines:
             lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
             failed += shopify_blocked
+        if lines:
+            lines, odoo_blocked, _odoo_messages = filter_lines_by_live_odoo_status(conn, store_id, [dict(line) for line in lines])
+            failed += odoo_blocked
     inventory_lines: list[dict[str, Any]] = []
     purchase_lines: list[dict[str, Any]] = []
     for line in lines:
@@ -23223,6 +23232,88 @@ def check_odoo_order_not_cancelled(store_id: int, odoo_order_id: int) -> tuple[b
     if invoice_status == "refunded":
         return False, "refunded", f"Odoo order {order.get('name') or odoo_order_id} is refunded."
     return True, invoice_status or state or "open", ""
+
+
+def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any]) -> tuple[list[dict[str, Any]], int, list[str]]:
+    rows = [row_to_dict(line) for line in (lines or [])]
+    order_ids = sorted({
+        int(row.get("odoo_order_id") or 0)
+        for row in rows
+        if int(row.get("odoo_order_id") or 0) > 0
+    })
+    if not rows or not order_ids:
+        return rows, 0, []
+
+    try:
+        store = get_store(store_id)
+        odoo = OdooClient(store)
+        fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status"])
+        live_orders = odoo.read("sale.order", order_ids, fields or ["id", "name", "state", "invoice_status"])
+    except Exception as exc:
+        raise HTTPException(502, f"Could not verify Odoo order status before placing order: {exc}") from exc
+
+    live_by_id = {int(order.get("id") or 0): order for order in live_orders}
+    blocked: dict[int, tuple[str, str]] = {}
+    for order_id in order_ids:
+        order = live_by_id.get(order_id)
+        if not order:
+            blocked[order_id] = ("error", f"Odoo order {order_id} was not found during pre-fulfilment check.")
+            continue
+        order_name = clean_text(order.get("name")) or str(order_id)
+        state = clean_text(order.get("state")).lower()
+        invoice_status = clean_text(order.get("invoice_status")).lower()
+        if state == "cancel":
+            blocked[order_id] = ("cancelled", f"Odoo order {order_name} is cancelled.")
+        elif invoice_status == "refunded":
+            blocked[order_id] = ("refunded", f"Odoo order {order_name} is refunded.")
+
+    if not blocked:
+        return rows, 0, []
+
+    now = utc_now()
+    messages = list(dict.fromkeys(message for _status, message in blocked.values()))
+    for order_id, (status, message) in blocked.items():
+        if status in {"cancelled", "refunded"}:
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET odoo_status_label=?,
+                    last_error=?,
+                    updated_at=?
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND COALESCE(amazon_order_id, '') = ''
+                """,
+                (status, message, now, store_id, order_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET state=CASE WHEN COALESCE(amazon_order_id, '') = '' THEN 'error' ELSE state END,
+                    last_error=?,
+                    updated_at=?
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND COALESCE(amazon_order_id, '') = ''
+                """,
+                (message, now, store_id, order_id),
+            )
+
+    updated_rows = conn.execute(
+        f"""
+        SELECT *
+        FROM order_lines
+        WHERE store_id=?
+          AND odoo_order_id IN ({','.join('?' for _ in blocked)})
+        """,
+        [store_id, *blocked.keys()],
+    ).fetchall()
+    for updated in updated_rows:
+        index_order_line(updated)
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "missing", "back-in-stock"})
+    filtered = [row for row in rows if int(row.get("odoo_order_id") or 0) not in blocked]
+    return filtered, len(blocked), messages
 
 
 def mark_back_in_stock_cancelled(line_id: int, asin: str, status: str, message: str) -> None:

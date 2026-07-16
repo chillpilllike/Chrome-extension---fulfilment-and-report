@@ -3345,7 +3345,7 @@ function App() {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [page, storeId])
+  }, [page, storeId, ordersQuery, orderCondition, orderCountry, sortKey, sortDirection])
 
   useEffect(() => {
     if (page !== "home" || !data || !savedAdminToken()) return
@@ -3670,7 +3670,7 @@ function App() {
       active = false
       window.clearInterval(timer)
     }
-  }, [page, storeId, ordersPage, shopifyStatusForceSync?.status])
+  }, [page, storeId, ordersPage, ordersQuery, orderCondition, orderCountry, sortKey, sortDirection, shopifyStatusForceSync?.status])
   const filteredRows = useMemo(() => {
     if (ordersTransitioning) return []
     return rows
