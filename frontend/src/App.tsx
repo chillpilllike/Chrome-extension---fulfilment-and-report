@@ -4141,15 +4141,16 @@ function App() {
         return <span className="text-xs text-muted-foreground">{formatOrderDateTime(row.pulled_at || row.created_at)}</span>
       case "ordered_at":
         return <span className="text-xs text-muted-foreground">{formatOrderDateTime(row.ordered_at)}</span>
-      case "asin":
-        return row.asin ? (
+      case "asin": {
+        const displayAsin = row.replacement_asin || row.asin
+        return displayAsin ? (
           row.replacement_asin ? (
             <Tooltip>
               <TooltipTrigger
                 className="inline-flex items-center gap-1 rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 font-mono text-xs font-semibold text-amber-900 underline-offset-4 hover:underline"
-                onClick={() => window.open(`https://www.amazon.com/dp/${row.asin}`, "_blank")}
+                onClick={() => window.open(`https://www.amazon.com/dp/${displayAsin}`, "_blank")}
               >
-                {row.asin}
+                {displayAsin}
               </TooltipTrigger>
               <TooltipContent side="top" align="start" className="max-w-sm whitespace-normal leading-relaxed">
                 Original ASIN: {row.original_asin || "unknown"}<br />
@@ -4163,6 +4164,7 @@ function App() {
             </a>
           )
         ) : ""
+      }
       case "spaid":
         return (
           <button
