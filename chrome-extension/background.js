@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-07-16-multi-item-cart-v1";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-07-16-multi-item-cart-v2";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -87,7 +87,7 @@ async function getWindowState(windowId) {
   };
 }
 
-async function setWindowJob(windowId, activeJob) {
+async function setWindowJob(windowId, activeJob, options = {}) {
   if (activeJob && await forceStopActive()) return;
   const state = await getSettings();
   const { activeJobsByWindow } = state;
@@ -95,6 +95,33 @@ async function setWindowJob(windowId, activeJob) {
   const key = String(windowId || "");
   const current = windowId ? next[key] || null : state.activeJob || null;
   const sameGroup = current?.job?.group_key && activeJob?.job?.group_key === current.job.group_key;
+  if (sameGroup && options.allowItemRemoval !== true) {
+    const currentItems = Array.isArray(current?.job?.items) ? current.job.items : [];
+    const incomingItems = Array.isArray(activeJob?.job?.items) ? activeJob.job.items : [];
+    if (currentItems.length > incomingItems.length) {
+      await diagnosticLog(
+        `Prevented active job ${activeJob.job.group_key} from shrinking from ${currentItems.length} items to ${incomingItems.length}.`,
+        {
+          windowId,
+          activeJob: current,
+          level: "warn",
+          details: {
+            current_asins: currentItems.map((item) => item?.asin || ""),
+            incoming_asins: incomingItems.map((item) => item?.asin || ""),
+            reason: options.reason || "",
+          },
+        },
+      );
+      activeJob = {
+        ...activeJob,
+        job: {
+          ...activeJob.job,
+          items: currentItems,
+          line_ids: current.job.line_ids || activeJob.job.line_ids || [],
+        },
+      };
+    }
+  }
   if (sameGroup && orderSubmitStarted(current) && !orderSubmitStarted(activeJob)) {
     return;
   }
@@ -1876,9 +1903,18 @@ async function releaseAllStoredJobs(label = "from the previous Chrome session") 
 
 async function heartbeatJob(activeJob, windowId) {
   if (!activeJob?.job?.group_key || !activeJob?.workerId) return;
+  const items = Array.isArray(activeJob.job.items) ? activeJob.job.items : [];
   await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/heartbeat`, {
     method: "POST",
-    body: JSON.stringify({ worker_id: activeJob.workerId }),
+    body: JSON.stringify({
+      worker_id: activeJob.workerId,
+      stage: activeJob.stage || "",
+      item_index: Number(activeJob.itemIndex || 0),
+      item_count: items.length,
+      asins: items.map((item) => item?.asin || "").filter(Boolean),
+      target_window_id: windowId || activeJob.targetWindowId || null,
+      extension_build: EXPECTED_CONTENT_SCRIPT_BUILD,
+    }),
   });
   activeJob.lastHeartbeatAt = Date.now();
   await setWindowJob(windowId, activeJob);
@@ -2704,7 +2740,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           );
         }
       }
-      await setWindowJob(windowId, incomingJob);
+      await setWindowJob(windowId, incomingJob, {
+        allowItemRemoval: message.reason === "partial_missing_line_removed",
+        reason: message.reason || "",
+      });
       return { ok: true };
     }
     if (message.type === "DIAG_LOG") {

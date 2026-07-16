@@ -27022,6 +27022,21 @@ def api_chrome_job_heartbeat(group_key: str, payload: ChromeJobHeartbeatPayload)
     if not worker_id:
         raise HTTPException(400, "worker_id is required")
     expiry = chrome_job_lease_expiry()
+    diagnostic = {
+        "event": "chrome_job_heartbeat",
+        "at": utc_now(),
+        "worker_id": worker_id,
+        "stage": clean_text(payload.stage),
+        "item_index": max(0, int(payload.item_index or 0)),
+        "item_count": max(0, int(payload.item_count or 0)),
+        "asins": [
+            asin
+            for asin in (normalize_asin(value) for value in (payload.asins or []))
+            if asin
+        ],
+        "target_window_id": payload.target_window_id,
+        "extension_build": clean_text(payload.extension_build),
+    }
     with db() as conn:
         cursor = conn.execute(
             """
@@ -27034,6 +27049,14 @@ def api_chrome_job_heartbeat(group_key: str, payload: ChromeJobHeartbeatPayload)
               AND chrome_claimed_by=?
             """,
             (expiry, utc_now(), group_key, worker_id),
+        )
+        conn.execute(
+            """
+            UPDATE amazon_attempts
+            SET response_json=?
+            WHERE external_id=? AND mode='chrome'
+            """,
+            (json.dumps(diagnostic), group_key),
         )
     if not cursor.rowcount:
         raise HTTPException(409, "Chrome job lock is no longer owned by this worker.")

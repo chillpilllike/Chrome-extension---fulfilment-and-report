@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-07-16-multi-item-cart-v1";
+const CONTENT_SCRIPT_BUILD = "2026-07-16-multi-item-cart-v2";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -293,6 +293,23 @@ async function setActiveJob(activeJob, options = {}) {
       return { ok: false, stale: true };
     }
     if (latest?.job?.group_key === activeJob.job.group_key) {
+      const latestItems = Array.isArray(latest?.job?.items) ? latest.job.items : [];
+      const incomingItems = Array.isArray(activeJob?.job?.items) ? activeJob.job.items : [];
+      if (latestItems.length > incomingItems.length && options.allowItemRemoval !== true) {
+        const preservedJob = {
+          ...activeJob.job,
+          items: latestItems,
+          line_ids: latest.job.line_ids || activeJob.job.line_ids || [],
+        };
+        activeJob.job = preservedJob;
+        next = { ...next, job: preservedJob };
+        await sendDiagnostic("Prevented the content page from shrinking a multi-item active job.", {
+          group_key: activeJob.job.group_key,
+          latest_asins: latestItems.map((item) => item?.asin || ""),
+          incoming_asins: incomingItems.map((item) => item?.asin || ""),
+          reason: options.reason || "",
+        }, "warn");
+      }
       const latestIndex = Number(latest.itemIndex || 0);
       const nextIndex = Number(activeJob.itemIndex || 0);
       const latestProgress = stageProgress(latest.stage);
@@ -1325,11 +1342,13 @@ function checkoutSummaryUnitCount() {
 
 async function ensureCheckoutOnlyExpectedUnits(activeJob) {
   const expected = expectedCheckoutUnitCount(activeJob);
-  const groups = checkoutLineItemGroups(document);
   const actual = checkoutSummaryUnitCount();
-  if (!expected || !Number.isFinite(actual) || actual <= expected) return true;
+  if (!expected || (Number.isFinite(actual) && actual === expected)) return true;
   const expectedAsins = Object.keys(expectedCartQuantities(activeJob) || {}).join(", ");
-  const message = `Amazon checkout shows ${actual} item unit(s), but this queued job only expects ${expected}${expectedAsins ? ` (${expectedAsins})` : ""}. The order was stopped before Place Order so the dispatch quantity is not over-ordered.`;
+  const actualLabel = Number.isFinite(actual)
+    ? `${actual < expected ? "only " : ""}${actual} item unit(s)`
+    : "an unreadable item count";
+  const message = `Amazon checkout shows ${actualLabel}, but this queued job expects exactly ${expected}${expectedAsins ? ` (${expectedAsins})` : ""}. The order was stopped before Place Order because the checkout contents could not be verified against the complete queued order.`;
   showPanel("Checkout quantity mismatch", message, null, null);
   await send({
     type: "FAIL_JOB",
@@ -1339,7 +1358,7 @@ async function ensureCheckoutOnlyExpectedUnits(activeJob) {
     failureCode: "cart_quantity_mismatch",
     requestedQuantity: expected,
     fulfilledQuantity: actual,
-    availableQuantity: actual,
+    availableQuantity: Number.isFinite(actual) && actual < expected ? actual : null,
   });
   return false;
 }
@@ -1965,19 +1984,19 @@ async function continueAfterPartialMissing(activeJob, item, purchaseItem, messag
     activeJob.cleanupAfterFailure = true;
     activeJob.cleanupReason = message || "Order was moved to Missing ASINs. Cleaning cart before continuing.";
     activeJob.paused = false;
-    await setActiveJob(activeJob);
+    await setActiveJob(activeJob, { allowItemRemoval: true, reason: "partial_missing_line_removed" });
     showPanel("Missing ASINs", `${message} ${result.message || "Order moved to Missing ASINs."}`, null, null);
     location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
     return true;
   }
   if (activeJob.itemIndex < remainingItems.length) {
     activeJob.stage = "product";
-    await setActiveJob(activeJob);
+    await setActiveJob(activeJob, { allowItemRemoval: true, reason: "partial_missing_line_removed" });
     showPanel("Split fulfilment", `${message} ${result.message || ""} Continuing with remaining Amazon item(s).`, null, null);
     location.href = `https://www.amazon.com/dp/${remainingItems[activeJob.itemIndex].asin}`;
   } else {
     activeJob.stage = "cart";
-    await setActiveJob(activeJob);
+    await setActiveJob(activeJob, { allowItemRemoval: true, reason: "partial_missing_line_removed" });
     showPanel("Split fulfilment", `${message} ${result.message || ""} Proceeding to checkout for remaining Amazon item(s).`, null, null);
     location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
   }

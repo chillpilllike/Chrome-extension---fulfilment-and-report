@@ -183,6 +183,12 @@ class ManualFulfilmentPayload(BaseModel):
 
 class ChromeJobHeartbeatPayload(BaseModel):
     worker_id: str = ""
+    stage: str = ""
+    item_index: int = 0
+    item_count: int = 0
+    asins: list[str] = []
+    target_window_id: Optional[int] = None
+    extension_build: str = ""
 
 
 class ChromeJobResetPayload(BaseModel):
