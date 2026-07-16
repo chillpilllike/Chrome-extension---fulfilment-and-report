@@ -1406,6 +1406,7 @@ function checkoutLimitPurchaseIssue(activeJob) {
 
 function cartDeleteButtons() {
   const activeCart = document.querySelector("#sc-active-cart");
+  if (!activeCart || !visible(activeCart)) return [];
   const deleteSelector = [
     "input[data-action*='delete' i]",
     "button[data-action*='delete' i]",
@@ -1432,15 +1433,6 @@ function cartDeleteButtons() {
     ].filter(Boolean).join(" "));
     return /\bdelete\b/i.test(label) && !/save for later|saved for later|share/i.test(label);
   };
-  const activeItems = cartActiveItems();
-  const buttons = activeItems
-    .flatMap((item) => [...item.querySelectorAll(deleteSelector)].filter(isDeleteControl));
-  if (buttons.length) return [...new Set(buttons)];
-  if (!activeCart || !visible(activeCart)) {
-    return [
-      ...document.querySelectorAll(deleteSelector),
-    ].filter((button) => isDeleteControl(button) && button.closest?.("[data-name='Active Items'], [aria-label='Shopping Cart'], [data-itemtype='active'], .sc-list-item"));
-  }
   return [
     ...activeCart.querySelectorAll(deleteSelector),
   ].filter(isDeleteControl);
@@ -1498,31 +1490,10 @@ function cartItemQuantity(item) {
 
 function cartActiveItems() {
   const activeCart = document.querySelector("#sc-active-cart");
-  const activeRoots = [
-    activeCart,
-    document.querySelector("[data-name='Active Items']"),
-    document.querySelector("[aria-label='Shopping Cart']"),
-  ].filter((root) => root && visible(root));
-  const candidates = [];
-  for (const root of activeRoots) {
-    candidates.push(...root.querySelectorAll("[data-itemtype='active'], .sc-list-item, [data-name='Active Items'] [role='listitem']"));
-  }
-
-  // Amazon's newer cart can omit #sc-active-cart. In that layout, active cart
-  // rows are still anchored by visible Delete buttons and quantity controls.
-  for (const control of document.querySelectorAll("button[aria-label*='Delete' i], input[aria-label*='Delete' i], button[title*='Delete' i], input[value*='Delete' i], button[value*='Delete' i], button[data-action*='delete' i], input[data-action*='delete' i], button[name*='delete' i], input[name*='delete' i]")) {
-    if (!visible(control)) continue;
-    let node = control;
-    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
-      const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ");
-      const hasProductLink = Boolean(node.querySelector?.("a[href*='/dp/'], a[href*='/gp/product/']"));
-      const hasQuantityControl = Boolean(node.querySelector?.("select[name='quantity'], input[name='quantity'], button[aria-label*='quantity' i], [data-a-selector='inner-value']"));
-      if (hasProductLink && (hasQuantityControl || /in stock|size:/i.test(text))) {
-        candidates.push(node);
-        break;
-      }
-    }
-  }
+  if (!activeCart || !visible(activeCart)) return [];
+  const candidates = [
+    ...activeCart.querySelectorAll("[data-itemtype='active'], .sc-list-item, [data-name='Active Items'] [role='listitem']"),
+  ];
 
   const seen = new Set();
   const filtered = candidates
