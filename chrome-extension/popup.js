@@ -1,6 +1,7 @@
 const apiBase = document.querySelector("#apiBase");
 const adminToken = document.querySelector("#adminToken");
 const cardLast4Preference = document.querySelector("#cardLast4Preference");
+const deliveryLimitDays = document.querySelector("#deliveryLimitDays");
 const editExistingAddress = document.querySelector("#editExistingAddress");
 const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAsin");
 const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
@@ -50,6 +51,7 @@ function hydrateSettingsValues(settings = {}) {
   apiBase.value = settings.apiBase || "http://127.0.0.1:8000";
   adminToken.value = settings.adminToken || "";
   cardLast4Preference.value = settings.cardLast4Preference || "";
+  deliveryLimitDays.value = String(Math.min(30, Math.max(1, Math.floor(Number(settings.deliveryLimitDays) || 5))));
   editExistingAddress.checked = settings.editExistingAddress !== false;
   fulfilAvailableMixedAsin.checked = settings.fulfilAvailableMixedAsin === true;
   splitMixedAsinOrders.checked = settings.splitMixedAsinOrders !== false;
@@ -63,6 +65,7 @@ function hasSettingsPayload(state) {
     Object.hasOwn(state, "apiBase") ||
     Object.hasOwn(state, "adminToken") ||
     Object.hasOwn(state, "cardLast4Preference") ||
+    Object.hasOwn(state, "deliveryLimitDays") ||
     Object.hasOwn(state, "editExistingAddress") ||
     Object.hasOwn(state, "fulfilAvailableMixedAsin") ||
     Object.hasOwn(state, "splitMixedAsinOrders") ||
@@ -77,13 +80,14 @@ function loadSavedSettings() {
       apiBase: "http://127.0.0.1:8000",
       adminToken: "",
       cardLast4Preference: "",
+      deliveryLimitDays: 5,
       editExistingAddress: true,
       fulfilAvailableMixedAsin: false,
       splitMixedAsinOrders: true,
       browserlessOrderMode: false,
       pauseBeforePlaceOrder: false,
     }, (settings) => {
-      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].includes(document.activeElement)) {
+      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].includes(document.activeElement)) {
         hydrateSettingsValues(settings);
         settingsHydrated = true;
       }
@@ -108,7 +112,7 @@ function registerControlWindow() {
   });
 }
 
-[apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].forEach((input) => {
+[apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].forEach((input) => {
   input.addEventListener("input", () => {
     settingsDirty = true;
   });
@@ -131,7 +135,7 @@ function updateModeNotice() {
 browserlessOrderMode.addEventListener("change", updateModeNotice);
 
 function syncSettingsInputs(state) {
-  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].includes(document.activeElement)) return;
+  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder].includes(document.activeElement)) return;
   hydrateSettingsValues(state);
   settingsHydrated = true;
 }
@@ -141,6 +145,7 @@ function settingsPayload() {
     apiBase: apiBase.value.trim(),
     adminToken: adminToken.value.trim(),
     cardLast4Preference: cardLast4Preference.value.trim(),
+    deliveryLimitDays: Math.min(30, Math.max(1, Math.floor(Number(deliveryLimitDays.value) || 5))),
     editExistingAddress: editExistingAddress.checked,
     fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked,
     splitMixedAsinOrders: splitMixedAsinOrders.checked,

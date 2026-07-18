@@ -654,6 +654,14 @@
     background: #ffe4e6;
 }
 
+.tabler-admin-shell tr.order-row-costly > * {
+    background: #f3e8ff;
+}
+
+.tabler-admin-shell tr.order-row-costly:hover > * {
+    background: #ead7ff;
+}
+
 .tabler-admin-shell tr.order-row-cancelled-refunded > *,
 .tabler-admin-shell tr.order-row-cancelled-refunded:hover > * {
     background: #7f1d1d;

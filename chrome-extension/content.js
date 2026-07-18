@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-07-17-no-duplicate-add-v8";
+const CONTENT_SCRIPT_BUILD = "2026-07-18-history-report-guard-v19";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -70,6 +70,12 @@ const IDLE_ACTIVE_JOB_POLL_MS = 30000;
 
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
+const DEFAULT_DELIVERY_LIMIT_DAYS = 5;
+
+function normalizedDeliveryLimitDays(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.min(parsed, 30) : DEFAULT_DELIVERY_LIMIT_DAYS;
+}
 
 function normalizeContentApiBase(value) {
   return String(value || DEFAULT_API_BASE).trim().replace(/\/+$/, "") || DEFAULT_API_BASE;
@@ -498,6 +504,59 @@ function showPanel(title, message, actionText, action) {
     button.addEventListener("click", action);
     panel.append(button);
   }
+}
+
+async function waitForCostlyLossOverride(activeJob, item, purchaseItem, storeTotal, amazonTotal) {
+  const costlyLineId = itemPrimaryLineId(item);
+  const overrideKey = String(costlyLineId || item?.asin || purchaseItem?.asin || "").toUpperCase();
+  const existingOverrides = Array.isArray(activeJob?.costlyLossOverrides) ? activeJob.costlyLossOverrides : [];
+  if (overrideKey && existingOverrides.includes(overrideKey)) return true;
+
+  const waitSeconds = 10;
+  const deadline = Date.now() + waitSeconds * 1000;
+  let settled = false;
+  let timer = null;
+  return new Promise((resolve) => {
+    const finish = (approved) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearInterval(timer);
+      resolve(approved);
+    };
+    const approveLoss = async () => {
+      if (settled) return;
+      const latest = await getActiveJob();
+      const next = latest?.job?.group_key === activeJob?.job?.group_key ? latest : activeJob;
+      next.costlyLossOverrides = Array.from(new Set([
+        ...(Array.isArray(next.costlyLossOverrides) ? next.costlyLossOverrides : []),
+        overrideKey,
+      ].filter(Boolean)));
+      activeJob.costlyLossOverrides = next.costlyLossOverrides;
+      await setActiveJob(next, { reason: "costly_loss_force_approved" });
+      showPanel(
+        "Loss fulfilment approved",
+        `Continuing ${purchaseItem.asin} at Amazon cost $${amazonTotal.toFixed(2)} against store sale value $${storeTotal.toFixed(2)}.`,
+        null,
+        null,
+      );
+      finish(true);
+    };
+    showPanel(
+      "Costly fulfilment detected",
+      `Amazon cost is $${amazonTotal.toFixed(2)} but store sale value is $${storeTotal.toFixed(2)}. You have 10 seconds to force fulfil this order in loss; otherwise it moves to Costly and the next order starts automatically.`,
+      "Force fulfil this order in loss (10s)",
+      approveLoss,
+    );
+    timer = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      const button = document.querySelector("#nutricity-panel .nutricity-panel-action");
+      if (button) button.textContent = `Force fulfil this order in loss (${remaining}s)`;
+      if (remaining <= 0) {
+        button?.remove();
+        finish(false);
+      }
+    }, 250);
+  });
 }
 
 function togglePanelMinimized(event) {
@@ -1518,6 +1577,8 @@ function cartLooksEmpty() {
 }
 
 function cartItemQuantity(item) {
+  const itemQuantity = Number(String(item?.getAttribute?.("data-quantity") || "").replace(/[^\d.]/g, ""));
+  if (Number.isFinite(itemQuantity) && itemQuantity > 0) return itemQuantity;
   const stepperValue = [
     "[data-a-selector='inner-value']",
     "[data-a-selector='value'] [data-a-selector='inner-value']",
@@ -1956,7 +2017,60 @@ function availabilityPrice() {
   return 0;
 }
 
-function checkAsinAvailability(asin = "") {
+function parseAmazonDeliveryPromise(text = "", limitDays = DEFAULT_DELIVERY_LIMIT_DAYS) {
+  const normalized = normalizedText(text);
+  if (!normalized) return { text: "", earliest: null, latest: null, daysFromToday: null, late: false };
+  const monthPattern = "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?";
+  const matches = [...normalized.matchAll(new RegExp(`\\b(${monthPattern})\\.?\\s+(\\d{1,2})(?:,\\s*(\\d{4}))?`, "gi"))];
+  const today = new Date();
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const dates = matches.map((match) => {
+    const year = Number(match[3] || today.getFullYear());
+    const month = new Date(`${match[1]} 1, ${year}`).getMonth();
+    const date = new Date(year, month, Number(match[2]));
+    if (!match[3] && date < new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1)) date.setFullYear(date.getFullYear() + 1);
+    return date;
+  }).filter((date) => Number.isFinite(date.getTime()));
+  if (!dates.length) {
+    const lower = normalized.toLowerCase();
+    if (/arriving\s+today|deliver(?:y|ing)?\s+today/.test(lower)) {
+      return { text: normalized, earliest: startOfToday, latest: startOfToday, daysFromToday: 0, late: false };
+    }
+    if (/arriving\s+tomorrow|deliver(?:y|ing)?\s+tomorrow/.test(lower)) {
+      const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+      return { text: normalized, earliest: tomorrow, latest: tomorrow, daysFromToday: 1, late: false };
+    }
+    return { text: normalized, earliest: null, latest: null, daysFromToday: null, late: false };
+  }
+  const earliest = new Date(Math.min(...dates.map((date) => date.getTime())));
+  const latest = new Date(Math.max(...dates.map((date) => date.getTime())));
+  const daysFromToday = Math.ceil((earliest.getTime() - startOfToday.getTime()) / 86400000);
+  return {
+    text: normalized,
+    earliest,
+    latest,
+    daysFromToday,
+    late: daysFromToday > normalizedDeliveryLimitDays(limitDays),
+  };
+}
+
+function productDeliveryPromiseText() {
+  const deliveryTime = [...document.querySelectorAll("#deliveryBlockMessage [data-csa-c-delivery-time], #mir-layout-DELIVERY_BLOCK [data-csa-c-delivery-time]")]
+    .filter((element) => visible(element))
+    .map((element) => normalizedText(element.getAttribute("data-csa-c-delivery-time") || ""))
+    .find(Boolean);
+  if (deliveryTime) return deliveryTime;
+  return [...document.querySelectorAll("#deliveryBlockMessage, #mir-layout-DELIVERY_BLOCK, #delivery-message, #ddmDeliveryMessage")]
+    .filter((element) => visible(element))
+    .map((element) => normalizedText(element.textContent || ""))
+    .find((text) => text && /deliver|arriv/i.test(text)) || "";
+}
+
+function productDeliveryPromise(limitDays = DEFAULT_DELIVERY_LIMIT_DAYS) {
+  return parseAmazonDeliveryPromise(productDeliveryPromiseText(), limitDays);
+}
+
+function checkAsinAvailability(asin = "", deliveryLimitDays = DEFAULT_DELIVERY_LIMIT_DAYS) {
   const pageAsin = currentAsinFromUrl();
   const unavailable = unavailableMessage();
   const addToCart = [...document.querySelectorAll("#add-to-cart-button, input#add-to-cart-button, #submit.add-to-cart")].find((node) => visible(node) && !node.disabled);
@@ -1967,16 +2081,23 @@ function checkAsinAvailability(asin = "") {
   const bodyText = (document.body?.innerText || "").toLowerCase();
   const blockedText = /currently unavailable|temporarily out of stock|see all buying options|not available to business prime|isn't available to business prime|we don't know when or if this item will be back in stock|we do not know when or if this item will be back in stock/i.test(bodyText);
   const directlyOrderable = Boolean(addToCart || buyNow);
-  const inStock = Boolean(!unavailable && !blockedText && directlyOrderable);
+  const deliveryPromise = productDeliveryPromise(deliveryLimitDays);
+  const inStock = Boolean(!unavailable && !blockedText && directlyOrderable && !deliveryPromise.late);
   const notDirectlyOrderableMessage = /in stock/i.test(`${availabilityText} ${bodyText}`)
     ? "Amazon shows this ASIN as in stock, but no direct Add to cart or Buy Now control is available for this Business account."
     : "Amazon did not show this ASIN as directly available.";
+  const deliveryMessage = deliveryPromise.late
+    ? `Amazon's earliest estimated delivery is ${deliveryPromise.daysFromToday} days away (${deliveryPromise.text}), beyond the ${normalizedDeliveryLimitDays(deliveryLimitDays)}-day limit.`
+    : "";
   return {
     ok: true,
     asin: pageAsin || String(asin || "").trim().toUpperCase(),
     in_stock: inStock,
-    message: inStock ? (availabilityText || "Amazon product controls are available.") : (unavailable || availabilityText || notDirectlyOrderableMessage),
+    message: inStock ? (availabilityText || "Amazon product controls are available.") : (deliveryMessage || unavailable || availabilityText || notDirectlyOrderableMessage),
     price: availabilityPrice(),
+    delivery_text: deliveryPromise.text,
+    delivery_days: deliveryPromise.daysFromToday,
+    delivery_limit_days: normalizedDeliveryLimitDays(deliveryLimitDays),
     url: location.href,
   };
 }
@@ -3196,6 +3317,20 @@ async function handleProduct(activeJob) {
     return;
   }
 
+  const extensionState = await getExtensionState();
+  const deliveryLimitDays = normalizedDeliveryLimitDays(extensionState.deliveryLimitDays);
+  const deliveryPromise = productDeliveryPromise(deliveryLimitDays);
+  if (deliveryPromise.late) {
+    await failCurrentItemAsMissing(
+      activeJob,
+      item,
+      expectedItem,
+      `ASIN ${expectedItem.asin} is marked Missing because Amazon's earliest estimated delivery is ${deliveryPromise.daysFromToday} days away (${deliveryPromise.text}), beyond the ${deliveryLimitDays}-day limit.`,
+      "late_delivery",
+    );
+    return;
+  }
+
   const savingsApplied = await applyAdditionalSavings("regular");
   if (savingsApplied) {
     await waitForStableDom(900, 6000);
@@ -3228,16 +3363,21 @@ async function handleProduct(activeJob) {
   const storeTotal = Number(item.store_total_price || Number(item.store_unit_price || 0) * Number(item.quantity || 1) || 0);
   const amazonTotal = Number(priceForDecision || 0) * quantity;
   if (!item.cost_approved && storeTotal > 0 && amazonTotal > storeTotal) {
-    await send({
-      type: "COSTLY_JOB",
-      message: `ASIN ${purchaseItem.asin} costs $${amazonTotal.toFixed(2)} on Amazon but store sale value is $${storeTotal.toFixed(2)}. Approval required before fulfilment.`,
-      costlyAsin: item.asin,
-      costlyLineId: itemPrimaryLineId(item),
-      storeTotalPrice: storeTotal,
-      amazonTotalPrice: amazonTotal,
-    });
-    showPanel("Costly fulfilment review", "Amazon cost is higher than store sale value. Order moved to Costly page.", null, null);
-    return;
+    const forceApproved = await waitForCostlyLossOverride(activeJob, item, purchaseItem, storeTotal, amazonTotal);
+    if (forceApproved) {
+      showPanel("Loss fulfilment approved", `Continuing ASIN ${purchaseItem.asin} after manual loss approval.`, null, null);
+    } else {
+      await send({
+        type: "COSTLY_JOB",
+        message: `ASIN ${purchaseItem.asin} costs $${amazonTotal.toFixed(2)} on Amazon but store sale value is $${storeTotal.toFixed(2)}. Approval required before fulfilment.`,
+        costlyAsin: item.asin,
+        costlyLineId: itemPrimaryLineId(item),
+        storeTotalPrice: storeTotal,
+        amazonTotalPrice: amazonTotal,
+      });
+      showPanel("Costly fulfilment review", "No loss approval was selected within 10 seconds. Order moved to Costly and the next queued order is starting.", null, null);
+      return;
+    }
   }
 
   if (mixedAsinAfterVariant && snsIsCheaper) {
@@ -3389,6 +3529,9 @@ async function handleCart(activeJob) {
     const purchaseItem = selectedVariantItem(activeJob, currentItem);
     const expectedAsin = String(purchaseItem?.asin || currentItem?.asin || "").toUpperCase();
     const expectedQuantity = Math.max(1, Math.round(Number(purchaseItem?.quantity || currentItem?.quantity || 1)));
+    await waitUntil(() => (
+      cartQuantityForAsin(expectedAsin) > 0 || cartIsVisiblyEmpty()
+    ), 12000, 300);
     const actualQuantity = cartQuantityForAsin(expectedAsin);
     if (actualQuantity < expectedQuantity) {
       const retryKey = `verify:${Number(activeJob.itemIndex || 0)}:${expectedAsin}`;
@@ -3951,12 +4094,28 @@ function currentCheckoutDeliveryText() {
 }
 
 function checkoutShowsWarehouseAddress() {
-  const bodyDeliveryMatch = (document.body?.innerText || document.body?.textContent || "")
-    .replace(/\s+/g, " ")
-    .match(/\bDelivering\s+to\s+.{0,240}/i);
-  const text = normalizedText([currentCheckoutDeliveryText(), bodyDeliveryMatch?.[0] || ""].join(" "));
+  const bodyText = (document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ");
+  const deliveryStart = bodyText.search(/\bDelivering\s+to\b/i);
+  // Amazon's Business checkout varies its delivery-card markup.  Read a
+  // bounded section after the visible "Delivering to" heading rather than
+  // relying on one particular link or address-card structure.
+  const bodyDeliveryText = deliveryStart >= 0 ? bodyText.slice(deliveryStart, deliveryStart + 600) : "";
+  const text = normalizedText([currentCheckoutDeliveryText(), bodyDeliveryText].join(" "));
   const tokens = warehouseAddressTokens();
   return tokens.some((token) => text.includes(token));
+}
+
+function checkoutPageShowsExpectedDelivery(name) {
+  const wanted = normalizedText(name);
+  if (!wanted) return false;
+  const bodyText = (document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ");
+  const deliveryStart = bodyText.search(/\bDelivering\s+to\b/i);
+  if (deliveryStart < 0) return false;
+  const deliveryText = normalizedText(bodyText.slice(deliveryStart, deliveryStart + 600));
+  if (!deliveryText.includes(wanted)) return false;
+  const visibleHeading = normalizedText(document.querySelector("#deliver-to-customer-text")?.textContent || "");
+  if (visibleHeading && !visibleHeading.includes(wanted)) return false;
+  return warehouseAddressTokens().some((token) => deliveryText.includes(token));
 }
 
 function checkoutDeliveryRecipientText() {
@@ -3999,6 +4158,7 @@ function checkoutDeliveryRecipientMatches(name) {
 }
 
 function checkoutRecipientConfirmed(name) {
+  if (checkoutPageShowsExpectedDelivery(name)) return true;
   if ((checkoutDeliveryRecipientMatches(name) && checkoutShowsWarehouseAddress()) || checkoutShowsRecipient(name)) return true;
   const wanted = normalizedText(name);
   if (!wanted) return false;
@@ -4645,9 +4805,146 @@ function findPlaceOrderButton() {
   });
 }
 
-const CHECKOUT_DELIVERY_LIMIT_DAYS = 4;
+function isOnePercentDeliveryRewardText(value = "") {
+  const text = normalizedText(value);
+  if (!text.includes("1%")) return false;
+  const rewardWording = /\b(?:back|reward|rewards|discount|saving|savings|earn|earns|earning|additional|extra)\b/i.test(text);
+  const deliveryWording = /\b(?:arriv|delivery|deliver|shipping|shipment|amazon day|nominated day)\w*/i.test(text);
+  return rewardWording && deliveryWording;
+}
+
+function deliveryRadioContext(radio) {
+  if (!radio) return { radio: null, control: null, container: null, text: "", optionCount: 0 };
+  const explicitLabel = radio.id
+    ? document.querySelector(`label[for='${CSS.escape(radio.id)}']`)
+    : null;
+  const labelledElements = String(radio.getAttribute("aria-labelledby") || "")
+    .split(/\s+/)
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+  const closestLabel = radio.closest("label");
+  const controlRow = radio.closest(".rcx-checkout-delivery-option-a-control-row, .a-radio, label");
+  const matchedContainer = explicitLabel || closestLabel || controlRow || radio.parentElement;
+  const localParts = [...new Set([
+    ...labelledElements,
+    explicitLabel,
+    closestLabel,
+    controlRow,
+    matchedContainer,
+  ].filter(Boolean))];
+  const text = normalizedText(localParts.map((element) => element.innerText || element.textContent || "").join(" "));
+  const localLabel = matchedContainer?.querySelector?.(".a-radio-label, label");
+  const control = explicitLabel || closestLabel || localLabel || controlRow || radio;
+  const sameGroup = radio.name
+    ? [...document.querySelectorAll("input[type='radio']")].filter((candidate) => candidate.name === radio.name && !candidate.disabled)
+    : [...(matchedContainer?.parentElement?.querySelectorAll?.("input[type='radio']") || [])].filter((candidate) => !candidate.disabled);
+  return {
+    radio,
+    control,
+    container: matchedContainer,
+    text,
+    optionCount: Math.max(1, sameGroup.length),
+  };
+}
+
+function checkoutOffersOnePercentDeliveryReward() {
+  const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
+  return /(?:earn|earning|get|receive|additional|extra)[^.]{0,160}1%[^.]{0,160}(?:back|reward|rewards)/i.test(text)
+    || /1%[^.]{0,160}(?:back|reward|rewards)[^.]{0,160}(?:delivery|shipping|shipment|amazon day)/i.test(text);
+}
+
+function radioLinkedToDeliveryReference(node) {
+  const referenceId = String(node?.id || "").trim();
+  if (!referenceId) return null;
+  return [...document.querySelectorAll("input[type='radio']")].find((radio) => (
+    !radio.disabled && String(radio.getAttribute("aria-labelledby") || "").split(/\s+/).includes(referenceId)
+  )) || null;
+}
+
+function isAmazonDayDeliveryContext(context) {
+  const radioId = String(context?.radio?.id || "").toLowerCase();
+  const labelledBy = String(context?.radio?.getAttribute?.("aria-labelledby") || "").toLowerCase();
+  const text = normalizedText(context?.text || "").toLowerCase();
+  return /amazon day|nominated day/.test(text) || /nominated-day|amazon-day/.test(`${radioId} ${labelledBy}`);
+}
+
+function fridayRewardDeliveryOption() {
+  const radios = [...document.querySelectorAll("input[type='radio']")].filter((radio) => !radio.disabled);
+  for (const radio of radios) {
+    const context = deliveryRadioContext(radio);
+    if (isOnePercentDeliveryRewardText(context.text)) return context;
+  }
+
+  if (!checkoutOffersOnePercentDeliveryReward()) return null;
+  const knownRewardNodes = [
+    document.querySelector("#second-nominated-dayPromiseReferenceForRadioLabel"),
+    document.querySelector("#second-nominated-dayReferenceForRadioLabel"),
+    ...document.querySelectorAll("[id*='nominated-day' i], .delivery-promise-text, .delivery-option-text"),
+  ].filter(Boolean);
+  for (const node of knownRewardNodes) {
+    const radio = radioLinkedToDeliveryReference(node);
+    if (radio) return deliveryRadioContext(radio);
+  }
+  for (const radio of radios) {
+    const context = deliveryRadioContext(radio);
+    if (isAmazonDayDeliveryContext(context)) return context;
+  }
+  return null;
+}
+
+function fridayRewardDeliverySelected() {
+  const selectedRadio = [...document.querySelectorAll("input[type='radio']:checked")][0] || null;
+  if (!selectedRadio) return false;
+  const context = deliveryRadioContext(selectedRadio);
+  return isOnePercentDeliveryRewardText(context.text)
+    || checkoutOffersOnePercentDeliveryReward() && isAmazonDayDeliveryContext(context);
+}
+
+async function ensureFridayRewardDelivery(activeJob) {
+  if (new Date().getDay() !== 5) return true;
+  if (fridayRewardDeliverySelected()) return true;
+
+  const rewardOption = fridayRewardDeliveryOption();
+  if (!rewardOption) return true;
+  if (!rewardOption.control) {
+    await pauseForManualCheckout(
+      activeJob,
+      "Amazon offers a Friday delivery option with an extra 1% reward, but its radio control could not be selected safely.",
+      "checkout",
+    );
+    return false;
+  }
+
+  showPanel(
+    "Friday 1% delivery reward",
+    `Selecting the rewarded delivery option from ${rewardOption.optionCount} available option(s): ${rewardOption.text}`,
+    null,
+    null,
+  );
+  await sendDiagnostic("Selecting Friday delivery option with 1% reward.", {
+    option_count: rewardOption.optionCount,
+    option_text: rewardOption.text,
+  });
+  await clickElement(rewardOption.control, "Friday delivery option with 1% reward");
+  const selected = await waitUntil(fridayRewardDeliverySelected, 12000, 300);
+  if (!selected) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Amazon offered a delivery option with an extra 1% reward, but did not confirm its selection. Option text: ${rewardOption.text}`,
+      "checkout",
+    );
+    return false;
+  }
+  await sleep(1200);
+  return true;
+}
 
 function checkoutDeliveryPromiseText() {
+  const optionRows = [...document.querySelectorAll("label, .a-radio-label")]
+    .filter((element) => visible(element) && element.querySelector?.(".delivery-promise-text, .delivery-option-text"))
+    .slice(0, 40)
+    .map((element) => normalizedText(element.textContent || ""))
+    .filter((text) => text && text.length <= 500);
   const selectors = [
     "h2.address-promise-text",
     ".address-promise-text",
@@ -4656,60 +4953,28 @@ function checkoutDeliveryPromiseText() {
     "[data-testid*='delivery-promise' i]",
     "[class*='delivery-promise' i]",
   ];
-  const candidates = [...document.querySelectorAll(selectors.join(", "))]
+  const elementCandidates = [...document.querySelectorAll(selectors.join(", "))]
     .filter((element) => visible(element) && !element.closest?.("#nutricity-panel, .a-popover, .a-popover-preload"))
     .slice(0, 80)
     .map((element) => normalizedText(element.textContent || ""))
     .filter((text) => text && /arriv|deliver|shipping|delivery/i.test(text) && text.length <= 300);
+  const candidates = [...optionRows, ...elementCandidates];
   const unique = [...new Set(candidates)];
   const month = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}\b/i;
   const dated = unique.filter((text) => month.test(text) || /arriving\s+(?:today|tomorrow)|deliver(?:y|ing)?\s+(?:today|tomorrow)/i.test(text));
   return (dated.length ? dated : unique).sort((left, right) => left.length - right.length)[0] || "";
 }
 
-function checkoutDeliveryPromise() {
+function checkoutDeliveryPromise(limitDays = DEFAULT_DELIVERY_LIMIT_DAYS) {
   const text = checkoutDeliveryPromiseText();
-  if (!text) return { text: "", earliest: null, latest: null, daysFromToday: null, late: false };
-  const monthPattern = "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?";
-  const matches = [...text.matchAll(new RegExp(`\\b(${monthPattern})\\.?\\s+(\\d{1,2})(?:,\\s*(\\d{4}))?`, "gi"))];
-  const today = new Date();
-  const dates = matches.map((match) => {
-    const year = Number(match[3] || today.getFullYear());
-    const month = new Date(`${match[1]} 1, ${year}`).getMonth();
-    const date = new Date(year, month, Number(match[2]));
-    if (!match[3] && date < new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1)) date.setFullYear(date.getFullYear() + 1);
-    return date;
-  }).filter((date) => Number.isFinite(date.getTime()));
-  if (!dates.length) {
-    const lower = text.toLowerCase();
-    if (/arriving\s+today|deliver(?:y|ing)?\s+today/.test(lower)) {
-      const todayOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-      return { text, earliest: todayOnly, latest: todayOnly, daysFromToday: 0, late: false };
-    }
-    if (/arriving\s+tomorrow|deliver(?:y|ing)?\s+tomorrow/.test(lower)) {
-      const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
-      return { text, earliest: tomorrow, latest: tomorrow, daysFromToday: 1, late: false };
-    }
-    return { text, earliest: null, latest: null, daysFromToday: null, late: false };
-  }
-  const earliest = new Date(Math.min(...dates.map((date) => date.getTime())));
-  const latest = new Date(Math.max(...dates.map((date) => date.getTime())));
-  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-  const daysFromToday = Math.ceil((earliest.getTime() - startOfToday.getTime()) / 86400000);
-  return {
-    text,
-    earliest,
-    latest,
-    daysFromToday,
-    late: daysFromToday > CHECKOUT_DELIVERY_LIMIT_DAYS,
-  };
+  return parseAmazonDeliveryPromise(text, limitDays);
 }
 
-async function rejectLateCheckout(activeJob, promise) {
+async function rejectLateCheckout(activeJob, promise, deliveryLimitDays) {
   const orderNames = Array.isArray(activeJob?.job?.order_names) ? activeJob.job.order_names.filter(Boolean) : [];
   const orderLabel = orderNames.join(", ") || activeJob?.job?.recipient_name || activeJob?.job?.group_key || "Amazon checkout";
   const earliest = promise.earliest?.toLocaleDateString?.("en-US", { month: "short", day: "numeric", year: "numeric" }) || "a date beyond the allowed window";
-  const message = `Skipped Amazon checkout for ${orderLabel}: delivery is promised for ${earliest}, which is ${promise.daysFromToday} day(s) away. The maximum allowed delivery window is ${CHECKOUT_DELIVERY_LIMIT_DAYS} days. Amazon promise: ${promise.text}`;
+  const message = `Skipped Amazon checkout for ${orderLabel}: delivery is promised for ${earliest}, which is ${promise.daysFromToday} day(s) away. The maximum allowed delivery window is ${deliveryLimitDays} days. Amazon promise: ${promise.text}`;
   const notificationKey = `late-delivery:${activeJob?.job?.group_key || orderLabel}:${promise.earliest?.toISOString?.().slice(0, 10) || "unknown"}`;
   try {
     await contentApi("/api/notifications", {
@@ -4739,12 +5004,14 @@ async function rejectLateCheckout(activeJob, promise) {
 }
 
 async function checkoutDeliveryWindowIsAllowed(activeJob) {
+  const state = await getExtensionState();
+  const deliveryLimitDays = normalizedDeliveryLimitDays(state.deliveryLimitDays);
   const promise = await waitUntil(() => {
-    const parsed = checkoutDeliveryPromise();
+    const parsed = checkoutDeliveryPromise(deliveryLimitDays);
     return parsed.text || null;
-  }, 5000, 500) || checkoutDeliveryPromise();
+  }, 5000, 500) || checkoutDeliveryPromise(deliveryLimitDays);
   if (!promise.text) {
-    sendDiagnostic("Checkout delivery promise was not visible; continuing without the four-day guard.", {
+    sendDiagnostic(`Checkout delivery promise was not visible; continuing without the ${deliveryLimitDays}-day guard.`, {
       order: activeJobOrderLabel(activeJob) || activeJob?.job?.group_key || "",
       url: location.href,
     }, "warn").catch(() => {});
@@ -4761,7 +5028,7 @@ async function checkoutDeliveryWindowIsAllowed(activeJob) {
     return true;
   }
   if (promise.late) {
-    await rejectLateCheckout(activeJob, promise);
+    await rejectLateCheckout(activeJob, promise, deliveryLimitDays);
     return false;
   }
   showPanel("Nutricity checkout", `Delivery window accepted: ${promise.text}`, null, null);
@@ -5318,6 +5585,30 @@ async function saveNewDeliveryAddress(activeJob, checkoutRecipient) {
 }
 
 async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
+  if (checkoutPageShowsExpectedDelivery(checkoutRecipient)) {
+    activeJob.addressVerifiedRecipient = checkoutRecipient;
+    activeJob.addressVerifiedAt = Date.now();
+    activeJob.addressVerifyAttempts = 0;
+    await setActiveJob(activeJob);
+    return true;
+  }
+  // Closing Amazon's address editor often restores the checkout card in two
+  // renders: the Place Order button appears first, then the delivery details.
+  // Do not pause in the gap when the correct address has simply not painted yet.
+  if (!checkoutRecipientConfirmed(checkoutRecipient)) {
+    const confirmedAfterRender = await waitUntil(
+      () => checkoutRecipientConfirmed(checkoutRecipient),
+      6000,
+      250,
+    );
+    if (confirmedAfterRender) {
+      activeJob.addressVerifiedRecipient = checkoutRecipient;
+      activeJob.addressVerifiedAt = Date.now();
+      activeJob.addressVerifyAttempts = 0;
+      await setActiveJob(activeJob);
+      return true;
+    }
+  }
   const deliveredTo = checkoutDeliveryRecipientText();
   const placeOrderVisible = Boolean(findPlaceOrderButton());
   if (!deliveredTo) {
@@ -5608,6 +5899,7 @@ async function handleCheckout(activeJob) {
   if (!await ensurePreferredCheckoutPayment(activeJob)) return;
   if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
+  if (!await ensureFridayRewardDelivery(activeJob)) return;
 
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([
@@ -5885,6 +6177,23 @@ function amazonDuplicateOrderPage() {
 async function protectBeforeAmazonSubmit(activeJob, retryStage = "checkout") {
   const result = await send({ type: "MARK_ORDER_SUBMITTED" });
   if (!result?.ok) {
+    if (result?.duplicate_submit_blocked && result?.protected_in_current_window) {
+      // The previous click in this same worker was already protected.  It may
+      // have navigated while the content script was reloaded, so verify Amazon
+      // order history instead of turning our own duplicate guard into a pause.
+      const latest = await getActiveJob();
+      const recovery = {
+        ...(latest || activeJob),
+        stage: "find_order_id",
+        paused: false,
+        pausedStage: null,
+        amazonSubmittedAt: (latest || activeJob)?.amazonSubmittedAt || Date.now(),
+      };
+      await setActiveJob(recovery, { allowUnpause: true, reason: "protected_submit_history_recovery" });
+      showPanel("Nutricity fulfilment", "A protected Place Order attempt already exists. Checking recent Amazon orders instead of submitting again.", null, null);
+      await handleOrderHistory(recovery);
+      return false;
+    }
     activeJob.paused = true;
     activeJob.pausedStage = retryStage;
     await setActiveJob(activeJob);
@@ -7297,6 +7606,56 @@ async function findRememberedDuplicateOrder(activeJob) {
   return orders[0] || null;
 }
 
+async function selectUnambiguousSubmittedHistoryOrders(activeJob, candidates = []) {
+  const unique = [];
+  const seen = new Set();
+  for (const candidate of candidates || []) {
+    const orderId = String(candidate?.amazon_order_id || "").trim();
+    if (!/^\d{3}-\d{7}-\d{7}$/.test(orderId) || seen.has(orderId)) continue;
+    seen.add(orderId);
+    unique.push(candidate);
+  }
+  if (unique.length <= 1) return { orders: unique, ambiguous: false };
+
+  // Multiple cards can share the same Nutricity recipient and ASIN. Never
+  // report the first matching card: first exclude Amazon IDs that the app has
+  // already recorded, then continue only if one new candidate remains.
+  let lookup = null;
+  try {
+    lookup = await send({ type: "LOOKUP_AMAZON_HISTORY_ORDERS", orders: unique });
+  } catch (_) {
+    lookup = null;
+  }
+  if (!lookup?.ok) {
+    await sendDiagnostic("Did not report ambiguous Amazon history cards because the app lookup was unavailable.", {
+      group_key: activeJob?.job?.group_key || "",
+      candidate_order_ids: unique.map((order) => order.amazon_order_id),
+    }, "warn");
+    return { orders: [], ambiguous: true };
+  }
+
+  const previouslyReported = new Set(String(activeJob?.reportedOrderId || "").match(/\b\d{3}-\d{7}-\d{7}\b/g) || []);
+  const matches = lookup.matches || {};
+  const unrecorded = unique.filter((order) => {
+    const orderId = String(order.amazon_order_id || "").trim();
+    return !previouslyReported.has(orderId) && !((matches[orderId]?.orders || []).length);
+  });
+  if (unrecorded.length === 1) return { orders: unrecorded, ambiguous: false };
+  if (previouslyReported.size) {
+    const prior = unique.filter((order) => previouslyReported.has(String(order.amazon_order_id || "").trim()));
+    if (prior.length === 1) return { orders: prior, ambiguous: false };
+  }
+  await sendDiagnostic("Refused to report an ambiguous Amazon history match.", {
+    group_key: activeJob?.job?.group_key || "",
+    candidate_order_ids: unique.map((order) => order.amazon_order_id),
+    unrecorded_order_ids: unrecorded.map((order) => order.amazon_order_id),
+    already_recorded_order_ids: unique
+      .filter((order) => (matches[String(order.amazon_order_id || "").trim()]?.orders || []).length)
+      .map((order) => order.amazon_order_id),
+  }, "error");
+  return { orders: [], ambiguous: true };
+}
+
 function extractRecentOrders(activeJob) {
   const recipient = String(activeJob.job.recipient_name || "").toLowerCase();
   const compactRecipient = compactMatchText(recipient);
@@ -7350,6 +7709,18 @@ async function handleCompletion(activeJob) {
     await reportAmazonOrder(activeJob, orderId);
     return;
   }
+  // Amazon normally replaces checkout with its confirmation page immediately.
+  // If that did not happen after a protected click, do not retry Place Order:
+  // first look in order history.  This handles a content-script/extension reload
+  // between the click and navigation without risking a duplicate purchase.
+  const clickAge = Date.now() - Number(activeJob.placeOrderClickStartedAt || activeJob.amazonSubmittedAt || Date.now());
+  if (/\/checkout/i.test(location.pathname) && findPlaceOrderButton() && clickAge >= 45000) {
+    showPanel("Nutricity fulfilment", "Amazon did not show a confirmation after Place Order. Opening recent orders to verify the result without submitting again.", null, null);
+    activeJob.stage = "find_order_id";
+    await setActiveJob(activeJob);
+    location.href = orderHistoryUrl();
+    return;
+  }
   if (/\/cart|\/dp\/|\/gp\/product/i.test(location.pathname)) {
     showPanel("Nutricity fulfilment", "Amazon submit already started. Opening order history to capture the order number.", null, null);
     activeJob.stage = "find_order_id";
@@ -7395,8 +7766,19 @@ async function handleOrderHistory(activeJob) {
   if (historyOrders.length) {
     await send({ type: "REMEMBER_RECENT_AMAZON_ORDERS", orders: historyOrders });
   }
-  const orders = extractRecentOrders(activeJob);
-  const rememberedOrder = orders.length ? null : await findRememberedDuplicateOrder(activeJob);
+  const historyCandidates = extractRecentOrders(activeJob);
+  const selection = await selectUnambiguousSubmittedHistoryOrders(activeJob, historyCandidates);
+  const orders = selection.orders;
+  const rememberedOrder = orders.length || selection.ambiguous ? null : await findRememberedDuplicateOrder(activeJob);
+  if (selection.ambiguous) {
+    showPanel(
+      "Nutricity fulfilment",
+      "More than one matching Amazon history order was found. Waiting for a single safe match instead of writing the wrong Amazon order ID.",
+      null,
+      null,
+    );
+    return;
+  }
   if (!orders.length && !rememberedOrder) {
     const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
     if (lookupAge > 120000) {
@@ -8002,7 +8384,7 @@ registerContentCleanup(() => document.removeEventListener("visibilitychange", on
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type !== "CHECK_ASIN_AVAILABILITY") return false;
   try {
-    sendResponse(checkAsinAvailability(message.asin));
+    sendResponse(checkAsinAvailability(message.asin, message.deliveryLimitDays));
   } catch (error) {
     sendResponse({
       ok: false,

@@ -332,6 +332,8 @@ def fast_page_cache_clear_matching(prefixes: set[str]) -> None:
 
 
 ORDER_PROGRESS_CACHE_PREFIXES = {
+    "chrome-order-history-lookup",
+    "chrome-order-history-odoo-direct",
     "chrome-jobs",
     "dashboard",
     "orders",
@@ -29843,6 +29845,9 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 "updated_at": now,
             })
     matched_refs = sorted({str(row["odoo_order_name"]).upper() for row in rows})
+    # Clear order-history annotations immediately after a manual correction so
+    # a former Amazon ID does not continue to display as a conflict.
+    clear_order_progress_caches()
     followup_timer = threading.Timer(
         0.1,
         manual_amazon_match_followups,

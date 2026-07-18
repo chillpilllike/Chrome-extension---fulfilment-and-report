@@ -2274,6 +2274,10 @@ function isCurrentAmazonCancelledLine(row: OrderLine) {
   return Boolean(row.amazon_cancelled_at && !row.amazon_order_id)
 }
 
+function isCostlyOrderLine(row: OrderLine) {
+  return String(row.state || "").toLowerCase() === "costly" || String(row.amazon_status || "").toLowerCase() === "cost_review"
+}
+
 function ErrorTooltip({ value, className = "" }: { value?: string; className?: string }) {
   const text = String(value || "").trim()
   if (!text) return null
@@ -5095,6 +5099,8 @@ function App() {
                               ? "order-row-cancelled-refunded"
                             : row.state === "ignored"
                               ? "bg-slate-50 opacity-75 [&_td:not(:first-child)]:line-through [&_td:not(:first-child)]:text-muted-foreground"
+                              : isCostlyOrderLine(row)
+                                ? "order-row-costly"
                               : "",
                             isLimitPurchaseLine(row)
                             ? "bg-[#f5f0ff]"
@@ -10772,7 +10778,7 @@ function CostlyPage({
             </TableHeader>
             <TableBody>
               {rows.map((row) => (
-                <TableRow key={row.id}>
+                <TableRow key={row.id} className="order-row-costly">
                   <TableCell>
                     <Checkbox
                       checked={selected.includes(row.id)}

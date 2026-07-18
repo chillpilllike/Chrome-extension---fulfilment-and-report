@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-07-17-no-duplicate-add-v8";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-07-18-history-report-guard-v19";
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -11,6 +11,8 @@ let startNextJobInFlight = null;
 const claimNextJobInFlight = new Map();
 const MISSING_ASIN_ALARM = "nutricity-missing-asin-availability";
 const MISSING_ASIN_CHECK_PERIOD_MINUTES = 24 * 60;
+const FULFILMENT_WATCHDOG_ALARM = "nutricity-fulfilment-watchdog";
+const FULFILMENT_WATCHDOG_PERIOD_MINUTES = 1;
 const BROWSERLESS_SWITCH_POLL_MS = 2000;
 const BROWSERLESS_SWITCH_TIMEOUT_MS = 10 * 60 * 1000;
 const DIAGNOSTIC_SESSION_LIMIT = 4;
@@ -28,6 +30,7 @@ async function getSettings() {
     splitMixedAsinOrders: true,
     browserlessOrderMode: false,
     pauseBeforePlaceOrder: false,
+    deliveryLimitDays: 5,
     workerId: "",
     activeJob: null,
     activeJobsByWindow: {},
@@ -324,8 +327,10 @@ async function setForceStop(active, reason = "") {
   await chrome.storage.local.set({ forceStop });
   if (active === true && chrome.alarms?.clear) {
     await chrome.alarms.clear(MISSING_ASIN_ALARM).catch(() => undefined);
+    await chrome.alarms.clear(FULFILMENT_WATCHDOG_ALARM).catch(() => undefined);
   } else if (active !== true) {
     await setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+    await setupFulfilmentWatchdogAlarm().catch((error) => log(`Could not schedule fulfilment watchdog: ${error.message}`));
   }
   return forceStop;
 }
@@ -897,7 +902,6 @@ async function navigateWindowToCart(windowId) {
     const updated = await chrome.tabs.update(tab.id, { url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
     await injectContentScriptWhenReady(updated?.id || tab.id);
   }
-  await chrome.windows.update(windowId, { focused: true });
 }
 
 async function navigateWindowToProduct(windowId, asin) {
@@ -913,13 +917,12 @@ async function navigateWindowToProduct(windowId, asin) {
     const created = await chrome.tabs.create({ windowId, url, active: true });
     await injectContentScriptWhenReady(created?.id);
   }
-  await chrome.windows.update(windowId, { focused: true });
 }
 
 async function navigateWindowToOrderHistory(windowId) {
   const url = "https://www.amazon.com/gp/your-account/order-history?ref=ppx_pt2_dt_b_yo_link";
   if (!windowId) {
-    const created = await chrome.windows.create({ url, type: "normal", focused: true });
+    const created = await chrome.windows.create({ url, type: "normal", focused: false });
     await injectActiveAmazonTabInWindow(created?.id);
     return created?.id || null;
   }
@@ -932,7 +935,6 @@ async function navigateWindowToOrderHistory(windowId) {
     const created = await chrome.tabs.create({ windowId, url, active: true });
     await injectContentScriptWhenReady(created?.id);
   }
-  await chrome.windows.update(windowId, { focused: true });
   return windowId;
 }
 
@@ -950,7 +952,9 @@ async function createAmazonWorkerWindow(incognito = false) {
   const createData = {
     url: "https://www.amazon.com/cart?ref_=sw_gtc",
     type: "normal",
-    focused: true,
+    // A fulfilment worker must never take focus away from the user's work.
+    // Chrome can drive a non-focused window and its active worker tab normally.
+    focused: false,
     ...(incognito ? { incognito: true } : {}),
   };
   try {
@@ -959,8 +963,16 @@ async function createAmazonWorkerWindow(incognito = false) {
     await log(`Could not open new ${incognito ? "incognito " : ""}Chrome window: ${error.message}`);
     if (incognito) throw error;
   }
-  const createdTab = await chrome.tabs.create({ url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
-  return createdTab.windowId ? await chrome.windows.get(createdTab.windowId) : null;
+  try {
+    return await chrome.windows.create({
+      url: "https://www.amazon.com/cart?ref_=sw_gtc",
+      type: "normal",
+      focused: false,
+    });
+  } catch (fallbackError) {
+    await log(`Could not create a background Amazon worker window: ${fallbackError.message}`);
+    return null;
+  }
 }
 
 async function contentScriptLoaded(tabId) {
@@ -1843,6 +1855,8 @@ async function markAmazonSubmitted(windowId) {
     return {
       ok: false,
       duplicate_submit_blocked: true,
+      protected_in_current_window: true,
+      group_key: activeJob.job.group_key,
       message: `${activeJob.job.group_key} is already protected for Amazon submit. Fulfilment paused before a repeat Place Order click.`,
     };
   }
@@ -1856,6 +1870,8 @@ async function markAmazonSubmitted(windowId) {
     return {
       ok: false,
       duplicate_submit_blocked: true,
+      protected_in_current_window: false,
+      group_key: activeJob.job.group_key,
       message: `${activeJob.job.group_key} is already protected in another Chrome window. Fulfilment paused before a duplicate Place Order click.`,
     };
   }
@@ -1923,6 +1939,37 @@ async function releaseMissingWindowJobs(options = {}) {
   } finally {
     releaseMissingWindowJobsInFlight = null;
   }
+}
+
+async function runFulfilmentWatchdog(label = "scheduled watchdog") {
+  if (await forceStopActive()) return { ok: true, stopped: true };
+
+  await releaseMissingWindowJobs({ force: true });
+  await ensureStoredActiveJobContentScripts(label);
+
+  const state = await getSettings();
+  const progress = state.orderProgress || {};
+  const visibleRunWasActive = progress.running === true && progress.source !== "browserless";
+  if (!visibleRunWasActive || await activeOrderingInProgress()) {
+    return { ok: true, restarted: false };
+  }
+
+  const browserless = await browserlessOrderStatus().catch(() => null);
+  if (browserless?.progress?.running === true) return { ok: true, restarted: false, browserless: true };
+
+  await log("Fulfilment watchdog found a running queue without an Amazon worker. Starting a replacement worker window.");
+  const result = await startNextJob(null);
+  if (result?.ok) {
+    await setOrderProgress({
+      ...progress,
+      running: true,
+      message: "Recovered a missing Amazon worker window and resumed the order run.",
+      startedAt: progress.startedAt || Date.now(),
+      updatedAt: Date.now(),
+      source: "visible",
+    });
+  }
+  return { ok: true, restarted: Boolean(result?.ok), result };
 }
 
 async function releaseAllStoredJobs(label = "from the previous Chrome session") {
@@ -2278,7 +2325,16 @@ async function costlyJob(message, details = {}, windowId) {
   await log(`Costly review ${activeJob.job.group_key}: ${message}`, windowId);
   await recordLastProcessed(activeJob, "costly", message);
   await incrementOrderProgress(`Processed ${activeJob.job.group_key}: costly review.`);
-  return result;
+  await navigateWindowToCart(windowId);
+  const nextJob = await claimNextJobInWindow(windowId);
+  return {
+    ...result,
+    next_job_started: Boolean(nextJob),
+    next_group_key: nextJob?.job?.group_key || "",
+    message: nextJob
+      ? `${result.message || "Order moved to Costly."} Started next ${nextJob.job.group_key}.`
+      : result.message || "Order moved to Costly. No more queued Chrome jobs found.",
+  };
 }
 
 async function clearFailedJobs() {
@@ -2332,6 +2388,14 @@ async function setupAvailabilityAlarm() {
   });
 }
 
+async function setupFulfilmentWatchdogAlarm() {
+  if (!chrome.alarms?.create) return;
+  await chrome.alarms.create(FULFILMENT_WATCHDOG_ALARM, {
+    delayInMinutes: FULFILMENT_WATCHDOG_PERIOD_MINUTES,
+    periodInMinutes: FULFILMENT_WATCHDOG_PERIOD_MINUTES,
+  });
+}
+
 function waitForTabComplete(tabId, timeoutMs = 30000) {
   return new Promise((resolve) => {
     let settled = false;
@@ -2354,6 +2418,7 @@ function waitForTabComplete(tabId, timeoutMs = 30000) {
 }
 
 async function checkAmazonAvailabilityCandidate(candidate) {
+  const { deliveryLimitDays } = await getSettings();
   const amazonUrl = candidate.amazon_url || `https://www.amazon.com/dp/${encodeURIComponent(candidate.asin || "")}`;
   const tab = await chrome.tabs.create({ url: amazonUrl, active: false });
   try {
@@ -2361,7 +2426,11 @@ async function checkAmazonAvailabilityCandidate(candidate) {
     await injectContentScript(tab.id);
     await new Promise((resolve) => setTimeout(resolve, 2500));
     try {
-      return await chrome.tabs.sendMessage(tab.id, { type: "CHECK_ASIN_AVAILABILITY", asin: candidate.asin });
+      return await chrome.tabs.sendMessage(tab.id, {
+        type: "CHECK_ASIN_AVAILABILITY",
+        asin: candidate.asin,
+        deliveryLimitDays,
+      });
     } catch (error) {
       return {
         ok: false,
@@ -2560,20 +2629,28 @@ chrome.action.onClicked.addListener((tab) => {
 chrome.runtime.onStartup.addListener(() => {
   forceStopActive().then((stopped) => {
     if (stopped) return;
-    releaseAllStoredJobs().catch((error) => log(`Could not release previous Chrome session jobs: ${error.message}`));
+    releaseAllStoredJobs()
+      .then(() => runFulfilmentWatchdog("Chrome startup"))
+      .catch((error) => log(`Could not recover previous Chrome session jobs: ${error.message}`));
     setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+    setupFulfilmentWatchdogAlarm().catch((error) => log(`Could not schedule fulfilment watchdog: ${error.message}`));
   });
 });
 
 chrome.runtime.onInstalled.addListener(() => {
   forceStopActive().then((stopped) => {
     if (stopped) return;
-    ensureStoredActiveJobContentScripts("extension reload").catch((error) => log(`Could not recover active job tabs after extension reload: ${error.message}`));
+    runFulfilmentWatchdog("extension reload").catch((error) => log(`Could not recover fulfilment after extension reload: ${error.message}`));
     setupAvailabilityAlarm().catch((error) => log(`Could not schedule missing ASIN availability checks: ${error.message}`));
+    setupFulfilmentWatchdogAlarm().catch((error) => log(`Could not schedule fulfilment watchdog: ${error.message}`));
   });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === FULFILMENT_WATCHDOG_ALARM) {
+    runFulfilmentWatchdog("background watchdog").catch((error) => log(`Fulfilment watchdog failed: ${error.message}`));
+    return;
+  }
   if (alarm.name !== MISSING_ASIN_ALARM) return;
   forceStopActive().then((stopped) => {
     if (stopped) return;
@@ -2643,6 +2720,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "GET_STATE") {
       if (await forceStopActive()) return { ...(await getWindowState(windowId)), activeJob: null };
       await releaseMissingWindowJobs();
+      // The popup polls for state while a job is active.  Use that heartbeat to
+      // repair a content script that was removed by an extension reload while
+      // Amazon stayed on the same checkout URL (so tabs.onUpdated never fires).
+      // injectContentScript is build-idempotent, so this is safe on every poll.
+      await ensureStoredActiveJobContentScripts("popup state refresh");
       await refreshActiveJobFromQueue(windowId);
       const { activeJob } = await getWindowState(windowId);
       if (!await forceStopActive() && (!activeJob?.job || !orderSubmitStarted(activeJob))) {
@@ -2836,6 +2918,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         splitMixedAsinOrders: message.splitMixedAsinOrders === true,
         browserlessOrderMode: message.browserlessOrderMode === true,
         pauseBeforePlaceOrder: message.pauseBeforePlaceOrder === true,
+        deliveryLimitDays: Math.min(30, Math.max(1, Math.floor(Number(message.deliveryLimitDays) || 5))),
       });
       return { ok: true };
     }
