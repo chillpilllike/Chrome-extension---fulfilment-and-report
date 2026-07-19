@@ -1044,7 +1044,7 @@ function notifyAdminAuthRequired() {
 }
 
 const PAGE_SIZE = 100
-const ORDERS_PAGE_SIZE = 20
+const ORDERS_PAGE_SIZE = 100
 const DUPLICATE_ASIN_PAGE_SIZE = 12
 const FULFILMENT_PENDING_PAGE_SIZE = 30
 

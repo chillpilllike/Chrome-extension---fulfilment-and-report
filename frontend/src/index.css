@@ -687,6 +687,10 @@
     min-height: 11rem;
 }
 
+.tabler-admin-shell .orders-table-wrap .tabler-sticky-table-wrap {
+    max-height: none;
+}
+
 .tabler-admin-shell .orders-table-loader {
     position: absolute;
     inset: 0;
