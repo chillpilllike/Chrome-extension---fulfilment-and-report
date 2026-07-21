@@ -15239,7 +15239,12 @@ def customer_track_order_page_title(slug: str, store: Optional[dict[str, Any]]) 
     return clean_text(store.get("name") if store else "") or "Track Order"
 
 
-def track_order_rows(store_id: Optional[int], page: int = 1, per_page: int = 50) -> tuple[list[dict[str, Any]], int, int, int]:
+def track_order_rows(
+    store_id: Optional[int],
+    page: int = 1,
+    per_page: int = 50,
+    final_mile_only: bool = False,
+) -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     with db() as conn:
         total = int(conn.execute(
@@ -15247,8 +15252,9 @@ def track_order_rows(store_id: Optional[int], page: int = 1, per_page: int = 50)
             SELECT COUNT(*) AS count
             FROM epost_global_tracking
             WHERE (? IS NULL OR store_id=?)
+              AND (? = FALSE OR NULLIF(BTRIM(COALESCE(final_mile_tracking_number, '')), '') IS NOT NULL)
             """,
-            (store_id, store_id),
+            (store_id, store_id, final_mile_only),
         ).fetchone()["count"] or 0)
         rows = conn.execute(
             """
@@ -15256,13 +15262,14 @@ def track_order_rows(store_id: Optional[int], page: int = 1, per_page: int = 50)
             FROM epost_global_tracking
             JOIN stores ON stores.id=epost_global_tracking.store_id
             WHERE (? IS NULL OR epost_global_tracking.store_id=?)
+              AND (? = FALSE OR NULLIF(BTRIM(COALESCE(epost_global_tracking.final_mile_tracking_number, '')), '') IS NOT NULL)
             ORDER BY
               COALESCE(epost_global_tracking.odoo_order_id, 0) DESC,
               epost_global_tracking.created_at DESC,
               epost_global_tracking.updated_at DESC
             LIMIT ? OFFSET ?
             """,
-            (store_id, store_id, per_page, offset),
+            (store_id, store_id, final_mile_only, per_page, offset),
         ).fetchall()
     data = rows_to_dicts(rows)
     stores = {int(store["id"]): store for store in list_stores()}
@@ -15353,7 +15360,11 @@ def public_track_order_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def customer_track_order_public_rows(store_id: Optional[int], query: str) -> list[dict[str, Any]]:
-    return [public_track_order_row(row) for row in customer_track_order_rows(store_id, query)]
+    return [
+        public_track_order_row(row)
+        for row in customer_track_order_rows(store_id, query)
+        if clean_text(row.get("final_mile_tracking_number"))
+    ]
 
 
 def public_track_order_rows(
@@ -15367,7 +15378,7 @@ def public_track_order_rows(
         rows = customer_track_order_public_rows(store_id, query)
         paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
         return paged_rows, total, page, per_page
-    rows, total, page, per_page = track_order_rows(store_id, page, per_page)
+    rows, total, page, per_page = track_order_rows(store_id, page, per_page, final_mile_only=True)
     return [public_track_order_row(row) for row in rows], total, page, per_page
     return public_rows
 
