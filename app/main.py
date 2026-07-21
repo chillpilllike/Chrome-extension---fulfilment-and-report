@@ -641,6 +641,7 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_epost_store_status_checked ON epost_global_tracking(store_id, epost_status, last_checked_at ASC, updated_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_epost_store_checked ON epost_global_tracking(store_id, last_checked_at ASC, updated_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_epost_store_order_name ON epost_global_tracking(store_id, odoo_order_name)",
+        "CREATE INDEX IF NOT EXISTS idx_epost_store_website_order ON epost_global_tracking(store_id, website_id, odoo_order_id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_epost_upper_tracking ON epost_global_tracking(UPPER(tracking_code))",
         "CREATE INDEX IF NOT EXISTS idx_epost_order_name ON epost_global_tracking(odoo_order_name)",
         "CREATE INDEX IF NOT EXISTS idx_shipping_charges_upper_tracking ON shipping_charges(UPPER(tracking_number))",
@@ -1036,6 +1037,7 @@ def init_db() -> None:
                 order_line_id INTEGER REFERENCES order_lines(id) ON DELETE SET NULL,
                 odoo_order_id INTEGER,
                 odoo_order_name TEXT,
+                website_id INTEGER,
                 amazon_order_id TEXT,
                 amazon_order_url TEXT,
                 picking_id INTEGER,
@@ -1462,6 +1464,7 @@ def init_db() -> None:
             "final_mile_tracking_url": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_tracking_url TEXT",
             "final_mile_carrier": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_carrier TEXT",
             "final_mile_checked_at": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_checked_at TEXT",
+            "website_id": "ALTER TABLE epost_global_tracking ADD COLUMN website_id INTEGER",
         }.items():
             if column not in existing_epost_cols:
                 conn.execute(ddl)
@@ -2084,6 +2087,17 @@ class OdooClient:
         elif "write_date" in fields:
             domain.append(("write_date", ">=", cutoff_text))
         pickings = self.search_read("stock.picking", domain, fields, limit=limit, order="write_date desc")
+        sale_ids = sorted({
+            int(picking["sale_id"][0])
+            for picking in pickings
+            if isinstance(picking.get("sale_id"), list) and picking["sale_id"]
+        })
+        sale_websites = {}
+        for order in self.read("sale.order", sale_ids, ["website_id"]):
+            website = order.get("website_id") or []
+            sale_websites[int(order["id"])] = (
+                int(website[0]) if isinstance(website, list) and website else None
+            )
         found: list[dict[str, Any]] = []
         for picking in pickings:
             tracking_text = str(picking.get("carrier_tracking_ref") or "")
@@ -2094,6 +2108,7 @@ class OdooClient:
                     {
                         "odoo_order_id": sale[0] if isinstance(sale, list) and sale else None,
                         "odoo_order_name": sale[1] if isinstance(sale, list) and len(sale) > 1 else picking.get("origin") or "",
+                        "website_id": sale_websites.get(int(sale[0])) if isinstance(sale, list) and sale else None,
                         "picking_id": picking.get("id"),
                         "picking_name": picking.get("name") or str(picking.get("id")),
                         "tracking_code": code.upper(),
@@ -15045,6 +15060,7 @@ def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2)
                     local_row["id"] if local_row else None,
                     odoo_order_id,
                     track.get("odoo_order_name") or "",
+                    track.get("website_id"),
                     (local_row["amazon_order_id"] or "") if local_row else "",
                     (local_row["amazon_order_url"] or "") if local_row else "",
                     track.get("picking_id"),
@@ -15061,13 +15077,14 @@ def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2)
             conn.execute_values(
                 """
                 INSERT INTO epost_global_tracking
-                (store_id, order_line_id, odoo_order_id, odoo_order_name, amazon_order_id, amazon_order_url,
+                (store_id, order_line_id, odoo_order_id, odoo_order_name, website_id, amazon_order_id, amazon_order_url,
                  picking_id, picking_name, tracking_code, tracking_url, epost_status, created_at, updated_at)
                 VALUES ?
                 ON CONFLICT(store_id, tracking_code) DO UPDATE SET
                     order_line_id=COALESCE(epost_global_tracking.order_line_id, excluded.order_line_id),
                     odoo_order_id=excluded.odoo_order_id,
                     odoo_order_name=excluded.odoo_order_name,
+                    website_id=COALESCE(excluded.website_id, epost_global_tracking.website_id),
                     amazon_order_id=COALESCE(NULLIF(epost_global_tracking.amazon_order_id, ''), excluded.amazon_order_id),
                     amazon_order_url=COALESCE(NULLIF(epost_global_tracking.amazon_order_url, ''), excluded.amazon_order_url),
                     picking_id=excluded.picking_id,
@@ -15076,7 +15093,7 @@ def sync_epost_tracking_from_odoo(store_id: Optional[int] = None, days: int = 2)
                     updated_at=excluded.updated_at
                 """,
                 values,
-                template="(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                template="(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 page_size=500,
             )
             synced += len(values)
@@ -15255,6 +15272,7 @@ def track_order_rows(
     page: int = 1,
     per_page: int = 50,
     final_mile_only: bool = False,
+    website_id: Optional[int] = None,
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     with db() as conn:
@@ -15263,9 +15281,10 @@ def track_order_rows(
             SELECT COUNT(*) AS count
             FROM epost_global_tracking
             WHERE (? IS NULL OR store_id=?)
+              AND (? IS NULL OR website_id=?)
               AND (? = FALSE OR NULLIF(BTRIM(COALESCE(final_mile_tracking_number, '')), '') IS NOT NULL)
             """,
-            (store_id, store_id, final_mile_only),
+            (store_id, store_id, website_id, website_id, final_mile_only),
         ).fetchone()["count"] or 0)
         rows = conn.execute(
             """
@@ -15273,6 +15292,7 @@ def track_order_rows(
             FROM epost_global_tracking
             JOIN stores ON stores.id=epost_global_tracking.store_id
             WHERE (? IS NULL OR epost_global_tracking.store_id=?)
+              AND (? IS NULL OR epost_global_tracking.website_id=?)
               AND (? = FALSE OR NULLIF(BTRIM(COALESCE(epost_global_tracking.final_mile_tracking_number, '')), '') IS NOT NULL)
             ORDER BY
               COALESCE(epost_global_tracking.odoo_order_id, 0) DESC,
@@ -15280,7 +15300,7 @@ def track_order_rows(
               epost_global_tracking.updated_at DESC
             LIMIT ? OFFSET ?
             """,
-            (store_id, store_id, final_mile_only, per_page, offset),
+            (store_id, store_id, website_id, website_id, final_mile_only, per_page, offset),
         ).fetchall()
     data = rows_to_dicts(rows)
     stores = {int(store["id"]): store for store in list_stores()}
@@ -15307,7 +15327,11 @@ def latest_track_order_row_id(store_id: Optional[int]) -> Optional[int]:
     return int(row["id"]) if row else None
 
 
-def customer_track_order_rows(store_id: Optional[int], query: str) -> list[dict[str, Any]]:
+def customer_track_order_rows(
+    store_id: Optional[int],
+    query: str,
+    website_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
     term = clean_text(query).upper()
     if not term or len(term) < 4:
         return []
@@ -15318,6 +15342,7 @@ def customer_track_order_rows(store_id: Optional[int], query: str) -> list[dict[
             FROM epost_global_tracking
             JOIN stores ON stores.id=epost_global_tracking.store_id
             WHERE (? IS NULL OR epost_global_tracking.store_id=?)
+              AND (? IS NULL OR epost_global_tracking.website_id=?)
               AND (
                 UPPER(epost_global_tracking.odoo_order_name)=?
                 OR UPPER(epost_global_tracking.tracking_code)=?
@@ -15326,7 +15351,7 @@ def customer_track_order_rows(store_id: Optional[int], query: str) -> list[dict[
             ORDER BY COALESCE(epost_global_tracking.odoo_order_id, 0) DESC, epost_global_tracking.updated_at DESC
             LIMIT 10
             """,
-            (store_id, store_id, term, term, term),
+            (store_id, store_id, website_id, website_id, term, term, term),
         ).fetchall()
     data = rows_to_dicts(rows)
     for row in data:
@@ -15370,10 +15395,14 @@ def public_track_order_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def customer_track_order_public_rows(store_id: Optional[int], query: str) -> list[dict[str, Any]]:
+def customer_track_order_public_rows(
+    store_id: Optional[int],
+    query: str,
+    website_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
     return [
         public_track_order_row(row)
-        for row in customer_track_order_rows(store_id, query)
+        for row in customer_track_order_rows(store_id, query, website_id)
         if clean_text(row.get("final_mile_tracking_number"))
     ]
 
@@ -15383,13 +15412,20 @@ def public_track_order_rows(
     page: int = 1,
     per_page: int = 25,
     q: str = "",
+    website_id: Optional[int] = None,
 ) -> tuple[list[dict[str, Any]], int, int, int]:
     query = clean_text(q)
     if query:
-        rows = customer_track_order_public_rows(store_id, query)
+        rows = customer_track_order_public_rows(store_id, query, website_id)
         paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
         return paged_rows, total, page, per_page
-    rows, total, page, per_page = track_order_rows(store_id, page, per_page, final_mile_only=True)
+    rows, total, page, per_page = track_order_rows(
+        store_id,
+        page,
+        per_page,
+        final_mile_only=True,
+        website_id=website_id,
+    )
     return [public_track_order_row(row) for row in rows], total, page, per_page
     return public_rows
 
@@ -30222,15 +30258,21 @@ def api_public_tracking(store_id: Optional[int] = None) -> dict[str, Any]:
 
 
 @app.get("/api/public/track-order/{slug}")
-def api_public_track_order(slug: str, q: str = "", store_id: Optional[int] = None) -> dict[str, Any]:
+def api_public_track_order(
+    slug: str,
+    q: str = "",
+    store_id: Optional[int] = None,
+    website_id: Optional[int] = None,
+) -> dict[str, Any]:
     target_store_id = store_id or default_track_order_store_id(slug)
     query = clean_text(q)
-    rows = customer_track_order_public_rows(target_store_id, query) if query else []
+    rows = customer_track_order_public_rows(target_store_id, query, website_id) if query else []
     return {
         "ok": True,
         "slug": slug,
         "query": query,
         "store_id": target_store_id,
+        "website_id": website_id,
         "rows": rows,
         "total": len(rows),
     }
@@ -30243,14 +30285,22 @@ def api_public_track_orders(
     store_id: Optional[int] = None,
     page: int = 1,
     per_page: int = 25,
+    website_id: Optional[int] = None,
 ) -> dict[str, Any]:
     target_store_id = store_id or default_track_order_store_id(slug)
-    rows, total, page, per_page = public_track_order_rows(target_store_id, page, per_page, q)
+    rows, total, page, per_page = public_track_order_rows(
+        target_store_id,
+        page,
+        per_page,
+        q,
+        website_id,
+    )
     return {
         "ok": True,
         "slug": slug,
         "query": clean_text(q),
         "store_id": target_store_id,
+        "website_id": website_id,
         "rows": rows,
         "page": page,
         "per_page": per_page,
