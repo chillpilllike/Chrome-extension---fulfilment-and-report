@@ -15183,7 +15183,12 @@ def fetch_epg_final_mile_details(tracking_code: str) -> dict[str, str]:
 def refresh_epost_final_mile_tracking(row_id: int) -> dict[str, Any]:
     with db() as conn:
         row = conn.execute(
-            "SELECT id, tracking_code FROM epost_global_tracking WHERE id=?",
+            """
+            SELECT id, tracking_code, final_mile_tracking_number,
+                   final_mile_tracking_url, final_mile_carrier
+            FROM epost_global_tracking
+            WHERE id=?
+            """,
             (row_id,),
         ).fetchone()
     if not row:
@@ -15194,9 +15199,9 @@ def refresh_epost_final_mile_tracking(row_id: int) -> dict[str, Any]:
         conn.execute(
             """
             UPDATE epost_global_tracking
-            SET final_mile_tracking_number=?,
-                final_mile_tracking_url=?,
-                final_mile_carrier=?,
+            SET final_mile_tracking_number=COALESCE(NULLIF(?, ''), final_mile_tracking_number),
+                final_mile_tracking_url=COALESCE(NULLIF(?, ''), final_mile_tracking_url),
+                final_mile_carrier=COALESCE(NULLIF(?, ''), final_mile_carrier),
                 final_mile_checked_at=?,
                 updated_at=?
             WHERE id=?
@@ -15210,7 +15215,13 @@ def refresh_epost_final_mile_tracking(row_id: int) -> dict[str, Any]:
                 row_id,
             ),
         )
-    return {"ok": True, "row_id": row_id, **details}
+    return {
+        "ok": True,
+        "row_id": row_id,
+        "final_mile_tracking_number": details.get("final_mile_tracking_number") or row["final_mile_tracking_number"] or "",
+        "final_mile_tracking_url": details.get("final_mile_tracking_url") or row["final_mile_tracking_url"] or "",
+        "final_mile_carrier": details.get("final_mile_carrier") or row["final_mile_carrier"] or "",
+    }
 
 
 def default_track_order_store_id(slug: str) -> Optional[int]:
