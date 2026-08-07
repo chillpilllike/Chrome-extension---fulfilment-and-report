@@ -15241,6 +15241,52 @@ def refresh_epost_final_mile_tracking(row_id: int) -> dict[str, Any]:
     }
 
 
+def sync_epost_tracking_and_final_mile(days: int = 7, limit: int = 500, workers: int = 4) -> dict[str, int]:
+    synced = sync_epost_tracking_from_odoo(None, days)
+    retry_before = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM epost_global_tracking
+            WHERE tracking_code ILIKE 'EPG%'
+              AND COALESCE(final_mile_tracking_number, '') = ''
+              AND (final_mile_checked_at IS NULL OR final_mile_checked_at <= ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (retry_before, max(1, min(2000, int(limit or 500)))),
+        ).fetchall()
+    row_ids = [int(row["id"]) for row in rows]
+    found = 0
+    failed = 0
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(8, int(workers or 4))),
+        thread_name_prefix="epost-final-mile",
+    ) as executor:
+        futures = {
+            executor.submit(refresh_epost_final_mile_tracking, row_id): row_id
+            for row_id in row_ids
+        }
+        for future, row_id in futures.items():
+            try:
+                if future.result().get("final_mile_tracking_number"):
+                    found += 1
+            except Exception:
+                failed += 1
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE epost_global_tracking SET final_mile_checked_at=? WHERE id=?",
+                        (utc_now(), row_id),
+                    )
+    return {
+        "synced": synced,
+        "checked": len(row_ids),
+        "found": found,
+        "failed": failed,
+    }
+
+
 def default_track_order_store_id(slug: str) -> Optional[int]:
     cleaned = clean_text(slug).lower()
     stores = list_stores()
@@ -22866,6 +22912,7 @@ def autosync_loop() -> None:
     last_run = time.time()
     last_chrome_run = time.time()
     last_cancelled_run = time.time()
+    last_epost_run = 0.0
     while True:
         try:
             settings = get_service_settings()
@@ -22897,6 +22944,20 @@ def autosync_loop() -> None:
                 for store in list_stores():
                     sync_cancelled_orders_for_store(int(store["id"]), days=days)
                 last_cancelled_run = time.time()
+            if time.time() - last_epost_run >= 60 * 60:
+                try:
+                    result = sync_epost_tracking_and_final_mile(days=7)
+                    set_setting(
+                        "epost_auto_sync_last_message",
+                        (
+                            f"Imported {result['synced']} EPG shipments; checked {result['checked']} final-mile records, "
+                            f"found {result['found']}, failed {result['failed']}."
+                        ),
+                    )
+                    set_setting("epost_auto_sync_last_run_at", utc_now())
+                except Exception as exc:
+                    set_setting("epost_auto_sync_last_message", f"Automatic EPG sync failed: {str(exc)[:400]}")
+                last_epost_run = time.time()
         except Exception:
             pass
         time.sleep(60)
