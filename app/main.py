@@ -15161,6 +15161,8 @@ def extract_epg_final_mile_details(html_text: str) -> dict[str, str]:
     )
     if number_match:
         tracking_number = clean_text(number_match.group(1))
+    if tracking_number.lower() in {"-", "n/a", "na", "none", "pending"}:
+        tracking_number = ""
     if not tracking_number and tracking_url:
         parsed = urlparse(tracking_url)
         query = parse_qs(parsed.query)
@@ -15176,7 +15178,35 @@ def extract_epg_final_mile_details(html_text: str) -> dict[str, str]:
     }
 
 
-def fetch_epg_final_mile_details(tracking_code: str) -> dict[str, str]:
+def extract_epg_tracking_events(html_text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for encoded in re.findall(
+        r"transactionDetails\('(\[.*?\])'\s*,",
+        str(html_text or ""),
+        re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            payload = json.loads(html.unescape(encoded))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, list):
+            events.extend(item for item in payload if isinstance(item, dict))
+    unique: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for event in events:
+        key = (
+            clean_text(event.get("EventDT")),
+            clean_text(event.get("Event")),
+            clean_text(event.get("Loc")),
+        )
+        unique[key] = event
+    return sorted(
+        unique.values(),
+        key=lambda event: parse_epost_datetime(event.get("EventDT")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def fetch_epg_tracking_snapshot(tracking_code: str) -> dict[str, Any]:
     code = clean_text(tracking_code).upper()
     if not re.fullmatch(r"EPG[0-9A-Z]+", code):
         return {}
@@ -15194,7 +15224,23 @@ def fetch_epg_final_mile_details(tracking_code: str) -> dict[str, str]:
     )
     response.raise_for_status()
     details = extract_epg_final_mile_details(response.text)
-    return {key: clean_text(value) for key, value in details.items()}
+    events = extract_epg_tracking_events(response.text)
+    latest = events[0] if events else {}
+    return {
+        **{key: clean_text(value) for key, value in details.items()},
+        "status": clean_text(latest.get("Event")),
+        "last_update_at": clean_text(latest.get("EventDT")),
+        "location": clean_text(latest.get("Loc")),
+        "events": events,
+    }
+
+
+def fetch_epg_final_mile_details(tracking_code: str) -> dict[str, str]:
+    snapshot = fetch_epg_tracking_snapshot(tracking_code)
+    return {
+        key: clean_text(snapshot.get(key))
+        for key in ("final_mile_tracking_number", "final_mile_tracking_url", "final_mile_carrier")
+    }
 
 
 def refresh_epost_final_mile_tracking(row_id: int) -> dict[str, Any]:
@@ -15241,8 +15287,64 @@ def refresh_epost_final_mile_tracking(row_id: int) -> dict[str, Any]:
     }
 
 
+def refresh_epost_tracking_snapshot(row_id: int) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM epost_global_tracking WHERE id=?", (row_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tracking row not found.")
+    snapshot = fetch_epg_tracking_snapshot(row["tracking_code"])
+    status = clean_text(snapshot.get("status")) or clean_text(row["status"])
+    last_update_at = clean_text(snapshot.get("last_update_at")) or clean_text(row["last_update_at"])
+    epost_status = epost_status_from_update(status, last_update_at, row["created_at"])
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE epost_global_tracking
+            SET status=COALESCE(NULLIF(?, ''), status),
+                last_update_at=COALESCE(NULLIF(?, ''), last_update_at),
+                location=COALESCE(NULLIF(?, ''), location),
+                events_json=CASE WHEN ? != '[]' THEN ? ELSE events_json END,
+                last_checked_at=?,
+                epost_status=?,
+                final_mile_tracking_number=COALESCE(NULLIF(?, ''), final_mile_tracking_number),
+                final_mile_tracking_url=COALESCE(NULLIF(?, ''), final_mile_tracking_url),
+                final_mile_carrier=COALESCE(NULLIF(?, ''), final_mile_carrier),
+                final_mile_checked_at=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                status,
+                last_update_at,
+                clean_text(snapshot.get("location")),
+                json.dumps(snapshot.get("events") or [], default=str),
+                json.dumps(snapshot.get("events") or [], default=str),
+                now,
+                epost_status,
+                clean_text(snapshot.get("final_mile_tracking_number")),
+                clean_text(snapshot.get("final_mile_tracking_url")),
+                clean_text(snapshot.get("final_mile_carrier")),
+                now,
+                now,
+                row_id,
+            ),
+        )
+    return {
+        "ok": True,
+        "row_id": row_id,
+        "status": status,
+        "epost_status": epost_status,
+        "final_mile_tracking_number": clean_text(snapshot.get("final_mile_tracking_number")) or clean_text(row["final_mile_tracking_number"]),
+    }
+
+
 def sync_epost_tracking_and_final_mile(days: int = 7, limit: int = 500, workers: int = 4) -> dict[str, int]:
-    synced = sync_epost_tracking_from_odoo(None, days)
+    with db() as conn:
+        count_before = int(conn.execute("SELECT COUNT(*) AS count FROM epost_global_tracking").fetchone()["count"] or 0)
+    scanned = sync_epost_tracking_from_odoo(None, days)
+    with db() as conn:
+        count_after = int(conn.execute("SELECT COUNT(*) AS count FROM epost_global_tracking").fetchone()["count"] or 0)
     retry_before = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     with db() as conn:
         rows = conn.execute(
@@ -15250,12 +15352,14 @@ def sync_epost_tracking_and_final_mile(days: int = 7, limit: int = 500, workers:
             SELECT id
             FROM epost_global_tracking
             WHERE tracking_code ILIKE 'EPG%'
-              AND COALESCE(final_mile_tracking_number, '') = ''
-              AND (final_mile_checked_at IS NULL OR final_mile_checked_at <= ?)
+              AND (
+                    (COALESCE(epost_status, '') != 'delivered' AND (last_checked_at IS NULL OR last_checked_at <= ?))
+                 OR (COALESCE(final_mile_tracking_number, '') = '' AND (final_mile_checked_at IS NULL OR final_mile_checked_at <= ?))
+              )
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (retry_before, max(1, min(2000, int(limit or 500)))),
+            (retry_before, retry_before, max(1, min(2000, int(limit or 500)))),
         ).fetchall()
     row_ids = [int(row["id"]) for row in rows]
     found = 0
@@ -15265,7 +15369,7 @@ def sync_epost_tracking_and_final_mile(days: int = 7, limit: int = 500, workers:
         thread_name_prefix="epost-final-mile",
     ) as executor:
         futures = {
-            executor.submit(refresh_epost_final_mile_tracking, row_id): row_id
+            executor.submit(refresh_epost_tracking_snapshot, row_id): row_id
             for row_id in row_ids
         }
         for future, row_id in futures.items():
@@ -15276,11 +15380,12 @@ def sync_epost_tracking_and_final_mile(days: int = 7, limit: int = 500, workers:
                 failed += 1
                 with db() as conn:
                     conn.execute(
-                        "UPDATE epost_global_tracking SET final_mile_checked_at=? WHERE id=?",
-                        (utc_now(), row_id),
+                        "UPDATE epost_global_tracking SET final_mile_checked_at=?, last_checked_at=? WHERE id=?",
+                        (utc_now(), utc_now(), row_id),
                     )
     return {
-        "synced": synced,
+        "synced": max(0, count_after - count_before),
+        "scanned": scanned,
         "checked": len(row_ids),
         "found": found,
         "failed": failed,
@@ -15328,7 +15433,7 @@ def track_order_rows(
             FROM epost_global_tracking
             WHERE (? IS NULL OR store_id=?)
               AND (? IS NULL OR website_id=?)
-              AND (? = FALSE OR NULLIF(BTRIM(COALESCE(final_mile_tracking_number, '')), '') IS NOT NULL)
+              AND (? = FALSE OR LOWER(BTRIM(COALESCE(final_mile_tracking_number, ''))) NOT IN ('', '-', 'n/a', 'na', 'none', 'pending'))
             """,
             (store_id, store_id, website_id, website_id, final_mile_only),
         ).fetchone()["count"] or 0)
@@ -15339,7 +15444,7 @@ def track_order_rows(
             JOIN stores ON stores.id=epost_global_tracking.store_id
             WHERE (? IS NULL OR epost_global_tracking.store_id=?)
               AND (? IS NULL OR epost_global_tracking.website_id=?)
-              AND (? = FALSE OR NULLIF(BTRIM(COALESCE(epost_global_tracking.final_mile_tracking_number, '')), '') IS NOT NULL)
+              AND (? = FALSE OR LOWER(BTRIM(COALESCE(epost_global_tracking.final_mile_tracking_number, ''))) NOT IN ('', '-', 'n/a', 'na', 'none', 'pending'))
             ORDER BY
               COALESCE(epost_global_tracking.odoo_order_id, 0) DESC,
               epost_global_tracking.created_at DESC,
@@ -15449,7 +15554,7 @@ def customer_track_order_public_rows(
     return [
         public_track_order_row(row)
         for row in customer_track_order_rows(store_id, query, website_id)
-        if clean_text(row.get("final_mile_tracking_number"))
+        if clean_text(row.get("final_mile_tracking_number")).lower() not in {"", "-", "n/a", "na", "none", "pending"}
     ]
 
 
@@ -22950,8 +23055,9 @@ def autosync_loop() -> None:
                     set_setting(
                         "epost_auto_sync_last_message",
                         (
-                            f"Imported {result['synced']} EPG shipments; checked {result['checked']} final-mile records, "
-                            f"found {result['found']}, failed {result['failed']}."
+                            f"Imported {result['synced']} new EPG shipments from {result['scanned']} recent Odoo records; "
+                            f"refreshed {result['checked']} tracking records, {result['found']} with final-mile details, "
+                            f"failed {result['failed']}."
                         ),
                     )
                     set_setting("epost_auto_sync_last_run_at", utc_now())
@@ -32092,7 +32198,21 @@ def latest_report(store_id: int) -> StreamingResponse:
 def health() -> dict[str, Any]:
     with db() as conn:
         conn.execute("SELECT 1")
-    return {"ok": True, "db": "postgres", "storage": "cloudflare-r2"}
+        epost_last_run = conn.execute(
+            "SELECT value FROM app_settings WHERE key='epost_auto_sync_last_run_at'"
+        ).fetchone()
+        epost_last_message = conn.execute(
+            "SELECT value FROM app_settings WHERE key='epost_auto_sync_last_message'"
+        ).fetchone()
+    return {
+        "ok": True,
+        "db": "postgres",
+        "storage": "cloudflare-r2",
+        "epost_auto_sync": {
+            "last_run_at": epost_last_run["value"] if epost_last_run else "",
+            "last_message": epost_last_message["value"] if epost_last_message else "",
+        },
+    }
 
 
 @app.get("/amazon-order-history-unmatched", response_class=HTMLResponse)
