@@ -118,6 +118,8 @@ COUNTRY_CODE_BY_HOST_SUFFIX = {
     ".ca": "CA",
     ".in": "IN",
 }
+EPOST_NEW_CODE_SYNC_INTERVAL_MINUTES = 5
+EPOST_STATUS_REFRESH_INTERVAL_HOURS = 6
 
 app = FastAPI(title="Amazon Business Fulfilment Control Panel")
 app.add_middleware(
@@ -15339,13 +15341,19 @@ def refresh_epost_tracking_snapshot(row_id: int) -> dict[str, Any]:
     }
 
 
-def sync_epost_tracking_and_final_mile(days: int = 7, limit: int = 500, workers: int = 4) -> dict[str, int]:
+def sync_epost_tracking_and_final_mile(
+    days: int = 7,
+    limit: int = 500,
+    workers: int = 4,
+    refresh_hours: int = EPOST_STATUS_REFRESH_INTERVAL_HOURS,
+) -> dict[str, int]:
     with db() as conn:
         count_before = int(conn.execute("SELECT COUNT(*) AS count FROM epost_global_tracking").fetchone()["count"] or 0)
     scanned = sync_epost_tracking_from_odoo(None, days)
     with db() as conn:
         count_after = int(conn.execute("SELECT COUNT(*) AS count FROM epost_global_tracking").fetchone()["count"] or 0)
-    retry_before = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    refresh_hours = max(1, min(24, int(refresh_hours or EPOST_STATUS_REFRESH_INTERVAL_HOURS)))
+    retry_before = (datetime.now(timezone.utc) - timedelta(hours=refresh_hours)).isoformat()
     with db() as conn:
         rows = conn.execute(
             """
@@ -23049,15 +23057,19 @@ def autosync_loop() -> None:
                 for store in list_stores():
                     sync_cancelled_orders_for_store(int(store["id"]), days=days)
                 last_cancelled_run = time.time()
-            if time.time() - last_epost_run >= 60 * 60:
+            if time.time() - last_epost_run >= EPOST_NEW_CODE_SYNC_INTERVAL_MINUTES * 60:
                 try:
-                    result = sync_epost_tracking_and_final_mile(days=7)
+                    result = sync_epost_tracking_and_final_mile(
+                        days=7,
+                        refresh_hours=EPOST_STATUS_REFRESH_INTERVAL_HOURS,
+                    )
                     set_setting(
                         "epost_auto_sync_last_message",
                         (
                             f"Imported {result['synced']} new EPG shipments from {result['scanned']} recent Odoo records; "
                             f"refreshed {result['checked']} tracking records, {result['found']} with final-mile details, "
-                            f"failed {result['failed']}."
+                            f"failed {result['failed']}. New-code scan: {EPOST_NEW_CODE_SYNC_INTERVAL_MINUTES} minutes; "
+                            f"status refresh: {EPOST_STATUS_REFRESH_INTERVAL_HOURS} hours."
                         ),
                     )
                     set_setting("epost_auto_sync_last_run_at", utc_now())
@@ -32209,6 +32221,8 @@ def health() -> dict[str, Any]:
         "db": "postgres",
         "storage": "cloudflare-r2",
         "epost_auto_sync": {
+            "new_code_scan_minutes": EPOST_NEW_CODE_SYNC_INTERVAL_MINUTES,
+            "status_refresh_hours": EPOST_STATUS_REFRESH_INTERVAL_HOURS,
             "last_run_at": epost_last_run["value"] if epost_last_run else "",
             "last_message": epost_last_message["value"] if epost_last_message else "",
         },
