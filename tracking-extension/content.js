@@ -511,8 +511,11 @@ function orderCardItems(card) {
   const byAsin = new Map();
   for (const product of productItemsFrom(card)) {
     if (!product.asin) continue;
-    const existing = byAsin.get(product.asin) || { ...product, quantity: 0 };
-    existing.quantity += 1;
+    const existing = byAsin.get(product.asin) || { ...product, quantity: 0, quantity_verified: false };
+    if (!existing.quantity_verified || product.quantity_verified) {
+      existing.quantity = Math.max(Number(existing.quantity || 0), Number(product.quantity || 1));
+    }
+    existing.quantity_verified = existing.quantity_verified || product.quantity_verified === true;
     byAsin.set(product.asin, existing);
   }
   for (const item of byAsin.values()) items.push(item);
@@ -763,12 +766,17 @@ function productItemsFrom(root, limit = 50) {
       "",
     ) : "";
     if (!title || !imageUrl) return;
+    const quantityNode = box.querySelector(".od-item-view-qty, .itemQuantity, [data-quantity]");
+    const quantityValue = quantityNode?.getAttribute?.("data-quantity") || quantityNode?.textContent || box.getAttribute?.("data-quantity") || "";
+    const explicitQuantity = String(quantityValue).match(/\d+/)?.[0];
     seen.add(asin);
     products.push({
       asin,
       url: absoluteUrl(href),
       title,
       image_url: imageUrl,
+      quantity: Math.max(1, Math.round(Number(explicitQuantity || 1))),
+      quantity_verified: Boolean(explicitQuantity),
     });
   }
 

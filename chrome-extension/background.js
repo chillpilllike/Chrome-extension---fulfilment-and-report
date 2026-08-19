@@ -414,16 +414,27 @@ async function updateOrderProgressTotal(total = 0, message = "") {
 function normalizeRecentAmazonOrder(order = {}) {
   const orderId = String(order.amazon_order_id || "").trim();
   if (!/^\d{3}-\d{7}-\d{7}$/.test(orderId)) return null;
-  const items = (order.items || [])
+  const rawItems = (order.items || [])
     .map((item) => ({
       asin: String(item?.asin || "").trim().toUpperCase(),
       quantity: Math.max(1, Math.round(Number(item?.quantity || 1))),
+      quantity_verified: item?.quantity_verified === true,
     }))
     .filter((item) => item.asin);
-  const asinQuantities = {};
-  for (const item of items) {
-    asinQuantities[item.asin] = (asinQuantities[item.asin] || 0) + item.quantity;
+  const itemsByAsin = new Map();
+  for (const item of rawItems) {
+    const existing = itemsByAsin.get(item.asin);
+    if (!existing) {
+      itemsByAsin.set(item.asin, item);
+      continue;
+    }
+    if (!existing.quantity_verified || item.quantity_verified) {
+      existing.quantity = Math.max(existing.quantity, item.quantity);
+    }
+    existing.quantity_verified = existing.quantity_verified || item.quantity_verified;
   }
+  const items = [...itemsByAsin.values()];
+  const asinQuantities = Object.fromEntries(items.map((item) => [item.asin, item.quantity]));
   for (const asin of order.asins || []) {
     const normalizedAsin = String(asin || "").trim().toUpperCase();
     if (normalizedAsin && !asinQuantities[normalizedAsin]) asinQuantities[normalizedAsin] = 1;

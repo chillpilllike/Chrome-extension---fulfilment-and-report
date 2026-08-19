@@ -634,6 +634,7 @@ type DispatchStatusRow = {
 type PackageTrackerProduct = {
   title: string
   asin: string
+  quantity?: number
   image_url?: string
   url?: string
 }
@@ -8682,7 +8683,10 @@ function PackageTrackerDesignPage() {
                                     )}
                                     <div className="flex-fill overflow-hidden">
                                       <h4 className="card-title mb-0 text-break">{product.title}</h4>
-                                      <div className="text-secondary small text-break">{product.asin}</div>
+                                      <div className="d-flex flex-wrap align-items-center gap-1 text-secondary small text-break">
+                                        <span>{product.asin}</span>
+                                        <span className="badge bg-secondary-lt text-secondary">Qty {Number(product.quantity || 1)}</span>
+                                      </div>
                                     </div>
                                   </div>
                                 )

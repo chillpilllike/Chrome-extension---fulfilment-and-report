@@ -39,6 +39,15 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
 
         self.assertEqual(merged[0]["quantity"], 2)
 
+    def test_verified_amazon_quantity_corrects_older_inflated_value(self):
+        existing = [{"asin": "B0FSG4V4H8", "quantity": 3}]
+        incoming = [{"asin": "B0FSG4V4H8", "quantity": 2, "quantity_verified": True}]
+
+        merged = merge_amazon_product_snapshots(existing, incoming)
+
+        self.assertEqual(merged[0]["quantity"], 2)
+        self.assertTrue(merged[0]["quantity_verified"])
+
     def test_tracker_uses_captured_image_for_unambiguous_replacement_asin(self):
         product = {"asin": "B0D1QMKKQR", "image_url": ""}
         history_products = [{

@@ -3913,14 +3913,21 @@ def normalize_amazon_product_items(values: Any) -> list[dict[str, Any]]:
             quantity = max(1.0, float(raw.get("quantity") or 1))
         except (TypeError, ValueError):
             quantity = 1.0
+        quantity_verified = bool(raw.get("quantity_verified"))
         product = by_asin.setdefault(asin, {
             "asin": asin,
             "url": asin_product_url(asin),
             "title": "",
             "image_url": "",
             "quantity": 0.0,
+            "quantity_verified": False,
         })
-        product["quantity"] = float(product.get("quantity") or 0) + quantity
+        if quantity_verified:
+            prior_quantity = float(product.get("quantity") or 0) if product.get("quantity_verified") else 0.0
+            product["quantity"] = max(prior_quantity, quantity)
+            product["quantity_verified"] = True
+        elif not product.get("quantity_verified"):
+            product["quantity"] = float(product.get("quantity") or 0) + quantity
         title = useful_amazon_product_title(raw.get("title"))
         image_url = clean_text(raw.get("image_url") or raw.get("imageUrl"))
         url = clean_text(raw.get("url"))
@@ -3933,6 +3940,8 @@ def normalize_amazon_product_items(values: Any) -> list[dict[str, Any]]:
     for product in by_asin.values():
         if float(product.get("quantity") or 0) == 1:
             product.pop("quantity", None)
+        if not product.get("quantity_verified"):
+            product.pop("quantity_verified", None)
         products.append(product)
     return products
 
@@ -3961,11 +3970,13 @@ def merge_amazon_product_snapshots(existing_values: Any, incoming_values: Any) -
             incoming_quantity = max(1.0, float(product.get("quantity") or 1))
         except (TypeError, ValueError):
             incoming_quantity = 1.0
-        quantity = max(existing_quantity, incoming_quantity)
+        quantity = incoming_quantity if product.get("quantity_verified") else max(existing_quantity, incoming_quantity)
         if quantity == 1:
             current.pop("quantity", None)
         else:
             current["quantity"] = quantity
+        if product.get("quantity_verified"):
+            current["quantity_verified"] = True
     return list(merged.values())
 
 
@@ -31644,9 +31655,18 @@ def api_public_package_tracker(
                 products.extend(dict(product) for product in missing_history_products)
             history_products = [dict(item) for item in parse_json_list_value(history.get("items_json")) if isinstance(item, dict)]
             history_asins = list(dict.fromkeys(normalize_asin(item.get("asin")) for item in history_products if normalize_asin(item.get("asin"))))
+            normalized_history_by_asin = {
+                normalize_asin(item.get("asin")): item
+                for item in normalize_amazon_product_items(history_products)
+                if normalize_asin(item.get("asin"))
+            }
             for product in products:
                 asin = normalize_asin(product.get("asin"))
                 product["asin"] = asin
+                history_product = normalized_history_by_asin.get(asin, {})
+                if not product.get("quantity") and history_product.get("quantity"):
+                    product["quantity"] = history_product["quantity"]
+                product["quantity"] = max(1.0, float(product.get("quantity") or 1))
                 title = clean_text(product.get("title"))
                 if not useful_amazon_product_title(title) or title.upper() == asin:
                     title = source_title_by_order_asin.get((clean_text(package.get("amazon_order_id")), asin), "") or source_title_by_card_asin.get((store_id, order_name, asin), "")
@@ -31671,6 +31691,7 @@ def api_public_package_tracker(
                     existing["title"] = product.get("title")
                 if not clean_text(existing.get("image_url")) and clean_text(product.get("image_url")):
                     existing["image_url"] = product.get("image_url")
+                existing["quantity"] = max(float(existing.get("quantity") or 1), float(product.get("quantity") or 1))
             products = list(products_by_asin.values())
             tracking_id = next((clean_text(value) for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code")) if package_tracking_id_is_physical(value)), "")
             item = {

@@ -6452,18 +6452,40 @@ function orderCardItems(card) {
       : row.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
     const asin = asinFromAmazonHref(link?.href || link?.getAttribute?.("href") || "");
     if (!asin) continue;
-    const quantityText = row.matches?.("a[href*='/dp/'], a[href*='/gp/product/']")
-      ? ""
-      : (row.querySelector(".itemQuantity")?.textContent || "");
-    const quantity = Math.max(1, Math.round(Number((quantityText || "").match(/\d+/)?.[0] || 1)));
-    quantitiesByAsin[asin] = (quantitiesByAsin[asin] || 0) + quantity;
+    const quantityInfo = quantityFromItemElement(itemContainerForQuantity(link));
+    const existing = quantitiesByAsin[asin] || { quantity: 0, quantity_verified: false };
+    if (!existing.quantity_verified || quantityInfo.quantity_verified) {
+      existing.quantity = Math.max(Number(existing.quantity || 0), quantityInfo.quantity);
+    }
+    existing.quantity_verified = existing.quantity_verified || quantityInfo.quantity_verified;
+    quantitiesByAsin[asin] = existing;
   }
-  return Object.entries(quantitiesByAsin).map(([asin, quantity]) => ({ asin, quantity }));
+  return Object.entries(quantitiesByAsin).map(([asin, value]) => ({ asin, ...value }));
 }
 
 function quantityFromText(text = "") {
   const match = String(text || "").match(/\b(?:qty|quantity)\s*:?\s*(\d+)\b/i);
   return Math.max(1, Math.round(Number(match?.[1] || 1)));
+}
+
+function itemContainerForQuantity(link) {
+  let node = link?.parentElement || null;
+  for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+    const quantities = node.querySelectorAll?.(".od-item-view-qty, .itemQuantity, [data-quantity]") || [];
+    if (quantities.length === 1) return node;
+  }
+  return link?.closest?.("[data-component='purchasedItems'], [data-component='item'], .od-item, .a-fixed-left-grid, .a-row.a-spacing-top-base, .a-section, li") || link?.parentElement;
+}
+
+function quantityFromItemElement(element) {
+  const quantityNode = element?.querySelector?.(".od-item-view-qty, .itemQuantity, [data-quantity]");
+  const attributeValue = quantityNode?.getAttribute?.("data-quantity") || element?.getAttribute?.("data-quantity") || "";
+  const visibleValue = quantityNode?.textContent || "";
+  const explicit = String(attributeValue || visibleValue).match(/\d+/)?.[0];
+  if (explicit) {
+    return { quantity: Math.max(1, Math.round(Number(explicit) || 1)), quantity_verified: true };
+  }
+  return { quantity: quantityFromText(element?.innerText || element?.textContent || ""), quantity_verified: false };
 }
 
 function orderDetailsPageOrderId() {
@@ -6510,11 +6532,16 @@ function orderDetailsPageItems() {
   for (const link of purchasedLinks) {
     const asin = asinFromAmazonHref(link.href || link.getAttribute("href") || "");
     if (!asin) continue;
-    const row = link.closest(".a-row.a-spacing-top-base, .a-row, .a-section, li, div");
-    const quantity = quantityFromText(row?.innerText || row?.textContent || "");
-    quantitiesByAsin[asin] = Math.max(Number(quantitiesByAsin[asin] || 0), quantity);
+    const row = itemContainerForQuantity(link);
+    const quantityInfo = quantityFromItemElement(row);
+    const existing = quantitiesByAsin[asin] || { quantity: 0, quantity_verified: false };
+    if (!existing.quantity_verified || quantityInfo.quantity_verified) {
+      existing.quantity = Math.max(Number(existing.quantity || 0), quantityInfo.quantity);
+    }
+    existing.quantity_verified = existing.quantity_verified || quantityInfo.quantity_verified;
+    quantitiesByAsin[asin] = existing;
   }
-  return Object.entries(quantitiesByAsin).map(([asin, quantity]) => ({ asin, quantity }));
+  return Object.entries(quantitiesByAsin).map(([asin, value]) => ({ asin, ...value }));
 }
 
 function orderDetailsPageDetails() {
