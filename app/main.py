@@ -31075,6 +31075,8 @@ def package_tracker_quantity_analysis(
 
     packages_by_order: dict[str, list[dict[str, Any]]] = {}
     for package in packages:
+        if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) == "cancelled":
+            continue
         packages_by_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
 
     amazon_by_asin: dict[str, dict[str, Any]] = {}

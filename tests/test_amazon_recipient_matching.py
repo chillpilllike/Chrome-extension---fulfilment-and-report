@@ -60,6 +60,23 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
 
         self.assertEqual(analysis["asin_mismatches"][0]["amazon_asin"], "B099999999")
 
+    def test_duplicate_analysis_ignores_cancelled_amazon_packages(self):
+        lines = [{"asin": "B012345678", "quantity": 1}]
+        packages = [
+            {"amazon_order_id": "111-1111111-1111111", "products_json": '[{"asin":"B012345678"}]', "asins_json": "[]"},
+            {
+                "amazon_order_id": "111-2222222-2222222",
+                "package_status": "Order cancelled",
+                "products_json": '[{"asin":"B012345678"},{"asin":"B099999999"}]',
+                "asins_json": "[]",
+            },
+        ]
+
+        analysis = package_tracker_quantity_analysis(lines, packages, {})
+
+        self.assertFalse(analysis["suspected_duplicate"])
+        self.assertEqual(analysis["asin_mismatches"], [])
+
     def test_tracker_adds_history_item_only_for_strict_product_superset(self):
         packages = [{"asins_json": '["B09NP8BRPB", "B00C2DHB5K"]', "products_json": "[]"}]
         history = {"items_json": '[{"asin":"B09NP8BRPB"},{"asin":"B00C2DHB5K"},{"asin":"B0F49XZ5PC","title":"Golden Thread"}]'}
