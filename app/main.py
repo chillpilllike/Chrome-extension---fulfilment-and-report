@@ -31053,6 +31053,7 @@ def api_public_package_tracker(
         "delivered": "active_count > 0 AND delivered_count = active_count",
         "shopify_pending": "active_count > 0 AND delivered_count = active_count AND NOT shopify_fulfilled",
         "cancelled_history": "has_cancelled_history",
+        "suspected_duplicate": "has_suspected_duplicates",
     }.get(status, "TRUE")
     sort_sql = {
         "delivery_asc": "NULLIF(delivery_date, '') ASC NULLS LAST, odoo_order_name ASC",
@@ -31219,11 +31220,30 @@ def api_public_package_tracker(
                     SELECT 1 FROM line_groups lines
                     WHERE lines.store_id=packages.store_id AND UPPER(lines.odoo_order_name)=UPPER(packages.odoo_order_name)
                 )
+            ), duplicate_package_groups AS (
+                SELECT duplicate_asins.store_id, duplicate_asins.order_key, TRUE AS has_suspected_duplicates
+                FROM (
+                    SELECT p.store_id, UPPER(p.odoo_order_name) AS order_key, UPPER(package_asin.value) AS asin
+                    FROM amazon_dispatch_packages p
+                    CROSS JOIN LATERAL jsonb_array_elements_text(
+                        CASE
+                            WHEN COALESCE(p.asins_json, '') ~ '^\\s*\\[' THEN p.asins_json::jsonb
+                            ELSE '[]'::jsonb
+                        END
+                    ) package_asin(value)
+                    WHERE COALESCE(p.odoo_order_name, '') != ''
+                      AND COALESCE(p.amazon_order_id, '') != ''
+                      AND LOWER(COALESCE(p.package_status, '') || ' ' || COALESCE(p.promise, '')) NOT LIKE '%cancel%'
+                    GROUP BY p.store_id, UPPER(p.odoo_order_name), UPPER(package_asin.value)
+                    HAVING COUNT(DISTINCT p.amazon_order_id) > 1
+                ) duplicate_asins
+                GROUP BY duplicate_asins.store_id, duplicate_asins.order_key
             ), enriched AS (
                 SELECT groups.*, COALESCE(shop.shopify_order_url, '') AS shopify_order_url,
                        COALESCE(shop.fulfillment_status, '') AS shopify_fulfillment_status,
                        COALESCE(shop.synced_at, '') AS shopify_synced_at,
-                       LOWER(COALESCE(shop.fulfillment_status, '')) IN ('fulfilled', 'success') AS shopify_fulfilled
+                       LOWER(COALESCE(shop.fulfillment_status, '')) IN ('fulfilled', 'success') AS shopify_fulfilled,
+                       COALESCE(duplicates.has_suspected_duplicates, FALSE) AS has_suspected_duplicates
                 FROM combined_groups groups
                 LEFT JOIN LATERAL (
                     SELECT cache.shopify_order_url, cache.fulfillment_status, cache.synced_at
@@ -31232,6 +31252,8 @@ def api_public_package_tracker(
                     ORDER BY CASE WHEN COALESCE(cache.cancelled_at, '') = '' THEN 0 ELSE 1 END, cache.synced_at DESC
                     LIMIT 1
                 ) shop ON TRUE
+                LEFT JOIN duplicate_package_groups duplicates
+                  ON duplicates.store_id=groups.store_id AND duplicates.order_key=UPPER(groups.odoo_order_name)
             ), filtered AS (
                 SELECT * FROM enriched e
                 WHERE (? = '' OR ({scoped_search_sql}))

@@ -8346,6 +8346,20 @@ function packageTrackerLatestAmazonOrderDate(row: PackageTrackerOrderCard) {
   }, { value: "", timestamp: Number.NEGATIVE_INFINITY }).value
 }
 
+function packageTrackerDuplicateAsins(row: PackageTrackerOrderCard) {
+  const amazonOrdersByAsin = new Map<string, Set<string>>()
+  row.packages.forEach((item) => {
+    item.products.forEach((product) => {
+      const asin = product.asin?.trim().toUpperCase()
+      if (!asin || !item.amazon_order_id) return
+      const amazonOrders = amazonOrdersByAsin.get(asin) || new Set<string>()
+      amazonOrders.add(item.amazon_order_id)
+      amazonOrdersByAsin.set(asin, amazonOrders)
+    })
+  })
+  return [...amazonOrdersByAsin.entries()].filter(([, amazonOrders]) => amazonOrders.size > 1).map(([asin]) => asin)
+}
+
 function PackageTrackerDesignPage() {
   const [query, setQuery] = useState("")
   const [debouncedQuery, setDebouncedQuery] = useState("")
@@ -8486,6 +8500,7 @@ function PackageTrackerDesignPage() {
                 <option value="delivered">Fully delivered</option>
                 <option value="shopify_pending">Delivered, Shopify pending</option>
                 <option value="cancelled_history">Has cancelled history</option>
+                <option value="suspected_duplicate">Suspected duplicate orders</option>
               </select>
             </div>
             <div className="col-12 col-md-4 col-xl-2">
@@ -8545,6 +8560,7 @@ function PackageTrackerDesignPage() {
         const historyOpen = expandedHistory.includes(row.id)
         const progress = summary.active ? Math.round((summary.delivered / summary.active) * 100) : 0
         const latestAmazonOrderDate = packageTrackerLatestAmazonOrderDate(row)
+        const duplicateAsins = packageTrackerDuplicateAsins(row)
         return (
           <article className="card card-sm" key={row.id}>
             <div className={`card-status-top bg-${color}`} />
@@ -8567,6 +8583,7 @@ function PackageTrackerDesignPage() {
                     {row.recipient_verified ? "Recipient verified" : "Check recipient"}
                   </span>
                   {latestAmazonOrderDate && <span className="badge bg-azure-lt text-azure">Latest Amazon order · {packageTrackerAmazonOrderDate(latestAmazonOrderDate)}</span>}
+                  {duplicateAsins.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {duplicateAsins.length} ASIN{duplicateAsins.length === 1 ? "" : "s"}</span>}
                   <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
                 </div>
               </div>
