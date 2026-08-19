@@ -31012,6 +31012,33 @@ def package_tracker_cached_image_url(asin: str) -> str:
     return image_url
 
 
+def package_tracker_product_image_url(
+    product: dict[str, Any],
+    history_products: list[dict[str, Any]],
+    *,
+    allow_unambiguous_replacement: bool = False,
+) -> str:
+    """Prefer captured Amazon images before the slower ASIN lookup fallback."""
+    existing_url = clean_text(product.get("image_url"))
+    if existing_url:
+        return existing_url
+    asin = normalize_asin(product.get("asin"))
+    normalized_history = normalize_amazon_product_items(history_products)
+    history_by_asin = {
+        normalize_asin(item.get("asin")): item
+        for item in normalized_history
+        if normalize_asin(item.get("asin"))
+    }
+    matched = history_by_asin.get(asin)
+    if not matched and allow_unambiguous_replacement and len(history_by_asin) == 1:
+        matched = next(iter(history_by_asin.values()))
+    captured_url = clean_text((matched or {}).get("image_url"))
+    if captured_url:
+        return captured_url
+    image_asin = normalize_asin((matched or {}).get("asin")) or asin
+    return f"/api/public/asin-image/{quote_plus(image_asin)}" if image_asin else ""
+
+
 def package_tracker_missing_history_products(
     packages: list[dict[str, Any]],
     history: dict[str, Any],
@@ -31566,6 +31593,8 @@ def api_public_package_tracker(
             missing_history_products = missing_history_products_by_order.get(amazon_order_id, [])
             if missing_history_products and len(package_rows_by_amazon_order.get(amazon_order_id, [])) == 1:
                 products.extend(dict(product) for product in missing_history_products)
+            history_products = [dict(item) for item in parse_json_list_value(history.get("items_json")) if isinstance(item, dict)]
+            history_asins = list(dict.fromkeys(normalize_asin(item.get("asin")) for item in history_products if normalize_asin(item.get("asin"))))
             for product in products:
                 asin = normalize_asin(product.get("asin"))
                 product["asin"] = asin
@@ -31573,14 +31602,13 @@ def api_public_package_tracker(
                 if not useful_amazon_product_title(title) or title.upper() == asin:
                     title = source_title_by_order_asin.get((clean_text(package.get("amazon_order_id")), asin), "") or source_title_by_card_asin.get((store_id, order_name, asin), "")
                 product["title"] = title or asin or "Amazon product"
-                image_asin = asin
-                history_products = [dict(item) for item in parse_json_list_value(history.get("items_json")) if isinstance(item, dict)]
-                history_asins = list(dict.fromkeys(normalize_asin(item.get("asin")) for item in history_products if normalize_asin(item.get("asin"))))
                 # A replacement ASIN is a safe image fallback only for the same Amazon order
                 # when both the dispatch package and history describe one unambiguous product.
-                if not clean_text(product.get("image_url")) and len(products) == 1 and len(history_asins) == 1:
-                    image_asin = history_asins[0]
-                product["image_url"] = clean_text(product.get("image_url")) or (f"/api/public/asin-image/{quote_plus(image_asin)}" if image_asin else "")
+                product["image_url"] = package_tracker_product_image_url(
+                    product,
+                    history_products,
+                    allow_unambiguous_replacement=len(products) == 1 and len(history_asins) == 1,
+                )
                 product["url"] = clean_text(product.get("url")) or (f"https://www.amazon.com/dp/{quote_plus(asin)}" if asin else "")
             products_by_asin: dict[str, dict[str, Any]] = {}
             for product in products:

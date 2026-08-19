@@ -10,12 +10,39 @@ from app.main import (
     manual_order_refs_from_payload,
     parse_amazon_order_placed_date,
     package_tracker_missing_history_products,
+    package_tracker_product_image_url,
     package_tracker_quantity_analysis,
 )
 from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatchPayload
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_tracker_uses_captured_image_for_unambiguous_replacement_asin(self):
+        product = {"asin": "B0D1QMKKQR", "image_url": ""}
+        history_products = [{
+            "asin": "B002NPCML0",
+            "image_url": "https://m.media-amazon.com/images/I/captured.jpg",
+        }]
+
+        image_url = package_tracker_product_image_url(
+            product,
+            history_products,
+            allow_unambiguous_replacement=True,
+        )
+
+        self.assertEqual(image_url, "https://m.media-amazon.com/images/I/captured.jpg")
+
+    def test_tracker_does_not_borrow_ambiguous_history_image(self):
+        product = {"asin": "B0D1QMKKQR", "image_url": ""}
+        history_products = [
+            {"asin": "B002NPCML0", "image_url": "https://m.media-amazon.com/images/I/one.jpg"},
+            {"asin": "B099999999", "image_url": "https://m.media-amazon.com/images/I/two.jpg"},
+        ]
+
+        image_url = package_tracker_product_image_url(product, history_products)
+
+        self.assertEqual(image_url, "/api/public/asin-image/B0D1QMKKQR")
+
     def test_duplicate_analysis_respects_odoo_quantity_across_amazon_orders(self):
         lines = [{"asin": "B012345678", "quantity": 2}]
         packages = [
