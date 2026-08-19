@@ -31405,6 +31405,30 @@ def package_tracker_missing_history_products(
     return [dict(history_by_asin[asin]) for asin in sorted(history_asins - package_asins)]
 
 
+def package_tracker_allowed_asins_for_order(
+    lines: list[dict[str, Any]],
+    amazon_order_id: str,
+    history: dict[str, Any],
+) -> set[str]:
+    """ASINs proven to belong to one Amazon order, including replacements."""
+    order_id = clean_text(amazon_order_id)
+    allowed: set[str] = set()
+    for line in lines:
+        if clean_text(line.get("amazon_order_id")) == order_id:
+            allowed.update(order_line_asin_aliases(line))
+    for product in parse_json_list_value(history.get("items_json")):
+        if isinstance(product, dict):
+            asin = normalize_asin(product.get("asin"))
+            if asin:
+                allowed.add(asin)
+    allowed.update(
+        normalize_asin(value)
+        for value in parse_json_list_value(history.get("asins_json"))
+        if normalize_asin(value)
+    )
+    return allowed
+
+
 def package_tracker_quantity_analysis(
     lines: list[dict[str, Any]],
     packages: list[dict[str, Any]],
@@ -31448,13 +31472,22 @@ def package_tracker_quantity_analysis(
             entry["amazon_order_ids"].add(amazon_order_id)
 
     for amazon_order_id, order_packages in packages_by_order.items():
+        allowed_asins = package_tracker_allowed_asins_for_order(
+            lines,
+            amazon_order_id,
+            history_by_order_id.get(amazon_order_id, {}),
+        )
         for package in order_packages:
             products = normalize_amazon_product_items(parse_json_list_value(package.get("products_json")))
+            if allowed_asins:
+                products = [product for product in products if normalize_asin(product.get("asin")) in allowed_asins]
             if products:
                 for product in products:
                     add_amazon_item(product.get("asin"), product.get("quantity"), amazon_order_id)
             else:
                 for asin in list(dict.fromkeys(normalize_asin(value) for value in parse_json_list_value(package.get("asins_json")) if normalize_asin(value))):
+                    if allowed_asins and asin not in allowed_asins:
+                        continue
                     add_amazon_item(asin, 1, amazon_order_id)
         if len(order_packages) == 1:
             for product in package_tracker_missing_history_products(
@@ -31932,13 +31965,29 @@ def api_public_package_tracker(
         for package in card_package_rows:
             history = history_by_order_id.get(clean_text(package.get("amazon_order_id")), {})
             amazon_order_id = clean_text(package.get("amazon_order_id"))
+            allowed_asins = package_tracker_allowed_asins_for_order(
+                lines_by_key.get((store_id, order_name), []),
+                amazon_order_id,
+                history,
+            )
             kind = package_tracker_delivery_kind(package.get("package_status"), package.get("promise"))
             delivered_at = clean_text(package.get("received_at")) if kind == "delivered" else ""
             if kind == "delivered" and not delivered_at:
                 delivered_at = package_tracker_delivery_date(package.get("package_status"), package.get("promise"), package.get("updated_at"))
             products = [dict(item) for item in parse_json_list_value(package.get("products_json")) if isinstance(item, dict)]
-            if not products:
-                products = [{"asin": clean_text(asin), "title": clean_text(asin), "image_url": "", "url": f"https://www.amazon.com/dp/{quote_plus(clean_text(asin))}"} for asin in parse_json_list_value(package.get("asins_json")) if clean_text(asin)]
+            if allowed_asins:
+                products = [product for product in products if normalize_asin(product.get("asin")) in allowed_asins]
+            package_asins = list(dict.fromkeys(
+                normalize_asin(asin)
+                for asin in parse_json_list_value(package.get("asins_json"))
+                if normalize_asin(asin) and (not allowed_asins or normalize_asin(asin) in allowed_asins)
+            ))
+            represented_asins = {normalize_asin(product.get("asin")) for product in products if normalize_asin(product.get("asin"))}
+            products.extend(
+                {"asin": asin, "title": asin, "image_url": "", "url": f"https://www.amazon.com/dp/{quote_plus(asin)}"}
+                for asin in package_asins
+                if asin not in represented_asins
+            )
             missing_history_products = missing_history_products_by_order.get(amazon_order_id, [])
             if missing_history_products and len(package_rows_by_amazon_order.get(amazon_order_id, [])) == 1:
                 products.extend(dict(product) for product in missing_history_products)

@@ -13,6 +13,7 @@ from app.main import (
     normalize_amazon_product_items,
     parse_amazon_order_placed_date,
     package_tracker_missing_history_products,
+    package_tracker_allowed_asins_for_order,
     package_tracker_product_image_url,
     package_tracker_quantity_analysis,
     package_tracker_stuck_analysis,
@@ -138,6 +139,32 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
         )
 
         self.assertEqual(image_url, "https://m.media-amazon.com/images/I/global-capture.jpg")
+
+    def test_tracker_allowed_asins_are_scoped_to_exact_amazon_order(self):
+        lines = [
+            {"amazon_order_id": "111-1111111-1111111", "asin": "B089T9W99Z"},
+            {"amazon_order_id": "111-2222222-2222222", "asin": "B0D1QMKKQR"},
+        ]
+        history = {"asins_json": '["B002NPCML0"]', "items_json": '[]'}
+
+        allowed = package_tracker_allowed_asins_for_order(lines, "111-2222222-2222222", history)
+
+        self.assertEqual(allowed, {"B0D1QMKKQR", "B002NPCML0"})
+
+    def test_duplicate_analysis_drops_asin_leaked_from_another_amazon_order(self):
+        lines = [
+            {"amazon_order_id": "111-1111111-1111111", "asin": "B089T9W99Z", "quantity": 1},
+            {"amazon_order_id": "111-2222222-2222222", "asin": "B0D1QMKKQR", "quantity": 1},
+        ]
+        packages = [
+            {"amazon_order_id": "111-1111111-1111111", "products_json": '[{"asin":"B089T9W99Z"}]', "asins_json": '[]'},
+            {"amazon_order_id": "111-2222222-2222222", "products_json": '[]', "asins_json": '["B089T9W99Z","B0D1QMKKQR"]'},
+        ]
+
+        analysis = package_tracker_quantity_analysis(lines, packages, {})
+
+        self.assertFalse(analysis["suspected_duplicate"])
+        self.assertEqual(analysis["asin_mismatches"], [])
 
     def test_duplicate_analysis_respects_odoo_quantity_across_amazon_orders(self):
         lines = [{"asin": "B012345678", "quantity": 2}]

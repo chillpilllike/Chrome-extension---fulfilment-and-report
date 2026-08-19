@@ -2085,6 +2085,8 @@ function dispatchProductImagesFrom(value: { products?: Array<{ asin?: string; ti
     .filter((item) => item.src)
 }
 
+const dispatchThumbnailAutoRetryDelays = [1500, 5000, 15000, 60000]
+
 function DispatchProductThumb({ image, onPreview, itemClass }: { image: DispatchProductImage; onPreview: (image: DispatchProductImage) => void; itemClass: string }) {
   const [attempt, setAttempt] = useState(0)
   const [loaded, setLoaded] = useState(false)
@@ -2094,33 +2096,44 @@ function DispatchProductThumb({ image, onPreview, itemClass }: { image: Dispatch
     setLoaded(false)
     setFailed(false)
   }, [image.src])
-  const retrySrc = attempt ? `${image.src}${image.src.includes("?") ? "&" : "?"}retry=${attempt}` : image.src
+  useEffect(() => {
+    if (!failed || attempt >= dispatchThumbnailAutoRetryDelays.length) return
+    const timer = window.setTimeout(() => {
+      setLoaded(false)
+      setFailed(false)
+      setAttempt((value) => value + 1)
+    }, dispatchThumbnailAutoRetryDelays[attempt])
+    return () => window.clearTimeout(timer)
+  }, [attempt, failed])
+  const retryKey = attempt === dispatchThumbnailAutoRetryDelays.length ? "retry" : "image_retry"
+  const retrySrc = attempt ? `${image.src}${image.src.includes("?") ? "&" : "?"}${retryKey}=${attempt}` : image.src
+  const retriesExhausted = failed && attempt >= dispatchThumbnailAutoRetryDelays.length
   return (
     <button
       type="button"
       className={cn("relative flex items-center justify-center overflow-hidden rounded border bg-white transition hover:border-primary hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary", itemClass)}
       onClick={() => {
-        if (failed) {
+        if (retriesExhausted) {
           setLoaded(false)
           setFailed(false)
-          setAttempt((value) => value + 1)
+          setAttempt(0)
         } else if (loaded) {
           onPreview(image)
         }
       }}
-      title={failed ? `Retry thumbnail for ${image.asin || image.title}` : image.title}
+      title={retriesExhausted ? `Refresh thumbnail for ${image.asin || image.title}` : image.title}
     >
-      {!loaded && !failed && <span className="position-absolute spinner-border spinner-border-sm text-secondary" aria-label="Loading thumbnail" />}
-      {failed ? (
+      {!loaded && !retriesExhausted && <span className="position-absolute spinner-border spinner-border-sm text-secondary" aria-label="Loading thumbnail" />}
+      {retriesExhausted ? (
         <span className="d-flex flex-column align-items-center justify-content-center text-secondary" style={{ fontSize: "0.6rem", lineHeight: 1.1 }}>
           <PackageCheck className="icon icon-1 mb-1" />
-          Retry
+          No image
         </span>
       ) : (
         <img
           src={retrySrc}
           alt={image.title}
-          className={cn("h-full w-full object-contain", !loaded && "opacity-0")}
+          className={cn("h-full w-full object-contain", (!loaded || failed) && "opacity-0")}
           decoding="async"
           onLoad={() => setLoaded(true)}
           onError={() => { setLoaded(false); setFailed(true) }}
