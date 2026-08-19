@@ -771,7 +771,8 @@ function productItemsFrom(root, limit = 50) {
         .map((candidate) => String(candidate.getAttribute("href") || "").match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1]?.toUpperCase() || "")
         .filter(Boolean),
     );
-    const quantityNode = boxAsins.size === 1 && boxAsins.has(asin)
+    const quantityIsolated = boxAsins.size === 1 && boxAsins.has(asin);
+    const quantityNode = quantityIsolated
       ? (box.matches("[data-quantity]") ? box : box.querySelector(".od-item-view-qty, .itemQuantity, [data-quantity]"))
       : null;
     const quantityValue = quantityNode?.getAttribute?.("data-quantity") || quantityNode?.textContent || "";
@@ -783,7 +784,9 @@ function productItemsFrom(root, limit = 50) {
       title,
       image_url: imageUrl,
       quantity: Math.max(1, Math.round(Number(explicitQuantity || 1))),
-      quantity_verified: Boolean(explicitQuantity),
+      // Amazon only renders the quantity badge when the quantity exceeds one.
+      // Mark the default as verified only when this box belongs to one ASIN.
+      quantity_verified: quantityIsolated,
     });
   }
 

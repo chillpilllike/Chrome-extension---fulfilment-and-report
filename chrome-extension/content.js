@@ -6443,7 +6443,7 @@ function orderCardItems(card) {
       const asin = asinFromAmazonHref(link.href || link.getAttribute("href") || "");
       if (asin && !quantitiesByAsin[asin]) quantitiesByAsin[asin] = 1;
     }
-    return Object.entries(quantitiesByAsin).map(([asin, quantity]) => ({ asin, quantity }));
+    return Object.entries(quantitiesByAsin).map(([asin, quantity]) => ({ asin, quantity, quantity_verified: true }));
   }
   const rows = itemRows;
   for (const row of rows) {
@@ -6487,6 +6487,7 @@ function itemContainerForQuantity(link, targetAsin = "") {
 }
 
 function quantityFromItemElement(element) {
+  if (!element) return { quantity: 1, quantity_verified: false };
   const quantityNode = element?.querySelector?.(".od-item-view-qty, .itemQuantity, [data-quantity]");
   const attributeValue = quantityNode?.getAttribute?.("data-quantity") || element?.getAttribute?.("data-quantity") || "";
   const visibleValue = quantityNode?.textContent || "";
@@ -6494,7 +6495,9 @@ function quantityFromItemElement(element) {
   if (explicit) {
     return { quantity: Math.max(1, Math.round(Number(explicit) || 1)), quantity_verified: true };
   }
-  return { quantity: 1, quantity_verified: false };
+  // Amazon omits the quantity badge for a single unit. Once this product row
+  // is isolated to one ASIN, absence of the badge is an explicit quantity 1.
+  return { quantity: 1, quantity_verified: true };
 }
 
 function orderDetailsPageOrderId() {

@@ -10,6 +10,7 @@ from app.main import (
     chrome_completion_history_evidence_error,
     manual_order_refs_from_payload,
     merge_amazon_product_snapshots,
+    normalize_amazon_product_items,
     parse_amazon_order_placed_date,
     package_tracker_missing_history_products,
     package_tracker_product_image_url,
@@ -80,6 +81,16 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
         merged = merge_amazon_product_snapshots(existing, incoming)
 
         self.assertEqual(merged[0]["quantity"], 2)
+
+    def test_repeated_unverified_dom_links_do_not_inflate_quantity(self):
+        normalized = normalize_amazon_product_items([
+            {"asin": "B0FSG4V4H8"},
+            {"asin": "B0FSG4V4H8"},
+            {"asin": "B0FSG4V4H8"},
+        ])
+
+        self.assertEqual(len(normalized), 1)
+        self.assertNotIn("quantity", normalized[0])
 
     def test_verified_amazon_quantity_corrects_older_inflated_value(self):
         existing = [{"asin": "B0FSG4V4H8", "quantity": 3}]

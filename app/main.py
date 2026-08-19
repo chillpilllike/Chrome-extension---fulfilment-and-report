@@ -4048,7 +4048,9 @@ def normalize_amazon_product_items(values: Any) -> list[dict[str, Any]]:
             product["quantity"] = max(prior_quantity, quantity)
             product["quantity_verified"] = True
         elif not product.get("quantity_verified"):
-            product["quantity"] = float(product.get("quantity") or 0) + quantity
+            # Amazon repeats the same product link in image/title/action markup.
+            # Those are duplicate DOM representations, not additional units.
+            product["quantity"] = max(float(product.get("quantity") or 0), quantity)
         title = useful_amazon_product_title(raw.get("title"))
         image_url = clean_text(raw.get("image_url") or raw.get("imageUrl"))
         url = clean_text(raw.get("url"))
@@ -31817,12 +31819,13 @@ def api_public_package_tracker(
             ), filtered AS (
                 SELECT * FROM enriched e
                 WHERE (? = '' OR ({scoped_search_sql}))
-                  AND (? = '' OR COALESCE(NULLIF(delivery_date, ''), SUBSTRING(effective_date, 1, 10)) >= ?)
-                  AND (? = '' OR COALESCE(NULLIF(delivery_date, ''), SUBSTRING(effective_date, 1, 10)) <= ?)
+                  AND (? = '' OR NULLIF(delivery_date, '') >= ?)
+                  AND (? = '' OR NULLIF(delivery_date, '') <= ?)
                   AND {status_sql}
             )
             SELECT *, COUNT(*) OVER() AS total_count,
                    COALESCE(SUM(active_count) OVER(), 0) AS summary_packages,
+                   COALESCE(SUM(delivered_count) OVER(), 0) AS summary_delivered_packages,
                    COALESCE(SUM(CASE WHEN active_count > 0 AND delivered_count=active_count THEN 1 ELSE 0 END) OVER(), 0) AS summary_delivered,
                    COALESCE(SUM(CASE WHEN delivered_count > 0 AND delivered_count<active_count THEN 1 ELSE 0 END) OVER(), 0) AS summary_partial,
                    COALESCE(SUM(CASE WHEN active_count > 0 AND delivered_count=active_count AND NOT shopify_fulfilled THEN 1 ELSE 0 END) OVER(), 0) AS summary_shopify_pending
@@ -32144,6 +32147,7 @@ def api_public_package_tracker(
         "pages": max(1, (total + per_page - 1) // per_page),
         "summary": {
             "cards": total, "packages": int(first.get("summary_packages") or 0),
+            "delivered_packages": int(first.get("summary_delivered_packages") or 0),
             "delivered": int(first.get("summary_delivered") or 0), "partial": int(first.get("summary_partial") or 0),
             "shopify_pending": int(first.get("summary_shopify_pending") or 0),
         },

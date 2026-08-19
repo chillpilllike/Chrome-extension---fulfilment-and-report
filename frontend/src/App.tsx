@@ -703,7 +703,7 @@ type PackageTrackerResponse = {
   per_page: number
   total: number
   pages: number
-  summary: { cards: number; packages: number; delivered: number; partial: number; shopify_pending: number }
+  summary: { cards: number; packages: number; delivered_packages: number; delivered: number; partial: number; shopify_pending: number }
 }
 
 const packageTrackerDesignRows: PackageTrackerOrderCard[] = [
@@ -8431,7 +8431,7 @@ function PackageTrackerDesignPage() {
   const [perPage, setPerPage] = useState(12)
   const [rows, setRows] = useState<PackageTrackerOrderCard[]>([])
   const [total, setTotal] = useState(0)
-  const [totals, setTotals] = useState({ cards: 0, packages: 0, delivered: 0, partial: 0, shopify_pending: 0 })
+  const [totals, setTotals] = useState({ cards: 0, packages: 0, delivered_packages: 0, delivered: 0, partial: 0, shopify_pending: 0 })
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState("")
   const [imagePreview, setImagePreview] = useState<DispatchProductImage | null>(null)
@@ -8463,7 +8463,7 @@ function PackageTrackerDesignPage() {
       .then((result) => {
         setRows(result.rows || [])
         setTotal(Number(result.total || 0))
-        setTotals(result.summary || { cards: 0, packages: 0, delivered: 0, partial: 0, shopify_pending: 0 })
+        setTotals(result.summary || { cards: 0, packages: 0, delivered_packages: 0, delivered: 0, partial: 0, shopify_pending: 0 })
       })
       .catch((error) => {
         if (error?.name !== "AbortError") setLoadError(error instanceof Error ? error.message : "Package data could not be loaded.")
@@ -8571,7 +8571,14 @@ function PackageTrackerDesignPage() {
               <input id="package-tracker-from" className="form-control" type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} />
             </div>
             <div className="col-6 col-md-2 col-xl-2">
-              <label className="form-label" htmlFor="package-tracker-to">To date</label>
+              <div className="d-flex align-items-center justify-content-between">
+                <label className="form-label" htmlFor="package-tracker-to">To date</label>
+                {(fromDate || toDate) && (
+                  <button type="button" className="btn btn-link btn-sm p-0 mb-2" onClick={() => { setFromDate(""); setToDate("") }}>
+                    Clear dates
+                  </button>
+                )}
+              </div>
               <input id="package-tracker-to" className="form-control" type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} />
             </div>
           </div>
@@ -8580,6 +8587,7 @@ function PackageTrackerDesignPage() {
           <div className="row g-3 text-center">
             <div className="col-6 col-md"><div className="h2 m-0">{totals.cards.toLocaleString()}</div><div className="text-secondary">Odoo cards</div></div>
             <div className="col-6 col-md"><div className="h2 m-0">{totals.packages}</div><div className="text-secondary">Current packages</div></div>
+            <div className="col-6 col-md"><div className="h2 m-0 text-green">{totals.delivered_packages}</div><div className="text-secondary">Delivered packages</div></div>
             <div className="col-6 col-md"><div className="h2 m-0 text-green">{totals.delivered}</div><div className="text-secondary">Fully delivered</div></div>
             <div className="col-6 col-md"><div className="h2 m-0 text-yellow">{totals.partial}</div><div className="text-secondary">Partially delivered</div></div>
             <div className="col-12 col-md"><div className="h2 m-0 text-red">{totals.shopify_pending}</div><div className="text-secondary">Shopify action</div></div>
@@ -8734,7 +8742,7 @@ function PackageTrackerDesignPage() {
                                       <h4 className="card-title mb-0 text-break">{product.title}</h4>
                                       <div className="d-flex flex-wrap align-items-center gap-1 text-secondary small text-break">
                                         <span>{product.asin}</span>
-                                        <span className="badge bg-secondary-lt text-secondary">{product.quantity_verified ? `Qty ${Number(product.quantity || 1)}` : "Qty pending scan"}</span>
+                                        <span className="badge bg-secondary-lt text-secondary">{`Qty ${Number(product.quantity || 1)}`}</span>
                                       </div>
                                     </div>
                                   </div>
