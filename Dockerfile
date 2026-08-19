@@ -7,9 +7,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-# Bust Docker cache whenever the public GitHub main branch changes.
-ADD https://api.github.com/repos/chillpilllike/Chrome-extension---fulfilment-and-report/commits/main /tmp/github-version.json
-
 WORKDIR /src
 RUN git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" .
 
