@@ -31664,9 +31664,14 @@ def api_public_package_tracker(
                 asin = normalize_asin(product.get("asin"))
                 product["asin"] = asin
                 history_product = normalized_history_by_asin.get(asin, {})
-                if not product.get("quantity") and history_product.get("quantity"):
+                if product.get("quantity_verified"):
+                    product["quantity"] = max(1.0, float(product.get("quantity") or 1))
+                elif history_product.get("quantity_verified"):
                     product["quantity"] = history_product["quantity"]
-                product["quantity"] = max(1.0, float(product.get("quantity") or 1))
+                    product["quantity_verified"] = True
+                else:
+                    product["quantity"] = 1.0
+                    product["quantity_verified"] = False
                 title = clean_text(product.get("title"))
                 if not useful_amazon_product_title(title) or title.upper() == asin:
                     title = source_title_by_order_asin.get((clean_text(package.get("amazon_order_id")), asin), "") or source_title_by_card_asin.get((store_id, order_name, asin), "")

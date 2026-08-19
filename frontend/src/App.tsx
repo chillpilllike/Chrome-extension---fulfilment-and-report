@@ -635,6 +635,7 @@ type PackageTrackerProduct = {
   title: string
   asin: string
   quantity?: number
+  quantity_verified?: boolean
   image_url?: string
   url?: string
 }
@@ -8685,7 +8686,7 @@ function PackageTrackerDesignPage() {
                                       <h4 className="card-title mb-0 text-break">{product.title}</h4>
                                       <div className="d-flex flex-wrap align-items-center gap-1 text-secondary small text-break">
                                         <span>{product.asin}</span>
-                                        <span className="badge bg-secondary-lt text-secondary">Qty {Number(product.quantity || 1)}</span>
+                                        <span className="badge bg-secondary-lt text-secondary">{product.quantity_verified ? `Qty ${Number(product.quantity || 1)}` : "Qty pending scan"}</span>
                                       </div>
                                     </div>
                                   </div>
