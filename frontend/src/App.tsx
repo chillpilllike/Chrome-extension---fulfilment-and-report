@@ -8731,6 +8731,7 @@ function PackageTrackerDesignPage() {
                             <div className="d-grid gap-2">
                               {item.products.map((product, productIndex) => {
                                 const productImages = dispatchProductImagesFrom({ products: [product] })
+                                const productUrl = product.url || `https://www.amazon.com/dp/${encodeURIComponent(product.asin)}`
                                 return (
                                   <div className={`d-flex align-items-center gap-2 ${productIndex ? "border-top pt-2" : ""}`} key={`${product.asin}:${productIndex}`}>
                                     {productImages.length ? (
@@ -8739,9 +8740,13 @@ function PackageTrackerDesignPage() {
                                       <span className="avatar avatar-md bg-blue-lt text-blue flex-shrink-0"><PackageCheck className="icon" /></span>
                                     )}
                                     <div className="flex-fill overflow-hidden">
-                                      <h4 className="card-title mb-0 text-break">{product.title}</h4>
+                                      <h4 className="card-title mb-0 text-break">
+                                        <a href={productUrl} target="_blank" rel="noreferrer" className="text-reset text-decoration-none hover-underline">
+                                          {product.title}
+                                        </a>
+                                      </h4>
                                       <div className="d-flex flex-wrap align-items-center gap-1 text-secondary small text-break">
-                                        <span>{product.asin}</span>
+                                        <a href={productUrl} target="_blank" rel="noreferrer" className="font-monospace fw-semibold">{product.asin}</a>
                                         <span className="badge bg-secondary-lt text-secondary">{`Qty ${Number(product.quantity || 1)}`}</span>
                                       </div>
                                     </div>
