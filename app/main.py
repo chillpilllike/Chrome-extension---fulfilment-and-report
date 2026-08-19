@@ -31273,7 +31273,11 @@ def api_public_package_tracker(
                     ORDER BY l.updated_at DESC, l.id""",
                 key_params,
             ).fetchall())
-            amazon_order_ids = sorted({clean_text(row.get("amazon_order_id")) for row in line_rows if clean_text(row.get("amazon_order_id"))})
+            amazon_order_ids = sorted({
+                clean_text(row.get("amazon_order_id"))
+                for row in [*line_rows, *package_rows]
+                if clean_text(row.get("amazon_order_id"))
+            })
             if amazon_order_ids:
                 placeholders = ",".join("?" for _ in amazon_order_ids)
                 history_rows = rows_to_dicts(conn.execute(
@@ -31309,6 +31313,7 @@ def api_public_package_tracker(
         current_packages: list[dict[str, Any]] = []
         previous_orders: list[dict[str, Any]] = []
         for package in packages_by_key.get((store_id, order_name), []):
+            history = history_by_order_id.get(clean_text(package.get("amazon_order_id")), {})
             kind = package_tracker_delivery_kind(package.get("package_status"), package.get("promise"))
             delivered_at = clean_text(package.get("received_at")) if kind == "delivered" else ""
             if kind == "delivered" and not delivered_at:
@@ -31324,7 +31329,6 @@ def api_public_package_tracker(
                     title = source_title_by_order_asin.get((clean_text(package.get("amazon_order_id")), asin), "") or source_title_by_card_asin.get((store_id, order_name, asin), "")
                 product["title"] = title or asin or "Amazon product"
                 image_asin = asin
-                history = history_by_order_id.get(clean_text(package.get("amazon_order_id")), {})
                 history_products = [dict(item) for item in parse_json_list_value(history.get("items_json")) if isinstance(item, dict)]
                 history_asins = list(dict.fromkeys(normalize_asin(item.get("asin")) for item in history_products if normalize_asin(item.get("asin"))))
                 # A replacement ASIN is a safe image fallback only for the same Amazon order
@@ -31350,6 +31354,7 @@ def api_public_package_tracker(
             item = {
                 "amazon_order_id": clean_text(package.get("amazon_order_id")),
                 "amazon_order_url": clean_text(package.get("amazon_order_url")) or order_line_amazon_url(package.get("amazon_order_id")),
+                "order_date": parse_amazon_order_placed_date(history.get("order_date")),
                 "recipient": clean_text(package.get("recipient_ref")) or recipient,
                 "tracking_id": tracking_id, "tracking_url": clean_text(package.get("tracking_url")),
                 "carrier": clean_text(package.get("carrier")) or "Amazon",
@@ -31413,6 +31418,7 @@ def api_public_package_tracker(
                 synthetic = {
                     "amazon_order_id": amazon_order_id,
                     "amazon_order_url": clean_text(history.get("amazon_order_url") or source.get("amazon_order_url")) or order_line_amazon_url(amazon_order_id),
+                    "order_date": parse_amazon_order_placed_date(history.get("order_date")),
                     "recipient": history_recipient or recipient or order_name,
                     "tracking_id": tracking_id,
                     "tracking_url": clean_text(part.get("tracking_url") or part.get("trackingUrl")) or clean_text(source.get("amazon_order_url")),
@@ -31428,6 +31434,13 @@ def api_public_package_tracker(
                     previous_orders.append(synthetic)
                 else:
                     current_packages.append(synthetic)
+        current_packages.sort(
+            key=lambda item: (
+                parse_iso_date(clean_text(item.get("order_date"))) or datetime.min.replace(tzinfo=timezone.utc),
+                parse_iso_date(clean_text(item.get("updated_at"))) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
+            reverse=True,
+        )
         fulfillment = clean_text(group.get("shopify_fulfillment_status")).lower()
         cards.append({
             "id": f"{store_id}:{order_name}",

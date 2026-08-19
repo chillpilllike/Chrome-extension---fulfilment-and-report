@@ -8,11 +8,18 @@ from app.main import (
     api_manual_amazon_match,
     chrome_completion_history_evidence_error,
     manual_order_refs_from_payload,
+    parse_amazon_order_placed_date,
 )
 from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatchPayload
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_amazon_history_order_date_is_normalized_for_tracker_cards(self):
+        self.assertEqual(
+            parse_amazon_order_placed_date("August 17, 2026"),
+            "2026-08-17T00:00:00+00:00",
+        )
+
     def test_recipient_pack_suffix_keeps_exact_order_reference(self):
         self.assertIn("NC20380", amazon_order_refs_from_text("Nutricity NC20380 1Pack"))
 

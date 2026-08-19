@@ -641,6 +641,7 @@ type PackageTrackerProduct = {
 type PackageTrackerAmazonOrder = {
   amazon_order_id: string
   amazon_order_url: string
+  order_date?: string
   recipient: string
   tracking_id: string
   tracking_url: string
@@ -8330,6 +8331,21 @@ function packageTrackerStatusClass(row: PackageTrackerOrderCard) {
   return "primary"
 }
 
+function packageTrackerAmazonOrderDate(value?: string) {
+  if (!value) return ""
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "short", day: "2-digit" })
+}
+
+function packageTrackerLatestAmazonOrderDate(row: PackageTrackerOrderCard) {
+  return row.packages.reduce((latest, item) => {
+    if (!item.order_date) return latest
+    const timestamp = new Date(item.order_date).getTime()
+    return Number.isFinite(timestamp) && timestamp > latest.timestamp ? { value: item.order_date, timestamp } : latest
+  }, { value: "", timestamp: Number.NEGATIVE_INFINITY }).value
+}
+
 function PackageTrackerDesignPage() {
   const [query, setQuery] = useState("")
   const [debouncedQuery, setDebouncedQuery] = useState("")
@@ -8528,6 +8544,7 @@ function PackageTrackerDesignPage() {
         const daysSinceDelivered = packageTrackerDaysSince(summary.completedAt)
         const historyOpen = expandedHistory.includes(row.id)
         const progress = summary.active ? Math.round((summary.delivered / summary.active) * 100) : 0
+        const latestAmazonOrderDate = packageTrackerLatestAmazonOrderDate(row)
         return (
           <article className="card card-sm" key={row.id}>
             <div className={`card-status-top bg-${color}`} />
@@ -8549,6 +8566,7 @@ function PackageTrackerDesignPage() {
                     {row.recipient_verified ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
                     {row.recipient_verified ? "Recipient verified" : "Check recipient"}
                   </span>
+                  {latestAmazonOrderDate && <span className="badge bg-azure-lt text-azure">Latest Amazon order · {packageTrackerAmazonOrderDate(latestAmazonOrderDate)}</span>}
                   <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
                 </div>
               </div>
@@ -8623,6 +8641,7 @@ function PackageTrackerDesignPage() {
                               <div className="col-12 col-sm-6">
                                 <div className="text-secondary fw-bold">Amazon</div>
                                 <a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id}</a>
+                                {item.order_date && <div className="text-secondary">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}
                               </div>
                               <div className="col-12 col-sm-6">
                                 <div className="text-secondary fw-bold">Tracking</div>
@@ -8661,7 +8680,7 @@ function PackageTrackerDesignPage() {
                         <div className="card card-sm bg-secondary-lt">
                           <div className="card-body">
                             <div className="d-flex flex-column flex-sm-row justify-content-between gap-2">
-                              <div><a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id} <ExternalLink className="icon icon-1" /></a><div className="text-secondary small text-break">{item.products.map((product) => product.title).join(", ")}</div></div>
+                              <div><a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id} <ExternalLink className="icon icon-1" /></a>{item.order_date && <div className="text-secondary small">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}<div className="text-secondary small text-break">{item.products.map((product) => product.title).join(", ")}</div></div>
                               <div className="text-sm-end"><span className="badge bg-secondary-lt text-secondary">{item.hidden_reason === "duplicate" ? "Older duplicate" : "Cancelled / replaced"}</span><div className="text-secondary small mt-1">{formatDateTime(item.updated_at)}</div></div>
                             </div>
                           </div>
