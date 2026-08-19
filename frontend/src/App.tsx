@@ -654,6 +654,7 @@ type PackageTrackerAmazonOrder = {
   dispatch_location: string
   scan_status: string
   products: PackageTrackerProduct[]
+  unassigned_products?: PackageTrackerProduct[]
   hidden_reason?: "cancelled" | "duplicate" | "replaced"
 }
 
@@ -8360,6 +8361,10 @@ function packageTrackerDuplicateAsins(row: PackageTrackerOrderCard) {
   return [...amazonOrdersByAsin.entries()].filter(([, amazonOrders]) => amazonOrders.size > 1).map(([asin]) => asin)
 }
 
+function packageTrackerUnassignedProducts(row: PackageTrackerOrderCard) {
+  return row.packages.flatMap((item) => item.unassigned_products || [])
+}
+
 function PackageTrackerDesignPage() {
   const [query, setQuery] = useState("")
   const [debouncedQuery, setDebouncedQuery] = useState("")
@@ -8561,6 +8566,7 @@ function PackageTrackerDesignPage() {
         const progress = summary.active ? Math.round((summary.delivered / summary.active) * 100) : 0
         const latestAmazonOrderDate = packageTrackerLatestAmazonOrderDate(row)
         const duplicateAsins = packageTrackerDuplicateAsins(row)
+        const unassignedProducts = packageTrackerUnassignedProducts(row)
         return (
           <article className="card card-sm" key={row.id}>
             <div className={`card-status-top bg-${color}`} />
@@ -8584,6 +8590,7 @@ function PackageTrackerDesignPage() {
                   </span>
                   {latestAmazonOrderDate && <span className="badge bg-azure-lt text-azure">Latest Amazon order · {packageTrackerAmazonOrderDate(latestAmazonOrderDate)}</span>}
                   {duplicateAsins.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {duplicateAsins.length} ASIN{duplicateAsins.length === 1 ? "" : "s"}</span>}
+                  {unassignedProducts.length > 0 && <span className="badge bg-red-lt text-red">Incomplete shipment mapping</span>}
                   <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
                 </div>
               </div>
@@ -8620,6 +8627,12 @@ function PackageTrackerDesignPage() {
                     <section className="card card-sm w-100" key={packageKey}>
                       <div className={`card-status-start bg-${itemColor}`} />
                       <div className="card-body p-2 p-md-3">
+                        {(item.unassigned_products || []).length > 0 && (
+                          <div className="alert alert-danger py-2 px-3 mb-2" role="alert">
+                            <AlertCircle className="icon alert-icon" />
+                            <div><strong>Amazon items are not assigned to a shipment.</strong><div className="small">Verify before dispatch: {(item.unassigned_products || []).map((product) => `${product.title} (${product.asin})`).join(", ")}</div></div>
+                          </div>
+                        )}
                         <div className="row g-3 align-items-start">
                           <div className="col-12 col-md-5 col-xl-6">
                             <div className="d-grid gap-2">

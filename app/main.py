@@ -31012,6 +31012,46 @@ def package_tracker_cached_image_url(asin: str) -> str:
     return image_url
 
 
+def package_tracker_missing_history_products(
+    packages: list[dict[str, Any]],
+    history: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return only confidently missing products, never replacement-only ASIN differences."""
+    package_asins: set[str] = set()
+    for package in packages:
+        package_asins.update(
+            normalize_asin(value)
+            for value in parse_json_list_value(package.get("asins_json"))
+            if normalize_asin(value)
+        )
+        package_asins.update(
+            normalize_asin(product.get("asin"))
+            for product in parse_json_list_value(package.get("products_json"))
+            if isinstance(product, dict) and normalize_asin(product.get("asin"))
+        )
+    history_products = normalize_amazon_product_items(parse_json_list_value(history.get("items_json")))
+    history_by_asin = {
+        normalize_asin(product.get("asin")): product
+        for product in history_products
+        if normalize_asin(product.get("asin"))
+    }
+    for value in parse_json_list_value(history.get("asins_json")):
+        asin = normalize_asin(value)
+        if asin and asin not in history_by_asin:
+            history_by_asin[asin] = {
+                "asin": asin,
+                "title": asin,
+                "image_url": "",
+                "url": asin_product_url(asin),
+            }
+    history_asins = set(history_by_asin)
+    # A strict superset proves Amazon knows about additional items. Disjoint
+    # sets usually represent an ASIN replacement and must not create extras.
+    if not package_asins or not package_asins < history_asins:
+        return []
+    return [dict(history_by_asin[asin]) for asin in sorted(history_asins - package_asins)]
+
+
 @app.get("/api/public/asin-image/{asin}")
 def api_public_package_tracker_asin_image(asin: str) -> Response:
     normalized_asin = normalize_asin(asin)
@@ -31334,8 +31374,21 @@ def api_public_package_tracker(
         recipient = clean_text(group.get("recipient_ref"))
         current_packages: list[dict[str, Any]] = []
         previous_orders: list[dict[str, Any]] = []
-        for package in packages_by_key.get((store_id, order_name), []):
+        card_package_rows = packages_by_key.get((store_id, order_name), [])
+        package_rows_by_amazon_order: dict[str, list[dict[str, Any]]] = {}
+        for package in card_package_rows:
+            package_rows_by_amazon_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
+        missing_history_products_by_order = {
+            amazon_order_id: package_tracker_missing_history_products(
+                order_packages,
+                history_by_order_id.get(amazon_order_id, {}),
+            )
+            for amazon_order_id, order_packages in package_rows_by_amazon_order.items()
+        }
+        unassigned_warning_emitted: set[str] = set()
+        for package in card_package_rows:
             history = history_by_order_id.get(clean_text(package.get("amazon_order_id")), {})
+            amazon_order_id = clean_text(package.get("amazon_order_id"))
             kind = package_tracker_delivery_kind(package.get("package_status"), package.get("promise"))
             delivered_at = clean_text(package.get("received_at")) if kind == "delivered" else ""
             if kind == "delivered" and not delivered_at:
@@ -31343,6 +31396,9 @@ def api_public_package_tracker(
             products = [dict(item) for item in parse_json_list_value(package.get("products_json")) if isinstance(item, dict)]
             if not products:
                 products = [{"asin": clean_text(asin), "title": clean_text(asin), "image_url": "", "url": f"https://www.amazon.com/dp/{quote_plus(clean_text(asin))}"} for asin in parse_json_list_value(package.get("asins_json")) if clean_text(asin)]
+            missing_history_products = missing_history_products_by_order.get(amazon_order_id, [])
+            if missing_history_products and len(package_rows_by_amazon_order.get(amazon_order_id, [])) == 1:
+                products.extend(dict(product) for product in missing_history_products)
             for product in products:
                 asin = normalize_asin(product.get("asin"))
                 product["asin"] = asin
@@ -31374,7 +31430,7 @@ def api_public_package_tracker(
             products = list(products_by_asin.values())
             tracking_id = next((clean_text(value) for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code")) if package_tracking_id_is_physical(value)), "")
             item = {
-                "amazon_order_id": clean_text(package.get("amazon_order_id")),
+                "amazon_order_id": amazon_order_id,
                 "amazon_order_url": clean_text(package.get("amazon_order_url")) or order_line_amazon_url(package.get("amazon_order_id")),
                 "order_date": parse_amazon_order_placed_date(history.get("order_date")),
                 "recipient": clean_text(package.get("recipient_ref")) or recipient,
@@ -31388,7 +31444,16 @@ def api_public_package_tracker(
                 "dispatch_location": clean_text(package.get("tote_code")),
                 "scan_status": clean_text(package.get("scan_status")).replace("_", " ").title() or "Pending",
                 "products": products,
+                "unassigned_products": (
+                    [dict(product) for product in missing_history_products]
+                    if missing_history_products
+                    and len(package_rows_by_amazon_order.get(amazon_order_id, [])) > 1
+                    and amazon_order_id not in unassigned_warning_emitted
+                    else []
+                ),
             }
+            if item["unassigned_products"]:
+                unassigned_warning_emitted.add(amazon_order_id)
             if kind == "cancelled":
                 item["hidden_reason"] = "cancelled"
                 previous_orders.append(item)

@@ -9,11 +9,27 @@ from app.main import (
     chrome_completion_history_evidence_error,
     manual_order_refs_from_payload,
     parse_amazon_order_placed_date,
+    package_tracker_missing_history_products,
 )
 from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatchPayload
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_tracker_adds_history_item_only_for_strict_product_superset(self):
+        packages = [{"asins_json": '["B09NP8BRPB", "B00C2DHB5K"]', "products_json": "[]"}]
+        history = {"items_json": '[{"asin":"B09NP8BRPB"},{"asin":"B00C2DHB5K"},{"asin":"B0F49XZ5PC","title":"Golden Thread"}]'}
+
+        self.assertEqual(
+            [product["asin"] for product in package_tracker_missing_history_products(packages, history)],
+            ["B0F49XZ5PC"],
+        )
+
+    def test_tracker_does_not_turn_replacement_asin_into_extra_product(self):
+        packages = [{"asins_json": '["B0BKQ3NR2H"]', "products_json": "[]"}]
+        history = {"items_json": '[{"asin":"B0GJD97KNS"}]'}
+
+        self.assertEqual(package_tracker_missing_history_products(packages, history), [])
+
     def test_amazon_history_order_date_is_normalized_for_tracker_cards(self):
         self.assertEqual(
             parse_amazon_order_placed_date("August 17, 2026"),
