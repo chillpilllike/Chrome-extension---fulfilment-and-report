@@ -8,6 +8,7 @@ from app.main import (
     api_manual_amazon_match,
     chrome_completion_history_evidence_error,
     manual_order_refs_from_payload,
+    merge_amazon_product_snapshots,
     parse_amazon_order_placed_date,
     package_tracker_missing_history_products,
     package_tracker_product_image_url,
@@ -17,6 +18,27 @@ from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatc
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_partial_amazon_refresh_cannot_hide_known_asin(self):
+        existing = [
+            {"asin": "B089T9W99Z", "title": "Old title"},
+            {"asin": "B06ZYLFV8L", "title": "Tucks pads", "image_url": "https://images.example/tucks.jpg"},
+        ]
+        incoming = [{"asin": "B089T9W99Z", "title": "Updated title"}]
+
+        merged = merge_amazon_product_snapshots(existing, incoming)
+
+        self.assertEqual([item["asin"] for item in merged], ["B089T9W99Z", "B06ZYLFV8L"])
+        self.assertEqual(merged[0]["title"], "Updated title")
+        self.assertEqual(merged[1]["image_url"], "https://images.example/tucks.jpg")
+
+    def test_repeated_amazon_snapshot_does_not_add_quantities(self):
+        existing = [{"asin": "B089T9W99Z", "quantity": 2}]
+        incoming = [{"asin": "B089T9W99Z", "quantity": 2}]
+
+        merged = merge_amazon_product_snapshots(existing, incoming)
+
+        self.assertEqual(merged[0]["quantity"], 2)
+
     def test_tracker_uses_captured_image_for_unambiguous_replacement_asin(self):
         product = {"asin": "B0D1QMKKQR", "image_url": ""}
         history_products = [{

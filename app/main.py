@@ -3564,6 +3564,8 @@ def upsert_amazon_history_unmatched(conn: Any, records: list[dict[str, Any]], ma
         resolved_at = now if order_id in matched_ids else None
         if order_id not in matched_ids:
             unmatched.append(order_id)
+        merged_items = merge_amazon_history_products_for_order(conn, order_id, record.get("items") or [])
+        merged_asins = [product["asin"] for product in merged_items if normalize_asin(product.get("asin"))]
         conn.execute(
             """
             INSERT INTO amazon_order_history_unmatched
@@ -3586,8 +3588,8 @@ def upsert_amazon_history_unmatched(conn: Any, records: list[dict[str, Any]], ma
                 record["recipient"],
                 record["status"],
                 record["order_date"],
-                json.dumps(record["asins"]),
-                json.dumps(record.get("items") or []),
+                json.dumps(merged_asins),
+                json.dumps(merged_items),
                 now,
                 now,
                 resolved_at,
@@ -3933,6 +3935,47 @@ def normalize_amazon_product_items(values: Any) -> list[dict[str, Any]]:
             product.pop("quantity", None)
         products.append(product)
     return products
+
+
+def merge_amazon_product_snapshots(existing_values: Any, incoming_values: Any) -> list[dict[str, Any]]:
+    """Merge partial Amazon snapshots without letting a later read hide known ASINs."""
+    existing = normalize_amazon_product_items(existing_values or [])
+    incoming = normalize_amazon_product_items(incoming_values or [])
+    merged = {normalize_asin(product.get("asin")): dict(product) for product in existing if normalize_asin(product.get("asin"))}
+    for product in incoming:
+        asin = normalize_asin(product.get("asin"))
+        if not asin:
+            continue
+        current = merged.get(asin)
+        if not current:
+            merged[asin] = dict(product)
+            continue
+        for field in ("url", "title", "image_url"):
+            if clean_text(product.get(field)):
+                current[field] = product[field]
+        try:
+            existing_quantity = max(1.0, float(current.get("quantity") or 1))
+        except (TypeError, ValueError):
+            existing_quantity = 1.0
+        try:
+            incoming_quantity = max(1.0, float(product.get("quantity") or 1))
+        except (TypeError, ValueError):
+            incoming_quantity = 1.0
+        quantity = max(existing_quantity, incoming_quantity)
+        if quantity == 1:
+            current.pop("quantity", None)
+        else:
+            current["quantity"] = quantity
+    return list(merged.values())
+
+
+def merge_amazon_history_products_for_order(conn: Any, amazon_order_id: str, incoming_values: Any) -> list[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT items_json FROM amazon_order_history_unmatched WHERE amazon_order_id=?",
+        (clean_text(amazon_order_id),),
+    ).fetchone()
+    existing_values = parse_json_list_value(row["items_json"]) if row else []
+    return merge_amazon_product_snapshots(existing_values, incoming_values)
 
 
 def order_level_products_from_tracking_payload(payload: ChromeTrackingUpdatePayload) -> list[dict[str, Any]]:
@@ -4714,6 +4757,8 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
     if updated:
         aggregate_status = tracking_status_from_packages(package_payloads)
         order_products = tracking_products_from_packages(package_payloads)
+        if order_products:
+            order_products = merge_amazon_history_products_for_order(conn, order_id, order_products)
         resolved_at = now if tracking_status_rank(aggregate_status) >= tracking_status_rank("delivered") else None
         conn.execute(
             """
@@ -4839,6 +4884,8 @@ def update_history_matched_order_from_tracking(conn: Any, amazon_order_id: str, 
     _order_id, values, package_count, _error = dispatch_bulk_package_rows_for_order(order_id, refreshed_rows, now)
     bulk_upsert_dispatch_package_rows(conn, values)
     order_products = tracking_products_from_packages(package_payloads)
+    if order_products:
+        order_products = merge_amazon_history_products_for_order(conn, order_id, order_products)
     order_product_asins = [product.get("asin") for product in order_products if normalize_asin(product.get("asin"))]
     conn.execute(
         """
@@ -4895,6 +4942,8 @@ def mark_history_tracking_order_status(conn: Any, amazon_order_id: str, amazon_o
     now = utc_now()
     resolved_at = now if status == "Delivered" else None
     order_products = tracking_products_from_packages([package for package in packages if isinstance(package, dict)])
+    if order_products:
+        order_products = merge_amazon_history_products_for_order(conn, order_id, order_products)
     order_product_asins = [product.get("asin") for product in order_products if normalize_asin(product.get("asin"))]
     conn.execute(
         """
