@@ -665,6 +665,7 @@ type PackageTrackerOrderCard = {
   recipient_verified: boolean
   shopify_status: "fulfilled" | "unfulfilled" | "partially_fulfilled"
   shopify_url: string
+  shopify_fulfillment_at?: string
   shopify_synced_at: string
   updated_at: string
   packages: PackageTrackerAmazonOrder[]
@@ -8759,6 +8760,9 @@ function PackageTrackerDesignPage() {
             <div className="card-footer py-2 px-3">
               <div className="d-flex flex-column flex-md-row align-items-md-center gap-2">
                 <span className={`badge ${row.shopify_status === "fulfilled" ? "bg-green-lt text-green" : row.shopify_status === "partially_fulfilled" ? "bg-yellow-lt text-yellow" : "bg-red-lt text-red"}`}>Shopify: {row.shopify_status.replaceAll("_", " ")}</span>
+                {row.shopify_status === "fulfilled" && row.shopify_fulfillment_at && (
+                  <span className="text-secondary small">Fulfilled {formatDateTime(row.shopify_fulfillment_at)}</span>
+                )}
                 <span className="text-secondary small">Synced {formatDateTime(row.shopify_synced_at)}</span>
                 <span className="text-secondary small ms-md-auto">{summary.fullyDelivered
                   ? daysSinceDelivered === null ? "Full delivery date not recorded" : `${daysSinceDelivered} day${daysSinceDelivered === 1 ? "" : "s"} since full delivery`

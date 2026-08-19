@@ -31445,12 +31445,13 @@ def api_public_package_tracker(
             ), enriched AS (
                 SELECT groups.*, COALESCE(shop.shopify_order_url, '') AS shopify_order_url,
                        COALESCE(shop.fulfillment_status, '') AS shopify_fulfillment_status,
+                       COALESCE(shop.fulfillment_at, '') AS shopify_fulfillment_at,
                        COALESCE(shop.synced_at, '') AS shopify_synced_at,
                        LOWER(COALESCE(shop.fulfillment_status, '')) IN ('fulfilled', 'success') AS shopify_fulfilled,
                        COALESCE(duplicates.has_suspected_duplicates, FALSE) AS has_suspected_duplicates
                 FROM combined_groups groups
                 LEFT JOIN LATERAL (
-                    SELECT cache.shopify_order_url, cache.fulfillment_status, cache.synced_at
+                    SELECT cache.shopify_order_url, cache.fulfillment_status, cache.fulfillment_at, cache.synced_at
                     FROM shopify_order_status_cache cache
                     WHERE cache.store_id=groups.store_id AND UPPER(cache.odoo_order_name)=UPPER(groups.odoo_order_name)
                     ORDER BY CASE WHEN COALESCE(cache.cancelled_at, '') = '' THEN 0 ELSE 1 END, cache.synced_at DESC
@@ -31707,6 +31708,7 @@ def api_public_package_tracker(
             "recipient_verified": order_name in amazon_history_order_refs_from_text(recipient),
             "shopify_status": "fulfilled" if fulfillment in {"fulfilled", "success"} else ("partially_fulfilled" if "partial" in fulfillment else "unfulfilled"),
             "shopify_url": clean_text(group.get("shopify_order_url")),
+            "shopify_fulfillment_at": clean_text(group.get("shopify_fulfillment_at")),
             "shopify_synced_at": clean_text(group.get("shopify_synced_at")),
             "updated_at": clean_text(group.get("updated_at")),
             "packages": current_packages,
