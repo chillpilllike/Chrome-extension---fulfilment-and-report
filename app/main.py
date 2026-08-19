@@ -31667,7 +31667,9 @@ def api_public_package_tracker(
                 if product.get("quantity_verified"):
                     product["quantity"] = max(1.0, float(product.get("quantity") or 1))
                 elif history_product.get("quantity_verified"):
-                    product["quantity"] = history_product["quantity"]
+                    product["quantity"] = max(
+                        1.0, float(history_product.get("quantity") or 1)
+                    )
                     product["quantity_verified"] = True
                 else:
                     product["quantity"] = 1.0
