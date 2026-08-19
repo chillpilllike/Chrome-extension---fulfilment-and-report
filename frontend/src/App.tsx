@@ -658,6 +658,11 @@ type PackageTrackerAmazonOrder = {
   products: PackageTrackerProduct[]
   unassigned_products?: PackageTrackerProduct[]
   hidden_reason?: "cancelled" | "duplicate" | "replaced"
+  possibly_stuck?: boolean
+  stuck_score?: number
+  stuck_reasons?: string[]
+  order_age_days?: number | null
+  last_status_age_days?: number | null
 }
 
 type PackageTrackerOrderCard = {
@@ -8338,6 +8343,7 @@ function packageTrackerStatusLabel(row: PackageTrackerOrderCard) {
   const summary = packageTrackerSummary(row)
   if (summary.needsShopifyDispatch) return "Delivered · Shopify pending"
   if (summary.fullyDelivered) return "Fully delivered"
+  if (row.packages.some((item) => item.possibly_stuck)) return "Possibly stuck delivery"
   if (summary.partiallyDelivered) return "Partially delivered"
   if (row.packages.some((item) => item.status_kind === "exception")) return "Delivery exception"
   return "Arriving"
@@ -8347,6 +8353,7 @@ function packageTrackerStatusClass(row: PackageTrackerOrderCard) {
   const summary = packageTrackerSummary(row)
   if (summary.needsShopifyDispatch) return "danger"
   if (summary.fullyDelivered) return "success"
+  if (row.packages.some((item) => item.possibly_stuck)) return "orange"
   if (summary.partiallyDelivered) return "warning"
   if (row.packages.some((item) => item.status_kind === "exception")) return "danger"
   return "primary"
@@ -8575,6 +8582,7 @@ function PackageTrackerDesignPage() {
         const asinMismatches = row.quantity_analysis?.asin_mismatches || []
         const excessQuantity = duplicateItems.reduce((total, item) => total + Number(item.excess_quantity || 0), 0)
         const unassignedProducts = packageTrackerUnassignedProducts(row)
+        const stuckPackages = row.packages.filter((item) => item.possibly_stuck)
         return (
           <article className="card card-sm" key={row.id}>
             <div className={`card-status-top bg-${color}`} />
@@ -8600,6 +8608,7 @@ function PackageTrackerDesignPage() {
                   {duplicateItems.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {excessQuantity} excess unit{excessQuantity === 1 ? "" : "s"}</span>}
                   {asinMismatches.length > 0 && <span className="badge bg-red-lt text-red">ASIN mismatch · {asinMismatches.length}</span>}
                   {unassignedProducts.length > 0 && <span className="badge bg-red-lt text-red">Incomplete shipment mapping</span>}
+                  {stuckPackages.length > 0 && <span className="badge bg-orange-lt text-orange">Possibly stuck · {stuckPackages.length} package{stuckPackages.length === 1 ? "" : "s"}</span>}
                   <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
                 </div>
               </div>
@@ -8655,7 +8664,7 @@ function PackageTrackerDesignPage() {
 
               <div className="d-grid gap-2">
                 {row.packages.map((item, itemIndex) => {
-                  const itemColor = item.status_kind === "delivered" ? "success" : item.status_kind === "exception" ? "danger" : "primary"
+                  const itemColor = item.status_kind === "delivered" ? "success" : item.status_kind === "exception" ? "danger" : item.possibly_stuck ? "orange" : "primary"
                   const packageKey = `${row.id}:${item.amazon_order_id}:${item.tracking_id}:${itemIndex}`
                   const packageExpanded = expandedPackages.includes(packageKey)
                   const sameAmazonOrderIndexes = row.packages.flatMap((candidate, candidateIndex) => candidate.amazon_order_id === item.amazon_order_id ? [candidateIndex] : [])
@@ -8664,6 +8673,12 @@ function PackageTrackerDesignPage() {
                     <section className="card card-sm w-100" key={packageKey}>
                       <div className={`card-status-start bg-${itemColor}`} />
                       <div className="card-body p-2 p-md-3">
+                        {item.possibly_stuck && (
+                          <div className="alert alert-warning py-2 px-3 mb-2" role="alert">
+                            <AlertCircle className="icon alert-icon" />
+                            <div><strong>Possibly stuck delivery</strong><div className="small">{(item.stuck_reasons || []).join(" · ")}</div></div>
+                          </div>
+                        )}
                         {(item.unassigned_products || []).length > 0 && (
                           <div className="alert alert-danger py-2 px-3 mb-2" role="alert">
                             <AlertCircle className="icon alert-icon" />
@@ -8694,7 +8709,7 @@ function PackageTrackerDesignPage() {
                               })}
                             </div>
                             <div className="d-flex flex-wrap align-items-center gap-1 mt-2">
-                              <span className={`badge bg-${itemColor}-lt text-${itemColor}`}>{item.status_kind === "delivered" ? "Delivered" : item.status_kind === "exception" ? "Exception" : "Arriving"}</span>
+                              <span className={`badge bg-${itemColor}-lt text-${itemColor}`}>{item.status_kind === "delivered" ? "Delivered" : item.status_kind === "exception" ? "Exception" : item.possibly_stuck ? "Possibly stuck" : "Arriving"}</span>
                               {sameAmazonOrderIndexes.length > 1 && <span className="badge bg-blue-lt text-blue">Shipment {shipmentPosition} of {sameAmazonOrderIndexes.length}</span>}
                             </div>
                           </div>

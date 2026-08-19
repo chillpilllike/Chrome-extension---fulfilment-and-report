@@ -766,8 +766,15 @@ function productItemsFrom(root, limit = 50) {
       "",
     ) : "";
     if (!title || !imageUrl) return;
-    const quantityNode = box.querySelector(".od-item-view-qty, .itemQuantity, [data-quantity]");
-    const quantityValue = quantityNode?.getAttribute?.("data-quantity") || quantityNode?.textContent || box.getAttribute?.("data-quantity") || "";
+    const boxAsins = new Set(
+      [...box.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]
+        .map((candidate) => String(candidate.getAttribute("href") || "").match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1]?.toUpperCase() || "")
+        .filter(Boolean),
+    );
+    const quantityNode = boxAsins.size === 1 && boxAsins.has(asin)
+      ? (box.matches("[data-quantity]") ? box : box.querySelector(".od-item-view-qty, .itemQuantity, [data-quantity]"))
+      : null;
+    const quantityValue = quantityNode?.getAttribute?.("data-quantity") || quantityNode?.textContent || "";
     const explicitQuantity = String(quantityValue).match(/\d+/)?.[0];
     seen.add(asin);
     products.push({

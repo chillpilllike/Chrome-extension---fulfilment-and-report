@@ -6452,7 +6452,7 @@ function orderCardItems(card) {
       : row.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
     const asin = asinFromAmazonHref(link?.href || link?.getAttribute?.("href") || "");
     if (!asin) continue;
-    const quantityInfo = quantityFromItemElement(itemContainerForQuantity(link));
+    const quantityInfo = quantityFromItemElement(itemContainerForQuantity(link, asin));
     const existing = quantitiesByAsin[asin] || { quantity: 0, quantity_verified: false };
     if (!existing.quantity_verified || quantityInfo.quantity_verified) {
       existing.quantity = Math.max(Number(existing.quantity || 0), quantityInfo.quantity);
@@ -6468,13 +6468,22 @@ function quantityFromText(text = "") {
   return Math.max(1, Math.round(Number(match?.[1] || 1)));
 }
 
-function itemContainerForQuantity(link) {
+function itemContainerForQuantity(link, targetAsin = "") {
+  const normalizedTarget = String(targetAsin || asinFromAmazonHref(link?.href || link?.getAttribute?.("href") || "")).toUpperCase();
   let node = link?.parentElement || null;
   for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
     const quantities = node.querySelectorAll?.(".od-item-view-qty, .itemQuantity, [data-quantity]") || [];
-    if (quantities.length === 1) return node;
+    const productAsins = new Set(
+      [...(node.querySelectorAll?.("a[href*='/dp/'], a[href*='/gp/product/']") || [])]
+        .map((candidate) => asinFromAmazonHref(candidate.href || candidate.getAttribute?.("href") || ""))
+        .filter(Boolean),
+    );
+    if (quantities.length === 1 && productAsins.size === 1 && productAsins.has(normalizedTarget)) return node;
+    // Never climb into a shipment/order wrapper containing sibling ASINs. A
+    // quantity bubble there may belong to a different product.
+    if (productAsins.size > 1) return null;
   }
-  return link?.closest?.("[data-component='purchasedItems'], [data-component='item'], .od-item, .a-fixed-left-grid, .a-row.a-spacing-top-base, .a-section, li") || link?.parentElement;
+  return null;
 }
 
 function quantityFromItemElement(element) {
@@ -6485,7 +6494,7 @@ function quantityFromItemElement(element) {
   if (explicit) {
     return { quantity: Math.max(1, Math.round(Number(explicit) || 1)), quantity_verified: true };
   }
-  return { quantity: quantityFromText(element?.innerText || element?.textContent || ""), quantity_verified: false };
+  return { quantity: 1, quantity_verified: false };
 }
 
 function orderDetailsPageOrderId() {
@@ -6532,7 +6541,7 @@ function orderDetailsPageItems() {
   for (const link of purchasedLinks) {
     const asin = asinFromAmazonHref(link.href || link.getAttribute("href") || "");
     if (!asin) continue;
-    const row = itemContainerForQuantity(link);
+    const row = itemContainerForQuantity(link, asin);
     const quantityInfo = quantityFromItemElement(row);
     const existing = quantitiesByAsin[asin] || { quantity: 0, quantity_verified: false };
     if (!existing.quantity_verified || quantityInfo.quantity_verified) {

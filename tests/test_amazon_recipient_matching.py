@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 
 from fastapi import HTTPException
 
@@ -13,11 +14,52 @@ from app.main import (
     package_tracker_missing_history_products,
     package_tracker_product_image_url,
     package_tracker_quantity_analysis,
+    package_tracker_stuck_analysis,
 )
 from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatchPayload
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_delivery_stuck_detector_marks_late_and_old_relative_promises(self):
+        running_late = package_tracker_stuck_analysis(
+            status="On the way, but running late",
+            carrier="We're very sorry your delivery is late.",
+            order_date="2026-08-17T00:00:00+00:00",
+            tracking_id="TBA333856460383",
+            updated_at="2026-08-19T20:42:03+00:00",
+            today=date(2026, 8, 20),
+        )
+        old_tomorrow = package_tracker_stuck_analysis(
+            status="Arriving tomorrow",
+            order_date="2026-08-17T00:00:00+00:00",
+            tracking_id="TBA333855979784",
+            updated_at="2026-08-19T20:55:42+00:00",
+            today=date(2026, 8, 20),
+        )
+
+        self.assertTrue(running_late["possibly_stuck"])
+        self.assertTrue(old_tomorrow["possibly_stuck"])
+        self.assertTrue(any("Arriving Tomorrow" in reason for reason in old_tomorrow["stuck_reasons"]))
+
+    def test_delivery_stuck_detector_does_not_flag_fresh_or_completed_orders(self):
+        fresh = package_tracker_stuck_analysis(
+            status="Arriving tomorrow",
+            order_date="2026-08-19T00:00:00+00:00",
+            tracking_id="TBA333855979784",
+            updated_at="2026-08-19T20:55:42+00:00",
+            today=date(2026, 8, 20),
+        )
+        delivered = package_tracker_stuck_analysis(
+            status="Delivered August 19",
+            order_date="2026-08-17T00:00:00+00:00",
+            tracking_id="TBA333855979784",
+            updated_at="2026-08-19T20:55:42+00:00",
+            today=date(2026, 8, 20),
+        )
+
+        self.assertFalse(fresh["possibly_stuck"])
+        self.assertFalse(delivered["possibly_stuck"])
+
     def test_partial_amazon_refresh_cannot_hide_known_asin(self):
         existing = [
             {"asin": "B089T9W99Z", "title": "Old title"},

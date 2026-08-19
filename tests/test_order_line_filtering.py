@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import patch
+from starlette.requests import Request
 
 from app import redis_support
 from app import main as app_main
@@ -8,6 +9,12 @@ from app.main import should_skip_order_line
 
 
 class OrderLineFilteringTests(unittest.TestCase):
+    def test_public_pages_fail_closed_when_access_code_is_not_configured(self):
+        request = Request({"type": "http", "method": "GET", "path": "/package-tracker", "headers": [], "query_string": b""})
+        with patch.object(app_main, "PUBLIC_ACCESS_CODE", ""), patch.object(app_main, "request_has_admin_access", return_value=False):
+            self.assertTrue(app_main.request_requires_public_access(request))
+            self.assertFalse(app_main.request_has_public_access(request))
+
     def test_product_title_with_free_shipping_is_not_skipped(self):
         line = {
             "name": "Cramp 911 Muscle Relaxing Roll-On Lotion, 0.71 Oz, Free Shipping, New",

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import copy
+import hashlib
+import hmac
 import html
 import http.client
 import importlib.util
@@ -185,6 +187,8 @@ PUBLIC_DISPATCH_GET_PREFIXES = (
     "/api/dispatch-sorting/packages/",
 )
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
+PUBLIC_ACCESS_CODE = os.getenv("PUBLIC_ACCESS_CODE", "").strip()
+PUBLIC_ACCESS_COOKIE = "public_access_session"
 _ADMIN_ACCESS_TOKEN_CACHE: tuple[str, float] = ("", 0.0)
 _ADMIN_ACCESS_TOKEN_CACHE_LOCK = threading.Lock()
 ADMIN_ACCESS_TOKEN_CACHE_TTL_SECONDS = 600
@@ -704,6 +708,84 @@ def request_has_admin_access(request: Request) -> bool:
     return supplied == token or supplied == MASTER_ADMIN_ACCESS_TOKEN
 
 
+def public_access_cookie_value() -> str:
+    if not PUBLIC_ACCESS_CODE:
+        return ""
+    return hmac.new(
+        MASTER_ADMIN_ACCESS_TOKEN.encode("utf-8"),
+        f"public-access:{PUBLIC_ACCESS_CODE}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def request_has_public_access(request: Request) -> bool:
+    if PUBLIC_ACCESS_CODE:
+        supplied_code = clean_text(request.headers.get("X-Public-Access-Code"))
+        if supplied_code and hmac.compare_digest(supplied_code, PUBLIC_ACCESS_CODE):
+            return True
+        supplied_cookie = clean_text(request.cookies.get(PUBLIC_ACCESS_COOKIE))
+        expected_cookie = public_access_cookie_value()
+        if supplied_cookie and expected_cookie and hmac.compare_digest(supplied_cookie, expected_cookie):
+            return True
+    return request_has_admin_access(request)
+
+
+def request_requires_public_access(request: Request) -> bool:
+    path = request.url.path
+    if path in {"/public/access", "/api/public/access"}:
+        return False
+    return bool(
+        path in PUBLIC_FRONTEND_PATHS
+        or path.startswith("/public/")
+        or path.startswith("/api/public/")
+        or path.startswith("/track-order")
+        or path in PUBLIC_API_PATHS
+        or path in PUBLIC_POST_API_PATHS
+        or path.startswith(PUBLIC_DISPATCH_POST_PREFIXES)
+        or path.startswith(PUBLIC_DISPATCH_GET_PREFIXES)
+        or path.startswith("/api/inventory/asin-image/")
+        or re.fullmatch(r"/api/inventory/\d+/image", path)
+    )
+
+
+def public_access_page_response(request: Request, *, error: str = "", next_path: str = "") -> HTMLResponse:
+    current_path = clean_text(next_path) or clean_text(request.query_params.get("next")) or request.url.path
+    if request.url.query and not next_path and not request.query_params.get("next"):
+        current_path += f"?{request.url.query}"
+    safe_path = current_path if urlsplit(current_path).path.startswith("/") else "/package-tracker"
+    error_html = f'<div class="alert alert-danger py-2">{html.escape(error)}</div>' if error else ""
+    return HTMLResponse(
+        f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dispatch access required</title>
+    <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+  </head>
+  <body class="d-flex flex-column bg-light">
+    <main class="page page-center">
+      <div class="container container-tight py-4">
+        <form class="card card-md" method="post" action="/api/public/access" autocomplete="off">
+          <div class="card-body">
+            <h2 class="card-title text-center mb-3">Dispatch access</h2>
+            <p class="text-secondary text-center">Enter the public access code to continue.</p>
+            {error_html}
+            <input type="hidden" name="next" value="{html.escape(safe_path, quote=True)}">
+            <label class="form-label" for="public-access-code">Access code</label>
+            <input id="public-access-code" class="form-control" type="password" name="code" required autofocus autocomplete="current-password">
+            <div class="form-footer"><button class="btn btn-primary w-100" type="submit">Continue</button></div>
+          </div>
+        </form>
+      </div>
+    </main>
+  </body>
+</html>""",
+        status_code=401 if error else 200,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def admin_access_bridge_response(request: Request) -> HTMLResponse:
     current_path = request.url.path
     if request.url.query:
@@ -798,6 +880,15 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     path = request.url.path
     if request.method == "OPTIONS":
         return await call_next(request)
+    if request_requires_public_access(request) and not request_has_public_access(request):
+        if request.method in {"GET", "HEAD"} and not path.startswith("/api/"):
+            return public_access_page_response(request)
+        return Response(
+            json.dumps({"ok": False, "detail": "Public access code required."}),
+            status_code=401,
+            media_type="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
     allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
     allow_public_frontend = request.method in {"GET", "HEAD"} and path in PUBLIC_FRONTEND_PATHS
     allow_public_api = (request.method in {"GET", "HEAD"} and path in PUBLIC_API_PATHS) or (request.method == "POST" and path in PUBLIC_POST_API_PATHS)
@@ -819,6 +910,36 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
         if is_database_unavailable_error(exc):
             return database_unavailable_response(request)
         raise
+
+
+@app.get("/public/access", response_class=HTMLResponse)
+def public_access_page(request: Request, next: str = "/package-tracker") -> HTMLResponse:
+    return public_access_page_response(request, next_path=next)
+
+
+@app.post("/api/public/access")
+def public_access_login(request: Request, code: str = Form(...), next: str = Form("/package-tracker")) -> Response:
+    safe_path = clean_text(next)
+    if not safe_path.startswith("/") or safe_path.startswith("//"):
+        safe_path = "/package-tracker"
+    supplied = clean_text(code)
+    if not PUBLIC_ACCESS_CODE:
+        return public_access_page_response(request, error="Public access is not configured.", next_path=safe_path)
+    if not hmac.compare_digest(supplied, PUBLIC_ACCESS_CODE):
+        return public_access_page_response(request, error="Incorrect access code.", next_path=safe_path)
+    response = RedirectResponse(safe_path, status_code=303)
+    forwarded_proto = clean_text(request.headers.get("X-Forwarded-Proto")).lower()
+    response.set_cookie(
+        PUBLIC_ACCESS_COOKIE,
+        public_access_cookie_value(),
+        max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        secure=request.url.scheme == "https" or forwarded_proto == "https",
+        samesite="lax",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def init_db() -> None:
@@ -31054,6 +31175,73 @@ def package_tracker_delivery_date(package_status: Any, promise: Any, updated_at:
     return parsed.isoformat()
 
 
+def package_tracker_stuck_analysis(
+    *,
+    status: Any,
+    promise: Any = "",
+    carrier: Any = "",
+    order_date: Any = "",
+    expected_at: Any = "",
+    tracking_id: Any = "",
+    updated_at: Any = "",
+    today: Any = None,
+) -> dict[str, Any]:
+    """Flag delivery risk conservatively; never turn a heuristic into a delivery fact."""
+    status_text = clean_text(status)
+    combined = f"{status_text} {clean_text(promise)} {clean_text(carrier)}".lower()
+    kind = package_tracker_delivery_kind(status_text, promise)
+    if kind in {"delivered", "cancelled"}:
+        return {"possibly_stuck": False, "stuck_score": 0, "stuck_reasons": []}
+
+    current_date = today or dispatch_current_date()
+    order_dt = parse_iso_date(parse_amazon_order_placed_date(order_date) or clean_text(order_date))
+    updated_dt = parse_iso_date(clean_text(updated_at))
+    order_age_days = max(0, (current_date - order_dt.date()).days) if order_dt else None
+    update_age_days = max(0, (current_date - updated_dt.date()).days) if updated_dt else None
+    score = 0
+    reasons: list[str] = []
+
+    explicit_late = any(token in combined for token in (
+        "running late", "delivery is late", "delayed", "delay in transit",
+        "now expected", "may be lost", "package is late",
+    ))
+    if explicit_late:
+        score += 4
+        reasons.append("Amazon reports a late or rescheduled delivery")
+
+    expected_iso = package_tracker_delivery_date(status_text, promise, updated_at)
+    expected_dt = parse_iso_date(clean_text(expected_at)) or parse_iso_date(expected_iso)
+    if expected_dt and expected_dt.date() < current_date:
+        score += 4
+        reasons.append(f"Promised date passed on {expected_dt.date().isoformat()}")
+
+    relative_promise = next((label for label in (
+        "arriving tomorrow", "arriving today", "expected today", "out for delivery",
+    ) if label in combined), "")
+    if order_age_days is not None and order_age_days >= 2 and relative_promise:
+        score += 3
+        reasons.append(f'Still "{relative_promise.title()}" {order_age_days} days after ordering')
+    elif order_age_days is not None and order_age_days >= 4:
+        score += 3
+        reasons.append(f"Not delivered {order_age_days} days after ordering")
+
+    if order_age_days is not None and order_age_days >= 2 and not package_tracking_id_is_physical(tracking_id):
+        score += 2
+        reasons.append(f"No physical tracking ID {order_age_days} days after ordering")
+    if update_age_days is not None and update_age_days >= 2:
+        score += 1
+        reasons.append(f"Amazon status has not refreshed for {update_age_days} days")
+
+    possibly_stuck = score >= 3
+    return {
+        "possibly_stuck": possibly_stuck,
+        "stuck_score": score,
+        "stuck_reasons": reasons if possibly_stuck else [],
+        "order_age_days": order_age_days,
+        "last_status_age_days": update_age_days,
+    }
+
+
 _PACKAGE_TRACKER_IMAGE_URL_CACHE: dict[str, str] = {}
 _PACKAGE_TRACKER_IMAGE_URL_CACHE_LOCK = threading.Lock()
 
@@ -31724,6 +31912,15 @@ def api_public_package_tracker(
                     else []
                 ),
             }
+            item.update(package_tracker_stuck_analysis(
+                status=item["status"],
+                promise=package.get("promise"),
+                carrier=item["carrier"],
+                order_date=item["order_date"],
+                expected_at=item["expected_at"],
+                tracking_id=item["tracking_id"],
+                updated_at=item["updated_at"],
+            ))
             if item["unassigned_products"]:
                 unassigned_warning_emitted.add(amazon_order_id)
             if kind == "cancelled":
@@ -31788,6 +31985,15 @@ def api_public_package_tracker(
                     "dispatch_location": "", "scan_status": "Awaiting package scan",
                     "products": product_values,
                 }
+                synthetic.update(package_tracker_stuck_analysis(
+                    status=synthetic["status"],
+                    promise=promise,
+                    carrier=synthetic["carrier"],
+                    order_date=synthetic["order_date"],
+                    expected_at=synthetic["expected_at"],
+                    tracking_id=synthetic["tracking_id"],
+                    updated_at=synthetic["updated_at"],
+                ))
                 if kind == "cancelled":
                     synthetic["hidden_reason"] = "cancelled"
                     previous_orders.append(synthetic)
