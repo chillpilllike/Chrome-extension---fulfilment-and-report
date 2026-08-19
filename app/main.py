@@ -31052,6 +31052,115 @@ def package_tracker_missing_history_products(
     return [dict(history_by_asin[asin]) for asin in sorted(history_asins - package_asins)]
 
 
+def package_tracker_quantity_analysis(
+    lines: list[dict[str, Any]],
+    packages: list[dict[str, Any]],
+    history_by_order_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    expected_by_canonical: dict[str, dict[str, Any]] = {}
+    for line in lines:
+        canonical = normalize_asin(line.get("original_asin")) or normalize_asin(line.get("asin"))
+        if not canonical:
+            continue
+        group = expected_by_canonical.setdefault(canonical, {
+            "odoo_asin": canonical,
+            "aliases": set(),
+            "expected_quantity": 0.0,
+        })
+        group["aliases"].update(order_line_asin_aliases(line))
+        try:
+            group["expected_quantity"] += max(0.0, float(line.get("quantity") or 0))
+        except (TypeError, ValueError):
+            group["expected_quantity"] += 1.0
+
+    packages_by_order: dict[str, list[dict[str, Any]]] = {}
+    for package in packages:
+        packages_by_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
+
+    amazon_by_asin: dict[str, dict[str, Any]] = {}
+
+    def add_amazon_item(asin_value: Any, quantity_value: Any, amazon_order_id: str) -> None:
+        asin = normalize_asin(asin_value)
+        if not asin:
+            return
+        try:
+            quantity = max(1.0, float(quantity_value or 1))
+        except (TypeError, ValueError):
+            quantity = 1.0
+        entry = amazon_by_asin.setdefault(asin, {"quantity": 0.0, "amazon_order_ids": set()})
+        entry["quantity"] += quantity
+        if amazon_order_id:
+            entry["amazon_order_ids"].add(amazon_order_id)
+
+    for amazon_order_id, order_packages in packages_by_order.items():
+        for package in order_packages:
+            products = normalize_amazon_product_items(parse_json_list_value(package.get("products_json")))
+            if products:
+                for product in products:
+                    add_amazon_item(product.get("asin"), product.get("quantity"), amazon_order_id)
+            else:
+                for asin in list(dict.fromkeys(normalize_asin(value) for value in parse_json_list_value(package.get("asins_json")) if normalize_asin(value))):
+                    add_amazon_item(asin, 1, amazon_order_id)
+        if len(order_packages) == 1:
+            for product in package_tracker_missing_history_products(
+                order_packages,
+                history_by_order_id.get(amazon_order_id, {}),
+            ):
+                # History quantity is frequently the total order item count,
+                # so a recovered missing ASIN contributes one proven unit.
+                add_amazon_item(product.get("asin"), 1, amazon_order_id)
+
+    alias_to_canonical: dict[str, list[str]] = {}
+    for canonical, expected in expected_by_canonical.items():
+        expected["aliases"].add(canonical)
+        for alias in expected["aliases"]:
+            alias_to_canonical.setdefault(alias, []).append(canonical)
+
+    amazon_by_canonical: dict[str, dict[str, Any]] = {}
+    mismatches: list[dict[str, Any]] = []
+    for amazon_asin, amazon in amazon_by_asin.items():
+        candidates = alias_to_canonical.get(amazon_asin, [])
+        if not candidates:
+            mismatches.append({
+                "amazon_asin": amazon_asin,
+                "amazon_quantity": amazon["quantity"],
+                "amazon_order_ids": sorted(amazon["amazon_order_ids"]),
+            })
+            continue
+        canonical = amazon_asin if amazon_asin in candidates else candidates[0]
+        total = amazon_by_canonical.setdefault(canonical, {
+            "amazon_quantity": 0.0,
+            "amazon_order_ids": set(),
+            "amazon_asins": set(),
+        })
+        total["amazon_quantity"] += amazon["quantity"]
+        total["amazon_order_ids"].update(amazon["amazon_order_ids"])
+        total["amazon_asins"].add(amazon_asin)
+
+    duplicate_items: list[dict[str, Any]] = []
+    for canonical, amazon in amazon_by_canonical.items():
+        expected = expected_by_canonical[canonical]
+        expected_quantity = float(expected["expected_quantity"] or 0)
+        amazon_quantity = float(amazon["amazon_quantity"] or 0)
+        if amazon_quantity <= expected_quantity:
+            continue
+        duplicate_items.append({
+            "odoo_asin": canonical,
+            "replacement_asins": sorted(set(expected["aliases"]) - {canonical}),
+            "expected_quantity": expected_quantity,
+            "amazon_quantity": amazon_quantity,
+            "excess_quantity": amazon_quantity - expected_quantity,
+            "amazon_order_ids": sorted(amazon["amazon_order_ids"]),
+            "amazon_asins": sorted(amazon["amazon_asins"]),
+        })
+
+    return {
+        "suspected_duplicate": bool(duplicate_items),
+        "duplicate_items": sorted(duplicate_items, key=lambda item: (-item["excess_quantity"], item["odoo_asin"])),
+        "asin_mismatches": sorted(mismatches, key=lambda item: item["amazon_asin"]),
+    }
+
+
 @app.get("/api/public/asin-image/{asin}")
 def api_public_package_tracker_asin_image(asin: str) -> Response:
     normalized_asin = normalize_asin(asin)
@@ -31260,24 +31369,77 @@ def api_public_package_tracker(
                     SELECT 1 FROM line_groups lines
                     WHERE lines.store_id=packages.store_id AND UPPER(lines.odoo_order_name)=UPPER(packages.odoo_order_name)
                 )
-            ), duplicate_package_groups AS (
-                SELECT duplicate_asins.store_id, duplicate_asins.order_key, TRUE AS has_suspected_duplicates
+            ), odoo_expected_quantities AS (
+                SELECT l.store_id, UPPER(l.odoo_order_name) AS order_key,
+                       UPPER(COALESCE(NULLIF(l.original_asin, ''), NULLIF(l.asin, ''))) AS canonical_asin,
+                       SUM(GREATEST(COALESCE(l.quantity, 1), 0)) AS expected_quantity
+                FROM order_lines l
+                WHERE COALESCE(l.odoo_order_name, '') != '' AND COALESCE(l.asin, '') != ''
+                GROUP BY l.store_id, UPPER(l.odoo_order_name),
+                         UPPER(COALESCE(NULLIF(l.original_asin, ''), NULLIF(l.asin, '')))
+            ), odoo_expected_aliases AS (
+                SELECT aliases.store_id, aliases.order_key, aliases.canonical_asin,
+                       ARRAY_AGG(DISTINCT aliases.alias_asin) AS asin_aliases
                 FROM (
-                    SELECT p.store_id, UPPER(p.odoo_order_name) AS order_key, UPPER(package_asin.value) AS asin
-                    FROM amazon_dispatch_packages p
-                    CROSS JOIN LATERAL jsonb_array_elements_text(
-                        CASE
-                            WHEN COALESCE(p.asins_json, '') ~ '^\\s*\\[' THEN p.asins_json::jsonb
-                            ELSE '[]'::jsonb
-                        END
-                    ) package_asin(value)
-                    WHERE COALESCE(p.odoo_order_name, '') != ''
-                      AND COALESCE(p.amazon_order_id, '') != ''
-                      AND LOWER(COALESCE(p.package_status, '') || ' ' || COALESCE(p.promise, '')) NOT LIKE '%cancel%'
-                    GROUP BY p.store_id, UPPER(p.odoo_order_name), UPPER(package_asin.value)
-                    HAVING COUNT(DISTINCT p.amazon_order_id) > 1
-                ) duplicate_asins
-                GROUP BY duplicate_asins.store_id, duplicate_asins.order_key
+                    SELECT l.store_id, UPPER(l.odoo_order_name) AS order_key,
+                           UPPER(COALESCE(NULLIF(l.original_asin, ''), NULLIF(l.asin, ''))) AS canonical_asin,
+                           UPPER(alias.value) AS alias_asin
+                    FROM order_lines l
+                    CROSS JOIN LATERAL UNNEST(ARRAY[
+                        COALESCE(l.asin, ''), COALESCE(l.original_asin, ''), COALESCE(l.replacement_asin, ''),
+                        COALESCE(l.asin_from_reference, ''), COALESCE(l.asin_from_note, '')
+                    ]) alias(value)
+                    WHERE COALESCE(l.odoo_order_name, '') != '' AND COALESCE(alias.value, '') != ''
+                ) aliases
+                GROUP BY aliases.store_id, aliases.order_key, aliases.canonical_asin
+            ), odoo_expected_items AS (
+                SELECT quantities.store_id, quantities.order_key, quantities.canonical_asin,
+                       quantities.expected_quantity, aliases.asin_aliases
+                FROM odoo_expected_quantities quantities
+                JOIN odoo_expected_aliases aliases
+                  ON aliases.store_id=quantities.store_id AND aliases.order_key=quantities.order_key
+                 AND aliases.canonical_asin=quantities.canonical_asin
+            ), package_json_sources AS (
+                SELECT p.store_id, UPPER(p.odoo_order_name) AS order_key, p.amazon_order_id,
+                       CASE WHEN COALESCE(p.products_json, '') ~ '^\\s*\\[' THEN p.products_json::jsonb ELSE '[]'::jsonb END AS products,
+                       CASE WHEN COALESCE(p.asins_json, '') ~ '^\\s*\\[' THEN p.asins_json::jsonb ELSE '[]'::jsonb END AS asins
+                FROM amazon_dispatch_packages p
+                WHERE COALESCE(p.odoo_order_name, '') != '' AND COALESCE(p.amazon_order_id, '') != ''
+                  AND LOWER(COALESCE(p.package_status, '') || ' ' || COALESCE(p.promise, '')) NOT LIKE '%cancel%'
+            ), amazon_package_items AS (
+                SELECT source.store_id, source.order_key, source.amazon_order_id,
+                       UPPER(product.value->>'asin') AS amazon_asin,
+                       CASE
+                           WHEN COALESCE(product.value->>'quantity', '') ~ '^[0-9]+(?:\\.[0-9]+)?$'
+                           THEN GREATEST((product.value->>'quantity')::numeric, 1)
+                           ELSE 1::numeric
+                       END AS amazon_quantity
+                FROM package_json_sources source
+                CROSS JOIN LATERAL jsonb_array_elements(source.products) product(value)
+                WHERE COALESCE(product.value->>'asin', '') != ''
+                UNION ALL
+                SELECT source.store_id, source.order_key, source.amazon_order_id,
+                       UPPER(package_asin.value) AS amazon_asin, 1::numeric AS amazon_quantity
+                FROM package_json_sources source
+                CROSS JOIN LATERAL jsonb_array_elements_text(source.asins) package_asin(value)
+                WHERE jsonb_array_length(source.products)=0 AND COALESCE(package_asin.value, '') != ''
+            ), amazon_item_totals AS (
+                SELECT items.store_id, items.order_key, items.amazon_asin,
+                       SUM(items.amazon_quantity) AS amazon_quantity
+                FROM amazon_package_items items
+                GROUP BY items.store_id, items.order_key, items.amazon_asin
+            ), duplicate_item_groups AS (
+                SELECT expected.store_id, expected.order_key, expected.canonical_asin
+                FROM odoo_expected_items expected
+                JOIN amazon_item_totals amazon
+                  ON amazon.store_id=expected.store_id AND amazon.order_key=expected.order_key
+                 AND amazon.amazon_asin=ANY(expected.asin_aliases)
+                GROUP BY expected.store_id, expected.order_key, expected.canonical_asin, expected.expected_quantity
+                HAVING SUM(amazon.amazon_quantity) > expected.expected_quantity
+            ), duplicate_package_groups AS (
+                SELECT duplicates.store_id, duplicates.order_key, TRUE AS has_suspected_duplicates
+                FROM duplicate_item_groups duplicates
+                GROUP BY duplicates.store_id, duplicates.order_key
             ), enriched AS (
                 SELECT groups.*, COALESCE(shop.shopify_order_url, '') AS shopify_order_url,
                        COALESCE(shop.fulfillment_status, '') AS shopify_fulfillment_status,
@@ -31328,7 +31490,9 @@ def api_public_package_tracker(
             ).fetchall())
             line_rows = rows_to_dicts(conn.execute(
                 f"""SELECT l.id, l.store_id, l.odoo_order_id, l.odoo_order_name, l.amazon_order_id,
-                            l.amazon_order_url, l.asin, l.product_name, l.tracking_status, l.tracking_payload,
+                            l.amazon_order_url, l.asin, l.original_asin, l.replacement_asin,
+                            l.asin_from_reference, l.asin_from_note, l.quantity,
+                            l.product_name, l.tracking_status, l.tracking_payload,
                             l.tracking_checked_at, l.amazon_cancelled_at, l.updated_at
                     FROM order_lines l
                     WHERE ({key_sql.replace('p.', 'l.')}) AND COALESCE(l.amazon_order_id, '') != ''
@@ -31528,6 +31692,11 @@ def api_public_package_tracker(
             ),
             reverse=True,
         )
+        quantity_analysis = package_tracker_quantity_analysis(
+            lines_by_key.get((store_id, order_name), []),
+            card_package_rows,
+            history_by_order_id,
+        )
         fulfillment = clean_text(group.get("shopify_fulfillment_status")).lower()
         cards.append({
             "id": f"{store_id}:{order_name}",
@@ -31540,6 +31709,7 @@ def api_public_package_tracker(
             "updated_at": clean_text(group.get("updated_at")),
             "packages": current_packages,
             "previous_orders": previous_orders,
+            "quantity_analysis": quantity_analysis,
         })
 
     first = grouped_rows[0] if grouped_rows else {}

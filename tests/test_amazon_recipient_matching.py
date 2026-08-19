@@ -10,11 +10,56 @@ from app.main import (
     manual_order_refs_from_payload,
     parse_amazon_order_placed_date,
     package_tracker_missing_history_products,
+    package_tracker_quantity_analysis,
 )
 from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatchPayload
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_duplicate_analysis_respects_odoo_quantity_across_amazon_orders(self):
+        lines = [{"asin": "B012345678", "quantity": 2}]
+        packages = [
+            {"amazon_order_id": "111-1111111-1111111", "products_json": '[{"asin":"B012345678"}]', "asins_json": "[]"},
+            {"amazon_order_id": "111-2222222-2222222", "products_json": '[{"asin":"B012345678"}]', "asins_json": "[]"},
+        ]
+
+        analysis = package_tracker_quantity_analysis(lines, packages, {})
+
+        self.assertFalse(analysis["suspected_duplicate"])
+        self.assertEqual(analysis["duplicate_items"], [])
+
+    def test_duplicate_analysis_flags_only_quantity_above_odoo_total(self):
+        lines = [{"asin": "B012345678", "quantity": 1}]
+        packages = [
+            {"amazon_order_id": "111-1111111-1111111", "products_json": '[{"asin":"B012345678"}]', "asins_json": "[]"},
+            {"amazon_order_id": "111-2222222-2222222", "products_json": '[{"asin":"B012345678"}]', "asins_json": "[]"},
+        ]
+
+        analysis = package_tracker_quantity_analysis(lines, packages, {})
+
+        self.assertTrue(analysis["suspected_duplicate"])
+        self.assertEqual(analysis["duplicate_items"][0]["excess_quantity"], 1)
+
+    def test_duplicate_analysis_combines_original_and_replacement_asins(self):
+        lines = [{"asin": "B012345678", "replacement_asin": "B087654321", "quantity": 2}]
+        packages = [
+            {"amazon_order_id": "111-1111111-1111111", "products_json": '[{"asin":"B012345678"}]', "asins_json": "[]"},
+            {"amazon_order_id": "111-2222222-2222222", "products_json": '[{"asin":"B087654321"}]', "asins_json": "[]"},
+        ]
+
+        analysis = package_tracker_quantity_analysis(lines, packages, {})
+
+        self.assertFalse(analysis["suspected_duplicate"])
+        self.assertEqual(analysis["asin_mismatches"], [])
+
+    def test_duplicate_analysis_reports_unmapped_amazon_asin(self):
+        lines = [{"asin": "B012345678", "quantity": 1}]
+        packages = [{"amazon_order_id": "111-1111111-1111111", "products_json": '[{"asin":"B099999999"}]', "asins_json": "[]"}]
+
+        analysis = package_tracker_quantity_analysis(lines, packages, {})
+
+        self.assertEqual(analysis["asin_mismatches"][0]["amazon_asin"], "B099999999")
+
     def test_tracker_adds_history_item_only_for_strict_product_superset(self):
         packages = [{"asins_json": '["B09NP8BRPB", "B00C2DHB5K"]', "products_json": "[]"}]
         history = {"items_json": '[{"asin":"B09NP8BRPB"},{"asin":"B00C2DHB5K"},{"asin":"B0F49XZ5PC","title":"Golden Thread"}]'}

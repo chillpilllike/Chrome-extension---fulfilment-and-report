@@ -669,6 +669,23 @@ type PackageTrackerOrderCard = {
   updated_at: string
   packages: PackageTrackerAmazonOrder[]
   previous_orders: PackageTrackerAmazonOrder[]
+  quantity_analysis?: {
+    suspected_duplicate: boolean
+    duplicate_items: Array<{
+      odoo_asin: string
+      replacement_asins: string[]
+      expected_quantity: number
+      amazon_quantity: number
+      excess_quantity: number
+      amazon_order_ids: string[]
+      amazon_asins: string[]
+    }>
+    asin_mismatches: Array<{
+      amazon_asin: string
+      amazon_quantity: number
+      amazon_order_ids: string[]
+    }>
+  }
 }
 
 type PackageTrackerResponse = {
@@ -8347,20 +8364,6 @@ function packageTrackerLatestAmazonOrderDate(row: PackageTrackerOrderCard) {
   }, { value: "", timestamp: Number.NEGATIVE_INFINITY }).value
 }
 
-function packageTrackerDuplicateAsins(row: PackageTrackerOrderCard) {
-  const amazonOrdersByAsin = new Map<string, Set<string>>()
-  row.packages.forEach((item) => {
-    item.products.forEach((product) => {
-      const asin = product.asin?.trim().toUpperCase()
-      if (!asin || !item.amazon_order_id) return
-      const amazonOrders = amazonOrdersByAsin.get(asin) || new Set<string>()
-      amazonOrders.add(item.amazon_order_id)
-      amazonOrdersByAsin.set(asin, amazonOrders)
-    })
-  })
-  return [...amazonOrdersByAsin.entries()].filter(([, amazonOrders]) => amazonOrders.size > 1).map(([asin]) => asin)
-}
-
 function packageTrackerUnassignedProducts(row: PackageTrackerOrderCard) {
   return row.packages.flatMap((item) => item.unassigned_products || [])
 }
@@ -8565,7 +8568,9 @@ function PackageTrackerDesignPage() {
         const historyOpen = expandedHistory.includes(row.id)
         const progress = summary.active ? Math.round((summary.delivered / summary.active) * 100) : 0
         const latestAmazonOrderDate = packageTrackerLatestAmazonOrderDate(row)
-        const duplicateAsins = packageTrackerDuplicateAsins(row)
+        const duplicateItems = row.quantity_analysis?.duplicate_items || []
+        const asinMismatches = row.quantity_analysis?.asin_mismatches || []
+        const excessQuantity = duplicateItems.reduce((total, item) => total + Number(item.excess_quantity || 0), 0)
         const unassignedProducts = packageTrackerUnassignedProducts(row)
         return (
           <article className="card card-sm" key={row.id}>
@@ -8589,7 +8594,8 @@ function PackageTrackerDesignPage() {
                     {row.recipient_verified ? "Recipient verified" : "Check recipient"}
                   </span>
                   {latestAmazonOrderDate && <span className="badge bg-azure-lt text-azure">Latest Amazon order · {packageTrackerAmazonOrderDate(latestAmazonOrderDate)}</span>}
-                  {duplicateAsins.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {duplicateAsins.length} ASIN{duplicateAsins.length === 1 ? "" : "s"}</span>}
+                  {duplicateItems.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {excessQuantity} excess unit{excessQuantity === 1 ? "" : "s"}</span>}
+                  {asinMismatches.length > 0 && <span className="badge bg-red-lt text-red">ASIN mismatch · {asinMismatches.length}</span>}
                   {unassignedProducts.length > 0 && <span className="badge bg-red-lt text-red">Incomplete shipment mapping</span>}
                   <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
                 </div>
@@ -8613,6 +8619,34 @@ function PackageTrackerDesignPage() {
                 <div className="mb-2">
                   <div className="d-flex flex-column flex-sm-row justify-content-between gap-1 mb-2"><strong>Partial delivery progress</strong><span className="text-secondary">Keep all packages with this Odoo card</span></div>
                   <div className="progress progress-sm"><div className="progress-bar bg-warning" style={{ width: `${progress}%` }} role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100} /></div>
+                </div>
+              )}
+
+              {duplicateItems.length > 0 && (
+                <div className="alert alert-warning py-2 px-3 mb-2" role="alert">
+                  <AlertCircle className="icon alert-icon" />
+                  <div>
+                    <strong>Amazon quantity exceeds the Odoo requirement.</strong>
+                    <div className="small d-grid gap-1 mt-1">
+                      {duplicateItems.map((item) => (
+                        <span key={item.odoo_asin}>
+                          <span className="font-monospace fw-semibold">{item.odoo_asin}</span>
+                          {item.replacement_asins.length > 0 && <> (replacement: {item.replacement_asins.join(", ")})</>}
+                          {` · Odoo ${item.expected_quantity} · Amazon ${item.amazon_quantity} · Excess ${item.excess_quantity}`}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {asinMismatches.length > 0 && (
+                <div className="alert alert-danger py-2 px-3 mb-2" role="alert">
+                  <AlertCircle className="icon alert-icon" />
+                  <div>
+                    <strong>Amazon ASIN does not match an Odoo or replacement ASIN.</strong>
+                    <div className="small mt-1">{asinMismatches.map((item) => `${item.amazon_asin} · Amazon qty ${item.amazon_quantity}`).join(", ")}</div>
+                  </div>
                 </div>
               )}
 
