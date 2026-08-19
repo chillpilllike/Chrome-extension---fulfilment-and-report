@@ -64,6 +64,7 @@ const KNOWN_APP_PAGES = new Set([
   "tracking",
   "dispatch-sorting",
   "dispatch-status",
+  "package-tracker",
   "payment-failed",
   "amazon-otp",
   "epost",
@@ -83,7 +84,7 @@ const KNOWN_APP_PAGES = new Set([
   "cancelled-orders",
   "settings",
 ])
-const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "dispatch-sorting", "amazon-otp", "epost"])
+const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "dispatch-sorting", "package-tracker", "amazon-otp", "epost"])
 
 function appPageFromLocation() {
   if (typeof window === "undefined") return "home"
@@ -630,6 +631,233 @@ type DispatchStatusRow = {
   tracking_code_count: number
 }
 
+type PackageTrackerProduct = {
+  title: string
+  asin: string
+  image_url?: string
+  url?: string
+}
+
+type PackageTrackerAmazonOrder = {
+  amazon_order_id: string
+  amazon_order_url: string
+  recipient: string
+  tracking_id: string
+  tracking_url: string
+  carrier: string
+  status: string
+  status_kind: "arriving" | "delivered" | "exception" | "cancelled"
+  expected_at?: string
+  delivered_at?: string
+  updated_at: string
+  dispatch_location: string
+  scan_status: string
+  products: PackageTrackerProduct[]
+  hidden_reason?: "cancelled" | "duplicate" | "replaced"
+}
+
+type PackageTrackerOrderCard = {
+  id: string
+  odoo_orders: Array<{ name: string; url: string }>
+  recipient: string
+  recipient_verified: boolean
+  shopify_status: "fulfilled" | "unfulfilled" | "partially_fulfilled"
+  shopify_url: string
+  shopify_synced_at: string
+  updated_at: string
+  packages: PackageTrackerAmazonOrder[]
+  previous_orders: PackageTrackerAmazonOrder[]
+}
+
+type PackageTrackerResponse = {
+  ok: boolean
+  rows: PackageTrackerOrderCard[]
+  page: number
+  per_page: number
+  total: number
+  pages: number
+  summary: { cards: number; packages: number; delivered: number; partial: number; shopify_pending: number }
+}
+
+const packageTrackerDesignRows: PackageTrackerOrderCard[] = [
+  {
+    id: "NC24001",
+    odoo_orders: [{ name: "NC24001", url: "#" }],
+    recipient: "Nutricity NC24001 1Pack",
+    recipient_verified: true,
+    shopify_status: "unfulfilled",
+    shopify_url: "#",
+    shopify_synced_at: "2026-08-20T00:15:00Z",
+    updated_at: "2026-08-20T01:16:00Z",
+    packages: [
+      {
+        amazon_order_id: "111-0001001-0002001",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=111-0001001-0002001",
+        recipient: "Nutricity NC24001 1Pack",
+        tracking_id: "TBA000001000001",
+        tracking_url: "https://www.amazon.com/progress-tracker/package/ref=ppx_yo_dt_b_track_package",
+        carrier: "Amazon Logistics",
+        status: "Delivered",
+        status_kind: "delivered",
+        delivered_at: "2026-08-20T01:16:00Z",
+        updated_at: "2026-08-20T01:18:00Z",
+        dispatch_location: "Bay 03",
+        scan_status: "Received",
+        products: [{ title: "Zymox Otic Enzymatic Solution", asin: "B0025YMU3E" }],
+      },
+      {
+        amazon_order_id: "111-0001002-0002002",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=111-0001002-0002002",
+        recipient: "Nutricity NC24001 1Pack",
+        tracking_id: "TBA000001000002",
+        tracking_url: "https://www.amazon.com/progress-tracker/package/ref=ppx_yo_dt_b_track_package",
+        carrier: "Amazon Logistics",
+        status: "Delivered",
+        status_kind: "delivered",
+        delivered_at: "2026-08-19T23:42:00Z",
+        updated_at: "2026-08-20T00:02:00Z",
+        dispatch_location: "Bay 03",
+        scan_status: "Received",
+        products: [{ title: "Pet wellness supplement", asin: "B0C8V7K2LM" }],
+      },
+    ],
+    previous_orders: [],
+  },
+  {
+    id: "NC24002-NC24003",
+    odoo_orders: [{ name: "NC24002", url: "#" }, { name: "NC24003", url: "#" }],
+    recipient: "Nutricity NC24002 NC24003 2Pack",
+    recipient_verified: true,
+    shopify_status: "partially_fulfilled",
+    shopify_url: "#",
+    shopify_synced_at: "2026-08-20T00:10:00Z",
+    updated_at: "2026-08-20T01:40:00Z",
+    packages: [
+      {
+        amazon_order_id: "113-0001003-0002003",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=113-0001003-0002003",
+        recipient: "Nutricity NC24002 NC24003 2Pack",
+        tracking_id: "1Z0000000000000001",
+        tracking_url: "https://www.ups.com/track?loc=en_US&tracknum=1Z0000000000000001",
+        carrier: "UPS",
+        status: "Delivered",
+        status_kind: "delivered",
+        delivered_at: "2026-08-20T00:38:00Z",
+        updated_at: "2026-08-20T00:41:00Z",
+        dispatch_location: "Tote T-08",
+        scan_status: "Received",
+        products: [{ title: "NatureBell DHEA", asin: "B074Q2KK6Z" }],
+      },
+      {
+        amazon_order_id: "113-0001004-0002004",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=113-0001004-0002004",
+        recipient: "Nutricity NC24002 NC24003 2Pack",
+        tracking_id: "TBA000001000004",
+        tracking_url: "https://www.amazon.com/progress-tracker/package/ref=ppx_yo_dt_b_track_package",
+        carrier: "Amazon Logistics",
+        status: "Arriving tomorrow by 10 PM",
+        status_kind: "arriving",
+        expected_at: "2026-08-21T22:00:00Z",
+        updated_at: "2026-08-20T01:40:00Z",
+        dispatch_location: "Tote T-08",
+        scan_status: "Expected",
+        products: [
+          { title: "Kids sleep gummies", asin: "B0BX7DV92P" },
+          { title: "Magnesium capsules", asin: "B09KMV7GJL" },
+        ],
+      },
+    ],
+    previous_orders: [],
+  },
+  {
+    id: "ES00991",
+    odoo_orders: [{ name: "ES00991", url: "#" }],
+    recipient: "Nutricity ES00991Pack",
+    recipient_verified: true,
+    shopify_status: "unfulfilled",
+    shopify_url: "#",
+    shopify_synced_at: "2026-08-20T00:05:00Z",
+    updated_at: "2026-08-20T01:55:00Z",
+    packages: [
+      {
+        amazon_order_id: "113-0001005-0002005",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=113-0001005-0002005",
+        recipient: "Nutricity ES00991Pack",
+        tracking_id: "TBA000001000005",
+        tracking_url: "https://www.amazon.com/progress-tracker/package/ref=ppx_yo_dt_b_track_package",
+        carrier: "Amazon Logistics",
+        status: "Arriving Monday",
+        status_kind: "arriving",
+        expected_at: "2026-08-24T22:00:00Z",
+        updated_at: "2026-08-20T01:55:00Z",
+        dispatch_location: "Tote T-21",
+        scan_status: "Expected",
+        products: [{ title: "Sleep support capsules", asin: "B08M4H2Q9K" }],
+      },
+    ],
+    previous_orders: [
+      {
+        amazon_order_id: "113-0001006-0002006",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=113-0001006-0002006",
+        recipient: "Nutricity ES00991Pack",
+        tracking_id: "",
+        tracking_url: "",
+        carrier: "Amazon",
+        status: "Cancelled by Amazon",
+        status_kind: "cancelled",
+        updated_at: "2026-08-18T05:12:00Z",
+        dispatch_location: "",
+        scan_status: "Cancelled",
+        products: [{ title: "Sleep support capsules", asin: "B08M4H2Q9K" }],
+        hidden_reason: "replaced",
+      },
+      {
+        amazon_order_id: "113-0001007-0002007",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=113-0001007-0002007",
+        recipient: "Nutricity ES00991Pack",
+        tracking_id: "",
+        tracking_url: "",
+        carrier: "Amazon",
+        status: "Older duplicate hidden",
+        status_kind: "cancelled",
+        updated_at: "2026-08-17T04:40:00Z",
+        dispatch_location: "",
+        scan_status: "Duplicate",
+        products: [{ title: "Sleep support capsules", asin: "B08M4H2Q9K" }],
+        hidden_reason: "duplicate",
+      },
+    ],
+  },
+  {
+    id: "NC23997",
+    odoo_orders: [{ name: "NC23997", url: "#" }],
+    recipient: "Nutricity NC23997 1Pack",
+    recipient_verified: true,
+    shopify_status: "fulfilled",
+    shopify_url: "#",
+    shopify_synced_at: "2026-08-18T03:00:00Z",
+    updated_at: "2026-08-17T12:30:00Z",
+    packages: [
+      {
+        amazon_order_id: "111-0001008-0002008",
+        amazon_order_url: "https://www.amazon.com/your-orders/order-details?orderID=111-0001008-0002008",
+        recipient: "Nutricity NC23997 1Pack",
+        tracking_id: "9400000000000000000001",
+        tracking_url: "https://tools.usps.com/go/TrackConfirmAction?tLabels=9400000000000000000001",
+        carrier: "USPS",
+        status: "Delivered",
+        status_kind: "delivered",
+        delivered_at: "2026-08-17T12:30:00Z",
+        updated_at: "2026-08-17T12:30:00Z",
+        dispatch_location: "Dispatched",
+        scan_status: "Shopify fulfilled",
+        products: [{ title: "Daily multivitamin", asin: "B07N8K6R5V" }],
+      },
+    ],
+    previous_orders: [],
+  },
+]
+
 type PartialFulfilment = {
   id: number
   store_id: number
@@ -929,6 +1157,7 @@ const defaultUiCopy: UiCopy = {
   tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
   "dispatch-sorting": { title: "Dispatch Sorting", description: "Scan Amazon packages, match orders instantly, and place them into totes." },
   "dispatch-status": { title: "Dispatch Status", description: "Track Odoo order to dispatch timing, ePost movement, and delay risk." },
+  "package-tracker": { title: "Package Tracker", description: "Public Amazon delivery cards grouped and guarded by exact Odoo recipient references." },
   "payment-failed": { title: "Payment Failed", description: "Review Amazon orders that need payment revision." },
   "amazon-otp": { title: "Amazon OTP", description: "Match OTP emails to Amazon and Odoo orders." },
   epost: { title: "ePost Tracking", description: "Monitor ePost Global shipment events." },
@@ -1735,6 +1964,21 @@ function normalizeCodeText(value?: string) {
   return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9-]/g, "")
 }
 
+function isPhysicalDispatchBarcode(value?: string) {
+  const code = normalizeCodeText(value)
+  return /^TBA[A-Z0-9]+$/.test(code)
+    || /^1Z[A-Z0-9]{12,24}$/.test(code)
+    || /^(?:SG|D)\d{10,24}$/.test(code)
+    || /^\d{12,30}$/.test(code)
+}
+
+function looksLikeAmazonInternalLabel(value?: string) {
+  const raw = String(value || "").trim()
+  const code = normalizeCodeText(raw)
+  if (!code || isPhysicalDispatchBarcode(raw) || /^\d{3}-\d{7}-\d{7}$/.test(raw)) return false
+  return code.length >= 8 && (/[_/]/.test(raw) || /^SP[A-Z0-9]{6,22}$/.test(code))
+}
+
 function DispatchPackageCodes({ pkg }: { pkg: Partial<DispatchPackage> }) {
   const scanned = String(pkg.last_scanned_code || pkg.scanned_codes?.[0] || "").trim()
   const tracking = String(pkg.canonical_scan_code || pkg.scan_code || pkg.display_code || "").trim()
@@ -1812,11 +2056,13 @@ function dispatchProductImagesFrom(value: { products?: Array<{ asin?: string; ti
 }
 
 function DispatchProductThumbs({ images, onPreview, size = "md" }: { images: DispatchProductImage[]; onPreview: (image: DispatchProductImage) => void; size?: "sm" | "md" }) {
-  if (!images.length) return null
+  const [failedSources, setFailedSources] = useState<string[]>([])
+  const visibleImages = images.filter((image) => !failedSources.includes(image.src))
+  if (!visibleImages.length) return null
   const itemClass = size === "sm" ? "size-12" : "size-[88px]"
   return (
     <div className="flex shrink-0 flex-wrap gap-2" style={{ flexShrink: 0 }}>
-      {images.map((image, index) => (
+      {visibleImages.map((image, index) => (
         <button
           key={`${image.src}-${index}`}
           type="button"
@@ -1824,7 +2070,7 @@ function DispatchProductThumbs({ images, onPreview, size = "md" }: { images: Dis
           onClick={() => onPreview(image)}
           title={image.title}
         >
-          <img src={image.src} alt={image.title} className="h-full w-full object-contain" />
+          <img src={image.src} alt={image.title} className="h-full w-full object-contain" onError={() => setFailedSources((current) => current.includes(image.src) ? current : [...current, image.src])} />
         </button>
       ))}
     </div>
@@ -4273,6 +4519,7 @@ function App() {
       items: [
         ["tracking", "Amazon Tracking", PackageCheck],
         ["dispatch-sorting", "Dispatch Sorting", PackageCheck],
+        ["package-tracker", "Package Tracker", PackageCheck],
         ["dispatch-status", "Dispatch Status", PackageCheck],
         ["payment-failed", "Payment Failed", AlertCircle],
         ["amazon-otp", "Amazon OTP", Bell],
@@ -4300,6 +4547,7 @@ function App() {
       items: [
         ["tracking", "Amazon Tracking", PackageCheck],
         ["dispatch-sorting", "Dispatch Sorting", PackageCheck],
+        ["package-tracker", "Package Tracker", PackageCheck],
         ["fulfilment-pending", "Pending Dispatch", AlertCircle],
         ["dispatch-status", "Dispatch Status", PackageCheck],
         ["amazon-otp", "Amazon OTP", Bell],
@@ -5244,6 +5492,9 @@ function App() {
         {page === "dispatch-sorting" && (
           <DispatchSortingPage storeId={storeId} publicVisitor={publicVisitor} onResult={setModal} />
         )}
+        {page === "package-tracker" && (
+          <PackageTrackerDesignPage />
+        )}
         {page === "amazon-otp" && (
           <AmazonOtpPage onResult={setModal} />
         )}
@@ -6042,6 +6293,8 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
   const scannerReaderRef = useRef<BrowserMultiFormatReader | null>(null)
   const scannerStreamRef = useRef<MediaStream | null>(null)
   const scannerLastCodeRef = useRef("")
+  const scannerLookupBusyRef = useRef(false)
+  const pendingLabelAliasRef = useRef("")
   const scanResultRef = useRef<HTMLDivElement | null>(null)
 
   async function refreshSummary() {
@@ -6110,7 +6363,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
     window.setTimeout(() => scanResultRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 50)
   }, [searchConfirmation, lastMessage, scanMatches.length, matchedPackage?.id])
 
-  async function submitScan(rawCode: string) {
+  async function submitScan(rawCode: string, explicitAliases?: string[]) {
     const code = rawCode.trim()
     if (!code) return
     scannerLastCodeRef.current = code
@@ -6120,11 +6373,20 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
     setScanMatches([])
     setBusy(true)
     try {
-      const result = await api<{ ok: boolean; matched: boolean; ambiguous?: boolean; package?: DispatchPackage; matches?: DispatchPackage[]; suggested_tote?: string; message: string }>("/api/dispatch-sorting/scan", {
+      const aliases = explicitAliases !== undefined ? explicitAliases : (pendingLabelAliasRef.current ? [pendingLabelAliasRef.current] : [])
+      const result = await api<{ ok: boolean; matched: boolean; ambiguous?: boolean; requires_tracking_scan?: boolean; barcode_kind?: string; package?: DispatchPackage; matches?: DispatchPackage[]; suggested_tote?: string; message: string }>("/api/dispatch-sorting/scan", {
         method: "POST",
-        body: JSON.stringify({ scan_code: code, store_id: storeId ? Number(storeId) : null }),
+        body: JSON.stringify({ scan_code: code, alias_codes: aliases, store_id: storeId ? Number(storeId) : null }),
       })
-      if (result.ambiguous && result.matches?.length) {
+      if (result.requires_tracking_scan) {
+        pendingLabelAliasRef.current = code
+        setMatchedPackage(null)
+        setScanMatches([])
+        setSuggestedTote("")
+        setLastMessage(result.message)
+        setSearchConfirmation(result.message)
+        setScannerStatus(`Label code ${code} captured. Now scan the long TBA tracking barcode.`)
+      } else if (result.ambiguous && result.matches?.length) {
         setMatchedPackage(null)
         setScanMatches([...(result.matches || [])])
         setSuggestedTote("")
@@ -6132,6 +6394,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
         setLastMessage(message)
         setSearchConfirmation(message)
       } else if (!result.matched || !result.package) {
+        pendingLabelAliasRef.current = ""
         setMatchedPackage(null)
         setScanMatches([])
         setSuggestedTote(result.suggested_tote || "EXCEPTION-SCAN-01")
@@ -6139,6 +6402,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
         setLastMessage(message)
         setSearchConfirmation(message)
       } else {
+        pendingLabelAliasRef.current = ""
         setMatchedPackage(result.package)
         setScanMatches([])
         setSuggestedTote(result.package.suggested_tote || result.package.tote_code || "")
@@ -6162,6 +6426,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       } else {
         void refreshSummary().catch((error) => onResult({ ok: false, title: "Dispatch Summary Failed", message: String(error) }))
       }
+      return result
     } catch (error) {
       const message = `Scan failed for ${code}: ${String(error)}`
       setMatchedPackage(null)
@@ -6236,6 +6501,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       setSearchConfirmation(`Batch scan completed: ${results.length} package code${results.length === 1 ? "" : "s"} processed.`)
       if (scanEventPage !== 1) setScanEventPage(1)
       else await refreshSummary()
+      return result
     } catch (error) {
       onResult({ ok: false, title: "Batch Scan Failed", message: String(error) })
     } finally {
@@ -6243,14 +6509,20 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
     }
   }
 
-  async function submitBatchCameraScan(code: string) {
+  async function submitBatchCameraScan(code: string, aliases: string[] = []) {
     const limit = Math.max(1, Math.min(50, Number.parseInt(batchLimit || "10", 10) || 10))
     setBatchBusy(true)
     try {
-      const result = await api<{ ok: boolean; matched: boolean; ambiguous?: boolean; package?: DispatchPackage; matches?: DispatchPackage[]; message: string }>("/api/dispatch-sorting/scan", {
+      const result = await api<{ ok: boolean; matched: boolean; ambiguous?: boolean; requires_tracking_scan?: boolean; package?: DispatchPackage; matches?: DispatchPackage[]; message: string }>("/api/dispatch-sorting/scan", {
         method: "POST",
-        body: JSON.stringify({ scan_code: code, store_id: storeId ? Number(storeId) : null }),
+        body: JSON.stringify({ scan_code: code, alias_codes: aliases, store_id: storeId ? Number(storeId) : null }),
       })
+      if (result.requires_tracking_scan) {
+        pendingLabelAliasRef.current = code
+        setScannerStatus(`Internal label code captured: ${code}. Now scan the long barcode beside the printed TBA number.`)
+        return
+      }
+      pendingLabelAliasRef.current = ""
       setBatchResults((current) => {
         const next = [...current, { code, message: result.message || "", ok: Boolean(result.matched), package: result.package, matches: result.matches }]
         if (next.length >= limit) {
@@ -6288,15 +6560,19 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
 
   function stopCameraScanner() {
     stopScannerStream()
+    scannerLookupBusyRef.current = false
     setScannerOpen(false)
     setBatchCameraMode(false)
     setScannerError("")
     setScannerStatus("")
+    pendingLabelAliasRef.current = ""
     scanInputRef.current?.focus()
   }
 
   async function openCameraScanner(batch = false) {
     scannerLastCodeRef.current = ""
+    scannerLookupBusyRef.current = false
+    pendingLabelAliasRef.current = ""
     setBatchCameraMode(batch)
     setScannerOpen(true)
     setScannerError("")
@@ -6366,15 +6642,39 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
             )
           })
         }
-        setScannerStatus("Camera ready. Point at the Amazon label barcode or QR code.")
+        setScannerStatus("Camera ready. Scan the long TBA barcode. If a square Amazon code is read first, scan the TBA barcode next and both will be linked.")
         const controls = await reader.decodeFromVideoElement(
           videoElement,
           (result) => {
             const text = result?.getText?.().trim()
-            if (!text || scannerLastCodeRef.current === text) return
+            if (!text || scannerLookupBusyRef.current || scannerLastCodeRef.current === text) return
             scannerLastCodeRef.current = text
+            if (looksLikeAmazonInternalLabel(text) && !isPhysicalDispatchBarcode(text)) {
+              scannerLookupBusyRef.current = true
+              pendingLabelAliasRef.current = text
+              setScannerStatus(`Checking Amazon label code ${text}...`)
+              if (batchCameraMode) {
+                void submitBatchCameraScan(text, []).finally(() => {
+                  scannerLookupBusyRef.current = false
+                })
+              } else {
+                void submitScan(text, []).then((scanResult) => {
+                  if (scanResult?.matched) {
+                    stopScannerStream()
+                    setScannerOpen(false)
+                  }
+                }).finally(() => {
+                  scannerLookupBusyRef.current = false
+                })
+              }
+              window.setTimeout(() => {
+                if (scannerLastCodeRef.current === text) scannerLastCodeRef.current = ""
+              }, 1200)
+              return
+            }
+            const aliases = pendingLabelAliasRef.current ? [pendingLabelAliasRef.current] : []
             if (batchCameraMode) {
-              void submitBatchCameraScan(text)
+              void submitBatchCameraScan(text, aliases)
               window.setTimeout(() => {
                 if (scannerLastCodeRef.current === text) scannerLastCodeRef.current = ""
               }, 1200)
@@ -6382,7 +6682,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               stopScannerStream()
               setScannerOpen(false)
               setSearchConfirmation(`Scanned ${text}. Checking package...`)
-              void submitScan(text)
+              void submitScan(text, aliases)
             }
           },
         )
@@ -7141,7 +7441,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
               {batchCameraMode ? "Batch Camera Scanner" : "Camera Scanner"}
             </DialogTitle>
             <DialogDescription>
-              {batchCameraMode ? `Scan up to ${batchLimit || "10"} package labels. The camera stays open until the batch limit is reached or you close it.` : "Point the phone camera at the Amazon label barcode or QR code."}
+              {batchCameraMode ? `Scan up to ${batchLimit || "10"} package labels. If a square Amazon code is captured first, scan the long TBA barcode next to pair them.` : "Scan the long barcode beside the printed TBA number. Square Amazon label codes are paired to that tracking ID, not treated as tracking IDs themselves."}
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-3 p-4">
@@ -7986,6 +8286,426 @@ function dispatchStatusBadgeVariant(value: string) {
   if (value === "late_dispatch" || value === "pending_dispatch") return "destructive"
   if (value === "timely_dispatch") return "outline"
   return "secondary"
+}
+
+function packageTrackerSummary(row: PackageTrackerOrderCard) {
+  const delivered = row.packages.filter((item) => item.status_kind === "delivered")
+  const active = row.packages.filter((item) => item.status_kind !== "cancelled")
+  const fullyDelivered = active.length > 0 && delivered.length === active.length
+  const partiallyDelivered = delivered.length > 0 && delivered.length < active.length
+  const completedAt = fullyDelivered
+    ? delivered.map((item) => item.delivered_at || "").filter(Boolean).sort().at(-1) || ""
+    : ""
+  const nextExpectedAt = active.map((item) => item.expected_at || "").filter(Boolean).sort()[0] || ""
+  const needsShopifyDispatch = fullyDelivered && row.shopify_status !== "fulfilled"
+  const effectiveDate = completedAt || nextExpectedAt || row.updated_at
+  return { delivered: delivered.length, active: active.length, fullyDelivered, partiallyDelivered, completedAt, nextExpectedAt, needsShopifyDispatch, effectiveDate }
+}
+
+function packageTrackerDaysSince(value: string) {
+  if (!value) return null
+  const timestamp = new Date(value).getTime()
+  if (!Number.isFinite(timestamp)) return null
+  return Math.max(0, Math.floor((Date.now() - timestamp) / 86400000))
+}
+
+function packageTrackerStatusLabel(row: PackageTrackerOrderCard) {
+  const summary = packageTrackerSummary(row)
+  if (summary.needsShopifyDispatch) return "Delivered · Shopify pending"
+  if (summary.fullyDelivered) return "Fully delivered"
+  if (summary.partiallyDelivered) return "Partially delivered"
+  if (row.packages.some((item) => item.status_kind === "exception")) return "Delivery exception"
+  return "Arriving"
+}
+
+function packageTrackerStatusClass(row: PackageTrackerOrderCard) {
+  const summary = packageTrackerSummary(row)
+  if (summary.needsShopifyDispatch) return "danger"
+  if (summary.fullyDelivered) return "success"
+  if (summary.partiallyDelivered) return "warning"
+  if (row.packages.some((item) => item.status_kind === "exception")) return "danger"
+  return "primary"
+}
+
+function PackageTrackerDesignPage() {
+  const [query, setQuery] = useState("")
+  const [debouncedQuery, setDebouncedQuery] = useState("")
+  const [searchField, setSearchField] = useState(() => {
+    try {
+      return window.localStorage.getItem("packageTrackerSearchField") || "all"
+    } catch {
+      return "all"
+    }
+  })
+  const [status, setStatus] = useState("all")
+  const [sortBy, setSortBy] = useState("recent_delivery")
+  const [fromDate, setFromDate] = useState("")
+  const [toDate, setToDate] = useState("")
+  const [expandedHistory, setExpandedHistory] = useState<string[]>([])
+  const [expandedPackages, setExpandedPackages] = useState<string[]>([])
+  const [page, setPage] = useState(1)
+  const [perPage, setPerPage] = useState(12)
+  const [rows, setRows] = useState<PackageTrackerOrderCard[]>([])
+  const [total, setTotal] = useState(0)
+  const [totals, setTotals] = useState({ cards: 0, packages: 0, delivered: 0, partial: 0, shopify_pending: 0 })
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState("")
+  const [imagePreview, setImagePreview] = useState<DispatchProductImage | null>(null)
+  const [refreshVersion, setRefreshVersion] = useState(0)
+  const [syncingOrders, setSyncingOrders] = useState<string[]>([])
+  const [syncResults, setSyncResults] = useState<Record<string, { ok: boolean; message: string }>>({})
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 300)
+    return () => window.clearTimeout(timer)
+  }, [query])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("packageTrackerSearchField", searchField)
+    } catch {
+      // Search still works when browser storage is unavailable.
+    }
+  }, [searchField])
+
+  useEffect(() => setPage(1), [debouncedQuery, searchField, status, sortBy, fromDate, toDate, perPage])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const params = new URLSearchParams({ page: String(page), per_page: String(perPage), q: debouncedQuery, field: searchField, status, sort: sortBy, from_date: fromDate, to_date: toDate })
+    setLoading(true)
+    setLoadError("")
+    api<PackageTrackerResponse>(`/api/public/package-tracker?${params}`, { signal: controller.signal })
+      .then((result) => {
+        setRows(result.rows || [])
+        setTotal(Number(result.total || 0))
+        setTotals(result.summary || { cards: 0, packages: 0, delivered: 0, partial: 0, shopify_pending: 0 })
+      })
+      .catch((error) => {
+        if (error?.name !== "AbortError") setLoadError(error instanceof Error ? error.message : "Package data could not be loaded.")
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false)
+      })
+    return () => controller.abort()
+  }, [debouncedQuery, fromDate, page, perPage, refreshVersion, searchField, sortBy, status, toDate])
+
+  function toggleHistory(id: string) {
+    setExpandedHistory((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id])
+  }
+
+  function togglePackage(id: string) {
+    setExpandedPackages((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id])
+  }
+
+  async function syncOrderFulfilment(row: PackageTrackerOrderCard) {
+    const storeId = Number(row.id.split(":", 1)[0])
+    const orderNames = row.odoo_orders.map((order) => order.name).filter(Boolean)
+    if (!storeId || !orderNames.length || syncingOrders.includes(row.id)) return
+    setSyncingOrders((current) => [...current, row.id])
+    setSyncResults((current) => ({ ...current, [row.id]: { ok: true, message: "Syncing Shopify…" } }))
+    try {
+      const result = await api<{ ok: boolean; synced: number }>("/api/shopify/orders/status/sync", {
+        method: "POST",
+        body: JSON.stringify({ store_id: storeId, order_names: orderNames, force: true }),
+      })
+      setSyncResults((current) => ({
+        ...current,
+        [row.id]: {
+          ok: true,
+          message: result.synced ? "Fulfilment refreshed" : "No matching Shopify order",
+        },
+      }))
+      setRefreshVersion((value) => value + 1)
+    } catch (error) {
+      setSyncResults((current) => ({ ...current, [row.id]: { ok: false, message: error instanceof Error ? error.message : "Sync failed" } }))
+    } finally {
+      setSyncingOrders((current) => current.filter((id) => id !== row.id))
+    }
+  }
+
+  return (
+    <div className="d-grid gap-3">
+      <div className="card">
+        <div className="card-header">
+          <div>
+            <h3 className="card-title">Public package tracking</h3>
+            <div className="card-subtitle">Complete Odoo cards move together when sorted. Recipient references guard every Amazon association.</div>
+          </div>
+          <div className="card-actions">
+            <span className="status status-green"><span className="status-dot status-dot-animated" />Recipient guard active</span>
+          </div>
+        </div>
+        <div className="card-body">
+          <div className="row g-3">
+            <div className="col-12 col-xl-4">
+              <label className="form-label" htmlFor="package-tracker-search">Search</label>
+              <div className="row g-2">
+                <div className="col-5">
+                <select className="form-select" aria-label="Search field" value={searchField} onChange={(event) => setSearchField(event.target.value)}>
+                  <option value="all">All fields</option>
+                  <option value="order_number">Order number</option>
+                  <option value="amazon_order">Amazon order</option>
+                  <option value="asin">ASIN</option>
+                  <option value="product_name">Product name</option>
+                  <option value="tracking_id">Tracking ID</option>
+                  <option value="recipient">Recipient</option>
+                </select>
+                </div>
+                <div className="col-7 input-icon">
+                  <span className="input-icon-addon"><Search className="icon icon-1" /></span>
+                  <input id="package-tracker-search" className="form-control" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search packages…" />
+                </div>
+              </div>
+            </div>
+            <div className="col-12 col-md-4 col-xl-2">
+              <label className="form-label" htmlFor="package-tracker-status">Status</label>
+              <select id="package-tracker-status" className="form-select" value={status} onChange={(event) => setStatus(event.target.value)}>
+                <option value="all">All orders</option>
+                <option value="arriving">Arriving</option>
+                <option value="partial">Partially delivered</option>
+                <option value="delivered">Fully delivered</option>
+                <option value="shopify_pending">Delivered, Shopify pending</option>
+                <option value="cancelled_history">Has cancelled history</option>
+              </select>
+            </div>
+            <div className="col-12 col-md-4 col-xl-2">
+              <label className="form-label" htmlFor="package-tracker-sort">Sort full cards by</label>
+              <select id="package-tracker-sort" className="form-select" value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
+                <option value="recent_delivery">Recent deliveries first</option>
+                <option value="delivery_asc">Delivery date · earliest</option>
+                <option value="delivery_desc">Delivery date · latest</option>
+                <option value="partial_first">Partially delivered first</option>
+                <option value="shopify_action">Shopify action first</option>
+                <option value="updated">Recently updated</option>
+                <option value="odoo">Odoo order number</option>
+              </select>
+            </div>
+            <div className="col-6 col-md-2 col-xl-2">
+              <label className="form-label" htmlFor="package-tracker-from">From date</label>
+              <input id="package-tracker-from" className="form-control" type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} />
+            </div>
+            <div className="col-6 col-md-2 col-xl-2">
+              <label className="form-label" htmlFor="package-tracker-to">To date</label>
+              <input id="package-tracker-to" className="form-control" type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} />
+            </div>
+          </div>
+        </div>
+        <div className="card-footer">
+          <div className="row g-3 text-center">
+            <div className="col-6 col-md"><div className="h2 m-0">{totals.cards.toLocaleString()}</div><div className="text-secondary">Odoo cards</div></div>
+            <div className="col-6 col-md"><div className="h2 m-0">{totals.packages}</div><div className="text-secondary">Current packages</div></div>
+            <div className="col-6 col-md"><div className="h2 m-0 text-green">{totals.delivered}</div><div className="text-secondary">Fully delivered</div></div>
+            <div className="col-6 col-md"><div className="h2 m-0 text-yellow">{totals.partial}</div><div className="text-secondary">Partially delivered</div></div>
+            <div className="col-12 col-md"><div className="h2 m-0 text-red">{totals.shopify_pending}</div><div className="text-secondary">Shopify action</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card card-sm">
+        <div className="card-body d-flex flex-column flex-md-row align-items-md-center gap-3">
+          <PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="Odoo cards" />
+          <label className="d-flex align-items-center gap-2 ms-md-auto text-secondary small">
+            Cards per page
+            <select className="form-select form-select-sm w-auto" value={perPage} onChange={(event) => setPerPage(Number(event.target.value))} disabled={loading}>
+              <option value={12}>12</option>
+              <option value={24}>24</option>
+              <option value={48}>48</option>
+            </select>
+          </label>
+          {loading && <span className="status status-blue"><span className="status-dot status-dot-animated" />Loading</span>}
+        </div>
+      </div>
+
+      {loadError && <div className="alert alert-danger" role="alert"><AlertCircle className="icon alert-icon" /><div>{loadError}</div></div>}
+
+      {rows.map((row) => {
+        const summary = packageTrackerSummary(row)
+        const color = packageTrackerStatusClass(row)
+        const daysSinceDelivered = packageTrackerDaysSince(summary.completedAt)
+        const historyOpen = expandedHistory.includes(row.id)
+        const progress = summary.active ? Math.round((summary.delivered / summary.active) * 100) : 0
+        return (
+          <article className="card card-sm" key={row.id}>
+            <div className={`card-status-top bg-${color}`} />
+            <div className="card-body py-2 px-3 border-bottom">
+              <div className="d-flex flex-column flex-md-row align-items-md-center gap-2 w-100">
+                <div className="flex-fill">
+                  <div className="d-flex flex-wrap align-items-baseline gap-2">
+                    {row.odoo_orders.map((order) => <a key={order.name} href={order.url} className="h3 m-0 text-reset">{order.name}</a>)}
+                    <span className="text-secondary small text-break">Recipient: <strong className="text-body">{row.recipient}</strong></span>
+                  </div>
+                </div>
+                <div className="d-flex flex-wrap align-items-center justify-content-md-end gap-1">
+                  <button className="btn btn-outline-primary btn-sm" type="button" onClick={() => syncOrderFulfilment(row)} disabled={syncingOrders.includes(row.id)}>
+                    <RefreshCw className={`icon icon-1 ${syncingOrders.includes(row.id) ? "icon-spin" : ""}`} />
+                    {syncingOrders.includes(row.id) ? "Syncing…" : "Sync fulfilment"}
+                  </button>
+                  <span className={`status status-${color}`}><span className="status-dot" />{packageTrackerStatusLabel(row)}</span>
+                  <span className={`badge ${row.recipient_verified ? "bg-green-lt text-green" : "bg-red-lt text-red"}`}>
+                    {row.recipient_verified ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
+                    {row.recipient_verified ? "Recipient verified" : "Check recipient"}
+                  </span>
+                  <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
+                </div>
+              </div>
+              {syncResults[row.id] && <div className={`small mt-1 text-${syncResults[row.id].ok ? "green" : "red"}`}>{syncResults[row.id].message}</div>}
+            </div>
+
+            <div className="card-body p-2 p-md-3">
+              {summary.needsShopifyDispatch && (
+                <div className="alert alert-danger py-2 px-3 mb-2" role="alert">
+                  <div className="d-flex flex-column flex-md-row align-items-md-center gap-2">
+                    <AlertCircle className="icon alert-icon flex-shrink-0" />
+                    <strong className="flex-fill">Delivered · Shopify dispatch pending</strong>
+                    <span className="small">Synced {row.shopify_synced_at ? formatDateTime(row.shopify_synced_at) : "pending"}</span>
+                    <a href={row.shopify_url} className="btn btn-danger btn-sm">Shopify</a>
+                  </div>
+                </div>
+              )}
+
+              {summary.partiallyDelivered && (
+                <div className="mb-2">
+                  <div className="d-flex flex-column flex-sm-row justify-content-between gap-1 mb-2"><strong>Partial delivery progress</strong><span className="text-secondary">Keep all packages with this Odoo card</span></div>
+                  <div className="progress progress-sm"><div className="progress-bar bg-warning" style={{ width: `${progress}%` }} role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100} /></div>
+                </div>
+              )}
+
+              <div className="d-grid gap-2">
+                {row.packages.map((item, itemIndex) => {
+                  const itemColor = item.status_kind === "delivered" ? "success" : item.status_kind === "exception" ? "danger" : "primary"
+                  const packageKey = `${row.id}:${item.amazon_order_id}:${item.tracking_id}:${itemIndex}`
+                  const packageExpanded = expandedPackages.includes(packageKey)
+                  const sameAmazonOrderIndexes = row.packages.flatMap((candidate, candidateIndex) => candidate.amazon_order_id === item.amazon_order_id ? [candidateIndex] : [])
+                  const shipmentPosition = sameAmazonOrderIndexes.indexOf(itemIndex) + 1
+                  return (
+                    <section className="card card-sm w-100" key={packageKey}>
+                      <div className={`card-status-start bg-${itemColor}`} />
+                      <div className="card-body p-2 p-md-3">
+                        <div className="row g-3 align-items-start">
+                          <div className="col-12 col-md-5 col-xl-6">
+                            <div className="d-grid gap-2">
+                              {item.products.map((product, productIndex) => {
+                                const productImages = dispatchProductImagesFrom({ products: [product] })
+                                return (
+                                  <div className={`d-flex align-items-center gap-2 ${productIndex ? "border-top pt-2" : ""}`} key={`${product.asin}:${productIndex}`}>
+                                    {productImages.length ? (
+                                      <DispatchProductThumbs images={productImages} onPreview={setImagePreview} size="sm" />
+                                    ) : (
+                                      <span className="avatar avatar-md bg-blue-lt text-blue flex-shrink-0"><PackageCheck className="icon" /></span>
+                                    )}
+                                    <div className="flex-fill overflow-hidden">
+                                      <h4 className="card-title mb-0 text-break">{product.title}</h4>
+                                      <div className="text-secondary small text-break">{product.asin}</div>
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                            <div className="d-flex flex-wrap align-items-center gap-1 mt-2">
+                              <span className={`badge bg-${itemColor}-lt text-${itemColor}`}>{item.status_kind === "delivered" ? "Delivered" : item.status_kind === "exception" ? "Exception" : "Arriving"}</span>
+                              {sameAmazonOrderIndexes.length > 1 && <span className="badge bg-blue-lt text-blue">Shipment {shipmentPosition} of {sameAmazonOrderIndexes.length}</span>}
+                            </div>
+                          </div>
+
+                          <div className="col-12 d-md-none">
+                            <button type="button" className="btn btn-outline-secondary btn-sm w-100" onClick={() => togglePackage(packageKey)} aria-expanded={packageExpanded}>
+                              {packageExpanded ? "Hide package details" : "Show package details"}
+                              <ChevronDown className={`icon icon-1 ms-1 transition-transform ${packageExpanded ? "rotate-180" : ""}`} />
+                            </button>
+                          </div>
+
+                          <div className={`col-12 col-md-7 col-xl-6 ${packageExpanded ? "d-block" : "d-none"} d-md-block`}>
+                            <div className="row g-2 small">
+                              <div className="col-12 col-sm-6">
+                                <div className="text-secondary fw-bold">Amazon</div>
+                                <a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id}</a>
+                              </div>
+                              <div className="col-12 col-sm-6">
+                                <div className="text-secondary fw-bold">Tracking</div>
+                                {item.tracking_id ? <a href={item.tracking_url} target="_blank" rel="noreferrer" className="font-monospace text-break">{item.tracking_id}</a> : <span className="text-secondary">Not issued</span>}
+                                <div className="text-secondary">{item.carrier}</div>
+                              </div>
+                              <div className="col-12 col-lg-6">
+                                <div className="text-secondary fw-bold">Delivery</div>
+                                <span className={`status status-${itemColor}`}><span className="status-dot" />{item.status}</span>
+                                <div className="text-secondary mt-1">Updated {formatDateTime(item.updated_at)}</div>
+                              </div>
+                              <div className="col-6 col-lg-3">
+                                <div className="text-secondary fw-bold">Delivered / ETA</div>
+                                <strong>{item.delivered_at ? formatDateTime(item.delivered_at) : item.expected_at ? formatDateTime(item.expected_at) : "No estimate"}</strong>
+                              </div>
+                              <div className="col-6 col-lg-3">
+                                <div className="text-secondary fw-bold">Dispatch</div>
+                                <div className="fw-semibold text-break">{item.dispatch_location || "Not assigned"}</div>
+                                <span className={`badge ${item.scan_status === "Received" ? "bg-green-lt text-green" : "bg-blue-lt text-blue"}`}>{item.scan_status}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </section>
+                  )
+                })}
+              </div>
+
+              {historyOpen && row.previous_orders.length > 0 && (
+                <div className="mt-4">
+                  <h4 className="card-title">Earlier cancelled or duplicate orders</h4>
+                  <div className="row row-cards">
+                    {row.previous_orders.map((item) => (
+                      <div className="col-12 col-xl-6" key={item.amazon_order_id}>
+                        <div className="card card-sm bg-secondary-lt">
+                          <div className="card-body">
+                            <div className="d-flex flex-column flex-sm-row justify-content-between gap-2">
+                              <div><a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id} <ExternalLink className="icon icon-1" /></a><div className="text-secondary small text-break">{item.products.map((product) => product.title).join(", ")}</div></div>
+                              <div className="text-sm-end"><span className="badge bg-secondary-lt text-secondary">{item.hidden_reason === "duplicate" ? "Older duplicate" : "Cancelled / replaced"}</span><div className="text-secondary small mt-1">{formatDateTime(item.updated_at)}</div></div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="card-footer py-2 px-3">
+              <div className="d-flex flex-column flex-md-row align-items-md-center gap-2">
+                <span className={`badge ${row.shopify_status === "fulfilled" ? "bg-green-lt text-green" : row.shopify_status === "partially_fulfilled" ? "bg-yellow-lt text-yellow" : "bg-red-lt text-red"}`}>Shopify: {row.shopify_status.replaceAll("_", " ")}</span>
+                <span className="text-secondary small">Synced {formatDateTime(row.shopify_synced_at)}</span>
+                <span className="text-secondary small ms-md-auto">{summary.fullyDelivered
+                  ? daysSinceDelivered === null ? "Full delivery date not recorded" : `${daysSinceDelivered} day${daysSinceDelivered === 1 ? "" : "s"} since full delivery`
+                  : `Next delivery ${summary.nextExpectedAt ? formatDateTime(summary.nextExpectedAt) : "not estimated"}`}</span>
+                {row.previous_orders.length > 0 && (
+                  <button className="btn btn-outline-secondary btn-sm" type="button" onClick={() => toggleHistory(row.id)} aria-expanded={historyOpen}>
+                    <ChevronDown className={`icon icon-1 ${historyOpen ? "rotate-180" : ""}`} />
+                    {historyOpen ? "Hide" : "Show"} earlier orders ({row.previous_orders.length})
+                  </button>
+                )}
+              </div>
+            </div>
+          </article>
+        )
+      })}
+
+      {!loading && !rows.length && <div className="empty card"><div className="empty-icon"><Search className="icon" /></div><p className="empty-title">No order cards match</p><p className="empty-subtitle text-secondary">Change the search, date range, or status filter.</p></div>}
+
+      {total > 0 && <div className="card card-sm"><div className="card-body"><PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="Odoo cards" /></div></div>}
+
+      <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>{imagePreview?.title || "Amazon product image"}</DialogTitle>
+            <DialogDescription>{imagePreview?.asin ? `ASIN ${imagePreview.asin}` : "Product thumbnail from Amazon package details."}</DialogDescription>
+          </DialogHeader>
+          <div className="flex max-h-[72vh] items-center justify-center overflow-hidden rounded border bg-white p-4">
+            {imagePreview?.src ? <img src={imagePreview.src} alt={imagePreview.title || "Amazon product"} className="max-h-[68vh] w-full object-contain" /> : null}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
 }
 
 function DispatchStatusPage({

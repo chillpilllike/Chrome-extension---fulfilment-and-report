@@ -1272,13 +1272,22 @@ class ShopifyClient:
             return str(j)
         except Exception:
             return resp.text.strip()
-    def _request(self, method: str, url: str, json_body: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        url: str,
+        json_body: dict | None = None,
+        *,
+        retry_on_uncertain_failure: bool = True,
+    ) -> dict:
         for attempt in range(1, MAX_RETRIES + 1):
             resp = None
             try:
                 resp = self.session.request(method, url, json=json_body, timeout=HTTP_TIMEOUT)
             except requests.RequestException as e:
-                if attempt == MAX_RETRIES:
+                # A timed-out order-create request may already have succeeded in Shopify.
+                # Retrying that POST here can create a second order with the same name.
+                if not retry_on_uncertain_failure or attempt == MAX_RETRIES:
                     raise
                 sleep_s = (RETRY_BACKOFF_BASE ** attempt)
                 log("WARN", f"{self.name} HTTP exception: {e}. retry in {sleep_s:.1f}s")
@@ -1286,6 +1295,11 @@ class ShopifyClient:
                 continue
 
             if resp.status_code in (429, 500, 502, 503, 504):
+                if resp.status_code != 429 and not retry_on_uncertain_failure:
+                    details = self._format_shopify_error(resp)
+                    raise RuntimeError(
+                        f"{self.name} HTTP {resp.status_code} {resp.request.method} {resp.url} -> {details}"
+                    )
                 if attempt == MAX_RETRIES:
                     resp.raise_for_status()
                 sleep_s = (RETRY_BACKOFF_BASE ** attempt)
@@ -1585,10 +1599,16 @@ class ShopifyClient:
             return None
 
         try:
-            resp = self._request("POST", self.rest_base + "orders.json", payload)
+            resp = self._request(
+                "POST",
+                self.rest_base + "orders.json",
+                payload,
+                retry_on_uncertain_failure=False,
+            )
         except RuntimeError as e:
             msg = str(e)
-            if "province" in msg and "not valid" in msg:
+            is_validation_error = "HTTP 400" in msg or "HTTP 422" in msg
+            if is_validation_error and "province" in msg and "not valid" in msg:
                 # Drop province fields and retry once
                 try:
                     o = payload.get("order", {})
@@ -1598,10 +1618,20 @@ class ShopifyClient:
                         o["billing_address"].pop("province", None)
                 except Exception:
                     pass
-                resp = self._request("POST", self.rest_base + "orders.json", payload)
-            elif _shopify_error_is_invalid_phone(msg) and drop_order_phone_fields(payload):
+                resp = self._request(
+                    "POST",
+                    self.rest_base + "orders.json",
+                    payload,
+                    retry_on_uncertain_failure=False,
+                )
+            elif is_validation_error and _shopify_error_is_invalid_phone(msg) and drop_order_phone_fields(payload):
                 log("WARN", f"{self.name}: Shopify rejected order phone; retrying order create without validated phone fields")
-                resp = self._request("POST", self.rest_base + "orders.json", payload)
+                resp = self._request(
+                    "POST",
+                    self.rest_base + "orders.json",
+                    payload,
+                    retry_on_uncertain_failure=False,
+                )
             else:
                 raise
         created = resp["order"]

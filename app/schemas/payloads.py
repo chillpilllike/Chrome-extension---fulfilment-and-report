@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class StorePayload(BaseModel):
@@ -83,6 +83,8 @@ class ChromeJobCompletePayload(BaseModel):
     amazon_order_url: str = ""
     amazon_account_name: str = ""
     order_date: str = ""
+    amazon_recipient: str = ""
+    amazon_asins: list[str] = []
     line_ids: list[int] = []
     order_mappings: list[dict[str, Any]] = []
     pricing_summary: list[dict[str, Any]] = []
@@ -133,6 +135,7 @@ class DispatchScanPayload(BaseModel):
     scan_code: str
     store_id: Optional[int] = None
     operator: str = ""
+    alias_codes: list[str] = Field(default_factory=list)
 
 
 class DispatchPlacePayload(BaseModel):

@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-07-18-history-report-guard-v19";
+const CONTENT_SCRIPT_BUILD = "2026-07-19-queue-single-worker-v35";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -67,6 +67,10 @@ const MAX_ORDER_HISTORY_CARDS_PER_PASS = 12;
 const ORDER_HISTORY_CACHE_MS = 2 * 60 * 1000;
 const ORDER_HISTORY_NOT_FOUND_CACHE_MS = 15 * 1000;
 const IDLE_ACTIVE_JOB_POLL_MS = 30000;
+// Product selection, cart stabilization, address editing, and checkout can
+// legitimately take well over 25 seconds. Starting a second run while the
+// first is still awaiting Amazon duplicates Add-to-cart clicks and quantities.
+const CONTENT_RUN_STALE_MS = 3 * 60 * 1000;
 
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
@@ -271,8 +275,29 @@ function sendDiagnostic(message, details = {}, level = "info") {
 async function setActiveJob(activeJob, options = {}) {
   let next = activeJob;
   let latest = null;
-  if (activeJob?.job?.group_key && options.allowUnpause !== true) {
+  if (activeJob?.job?.group_key) {
     latest = await getActiveJob();
+    const latestPauseRevision = Number(latest?.pauseRevision || 0);
+    const incomingPauseRevision = Number(activeJob.pauseRevision || 0);
+    if (
+      latest?.job?.group_key === activeJob.job.group_key
+      && latestPauseRevision > incomingPauseRevision
+    ) {
+      // A run that began before the operator clicked Resume must never write
+      // its stale paused=true snapshot back after the background worker has
+      // already cleared the pause. That race made every navigation pause the
+      // same order again and prevented the queue from advancing unattended.
+      next = {
+        ...activeJob,
+        paused: Boolean(latest.paused),
+        pausedStage: latest.pausedStage || null,
+        pauseRevision: latestPauseRevision,
+      };
+      activeJob = next;
+    }
+  }
+  if (activeJob?.job?.group_key && options.allowUnpause !== true) {
+    latest = latest || await getActiveJob();
     if (latest?.job?.group_key === activeJob.job.group_key && latest.paused && !activeJob.paused) {
       next = {
         ...activeJob,
@@ -1262,33 +1287,10 @@ function chooseBestCountVariant(item, currentUnitPrice) {
 }
 
 async function selectCheapestCountVariant(activeJob, item, currentUnitPrice) {
-  const best = chooseBestCountVariant(item, currentUnitPrice);
-  if (!best) return false;
-  activeJob.variantSelections = activeJob.variantSelections || {};
-  activeJob.variantSelections[item.asin] = {
-    asin: best.asin,
-    quantity: best.quantity,
-    label: best.label,
-    units: best.units,
-    price: best.price,
-    requested_total_units: best.requested_total_units,
-  };
-  await setActiveJob(activeJob);
-  if (best.asin !== currentAsinFromUrl()) {
-    const currentTotal = Number(currentUnitPrice || 0) * Math.max(1, Math.round(Number(item.quantity || 1)));
-    const savingText = currentTotal && best.total < currentTotal - 0.01 ? " for less" : "";
-    showPanel("Nutricity fulfilment", `Switching to ${best.label} to buy ${best.requested_total_units} total count${savingText}.`, null, null);
-    if (best.target && visible(best.target)) {
-      best.target.scrollIntoView({ block: "center", behavior: "smooth" });
-      await sleep(500);
-      best.target.click();
-      await sleep(2500);
-    }
-    if (currentAsinFromUrl() !== best.asin) {
-      location.href = `https://www.amazon.com/dp/${best.asin}`;
-    }
-    return true;
-  }
+  // Never substitute another ASIN or pack automatically. A lower-priced pack
+  // can be a different product, strength or customer-approved alternative.
+  // The requested ASIN and quantity must remain intact unless an operator
+  // explicitly makes a replacement outside the fulfilment flow.
   return false;
 }
 
@@ -3975,12 +3977,25 @@ async function selectAddressRadioForElement(element) {
 }
 
 function findEditAddressTrigger() {
+  // Amazon's address row can contain several modal actions (including
+  // delivery preferences). Always pick the literal Edit address control from
+  // the selected safe warehouse row before considering generic modal hosts.
+  // Selecting a host's first child can click a non-edit action and leaves the
+  // worker paused on the unchanged address list.
+  const selectedRow = selectedCheckoutAddressRow();
+  const preferredRows = [selectedRow, nutricityAddressRow()]
+    .filter((row, index, rows) => row && rowIsSafeNutricityAddress(row) && rows.indexOf(row) === index);
+  for (const row of preferredRows) {
+    const exactEdit = [...row.querySelectorAll("a, button")].find((element) =>
+      visible(element) && normalizedText(element.innerText || element.textContent) === "edit address",
+    );
+    if (exactEdit) return exactEdit;
+  }
   const triggers = [...document.querySelectorAll("[id^='declarativeAction-'][data-action='checkout-view-modal']")].filter((element) => {
     const modalData = element.getAttribute("data-checkout-view-modal") || "";
     const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
     return visible(element) && (modalData.includes("editAddressModal") || text.includes("edit address"));
   });
-  const selectedRow = selectedCheckoutAddressRow();
   const selectedRowTrigger = triggers.find((element) => selectedRow && rowIsSafeNutricityAddress(selectedRow) && selectedRow.contains(element));
   if (selectedRowTrigger) return selectedRowTrigger.querySelector("a, button, span") || selectedRowTrigger;
 
@@ -4362,6 +4377,19 @@ function findDeliverToThisAddressButton() {
     "input[data-testid='ab-select-address-continue-button-bottom'], #ab-select-address-continue-button-bottom input, input[aria-labelledby='ab-select-address-continue-button-bottom-announce']",
   )].find((element) => visible(element) && !element.disabled);
   return direct || findButtonByText(["deliver to this address", "use this address"]);
+}
+
+// Amazon sometimes saves an edited address immediately and navigates straight
+// to the review (/spc) page. In that case the old address form's button is
+// gone because the save succeeded; treating it as a missing button pauses an
+// otherwise valid fulfilment.
+function checkoutAdvancedAfterAddressSave() {
+  if (findAddressNameInput()) return false;
+  const path = String(location.pathname || "").toLowerCase();
+  return path.includes("/spc")
+    || Boolean(findPaymentSelection())
+    || Boolean(findPaymentRadio())
+    || Boolean(findPlaceOrderButton());
 }
 
 function cardPreferenceList(value) {
@@ -4892,7 +4920,7 @@ function fridayRewardDeliveryOption() {
   return null;
 }
 
-function fridayRewardDeliverySelected() {
+function rewardedLaterDeliverySelected() {
   const selectedRadio = [...document.querySelectorAll("input[type='radio']:checked")][0] || null;
   if (!selectedRadio) return false;
   const context = deliveryRadioContext(selectedRadio);
@@ -4900,33 +4928,42 @@ function fridayRewardDeliverySelected() {
     || checkoutOffersOnePercentDeliveryReward() && isAmazonDayDeliveryContext(context);
 }
 
-async function ensureFridayRewardDelivery(activeJob) {
-  if (new Date().getDay() !== 5) return true;
-  if (fridayRewardDeliverySelected()) return true;
+async function ensureRewardedLaterDelivery(activeJob) {
+  const state = await getExtensionState();
+  const today = new Date().getDay();
+  // Amazon offers the 1% reward for accepting a later delivery. By default
+  // use it only when placing on Friday or Saturday; Sunday keeps Amazon's
+  // default. The holiday setting deliberately extends this preference to
+  // any other weekday without changing the normal Sunday rule.
+  const shouldPreferReward = today === 5 || today === 6 || state.preferRewardedLaterDelivery === true;
+  if (!shouldPreferReward) return true;
+  if (rewardedLaterDeliverySelected()) return true;
 
   const rewardOption = fridayRewardDeliveryOption();
   if (!rewardOption) return true;
   if (!rewardOption.control) {
     await pauseForManualCheckout(
       activeJob,
-      "Amazon offers a Friday delivery option with an extra 1% reward, but its radio control could not be selected safely.",
+      "Amazon offers a later delivery option with an extra 1% reward, but its radio control could not be selected safely.",
       "checkout",
     );
     return false;
   }
 
   showPanel(
-    "Friday 1% delivery reward",
+    "Later delivery 1% reward",
     `Selecting the rewarded delivery option from ${rewardOption.optionCount} available option(s): ${rewardOption.text}`,
     null,
     null,
   );
-  await sendDiagnostic("Selecting Friday delivery option with 1% reward.", {
+  await sendDiagnostic("Selecting later delivery option with 1% reward.", {
+    day_of_week: today,
+    warehouse_holiday_override: state.preferRewardedLaterDelivery === true,
     option_count: rewardOption.optionCount,
     option_text: rewardOption.text,
   });
-  await clickElement(rewardOption.control, "Friday delivery option with 1% reward");
-  const selected = await waitUntil(fridayRewardDeliverySelected, 12000, 300);
+  await clickElement(rewardOption.control, "later delivery option with 1% reward");
+  const selected = await waitUntil(rewardedLaterDeliverySelected, 12000, 300);
   if (!selected) {
     await pauseForManualCheckout(
       activeJob,
@@ -5467,6 +5504,15 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   await sleep(1000);
   const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "continue"]);
   if (!useAddress) {
+    if (checkoutAdvancedAfterAddressSave()) {
+      activeJob.stage = "checkout";
+      activeJob.editAddressClickedAt = null;
+      activeJob.addressEditedRecipient = checkoutRecipient;
+      activeJob.addressEditedAt = Date.now();
+      await setActiveJob(activeJob);
+      showPanel("Nutricity checkout", "Amazon saved the address and advanced to checkout.", null, null);
+      return true;
+    }
     await pauseForManualCheckout(activeJob, "Could not find the Use this address button.");
     return false;
   }
@@ -5493,6 +5539,19 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   const deliverToThisAddress = await waitUntil(findDeliverToThisAddressButton, 5000, 300);
   if (deliverToThisAddress) {
     if (!recipientAddressControl && !checkoutShowsRecipient(checkoutRecipient)) {
+      const retryCount = Number(activeJob.addressEditSaveRetries || 0) + 1;
+      activeJob.addressEditSaveRetries = retryCount;
+      if (retryCount <= 2) {
+        // Amazon can return to the address list with the previously selected
+        // warehouse row while the edited name is still being saved. Retry the
+        // same safe edit before escalating this recoverable delay to a pause.
+        activeJob.stage = "editing_address";
+        activeJob.editAddressClickedAt = Date.now();
+        await setActiveJob(activeJob);
+        showPanel("Nutricity checkout", `Amazon kept the previous address name. Retrying address save (${retryCount}/2).`, null, null);
+        const editor = await openAddressEditorIfAvailable(activeJob);
+        if (editor) return saveEditedAddress(activeJob, checkoutRecipient);
+      }
       await pauseForManualCheckout(activeJob, `Could not find the edited address row for "${checkoutRecipient}" after saving.`);
       return false;
     }
@@ -5524,7 +5583,17 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   activeJob.addressEditedRecipient = checkoutRecipient;
   activeJob.addressEditedAt = Date.now();
   await setActiveJob(activeJob);
-  await pauseForManualCheckout(activeJob, `Amazon did not confirm delivery address "${checkoutRecipient}" after saving.`);
+  const retryCount = Number(activeJob.addressEditSaveRetries || 0) + 1;
+  activeJob.addressEditSaveRetries = retryCount;
+  if (retryCount <= 2) {
+    activeJob.stage = "editing_address";
+    activeJob.editAddressClickedAt = Date.now();
+    await setActiveJob(activeJob);
+    showPanel("Nutricity checkout", `Amazon has not shown the updated address yet. Retrying address save (${retryCount}/2).`, null, null);
+    const editor = await openAddressEditorIfAvailable(activeJob);
+    if (editor) return saveEditedAddress(activeJob, checkoutRecipient);
+  }
+  await pauseForManualCheckout(activeJob, `Amazon did not confirm delivery address "${checkoutRecipient}" after saving twice.`);
   return false;
 }
 
@@ -5545,6 +5614,15 @@ async function saveNewDeliveryAddress(activeJob, checkoutRecipient) {
   await sleep(1000);
   const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "continue"]);
   if (!useAddress) {
+    if (checkoutAdvancedAfterAddressSave()) {
+      activeJob.stage = "checkout";
+      activeJob.addressMode = "new";
+      activeJob.addressEditedRecipient = checkoutRecipient;
+      activeJob.addressEditedAt = Date.now();
+      await setActiveJob(activeJob);
+      showPanel("Nutricity checkout", "Amazon saved the new address and advanced to checkout.", null, null);
+      return true;
+    }
     await pauseForManualCheckout(activeJob, "Could not find the Use this address button.");
     return false;
   }
@@ -5858,6 +5936,8 @@ async function handleCheckout(activeJob) {
       await clickUseAddressButton(useAddress);
       await sleep(3000);
       await waitUntil(() => checkoutRecipientConfirmed(checkoutRecipient) || findPaymentSelection() || findPlaceOrderButton(), 10000);
+    } else if (checkoutAdvancedAfterAddressSave()) {
+      showPanel("Nutricity checkout", "Amazon saved the address and advanced to checkout.", null, null);
     } else {
       await pauseForManualCheckout(activeJob, "Could not find the Use this address button.");
       return;
@@ -5899,7 +5979,7 @@ async function handleCheckout(activeJob) {
   if (!await ensurePreferredCheckoutPayment(activeJob)) return;
   if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
-  if (!await ensureFridayRewardDelivery(activeJob)) return;
+  if (!await ensureRewardedLaterDelivery(activeJob)) return;
 
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([
@@ -6075,8 +6155,11 @@ async function forceOrderReportingFromSubmittedPage(activeJob, reason = "") {
   };
   await setActiveJob(next, { allowUnpause: true, reason: "submitted_page_guard" });
   if (orderId) {
-    showPanel("Nutricity fulfilment", `Found Amazon order ${orderId}. Reporting back to the app.`, null, null);
-    await reportAmazonOrder(next, orderId);
+    next.stage = "find_order_id";
+    next.orderHistoryLookupStartedAt = next.orderHistoryLookupStartedAt || Date.now();
+    await setActiveJob(next, { allowUnpause: true, reason: "submitted_page_history_verification" });
+    showPanel("Nutricity fulfilment", `Found Amazon order ${orderId}. Verifying recipient and ASINs in order history before reporting.`, null, null);
+    location.href = orderHistoryUrl();
     return true;
   }
   showPanel("Nutricity fulfilment", "Amazon shows the order was submitted. Opening order history to capture the order number.", null, null);
@@ -6453,11 +6536,14 @@ function orderDetailsPageDetails() {
 
 function recipientFromOrderHistoryText(text = "") {
   const value = String(text || "").replace(/\s+/g, " ").trim();
-  const nutricityMatch = value.match(/\bNutricity\s+[A-Z]{2,5}\d{2,}(?:\s+[A-Za-z0-9]+){0,4}/i);
+  // Recipient suffixes can contain decimal product strengths such as
+  // "2.5mg". Preserve punctuation here: collapsing "NC18106 2" into
+  // "NC181062" breaks the exact-recipient guard and leaves a correct
+  // submitted order stuck in history recovery.
+  const nutricityMatch = value.match(/\bNutricity\s+[A-Z]{2,5}\d{2,}(?:\s+[A-Za-z0-9][A-Za-z0-9._-]*){0,4}/i);
   if (nutricityMatch?.[0]) {
     return nutricityMatch[0]
       .replace(/\b(?:Order|Placed|Total|Ship|To|View|Buy|Again|Invoice|Details)\b.*$/i, "")
-      .replace(/\b([A-Z]{2,5}\d{2,})\s+(\d{1,4})\b/g, "$1$2")
       .replace(/\s+/g, " ")
       .trim();
   }
@@ -6619,7 +6705,7 @@ function extractOrderHistoryOrders() {
   const candidates = orderHistoryCardCandidates();
   const seen = new Set();
   const orders = [];
-  for (const card of candidates) {
+  for (const [historyRank, card] of candidates.entries()) {
     const orderId = orderCardOrderId(card);
     if (!orderId || seen.has(orderId) || isCancelledOrderCard(card)) continue;
     seen.add(orderId);
@@ -6631,6 +6717,10 @@ function extractOrderHistoryOrders() {
       status: orderCardStatus(card),
       asins: orderCardAsins(card),
       items: orderCardItems(card),
+      // Amazon lists newest cards first. Keep this evidence so a re-placed
+      // order can be distinguished from an earlier order for the same
+      // recipient and ASIN without ever falling back to an unrelated card.
+      history_rank: historyRank,
       captured_at: Date.now(),
     });
     if (orders.length >= 10) break;
@@ -6920,7 +7010,7 @@ function renderOrderHistoryAnnotation(card, result) {
   }
   const container = orderHistoryAnnotationContainer(card);
   container.appendChild(marker);
-  appendDirectOdooHistoryRows(container, directOdoo, detailsClass);
+  appendDirectOdooHistoryRows(container, directOdoo, detailsClass, displayResult);
 }
 
 function orderHistoryResultAsinSet(result = {}) {
@@ -6977,36 +7067,47 @@ function filterOrderHistoryCandidatesForCard(candidates = [], cardAsins = new Se
 }
 
 function orderHistoryTextMatchesOrderName(text = "", orderName = "") {
-  const normalizeRefs = (value) => String(value || "")
-    .toUpperCase()
-    .replace(/\b([A-Z]{2,5}\d{2,})\s+(\d{1,4})\b/g, "$1$2")
-    .replace(/[^A-Z0-9]+/g, " ");
-  const normalizedText = normalizeRefs(text);
-  const normalizedOrder = String(orderName || "").toUpperCase().replace(/[^A-Z0-9]+/g, "");
-  return Boolean(
-    normalizedOrder
-    && (
-      new RegExp(`\\b${normalizedOrder}\\b`).test(normalizedText)
-      || normalizedText.replace(/\s+/g, "").includes(normalizedOrder)
-    )
-  );
+  const extractRefs = (value) => {
+    const upper = String(value || "").toUpperCase();
+    // Nutricity references always use a two-letter prefix plus five digits.
+    // Amazon can concatenate a pack/variant suffix (for example NC204942
+    // pack); taking the canonical seven-character reference avoids treating
+    // that suffix as part of the order number.
+    const canonical = upper.match(/\b(?:NC|ES)\d{5}/g) || [];
+    const generic = (upper.match(/\b[A-Z]{1,8}\d{2,}\b/g) || [])
+      .filter((ref) => !/^(?:NC|ES)\d{5}/.test(ref));
+    return [...new Set([...canonical, ...generic])];
+  };
+  const textRefs = new Set(extractRefs(text));
+  const orderRefs = extractRefs(orderName);
+  return orderRefs.length > 0 && orderRefs.every((ref) => textRefs.has(ref));
 }
 
 function filterOrderHistoryCandidatesForCardAndRecipient(candidates = [], cardAsins = new Set(), recipient = "") {
+  // Recipient references decide ownership. A shared ASIN must never introduce
+  // another order, and an Amazon split shipment must not hide a valid order
+  // reference merely because that card exposes only some of the cart ASINs.
+  // ASINs are used later only to select the relevant lines within the orders
+  // whose references are present in the recipient name.
   return (candidates || []).filter((candidate) =>
     orderHistoryTextMatchesOrderName(recipient, candidate.odoo_order_name)
-    || orderHistoryCandidateBelongsOnCard(candidate, cardAsins),
   );
 }
 
 function filterOrderHistoryResultForCard(result = {}) {
   const cardAsins = orderHistoryResultAsinSet(result);
-  if (!cardAsins.size) return result;
   const recipient = result.recipient || "";
+  if (!cardAsins.size && !recipient) return result;
   const matchOrders = filterOrderHistoryCandidatesForCardAndRecipient(result.match?.orders || [], cardAsins, recipient);
   const suggestions = filterOrderHistoryCandidatesForCardAndRecipient(result.suggestions || [], cardAsins, recipient);
   const conflicts = filterOrderHistoryCandidatesForCardAndRecipient(result.conflicts || [], cardAsins, recipient);
-  const directOdoo = filterOrderHistoryCandidatesForCardAndRecipient(result.odooDirect || [], cardAsins, recipient);
+  // Keep a direct Odoo recipient lookup visible even when its ASIN conflicts
+  // with Amazon. It is diagnostic evidence, but it must never make the main
+  // Odoo-order match appear green.
+  const directOdoo = (result.odooDirect || []).filter((candidate) =>
+    orderHistoryTextMatchesOrderName(recipient, candidate.odoo_order_name)
+    || orderHistoryCandidateBelongsOnCard(candidate, cardAsins),
+  );
   return {
     ...result,
     match: result.match ? { ...result.match, orders: matchOrders } : result.match,
@@ -7103,14 +7204,27 @@ function appendOrderHistoryQuantitySummary(marker, orders = []) {
   marker.appendChild(summary);
 }
 
-function appendDirectOdooHistoryRows(container, directOdoo = [], detailsClass = "") {
+function syncedHistoryResultVerifiesAsin(result = {}) {
+  const candidates = [
+    ...(result.match?.orders || []),
+    ...(result.suggestions || []),
+  ];
+  return candidates.some((candidate) => (candidate.quantity_checks || []).some((check) => check?.matches === true));
+}
+
+function appendDirectOdooHistoryRows(container, directOdoo = [], detailsClass = "", historyResult = {}) {
   const rows = (directOdoo || []).filter(Boolean);
   if (!rows.length) return;
+  const syncedAsinVerification = syncedHistoryResultVerifiesAsin(historyResult);
+  const amazonAsins = orderHistoryResultAsinSet(historyResult);
   for (const order of rows.slice(0, 4)) {
     const checks = order.quantity_checks || [];
     const warnings = checks.filter((check) => !check.matches);
+    const odooAsins = orderHistoryCandidateAsins(order);
+    const asinConflict = !checks.length && amazonAsins.size && odooAsins.size
+      && ![...odooAsins].some((asin) => amazonAsins.has(asin));
     const marker = document.createElement("div");
-    marker.className = `nutricity-order-history-annotation nutricity-order-history-direct ${order.error || !order.found || warnings.length ? "is-conflict" : "is-match"}${detailsClass}`;
+    marker.className = `nutricity-order-history-annotation nutricity-order-history-direct ${order.error || !order.found || warnings.length || asinConflict ? "is-conflict" : "is-match"}${detailsClass}`;
 
     const label = document.createElement("span");
     label.className = "nutricity-order-history-label";
@@ -7147,11 +7261,21 @@ function appendDirectOdooHistoryRows(container, directOdoo = [], detailsClass = 
       marker.appendChild(warning);
     } else {
       appendOrderHistoryQuantitySummary(marker, [order]);
-      if (!checks.length) {
+      if (asinConflict) {
+        const warning = document.createElement("span");
+        warning.className = "nutricity-order-history-warning";
+        warning.textContent = `ASIN conflict: Odoo ${[...odooAsins].join(", ")}; Amazon ${[...amazonAsins].join(", ")}`;
+        marker.appendChild(warning);
+      } else if (!checks.length && !syncedAsinVerification) {
         const warning = document.createElement("span");
         warning.className = "nutricity-order-history-warning";
         warning.textContent = "No ASIN lines found directly in Odoo";
         marker.appendChild(warning);
+      } else if (!checks.length) {
+        const verified = document.createElement("span");
+        verified.className = "nutricity-order-history-quantity is-match";
+        verified.textContent = "ASIN verified from synced fulfilment record";
+        marker.appendChild(verified);
       }
     }
     container.appendChild(marker);
@@ -7295,20 +7419,22 @@ async function syncSuggestedAmazonHistoryOrder(result) {
       .filter(Boolean)
       .some((asin) => amazonAsins.has(asin));
   };
-  const suggestionLineIds = [
-    ...new Set(suggestions.flatMap((order) => (order.line_ids || []).map(Number).filter(Boolean))),
-  ];
-  const matchingLineIds = [
+  const lineIdsForSync = [
     ...new Set(
-      suggestions.flatMap((order) =>
-        (order.lines || [])
+      suggestions.flatMap((order) => {
+        const matchingIds = (order.lines || [])
           .filter(lineMatchesAmazonAsin)
           .map((line) => Number(line.id || 0))
-          .filter(Boolean),
-      ),
+          .filter(Boolean);
+        // Evaluate each recipient order independently. A card containing two
+        // Odoo refs must not lose the second order merely because only the
+        // first order exposed a matching ASIN in the Amazon history DOM.
+        return matchingIds.length
+          ? matchingIds
+          : (order.line_ids || []).map(Number).filter(Boolean);
+      }),
     ),
   ];
-  const lineIdsForSync = matchingLineIds.length ? matchingLineIds : suggestionLineIds;
   if (!lineIdsForSync.length) {
     return {
       ok: false,
@@ -7606,6 +7732,25 @@ async function findRememberedDuplicateOrder(activeJob) {
   return orders[0] || null;
 }
 
+function splitHistoryOrdersMapEveryActiveLine(activeJob, orders = []) {
+  const items = activeJob?.job?.items || [];
+  if (items.length < 2 || orders.length < 2) return false;
+  for (const item of items) {
+    const requestedAsin = String(item?.asin || "").toUpperCase();
+    const purchasedAsin = String(activeJob?.pricing?.[requestedAsin]?.purchased_asin || "").toUpperCase();
+    const itemAsins = new Set([requestedAsin, purchasedAsin].filter(Boolean));
+    if (!itemAsins.size) return false;
+    const matchingOrders = orders.filter((order) => {
+      const asins = (order?.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean);
+      return asins.some((asin) => itemAsins.has(asin));
+    });
+    // Mapping must be exact: if an ASIN appears on two history cards, leave
+    // the job for review rather than assigning either Amazon order ID.
+    if (matchingOrders.length !== 1) return false;
+  }
+  return true;
+}
+
 async function selectUnambiguousSubmittedHistoryOrders(activeJob, candidates = []) {
   const unique = [];
   const seen = new Set();
@@ -7641,9 +7786,40 @@ async function selectUnambiguousSubmittedHistoryOrders(activeJob, candidates = [
     return !previouslyReported.has(orderId) && !((matches[orderId]?.orders || []).length);
   });
   if (unrecorded.length === 1) return { orders: unrecorded, ambiguous: false };
+  if (splitHistoryOrdersMapEveryActiveLine(activeJob, unrecorded)) {
+    await sendDiagnostic("Amazon split the submitted job into distinct ASIN order cards; reporting a per-line mapping.", {
+      group_key: activeJob?.job?.group_key || "",
+      split_order_ids: unrecorded.map((order) => order.amazon_order_id),
+      split_order_asins: unrecorded.map((order) => ({
+        amazon_order_id: order.amazon_order_id,
+        asins: order.asins || [],
+      })),
+    });
+    return { orders: unrecorded, ambiguous: false, split_by_asin: true };
+  }
   if (previouslyReported.size) {
     const prior = unique.filter((order) => previouslyReported.has(String(order.amazon_order_id || "").trim()));
     if (prior.length === 1) return { orders: prior, ambiguous: false };
+  }
+
+  // A reset/re-placement can legitimately leave an earlier Amazon card with
+  // the exact same recipient and ASIN in history. During the short post-submit
+  // verification window, Amazon's newest *matching* card is the only safe
+  // choice: recipient and ASIN have already been checked by
+  // recentOrderMatchesActiveJob, and the rank is taken from Amazon's newest
+  // first history layout. Do not use this escape hatch for stale jobs or for
+  // a match that is not the newest visible Amazon card.
+  const submittedAt = Number(activeJob?.placeOrderClickStartedAt || activeJob?.amazonSubmittedAt || 0);
+  const submitAge = submittedAt ? Date.now() - submittedAt : Number.POSITIVE_INFINITY;
+  const newestMatch = [...unrecorded].sort((a, b) => Number(a.history_rank ?? Number.MAX_SAFE_INTEGER) - Number(b.history_rank ?? Number.MAX_SAFE_INTEGER))[0];
+  if (submitAge >= 0 && submitAge <= 30 * 60 * 1000 && Number(newestMatch?.history_rank) === 0) {
+    await sendDiagnostic("Reported the newest matching Amazon history card after a re-placement.", {
+      group_key: activeJob?.job?.group_key || "",
+      selected_order_id: newestMatch.amazon_order_id,
+      duplicate_matching_order_ids: unrecorded.map((order) => order.amazon_order_id),
+      submit_age_seconds: Math.round(submitAge / 1000),
+    });
+    return { orders: [newestMatch], ambiguous: false, newest_matching_replacement: true };
   }
   await sendDiagnostic("Refused to report an ambiguous Amazon history match.", {
     group_key: activeJob?.job?.group_key || "",
@@ -7681,7 +7857,11 @@ function extractRecentOrders(activeJob) {
     const matchesOrderName = names.some((name) => name && lower.includes(name))
       || compactNames.some((name) => name && compactLower.includes(name));
     const orderMatch = text.match(/\b\d{3}-\d{7}-\d{7}\b/);
-    if (orderMatch && (matchesRecipient || matchesOrderName || candidates.length === 1)) {
+    // A single visible card is not proof that it belongs to this job. Amazon
+    // often shows one unrelated recent order while the newly submitted order
+    // is still loading. Never use a card unless its recipient/order label
+    // actually identifies the active job.
+    if (orderMatch && (matchesRecipient || matchesOrderName)) {
       const orderId = orderMatch[0];
       if (seen.has(orderId)) continue;
       seen.add(orderId);
@@ -7706,7 +7886,14 @@ async function handleCompletion(activeJob) {
   }
   const orderId = extractOrderId();
   if (orderId) {
-    await reportAmazonOrder(activeJob, orderId);
+    // A confirmation URL proves Amazon accepted a click, but it does not
+    // contain enough recipient/ASIN evidence to attach that number safely.
+    // Always verify it against the history card before reporting to the app.
+    activeJob.stage = "find_order_id";
+    activeJob.orderHistoryLookupStartedAt = activeJob.orderHistoryLookupStartedAt || Date.now();
+    await setActiveJob(activeJob);
+    showPanel("Nutricity fulfilment", `Amazon confirmation showed ${orderId}. Verifying recipient and ASINs in order history before reporting.`, null, null);
+    location.href = orderHistoryUrl();
     return;
   }
   // Amazon normally replaces checkout with its confirmation page immediately.
@@ -7761,7 +7948,28 @@ async function handleOrderHistory(activeJob) {
   }
   activeJob.orderHistoryLookupStartedAt = activeJob.orderHistoryLookupStartedAt || Date.now();
   await setActiveJob(activeJob);
-  await waitForElement(["#orderCardHeader", ".order-card", "[id*='orderCard']", "body"], 12000);
+  const historySurface = await waitForElement(["#orderCardHeader", ".order-card", "[id*='orderCard']"], 12000);
+  if (!historySurface) {
+    // Amazon occasionally completes the history navigation with only the
+    // header and filters rendered. Treating <body> as readiness made the
+    // worker wait two minutes against an empty shell, then mark a real order
+    // uncertain. Reload that incomplete shell at most four times; all duplicate
+    // and recipient/ASIN guards still run once actual order cards appear.
+    const emptyReloads = Number(activeJob.orderHistoryEmptyReloads || 0);
+    const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
+    if (emptyReloads < 4 && lookupAge < 90000) {
+      activeJob.orderHistoryEmptyReloads = emptyReloads + 1;
+      await setActiveJob(activeJob);
+      showPanel(
+        "Nutricity fulfilment",
+        `Amazon order history loaded without order cards. Reloading the incomplete page (${emptyReloads + 1}/4).`,
+        null,
+        null,
+      );
+      location.reload();
+      return;
+    }
+  }
   const historyOrders = extractOrderHistoryOrders();
   if (historyOrders.length) {
     await send({ type: "REMEMBER_RECENT_AMAZON_ORDERS", orders: historyOrders });
@@ -7771,9 +7979,20 @@ async function handleOrderHistory(activeJob) {
   const orders = selection.orders;
   const rememberedOrder = orders.length || selection.ambiguous ? null : await findRememberedDuplicateOrder(activeJob);
   if (selection.ambiguous) {
+    const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
+    if (lookupAge > 120000) {
+      const message = `Amazon history still has multiple matching cards for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key} after ${Math.round(lookupAge / 1000)} seconds. It was not assigned automatically, so the queue can continue safely.`;
+      const result = await send({
+        type: "SUBMIT_UNCERTAIN",
+        message,
+        failureCode: "ambiguous_submitted_order_history",
+      });
+      showPanel("Chrome fulfilment needs review", result?.message || message, null, null);
+      return;
+    }
     showPanel(
       "Nutricity fulfilment",
-      "More than one matching Amazon history order was found. Waiting for a single safe match instead of writing the wrong Amazon order ID.",
+      "More than one matching Amazon history order was found. Verifying for up to two minutes instead of writing the wrong Amazon order ID.",
       null,
       null,
     );
@@ -7871,8 +8090,25 @@ async function reportAmazonOrders(activeJob, orders) {
       amazon_order_id: orderId,
       amazon_order_url: order.amazon_order_url || orderDetailsUrl(orderId),
       order_date: order.order_date || "",
+      recipient: String(order.recipient || "").replace(/\s+/g, " ").trim(),
       asins: (order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean),
     });
+  }
+  const unsafeOrders = uniqueOrders.filter((order) => !recentOrderMatchesActiveJob(order, activeJob));
+  if (unsafeOrders.length) {
+    const message = `Refused to report Amazon order ${unsafeOrders.map((order) => order.amazon_order_id).join(", ")}: its history recipient or ASINs do not match ${recipientName(activeJob)}.`;
+    activeJob.paused = true;
+    activeJob.pausedStage = "reporting_complete";
+    activeJob.reportError = message;
+    await setActiveJob(activeJob);
+    await sendDiagnostic("Blocked unsafe Amazon history completion report.", {
+      group_key: activeJob?.job?.group_key || "",
+      expected_recipient: recipientName(activeJob),
+      expected_asins: activeJobAsins(activeJob),
+      candidates: unsafeOrders,
+    }, "error");
+    showPanel("Nutricity reporting needs attention", `${message} The order was not marked placed in the app.`, null, null);
+    return false;
   }
   const orderId = uniqueOrders[0]?.amazon_order_id || "";
   const orderLabel = uniqueOrders.map((order) => order.amazon_order_id).join(", ");
@@ -7929,6 +8165,8 @@ async function reportAmazonOrders(activeJob, orders) {
         orderDate: uniqueOrders[0]?.order_date || "",
         orderMappings,
         amazonAccountName: amazonSignedInAccountName(),
+        amazonRecipient: uniqueOrders[0]?.recipient || "",
+        amazonAsins: uniqueOrders[0]?.asins || [],
         page: diagnosticPageInfo(),
       });
       if (result?.ok) break;
@@ -8305,7 +8543,7 @@ async function run() {
 async function runSafely() {
   if (fulfilmentForceStopped) return;
   if (window.__nutricityRunning) {
-    if (Date.now() - Number(window.__nutricityRunningAt || 0) < 25000) return;
+    if (Date.now() - Number(window.__nutricityRunningAt || 0) < CONTENT_RUN_STALE_MS) return;
     console.warn("Nutricity fulfilment: recovering from a stale content-script run.");
   }
   window.__nutricityRunning = true;

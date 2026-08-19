@@ -41,13 +41,14 @@ class FinalMileTrackingController(http.Controller):
             error = "Tracking is not enabled for this website."
         elif not app_url:
             error = "Tracking is not configured for this website."
+        elif not website.final_mile_tracking_store_id:
+            error = "Tracking store is not mapped for this website."
         else:
             try:
                 params = {"page": page, "per_page": per_page}
                 if query:
                     params["q"] = query
-                if website.final_mile_tracking_store_id:
-                    params["store_id"] = int(website.final_mile_tracking_store_id)
+                params["store_id"] = int(website.final_mile_tracking_store_id)
                 response = requests.get(
                     f"{app_url}/api/public/track-orders/{_slug_from_website(website)}",
                     params=params,
