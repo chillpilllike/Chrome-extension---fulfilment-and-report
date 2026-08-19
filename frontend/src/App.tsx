@@ -858,6 +858,9 @@ const packageTrackerDesignRows: PackageTrackerOrderCard[] = [
   },
 ]
 
+// Retain the approved design fixture without treating it as live tracker data.
+void packageTrackerDesignRows
+
 type PartialFulfilment = {
   id: number
   store_id: number
@@ -6426,7 +6429,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       } else {
         void refreshSummary().catch((error) => onResult({ ok: false, title: "Dispatch Summary Failed", message: String(error) }))
       }
-      return result
+      return results
     } catch (error) {
       const message = `Scan failed for ${code}: ${String(error)}`
       setMatchedPackage(null)
