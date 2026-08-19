@@ -31,6 +31,10 @@ _STALE_DISABLED_PREFIXES = {
     "fulfilment-pending",
     "fulfilment-pending-count",
     "tracking-orders",
+    # Package cards contain live shipment composition and fulfilment state.
+    # Serving the hour-long stale copy can resurrect pre-deploy grouping bugs
+    # or hide a Chrome tracking update after the normal cache has expired.
+    "public-package-tracker",
 }
 
 

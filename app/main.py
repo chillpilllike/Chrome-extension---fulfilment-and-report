@@ -320,6 +320,9 @@ def fast_page_cache_clear() -> None:
 
 
 def fast_page_cache_clear_matching(prefixes: set[str]) -> None:
+    if prefixes.intersection({"orders", "tracking-orders", "dispatch-status", "dispatch-sorting-summary"}):
+        prefixes = set(prefixes)
+        prefixes.add("public-package-tracker")
     if "orders" in prefixes:
         prefixes = set(prefixes)
         prefixes.update({"orders-count", "orders-condition-count"})
@@ -346,6 +349,7 @@ ORDER_PROGRESS_CACHE_PREFIXES = {
     "dispatch-sorting-summary",
     "dispatch-sorting-summary-base",
     "shopify-fulfilment",
+    "public-package-tracker",
 }
 
 
