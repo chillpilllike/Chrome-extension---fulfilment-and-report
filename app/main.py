@@ -31244,19 +31244,90 @@ def package_tracker_stuck_analysis(
 
 _PACKAGE_TRACKER_IMAGE_URL_CACHE: dict[str, str] = {}
 _PACKAGE_TRACKER_IMAGE_URL_CACHE_LOCK = threading.Lock()
+_PACKAGE_TRACKER_IMAGE_FAILURE_CACHE: dict[str, float] = {}
+_PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE: dict[str, str] = {}
+_PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE_LOCK = threading.Lock()
 
 
-def package_tracker_cached_image_url(asin: str) -> str:
+def package_tracker_captured_image_urls(asins: Any) -> dict[str, str]:
+    normalized_asins = list(dict.fromkeys(
+        normalize_asin(value) for value in (asins or []) if normalize_asin(value)
+    ))
+    if not normalized_asins:
+        return {}
+    with _PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE_LOCK:
+        found = {
+            asin: _PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE[asin]
+            for asin in normalized_asins
+            if asin in _PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE
+        }
+    missing = [asin for asin in normalized_asins if asin not in found]
+    if not missing:
+        return found
+
+    candidates: list[dict[str, Any]] = []
+    with db() as conn:
+        placeholders = ",".join("?" for _ in missing)
+        inventory_rows = rows_to_dicts(conn.execute(
+            f"""SELECT asin, image_url FROM inventory_items
+                WHERE UPPER(asin) IN ({placeholders}) AND COALESCE(image_url, '') != ''
+                ORDER BY updated_at DESC""",
+            missing,
+        ).fetchall())
+        for row in inventory_rows:
+            candidates.append({"asin": row.get("asin"), "image_url": row.get("image_url")})
+        for table, column, date_column in (
+            ("amazon_order_history_unmatched", "items_json", "last_seen_at"),
+            ("amazon_dispatch_packages", "products_json", "updated_at"),
+        ):
+            clauses = " OR ".join(f"{column} LIKE ?" for _ in missing)
+            rows = rows_to_dicts(conn.execute(
+                f"SELECT {column} FROM {table} WHERE {clauses} ORDER BY {date_column} DESC",
+                [f"%{asin}%" for asin in missing],
+            ).fetchall())
+            for row in rows:
+                candidates.extend(
+                    dict(product)
+                    for product in parse_json_list_value(row.get(column))
+                    if isinstance(product, dict)
+                )
+
+    missing_set = set(missing)
+    for product in candidates:
+        asin = normalize_asin(product.get("asin"))
+        image_url = clean_text(product.get("image_url"))
+        if asin in missing_set and asin not in found and is_safe_amazon_image_url(image_url):
+            found[asin] = image_url
+    with _PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE_LOCK:
+        _PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE.update(found)
+    return found
+
+
+def package_tracker_cached_image_url(asin: str, *, force_refresh: bool = False) -> str:
+    now = time.monotonic()
     with _PACKAGE_TRACKER_IMAGE_URL_CACHE_LOCK:
         cached = _PACKAGE_TRACKER_IMAGE_URL_CACHE.get(asin)
+        failed_until = _PACKAGE_TRACKER_IMAGE_FAILURE_CACHE.get(asin, 0.0)
     if cached:
         return cached
+    captured = package_tracker_captured_image_urls([asin]).get(asin, "")
+    if captured:
+        with _PACKAGE_TRACKER_IMAGE_URL_CACHE_LOCK:
+            _PACKAGE_TRACKER_IMAGE_URL_CACHE[asin] = captured
+            _PACKAGE_TRACKER_IMAGE_FAILURE_CACHE.pop(asin, None)
+        return captured
+    if failed_until > now and not force_refresh:
+        return ""
     image_url = amazon_product_page_image_url(asin)
     if image_url:
         with _PACKAGE_TRACKER_IMAGE_URL_CACHE_LOCK:
             if len(_PACKAGE_TRACKER_IMAGE_URL_CACHE) >= 4096:
                 _PACKAGE_TRACKER_IMAGE_URL_CACHE.pop(next(iter(_PACKAGE_TRACKER_IMAGE_URL_CACHE)), None)
             _PACKAGE_TRACKER_IMAGE_URL_CACHE[asin] = image_url
+            _PACKAGE_TRACKER_IMAGE_FAILURE_CACHE.pop(asin, None)
+    else:
+        with _PACKAGE_TRACKER_IMAGE_URL_CACHE_LOCK:
+            _PACKAGE_TRACKER_IMAGE_FAILURE_CACHE[asin] = now + 10 * 60
     return image_url
 
 
@@ -31265,6 +31336,7 @@ def package_tracker_product_image_url(
     history_products: list[dict[str, Any]],
     *,
     allow_unambiguous_replacement: bool = False,
+    captured_images_by_asin: Optional[dict[str, str]] = None,
 ) -> str:
     """Prefer captured Amazon images before the slower ASIN lookup fallback."""
     existing_url = clean_text(product.get("image_url"))
@@ -31280,10 +31352,14 @@ def package_tracker_product_image_url(
     matched = history_by_asin.get(asin)
     if not matched and allow_unambiguous_replacement and len(history_by_asin) == 1:
         matched = next(iter(history_by_asin.values()))
-    captured_url = clean_text((matched or {}).get("image_url"))
+    captured_images_by_asin = captured_images_by_asin or {}
+    captured_url = clean_text(captured_images_by_asin.get(asin)) or clean_text((matched or {}).get("image_url"))
     if captured_url:
         return captured_url
     image_asin = normalize_asin((matched or {}).get("asin")) or asin
+    captured_url = clean_text(captured_images_by_asin.get(image_asin))
+    if captured_url:
+        return captured_url
     return f"/api/public/asin-image/{quote_plus(image_asin)}" if image_asin else ""
 
 
@@ -31439,14 +31515,18 @@ def package_tracker_quantity_analysis(
 
 
 @app.get("/api/public/asin-image/{asin}")
-def api_public_package_tracker_asin_image(asin: str) -> Response:
+def api_public_package_tracker_asin_image(asin: str, retry: int = 0) -> Response:
     normalized_asin = normalize_asin(asin)
     if not normalized_asin:
         raise HTTPException(404, "Amazon product image not found.")
-    image_url = package_tracker_cached_image_url(normalized_asin)
+    image_url = package_tracker_cached_image_url(normalized_asin, force_refresh=retry > 0)
     if not image_url:
         raise HTTPException(404, "Amazon product image not found.")
-    return fetch_remote_image_response(image_url)
+    return RedirectResponse(
+        image_url,
+        status_code=302,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @app.get("/api/public/package-tracker")
@@ -31797,6 +31877,24 @@ def api_public_package_tracker(
     for line in line_rows:
         lines_by_key.setdefault((int(line.get("store_id") or 0), clean_text(line.get("odoo_order_name")).upper()), []).append(line)
     history_by_order_id = {clean_text(row.get("amazon_order_id")): row for row in history_rows if clean_text(row.get("amazon_order_id"))}
+    tracker_asins: set[str] = set()
+    for line in line_rows:
+        tracker_asins.update(order_line_asin_aliases(line))
+    for package in package_rows:
+        tracker_asins.update(unique_normalized_asins(parse_json_list_value(package.get("asins_json"))))
+        tracker_asins.update(
+            normalize_asin(product.get("asin"))
+            for product in parse_json_list_value(package.get("products_json"))
+            if isinstance(product, dict) and normalize_asin(product.get("asin"))
+        )
+    for history in history_rows:
+        tracker_asins.update(unique_normalized_asins(parse_json_list_value(history.get("asins_json"))))
+        tracker_asins.update(
+            normalize_asin(product.get("asin"))
+            for product in parse_json_list_value(history.get("items_json"))
+            if isinstance(product, dict) and normalize_asin(product.get("asin"))
+        )
+    captured_images_by_asin = package_tracker_captured_image_urls(tracker_asins)
     source_title_by_order_asin: dict[tuple[str, str], str] = {}
     source_title_by_card_asin: dict[tuple[int, str, str], str] = {}
     for line in line_rows:
@@ -31872,6 +31970,7 @@ def api_public_package_tracker(
                     product,
                     history_products,
                     allow_unambiguous_replacement=len(products) == 1 and len(history_asins) == 1,
+                    captured_images_by_asin=captured_images_by_asin,
                 )
                 product["url"] = clean_text(product.get("url")) or (f"https://www.amazon.com/dp/{quote_plus(asin)}" if asin else "")
             products_by_asin: dict[str, dict[str, Any]] = {}
@@ -31949,14 +32048,19 @@ def api_public_package_tracker(
                 products_by_asin[asin] = {
                     "asin": asin,
                     "title": clean_text(product.get("title")) or asin,
-                    "image_url": clean_text(product.get("image_url")) or f"/api/public/asin-image/{quote_plus(asin)}",
+                    "image_url": clean_text(product.get("image_url")) or clean_text(captured_images_by_asin.get(asin)) or f"/api/public/asin-image/{quote_plus(asin)}",
                     "url": clean_text(product.get("url")) or asin_product_url(asin),
                 }
             for line in source_lines:
                 asin = normalize_asin(line.get("asin"))
                 if not asin:
                     continue
-                product = products_by_asin.setdefault(asin, {"asin": asin, "title": asin, "image_url": f"/api/public/asin-image/{quote_plus(asin)}", "url": asin_product_url(asin)})
+                product = products_by_asin.setdefault(asin, {
+                    "asin": asin,
+                    "title": asin,
+                    "image_url": clean_text(captured_images_by_asin.get(asin)) or f"/api/public/asin-image/{quote_plus(asin)}",
+                    "url": asin_product_url(asin),
+                })
                 title = clean_text(line.get("product_name")).splitlines()[0].strip()
                 title = re.sub(r"^\[[^\]]+\]\s*", "", title).strip()
                 if title:
@@ -31971,6 +32075,12 @@ def api_public_package_tracker(
                 part_products = normalize_amazon_product_items(part.get("products") or part.get("order_products") or [])
                 if part_products:
                     product_values = part_products
+                for product in product_values:
+                    asin = normalize_asin(product.get("asin"))
+                    if not asin:
+                        continue
+                    product["image_url"] = clean_text(product.get("image_url")) or clean_text(captured_images_by_asin.get(asin)) or f"/api/public/asin-image/{quote_plus(asin)}"
+                    product["url"] = clean_text(product.get("url")) or asin_product_url(asin)
                 synthetic = {
                     "amazon_order_id": amazon_order_id,
                     "amazon_order_url": clean_text(history.get("amazon_order_url") or source.get("amazon_order_url")) or order_line_amazon_url(amazon_order_id),

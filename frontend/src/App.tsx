@@ -2085,24 +2085,57 @@ function dispatchProductImagesFrom(value: { products?: Array<{ asin?: string; ti
     .filter((item) => item.src)
 }
 
+function DispatchProductThumb({ image, onPreview, itemClass }: { image: DispatchProductImage; onPreview: (image: DispatchProductImage) => void; itemClass: string }) {
+  const [attempt, setAttempt] = useState(0)
+  const [loaded, setLoaded] = useState(false)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    setAttempt(0)
+    setLoaded(false)
+    setFailed(false)
+  }, [image.src])
+  const retrySrc = attempt ? `${image.src}${image.src.includes("?") ? "&" : "?"}retry=${attempt}` : image.src
+  return (
+    <button
+      type="button"
+      className={cn("relative flex items-center justify-center overflow-hidden rounded border bg-white transition hover:border-primary hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary", itemClass)}
+      onClick={() => {
+        if (failed) {
+          setLoaded(false)
+          setFailed(false)
+          setAttempt((value) => value + 1)
+        } else if (loaded) {
+          onPreview(image)
+        }
+      }}
+      title={failed ? `Retry thumbnail for ${image.asin || image.title}` : image.title}
+    >
+      {!loaded && !failed && <span className="position-absolute spinner-border spinner-border-sm text-secondary" aria-label="Loading thumbnail" />}
+      {failed ? (
+        <span className="d-flex flex-column align-items-center justify-content-center text-secondary" style={{ fontSize: "0.6rem", lineHeight: 1.1 }}>
+          <PackageCheck className="icon icon-1 mb-1" />
+          Retry
+        </span>
+      ) : (
+        <img
+          src={retrySrc}
+          alt={image.title}
+          className={cn("h-full w-full object-contain", !loaded && "opacity-0")}
+          decoding="async"
+          onLoad={() => setLoaded(true)}
+          onError={() => { setLoaded(false); setFailed(true) }}
+        />
+      )}
+    </button>
+  )
+}
+
 function DispatchProductThumbs({ images, onPreview, size = "md" }: { images: DispatchProductImage[]; onPreview: (image: DispatchProductImage) => void; size?: "sm" | "md" }) {
-  const [failedSources, setFailedSources] = useState<string[]>([])
-  const visibleImages = images.filter((image) => !failedSources.includes(image.src))
-  if (!visibleImages.length) return null
+  if (!images.length) return null
   const itemClass = size === "sm" ? "size-12" : "size-[88px]"
   return (
     <div className="flex shrink-0 flex-wrap gap-2" style={{ flexShrink: 0 }}>
-      {visibleImages.map((image, index) => (
-        <button
-          key={`${image.src}-${index}`}
-          type="button"
-          className={cn("flex items-center justify-center overflow-hidden rounded border bg-white transition hover:border-primary hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary", itemClass)}
-          onClick={() => onPreview(image)}
-          title={image.title}
-        >
-          <img src={image.src} alt={image.title} className="h-full w-full object-contain" onError={() => setFailedSources((current) => current.includes(image.src) ? current : [...current, image.src])} />
-        </button>
-      ))}
+      {images.map((image, index) => <DispatchProductThumb key={`${image.src}-${index}`} image={image} onPreview={onPreview} itemClass={itemClass} />)}
     </div>
   )
 }

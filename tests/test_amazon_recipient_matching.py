@@ -116,6 +116,18 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
 
         self.assertEqual(image_url, "/api/public/asin-image/B0D1QMKKQR")
 
+    def test_tracker_reuses_exact_asin_image_captured_on_another_order(self):
+        product = {"asin": "B0D1QMKKQR", "image_url": ""}
+        image_url = package_tracker_product_image_url(
+            product,
+            [],
+            captured_images_by_asin={
+                "B0D1QMKKQR": "https://m.media-amazon.com/images/I/global-capture.jpg",
+            },
+        )
+
+        self.assertEqual(image_url, "https://m.media-amazon.com/images/I/global-capture.jpg")
+
     def test_duplicate_analysis_respects_odoo_quantity_across_amazon_orders(self):
         lines = [{"asin": "B012345678", "quantity": 2}]
         packages = [
