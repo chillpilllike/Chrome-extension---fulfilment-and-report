@@ -6429,7 +6429,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       } else {
         void refreshSummary().catch((error) => onResult({ ok: false, title: "Dispatch Summary Failed", message: String(error) }))
       }
-      return results
+      return result
     } catch (error) {
       const message = `Scan failed for ${code}: ${String(error)}`
       setMatchedPackage(null)
@@ -6504,7 +6504,7 @@ function DispatchSortingPage({ storeId, publicVisitor = false, onResult }: { sto
       setSearchConfirmation(`Batch scan completed: ${results.length} package code${results.length === 1 ? "" : "s"} processed.`)
       if (scanEventPage !== 1) setScanEventPage(1)
       else await refreshSummary()
-      return result
+      return results
     } catch (error) {
       onResult({ ok: false, title: "Batch Scan Failed", message: String(error) })
     } finally {
