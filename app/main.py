@@ -30705,6 +30705,18 @@ def package_pickup_business_date(value: Any, local_display: Any = "") -> str:
             except ValueError:
                 continue
     if delivered is None:
+        # Amazon's date-only statuses (for example ``Delivered today``) are
+        # persisted at midnight as a calendar marker.  They are not an actual
+        # UTC event time and must not shift to the previous Brooklyn day.  A
+        # sparse report from another Chrome/Amazon-account scan may omit the
+        # detailed delivery event, leaving this marker as our only date fact.
+        raw_value = clean_text(value)
+        date_only_marker = re.fullmatch(
+            r"(\d{4}-\d{2}-\d{2})(?:[T ]00:00(?::00(?:\.\d+)?)?(?:Z|[+-]00:00)?)?",
+            raw_value,
+        )
+        if date_only_marker:
+            return date_only_marker.group(1)
         parsed = parse_any_datetime(value)
         if parsed is None:
             return ""

@@ -36,6 +36,10 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
     def test_brooklyn_date_is_used_across_utc_midnight(self) -> None:
         self.assertEqual(package_pickup_business_date("2026-08-20T01:15:00Z"), "2026-08-19")
 
+    def test_date_only_delivery_marker_does_not_shift_to_previous_day(self) -> None:
+        self.assertEqual(package_pickup_business_date("2026-08-20T00:00:00+00:00"), "2026-08-20")
+        self.assertEqual(package_pickup_business_date("2026-08-20T00:00:00Z"), "2026-08-20")
+
     def test_explicit_local_delivery_display_controls_the_date(self) -> None:
         self.assertEqual(package_pickup_business_date("2026-08-20T00:00:00Z", "Aug 19, 2026 04:47 PM"), "2026-08-19")
 
