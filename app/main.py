@@ -2227,11 +2227,17 @@ class OdooClient:
 
     def post_order_note(self, order_id: int, body: str) -> None:
         try:
+            body_is_html = bool(re.search(r"</?(?:a|br|div|p|strong|ul|li)\b", str(body or ""), re.IGNORECASE))
             self.execute(
                 "sale.order",
                 "message_post",
                 [[order_id]],
-                {"body": body, "message_type": "comment", "subtype_xmlid": "mail.mt_note"},
+                {
+                    "body": body,
+                    "body_is_html": body_is_html,
+                    "message_type": "comment",
+                    "subtype_xmlid": "mail.mt_note",
+                },
             )
         except Exception:
             existing = self.read("sale.order", [order_id], ["note"])
@@ -29889,25 +29895,25 @@ def chrome_complete_followups(
         for order_id in sorted({int(row["odoo_order_id"]) for row in rows}):
             order_rows = [row for row in rows if int(row["odoo_order_id"]) == order_id]
             order_note_parts = [
-                f"<p>Amazon Chrome order placed: {html.escape(amazon_order_id)}</p>",
-                f"<p>Amazon account: {html.escape(chrome_account_name)}</p>",
+                f"<p><strong>Amazon Chrome order placed: {html.escape(amazon_order_id)}</strong></p>",
             ]
             if clean_text(amazon_recipient):
                 order_note_parts.append(
-                    f"<p>Verified Amazon history recipient: {html.escape(clean_text(amazon_recipient))}</p>"
+                    f"<p><strong>Recipient:</strong> {html.escape(clean_text(amazon_recipient))}</p>"
                 )
+            item_lines: list[str] = []
             for row in order_rows:
                 asin = normalize_asin(str(row.get("asin") or "")) or clean_text(row.get("asin")) or "UNKNOWN"
                 quantity = float(row.get("quantity") or 1)
                 quantity_text = str(int(quantity)) if quantity.is_integer() else f"{quantity:g}"
-                order_note_parts.append(
-                    f"<p>Verified item: {html.escape(asin)} × {html.escape(quantity_text)}</p>"
-                )
+                item_lines.append(f"{html.escape(asin)} × {html.escape(quantity_text)}")
+            order_note_parts.append(f"<p><strong>Items:</strong><br>{'<br>'.join(item_lines)}</p>")
+            order_note_parts.append(f"<p><strong>Amazon account:</strong> {html.escape(chrome_account_name)}</p>")
             for fulfilment_note in variant_notes_by_order.get(order_id, []):
                 order_note_parts.append(f"<p>{html.escape(fulfilment_note)}</p>")
             escaped_url = html.escape(order_url, quote=True)
             order_note_parts.append(
-                f'<p>Amazon order link:<br><a href="{escaped_url}" target="_blank" rel="noopener noreferrer">{html.escape(order_url)}</a></p>'
+                f'<p><a href="{escaped_url}" target="_blank" rel="noopener noreferrer">Open Amazon order</a></p>'
             )
             order_note = "".join(order_note_parts)
             enqueue_odoo_chatter_note(
