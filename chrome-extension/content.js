@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-stable-consolidated-delivery-v61";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-cart-missing-retry-v62";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -3582,6 +3582,42 @@ async function handleSubscribeCheckout(activeJob) {
   }
 }
 
+async function retryProvenMissingCartItemOnce(activeJob, itemIndex, asin, expectedQuantity) {
+  const normalizedAsin = String(asin || "").toUpperCase();
+  if (!normalizedAsin || cartQuantityForAsin(normalizedAsin) !== 0) return false;
+  const retries = activeJob.cartMissingAddRetries && typeof activeJob.cartMissingAddRetries === "object"
+    ? activeJob.cartMissingAddRetries
+    : {};
+  const retryKey = `${Number(itemIndex || 0)}:${normalizedAsin}`;
+  if (Number(retries[retryKey] || 0) >= 1) return false;
+
+  activeJob.cartMissingAddRetries = { ...retries, [retryKey]: 1 };
+  activeJob.itemIndex = Number(itemIndex || 0);
+  activeJob.stage = "product";
+  activeJob.addClickedAt = null;
+  await setActiveJob(activeJob, {
+    allowStageRegression: true,
+    reason: "retry_proven_missing_cart_item_once",
+  });
+  await sendDiagnostic("Retrying Add to cart once after the active cart proved the ASIN was absent.", {
+    group_key: activeJob?.job?.group_key || "",
+    asin: normalizedAsin,
+    expected_quantity: expectedQuantity,
+    cart_quantity: 0,
+    item_index: Number(itemIndex || 0),
+    cart: cartDiagnosticSummary(),
+  }, "warn");
+  showPanel(
+    "Retrying missing cart item",
+    `The active Amazon cart proves ${normalizedAsin} has quantity 0. Retrying Add to cart once; a second failure will stop the order.`,
+    null,
+    null,
+  );
+  await sleep(1000);
+  location.href = `https://www.amazon.com/dp/${normalizedAsin}?th=1`;
+  return true;
+}
+
 async function handleCart(activeJob) {
   const nextIndex = Number(activeJob.itemIndex || 0) + 1;
   const itemCount = Array.isArray(activeJob.job?.items) ? activeJob.job.items.length : 0;
@@ -3626,6 +3662,12 @@ async function handleCart(activeJob) {
         location.reload();
         return;
       }
+      if (actualQuantity === 0 && await retryProvenMissingCartItemOnce(
+        activeJob,
+        Number(activeJob.itemIndex || 0),
+        expectedAsin,
+        expectedQuantity,
+      )) return;
       const message = `Could not verify ASIN ${expectedAsin} in the Amazon cart after ${MAX_CART_VERIFICATION_RELOADS} stabilization reloads. Expected ${expectedQuantity}, cart has ${actualQuantity}. ${cartDiagnosticSummary()} Checkout was stopped without clicking Add to cart a second time.`;
       showPanel("Cart verification needs review", message, null, null);
       await send({
