@@ -199,6 +199,9 @@ PUBLIC_DISPATCH_POST_PREFIXES = (
 PUBLIC_DISPATCH_GET_PREFIXES = (
     "/api/dispatch-sorting/packages/",
 )
+UNAUTHENTICATED_PUBLIC_API_PREFIXES = (
+    "/api/public/track-orders/",
+)
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 PUBLIC_ACCESS_CODE = os.getenv("PUBLIC_ACCESS_CODE", "").strip()
 PUBLIC_ACCESS_COOKIE = "public_access_session"
@@ -747,6 +750,8 @@ def request_has_public_access(request: Request) -> bool:
 def request_requires_public_access(request: Request) -> bool:
     path = request.url.path
     if path in {"/public/access", "/api/public/access"}:
+        return False
+    if request.method in {"GET", "HEAD"} and path.startswith(UNAUTHENTICATED_PUBLIC_API_PREFIXES):
         return False
     return bool(
         path in PUBLIC_FRONTEND_PATHS

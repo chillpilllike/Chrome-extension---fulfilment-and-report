@@ -15,6 +15,28 @@ class OrderLineFilteringTests(unittest.TestCase):
             self.assertTrue(app_main.request_requires_public_access(request))
             self.assertFalse(app_main.request_has_public_access(request))
 
+    def test_customer_tracking_api_does_not_require_dispatch_access_code(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/public/track-orders/nutricity-com-au",
+            "headers": [],
+            "query_string": b"store_id=1&website_id=39",
+        })
+
+        self.assertFalse(app_main.request_requires_public_access(request))
+
+    def test_other_public_apis_still_require_dispatch_access_code(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/public/amazon-otp",
+            "headers": [],
+            "query_string": b"",
+        })
+
+        self.assertTrue(app_main.request_requires_public_access(request))
+
     def test_product_title_with_free_shipping_is_not_skipped(self):
         line = {
             "name": "Cramp 911 Muscle Relaxing Roll-On Lotion, 0.71 Oz, Free Shipping, New",
