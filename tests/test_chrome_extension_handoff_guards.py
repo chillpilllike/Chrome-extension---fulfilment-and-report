@@ -8,6 +8,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BACKGROUND = (ROOT / "chrome-extension" / "background.js").read_text()
 CONTENT = (ROOT / "chrome-extension" / "content.js").read_text()
 MANIFEST = json.loads((ROOT / "chrome-extension" / "manifest.json").read_text())
+POPUP_HTML = (ROOT / "chrome-extension" / "popup.html").read_text()
+POPUP_JS = (ROOT / "chrome-extension" / "popup.js").read_text()
 APP = (ROOT / "app" / "main.py").read_text()
 
 
@@ -44,7 +46,18 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.71")
+        self.assertEqual(MANIFEST["version"], "0.1.74")
+
+    def test_popup_exposes_the_loaded_extension_version(self) -> None:
+        self.assertIn('id="extensionVersion"', POPUP_HTML)
+        self.assertIn("chrome.runtime.getManifest().version", POPUP_JS)
+
+    def test_popup_start_gives_immediate_background_worker_feedback(self) -> None:
+        self.assertIn('const startNextButton = document.querySelector("#start");', POPUP_JS)
+        self.assertIn("startNextButton.disabled = true;", POPUP_JS)
+        self.assertIn("The Amazon worker is running in the background.", POPUP_JS)
+        self.assertIn("await refresh();", POPUP_JS)
+        self.assertIn("startNextButton.disabled = false;", POPUP_JS)
 
     def test_reporting_evidence_cannot_regress_during_same_job_refresh(self) -> None:
         set_window_start = BACKGROUND.index("async function setWindowJob")
@@ -97,8 +110,61 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         jobs_end = APP.index('@app.get("/api/chrome/jobs/recover-submitted")', jobs_start)
         jobs = APP[jobs_start:jobs_end]
         self.assertIn("existing = exact_amazon_history_match_for_chrome_job(job)", jobs)
-        self.assertIn("completion = api_chrome_job_complete(", jobs)
+        self.assertIn("completion = complete_chrome_job_from_exact_history_match(job, existing, worker_id)", jobs)
         self.assertIn('"reconciled_existing": reconciled_existing', jobs)
+
+    def test_submitted_recovery_consumes_an_exact_history_match(self) -> None:
+        recover_start = APP.index('@app.get("/api/chrome/jobs/recover-submitted")')
+        recover_end = APP.index('@app.post("/api/chrome/jobs/{group_key}/heartbeat")', recover_start)
+        recover = APP[recover_start:recover_end]
+        self.assertIn("existing = exact_amazon_history_match_for_chrome_job(job)", recover)
+        self.assertIn("complete_chrome_job_from_exact_history_match(job, existing, worker_id)", recover)
+        self.assertIn('"recovered": True', recover)
+
+        background_start = BACKGROUND.index("async function recoverSubmittedJobInWindow")
+        background_end = BACKGROUND.index("async function cleanupCartBeforeNextJob", background_start)
+        background = BACKGROUND[background_start:background_end]
+        self.assertIn("if (result.recovered && result.group_key)", background)
+        self.assertIn("await clearStoredJobGroup(result.group_key);", background)
+
+    def test_history_lookup_server_completes_exact_submissions_and_repairs_chatter(self) -> None:
+        lookup_start = APP.index('@app.post("/api/chrome/order-history/lookup")')
+        lookup_end = APP.index('@app.post("/api/chrome/order-history/odoo-direct")', lookup_start)
+        lookup = APP[lookup_start:lookup_end]
+        self.assertIn("reconcile_exact_submitted_chrome_jobs_from_history()", lookup)
+        self.assertIn("repair_missing_chrome_order_chatter()", lookup)
+        self.assertIn('"submitted_reconciled": submitted_reconciled', lookup)
+        self.assertIn('"chatter_repaired": chatter_repaired', lookup)
+
+        self.assertIn("def reconcile_exact_submitted_chrome_jobs_from_history(", APP)
+        self.assertIn("completion = complete_chrome_job_from_exact_history_match(job, existing, worker_id)", APP)
+        self.assertIn("def repair_missing_chrome_order_chatter(", APP)
+        self.assertIn("queued = queue_chrome_complete_odoo_chatter(", APP)
+
+    def test_start_and_submitted_recovery_discard_a_closed_popup_target_window(self) -> None:
+        self.assertIn("async function existingChromeWindowId(windowId)", BACKGROUND)
+        self.assertIn("await chrome.windows.get(normalized);", BACKGROUND)
+
+        start_begin = BACKGROUND.index("async function startNextJob(sourceWindowId = null)")
+        start_end = BACKGROUND.index("async function startBrowserlessOrderRun", start_begin)
+        start = BACKGROUND[start_begin:start_end]
+        self.assertIn("sourceWindowId = await existingChromeWindowId(sourceWindowId);", start)
+
+        recover_begin = BACKGROUND.index("async function recoverSubmittedJobInWindow(windowId)")
+        recover_end = BACKGROUND.index("async function cleanupCartBeforeNextJob", recover_begin)
+        recover = BACKGROUND[recover_begin:recover_end]
+        self.assertIn("windowId = await existingChromeWindowId(windowId);", recover)
+
+        claim_begin = BACKGROUND.index("async function claimNextJobInWindow(windowId)")
+        claim_end = BACKGROUND.index("async function finishCleanupAndClaimNext", claim_begin)
+        claim = BACKGROUND[claim_begin:claim_end]
+        self.assertIn("windowId = await existingChromeWindowId(windowId);", claim)
+        self.assertIn("const createdWindow = await createAmazonWorkerWindow(false);", claim)
+        self.assertIn("Could not create a replacement Amazon worker window", claim)
+        self.assertLess(
+            claim.index("const createdWindow = await createAmazonWorkerWindow(false);"),
+            claim.index("const activeJob = activeJobFor(job, workerId, windowId);"),
+        )
 
     def test_empty_order_history_candidate_cannot_complete_reporting(self) -> None:
         report_start = CONTENT.index("async function reportAmazonOrders(activeJob, orders)")
