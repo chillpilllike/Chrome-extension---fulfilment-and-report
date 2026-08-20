@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.76")
+        self.assertEqual(MANIFEST["version"], "0.1.77")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -55,7 +55,8 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
 
         self.assertNotIn("location.reload()", handler)
         self.assertNotIn("orderHistoryEmptyReloads", handler)
-        self.assertIn("Waiting for Amazon to finish loading recent orders", handler)
+        self.assertNotIn("if (!historySurface)", handler)
+        self.assertIn("await waitUntil(() => extractOrderHistoryOrders().length > 0", handler)
 
     def test_popup_exposes_the_loaded_extension_version(self) -> None:
         self.assertIn('id="extensionVersion"', POPUP_HTML)
