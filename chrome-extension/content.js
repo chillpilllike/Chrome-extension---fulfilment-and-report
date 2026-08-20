@@ -3543,12 +3543,14 @@ async function handleAddClicked(activeJob) {
   const clickedAt = Number(activeJob.addClickedAt || 0);
   const remainingWaitMs = Math.max(0, 4500 - (Date.now() - clickedAt));
   if (remainingWaitMs) {
-    showPanel("Nutricity fulfilment", "Amazon add was clicked. Waiting for Amazon to expose the next safe step.", null, null);
-    await waitUntil(() => (
-      /\/(?:cart|checkout)/i.test(location.pathname)
-      || findButtonByText(["proceed to checkout", "check out amazon cart"])
-      || document.querySelector("#sc-active-cart, input[name='proceedToRetailCheckout'], #sc-buy-box-ptc-button input")
-    ), remainingWaitMs, 250);
+    showPanel("Nutricity fulfilment", "Amazon add was clicked. Waiting for Amazon to finish updating the cart.", null, null);
+    // Amazon product pages can contain hidden cart/checkout markup before the
+    // current Add request has finished. Treating that markup as confirmation
+    // allowed a multi-item run to navigate away early and cancel item 2's Add
+    // request. Keep the page alive for the full post-click settling window.
+    // A real Amazon navigation unloads this script and the destination page
+    // resumes the saved add_clicked stage normally.
+    await sleep(remainingWaitMs);
   }
   if (/\/cart/i.test(location.pathname)) {
     const nextIndex = Number(activeJob.itemIndex || 0) + 1;

@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.74")
+        self.assertEqual(MANIFEST["version"], "0.1.75")
 
     def test_popup_exposes_the_loaded_extension_version(self) -> None:
         self.assertIn('id="extensionVersion"', POPUP_HTML)
@@ -308,6 +308,14 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
 
     def test_cart_verification_error_carries_detected_rows(self) -> None:
         self.assertGreaterEqual(CONTENT.count("${cartDiagnosticSummary()}"), 3)
+
+    def test_add_clicked_wait_cannot_short_circuit_on_hidden_cart_markup(self) -> None:
+        start = CONTENT.index("async function handleAddClicked(activeJob)")
+        end = CONTENT.index("async function handleSubscribeCheckout", start)
+        handler = CONTENT[start:end]
+        self.assertIn("await sleep(remainingWaitMs);", handler)
+        self.assertNotIn('document.querySelector("#sc-active-cart', handler)
+        self.assertNotIn('findButtonByText(["proceed to checkout"', handler)
 
     def test_next_job_is_published_only_after_leaving_order_history(self) -> None:
         claim_start = BACKGROUND.index("async function claimNextJobInWindow")
