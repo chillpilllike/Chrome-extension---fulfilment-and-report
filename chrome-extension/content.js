@@ -8275,25 +8275,16 @@ async function handleOrderHistory(activeJob) {
   await setActiveJob(activeJob);
   const historySurface = await waitForElement(["#orderCardHeader", ".order-card", "[id*='orderCard']"], 12000);
   if (!historySurface) {
-    // Amazon occasionally completes the history navigation with only the
-    // header and filters rendered. Treating <body> as readiness made the
-    // worker wait two minutes against an empty shell, then mark a real order
-    // uncertain. Reload that incomplete shell at most four times; all duplicate
-    // and recipient/ASIN guards still run once actual order cards appear.
-    const emptyReloads = Number(activeJob.orderHistoryEmptyReloads || 0);
-    const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
-    if (emptyReloads < 1 && lookupAge < 30000) {
-      activeJob.orderHistoryEmptyReloads = emptyReloads + 1;
-      await setActiveJob(activeJob);
-      showPanel(
-        "Nutricity fulfilment",
-        "Amazon order history loaded without order cards. Reloading it once before holding this order for verification.",
-        null,
-        null,
-      );
-      location.reload();
-      return;
-    }
+    // The content worker runs again every five seconds. Keep this page stable
+    // while Amazon renders its order cards instead of reloading an incomplete
+    // shell and repeatedly discarding the DOM that Amazon is still building.
+    showPanel(
+      "Nutricity fulfilment",
+      "Waiting for Amazon to finish loading recent orders. This page will stay open while fulfilment checks again automatically.",
+      null,
+      null,
+    );
+    return;
   }
   const historyOrders = extractOrderHistoryOrders();
   if (historyOrders.length) {
