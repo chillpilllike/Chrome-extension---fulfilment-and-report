@@ -26820,7 +26820,15 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
     cache_key = amazon_history_records_cache_key("chrome-order-history-lookup", records)
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
-        return cached
+        submitted_reconciled = reconcile_exact_submitted_chrome_jobs_from_history()
+        chatter_repaired = repair_missing_chrome_order_chatter()
+        if not submitted_reconciled and not chatter_repaired:
+            return cached
+        return {
+            **cached,
+            "submitted_reconciled": submitted_reconciled,
+            "chatter_repaired": chatter_repaired,
+        }
     order_ids = [record["amazon_order_id"] for record in records if record["amazon_order_id"]]
     last_db_error: Exception | None = None
     auto_reconciled: list[dict[str, Any]] = []
@@ -26886,6 +26894,13 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
         shopify_timer = threading.Timer(0.1, chrome_complete_shopify_followup, args=(rows,))
         shopify_timer.daemon = True
         shopify_timer.start()
+    # The browser has already delivered exact Amazon history evidence to this
+    # endpoint. Complete protected post-submit jobs here as well as in the
+    # extension message path, so a stale service worker cannot trap the queue
+    # in a history-page reload loop. Completion returns only after the durable,
+    # idempotent Odoo chatter outbox row is committed.
+    submitted_reconciled = reconcile_exact_submitted_chrome_jobs_from_history()
+    chatter_repaired = repair_missing_chrome_order_chatter()
     return fast_page_cache_set(cache_key, {
         "ok": True,
         "matches": matches,
@@ -26900,6 +26915,8 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
             }
             for plan in auto_reconciled
         ],
+        "submitted_reconciled": submitted_reconciled,
+        "chatter_repaired": chatter_repaired,
         "unmatched": unmatched,
         "not_found_url": "/amazon-order-history-unmatched",
     }, 300)
@@ -28593,6 +28610,175 @@ def exact_amazon_history_match_for_chrome_job(job: dict[str, Any]) -> Optional[d
     return matches[0] if len(matches) == 1 else None
 
 
+def complete_chrome_job_from_exact_history_match(
+    job: dict[str, Any],
+    existing: dict[str, Any],
+    worker_id: str,
+) -> dict[str, Any]:
+    """Save one server-verified Amazon history match for a Chrome job."""
+    amazon_order_id = clean_text(existing.get("amazon_order_id"))
+    amazon_order_url = clean_text(existing.get("amazon_order_url")) or order_line_amazon_url(amazon_order_id)
+    line_ids = sorted({
+        int(value)
+        for value in job.get("line_ids") or []
+        if str(value or "").isdigit() and int(value) > 0
+    })
+    return api_chrome_job_complete(
+        clean_text(job.get("group_key")),
+        ChromeJobCompletePayload(
+            amazon_order_id=amazon_order_id,
+            amazon_order_url=amazon_order_url,
+            amazon_account_name=clean_text(job.get("amazon_account_name")) or "Chrome Extension",
+            order_date=clean_text(existing.get("order_date")),
+            amazon_recipient=clean_text(existing.get("recipient")),
+            amazon_asins=[
+                asin
+                for asin in (normalize_asin(value) for value in existing.get("asins") or [])
+                if asin
+            ],
+            line_ids=line_ids,
+            order_mappings=[
+                {
+                    "amazon_order_id": amazon_order_id,
+                    "amazon_order_url": amazon_order_url,
+                    "asin": normalize_asin(item.get("asin")),
+                    "line_ids": [
+                        int(value)
+                        for value in item.get("line_ids") or []
+                        if str(value or "").isdigit() and int(value) > 0
+                    ],
+                }
+                for item in job.get("items") or []
+            ],
+            worker_id=clean_text(worker_id),
+        ),
+    )
+
+
+def reconcile_exact_submitted_chrome_jobs_from_history(limit: int = 8) -> list[dict[str, Any]]:
+    """Complete protected Chrome submissions from unique exact history evidence."""
+    with db() as conn:
+        groups = rows_to_dicts(conn.execute(
+            """
+            SELECT amazon_group_key, chrome_claimed_by, MAX(updated_at) AS updated_at
+            FROM order_lines
+            WHERE order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '')=''
+              AND COALESCE(amazon_group_key, '')!=''
+              AND COALESCE(chrome_claimed_by, '')!=''
+              AND COALESCE(amazon_status, '') IN ('order_submitted', 'reporting_complete')
+            GROUP BY amazon_group_key, chrome_claimed_by
+            ORDER BY MAX(updated_at) DESC
+            LIMIT ?
+            """,
+            (max(1, min(50, int(limit or 8))),),
+        ).fetchall())
+    reconciled: list[dict[str, Any]] = []
+    for group in groups:
+        group_key = clean_text(group.get("amazon_group_key"))
+        worker_id = clean_text(group.get("chrome_claimed_by"))
+        if not group_key or not worker_id:
+            continue
+        with db() as conn:
+            group_rows = rows_to_dicts(conn.execute(
+                """
+                SELECT *
+                FROM order_lines
+                WHERE amazon_group_key=?
+                  AND order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '')=''
+                ORDER BY id
+                """,
+                (group_key,),
+            ).fetchall())
+        if not group_rows:
+            continue
+        job = chrome_job_from_rows(group_rows)
+        existing = exact_amazon_history_match_for_chrome_job(job)
+        if not existing:
+            continue
+        try:
+            completion = complete_chrome_job_from_exact_history_match(job, existing, worker_id)
+        except Exception as exc:
+            print(f"Chrome exact history auto-completion held {group_key}: {exc}", flush=True)
+            continue
+        reconciled.append({
+            "group_key": group_key,
+            "amazon_order_id": clean_text(existing.get("amazon_order_id")),
+            "order_names": job.get("order_names") or [],
+            "odoo_chatter_queued": bool(completion.get("odoo_chatter_queued")),
+            "odoo_chatter_confirmed": bool(completion.get("odoo_chatter_confirmed")),
+        })
+    return reconciled
+
+
+def repair_missing_chrome_order_chatter(limit: int = 20) -> list[dict[str, Any]]:
+    """Backstop every saved Chrome order with a durable Odoo chatter outbox row."""
+    with db() as conn:
+        groups = rows_to_dicts(conn.execute(
+            """
+            SELECT DISTINCT ol.amazon_group_key, ol.amazon_order_id
+            FROM order_lines ol
+            WHERE ol.order_engine='chrome'
+              AND COALESCE(ol.amazon_group_key, '')!=''
+              AND COALESCE(ol.amazon_order_id, '')!=''
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM odoo_chatter_note_log log
+                  WHERE log.store_id=ol.store_id
+                    AND log.odoo_order_id=ol.odoo_order_id
+                    AND log.event_type='amazon_order_placed'
+                    AND log.amazon_order_id=ol.amazon_order_id
+              )
+            ORDER BY ol.amazon_order_id DESC
+            LIMIT ?
+            """,
+            (max(1, min(100, int(limit or 20))),),
+        ).fetchall())
+    repaired: list[dict[str, Any]] = []
+    for group in groups:
+        group_key = clean_text(group.get("amazon_group_key"))
+        amazon_order_id = clean_text(group.get("amazon_order_id"))
+        if not group_key or not amazon_order_id:
+            continue
+        with db() as conn:
+            rows = rows_to_dicts(conn.execute(
+                """
+                SELECT *
+                FROM order_lines
+                WHERE amazon_group_key=? AND amazon_order_id=? AND order_engine='chrome'
+                ORDER BY id
+                """,
+                (group_key, amazon_order_id),
+            ).fetchall())
+            history = conn.execute(
+                "SELECT recipient, amazon_order_url FROM amazon_order_history_unmatched WHERE amazon_order_id=?",
+                (amazon_order_id,),
+            ).fetchone()
+        if not rows:
+            continue
+        worker_id = clean_text(rows[0].get("chrome_claimed_by"))
+        queued = queue_chrome_complete_odoo_chatter(
+            group_key,
+            rows,
+            {},
+            amazon_order_id,
+            clean_text((history or {}).get("amazon_order_url")) or clean_text(rows[0].get("amazon_order_url")) or order_line_amazon_url(amazon_order_id),
+            clean_text(rows[0].get("amazon_account_name")) or "Chrome Extension",
+            worker_id,
+            clean_text((history or {}).get("recipient")),
+        )
+        if queued:
+            repaired.append({
+                "group_key": group_key,
+                "amazon_order_id": amazon_order_id,
+                "order_names": sorted({clean_text(row.get("odoo_order_name")) for row in rows if clean_text(row.get("odoo_order_name"))}),
+            })
+    return repaired
+
+
 @app.get("/api/chrome/jobs")
 def api_chrome_jobs(
     store_id: Optional[int] = None,
@@ -28603,6 +28789,8 @@ def api_chrome_jobs(
     split_mixed_asin: bool = False,
 ) -> dict[str, Any]:
     if claim:
+        history_reconciled = reconcile_exact_submitted_chrome_jobs_from_history()
+        chatter_repaired = repair_missing_chrome_order_chatter()
         # Older loaded extension workers used resume_existing=false, which can
         # abandon an in-progress checkout and jump to a different order. Claims
         # should be resumed by default for the same worker so a refresh/reload
@@ -28625,28 +28813,7 @@ def api_chrome_jobs(
             if not existing:
                 break
             try:
-                completion = api_chrome_job_complete(
-                    clean_text(job.get("group_key")),
-                    ChromeJobCompletePayload(
-                        amazon_order_id=existing["amazon_order_id"],
-                        amazon_order_url=existing["amazon_order_url"],
-                        amazon_account_name=clean_text(job.get("amazon_account_name")) or "Chrome Extension",
-                        order_date=existing["order_date"],
-                        amazon_recipient=existing["recipient"],
-                        amazon_asins=existing["asins"],
-                        line_ids=[int(value) for value in job.get("line_ids") or [] if int(value or 0) > 0],
-                        order_mappings=[
-                            {
-                                "amazon_order_id": existing["amazon_order_id"],
-                                "amazon_order_url": existing["amazon_order_url"],
-                                "asin": clean_text(item.get("asin")),
-                                "line_ids": [int(value) for value in item.get("line_ids") or [] if int(value or 0) > 0],
-                            }
-                            for item in job.get("items") or []
-                        ],
-                        worker_id=worker_id,
-                    ),
-                )
+                completion = complete_chrome_job_from_exact_history_match(job, existing, worker_id)
                 reconciled_existing.append({
                     "group_key": clean_text(job.get("group_key")),
                     "amazon_order_id": existing["amazon_order_id"],
@@ -28662,7 +28829,13 @@ def api_chrome_jobs(
                 resume_existing=True,
                 split_mixed_asin=split_mixed_asin,
             )
-        return {"ok": True, "jobs": [job] if job else [], "reconciled_existing": reconciled_existing}
+        return {
+            "ok": True,
+            "jobs": [job] if job else [],
+            "reconciled_existing": reconciled_existing,
+            "history_reconciled": history_reconciled,
+            "chatter_repaired": chatter_repaired,
+        }
     snapshot = chrome_queue_snapshot(store_id, limit=job_limit, worker_id=worker_id)
     return {"ok": True, **snapshot}
 
@@ -28731,7 +28904,25 @@ def api_chrome_recover_submitted_job(
             """,
             (group_key,),
         ).fetchall())
-    return {"ok": True, "job": chrome_job_from_rows(group_rows), "claim_expires_at": expiry}
+    job = chrome_job_from_rows(group_rows)
+    existing = exact_amazon_history_match_for_chrome_job(job)
+    if existing:
+        try:
+            completion = complete_chrome_job_from_exact_history_match(job, existing, worker_id)
+            return {
+                "ok": True,
+                "job": None,
+                "recovered": True,
+                "group_key": clean_text(job.get("group_key")),
+                "amazon_order_id": clean_text(existing.get("amazon_order_id")),
+                "message": completion.get("message") or "Recovered exact Amazon order-history match.",
+            }
+        except Exception as exc:
+            # Keep the protected submitted job available to the extension when
+            # a downstream follow-up (for example Odoo chatter) is temporarily
+            # unavailable. Never clear the lock or permit a second checkout.
+            print(f"Chrome submitted history reconciliation held {group_key}: {exc}", flush=True)
+    return {"ok": True, "job": job, "claim_expires_at": expiry}
 
 
 @app.post("/api/chrome/jobs/{group_key}/heartbeat")
@@ -28818,6 +29009,7 @@ def api_chrome_job_completion_status(group_key: str, line_ids: str = "") -> dict
     group_key = clean_text(group_key)
     if not group_key:
         raise HTTPException(400, "Chrome group key is required")
+    repair_missing_chrome_order_chatter()
     parsed_line_ids = sorted({
         int(match.group(0))
         for match in re.finditer(r"\d+", clean_text(line_ids))

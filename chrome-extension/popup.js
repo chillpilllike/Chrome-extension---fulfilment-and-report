@@ -36,6 +36,11 @@ const nextOrderStage = document.querySelector("#nextOrderStage");
 const diagnosticCount = document.querySelector("#diagnosticCount");
 const exportDiagnostics = document.querySelector("#exportDiagnostics");
 const clearDiagnostics = document.querySelector("#clearDiagnostics");
+const extensionVersion = document.querySelector("#extensionVersion");
+
+if (extensionVersion) {
+  extensionVersion.textContent = `v${chrome.runtime.getManifest().version}`;
+}
 
 function send(message) {
   return chrome.runtime.sendMessage({ ...message, targetWindowId });
@@ -496,7 +501,10 @@ document.querySelector("#reloadExtension").addEventListener("click", async () =>
   setTimeout(() => chrome.runtime.reload(), 50);
 });
 
-document.querySelector("#start").addEventListener("click", async () => {
+const startNextButton = document.querySelector("#start");
+
+startNextButton.addEventListener("click", async () => {
+  startNextButton.disabled = true;
   setStatus(browserlessOrderMode.checked ? "Starting background order placement..." : "Starting next queued order...");
   try {
     await send({ type: "SET_API_BASE", ...settingsPayload() });
@@ -507,9 +515,18 @@ document.querySelector("#start").addEventListener("click", async () => {
       targetWindowId = result.targetWindowId;
       registerControlWindow();
     }
-    setStatus(result.message || (result.ok ? "Started." : "Could not start."));
+    const groupKey = result?.activeJob?.job?.group_key || result?.next_group_key || "";
+    setStatus(
+      result.message
+      || (result.ok && groupKey
+        ? `Working on ${groupKey}. The Amazon worker is running in the background.`
+        : result.ok ? "Order worker started in the background." : "Could not start."),
+    );
+    await refresh();
   } catch (error) {
     setStatus(error.message || "Could not start queued order.");
+  } finally {
+    startNextButton.disabled = false;
   }
 });
 

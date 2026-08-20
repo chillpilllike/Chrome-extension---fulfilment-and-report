@@ -110,6 +110,17 @@ async function liveWorkerWindowId(windowId) {
   return mappedWindowId || windowId;
 }
 
+async function existingChromeWindowId(windowId) {
+  const normalized = Number(windowId || 0) || null;
+  if (!normalized) return null;
+  try {
+    await chrome.windows.get(normalized);
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
 async function setWindowJob(windowId, activeJob, options = {}) {
   if (activeJob && await forceStopActive()) return;
   const state = await getSettings();
@@ -1164,6 +1175,7 @@ async function ensureStoredActiveJobContentScripts(label = "active job recovery"
 async function startNextJob(sourceWindowId = null) {
   if (startNextJobInFlight) return startNextJobInFlight;
   startNextJobInFlight = (async () => {
+  sourceWindowId = await existingChromeWindowId(sourceWindowId);
   await setForceStop(false);
   await releaseMissingWindowJobs({ force: true });
   const submittedRecovery = await recoverSubmittedJobInWindow(sourceWindowId);
@@ -1404,6 +1416,7 @@ async function stopBrowserlessOrderRun(sourceWindowId = null) {
 }
 
 async function claimNextJobInWindow(windowId) {
+  windowId = await existingChromeWindowId(windowId);
   const claimKey = String(windowId || "global");
   if (claimNextJobInFlight.has(claimKey)) return claimNextJobInFlight.get(claimKey);
   const task = (async () => {
@@ -1465,6 +1478,21 @@ async function claimNextJobInWindow(windowId) {
     const recovered = await recoverSubmittedJobInWindow(windowId);
     return recovered.activeJob || null;
   }
+  if (!windowId) {
+    const createdWindow = await createAmazonWorkerWindow(false);
+    windowId = Number(createdWindow?.id || 0) || null;
+    if (!windowId) {
+      try {
+        await api(`/api/chrome/jobs/${encodeURIComponent(job.group_key)}/release`, {
+          method: "POST",
+          body: JSON.stringify({ worker_id: workerId }),
+        });
+      } catch (releaseError) {
+        await log(`Could not release ${job.group_key} after replacement worker creation failed: ${releaseError.message}`);
+      }
+      throw new Error("Could not create a replacement Amazon worker window for the next queued order.");
+    }
+  }
   const activeJob = activeJobFor(job, workerId, windowId);
   activeJob.startedAfterPreviousJob = true;
   await log(`Started next ${job.group_key} with ${job.items.length} item(s); clearing Amazon cart before product add.`, windowId);
@@ -1500,6 +1528,7 @@ async function finishCleanupAndClaimNext(windowId) {
 }
 
 async function recoverSubmittedJobInWindow(windowId) {
+  windowId = await existingChromeWindowId(windowId);
   const recoverKey = String(windowId || "global");
   if (recoverSubmittedJobsInFlight.has(recoverKey)) {
     return recoverSubmittedJobsInFlight.get(recoverKey);
@@ -1513,6 +1542,21 @@ async function recoverSubmittedJobInWindow(windowId) {
   const task = (async () => {
   const workerId = await getWorkerId();
   const result = await api(`/api/chrome/jobs/recover-submitted?worker_id=${encodeURIComponent(workerId)}`);
+  if (result.recovered && result.group_key) {
+    await clearStoredJobGroup(result.group_key);
+    lastEmptyRecoverSubmittedJobAt = Date.now();
+    await log(
+      `Recovered submitted ${result.group_key} as Amazon ${result.amazon_order_id || "order"} from exact order-history evidence.`,
+      windowId,
+    );
+    return {
+      ok: true,
+      recovered: true,
+      serverRecovered: true,
+      activeJob: null,
+      amazonOrderId: result.amazon_order_id || "",
+    };
+  }
   const job = result.job || null;
   if (!job?.group_key) {
     lastEmptyRecoverSubmittedJobAt = Date.now();
