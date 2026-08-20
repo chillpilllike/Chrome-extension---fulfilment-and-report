@@ -46,7 +46,16 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.75")
+        self.assertEqual(MANIFEST["version"], "0.1.76")
+
+    def test_order_history_waits_without_reloading_incomplete_cards(self):
+        start = CONTENT.index("async function handleOrderHistory(activeJob)")
+        end = CONTENT.index("async function reportPostSubmitUnplaced", start)
+        handler = CONTENT[start:end]
+
+        self.assertNotIn("location.reload()", handler)
+        self.assertNotIn("orderHistoryEmptyReloads", handler)
+        self.assertIn("Waiting for Amazon to finish loading recent orders", handler)
 
     def test_popup_exposes_the_loaded_extension_version(self) -> None:
         self.assertIn('id="extensionVersion"', POPUP_HTML)
@@ -197,7 +206,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('type: "SUBMIT_UNCERTAIN"', history)
         self.assertIn('activeJob.pausedStage = "find_order_id";', history)
         self.assertIn("the queue will not continue", history)
-        self.assertIn("emptyReloads < 1", history)
+        self.assertNotIn("location.reload()", history)
 
     def test_background_uncertain_submit_never_releases_or_cleans_queue(self) -> None:
         uncertain_start = BACKGROUND.index("async function submitUncertain")
