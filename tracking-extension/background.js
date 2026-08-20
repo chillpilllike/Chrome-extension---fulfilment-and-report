@@ -6,7 +6,7 @@ const DEFAULT_AUTO_TRACKING_HOURS = 3;
 const TRACKING_STEP_TIMEOUT_MS = 90000;
 const RECENT_TRACKING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const ORDER_HISTORY_URL = "https://www.amazon.com/gp/css/order-history?ref_=abn_yadd_ad_your_orders";
-const ORDER_HISTORY_PATH_RE = /\/(gp\/css\/order-history|gp\/your-account\/order-history|your-orders\/orders?)\/?$/i;
+const ORDER_HISTORY_PATH_RE = /\/(gp\/css\/order-history|gp\/your-account\/order-history|your-orders(?:\/orders?)?)(?:\/ref=[^/]+)?\/?$/i;
 const AMAZON_ORDER_ID_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
 async function getState() {
@@ -22,6 +22,7 @@ async function getState() {
     trackAllMaxPages: 202,
     tracking: { running: false, orders: [], index: 0, packages: [], packageIndex: 0 },
     recentTrackingChecks: [],
+    amazonAccountName: "",
     trackingByWindow: {},
     logs: [],
     logsByWindow: {},
@@ -309,12 +310,14 @@ async function assertPackagePayloadBelongsToOrder(amazonOrderId, packages = [], 
 async function postGuardedTrackingUpdate(amazonOrderId, payload = {}, options = {}, windowId = null) {
   const expected = normalizeAmazonOrderId(amazonOrderId);
   const packages = await assertPackagePayloadBelongsToOrder(expected, Array.isArray(payload.packages) ? payload.packages : [], windowId);
+  const state = await getState();
   return api("/api/tracking/update", {
     method: "POST",
     ...options,
     body: JSON.stringify({
       ...payload,
       amazon_order_id: expected,
+      amazon_account_name: String(payload.amazon_account_name || state.amazonAccountName || "").trim(),
       packages,
     }),
   });
@@ -835,6 +838,8 @@ async function advanceCurrentOrder(tracking, windowId, status = "checked") {
   tracking.packageIndex = 0;
   tracking.mismatchRecoveryKey = "";
   tracking.mismatchRecoveryCount = 0;
+  tracking.redirectRecoveryKey = "";
+  tracking.redirectRecoveryCount = 0;
   tracking.currentStep = "";
   tracking.currentUrl = "";
   tracking.currentOrderId = "";
@@ -1006,8 +1011,11 @@ async function fetchAllTrackingOrders(status = "active", options = {}) {
   let total = 0;
   const orders = [];
   const seen = new Set();
+  const state = await getState();
+  const amazonAccountName = String(options.amazonAccountName || state.amazonAccountName || "").trim();
   while (page <= 200) {
     const params = new URLSearchParams({ page: String(page), per_page: String(perPage), status });
+    if (amazonAccountName) params.set("amazon_account_name", amazonAccountName);
     if (options.includeHistoryRefresh === false) params.set("include_history_refresh", "0");
     const payload = await api(`/api/tracking/orders?${params.toString()}`, { timeoutMs: 30000 });
     total = Number(payload.total || total || 0);
@@ -1061,6 +1069,7 @@ function normalizeHistoryOrder(order = {}) {
   return {
     amazon_order_id: orderId,
     amazon_order_url: order.amazon_order_url || orderUrl({ amazon_order_id: orderId }),
+    amazon_account_name: String(order.amazon_account_name || order.amazonAccountName || "").trim(),
     recipient: String(order.recipient || "").replace(/\s+/g, " ").trim(),
     order_date: String(order.order_date || "").replace(/\s+/g, " ").trim(),
     status: String(order.status || "").replace(/\s+/g, " ").trim(),
@@ -1142,7 +1151,7 @@ async function manualMatchHistoryOrder(normalized, rows, windowId) {
     body: JSON.stringify({
       amazon_order_id: normalized.amazon_order_id,
       amazon_order_url: normalized.amazon_order_url,
-      amazon_account_name: "Amazon Tracking Track All",
+      amazon_account_name: normalized.amazon_account_name || "",
       order_date: normalized.order_date,
       order_names: orderNames,
       line_ids: lineIds,
@@ -1429,6 +1438,8 @@ async function advanceHistoryOrder(tracking, windowId, status = "checked") {
     }
   }
   tracking.currentOrder = null;
+  tracking.redirectRecoveryKey = "";
+  tracking.redirectRecoveryCount = 0;
   tracking.currentStep = "";
   tracking.currentUrl = "";
   tracking.lastActivityAt = Date.now();
@@ -2211,6 +2222,43 @@ async function recoverActiveTrackingPage(message = {}, windowId = null) {
   const activeOrderId = tracking.source === "history"
     ? tracking.currentOrder?.amazon_order_id || ""
     : tracking.orders?.[Number(tracking.index || 0)]?.amazon_order_id || "";
+  const redirectedToHistory = message.reason === "active order details redirected to order history"
+    && ORDER_HISTORY_PATH_RE.test(new URL(String(message.pageUrl || ORDER_HISTORY_URL)).pathname);
+  if (redirectedToHistory && activeOrderId) {
+    const recoveryKey = `${activeOrderId}|${String(tracking.currentUrl || "")}|${String(message.pageUrl || "")}`;
+    tracking.redirectRecoveryCount = tracking.redirectRecoveryKey === recoveryKey
+      ? Number(tracking.redirectRecoveryCount || 0) + 1
+      : 1;
+    tracking.redirectRecoveryKey = recoveryKey;
+    if (tracking.redirectRecoveryCount >= 2) {
+      await log(`Amazon redirected order ${activeOrderId} away from its detail page twice; skipped it without posting guessed tracking data.`, windowId);
+      if (tracking.source === "history") {
+        await advanceHistoryOrder(tracking, windowId, "failed");
+      } else {
+        await advanceCurrentOrder(tracking, windowId, "failed");
+      }
+      return {
+        ok: true,
+        skipped: true,
+        message: `Amazon would not open order ${activeOrderId}; skipped it safely and continued to the next order.`,
+      };
+    }
+    tracking.lastActivityAt = Date.now();
+    tracking.lastMessage = `Amazon redirected order ${activeOrderId}; retrying its detail page once.`;
+    await saveTracking(tracking, windowId);
+    await log(tracking.lastMessage, windowId);
+    if (tracking.source === "history") {
+      await openHistoryCurrentOrder(windowId);
+    } else {
+      await openCurrentOrder(windowId);
+    }
+    return {
+      ok: true,
+      recovering: true,
+      redirectUrl: String(tracking.currentUrl || "").trim(),
+      message: tracking.lastMessage,
+    };
+  }
   await log(`Recovering active tracking page${activeOrderId ? ` for ${activeOrderId}` : ""}; ignored ${message.amazonOrderId || "unknown"} at ${message.pageUrl || "unknown URL"}.`, windowId);
   tracking.lastActivityAt = Date.now();
   const redirectUrl = tracking.source === "history" ? activeHistoryRedirectUrl(tracking) : String(tracking.currentUrl || "").trim();
@@ -2271,6 +2319,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const windowId = messageWindowId(message, sender);
     if (message.type === "GET_STATE") {
       return { ...(await getWindowState(windowId)), senderTabId: Number(sender?.tab?.id || 0) || 0 };
+    }
+    if (message.type === "AMAZON_ACCOUNT_CONTEXT") {
+      const amazonAccountName = String(message.amazonAccountName || "").replace(/\s+/g, " ").trim().slice(0, 160);
+      if (amazonAccountName) await chrome.storage.local.set({ amazonAccountName });
+      return { ok: true, amazonAccountName };
     }
     if (message.type === "CONTENT_LOG") {
       await log(message.message || "Amazon content script reported activity.", windowId);

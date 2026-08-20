@@ -116,6 +116,7 @@ class ChromeJobCostlyPayload(BaseModel):
 class ChromeTrackingUpdatePayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
+    amazon_account_name: str = ""
     packages: list[dict[str, Any]] = []
     products: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []

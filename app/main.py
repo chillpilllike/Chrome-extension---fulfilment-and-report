@@ -9020,6 +9020,28 @@ def manual_order_refs_from_payload(payload: ManualAmazonOrderMatchPayload) -> li
     return requested_refs or source_refs
 
 
+TRACKING_ACCOUNT_PLACEHOLDERS = {
+    "amazon tracking track all",
+    "chrome manual matcher",
+    "amazon history",
+}
+
+
+def tracking_account_name_is_placeholder(value: Any) -> bool:
+    name = clean_text(value).lower()
+    return not name or name in TRACKING_ACCOUNT_PLACEHOLDERS
+
+
+def preserve_real_amazon_account_name(existing: Any, incoming: Any) -> str:
+    current = clean_text(existing)
+    candidate = clean_text(incoming)
+    if current and not tracking_account_name_is_placeholder(current):
+        return current
+    if candidate and not tracking_account_name_is_placeholder(candidate):
+        return candidate
+    return current or candidate
+
+
 def note_manual_amazon_match(rows: list[dict[str, Any]], amazon_order_id: str, amazon_order_url: str, amazon_account_name: str) -> None:
     # Manual/history matches are scan reconciliation; Odoo chatter is reserved for placement and delivery.
     return
@@ -13158,10 +13180,28 @@ def tracking_search_clause(q: str) -> tuple[str, list[Any]]:
     )
 
 
-def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active", q: str = "", page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, int]:
+def paged_tracking_orders(
+    store_id: Optional[int] = None,
+    status: str = "active",
+    q: str = "",
+    page: int = 1,
+    per_page: int = 100,
+    amazon_account_name: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     where_status, order_sql = tracking_filter_sql(status)
     search_clause, search_params = tracking_search_clause(q)
+    account_name = clean_text(amazon_account_name)
+    account_clause = ""
+    account_params: list[Any] = []
+    if account_name:
+        account_clause = """
+          AND (
+            LOWER(COALESCE(amazon_account_name, '')) = LOWER(?)
+            OR LOWER(COALESCE(amazon_account_name, '')) IN ('', 'amazon tracking track all', 'chrome manual matcher', 'amazon history')
+          )
+        """
+        account_params.append(account_name)
     order_expr = "COALESCE(NULLIF(amazon_order_id, ''), NULLIF(amazon_cancelled_order_id, ''), '')"
     target_order_sql = (
         """
@@ -13184,9 +13224,10 @@ def paged_tracking_orders(store_id: Optional[int] = None, status: str = "active"
         AND COALESCE(order_engine, '') != 'third_party'
         AND (? IS NULL OR store_id=?)
         AND {order_expr} != ''
+        {account_clause}
         {search_clause}
     """
-    params: list[Any] = [store_id, store_id, *search_params]
+    params: list[Any] = [store_id, store_id, *account_params, *search_params]
     with db() as conn:
         total = int(conn.execute(
             f"""
@@ -29099,12 +29140,20 @@ def api_tracking_orders(
     status: str = "active",
     q: str = "",
     include_history_refresh: bool = True,
+    amazon_account_name: str = "",
 ) -> dict[str, Any]:
-    cache_key = ("tracking-orders", store_id, page, per_page, clean_text(status), clean_text(q), bool(include_history_refresh))
+    cache_key = ("tracking-orders", store_id, page, per_page, clean_text(status), clean_text(q), bool(include_history_refresh), clean_text(amazon_account_name).lower())
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
-    orders, rows, total, page, per_page = paged_tracking_orders(store_id, status, q, page, per_page)
+    orders, rows, total, page, per_page = paged_tracking_orders(
+        store_id,
+        status,
+        q,
+        page,
+        per_page,
+        amazon_account_name=amazon_account_name,
+    )
     if include_history_refresh and page == 1 and clean_text(status).lower() in {"", "active"} and not clean_text(q):
         seen_order_ids = {clean_text(order.get("amazon_order_id")) for order in orders}
         appended_history_orders = 0
@@ -30110,6 +30159,21 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     "message": "Saved Amazon OTP from tracking page.",
                 }
             raise HTTPException(404, "Tracked Amazon order not found")
+        incoming_account_name = clean_text(payload.amazon_account_name)
+        if incoming_account_name and not tracking_account_name_is_placeholder(incoming_account_name):
+            refreshed_rows = []
+            for row in rows:
+                resolved_account_name = preserve_real_amazon_account_name(
+                    row["amazon_account_name"],
+                    incoming_account_name,
+                )
+                if resolved_account_name != clean_text(row["amazon_account_name"]):
+                    conn.execute(
+                        "UPDATE order_lines SET amazon_account_name=?, updated_at=? WHERE id=?",
+                        (resolved_account_name, utc_now(), row["id"]),
+                    )
+                refreshed_rows.append(conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone())
+            rows = [row for row in refreshed_rows if row]
         if payload.order_cancelled:
             tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in rows}
             now = utc_now()
@@ -30581,6 +30645,10 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         now = utc_now()
         updated_for_shopify: list[dict[str, Any]] = []
         for row in rows:
+            resolved_account_name = preserve_real_amazon_account_name(
+                row.get("amazon_account_name"),
+                amazon_account_name,
+            )
             if clean_text(row.get("amazon_order_id")) == amazon_order_id:
                 if amazon_order_placed_at:
                     conn.execute(
@@ -30597,12 +30665,12 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                             updated_at=?
                         WHERE id=?
                         """,
-                        (amazon_order_url, amazon_account_name, amazon_order_placed_at, now, row["id"]),
+                        (amazon_order_url, resolved_account_name, amazon_order_placed_at, now, row["id"]),
                     )
                     updated_for_shopify.append({
                         **dict(row),
                         "amazon_order_url": amazon_order_url,
-                        "amazon_account_name": amazon_account_name,
+                        "amazon_account_name": resolved_account_name,
                         "order_engine": "chrome",
                         "amazon_status": "ordered",
                         "state": "ordered",
@@ -30649,7 +30717,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 (
                     amazon_order_id,
                     amazon_order_url,
-                    amazon_account_name,
+                    resolved_account_name,
                     amazon_order_id,
                     amazon_order_id,
                     amazon_order_id,
@@ -30663,7 +30731,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 **dict(row),
                 "amazon_order_id": amazon_order_id,
                 "amazon_order_url": amazon_order_url,
-                "amazon_account_name": amazon_account_name,
+                "amazon_account_name": resolved_account_name,
                 "amazon_cancelled_order_id": clean_text(row.get("amazon_cancelled_order_id")) or (
                     clean_text(row.get("amazon_order_id"))
                     if clean_text(row.get("amazon_order_id")) and clean_text(row.get("amazon_order_id")) != amazon_order_id

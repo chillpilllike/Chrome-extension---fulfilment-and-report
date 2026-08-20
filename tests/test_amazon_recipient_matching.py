@@ -17,11 +17,26 @@ from app.main import (
     package_tracker_product_image_url,
     package_tracker_quantity_analysis,
     package_tracker_stuck_analysis,
+    preserve_real_amazon_account_name,
+    tracking_account_name_is_placeholder,
 )
 from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatchPayload
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_real_amazon_account_is_not_overwritten_by_track_all_placeholder(self):
+        self.assertTrue(tracking_account_name_is_placeholder("Amazon Tracking Track All"))
+        self.assertEqual(
+            preserve_real_amazon_account_name("Gurdev", "Amazon Tracking Track All"),
+            "Gurdev",
+        )
+
+    def test_real_tracking_account_repairs_placeholder_attribution(self):
+        self.assertEqual(
+            preserve_real_amazon_account_name("Amazon Tracking Track All", "Amit"),
+            "Amit",
+        )
+
     def test_delivery_stuck_detector_marks_late_and_old_relative_promises(self):
         running_late = package_tracker_stuck_analysis(
             status="On the way, but running late",

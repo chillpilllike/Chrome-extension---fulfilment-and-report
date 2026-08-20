@@ -271,6 +271,22 @@ function currentOrderId() {
   return fromPage ? fromPage[0] : "";
 }
 
+function amazonSignedInAccountName() {
+  const candidates = [
+    "#nav-link-accountList-nav-line-1",
+    "#nav-link-accountList .nav-line-1",
+    "span.nav-line-1",
+  ];
+  for (const selector of candidates) {
+    const element = [...document.querySelectorAll(selector)]
+      .find((node) => visible(node) && /hello,/i.test(node.textContent || ""));
+    const text = clean(element?.textContent || "");
+    const match = text.match(/^hello,\s*(.+)$/i);
+    if (match?.[1]) return match[1].trim();
+  }
+  return "";
+}
+
 function absoluteUrl(href) {
   return new URL(href, location.href).href;
 }
@@ -305,9 +321,9 @@ function orderDetailsUrl(orderId) {
 
 function isOrderHistoryPage() {
   const path = location.pathname.replace(/\/+$/, "");
-  return /^\/gp\/css\/order-history$/i.test(path)
-    || /^\/gp\/your-account\/order-history$/i.test(path)
-    || /^\/your-orders(?:\/orders?)?$/i.test(path);
+  return /^\/gp\/css\/order-history(?:\/ref=[^/]+)?$/i.test(path)
+    || /^\/gp\/your-account\/order-history(?:\/ref=[^/]+)?$/i.test(path)
+    || /^\/your-orders(?:\/orders?)?(?:\/ref=[^/]+)?$/i.test(path);
 }
 
 function isOrderDetailsLikePage() {
@@ -332,9 +348,9 @@ function activeTrackingUrl(state = {}) {
 function orderDetailsLikeUrl(value = "") {
   try {
     const url = new URL(value, location.href);
-    return /\/(your-orders\/order-details|your-orders\/order|gp\/your-account\/order|gp\/your-account\/order-details|gp\/css\/summary)/i.test(url.pathname);
+    return /\/(your-orders\/order-details|your-orders\/order|gp\/your-account\/order|gp\/your-account\/order-details|uff\/your-account\/order-details|gp\/css\/summary)/i.test(url.pathname);
   } catch {
-    return /order-details|your-orders\/order|gp\/your-account\/order|gp\/css\/summary/i.test(String(value || ""));
+    return /order-details|your-orders\/order|gp\/your-account\/order|uff\/your-account\/order-details|gp\/css\/summary/i.test(String(value || ""));
   }
 }
 
@@ -379,6 +395,7 @@ async function recoverActiveTrackingPage(state = {}, reason = "stale Amazon page
     pageUrl: location.href,
     reason,
   });
+  if (response?.message) showPanel("Nutricity tracking", response.message);
   if (response?.redirectUrl && response.redirectUrl !== location.href) {
     window.location.assign(response.redirectUrl);
   }
@@ -589,6 +606,7 @@ function extractHistoryTrackOrders() {
     orders.push({
       amazon_order_id: orderId,
       amazon_order_url: orderDetailsUrl(orderId),
+      amazon_account_name: amazonSignedInAccountName(),
       recipient: orderCardRecipient(card),
       order_date: orderCardDate(card),
       status,
@@ -1013,6 +1031,10 @@ async function run() {
   if (!extensionContextAlive) return;
   if (!/amazon\.com$/i.test(location.hostname)) return;
   if (!isRelevantTrackingPage()) return;
+  const signedInAccountName = amazonSignedInAccountName();
+  if (signedInAccountName) {
+    await send({ type: "AMAZON_ACCOUNT_CONTEXT", amazonAccountName: signedInAccountName });
+  }
   const runSignature = location.href;
   const now = Date.now();
   if (
@@ -1073,6 +1095,14 @@ async function run() {
     const state = initialState;
     if (state?.timedOut) {
       showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start Track all again.");
+      return;
+    }
+    if (
+      state?.tracking?.running
+      && activeTrackingOrderId(state)
+      && orderDetailsLikeUrl(activeTrackingUrl(state))
+    ) {
+      await recoverActiveTrackingPage(state, "active order details redirected to order history");
       return;
     }
     if (state?.tracking?.running && state.tracking.source === "history") {
