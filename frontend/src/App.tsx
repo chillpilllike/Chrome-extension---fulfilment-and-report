@@ -2172,6 +2172,7 @@ function dispatchProductImagesFrom(value: { products?: Array<{ asin?: string; ti
 const dispatchThumbnailAutoRetryDelays = [1500, 5000, 15000, 60000]
 
 function DispatchProductThumb({ image, onPreview, itemClass }: { image: DispatchProductImage; onPreview: (image: DispatchProductImage) => void; itemClass: string }) {
+  const imageElement = useRef<HTMLImageElement | null>(null)
   const [attempt, setAttempt] = useState(0)
   const [loaded, setLoaded] = useState(false)
   const [failed, setFailed] = useState(false)
@@ -2191,6 +2192,17 @@ function DispatchProductThumb({ image, onPreview, itemClass }: { image: Dispatch
   }, [attempt, failed])
   const retryKey = attempt === dispatchThumbnailAutoRetryDelays.length ? "retry" : "image_retry"
   const retrySrc = attempt ? `${image.src}${image.src.includes("?") ? "&" : "?"}${retryKey}=${attempt}` : image.src
+  useEffect(() => {
+    const element = imageElement.current
+    if (!element?.complete) return
+    if (element.naturalWidth > 0) {
+      setLoaded(true)
+      setFailed(false)
+    } else {
+      setLoaded(false)
+      setFailed(true)
+    }
+  }, [retrySrc])
   const retriesExhausted = failed && attempt >= dispatchThumbnailAutoRetryDelays.length
   return (
     <button
@@ -2215,6 +2227,7 @@ function DispatchProductThumb({ image, onPreview, itemClass }: { image: Dispatch
         </span>
       ) : (
         <img
+          ref={imageElement}
           src={retrySrc}
           alt={image.title}
           className={cn("h-full w-full object-contain", (!loaded || failed) && "opacity-0")}
