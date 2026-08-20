@@ -71,6 +71,16 @@ Do not put real keys in GitHub. Add them only in Coolify environment variables.
 
 Click **Deploy** in Coolify. On first boot the app creates or updates its PostgreSQL tables.
 
+For this project on the configured Mac, use the saved Coolify API credentials
+instead of opening the dashboard:
+
+```bash
+./scripts/deploy-coolify.sh
+```
+
+The command reads the API token, host, and application UUID from macOS
+Keychain service `codex.coolify.185.194.236.161`; no token is stored in Git.
+
 After deploy, open:
 
 ```text
