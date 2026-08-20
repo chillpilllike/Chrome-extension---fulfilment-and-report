@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.79")
+        self.assertEqual(MANIFEST["version"], "0.1.80")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -377,6 +377,8 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         reward_end = CONTENT.index("function checkoutDeliveryPromiseText", reward_start)
         reward = CONTENT[reward_start:reward_end]
         self.assertIn("sat(?:urday)?|sun(?:day)?", helpers)
+        self.assertIn("function deliveryContextHasSplitPromise(context)", helpers)
+        self.assertIn("function deliveryContextIsNotConsolidated(context)", helpers)
         self.assertIn("function consolidatedWeekdayDeliveryOption()", helpers)
         self.assertIn("candidates.find(isAmazonDayDeliveryContext)", helpers)
         self.assertLess(
@@ -389,9 +391,27 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         guard_end = CONTENT.index("function checkoutQuantityFromPage", guard_start)
         guard = CONTENT[guard_start:guard_end]
         self.assertIn("selectedDeliveryRadioContext()", guard)
-        self.assertIn("deliveryContextIncludesWarehouseClosedDay(selectedDelivery)", guard)
-        self.assertIn("Checkout is blocked because the selected Amazon delivery includes Saturday or Sunday", guard)
+        self.assertIn("deliveryContextIsNotConsolidated(selectedDelivery)", guard)
+        self.assertIn("Checkout is blocked because the selected Amazon delivery is split across dates", guard)
         self.assertIn("return false;", guard)
+
+    def test_final_delivery_selection_must_stay_consolidated_before_submit(self) -> None:
+        final_start = CONTENT.index("async function ensureFinalConsolidatedDelivery")
+        final_end = CONTENT.index("function checkoutDeliveryPromiseText", final_start)
+        final_guard = CONTENT[final_start:final_end]
+        self.assertIn("for (let attempt = 1; attempt <= 3; attempt += 1)", final_guard)
+        self.assertIn("await sleep(1800);", final_guard)
+        self.assertIn("deliveryContextIsNotConsolidated(afterSettle)", final_guard)
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        final_delivery = checkout.index("ensureFinalConsolidatedDelivery(activeJob)")
+        fresh_control = checkout.index("placeOrder = await waitUntil(findPlaceOrderButton, 10000, 250)", final_delivery)
+        protection = checkout.index('protectBeforeAmazonSubmit(activeJob, "checkout")')
+        self.assertLess(final_delivery, protection)
+        self.assertLess(final_delivery, fresh_control)
+        self.assertLess(fresh_control, protection)
+        self.assertIn("!placeOrder.isConnected", checkout)
 
     def test_place_order_lookup_returns_a_native_control_not_amazon_wrapper(self) -> None:
         finder_start = CONTENT.index("function findPlaceOrderButton()")
