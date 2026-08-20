@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-stable-order-history-v57";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-history-parser-v58";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -8273,19 +8273,10 @@ async function handleOrderHistory(activeJob) {
   }
   activeJob.orderHistoryLookupStartedAt = activeJob.orderHistoryLookupStartedAt || Date.now();
   await setActiveJob(activeJob);
-  const historySurface = await waitForElement(["#orderCardHeader", ".order-card", "[id*='orderCard']"], 12000);
-  if (!historySurface) {
-    // The content worker runs again every five seconds. Keep this page stable
-    // while Amazon renders its order cards instead of reloading an incomplete
-    // shell and repeatedly discarding the DOM that Amazon is still building.
-    showPanel(
-      "Nutricity fulfilment",
-      "Waiting for Amazon to finish loading recent orders. This page will stay open while fulfilment checks again automatically.",
-      null,
-      null,
-    );
-    return;
-  }
+  // Amazon's Business order-history wrapper changes independently of the
+  // actual order-card content. Wait on the parser itself, then always run it;
+  // a missing legacy wrapper must never strand a submitted order as stale.
+  await waitUntil(() => extractOrderHistoryOrders().length > 0, 12000, 300);
   const historyOrders = extractOrderHistoryOrders();
   if (historyOrders.length) {
     await send({ type: "REMEMBER_RECENT_AMAZON_ORDERS", orders: historyOrders });
