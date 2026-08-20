@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-native-place-order-v60";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-stable-consolidated-delivery-v61";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5107,6 +5107,23 @@ function deliveryContextIncludesWarehouseClosedDay(context) {
   return /\b(?:sat(?:urday)?|sun(?:day)?)\b/i.test(normalizedText(context?.text || ""));
 }
 
+function deliveryContextHasSplitPromise(context) {
+  const text = normalizedText(context?.text || "");
+  const namedDays = new Set(
+    (text.match(/\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/gi) || [])
+      .map((value) => value.toLowerCase()),
+  );
+  const datedPromises = new Set(
+    (text.match(/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}\b/gi) || [])
+      .map((value) => value.toLowerCase().replace(/\s+/g, " ")),
+  );
+  return namedDays.size > 1 || datedPromises.size > 1;
+}
+
+function deliveryContextIsNotConsolidated(context) {
+  return deliveryContextIncludesWarehouseClosedDay(context) || deliveryContextHasSplitPromise(context);
+}
+
 function deliveryContextNamesWarehouseOpenDay(context) {
   return /\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?)\b/i.test(
     normalizedText(context?.text || ""),
@@ -5120,7 +5137,7 @@ function consolidatedWeekdayDeliveryOption() {
     .filter((context) => (
       context.radio
       && context.control
-      && !deliveryContextIncludesWarehouseClosedDay(context)
+      && !deliveryContextIsNotConsolidated(context)
       && deliveryContextNamesWarehouseOpenDay(context)
     ));
   return candidates.find(isAmazonDayDeliveryContext)
@@ -5133,20 +5150,20 @@ function consolidatedWeekdayDeliverySelected() {
   const selected = selectedDeliveryRadioContext();
   return Boolean(
     selected
-    && !deliveryContextIncludesWarehouseClosedDay(selected)
+    && !deliveryContextIsNotConsolidated(selected)
     && deliveryContextNamesWarehouseOpenDay(selected),
   );
 }
 
 async function ensureWarehouseOpenDayDelivery(activeJob) {
   const selected = selectedDeliveryRadioContext();
-  if (!selected || !deliveryContextIncludesWarehouseClosedDay(selected)) return null;
+  if (!selected || !deliveryContextIsNotConsolidated(selected)) return null;
 
   const weekdayOption = consolidatedWeekdayDeliveryOption();
   if (!weekdayOption?.control) {
     await pauseForManualCheckout(
       activeJob,
-      `Amazon selected a delivery that includes Saturday or Sunday, but no Monday-Friday consolidated option could be selected safely. Selected option: ${selected.text}`,
+      `Amazon selected a split delivery or a delivery that includes Saturday or Sunday, but no Monday-Friday consolidated option could be selected safely. Selected option: ${selected.text}`,
       "checkout",
     );
     return false;
@@ -5158,7 +5175,7 @@ async function ensureWarehouseOpenDayDelivery(activeJob) {
     null,
     null,
   );
-  await sendDiagnostic("Replacing a weekend delivery with a consolidated weekday delivery.", {
+  await sendDiagnostic("Replacing a split or weekend delivery with a consolidated weekday delivery.", {
     selected_option_text: selected.text,
     replacement_option_text: weekdayOption.text,
     replacement_is_amazon_day: isAmazonDayDeliveryContext(weekdayOption),
@@ -5203,6 +5220,7 @@ function freeNextDayDeliveryOption() {
     const text = normalizedText(context.text || "").toLowerCase();
     return /\bfree\b/.test(text)
       && (/\btomorrow\b/.test(text) || /\bnext[ -]?day\b/.test(text) || /\bone[ -]?day\b/.test(text))
+      && !deliveryContextIsNotConsolidated(context)
       && !isAmazonDayDeliveryContext(context);
   }) || null;
 }
@@ -5215,6 +5233,7 @@ function freeNextDayDeliverySelected() {
       const text = normalizedText(context.text || "").toLowerCase();
       return /\bfree\b/.test(text)
         && (/\btomorrow\b/.test(text) || /\bnext[ -]?day\b/.test(text) || /\bone[ -]?day\b/.test(text))
+        && !deliveryContextIsNotConsolidated(context)
         && !isAmazonDayDeliveryContext(context);
     });
 }
@@ -5298,6 +5317,45 @@ async function ensureRewardedLaterDelivery(activeJob) {
   return true;
 }
 
+async function ensureFinalConsolidatedDelivery(activeJob) {
+  // Amazon can rerender the delivery radios after address/payment checks and
+  // silently restore its mixed-date default. Revalidate at the last possible
+  // point and require the consolidated selection to remain stable before the
+  // native Place Order control is clicked.
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const selected = selectedDeliveryRadioContext();
+    if (selected && deliveryContextIsNotConsolidated(selected)) {
+      const corrected = await ensureWarehouseOpenDayDelivery(activeJob);
+      if (!corrected) return false;
+    }
+
+    const stableText = selectedDeliveryRadioContext()?.text || "";
+    await sleep(1800);
+    const afterSettle = selectedDeliveryRadioContext();
+    if (
+      afterSettle
+      && !deliveryContextIsNotConsolidated(afterSettle)
+      && deliveryContextNamesWarehouseOpenDay(afterSettle)
+      && normalizedText(afterSettle.text || "") === normalizedText(stableText || afterSettle.text || "")
+    ) {
+      await sendDiagnostic("Final consolidated delivery selection remained stable before Place Order.", {
+        group_key: activeJob?.job?.group_key || "",
+        option_text: afterSettle.text,
+        stability_attempt: attempt,
+      });
+      return true;
+    }
+  }
+
+  const selected = selectedDeliveryRadioContext();
+  await pauseForManualCheckout(
+    activeJob,
+    `Amazon kept changing the final delivery selection. A single Monday-Friday consolidated option must remain selected before Place Order. Current option: ${selected?.text || "not visible"}`,
+    "checkout",
+  );
+  return false;
+}
+
 function checkoutDeliveryPromiseText() {
   const optionRows = [...document.querySelectorAll("label, .a-radio-label")]
     .filter((element) => visible(element) && element.querySelector?.(".delivery-promise-text, .delivery-option-text"))
@@ -5364,10 +5422,10 @@ async function rejectLateCheckout(activeJob, promise, deliveryLimitDays) {
 
 async function checkoutDeliveryWindowIsAllowed(activeJob) {
   const selectedDelivery = selectedDeliveryRadioContext();
-  if (selectedDelivery && deliveryContextIncludesWarehouseClosedDay(selectedDelivery)) {
+  if (selectedDelivery && deliveryContextIsNotConsolidated(selectedDelivery)) {
     await pauseForManualCheckout(
       activeJob,
-      `Checkout is blocked because the selected Amazon delivery includes Saturday or Sunday. Select a Monday-Friday consolidated delivery before continuing. Selected option: ${selectedDelivery.text}`,
+      `Checkout is blocked because the selected Amazon delivery is split across dates or includes Saturday/Sunday. Select one Monday-Friday consolidated delivery before continuing. Selected option: ${selectedDelivery.text}`,
       "checkout",
     );
     return false;
@@ -6356,7 +6414,7 @@ async function handleCheckout(activeJob) {
   if (!await ensureRewardedLaterDelivery(activeJob)) return;
   if (!await ensureSnsPaymentConfirmation(activeJob)) return;
 
-  const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
+  let placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([
       "input#placeOrder:not([disabled])",
       "input[name='placeYourOrder1']:not([disabled])",
@@ -6366,6 +6424,17 @@ async function handleCheckout(activeJob) {
     ], 5000)
     || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
+    if (!await ensureFinalConsolidatedDelivery(activeJob)) return;
+    // Selecting a delivery option replaces Amazon's final action block. Never
+    // click the pre-selection node, which may now be detached and inert.
+    placeOrder = await waitUntil(findPlaceOrderButton, 10000, 250) || findPlaceOrderButton();
+    if (!placeOrder || placeOrder.disabled || !placeOrder.isConnected) {
+      await pauseForManualCheckout(
+        activeJob,
+        "Amazon replaced the final checkout controls after delivery selection, but a fresh enabled Place your order control did not appear.",
+      );
+      return;
+    }
     if (!isNativePlaceOrderControl(placeOrder)) {
       await pauseForManualCheckout(
         activeJob,
