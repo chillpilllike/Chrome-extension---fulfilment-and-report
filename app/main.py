@@ -33868,6 +33868,54 @@ def package_tracker_single_package_history_products(
     ]
 
 
+def package_tracker_fallback_asins_by_package(
+    order_packages: list[dict[str, Any]],
+    lines: list[dict[str, Any]],
+    amazon_order_id: str,
+) -> dict[int, list[str]]:
+    """Allocate broad order-level ASIN fallbacks without repeating them on every shipment."""
+    order_id = clean_text(amazon_order_id)
+    occurrence_limits: dict[str, int] = {}
+    for line in lines:
+        if clean_text(line.get("amazon_order_id")) != order_id:
+            continue
+        try:
+            quantity = max(1, int(float(line.get("quantity") or 1)))
+        except (TypeError, ValueError):
+            quantity = 1
+        for asin in order_line_asin_aliases(line):
+            occurrence_limits[asin] = occurrence_limits.get(asin, 0) + quantity
+
+    allocations: dict[int, list[str]] = {}
+    occurrences: dict[str, int] = {}
+    sorted_packages = sorted(
+        order_packages,
+        key=lambda package: (int(package.get("package_index") or 9999), int(package.get("id") or 0)),
+    )
+    for package in sorted_packages:
+        package_id = int(package.get("id") or 0)
+        explicit_products = normalize_amazon_product_items(parse_json_list_value(package.get("products_json")))
+        represented_asins = {
+            normalize_asin(product.get("asin"))
+            for product in explicit_products
+            if normalize_asin(product.get("asin"))
+        }
+        allocated: list[str] = []
+        for asin in unique_normalized_asins(parse_json_list_value(package.get("asins_json"))):
+            if asin in represented_asins:
+                continue
+            # asins_json is often copied from the whole Amazon order onto each
+            # split shipment. Odoo quantity safely limits how many shipment
+            # rows may claim the same fallback ASIN.
+            limit = occurrence_limits.get(asin, 1)
+            if occurrences.get(asin, 0) >= limit:
+                continue
+            occurrences[asin] = occurrences.get(asin, 0) + 1
+            allocated.append(asin)
+        allocations[package_id] = allocated
+    return allocations
+
+
 def package_tracker_enforce_product_guard(
     packages: list[dict[str, Any]],
     history_by_order_id: dict[str, dict[str, Any]],
@@ -34000,6 +34048,11 @@ def package_tracker_quantity_analysis(
             amazon_order_id,
             history_by_order_id.get(amazon_order_id, {}),
         )
+        fallback_asins_by_package = package_tracker_fallback_asins_by_package(
+            order_packages,
+            lines,
+            amazon_order_id,
+        )
         for package in order_packages:
             products = normalize_amazon_product_items(parse_json_list_value(package.get("products_json")))
             if allowed_asins:
@@ -34008,7 +34061,7 @@ def package_tracker_quantity_analysis(
                 for product in products:
                     add_amazon_item(product.get("asin"), product.get("quantity"), amazon_order_id)
             else:
-                for asin in list(dict.fromkeys(normalize_asin(value) for value in parse_json_list_value(package.get("asins_json")) if normalize_asin(value))):
+                for asin in fallback_asins_by_package.get(int(package.get("id") or 0), []):
                     if allowed_asins and asin not in allowed_asins:
                         continue
                     add_amazon_item(asin, 1, amazon_order_id)
@@ -34349,7 +34402,7 @@ def api_public_package_tracker(
                 CROSS JOIN LATERAL jsonb_array_elements(source.products) product(value)
                 WHERE COALESCE(product.value->>'asin', '') != ''
                 UNION ALL
-                SELECT source.store_id, source.order_key, source.amazon_order_id,
+                SELECT DISTINCT source.store_id, source.order_key, source.amazon_order_id,
                        UPPER(package_asin.value) AS amazon_asin, 1::numeric AS amazon_quantity
                 FROM package_json_sources source
                 CROSS JOIN LATERAL jsonb_array_elements_text(source.asins) package_asin(value)
@@ -34493,6 +34546,13 @@ def api_public_package_tracker(
         package_rows_by_amazon_order: dict[str, list[dict[str, Any]]] = {}
         for package in card_package_rows:
             package_rows_by_amazon_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
+        fallback_asins_by_package_id: dict[int, list[str]] = {}
+        for amazon_order_id, order_packages in package_rows_by_amazon_order.items():
+            fallback_asins_by_package_id.update(package_tracker_fallback_asins_by_package(
+                order_packages,
+                lines_by_key.get((store_id, order_name), []),
+                amazon_order_id,
+            ))
         missing_history_products_by_order = {
             amazon_order_id: package_tracker_missing_history_products(
                 order_packages,
@@ -34521,11 +34581,11 @@ def api_public_package_tracker(
                 products = [dict(item) for item in parse_json_list_value(package.get("products_json")) if isinstance(item, dict)]
                 if allowed_asins:
                     products = [product for product in products if normalize_asin(product.get("asin")) in allowed_asins]
-                package_asins = list(dict.fromkeys(
-                    normalize_asin(asin)
-                    for asin in parse_json_list_value(package.get("asins_json"))
-                    if normalize_asin(asin) and (not allowed_asins or normalize_asin(asin) in allowed_asins)
-                ))
+                package_asins = [
+                    asin
+                    for asin in fallback_asins_by_package_id.get(int(package.get("id") or 0), [])
+                    if not allowed_asins or asin in allowed_asins
+                ]
                 represented_asins = {normalize_asin(product.get("asin")) for product in products if normalize_asin(product.get("asin"))}
                 products.extend(
                     {"asin": asin, "title": asin, "image_url": "", "url": f"https://www.amazon.com/dp/{quote_plus(asin)}"}
