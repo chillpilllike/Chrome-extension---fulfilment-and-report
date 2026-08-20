@@ -37,10 +37,31 @@ def _reset_pool() -> None:
 def _translate_placeholders(sql: str) -> str:
     out: list[str] = []
     in_single = False
+    in_line_comment = False
+    in_block_comment = False
     index = 0
     while index < len(sql):
         char = sql[index]
-        if char == "'":
+        next_char = sql[index + 1] if index + 1 < len(sql) else ""
+        if in_line_comment:
+            out.append(char)
+            if char == "\n":
+                in_line_comment = False
+        elif in_block_comment:
+            out.append(char)
+            if char == "*" and next_char == "/":
+                out.append(next_char)
+                index += 1
+                in_block_comment = False
+        elif not in_single and char == "-" and next_char == "-":
+            out.extend((char, next_char))
+            index += 1
+            in_line_comment = True
+        elif not in_single and char == "/" and next_char == "*":
+            out.extend((char, next_char))
+            index += 1
+            in_block_comment = True
+        elif char == "'":
             out.append(char)
             if index + 1 < len(sql) and sql[index + 1] == "'":
                 out.append(sql[index + 1])
