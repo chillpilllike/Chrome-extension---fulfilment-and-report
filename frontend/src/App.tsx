@@ -9263,6 +9263,7 @@ function PackageTrackerDesignPage() {
         const excessQuantity = duplicateItems.reduce((total, item) => total + Number(item.excess_quantity || 0), 0)
         const unassignedProducts = packageTrackerUnassignedProducts(row)
         const stuckPackages = row.packages.filter((item) => item.possibly_stuck)
+        const currentAmazonOrders = Array.from(new Map(row.packages.map((item) => [item.amazon_order_id, item.amazon_order_url])).entries())
         const renderedProductCount = new Set(row.packages.flatMap((item) => item.products.map((product) => `${item.amazon_order_id}:${product.asin}`))).size
         const productGuard = row.product_guard || {
           complete: renderedProductCount > 0,
@@ -9283,34 +9284,33 @@ function PackageTrackerDesignPage() {
                     {row.odoo_orders.map((order) => <a key={order.name} href={order.url} className="h3 m-0 text-reset">{order.name}</a>)}
                     <span className="text-secondary small text-break">Recipient: <strong className="text-body">{row.recipient}</strong></span>
                   </div>
+                  <div className="text-secondary small mt-1">
+                    {row.recipient_verified && productGuardComplete
+                      ? `${productGuard.expected_products} Amazon item${productGuard.expected_products === 1 ? "" : "s"} verified`
+                      : "Review the highlighted matching issue before dispatch"}
+                  </div>
                 </div>
                 <div className="d-flex flex-wrap align-items-center justify-content-md-end gap-1">
-                  <button
-                    className="btn btn-outline-primary btn-sm"
-                    type="button"
-                    onClick={() => syncOrderFulfilment(row)}
-                    disabled={syncingOrders.includes(row.id) || !productGuardComplete}
-                    title={productGuardComplete ? "Refresh Shopify fulfilment" : "Blocked until every associated product is displayed"}
-                  >
-                    <RefreshCw className={`icon icon-1 ${syncingOrders.includes(row.id) ? "icon-spin" : ""}`} />
-                    {syncingOrders.includes(row.id) ? "Syncing…" : "Sync fulfilment"}
-                  </button>
+                  {row.shopify_status !== "fulfilled" && (
+                    <button
+                      className="btn btn-outline-secondary btn-sm"
+                      type="button"
+                      onClick={() => syncOrderFulfilment(row)}
+                      disabled={syncingOrders.includes(row.id) || !productGuardComplete}
+                      title={productGuardComplete ? "Refresh Shopify fulfilment" : "Blocked until every associated product is displayed"}
+                    >
+                      <RefreshCw className={`icon icon-1 ${syncingOrders.includes(row.id) ? "icon-spin" : ""}`} />
+                      {syncingOrders.includes(row.id) ? "Syncing…" : "Sync Shopify"}
+                    </button>
+                  )}
                   <span className={`status status-${color}`}><span className="status-dot" />{packageTrackerStatusLabel(row)}</span>
-                  <span className={`badge ${row.recipient_verified ? "bg-green-lt text-green" : "bg-red-lt text-red"}`}>
-                    {row.recipient_verified ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
-                    {row.recipient_verified ? "Recipient verified" : "Check recipient"}
-                  </span>
-                  <span className={`badge ${productGuardComplete ? "bg-green-lt text-green" : "bg-red-lt text-red"}`}>
-                    {productGuardComplete ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
-                    {productGuardComplete
-                      ? `Product guard · ${productGuard.expected_products}/${productGuard.expected_products} shown`
-                      : `BLOCKED · ${renderedProductCount}/${productGuard.expected_products} products shown`}
-                  </span>
+                  {!row.recipient_verified && <span className="badge bg-red-lt text-red"><AlertCircle className="icon icon-1" />Check recipient</span>}
+                  {!productGuardComplete && <span className="badge bg-red-lt text-red"><AlertCircle className="icon icon-1" />BLOCKED · {renderedProductCount}/{productGuard.expected_products} items</span>}
                   {duplicateItems.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {excessQuantity} excess unit{excessQuantity === 1 ? "" : "s"}</span>}
-                  {asinMismatches.length > 0 && <span className="badge bg-red-lt text-red">ASIN mismatch · {asinMismatches.length}</span>}
-                  {unassignedProducts.length > 0 && <span className="badge bg-red-lt text-red">Incomplete shipment mapping</span>}
+                  {asinMismatches.length > 0 && <span className="badge bg-orange-lt text-orange">Amazon/Odoo item mismatch · {asinMismatches.length}</span>}
+                  {unassignedProducts.length > 0 && <span className="badge bg-orange-lt text-orange">Shipment assignment needed</span>}
                   {stuckPackages.length > 0 && <span className="badge bg-orange-lt text-orange">Possibly stuck · {stuckPackages.length} package{stuckPackages.length === 1 ? "" : "s"}</span>}
-                  <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
+                  <span className="text-secondary small">{summary.delivered} of {summary.active} packages delivered</span>
                 </div>
               </div>
               {syncResults[row.id] && <div className={`small mt-1 text-${syncResults[row.id].ok ? "green" : "red"}`}>{syncResults[row.id].message}</div>}
@@ -9372,6 +9372,16 @@ function PackageTrackerDesignPage() {
                 </div>
               )}
 
+              <div className="package-tracker-amazon-summary">
+                <div>
+                  <span>Amazon order</span>
+                  <div className="d-flex flex-wrap gap-2">
+                    {currentAmazonOrders.map(([orderId, orderUrl]) => <a key={orderId} href={orderUrl} target="_blank" rel="noreferrer" className="font-monospace fw-semibold">{orderId}</a>)}
+                  </div>
+                </div>
+                <strong>{row.packages.length} shipment{row.packages.length === 1 ? "" : "s"}</strong>
+              </div>
+
               <div className="package-tracker-package-list">
                 {row.packages.map((item, itemIndex) => {
                   const itemColor = item.status_kind === "delivered" ? "success" : item.status_kind === "exception" ? "danger" : item.possibly_stuck ? "orange" : "primary"
@@ -9421,6 +9431,7 @@ function PackageTrackerDesignPage() {
                                   </div>
                                 )
                               })}
+                              {item.products.length === 0 && <div className="text-secondary small">No separate product was captured for this shipment.</div>}
                             </div>
                             <div className="d-flex flex-wrap align-items-center gap-1 mt-2">
                               <span className={`badge bg-${itemColor}-lt text-${itemColor}`}>{item.status_kind === "delivered" ? "Delivered" : item.status_kind === "exception" ? "Exception" : item.possibly_stuck ? "Possibly stuck" : "Arriving"}</span>

@@ -14852,7 +14852,6 @@ def compact_pending_package_payload(package: Any) -> dict[str, Any]:
     asins = unique_normalized_asins([
         *package_asins,
         *(product.get("asin") for product in products),
-        *(product.get("asin") for product in order_products),
     ])
     latest_event = compact_tracking_event(package.get("latest_event"))
     compact = {
@@ -33868,6 +33867,40 @@ def package_tracker_single_package_history_products(
     ]
 
 
+def package_tracker_history_products_by_package(
+    order_packages: list[dict[str, Any]],
+    history: dict[str, Any],
+) -> dict[int, list[dict[str, Any]]]:
+    """Map Amazon order-page items to split shipments only when the mapping is unambiguous."""
+    history_products = [
+        dict(product)
+        for product in normalize_amazon_product_items(parse_json_list_value(history.get("items_json")))
+        if normalize_asin(product.get("asin"))
+    ]
+    if not history_products or not order_packages:
+        return {}
+    sorted_packages = sorted(
+        order_packages,
+        key=lambda package: (int(package.get("package_index") or 9999), int(package.get("id") or 0)),
+    )
+    allocations: dict[int, list[dict[str, Any]]] = {}
+    claimed_asins: set[str] = set()
+    empty_packages: list[dict[str, Any]] = []
+    for package in sorted_packages:
+        package_id = int(package.get("id") or 0)
+        explicit = normalize_amazon_product_items(parse_json_list_value(package.get("products_json")))
+        if explicit:
+            allocations[package_id] = [dict(product) for product in explicit]
+            claimed_asins.update(normalize_asin(product.get("asin")) for product in explicit)
+        else:
+            empty_packages.append(package)
+    remaining = [product for product in history_products if normalize_asin(product.get("asin")) not in claimed_asins]
+    if len(remaining) == len(empty_packages):
+        for package, product in zip(empty_packages, remaining):
+            allocations[int(package.get("id") or 0)] = [dict(product)]
+    return allocations
+
+
 def package_tracker_fallback_asins_by_package(
     order_packages: list[dict[str, Any]],
     lines: list[dict[str, Any]],
@@ -34035,9 +34068,8 @@ def package_tracker_quantity_analysis(
             entry["amazon_order_ids"].add(amazon_order_id)
 
     for amazon_order_id, order_packages in packages_by_order.items():
-        authoritative_history_products = package_tracker_single_package_history_products(
-            order_packages,
-            history_by_order_id.get(amazon_order_id, {}),
+        authoritative_history_products = normalize_amazon_product_items(
+            parse_json_list_value(history_by_order_id.get(amazon_order_id, {}).get("items_json"))
         )
         if authoritative_history_products:
             for product in authoritative_history_products:
@@ -34547,11 +34579,16 @@ def api_public_package_tracker(
         for package in card_package_rows:
             package_rows_by_amazon_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
         fallback_asins_by_package_id: dict[int, list[str]] = {}
+        history_products_by_package_id: dict[int, list[dict[str, Any]]] = {}
         for amazon_order_id, order_packages in package_rows_by_amazon_order.items():
             fallback_asins_by_package_id.update(package_tracker_fallback_asins_by_package(
                 order_packages,
                 lines_by_key.get((store_id, order_name), []),
                 amazon_order_id,
+            ))
+            history_products_by_package_id.update(package_tracker_history_products_by_package(
+                order_packages,
+                history_by_order_id.get(amazon_order_id, {}),
             ))
         missing_history_products_by_order = {
             amazon_order_id: package_tracker_missing_history_products(
@@ -34567,6 +34604,11 @@ def api_public_package_tracker(
             order_packages = package_rows_by_amazon_order.get(amazon_order_id, [])
             history_products = [dict(item) for item in parse_json_list_value(history.get("items_json")) if isinstance(item, dict)]
             authoritative_history_products = package_tracker_single_package_history_products(order_packages, history)
+            if not authoritative_history_products:
+                authoritative_history_products = [
+                    dict(product)
+                    for product in history_products_by_package_id.get(int(package.get("id") or 0), [])
+                ]
             allowed_asins = package_tracker_allowed_asins_for_order(
                 lines_by_key.get((store_id, order_name), []),
                 amazon_order_id,

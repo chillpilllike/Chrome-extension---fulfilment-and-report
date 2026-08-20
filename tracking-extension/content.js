@@ -827,11 +827,14 @@ function productItemsFrom(root, limit = 50) {
 }
 
 function shipmentRootForTrackingLink(link) {
-  const shipmentComponent = link.closest("[data-component='shipments']");
-  if (shipmentComponent) return shipmentComponent;
   const rightGrid = link.closest("[data-component='shipmentsRightGrid'], [data-component='shipmentConnections']");
   const shipmentGrid = rightGrid?.closest(".a-fixed-right-grid-inner");
   if (shipmentGrid) return shipmentGrid;
+  // `data-component="shipments"` wraps every shipment on current Amazon
+  // order-detail pages. Using it first mixes every product into every tracking
+  // package. Prefer the one-track-link grid that owns the product section.
+  const shipmentComponent = link.closest("[data-component='shipments']");
+  if (shipmentComponent) return shipmentComponent;
   return link.closest(".a-box, [data-component='orderCard']") || document.body;
 }
 
