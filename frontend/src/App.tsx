@@ -6338,6 +6338,7 @@ function PackagePickupPage({
   const [loading, setLoading] = useState(true)
   const [searchField, setSearchField] = useState("all")
   const [exactSearch, setExactSearch] = useState("")
+  const [packageView, setPackageView] = useState<"all" | "amazon_unfulfilled">("all")
   const [showPackageSearch, setShowPackageSearch] = useState(false)
   const [savingDate, setSavingDate] = useState("")
   const [receivingId, setReceivingId] = useState("")
@@ -6599,11 +6600,21 @@ function PackagePickupPage({
     if (searchField === "tracking_id") return trackingId === normalizedTrackingSearch
     return odooOrder === normalizedExactSearch || amazonOrder === normalizedExactSearch || trackingId === normalizedTrackingSearch
   }
+  function rowMatchesPackageView(row: PackagePickupRow) {
+    if (packageView === "amazon_unfulfilled") {
+      return row.source_type === "amazon" && !row.shopify_fulfilled
+    }
+    return true
+  }
+  function rowMatchesActiveFilters(row: PackagePickupRow) {
+    return rowMatchesPackageView(row) && rowMatchesExactSearch(row)
+  }
+  const hasActivePackageFilters = packageView !== "all" || Boolean(normalizedExactSearch)
   const visibleCards = (data?.cards || []).filter((card) => (
-    !normalizedExactSearch || [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages].some(rowMatchesExactSearch)
+    !hasActivePackageFilters || [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages].some(rowMatchesActiveFilters)
   ))
-  const exactMatchCount = visibleCards.reduce((total, card) => (
-    total + [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages].filter(rowMatchesExactSearch).length
+  const visiblePackageCount = visibleCards.reduce((total, card) => (
+    total + [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages].filter(rowMatchesActiveFilters).length
   ), 0)
   const pickupPageCount = Math.max(1, Math.ceil(visibleCards.length / pickupDaysPerPage))
   const safePickupPage = Math.min(pickupPage, pickupPageCount)
@@ -6611,7 +6622,7 @@ function PackagePickupPage({
 
   useEffect(() => {
     setPickupPage(1)
-  }, [storeId, dateFrom, dateTo, searchField, exactSearch])
+  }, [storeId, dateFrom, dateTo, searchField, exactSearch, packageView])
 
   useEffect(() => {
     if (pickupPage > pickupPageCount) setPickupPage(pickupPageCount)
@@ -6686,6 +6697,10 @@ function PackagePickupPage({
             </SelectField>
             <TextField label="From delivery date" type="date" value={dateFrom} onChange={setDateFrom} />
             <TextField label="To delivery date" type="date" value={dateTo} onChange={setDateTo} />
+            <SelectField label="Package view" value={packageView} onChange={(value) => setPackageView(value as "all" | "amazon_unfulfilled")}>
+              <option value="all">All packages</option>
+              <option value="amazon_unfulfilled">Amazon delivered · Shopify unfulfilled</option>
+            </SelectField>
             <button type="button" className="pickup-cutoff-chip" onClick={openPickupTimeEditor} title="Edit team pickup time"><Clock className="size-4" /><span>Team pickup <strong>{pickupTimeLabel(data?.cutoff || "09:30")}</strong></span><Edit className="size-3.5" /></button>
           </div>
           <div className="pickup-toolbar-actions">
@@ -6708,7 +6723,13 @@ function PackagePickupPage({
                 <Label>Exact order or tracking number</Label>
                 <SearchBox value={exactSearch} onChange={setExactSearch} placeholder="Enter the complete Odoo, Amazon, or tracking number" />
               </div>
-              {normalizedExactSearch && <div className="pickup-search-result">{exactMatchCount} exact package match{exactMatchCount === 1 ? "" : "es"}</div>}
+              {normalizedExactSearch && <div className="pickup-search-result">{visiblePackageCount} exact package match{visiblePackageCount === 1 ? "" : "es"}</div>}
+            </div>
+          )}
+          {packageView === "amazon_unfulfilled" && (
+            <div className="pickup-active-filter">
+              <span><strong>{visiblePackageCount}</strong> Amazon-delivered package{visiblePackageCount === 1 ? "" : "s"} not fulfilled in Shopify</span>
+              <button type="button" onClick={() => setPackageView("all")}>Clear filter</button>
             </div>
           )}
         </div>
@@ -6737,8 +6758,8 @@ function PackagePickupPage({
       {pagedPickupCards.map((card) => {
         const draft = drafts[card.pickup_date] || { amazon: String(card.amazon_picked_up), nonAmazon: String(card.non_amazon_picked_up), orderNumbers: "" }
         const allCardRows = [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages]
-        const rows = allCardRows.filter(rowMatchesExactSearch)
-        const expanded = expandedDates.has(card.pickup_date) || Boolean(normalizedExactSearch && rows.length)
+        const rows = allCardRows.filter(rowMatchesActiveFilters)
+        const expanded = expandedDates.has(card.pickup_date) || Boolean(hasActivePackageFilters && rows.length)
         const isMatched = card.missing_amazon === 0 && card.unreported_amazon === 0
         return (
           <section key={card.pickup_date} className="pickup-day-card card">
@@ -6757,7 +6778,7 @@ function PackagePickupPage({
                 {expanded ? <ChevronDown className="size-5" /> : <ChevronRight className="size-5" />}
                 <span>
                   <strong>{pickupDateLabel(card.pickup_date)}</strong>
-                  <small>{expanded ? "Hide" : "Show"} {allCardRows.length} package detail{allCardRows.length === 1 ? "" : "s"}</small>
+                  <small>{expanded ? "Hide" : "Show"} {hasActivePackageFilters ? rows.length : allCardRows.length} package detail{(hasActivePackageFilters ? rows.length : allCardRows.length) === 1 ? "" : "s"}</small>
                 </span>
               </button>
               <div className="pickup-day-metric"><span>Amazon delivered</span><strong>{card.amazon_reported_delivered}</strong></div>

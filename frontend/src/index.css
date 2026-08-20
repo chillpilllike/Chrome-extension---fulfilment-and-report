@@ -2446,7 +2446,7 @@ body,
 
 .pickup-filter-grid {
     display: grid;
-    grid-template-columns: minmax(12rem, 1fr) minmax(10rem, .65fr) minmax(10rem, .65fr) auto;
+    grid-template-columns: minmax(11rem, .85fr) minmax(9rem, .6fr) minmax(9rem, .6fr) minmax(15rem, 1.15fr) auto;
     gap: .8rem;
     align-items: end;
 }
@@ -2581,6 +2581,32 @@ body,
     gap: .5rem;
     margin-top: .75rem;
 }
+
+.pickup-active-filter {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: .75rem;
+    margin-top: .75rem;
+    padding: .55rem .7rem;
+    border: 1px solid #d9dee5;
+    border-radius: .4rem;
+    background: #f8fafc;
+    color: #526273;
+    font-size: .72rem;
+}
+
+.pickup-active-filter strong { color: #182433; }
+.pickup-active-filter button {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: #206bc4;
+    font-size: .72rem;
+    font-weight: 650;
+    white-space: nowrap;
+}
+.pickup-active-filter button:hover { text-decoration: underline; }
 
 .pickup-search-panel {
     margin-top: .75rem;
