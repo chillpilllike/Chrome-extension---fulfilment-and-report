@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.78")
+        self.assertEqual(MANIFEST["version"], "0.1.79")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -392,6 +392,27 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("deliveryContextIncludesWarehouseClosedDay(selectedDelivery)", guard)
         self.assertIn("Checkout is blocked because the selected Amazon delivery includes Saturday or Sunday", guard)
         self.assertIn("return false;", guard)
+
+    def test_place_order_lookup_returns_a_native_control_not_amazon_wrapper(self) -> None:
+        finder_start = CONTENT.index("function findPlaceOrderButton()")
+        finder_end = CONTENT.index("function findSnsPaymentConfirmationCheckbox", finder_start)
+        finder = CONTENT[finder_start:finder_end]
+        self.assertIn("for (const selector of nativeSelectors)", finder)
+        self.assertIn('document.querySelectorAll("button")', finder)
+        self.assertIn('wrapper.querySelectorAll("input[type=\'submit\'], input[type=\'button\'], button")', finder)
+        self.assertIn("function isNativePlaceOrderControl(element)", finder)
+        self.assertNotIn('"button",\n    "span.a-button",', finder)
+
+    def test_submit_protection_precedes_native_place_order_click_marker(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        protection = checkout.index('protectBeforeAmazonSubmit(activeJob, "checkout")')
+        marker = checkout.index("activeJob.placeOrderClickStartedAt = Date.now()", protection)
+        click = checkout.index('clickElement(placeOrder, "Place your order button")', marker)
+        self.assertLess(protection, marker)
+        self.assertLess(marker, click)
+        self.assertIn("isNativePlaceOrderControl(placeOrder)", checkout)
 
     def test_failure_cleanup_can_leave_order_history(self) -> None:
         self.assertIn('activeJob?.stage === "cleanup_after_failure"', CONTENT)
