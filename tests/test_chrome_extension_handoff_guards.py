@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.77")
+        self.assertEqual(MANIFEST["version"], "0.1.78")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -369,6 +369,29 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('/\\btomorrow\\b/', next_day)
         self.assertIn('/\\bnext[ -]?day\\b/', next_day)
         self.assertIn('!isAmazonDayDeliveryContext(context)', next_day)
+
+    def test_split_weekend_delivery_is_replaced_before_preferences_apply(self) -> None:
+        helper_start = CONTENT.index("function selectedDeliveryRadioContext()")
+        reward_start = CONTENT.index("async function ensureRewardedLaterDelivery", helper_start)
+        helpers = CONTENT[helper_start:reward_start]
+        reward_end = CONTENT.index("function checkoutDeliveryPromiseText", reward_start)
+        reward = CONTENT[reward_start:reward_end]
+        self.assertIn("sat(?:urday)?|sun(?:day)?", helpers)
+        self.assertIn("function consolidatedWeekdayDeliveryOption()", helpers)
+        self.assertIn("candidates.find(isAmazonDayDeliveryContext)", helpers)
+        self.assertLess(
+            reward.index("ensureWarehouseOpenDayDelivery(activeJob)"),
+            reward.index("state.preferRewardedLaterDelivery === true"),
+        )
+
+    def test_checkout_fails_closed_if_weekend_delivery_remains_selected(self) -> None:
+        guard_start = CONTENT.index("async function checkoutDeliveryWindowIsAllowed")
+        guard_end = CONTENT.index("function checkoutQuantityFromPage", guard_start)
+        guard = CONTENT[guard_start:guard_end]
+        self.assertIn("selectedDeliveryRadioContext()", guard)
+        self.assertIn("deliveryContextIncludesWarehouseClosedDay(selectedDelivery)", guard)
+        self.assertIn("Checkout is blocked because the selected Amazon delivery includes Saturday or Sunday", guard)
+        self.assertIn("return false;", guard)
 
     def test_failure_cleanup_can_leave_order_history(self) -> None:
         self.assertIn('activeJob?.stage === "cleanup_after_failure"', CONTENT)

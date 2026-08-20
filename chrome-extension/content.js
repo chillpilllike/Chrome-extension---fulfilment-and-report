@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-history-parser-v58";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-weekday-delivery-v59";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5078,6 +5078,86 @@ function rewardedLaterDeliverySelected() {
     || checkoutOffersOnePercentDeliveryReward() && isAmazonDayDeliveryContext(context);
 }
 
+function selectedDeliveryRadioContext() {
+  const selectedRadio = [...document.querySelectorAll("input[type='radio']:checked")]
+    .find((radio) => !radio.disabled) || null;
+  return selectedRadio ? deliveryRadioContext(selectedRadio) : null;
+}
+
+function deliveryContextIncludesWarehouseClosedDay(context) {
+  return /\b(?:sat(?:urday)?|sun(?:day)?)\b/i.test(normalizedText(context?.text || ""));
+}
+
+function deliveryContextNamesWarehouseOpenDay(context) {
+  return /\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?)\b/i.test(
+    normalizedText(context?.text || ""),
+  );
+}
+
+function consolidatedWeekdayDeliveryOption() {
+  const candidates = [...document.querySelectorAll("input[type='radio']")]
+    .filter((radio) => !radio.disabled)
+    .map(deliveryRadioContext)
+    .filter((context) => (
+      context.radio
+      && context.control
+      && !deliveryContextIncludesWarehouseClosedDay(context)
+      && deliveryContextNamesWarehouseOpenDay(context)
+    ));
+  return candidates.find(isAmazonDayDeliveryContext)
+    || candidates.find((context) => isOnePercentDeliveryRewardText(context.text))
+    || candidates[0]
+    || null;
+}
+
+function consolidatedWeekdayDeliverySelected() {
+  const selected = selectedDeliveryRadioContext();
+  return Boolean(
+    selected
+    && !deliveryContextIncludesWarehouseClosedDay(selected)
+    && deliveryContextNamesWarehouseOpenDay(selected),
+  );
+}
+
+async function ensureWarehouseOpenDayDelivery(activeJob) {
+  const selected = selectedDeliveryRadioContext();
+  if (!selected || !deliveryContextIncludesWarehouseClosedDay(selected)) return null;
+
+  const weekdayOption = consolidatedWeekdayDeliveryOption();
+  if (!weekdayOption?.control) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Amazon selected a delivery that includes Saturday or Sunday, but no Monday-Friday consolidated option could be selected safely. Selected option: ${selected.text}`,
+      "checkout",
+    );
+    return false;
+  }
+
+  showPanel(
+    "Weekday delivery required",
+    `The warehouse is closed Saturday and Sunday. Selecting the consolidated weekday option: ${weekdayOption.text}`,
+    null,
+    null,
+  );
+  await sendDiagnostic("Replacing a weekend delivery with a consolidated weekday delivery.", {
+    selected_option_text: selected.text,
+    replacement_option_text: weekdayOption.text,
+    replacement_is_amazon_day: isAmazonDayDeliveryContext(weekdayOption),
+  });
+  await clickElement(weekdayOption.control, "consolidated Monday-Friday delivery option");
+  const confirmed = await waitUntil(consolidatedWeekdayDeliverySelected, 12000, 300);
+  if (!confirmed) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Amazon did not confirm the Monday-Friday delivery selection. Attempted option: ${weekdayOption.text}`,
+      "checkout",
+    );
+    return false;
+  }
+  await sleep(1200);
+  return true;
+}
+
 function brooklynWeekday(now = new Date()) {
   try {
     return new Intl.DateTimeFormat("en-US", {
@@ -5147,6 +5227,12 @@ async function ensureFreeNextDayDelivery(activeJob, brooklynDay) {
 }
 
 async function ensureRewardedLaterDelivery(activeJob) {
+  // This is a hard warehouse-safety rule, independent of the optional reward
+  // preference. A split promise such as Friday + Saturday must be replaced by
+  // the available consolidated weekday option (normally Amazon Day Monday).
+  const warehouseDaySelection = await ensureWarehouseOpenDayDelivery(activeJob);
+  if (warehouseDaySelection !== null) return warehouseDaySelection;
+
   const state = await getExtensionState();
   const brooklynDay = brooklynWeekday();
   const shouldPreferReward = state.preferRewardedLaterDelivery === true
@@ -5258,6 +5344,16 @@ async function rejectLateCheckout(activeJob, promise, deliveryLimitDays) {
 }
 
 async function checkoutDeliveryWindowIsAllowed(activeJob) {
+  const selectedDelivery = selectedDeliveryRadioContext();
+  if (selectedDelivery && deliveryContextIncludesWarehouseClosedDay(selectedDelivery)) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Checkout is blocked because the selected Amazon delivery includes Saturday or Sunday. Select a Monday-Friday consolidated delivery before continuing. Selected option: ${selectedDelivery.text}`,
+      "checkout",
+    );
+    return false;
+  }
+
   const state = await getExtensionState();
   const deliveryLimitDays = normalizedDeliveryLimitDays(state.deliveryLimitDays);
   const promise = await waitUntil(() => {
