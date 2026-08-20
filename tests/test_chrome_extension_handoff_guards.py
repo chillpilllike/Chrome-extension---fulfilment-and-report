@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.80")
+        self.assertEqual(MANIFEST["version"], "0.1.81")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -432,6 +432,18 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("amazon_cancelled_order_id=CASE", reset)
         self.assertIn("THEN amazon_order_id", reset)
         self.assertIn("amazon_cancelled_at=CASE", reset)
+
+    def test_proven_zero_cart_quantity_gets_only_one_controlled_add_retry(self) -> None:
+        helper_start = CONTENT.index("async function retryProvenMissingCartItemOnce")
+        cart_start = CONTENT.index("async function handleCart(activeJob)", helper_start)
+        helper = CONTENT[helper_start:cart_start]
+        cart_end = CONTENT.index("async function fillFullName", cart_start)
+        cart = CONTENT[cart_start:cart_end]
+        self.assertIn("cartQuantityForAsin(normalizedAsin) !== 0", helper)
+        self.assertIn("Number(retries[retryKey] || 0) >= 1", helper)
+        self.assertIn('activeJob.cartMissingAddRetries = { ...retries, [retryKey]: 1 }', helper)
+        self.assertIn('reason: "retry_proven_missing_cart_item_once"', helper)
+        self.assertIn("actualQuantity === 0 && await retryProvenMissingCartItemOnce", cart)
 
     def test_place_order_lookup_returns_a_native_control_not_amazon_wrapper(self) -> None:
         finder_start = CONTENT.index("function findPlaceOrderButton()")
