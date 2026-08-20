@@ -20224,101 +20224,6 @@ def append_shopify_inventory_note(shop: Any, order: dict[str, Any], note: str) -
         raise RuntimeError("; ".join(clean_text(item.get("message")) for item in errors))
 
 
-def fulfill_mapped_shopify_order(store_id: int, order_name: str) -> dict[str, Any]:
-    """Fulfill every open fulfillment order for an exported Odoo order.
-
-    Shopify fulfillment creation is idempotent here: completed/cancelled fulfillment
-    orders are ignored, and an already-fulfilled Shopify order is returned unchanged.
-    Customer notifications are deliberately disabled because Amazon owns delivery
-    communication for these orders.
-    """
-    clean_order_name = clean_text(order_name).upper()
-    if not clean_order_name:
-        return {"fulfilled": 0, "message": "Missing Odoo order name."}
-    with db() as conn:
-        store_row = conn.execute("SELECT odoo_db FROM stores WHERE id=?", (store_id,)).fetchone()
-        odoo_db = clean_text((store_row or {}).get("odoo_db"))
-        mappings = rows_to_dicts(conn.execute(
-            """
-            SELECT state_scope, dest_name, dest_order_id
-            FROM shopify_export_order_map
-            WHERE src_order_key=?
-              AND COALESCE(dest_order_id, '') != ''
-            ORDER BY created_at DESC
-            """,
-            (f"{odoo_db}:{clean_order_name}",),
-        ).fetchall()) if odoo_db else []
-    fulfilled = 0
-    errors: list[str] = []
-    for mapping in mappings:
-        route = clean_text(mapping.get("state_scope")).lower()
-        dest_name = clean_text(mapping.get("dest_name"))
-        order_id = clean_text(mapping.get("dest_order_id"))
-        try:
-            shop = next((client for client in shopify_clients_for_route(route) if client.name == dest_name), None)
-            if shop is None:
-                raise RuntimeError(f"Shopify destination {dest_name or route} is unavailable.")
-            current = shopify_order_by_id(shop, order_id)
-            if not current or current.get("cancelled_at") or shopify_order_is_fulfilled(current):
-                continue
-            query = """
-            query($id: ID!) {
-              order(id: $id) {
-                fulfillmentOrders(first: 50) { nodes { id status } }
-              }
-            }
-            """
-            data = shop.graphql(query, {"id": f"gid://shopify/Order/{order_id}"})
-            nodes = (((data.get("order") or {}).get("fulfillmentOrders") or {}).get("nodes") or [])
-            for node in nodes:
-                if clean_text(node.get("status")).upper() in {"CLOSED", "CANCELLED"}:
-                    continue
-                mutation = """
-                mutation($fulfillment: FulfillmentInput!, $message: String) {
-                  fulfillmentCreate(fulfillment: $fulfillment, message: $message) {
-                    fulfillment { id status createdAt }
-                    userErrors { field message }
-                  }
-                }
-                """
-                result = shop.graphql(mutation, {
-                    "fulfillment": {
-                        "lineItemsByFulfillmentOrder": [{"fulfillmentOrderId": clean_text(node.get("id"))}],
-                        "notifyCustomer": False,
-                    },
-                    "message": f"Amazon delivery confirmed for {clean_order_name}",
-                })
-                payload = result.get("fulfillmentCreate") or {}
-                user_errors = payload.get("userErrors") or []
-                if user_errors:
-                    raise RuntimeError("; ".join(clean_text(item.get("message")) for item in user_errors))
-                if payload.get("fulfillment"):
-                    fulfilled += 1
-            refreshed = shopify_order_by_id(shop, order_id)
-            if refreshed:
-                upsert_shopify_order_status(store_id, route, shop.name, shop.shop, clean_order_name, refreshed)
-        except Exception as exc:
-            errors.append(f"{dest_name or route}: {str(exc)[:500]}")
-    return {"fulfilled": fulfilled, "errors": errors}
-
-
-def fulfill_shopify_orders_for_delivered_amazon_order(amazon_order_id: str) -> None:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT store_id, odoo_order_name
-            FROM order_lines
-            WHERE amazon_order_id=?
-              AND (state='delivered' OR LOWER(COALESCE(tracking_status, '')) LIKE 'delivered%')
-            """,
-            (amazon_order_id,),
-        ).fetchall()
-    for row in rows:
-        result = fulfill_mapped_shopify_order(int(row["store_id"]), clean_text(row["odoo_order_name"]))
-        if result.get("errors"):
-            print(f"Shopify fulfillment failed for {row['odoo_order_name']}: {' | '.join(result['errors'])}", flush=True)
-
-
 def shopify_status_is_fulfilled(status: Any) -> bool:
     normalized = clean_text(status).upper().replace(" ", "_")
     return normalized in {"FULFILLED", "PARTIALLY_FULFILLED", "PARTIAL"}
@@ -31965,12 +31870,6 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
         try:
             with _TRACKING_UPDATE_LOCK:
                 result = api_tracking_update_impl(payload)
-            if tracking_status_rank(result.get("tracking_status")) >= tracking_status_rank("delivered"):
-                threading.Thread(
-                    target=fulfill_shopify_orders_for_delivered_amazon_order,
-                    args=(clean_text(payload.amazon_order_id),),
-                    daemon=True,
-                ).start()
             return result
         except (db_session.psycopg2.errors.DeadlockDetected, db_session.psycopg2.OperationalError):
             if attempt >= 2:
