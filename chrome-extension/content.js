@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-weekday-delivery-v59";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-native-place-order-v60";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -4883,7 +4883,7 @@ function findAddNewDeliveryAddressLink() {
 }
 
 function findPlaceOrderButton() {
-  const selectors = [
+  const nativeSelectors = [
     "input#placeOrder",
     "input[name='placeYourOrder1']",
     "input[data-testid='SPC_selectPlaceOrder']",
@@ -4891,18 +4891,37 @@ function findPlaceOrderButton() {
     "input.place-your-order-button",
     "input[title='Place your order']",
     "input[value='Place your order']",
-    "button",
-    "span.a-button",
-  ].join(", ");
-  return [...document.querySelectorAll(selectors)].find((element) => {
+  ];
+  // querySelectorAll with one combined selector returns document order, not
+  // selector priority. Amazon wraps the real submit input in a span.a-button,
+  // so the old combined lookup could return and click that inert wrapper while
+  // still marking the order submitted. Always resolve a native form control.
+  for (const selector of nativeSelectors) {
+    const control = [...document.querySelectorAll(selector)]
+      .find((element) => visible(element) && !element.disabled);
+    if (control) return control;
+  }
+
+  const textButtons = [...document.querySelectorAll("button")].filter((element) => {
     const labelledBy = element.getAttribute?.("aria-labelledby");
     const labelText = labelledBy ? document.getElementById(labelledBy)?.textContent : "";
     const text = normalizedText(element.value || element.title || element.innerText || element.textContent || labelText);
-    return visible(element) && !element.disabled && (
-      element.matches?.("input#placeOrder, input[name='placeYourOrder1'], input[data-testid='SPC_selectPlaceOrder'], input[data-csa-c-slot-id='checkout-place-your-order-button'], input.place-your-order-button") ||
-      text.includes("place your order")
-    );
+    return visible(element) && !element.disabled && text.includes("place your order");
   });
+  if (textButtons.length) return textButtons[0];
+
+  for (const wrapper of document.querySelectorAll("span.a-button")) {
+    const text = normalizedText(wrapper.innerText || wrapper.textContent);
+    if (!visible(wrapper) || !text.includes("place your order")) continue;
+    const nested = [...wrapper.querySelectorAll("input[type='submit'], input[type='button'], button")]
+      .find((element) => visible(element) && !element.disabled);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function isNativePlaceOrderControl(element) {
+  return Boolean(element?.matches?.("input[type='submit'], input[type='button'], button"));
 }
 
 function findSnsPaymentConfirmationCheckbox() {
@@ -6347,6 +6366,13 @@ async function handleCheckout(activeJob) {
     ], 5000)
     || findButtonByText(["place your order"]);
   if (placeOrder && !placeOrder.disabled) {
+    if (!isNativePlaceOrderControl(placeOrder)) {
+      await pauseForManualCheckout(
+        activeJob,
+        "Amazon showed a Place your order wrapper, but the actual submit control could not be verified safely.",
+      );
+      return;
+    }
     if (!await checkoutDeliveryWindowIsAllowed(activeJob)) return;
     if (!checkoutDeliveryRecipientMatches(checkoutRecipient) && !checkoutRecipientConfirmed(checkoutRecipient)) {
       const deliveredTo = checkoutDeliveryRecipientText() || "unknown recipient";
@@ -6415,9 +6441,19 @@ async function handleCheckout(activeJob) {
       "checkout",
     )) return;
     showPanel("Final step", "Clicking Place your order now.", null, null);
-    activeJob.placeOrderClickStartedAt = Date.now();
-    await setActiveJob(activeJob);
     if (!await protectBeforeAmazonSubmit(activeJob, "checkout")) return;
+    activeJob.placeOrderClickStartedAt = Date.now();
+    activeJob.placeOrderControl = {
+      tag: String(placeOrder.tagName || "").toLowerCase(),
+      id: String(placeOrder.id || ""),
+      name: String(placeOrder.getAttribute?.("name") || ""),
+      testid: String(placeOrder.getAttribute?.("data-testid") || ""),
+    };
+    await setActiveJob(activeJob);
+    await sendDiagnostic("Clicking verified native Amazon Place Order control.", {
+      group_key: activeJob?.job?.group_key || "",
+      control: activeJob.placeOrderControl,
+    });
     await clickElement(placeOrder, "Place your order button");
   } else {
     await pauseForManualCheckout(activeJob, "Could not find the payment or Place your order control.", "complete_pending");
