@@ -210,6 +210,8 @@ type OrderLine = {
   replacement_asin_url?: string
   supplier_part_auxiliary_id: string
   quantity: number
+  inventory_allocated_quantity?: number
+  inventory_sent_quantity?: number
   state: string
   odoo_status_label: string
   amazon_status?: string
@@ -1088,6 +1090,11 @@ type InventoryItem = {
   amazon_order_id: string
   amazon_order_url: string
   amazon_account_name: string
+  source_tracking_id?: string
+  source_delivered_at?: string
+  source_received_at?: string
+  source_shopify_cancelled_at?: string
+  source_odoo_status?: string
   source_type: string
   reserved_order_line_id: number | null
   reserved_quantity?: number | null
@@ -11393,7 +11400,7 @@ function InventoryPage({
       <Card>
         <CardHeader>
           <CardTitle>Inventory</CardTitle>
-          <CardDescription>Available warehouse stock from delivered Amazon orders whose Odoo order was cancelled/refunded, plus manually added stock. Inventory-matched orders are not auto-bought by Chrome.</CardDescription>
+          <CardDescription>Reusable stock is released only after Amazon delivery, warehouse receipt, Shopify cancellation, and Odoo cancellation/refund are all confirmed. Manual stock uses the same ASIN and quantity allocation rules.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1fr_120px_1.2fr_1fr_1fr_1.2fr_auto]">
           <div className="grid gap-1.5">
@@ -11447,6 +11454,7 @@ function InventoryPage({
                 <TableHead>Product</TableHead>
                 <TableHead>Source</TableHead>
                 <TableHead>Amazon Order</TableHead>
+                <TableHead>Source Evidence</TableHead>
                 <TableHead>Reserved For</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Updated</TableHead>
@@ -11491,6 +11499,19 @@ function InventoryPage({
                     <div className="text-xs text-muted-foreground">{item.amazon_account_name || ""}</div>
                   </TableCell>
                   <TableCell>
+                    {item.source_type === "manual" ? (
+                      <Badge variant="outline">Manual stock</Badge>
+                    ) : (
+                      <div className="grid min-w-44 gap-1 text-xs">
+                        <span className={item.source_delivered_at ? "text-emerald-700" : "text-amber-700"}>{item.source_delivered_at ? `Delivered ${formatDateTime(item.source_delivered_at)}` : "Delivery pending"}</span>
+                        <span className={item.source_received_at ? "text-emerald-700" : "text-amber-700"}>{item.source_received_at ? `Received ${formatDateTime(item.source_received_at)}` : "Receipt pending"}</span>
+                        <span className={item.source_shopify_cancelled_at ? "text-emerald-700" : "text-amber-700"}>{item.source_shopify_cancelled_at ? `Shopify cancelled ${formatDateTime(item.source_shopify_cancelled_at)}` : "Shopify cancellation pending"}</span>
+                        <span className={item.source_odoo_status ? "text-emerald-700" : "text-amber-700"}>Odoo: {item.source_odoo_status || "pending"}</span>
+                        {item.source_tracking_id ? <span className="font-mono text-muted-foreground">Tracking {item.source_tracking_id}</span> : null}
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell>
                     {item.reserved_order_line_id ? (
                       <div className="grid gap-1">
                         {item.reserved_odoo_order_name ? (
@@ -11525,7 +11546,7 @@ function InventoryPage({
               ))}
               {!rows.length && (
                 <TableRow>
-                  <TableCell colSpan={10} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
+                  <TableCell colSpan={11} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
                 </TableRow>
               )}
             </TableBody>

@@ -1,6 +1,7 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-07-19-queue-single-worker-v35";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-21-chatter-transition-v56";
+const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -9,6 +10,7 @@ const recoverSubmittedJobsInFlight = new Map();
 let lastEmptyRecoverSubmittedJobAt = 0;
 let startNextJobInFlight = null;
 const claimNextJobInFlight = new Map();
+const submitProtectionLocks = new Set();
 const MISSING_ASIN_ALARM = "nutricity-missing-asin-availability";
 const MISSING_ASIN_CHECK_PERIOD_MINUTES = 24 * 60;
 const FULFILMENT_WATCHDOG_ALARM = "nutricity-fulfilment-watchdog";
@@ -116,6 +118,20 @@ async function setWindowJob(windowId, activeJob, options = {}) {
   const key = String(windowId || "");
   const current = windowId ? next[key] || null : state.activeJob || null;
   const sameGroup = current?.job?.group_key && activeJob?.job?.group_key === current.job.group_key;
+  if (sameGroup && activeJobHasReportedOrderId(current)) {
+    const currentAttemptedAt = Number(current.reportAttemptedAt || 0);
+    const incomingAttemptedAt = Number(activeJob.reportAttemptedAt || 0);
+    const incomingHasOrderId = activeJobHasReportedOrderId(activeJob);
+    if (!incomingHasOrderId || incomingAttemptedAt < currentAttemptedAt) {
+      activeJob = {
+        ...activeJob,
+        stage: "reporting_complete",
+        reportedOrderId: current.reportedOrderId,
+        reportAttemptedAt: current.reportAttemptedAt,
+        amazonSubmittedAt: activeJob.amazonSubmittedAt || current.amazonSubmittedAt || Date.now(),
+      };
+    }
+  }
   if (sameGroup && options.allowItemRemoval !== true) {
     const currentItems = Array.isArray(current?.job?.items) ? current.job.items : [];
     const incomingItems = Array.isArray(activeJob?.job?.items) ? activeJob.job.items : [];
@@ -792,12 +808,14 @@ async function refreshActiveJobFromQueue(windowId, force = false) {
     }
     const next = { ...(currentJob || activeJob), job: freshJob, jobRefreshedAt: Date.now() };
     if (jobWasSubmittedToAmazon(freshJob)) {
-      next.stage = next.stage === "reporting_complete" ? "reporting_complete" : "find_order_id";
+      next.stage = next.stage === "reporting_complete" && activeJobHasReportedOrderId(next)
+        ? "reporting_complete"
+        : "find_order_id";
       next.amazonSubmittedAt = next.amazonSubmittedAt || Date.now();
       if (!next.paused) next.pausedStage = null;
     }
-    await setWindowJob(windowId, next);
-    return next;
+    await setWindowJob(windowId, next, { reason: "queue_refresh" });
+    return (await getWindowState(windowId)).activeJob || next;
   } catch {
     return activeJob;
   }
@@ -866,7 +884,9 @@ async function getChromeJobCompletionStatus(activeJob) {
 }
 
 function completionStatusMatchesOrder(status, orderId = "") {
-  if (!status?.completed) return false;
+  const chatterAccepted = status?.odoo_chatter_queued === true || status?.odoo_chatter_confirmed === true;
+  const dataSaved = status?.data_saved === true || (status?.completed === true && status?.odoo_chatter_confirmed === true);
+  if (!status?.completed || !dataSaved || !chatterAccepted) return false;
   const expectedOrderIds = String(orderId || "").match(/\b\d{3}-\d{7}-\d{7}\b/g) || [];
   const orderIds = (status.amazon_order_ids || []).map((value) => String(value || "").trim()).filter(Boolean);
   return !expectedOrderIds.length || !orderIds.length || expectedOrderIds.some((expected) => orderIds.includes(expected));
@@ -1007,21 +1027,46 @@ async function createAmazonWorkerWindow(incognito = false) {
 async function contentScriptLoaded(tabId) {
   if (!chrome.scripting?.executeScript || !tabId) return true;
   try {
-    const result = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (expectedBuild) => window.__nutricityContentLoaded === expectedBuild,
-      args: [EXPECTED_CONTENT_SCRIPT_BUILD],
+    // A marker in the isolated world can survive an unpacked-extension reload
+    // even though the old content script's runtime port/listeners are dead.
+    // Require a live round trip to the current background worker; otherwise
+    // the recovery path would mistake that stale marker for a usable worker
+    // and leave a submitted Amazon order stuck on order history forever.
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: "NUTRICITY_CONTENT_PING",
+      expectedBuild: EXPECTED_CONTENT_SCRIPT_BUILD,
     });
-    return Boolean(result?.[0]?.result);
+    return Boolean(response?.ok && response?.build === EXPECTED_CONTENT_SCRIPT_BUILD);
   } catch {
     return false;
   }
+}
+
+async function clearStaleContentScriptMarker(tabId) {
+  if (!chrome.scripting?.executeScript || !tabId) return;
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      if (typeof window.__nutricityContentCleanup === "function") {
+        try {
+          window.__nutricityContentCleanup();
+        } catch (_) {
+          // The previous extension context is already invalid. Continue with
+          // a clean marker so the newly injected build can install listeners.
+        }
+      }
+      window.__nutricityContentLoaded = false;
+      window.__nutricityRunning = false;
+      window.__nutricityRunningAt = 0;
+    },
+  }).catch(() => undefined);
 }
 
 async function injectContentScript(tabId) {
   if (!chrome.scripting?.executeScript || !tabId) return false;
   if (await contentScriptLoaded(tabId)) return false;
   try {
+    await clearStaleContentScriptMarker(tabId);
     if (chrome.scripting.insertCSS) {
       await chrome.scripting.insertCSS({ target: { tabId }, files: ["content.css"] }).catch(() => undefined);
     }
@@ -1036,11 +1081,18 @@ async function injectContentScript(tabId) {
 async function injectContentScriptWhenReady(tabId, timeoutMs = 30000) {
   if (!tabId) return false;
   await waitForTabComplete(tabId, timeoutMs).catch(() => undefined);
-  if (await injectContentScript(tabId)) return true;
-  if (await contentScriptLoaded(tabId)) return true;
-  await new Promise((resolve) => setTimeout(resolve, 1500));
-  if (await injectContentScript(tabId)) return true;
-  return contentScriptLoaded(tabId);
+  let loaded = await injectContentScript(tabId) || await contentScriptLoaded(tabId);
+  if (!loaded) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    loaded = await injectContentScript(tabId) || await contentScriptLoaded(tabId);
+  }
+  if (loaded) {
+    // A newly claimed worker tab is normally backgrounded. The content script
+    // deliberately polls idle hidden tabs slowly, so explicitly wake it after
+    // a queue handoff instead of leaving the next server lock idle.
+    await chrome.tabs.sendMessage(tabId, { type: "RUN_ACTIVE_JOB" }).catch(() => undefined);
+  }
+  return loaded;
 }
 
 async function injectActiveAmazonTabInWindow(windowId) {
@@ -1415,9 +1467,14 @@ async function claimNextJobInWindow(windowId) {
   }
   const activeJob = activeJobFor(job, workerId, windowId);
   activeJob.startedAfterPreviousJob = true;
-  await setWindowJob(windowId, activeJob);
   await log(`Started next ${job.group_key} with ${job.items.length} item(s); clearing Amazon cart before product add.`, windowId);
+  // Do not publish the new job while the previous Amazon order-history page is
+  // still alive. Its safety guard would correctly pause an unsubmitted job on
+  // history, racing the navigation below and leaving the new server claim
+  // stranded. Navigate first, then expose and explicitly wake the new job.
   await navigateWindowToCart(windowId);
+  await setWindowJob(windowId, activeJob);
+  await injectActiveAmazonTabInWindow(windowId);
   return activeJob;
   })();
   claimNextJobInFlight.set(claimKey, task);
@@ -1804,6 +1861,12 @@ function orderSubmitStarted(activeJob) {
   );
 }
 
+function activeJobHasReportedOrderId(activeJob) {
+  return /^\d{3}-\d{7}-\d{7}(?:\s*,\s*\d{3}-\d{7}-\d{7})*$/.test(
+    String(activeJob?.reportedOrderId || "").trim(),
+  );
+}
+
 function isAmazonThankYouUrl(url = "") {
   return /^https:\/\/(?:www\.)?amazon\.com\/gp\/buy\/thankyou\/handlers\/display\.html/i.test(String(url || ""));
 }
@@ -1875,7 +1938,12 @@ async function recoverBlankThankYouTab(tab = {}) {
   if (Date.now() - Number(activeJob.thankYouUrlRecoveredAt || 0) < 15000) return false;
 
   if (!orderSubmitStarted(activeJob)) {
-    const protectedResult = await markAmazonSubmitted(windowId);
+    const protectedResult = await markAmazonSubmitted(
+      windowId,
+      activeJob.job.group_key,
+      activeJob.workerId || "",
+    );
+    if (protectedResult?.stale_job || protectedResult?.stale_local_update) return false;
     if (!protectedResult?.ok && !protectedResult?.duplicate_submit_blocked) {
       await log(
         `Saw Amazon thank-you URL for ${activeJob.job.group_key}, but could not protect the submit before recovery: ${protectedResult?.message || "unknown error"}`,
@@ -1886,6 +1954,13 @@ async function recoverBlankThankYouTab(tab = {}) {
   }
 
   const latest = (await getWindowState(windowId)).activeJob || activeJob;
+  if (
+    latest?.job?.group_key !== activeJob.job.group_key
+    || String(latest?.workerId || "") !== String(activeJob.workerId || "")
+  ) {
+    await log(`Thank-you recovery for ${activeJob.job.group_key} finished after the window moved to ${latest?.job?.group_key || "no active job"}; ignored the stale recovery.`, windowId);
+    return false;
+  }
   latest.stage = "find_order_id";
   latest.paused = false;
   latest.pausedStage = null;
@@ -1922,10 +1997,36 @@ function submittedWindowForGroup(state, groupKey, windowId) {
   return "";
 }
 
-async function markAmazonSubmitted(windowId) {
+async function markAmazonSubmitted(windowId, expectedGroupKey = "", expectedWorkerId = "") {
+  const lockKey = `${windowId || "global"}:${expectedGroupKey || "unknown"}`;
+  if (submitProtectionLocks.has(lockKey)) {
+    await log(`Blocked concurrent Place Order protection for ${expectedGroupKey || "the active job"}.`, windowId);
+    return {
+      ok: false,
+      duplicate_submit_blocked: true,
+      protected_in_current_window: true,
+      group_key: expectedGroupKey || "",
+      message: `${expectedGroupKey || "This job"} already has a Place Order protection request in progress.`,
+    };
+  }
+  submitProtectionLocks.add(lockKey);
+  try {
+    return await markAmazonSubmittedUnlocked(windowId, expectedGroupKey, expectedWorkerId);
+  } finally {
+    submitProtectionLocks.delete(lockKey);
+  }
+}
+
+async function markAmazonSubmittedUnlocked(windowId, expectedGroupKey = "", expectedWorkerId = "") {
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job?.group_key || !activeJob?.workerId) {
     return { ok: false, message: "No active job to protect before Amazon submit." };
+  }
+  const groupKey = String(activeJob.job.group_key || "");
+  const workerId = String(activeJob.workerId || "");
+  if ((expectedGroupKey && expectedGroupKey !== groupKey) || (expectedWorkerId && expectedWorkerId !== workerId)) {
+    await log(`Ignored stale submit marker for ${expectedGroupKey || "unknown job"}; current job is ${groupKey}.`, windowId);
+    return { ok: false, stale_job: true, group_key: groupKey, message: `Submit marker belongs to ${expectedGroupKey || "another job"}, not ${groupKey}.` };
   }
   if (orderSubmitStarted(activeJob)) {
     await log(`Blocked repeat Place Order click for ${activeJob.job.group_key}; this Chrome window already protected the submit.`, windowId);
@@ -1952,11 +2053,15 @@ async function markAmazonSubmitted(windowId) {
       message: `${activeJob.job.group_key} is already protected in another Chrome window. Fulfilment paused before a duplicate Place Order click.`,
     };
   }
-  const result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/submitted`, {
+  const result = await api(`/api/chrome/jobs/${encodeURIComponent(groupKey)}/submitted`, {
     method: "POST",
-    body: JSON.stringify({ worker_id: activeJob.workerId }),
+    body: JSON.stringify({ worker_id: workerId }),
   });
-  const latest = (await getWindowState(windowId)).activeJob || activeJob;
+  const latest = (await getWindowState(windowId)).activeJob;
+  if (latest?.job?.group_key !== groupKey || String(latest?.workerId || "") !== workerId) {
+    await log(`Submit protection completed for ${groupKey}, but the window has moved to ${latest?.job?.group_key || "no active job"}; ignored the stale local update.`, windowId);
+    return { ...result, ok: false, stale_local_update: true, protected_original_job: true, group_key: groupKey };
+  }
   latest.amazonSubmittedAt = latest.amazonSubmittedAt || Date.now();
   latest.stage = "complete_pending";
   latest.paused = false;
@@ -1964,7 +2069,7 @@ async function markAmazonSubmitted(windowId) {
   latest.lastHeartbeatAt = Date.now();
   await setWindowJob(windowId, latest);
   await log(`Protected ${latest.job.group_key} after Amazon submit started.`, windowId);
-  return result;
+  return { ...result, group_key: groupKey };
 }
 
 async function releaseMissingWindowJobs(options = {}) {
@@ -2152,6 +2257,9 @@ async function heartbeatJob(activeJob, windowId) {
       asins: items.map((item) => item?.asin || "").filter(Boolean),
       target_window_id: windowId || activeJob.targetWindowId || null,
       extension_build: EXPECTED_CONTENT_SCRIPT_BUILD,
+      paused: activeJob.paused === true,
+      paused_stage: activeJob.pausedStage || "",
+      last_error: activeJob.lastError || activeJob.pauseReason || "",
     }),
   });
   activeJob.lastHeartbeatAt = Date.now();
@@ -2175,13 +2283,44 @@ async function togglePause(windowId) {
   return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
 
-async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = [], orderDate = "", page = null, amazonRecipient = "", amazonAsins = []) {
+async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = [], orderDate = "", page = null, amazonRecipient = "", amazonAsins = [], expectedGroupKey = "", expectedWorkerId = "") {
   if (await forceStopActive()) {
     return { ok: false, stopped: true, message: "Force stop is active; ignored late order completion report." };
   }
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
   const groupKey = activeJob.job.group_key;
+  if (
+    (expectedGroupKey && expectedGroupKey !== groupKey)
+    || (expectedWorkerId && expectedWorkerId !== String(activeJob.workerId || ""))
+  ) {
+    await log(`Ignored stale completion report for ${expectedGroupKey || "unknown job"}; current job is ${groupKey}.`, windowId);
+    return { ok: false, stale_job: true, message: `Completion belongs to ${expectedGroupKey || "another job"}, not ${groupKey}.` };
+  }
+  const normalizedOrderId = String(orderId || "").trim();
+  if (!/^\d{3}-\d{7}-\d{7}$/.test(normalizedOrderId)) {
+    activeJob.stage = "find_order_id";
+    activeJob.paused = false;
+    activeJob.pausedStage = null;
+    activeJob.reportedOrderId = "";
+    activeJob.reportAttemptedAt = null;
+    activeJob.reportError = "Blocked completion because Amazon did not provide a valid order ID.";
+    await setWindowJob(windowId, activeJob);
+    await diagnosticLog("Blocked completion report without a valid Amazon order ID.", {
+      windowId,
+      source: "background",
+      activeJob,
+      page,
+      level: "error",
+      details: { supplied_order_id: orderId || "", group_key: groupKey },
+    });
+    await navigateWindowToOrderHistory(windowId);
+    return {
+      ok: false,
+      invalid_order_id: true,
+      message: `Amazon has not exposed a valid order number for ${groupKey}; continuing safe order-history verification.`,
+    };
+  }
   const lockKey = `${windowId || "global"}:${groupKey}`;
   await diagnosticLog(`Completion report received for ${groupKey}.`, {
     windowId,
@@ -2256,6 +2395,20 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
         return { ok: false, message, amazon_order_id: orderId, pending_completion: true };
       }
       throw error;
+    }
+    if (result?.odoo_chatter_queued !== true && result?.odoo_chatter_confirmed !== true) {
+      const message = `Amazon order ${orderId} was saved, but the app did not confirm its durable Odoo chatter outbox entry. The queue remains held before starting another order.`;
+      activeJob.paused = true;
+      activeJob.pausedStage = "reporting_complete";
+      activeJob.reportError = message;
+      await setWindowJob(windowId, activeJob);
+      await log(message, windowId, { amazon_order_id: orderId || "", order_url: orderUrl || "" });
+      return {
+        ok: false,
+        pending_odoo_chatter_queue: true,
+        amazon_order_id: result?.amazon_order_id || orderId || "",
+        message,
+      };
     }
     await log(`Completed ${groupKey} as ${result.amazon_order_id}.`, windowId, { amazon_order_id: result.amazon_order_id || orderId || "", order_url: orderUrl || "" });
     await recordLastProcessed(activeJob, "placed", result.amazon_order_id ? `Placed ${result.amazon_order_id}.` : "Placed on Amazon.", {
@@ -2354,48 +2507,25 @@ async function submitUncertain(message, details = {}, windowId) {
   }
   const { activeJob } = await getWindowState(windowId);
   if (!activeJob?.job) return { ok: false, message: "No active job." };
+  activeJob.stage = "find_order_id";
+  activeJob.paused = true;
+  activeJob.pausedStage = "find_order_id";
+  activeJob.lastError = message;
+  await setWindowJob(windowId, activeJob);
   try {
     await heartbeatJob(activeJob, windowId);
   } catch (error) {
-    await log(`Continuing submitted-order uncertainty report after heartbeat failed for ${activeJob.job.group_key}: ${error.message}`, windowId);
+    await log(`Submitted order ${activeJob.job.group_key} remains locally held after heartbeat failed: ${error.message}`, windowId);
   }
-  const body = {
+  await log(`Held submitted ${activeJob.job.group_key} for Amazon ID verification; the next queue job was not claimed: ${message}`, windowId);
+  return {
+    ok: false,
+    held_for_verification: true,
     message,
-    line_ids: activeJob.job.line_ids || [],
-    failure_code: details.failureCode || "submitted_order_not_found",
-    worker_id: activeJob.workerId || "",
+    next_job_started: false,
+    cleanup_required: false,
+    next_group_key: "",
   };
-  let result;
-  let recoveredReportingState = false;
-  try {
-    result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/submit-uncertain`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-  } catch (error) {
-    if (!/not in a protected submitted state without an Amazon order ID/i.test(String(error?.message || ""))) throw error;
-    // A worker restored from Chrome storage can retain find_order_id after the
-    // backend lost its order_submitted marker.  Retrying submit-uncertain then
-    // renews the same lock forever and prevents every later job from running.
-    // The backend has explicitly confirmed this group is *not* protected, so
-    // retire it through the ordinary owned-job failure path and continue.
-    const recoveryMessage = `${message} The extension recovered an inconsistent submitted-reporting state so the remaining queue could continue.`;
-    await log(`Recovered stale reporting state for ${activeJob.job.group_key}; retiring the unprotected job and continuing the queue.`, windowId);
-    result = await api(`/api/chrome/jobs/${encodeURIComponent(activeJob.job.group_key)}/fail`, {
-      method: "POST",
-      body: JSON.stringify({
-        ...body,
-        message: recoveryMessage,
-        failure_code: "reporting_state_mismatch",
-      }),
-    });
-    recoveredReportingState = true;
-  }
-  await log(`Submit uncertain for ${activeJob.job.group_key}: ${message}`, windowId);
-  await recordLastProcessed(activeJob, "chrome_error", result?.message || message);
-  await incrementOrderProgress(`Processed ${activeJob.job.group_key}: submitted order not found.`);
-  await cleanupCartBeforeNextJob(activeJob, windowId, result?.message || message);
-  return { ...result, recovered_reporting_state: recoveredReportingState, next_job_started: false, cleanup_required: true, next_group_key: "" };
 }
 
 async function markLineMissing(message, details = {}, windowId) {
@@ -2955,6 +3085,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return { ok: true, activeJob };
         }
       }
+      if (activeJob?.job && activeJob.stage === "reporting_complete" && !activeJobHasReportedOrderId(activeJob)) {
+        activeJob.stage = "find_order_id";
+        activeJob.paused = false;
+        activeJob.pausedStage = null;
+        activeJob.reportAttemptedAt = null;
+        activeJob.reportError = "Recovered an invalid completed-report state with no Amazon order ID.";
+        await setWindowJob(windowId, activeJob);
+        await log(`Recovered ${activeJob.job.group_key} from reporting_complete without an Amazon order ID; resuming order-history verification.`, windowId);
+      }
       if (
         activeJob?.job &&
         (activeJob.stage === "reporting_complete" || activeJob.reportedOrderId) &&
@@ -2978,7 +3117,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           await log(`Completed-job lock check failed for ${activeJob.job.group_key}: ${message}`, windowId);
         }
       }
-      if (activeJob?.job && activeJob?.workerId && Date.now() - Number(activeJob.lastHeartbeatAt || 0) > 5 * 60 * 1000) {
+      if (activeJob?.job && activeJob?.workerId && Date.now() - Number(activeJob.lastHeartbeatAt || 0) > ACTIVE_JOB_HEARTBEAT_MS) {
         try {
           await heartbeatJob(activeJob, windowId);
         } catch (error) {
@@ -3014,7 +3153,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === "MARK_ORDER_SUBMITTED") {
       if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; ignored submit marker." };
-      return markAmazonSubmitted(windowId);
+      return markAmazonSubmitted(windowId, String(message.groupKey || ""), String(message.workerId || ""));
     }
     if (message.type === "SET_ACTIVE_JOB") {
       if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; ignored active job update." };
@@ -3079,7 +3218,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return { ok: true };
     }
-    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "", senderPageInfo(sender, message.page || {}), message.amazonRecipient || "", message.amazonAsins || []);
+    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "", senderPageInfo(sender, message.page || {}), message.amazonRecipient || "", message.amazonAsins || [], String(message.groupKey || ""), String(message.workerId || ""));
     if (message.type === "MARK_LINE_MISSING") return markLineMissing(message.message || "Chrome extension line is missing.", message, windowId);
     if (message.type === "POST_SUBMIT_UNPLACED") return postSubmitUnplaced(message.message || "Amazon did not place the order after submit.", message, windowId);
     if (message.type === "SUBMIT_UNCERTAIN") return submitUncertain(message.message || "Amazon Place Order was submitted, but no matching Amazon order ID was found.", message, windowId);

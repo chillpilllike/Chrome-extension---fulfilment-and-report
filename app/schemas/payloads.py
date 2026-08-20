@@ -239,6 +239,9 @@ class ChromeJobHeartbeatPayload(BaseModel):
     asins: list[str] = []
     target_window_id: Optional[int] = None
     extension_build: str = ""
+    paused: bool = False
+    paused_stage: str = ""
+    last_error: str = ""
 
 
 class ChromeJobResetPayload(BaseModel):

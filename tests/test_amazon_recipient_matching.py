@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from app.main import (
     amazon_order_refs_from_text,
     amazon_history_order_refs_from_text,
+    amazon_history_uncertain_reconciliation_candidates,
     api_manual_amazon_match,
     chrome_completion_history_evidence_error,
     manual_order_refs_from_payload,
@@ -24,6 +25,112 @@ from app.schemas.payloads import ChromeJobCompletePayload, ManualAmazonOrderMatc
 
 
 class AmazonRecipientMatchingTests(unittest.TestCase):
+    def test_uncertain_chrome_submit_auto_reconciles_only_exact_asin_quantity(self):
+        records = [{
+            "amazon_order_id": "111-9956460-5183401",
+            "amazon_order_url": "https://www.amazon.com/your-orders/order-details?orderID=111-9956460-5183401",
+            "recipient": "Nutricity NC23192 50mg",
+            "order_date": "August 20, 2026",
+            "asin_quantities": {"B0074395XY": 1},
+            "cancelled": False,
+        }]
+        suggestions = {"111-9956460-5183401": [{
+            "odoo_order_name": "NC23192",
+            "current_amazon_order_id": "",
+            "lines": [{
+                "id": 3320308,
+                "asin": "B0074395XY",
+                "quantity": 1,
+                "state": "error",
+                "amazon_status": "chrome_error",
+                "order_engine": "chrome",
+                "last_error": "Amazon Place Order was submitted for NC23192, but no matching Amazon order appeared.",
+                "current_amazon_order_id": "",
+            }],
+        }]}
+
+        plans = amazon_history_uncertain_reconciliation_candidates(records, suggestions)
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["amazon_order_id"], "111-9956460-5183401")
+
+    def test_uncertain_chrome_submit_refuses_wrong_quantity(self):
+        records = [{
+            "amazon_order_id": "111-1111111-1111111",
+            "recipient": "Nutricity NC23099",
+            "asin_quantities": {"B018S68QZ8": 2},
+            "cancelled": False,
+        }]
+        suggestions = {"111-1111111-1111111": [{
+            "odoo_order_name": "NC23099",
+            "current_amazon_order_id": "",
+            "lines": [{
+                "id": 1,
+                "asin": "B018S68QZ8",
+                "quantity": 1,
+                "state": "error",
+                "amazon_status": "chrome_error",
+                "order_engine": "chrome",
+                "last_error": "Amazon Place Order was submitted, but history timed out.",
+                "current_amazon_order_id": "",
+            }],
+        }]}
+
+        self.assertEqual(amazon_history_uncertain_reconciliation_candidates(records, suggestions), [])
+
+    def test_uncertain_chrome_submit_accepts_exact_replacement_asin(self):
+        record = {
+            "amazon_order_id": "111-2222222-2222222",
+            "recipient": "Nutricity NC23050",
+            "asin_quantities": {"B099999999": 2},
+            "cancelled": False,
+        }
+        suggestions = {record["amazon_order_id"]: [{
+            "odoo_order_name": "NC23050",
+            "current_amazon_order_id": "",
+            "lines": [{
+                "id": 2,
+                "asin": "B012345678",
+                "replacement_asin": "B099999999",
+                "quantity": 2,
+                "state": "error",
+                "amazon_status": "chrome_error",
+                "order_engine": "chrome",
+                "last_error": "Amazon Place Order was submitted, but history timed out.",
+                "current_amazon_order_id": "",
+            }],
+        }]}
+
+        plans = amazon_history_uncertain_reconciliation_candidates([record], suggestions)
+
+        self.assertEqual(len(plans), 1)
+
+    def test_uncertain_chrome_submit_refuses_ambiguous_recipient_candidates(self):
+        record = {
+            "amazon_order_id": "111-1111111-1111111",
+            "recipient": "Nutricity NC20380 ES00393",
+            "asin_quantities": {"B0025YMU3E": 1},
+            "cancelled": False,
+        }
+        candidate = {
+            "odoo_order_name": "NC20380",
+            "current_amazon_order_id": "",
+            "lines": [{
+                "id": 1,
+                "asin": "B0025YMU3E",
+                "quantity": 1,
+                "state": "error",
+                "amazon_status": "chrome_error",
+                "order_engine": "chrome",
+                "last_error": "Amazon Place Order was submitted, but history timed out.",
+                "current_amazon_order_id": "",
+            }],
+        }
+
+        suggestions = {record["amazon_order_id"]: [candidate, {**candidate, "odoo_order_name": "ES00393"}]}
+
+        self.assertEqual(amazon_history_uncertain_reconciliation_candidates([record], suggestions), [])
+
     def test_real_amazon_account_is_not_overwritten_by_track_all_placeholder(self):
         self.assertTrue(tracking_account_name_is_placeholder("Amazon Tracking Track All"))
         self.assertEqual(

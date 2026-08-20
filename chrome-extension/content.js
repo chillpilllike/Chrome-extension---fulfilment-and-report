@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-07-19-queue-single-worker-v35";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-chatter-transition-v56";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -71,6 +71,7 @@ const IDLE_ACTIVE_JOB_POLL_MS = 30000;
 // legitimately take well over 25 seconds. Starting a second run while the
 // first is still awaiting Amazon duplicates Add-to-cart clicks and quantities.
 const CONTENT_RUN_STALE_MS = 3 * 60 * 1000;
+const MAX_CART_VERIFICATION_RELOADS = 3;
 
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
@@ -347,6 +348,23 @@ async function setActiveJob(activeJob, options = {}) {
       const nextProgress = stageProgress(next.stage);
       const latestSubmitted = submittedStage(latest);
       const nextSubmitted = submittedStage(next);
+      const latestReportedOrderId = String(latest.reportedOrderId || "").trim();
+      const nextReportedOrderId = String(next.reportedOrderId || "").trim();
+      const latestReportAttemptedAt = Number(latest.reportAttemptedAt || 0);
+      const nextReportAttemptedAt = Number(next.reportAttemptedAt || 0);
+      if (
+        latest.stage === "reporting_complete"
+        && /^\d{3}-\d{7}-\d{7}(?:\s*,\s*\d{3}-\d{7}-\d{7})*$/.test(latestReportedOrderId)
+        && (!nextReportedOrderId || nextReportAttemptedAt < latestReportAttemptedAt)
+      ) {
+        next = {
+          ...next,
+          stage: "reporting_complete",
+          reportedOrderId: latestReportedOrderId,
+          reportAttemptedAt: latest.reportAttemptedAt,
+          amazonSubmittedAt: next.amazonSubmittedAt || latest.amazonSubmittedAt || Date.now(),
+        };
+      }
       if (
         latestIndex >= nextIndex
         && latestProgress > nextProgress
@@ -653,7 +671,10 @@ async function togglePanelPause(event) {
       );
     } else {
       showPanel("Nutricity fulfilment", `Resuming ${result?.stage || "last step"}.`, null, null);
-      setTimeout(runSafely, 250);
+      // A paused waitIfPaused() loop resumes by itself. Starting a second run
+      // here could race the first flow all the way to Place Order. Only start a
+      // runner when the previous flow already returned after creating a pause.
+      if (!window.__nutricityRunning) setTimeout(runSafely, 250);
     }
   } finally {
     button.disabled = false;
@@ -1457,17 +1478,27 @@ async function ensureCheckoutOnlyExpectedUnits(activeJob) {
     return true;
   }
   const expectedAsins = Object.keys(expectedCartQuantities(activeJob) || {}).join(", ");
+  const expectedAsinList = Object.keys(expectedCartQuantities(activeJob) || {});
+  const verifiedSingleAsinShortage = (
+    Number.isFinite(actual)
+    && actual > 0
+    && actual < expected
+    && expectedAsinList.length === 1
+    && cartVerificationMatches(activeJob)
+  );
   const actualLabel = Number.isFinite(actual)
     ? `${actual < expected ? "only " : ""}${actual} item unit(s)`
     : "an unreadable item count";
-  const message = `Amazon checkout shows ${actualLabel}, but this queued job expects exactly ${expected}${expectedAsins ? ` (${expectedAsins})` : ""}. The order was stopped before Place Order because the checkout contents could not be verified against the complete queued order.`;
+  const message = verifiedSingleAsinShortage
+    ? `Amazon reduced ASIN ${expectedAsinList[0]} from the cart-verified quantity ${expected} to ${actual} at checkout. The order was stopped before Place Order and moved for quantity-shortage review.`
+    : `Amazon checkout shows ${actualLabel}, but this queued job expects exactly ${expected}${expectedAsins ? ` (${expectedAsins})` : ""}. The order was stopped before Place Order because the checkout contents could not be verified against the complete queued order.`;
   showPanel("Checkout quantity mismatch", message, null, null);
   await send({
     type: "FAIL_JOB",
     message,
-    missingAsin: "",
-    missingLineId: null,
-    failureCode: "cart_quantity_mismatch",
+    missingAsin: verifiedSingleAsinShortage ? expectedAsinList[0] : "",
+    missingLineId: verifiedSingleAsinShortage ? lineIdForAsin(activeJob, expectedAsinList[0]) : null,
+    failureCode: verifiedSingleAsinShortage ? "partial_quantity" : "cart_quantity_mismatch",
     requestedQuantity: expected,
     fulfilledQuantity: actual,
     availableQuantity: Number.isFinite(actual) && actual < expected ? actual : null,
@@ -1621,13 +1652,31 @@ function cartItemQuantity(item) {
   return match ? Number(match[1]) : 1;
 }
 
+function cartActiveRoots() {
+  const selectors = [
+    "#sc-active-cart",
+    "#activeCartViewForm",
+    "form[action*='/cart'] [data-name='Active Items']",
+    "[data-name='Active Items']",
+    "[data-csa-c-content-id*='activeCart' i]",
+  ];
+  const roots = selectors
+    .flatMap((selector) => [...document.querySelectorAll(selector)])
+    .filter((root) => root && visible(root));
+  return roots.filter((root, index) => !roots.some((other, otherIndex) => (
+    otherIndex !== index && other.contains(root)
+  )));
+}
+
 function cartActiveItems() {
-  const activeCart = document.querySelector("#sc-active-cart");
-  if (!activeCart || !visible(activeCart)) return [];
+  const roots = cartActiveRoots();
+  if (!roots.length) return [];
   const candidates = [
-    ...activeCart.querySelectorAll(
-      "[data-itemtype='active'], .sc-list-item, [data-asin], [data-name='Active Items'] [role='listitem']",
-    ),
+    ...roots.flatMap((root) => [
+      ...root.querySelectorAll(
+        "[data-itemtype='active'], .sc-list-item, [data-asin], [data-csa-c-asin], [role='listitem']",
+      ),
+    ]),
   ];
 
   const seen = new Set();
@@ -1636,8 +1685,8 @@ function cartActiveItems() {
       if (!item || !visible(item)) return false;
       const text = (item.innerText || item.textContent || "").replace(/\s+/g, " ");
       if (/saved for later|sponsored|discover more|buy it again/i.test(text)) return false;
-      if (!item.querySelector?.("a[href*='/dp/'], a[href*='/gp/product/']")) return false;
-      if (!item.querySelector?.("button[aria-label*='Delete' i], input[aria-label*='Delete' i], button[title*='Delete' i], input[value*='Delete' i], button[value*='Delete' i], button[data-action*='delete' i], input[data-action*='delete' i], button[name*='delete' i], input[name*='delete' i], [data-itemtype='active'], .sc-list-item")) return false;
+      if (!cartItemAsin(item)) return false;
+      if (!item.querySelector?.("button[aria-label*='Delete' i], input[aria-label*='Delete' i], button[title*='Delete' i], input[value*='Delete' i], button[value*='Delete' i], button[data-action*='delete' i], input[data-action*='delete' i], button[name*='delete' i], input[name*='delete' i], [data-itemtype='active'], .sc-list-item, [data-quantity], [data-a-selector*='stepper' i], select[name='quantity'], input[name='quantity']")) return false;
       if (seen.has(item)) return false;
       seen.add(item);
       return true;
@@ -1723,14 +1772,34 @@ function canClearCart(activeJob) {
 }
 
 function cartItemAsin(item) {
-  const direct = String(item.getAttribute("data-asin") || "").toUpperCase();
-  if (/^[A-Z0-9]{10}$/.test(direct)) return direct;
-  const link = [...item.querySelectorAll("a[href]")].find((anchor) => /\/(?:dp|gp\/product)\/[A-Z0-9]{10}/i.test(anchor.href || anchor.getAttribute("href") || ""));
-  const href = link?.href || link?.getAttribute("href") || "";
-  const match = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
-  if (match) return match[1].toUpperCase();
-  const textMatch = (item.innerText || item.textContent || "").match(/\b([A-Z0-9]{10})\b/);
+  const attributeNodes = [item, ...item.querySelectorAll("[data-asin], [data-csa-c-asin]")];
+  for (const node of attributeNodes) {
+    const direct = String(node.getAttribute("data-asin") || node.getAttribute("data-csa-c-asin") || "").trim().toUpperCase();
+    if (/^[A-Z0-9]{10}$/.test(direct)) return direct;
+  }
+  for (const anchor of item.querySelectorAll("a[href]")) {
+    const href = anchor.href || anchor.getAttribute("href") || "";
+    const match = href.match(/\/(?:dp|gp\/product|gp\/aw\/d|product-reviews)\/([A-Z0-9]{10})(?:[/?#]|$)/i)
+      || href.match(/[?&](?:asin|ASIN)=([A-Z0-9]{10})(?:[&#]|$)/);
+    if (match) return match[1].toUpperCase();
+  }
+  const markup = String(item.outerHTML || "");
+  const markupMatch = markup.match(/(?:data-(?:csa-c-)?asin=["']|\/(?:dp|gp\/product|gp\/aw\/d)\/)([A-Z0-9]{10})(?:["'/?#&]|$)/i);
+  if (markupMatch) return markupMatch[1].toUpperCase();
+  const textMatch = (item.innerText || item.textContent || "").match(/\b(B[A-Z0-9]{9})\b/i);
   return textMatch ? textMatch[1].toUpperCase() : "";
+}
+
+function cartDiagnosticSummary() {
+  const items = cartActiveItems();
+  const parts = items.map((item) => {
+    const asin = cartItemAsin(item) || "unreadable-ASIN";
+    return `${asin} qty ${cartItemQuantity(item)}`;
+  });
+  const roots = cartActiveRoots().length;
+  return parts.length
+    ? `Detected cart rows: ${parts.join(", ")}.`
+    : `Detected ${roots} active cart container(s), but no readable active item rows.`;
 }
 
 function expectedCartQuantities(activeJob) {
@@ -1776,7 +1845,7 @@ function smartWagonAddedCartState(activeJob, expected) {
 }
 
 function verifyCartQuantities(activeJob) {
-  const activeCart = document.querySelector("#sc-active-cart");
+  const activeCart = cartActiveRoots()[0] || null;
   const expected = expectedCartQuantities(activeJob);
   if (!Object.keys(expected).length) return { ok: true, exact: false };
   const items = cartActiveItems();
@@ -3541,21 +3610,21 @@ async function handleCart(activeJob) {
         ? activeJob.cartAddVerificationRetries
         : {};
       const retryCount = Number(retries[retryKey] || 0);
-      if (retryCount < 1) {
+      if (retryCount < MAX_CART_VERIFICATION_RELOADS) {
         activeJob.cartAddVerificationRetries = { ...retries, [retryKey]: retryCount + 1 };
         activeJob.stage = "cart";
         await setActiveJob(activeJob, { reason: "recheck_unverified_cart_add" });
         showPanel(
           "Rechecking Amazon cart",
-          `ASIN ${expectedAsin} is not readable in the active cart yet. Reloading the cart once without clicking Add to cart again.`,
+          `ASIN ${expectedAsin} is not readable in the active cart yet. Stabilization check ${retryCount + 1} of ${MAX_CART_VERIFICATION_RELOADS}; reloading without clicking Add to cart again.`,
           null,
           null,
         );
-        await sleep(1500);
+        await sleep(1500 * (retryCount + 1));
         location.reload();
         return;
       }
-      const message = `Could not verify ASIN ${expectedAsin} in the Amazon cart after reloading it. Expected ${expectedQuantity}, cart has ${actualQuantity}. Checkout was stopped without clicking Add to cart a second time.`;
+      const message = `Could not verify ASIN ${expectedAsin} in the Amazon cart after ${MAX_CART_VERIFICATION_RELOADS} stabilization reloads. Expected ${expectedQuantity}, cart has ${actualQuantity}. ${cartDiagnosticSummary()} Checkout was stopped without clicking Add to cart a second time.`;
       showPanel("Cart verification needs review", message, null, null);
       await send({
         type: "FAIL_JOB",
@@ -3647,23 +3716,24 @@ async function handleCart(activeJob) {
       const retries = activeJob.cartAddVerificationRetries && typeof activeJob.cartAddVerificationRetries === "object"
         ? activeJob.cartAddVerificationRetries
         : {};
-      if (missingIndex >= 0 && Number(retries[retryKey] || 0) < 1) {
-        activeJob.cartAddVerificationRetries = { ...retries, [retryKey]: Number(retries[retryKey] || 0) + 1 };
+      const retryCount = Number(retries[retryKey] || 0);
+      if (missingIndex >= 0 && retryCount < MAX_CART_VERIFICATION_RELOADS) {
+        activeJob.cartAddVerificationRetries = { ...retries, [retryKey]: retryCount + 1 };
         activeJob.stage = "cart";
         await setActiveJob(activeJob, { reason: "recheck_missing_final_cart_item" });
         showPanel(
           "Rechecking complete cart",
-          `ASIN ${missingAsin} is not readable in the complete cart yet. Reloading the cart once without clicking Add to cart again.`,
+          `ASIN ${missingAsin} is not readable in the complete cart yet. Stabilization check ${retryCount + 1} of ${MAX_CART_VERIFICATION_RELOADS}; reloading without clicking Add to cart again.`,
           null,
           null,
         );
-        await sleep(1500);
+        await sleep(1500 * (retryCount + 1));
         location.reload();
         return;
       }
     }
     if (mismatch?.mismatch_type === "missing_from_cart") {
-      const message = `Amazon cart stayed empty after Add to cart for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart showed 0. This may be a cart timing or parser issue, so the order was paused as an error instead of moved to Missing ASINs.`;
+      const message = `Amazon cart stayed empty after Add to cart for ASIN ${missingAsin}. Customer ordered ${mismatch.expected}, Amazon cart showed 0. ${cartDiagnosticSummary()} This may be a cart timing or parser issue, so the order was paused as an error instead of moved to Missing ASINs.`;
       showPanel("Cart verification needs review", message, null, null);
       await send({
         type: "FAIL_JOB",
@@ -3678,7 +3748,7 @@ async function handleCart(activeJob) {
       return;
     }
     if (mismatch && Number(mismatch.actual || 0) <= 0) {
-      const message = `Could not verify ASIN ${missingAsin} in the Amazon cart after Add to cart. Customer ordered ${mismatch.expected}, Amazon cart showed ${mismatch.actual}. This may be a cart timing or parser issue, so the order was paused as an error instead of moved to Missing ASINs.`;
+      const message = `Could not verify ASIN ${missingAsin} in the Amazon cart after Add to cart. Customer ordered ${mismatch.expected}, Amazon cart showed ${mismatch.actual}. ${cartDiagnosticSummary()} This may be a cart timing or parser issue, so the order was paused as an error instead of moved to Missing ASINs.`;
       showPanel("Cart verification needs review", message, null, null);
       await send({
         type: "FAIL_JOB",
@@ -3932,8 +4002,15 @@ function addressRowForRecipient(name) {
   const wanted = normalizedText(name);
   if (!wanted) return null;
   return checkoutAddressRows().find((row) => {
-    const text = normalizedText(row.innerText || row.textContent);
-    return text.includes(wanted) && rowMatchesWarehouseAddress(row);
+    const data = addressDataForRow(row);
+    const recipient = normalizedText(
+      data.fullName
+      || row.querySelector?.("[data-testid='address-row-radio-name']")?.textContent
+      || row.querySelector?.("[data-test-id*='recipient'], [data-testid*='recipient']")?.textContent
+      || String(row.innerText || row.textContent || "").split(/\r?\n/).find((line) => line.trim())
+      || "",
+    );
+    return recipient === wanted && rowMatchesWarehouseAddress(row);
   }) || null;
 }
 
@@ -4056,33 +4133,7 @@ function elementReadableText(element) {
 }
 
 function checkoutShowsRecipient(name) {
-  const wanted = normalizedText(name);
-  if (!wanted) return false;
-  const roots = [
-    ...document.querySelectorAll(
-      [
-        "#change-delivery-link",
-        "a[aria-label*='Delivering to' i]",
-        "a[aria-label*='delivery address' i]",
-        "a[href*='shipaddressselect']",
-        "a[href*='ChangeDelivery']",
-      ].join(", "),
-    ),
-  ];
-  const deliveryHeading = document.querySelector("#deliver-to-customer-text");
-  if (deliveryHeading) roots.push(deliveryHeading.closest?.("a, .a-row, .a-section, div") || deliveryHeading);
-  const deliveryAddress = document.querySelector("#deliver-to-address-text");
-  if (deliveryAddress) roots.push(deliveryAddress.closest?.("a, .a-row, .a-section, div") || deliveryAddress);
-  for (const radio of [...document.querySelectorAll("input[type='radio']:checked")]) {
-    const row = radio.closest?.("[data-testid^='address-row-'], .address-row, .a-box, .a-row, div");
-    if (row) roots.push(row);
-  }
-  for (const root of roots) {
-    if (!root || root.closest?.("#nutricity-panel") || root.closest?.(".a-popover, .a-popover-preload")) continue;
-    const text = normalizedText(elementReadableText(root));
-    if (text.includes(wanted) && rowMatchesWarehouseAddress(root)) return true;
-  }
-  return false;
+  return checkoutDeliveryRecipientMatches(name) && checkoutShowsWarehouseAddress();
 }
 
 function currentCheckoutDeliveryText() {
@@ -4127,16 +4178,19 @@ function checkoutPageShowsExpectedDelivery(name) {
   const deliveryStart = bodyText.search(/\bDelivering\s+to\b/i);
   if (deliveryStart < 0) return false;
   const deliveryText = normalizedText(bodyText.slice(deliveryStart, deliveryStart + 600));
-  if (!deliveryText.includes(wanted)) return false;
   const visibleHeading = normalizedText(document.querySelector("#deliver-to-customer-text")?.textContent || "");
-  if (visibleHeading && !visibleHeading.includes(wanted)) return false;
+  if (visibleHeading && visibleHeading !== wanted) return false;
+  if (!visibleHeading && !checkoutDeliveryRecipientMatches(name)) return false;
   return warehouseAddressTokens().some((token) => deliveryText.includes(token));
 }
 
 function checkoutDeliveryRecipientText() {
   const direct = document.querySelector("#deliver-to-customer-text");
+  const directText = (direct?.innerText || direct?.textContent || "").replace(/\s+/g, " ").trim();
+  if (direct && visible(direct) && directText) {
+    return directText.replace(/^delivering\s+to\s+/i, "").trim();
+  }
   const candidates = [
-    direct,
     ...document.querySelectorAll(
       [
         "#change-delivery-link",
@@ -4151,10 +4205,29 @@ function checkoutDeliveryRecipientText() {
   ].filter(Boolean);
   for (const element of candidates) {
     if (!visible(element)) continue;
-    const text = elementReadableText(element).replace(/\s+/g, " ").trim();
-    if (/^delivering\s+to\s+/i.test(text)) return text.replace(/^delivering\s+to\s+/i, "").trim();
-    const embedded = text.match(/\bDelivering\s+to\s+(.+?)(?:\s+\d{3,}|\s+Edit delivery preferences|\s+Deliver to multiple addresses|\s+Change delivery address|$)/i);
-    if (embedded?.[1]) return embedded[1].trim();
+    const nestedHeading = element.querySelector?.("h1, h2, h3, [id*='deliver-to-customer']");
+    const nestedHeadingText = (nestedHeading?.innerText || nestedHeading?.textContent || "").replace(/\s+/g, " ").trim();
+    if (nestedHeadingText) {
+      return nestedHeadingText.replace(/^delivering\s+to\s+/i, "").trim();
+    }
+    // Read each source independently. Concatenating innerText, textContent and
+    // aria-label repeats the same recipient on Amazon Business checkout and
+    // makes a correct exact match look unsafe.
+    const variants = [...new Set([
+      element.innerText,
+      element.textContent,
+      element.getAttribute?.("aria-label"),
+      element.getAttribute?.("title"),
+    ].filter(Boolean).map((value) => String(value).replace(/\s+/g, " ").trim()))];
+    for (const text of variants) {
+      if (/^delivering\s+to\s+/i.test(text)) {
+        const recipient = text.replace(/^delivering\s+to\s+/i, "").trim();
+        const beforeAddress = recipient.match(/^(.+?)(?:\s+\d{3,}|\s+Edit delivery preferences|\s+Deliver to multiple addresses|\s+Change delivery address|$)/i);
+        if (beforeAddress?.[1]) return beforeAddress[1].trim();
+      }
+      const embedded = text.match(/\bDelivering\s+to\s+(.+?)(?:\s+\d{3,}|\s+Edit delivery preferences|\s+Deliver to multiple addresses|\s+Change delivery address|$)/i);
+      if (embedded?.[1]) return embedded[1].trim();
+    }
   }
   const bodyText = (document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ").trim();
   const bodyMatch = bodyText.match(/\bDelivering\s+to\s+(.+?)(?:\s+\d{3,}|\s+Edit delivery preferences|\s+Deliver to multiple addresses|\s+Change delivery address|$)/i);
@@ -4165,22 +4238,12 @@ function checkoutDeliveryRecipientText() {
 function checkoutDeliveryRecipientMatches(name) {
   const deliveredTo = normalizedText(checkoutDeliveryRecipientText());
   const wanted = normalizedText(name);
-  return Boolean(deliveredTo && wanted && (
-    deliveredTo === wanted ||
-    deliveredTo.includes(wanted) ||
-    wanted.includes(deliveredTo)
-  ));
+  return Boolean(deliveredTo && wanted && deliveredTo === wanted);
 }
 
 function checkoutRecipientConfirmed(name) {
   if (checkoutPageShowsExpectedDelivery(name)) return true;
-  if ((checkoutDeliveryRecipientMatches(name) && checkoutShowsWarehouseAddress()) || checkoutShowsRecipient(name)) return true;
-  const wanted = normalizedText(name);
-  if (!wanted) return false;
-  const visibleDeliveryText = normalizedText(currentCheckoutDeliveryText());
-  if (!visibleDeliveryText.includes(wanted)) return false;
-  const tokens = warehouseAddressTokens();
-  return tokens.some((token) => visibleDeliveryText.includes(token));
+  return checkoutDeliveryRecipientMatches(name) && checkoutShowsWarehouseAddress();
 }
 
 async function markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, message = "Verified delivery address. Continuing checkout.") {
@@ -4377,6 +4440,13 @@ function findDeliverToThisAddressButton() {
     "input[data-testid='ab-select-address-continue-button-bottom'], #ab-select-address-continue-button-bottom input, input[aria-labelledby='ab-select-address-continue-button-bottom-announce']",
   )].find((element) => visible(element) && !element.disabled);
   return direct || findButtonByText(["deliver to this address", "use this address"]);
+}
+
+function checkoutAddressSelectionPageOpen() {
+  return !findAddressNameInput()
+    && !findPlaceOrderButton()
+    && checkoutAddressRows().length > 0
+    && Boolean(findDeliverToThisAddressButton());
 }
 
 // Amazon sometimes saves an edited address immediately and navigates straight
@@ -4833,6 +4903,84 @@ function findPlaceOrderButton() {
   });
 }
 
+function findSnsPaymentConfirmationCheckbox() {
+  return document.querySelector(
+    "input#SnsPaymentConfirmationImb[name='SnsPaymentConfirmationImb'], [data-client-component='PrimaryActionBlockerCheckbox'] input[name='SnsPaymentConfirmationImb']",
+  );
+}
+
+function snsPaymentConfirmationIsBlocking() {
+  const checkbox = findSnsPaymentConfirmationCheckbox();
+  if (!checkbox || checkbox.checked) return false;
+  const blocker = checkbox.closest?.("[data-client-component='PrimaryActionBlockerCheckbox'], [data-blocker-message], .a-checkbox");
+  const text = normalizedText([
+    blocker?.getAttribute?.("data-blocker-message"),
+    blocker?.innerText,
+    blocker?.textContent,
+  ].filter(Boolean).join(" "));
+  return text.includes("subscribe and save payment method")
+    || text.includes("use this payment method for your subscribe & save subscription")
+    || text.includes("use this payment method for your subscribe and save subscription");
+}
+
+async function ensureSnsPaymentConfirmation(activeJob) {
+  const checkbox = findSnsPaymentConfirmationCheckbox();
+  if (!checkbox || checkbox.checked) return true;
+  if (!snsPaymentConfirmationIsBlocking()) return true;
+
+  const label = document.querySelector(`label[for='${checkbox.id}']`) || checkbox.closest?.("label");
+  showPanel("Nutricity checkout", "Accepting the selected payment method for Subscribe & Save.", null, null);
+  await clickElement(label || checkbox, "Subscribe & Save payment confirmation checkbox");
+  const checked = await waitUntil(() => findSnsPaymentConfirmationCheckbox()?.checked === true, 3000, 100);
+  if (!checked) {
+    await pauseForManualCheckout(activeJob, "Amazon requires confirmation of the Subscribe & Save payment method, but the checkbox did not stay selected.");
+    return false;
+  }
+  activeJob.snsPaymentConfirmationAcceptedAt = Date.now();
+  await setActiveJob(activeJob);
+  return true;
+}
+
+async function recoverBlockedSnsSubmit(activeJob) {
+  if (
+    !activeJob?.placeOrderClickStartedAt
+    || !submittedStage(activeJob)
+    || !snsPaymentConfirmationIsBlocking()
+  ) return false;
+
+  const checkoutRecipient = recipientName(activeJob);
+  if (!checkoutRecipientConfirmed(checkoutRecipient) || !checkoutShowsWarehouseAddress()) {
+    await pauseForManualCheckout(activeJob, "Subscribe & Save confirmation appeared after submit, but the final delivery recipient or warehouse address is no longer verified.", "complete_pending");
+    return true;
+  }
+  const extensionState = await getExtensionState();
+  const cardPreferences = cardPreferenceList(extensionState.cardLast4Preference);
+  if (!checkoutPaymentConfirmed(cardPreferences)) {
+    await pauseForManualCheckout(activeJob, "Subscribe & Save confirmation appeared after submit, but the checkout payment method is no longer verified.", "complete_pending");
+    return true;
+  }
+  if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return true;
+  if (!await ensureSubscribeCheckoutQuantity(activeJob)) return true;
+  if (!await checkoutDeliveryWindowIsAllowed(activeJob)) return true;
+  if (!await ensureSnsPaymentConfirmation(activeJob)) return true;
+
+  const placeOrder = findPlaceOrderButton();
+  if (!placeOrder || placeOrder.disabled) {
+    await pauseForManualCheckout(activeJob, "Subscribe & Save payment was confirmed, but Amazon no longer shows an enabled Place your order button.", "complete_pending");
+    return true;
+  }
+  // protectBeforeAmazonSubmit already succeeded before the blocked click. Keep
+  // that same protected job identity and retry the Amazon control only once;
+  // calling protection again would intentionally look like a duplicate submit.
+  showPanel("Final step", "Subscribe & Save payment confirmed. Retrying the protected Place Order click once.", null, null);
+  activeJob.snsBlockedSubmitRecoveredAt = Date.now();
+  activeJob.placeOrderClickStartedAt = Date.now();
+  activeJob.stage = "complete_pending";
+  await setActiveJob(activeJob);
+  await clickElement(placeOrder, "Place your order after Subscribe & Save payment confirmation");
+  return true;
+}
+
 function isOnePercentDeliveryRewardText(value = "") {
   const text = normalizedText(value);
   if (!text.includes("1%")) return false;
@@ -4928,15 +5076,80 @@ function rewardedLaterDeliverySelected() {
     || checkoutOffersOnePercentDeliveryReward() && isAmazonDayDeliveryContext(context);
 }
 
+function brooklynWeekday(now = new Date()) {
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short",
+    }).format(now);
+  } catch {
+    return "";
+  }
+}
+
+function brooklynNextDayIsWarehouseHoliday(now = new Date()) {
+  // The warehouse is closed Saturday and Sunday. A Friday/Saturday checkout
+  // should therefore use Amazon's rewarded later delivery; every other
+  // Brooklyn weekday should keep the free next-day option.
+  return ["Fri", "Sat"].includes(brooklynWeekday(now));
+}
+
+function freeNextDayDeliveryOption() {
+  const contexts = [...document.querySelectorAll("input[type='radio']")]
+    .filter((radio) => !radio.disabled)
+    .map(deliveryRadioContext);
+  return contexts.find((context) => {
+    const text = normalizedText(context.text || "").toLowerCase();
+    return /\bfree\b/.test(text)
+      && (/\btomorrow\b/.test(text) || /\bnext[ -]?day\b/.test(text) || /\bone[ -]?day\b/.test(text))
+      && !isAmazonDayDeliveryContext(context);
+  }) || null;
+}
+
+function freeNextDayDeliverySelected() {
+  return [...document.querySelectorAll("input[type='radio']:checked")]
+    .filter((radio) => !radio.disabled)
+    .map(deliveryRadioContext)
+    .some((context) => {
+      const text = normalizedText(context.text || "").toLowerCase();
+      return /\bfree\b/.test(text)
+        && (/\btomorrow\b/.test(text) || /\bnext[ -]?day\b/.test(text) || /\bone[ -]?day\b/.test(text))
+        && !isAmazonDayDeliveryContext(context);
+    });
+}
+
+async function ensureFreeNextDayDelivery(activeJob, brooklynDay) {
+  const nextDay = freeNextDayDeliveryOption();
+  if (!nextDay?.radio || !nextDay?.control || freeNextDayDeliverySelected()) return true;
+  showPanel(
+    "Free next-day delivery",
+    `Brooklyn is ${brooklynDay || "not a warehouse-holiday day"}; selecting ${nextDay.text}.`,
+    null,
+    null,
+  );
+  await clickElement(nextDay.control, "free next-day delivery option");
+  // Amazon replaces the delivery-option markup after selection.  Re-query the
+  // checked radio instead of reading `.checked` from the label/control or a
+  // detached pre-click radio node.
+  const selected = await waitUntil(freeNextDayDeliverySelected, 12000, 300);
+  if (!selected) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Amazon showed a free next-day delivery option, but did not confirm its selection. Option text: ${nextDay.text}`,
+      "checkout",
+    );
+    return false;
+  }
+  await sleep(1200);
+  return true;
+}
+
 async function ensureRewardedLaterDelivery(activeJob) {
   const state = await getExtensionState();
-  const today = new Date().getDay();
-  // Amazon offers the 1% reward for accepting a later delivery. By default
-  // use it only when placing on Friday or Saturday; Sunday keeps Amazon's
-  // default. The holiday setting deliberately extends this preference to
-  // any other weekday without changing the normal Sunday rule.
-  const shouldPreferReward = today === 5 || today === 6 || state.preferRewardedLaterDelivery === true;
-  if (!shouldPreferReward) return true;
+  const brooklynDay = brooklynWeekday();
+  const shouldPreferReward = state.preferRewardedLaterDelivery === true
+    && brooklynNextDayIsWarehouseHoliday();
+  if (!shouldPreferReward) return ensureFreeNextDayDelivery(activeJob, brooklynDay);
   if (rewardedLaterDeliverySelected()) return true;
 
   const rewardOption = fridayRewardDeliveryOption();
@@ -4957,8 +5170,10 @@ async function ensureRewardedLaterDelivery(activeJob) {
     null,
   );
   await sendDiagnostic("Selecting later delivery option with 1% reward.", {
-    day_of_week: today,
-    warehouse_holiday_override: state.preferRewardedLaterDelivery === true,
+    brooklyn_weekday: brooklynDay,
+    brooklyn_timezone: "America/New_York",
+    next_day_is_warehouse_holiday: true,
+    warehouse_holiday_preference: state.preferRewardedLaterDelivery === true,
     option_count: rewardOption.optionCount,
     option_text: rewardOption.text,
   });
@@ -5687,6 +5902,48 @@ async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
       return true;
     }
   }
+  // Amazon's Change-address action navigates to an intermediate address-list
+  // page. That page deliberately has no final "Delivering to" summary, so it
+  // must be handled as an editable checkout state rather than as an unsafe
+  // final checkout. Prefer an already exact warehouse row; otherwise open only
+  // the verified Nutricity warehouse row's editor and let the next pass save it.
+  if (checkoutAddressSelectionPageOpen()) {
+    const recipientRow = addressRowForRecipient(checkoutRecipient);
+    if (recipientRow) {
+      const selectedRow = selectedCheckoutAddressRow();
+      if (selectedRow !== recipientRow && !recipientRow.contains(selectedRow)) {
+        const recipientControl = addressSelectionControl(recipientRow);
+        if (recipientControl) {
+          showPanel("Nutricity checkout", `Selecting delivery address for ${checkoutRecipient}.`, null, null);
+          await clickElement(recipientControl, "Recipient address row");
+          await sleep(700);
+        }
+      }
+      const selectedAfterClick = selectedCheckoutAddressRow();
+      if (selectedAfterClick === recipientRow || recipientRow.contains(selectedAfterClick)) {
+        const deliverButton = findDeliverToThisAddressButton();
+        if (deliverButton) {
+          showPanel("Nutricity checkout", "Exact recipient address selected. Returning to checkout.", null, null);
+          await clickElement(deliverButton, "Deliver to this address button");
+          return false;
+        }
+      }
+    }
+
+    activeJob.stage = "editing_address";
+    activeJob.editAddressClickedAt = Date.now();
+    await setActiveJob(activeJob);
+    const editor = await openAddressEditorIfAvailable(activeJob);
+    if (editor) {
+      showPanel("Nutricity checkout", `Editing the verified warehouse address for ${checkoutRecipient}.`, null, null);
+      return false;
+    }
+    await pauseForManualCheckout(
+      activeJob,
+      `Amazon showed its address list, but no editable Nutricity warehouse row was available for ${checkoutRecipient}.`,
+    );
+    return false;
+  }
   const deliveredTo = checkoutDeliveryRecipientText();
   const placeOrderVisible = Boolean(findPlaceOrderButton());
   if (!deliveredTo) {
@@ -5980,6 +6237,7 @@ async function handleCheckout(activeJob) {
   if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
   if (!await ensureRewardedLaterDelivery(activeJob)) return;
+  if (!await ensureSnsPaymentConfirmation(activeJob)) return;
 
   const placeOrder = await waitUntil(findPlaceOrderButton, 20000, 500)
     || await waitForElement([
@@ -6139,7 +6397,11 @@ async function forceOrderReportingFromSubmittedPage(activeJob, reason = "") {
     reason,
   }, "warn");
   if (!submittedOrPausedStage(activeJob) && !activeJobWasSubmittedToAmazon(activeJob)) {
-    await send({ type: "MARK_ORDER_SUBMITTED" }).catch((error) => {
+    await send({
+      type: "MARK_ORDER_SUBMITTED",
+      groupKey: activeJob?.job?.group_key || "",
+      workerId: activeJob?.workerId || "",
+    }).catch((error) => {
       sendDiagnostic("Could not mark job submitted during submitted-page guard.", {
         message: error?.message || String(error || ""),
       }, "warn");
@@ -6175,6 +6437,16 @@ async function guardUnexpectedAmazonPage(activeJob) {
   ) {
     await forceOrderReportingFromSubmittedPage(activeJob, "Amazon confirmation URL or placed-order text detected.");
     return true;
+  }
+  // A failed job is intentionally sent through order history before its cart
+  // cleanup starts. Let that narrowly scoped recovery state reach
+  // handleFailureCleanup; all normal pre-submit jobs remain protected below.
+  if (
+    (isOrderHistoryPage() || isOrderDetailsPage())
+    && activeJob?.stage === "cleanup_after_failure"
+    && activeJob?.cleanupAfterFailure === true
+  ) {
+    return false;
   }
   if ((isOrderHistoryPage() || isOrderDetailsPage()) && !submittedOrPausedStage(activeJob) && !activeJobWasSubmittedToAmazon(activeJob)) {
     activeJob.paused = true;
@@ -6258,7 +6530,11 @@ function amazonDuplicateOrderPage() {
 }
 
 async function protectBeforeAmazonSubmit(activeJob, retryStage = "checkout") {
-  const result = await send({ type: "MARK_ORDER_SUBMITTED" });
+  const result = await send({
+    type: "MARK_ORDER_SUBMITTED",
+    groupKey: activeJob?.job?.group_key || "",
+    workerId: activeJob?.workerId || "",
+  });
   if (!result?.ok) {
     if (result?.duplicate_submit_blocked && result?.protected_in_current_window) {
       // The previous click in this same worker was already protected.  It may
@@ -6574,7 +6850,15 @@ function orderDetailsPageDetails() {
 }
 
 function recipientFromOrderHistoryText(text = "") {
-  const value = String(text || "").replace(/\s+/g, " ").trim();
+  let value = String(text || "").replace(/\s+/g, " ").trim();
+  // Amazon's a-truncate-full node can contain both its visible and hidden
+  // recipient copies without whitespace (for example
+  // "Nutricity NC23225Nutricity NC23225"). Collapse an exact repeated half
+  // before parsing so a correct newest order card remains matchable.
+  if (value.length % 2 === 0) {
+    const midpoint = value.length / 2;
+    if (value.slice(0, midpoint) === value.slice(midpoint)) value = value.slice(0, midpoint);
+  }
   // Recipient suffixes can contain decimal product strengths such as
   // "2.5mg". Preserve punctuation here: collapsing "NC18106 2" into
   // "NC181062" breaks the exact-recipient guard and leaves a correct
@@ -6593,8 +6877,8 @@ function recipientFromOrderHistoryText(text = "") {
 function orderCardRecipient(card) {
   const orderId = orderCardOrderId(card);
   const selectors = [
-    ".shipToTriggerTextTruncate .a-truncate-full",
     ".shipToTriggerTextTruncate .a-truncate-cut",
+    ".shipToTriggerTextTruncate .a-truncate-full",
     "[data-a-popover*='PreloadedContent_'] .shipToTriggerTextTruncate .a-truncate-full",
     "[data-a-popover*='PreloadedContent_'] .shipToTriggerTextTruncate .a-truncate-cut",
     ".shipToTriggerTextTruncate",
@@ -7996,12 +8280,12 @@ async function handleOrderHistory(activeJob) {
     // and recipient/ASIN guards still run once actual order cards appear.
     const emptyReloads = Number(activeJob.orderHistoryEmptyReloads || 0);
     const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
-    if (emptyReloads < 4 && lookupAge < 90000) {
+    if (emptyReloads < 1 && lookupAge < 30000) {
       activeJob.orderHistoryEmptyReloads = emptyReloads + 1;
       await setActiveJob(activeJob);
       showPanel(
         "Nutricity fulfilment",
-        `Amazon order history loaded without order cards. Reloading the incomplete page (${emptyReloads + 1}/4).`,
+        "Amazon order history loaded without order cards. Reloading it once before holding this order for verification.",
         null,
         null,
       );
@@ -8020,13 +8304,12 @@ async function handleOrderHistory(activeJob) {
   if (selection.ambiguous) {
     const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
     if (lookupAge > 120000) {
-      const message = `Amazon history still has multiple matching cards for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key} after ${Math.round(lookupAge / 1000)} seconds. It was not assigned automatically, so the queue can continue safely.`;
-      const result = await send({
-        type: "SUBMIT_UNCERTAIN",
-        message,
-        failureCode: "ambiguous_submitted_order_history",
-      });
-      showPanel("Chrome fulfilment needs review", result?.message || message, null, null);
+      const message = `Amazon history still has multiple matching cards for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key} after ${Math.round(lookupAge / 1000)} seconds. This submitted order remains locked; the queue will not continue until one Amazon order ID is verified and reported to Odoo.`;
+      activeJob.paused = true;
+      activeJob.pausedStage = "find_order_id";
+      activeJob.lastError = message;
+      await setActiveJob(activeJob);
+      showPanel("Chrome fulfilment held for verification", message, null, null);
       return;
     }
     showPanel(
@@ -8040,13 +8323,12 @@ async function handleOrderHistory(activeJob) {
   if (!orders.length && !rememberedOrder) {
     const lookupAge = Date.now() - Number(activeJob.orderHistoryLookupStartedAt || Date.now());
     if (lookupAge > 120000) {
-      const message = `Amazon Place Order was submitted for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}, but no matching Amazon order appeared in order history after ${Math.round(lookupAge / 1000)} seconds. Marking as Chrome error instead of Missing so it can be reviewed without blocking the queue.`;
-      const result = await send({
-        type: "SUBMIT_UNCERTAIN",
-        message,
-        failureCode: "submitted_order_not_found",
-      });
-      showPanel("Chrome fulfilment needs review", result?.message || message, null, null);
+      const message = `Amazon Place Order was submitted for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key}, but no matching Amazon order appeared after ${Math.round(lookupAge / 1000)} seconds. This order remains locked; the queue will not continue until its Amazon order ID is verified and reported to Odoo.`;
+      activeJob.paused = true;
+      activeJob.pausedStage = "find_order_id";
+      activeJob.lastError = message;
+      await setActiveJob(activeJob);
+      showPanel("Chrome fulfilment held for verification", message, null, null);
       return;
     }
     showPanel("Nutricity fulfilment", `Looking for recent Amazon order for ${activeJob.job.recipient_name}.`, null, null);
@@ -8133,6 +8415,28 @@ async function reportAmazonOrders(activeJob, orders) {
       asins: (order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean),
     });
   }
+  if (!uniqueOrders.length) {
+    activeJob.stage = "find_order_id";
+    activeJob.reportedOrderId = "";
+    activeJob.reportAttemptedAt = null;
+    activeJob.reportError = "Amazon order history did not provide a valid order ID.";
+    await setActiveJob(activeJob, {
+      allowUnpause: true,
+      allowStageRegression: true,
+      reason: "invalid_order_history_report_candidate",
+    });
+    await sendDiagnostic("Blocked an empty Amazon order completion report.", {
+      group_key: activeJob?.job?.group_key || "",
+      candidates: orders || [],
+    }, "error");
+    showPanel(
+      "Nutricity fulfilment",
+      `Amazon has not exposed a valid order number for ${activeJobOrderLabel(activeJob) || activeJob.job.group_key} yet. Continuing safe order-history verification.`,
+      null,
+      null,
+    );
+    return false;
+  }
   const unsafeOrders = uniqueOrders.filter((order) => !recentOrderMatchesActiveJob(order, activeJob));
   if (unsafeOrders.length) {
     const message = `Refused to report Amazon order ${unsafeOrders.map((order) => order.amazon_order_id).join(", ")}: its history recipient or ASINs do not match ${recipientName(activeJob)}.`;
@@ -8199,6 +8503,8 @@ async function reportAmazonOrders(activeJob, orders) {
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       result = await send({
         type: "COMPLETE_JOB",
+        groupKey: activeJob?.job?.group_key || "",
+        workerId: activeJob?.workerId || "",
         orderId,
         orderUrl: uniqueOrders[0]?.amazon_order_url || orderDetailsUrl(orderId),
         orderDate: uniqueOrders[0]?.order_date || "",
@@ -8294,16 +8600,19 @@ async function autoResumeResolvedCheckoutPause(activeJob) {
   if (!/\/checkout/i.test(location.pathname)) return false;
   const pausedStage = String(activeJob?.pausedStage || activeJob?.stage || "");
   if (!["checkout", "editing_address"].includes(pausedStage)) return false;
-  const checkoutRecipient = recipientName(activeJob);
-  const extensionState = await getExtensionState();
   const placeOrder = findPlaceOrderButton();
   if (
     placeOrder &&
     !placeOrder.disabled &&
-    !findAddressNameInput() &&
-    checkoutRecipientConfirmed(checkoutRecipient) &&
-    checkoutPaymentConfirmed(cardPreferenceList(extensionState.cardLast4Preference))
+    !findAddressNameInput()
   ) {
+    // A reload can preserve a manual editing_address pause after Amazon has
+    // already returned to the final checkout page. Do not require the stale
+    // address/payment parser result to clear that pause: the normal checkout
+    // path immediately re-verifies recipient, warehouse, payment, exact unit
+    // count, delivery window, and SNS confirmation before Place Order. This
+    // lets quantity mismatches (for example Amazon reducing 7 units to 5) be
+    // reported instead of leaving the worker frozen behind an obsolete pause.
     const next = {
       ...activeJob,
       stage: "checkout",
@@ -8316,7 +8625,7 @@ async function autoResumeResolvedCheckoutPause(activeJob) {
       addressVerifiedAt: Date.now(),
     };
     await setActiveJob(next, { allowUnpause: true, allowStageRegression: true, reason: "auto_resume_checkout_ready" });
-    showPanel("Nutricity checkout", "Checkout is ready. Resuming placement.", null, null);
+    showPanel("Nutricity checkout", "Final checkout is visible. Re-running all recipient, payment, quantity, and delivery guards.", null, null);
     return true;
   }
   return false;
@@ -8377,6 +8686,7 @@ async function run() {
     await reportPostSubmitUnplaced(activeJob, postSubmitUnplaced);
     return;
   }
+  if (await recoverBlockedSnsSubmit(activeJob)) return;
   if (
     /\/checkout/i.test(location.pathname)
     && findPlaceOrderButton()
@@ -8535,6 +8845,7 @@ async function run() {
     if (!shouldMarkItemMissing) {
       activeJob.pausedStage = activeJob.stage || "product";
       activeJob.paused = true;
+      activeJob.lastError = String(error.message || error || "Unknown fulfilment error").slice(0, 500);
       await setActiveJob(activeJob);
       showPanel(
         "Nutricity fulfilment needs attention",
@@ -8659,6 +8970,16 @@ document.addEventListener("visibilitychange", onVisibilityChange);
 registerContentCleanup(() => document.removeEventListener("visibilitychange", onVisibilityChange));
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === "NUTRICITY_CONTENT_PING") {
+    sendResponse({ ok: true, build: CONTENT_SCRIPT_BUILD });
+    return true;
+  }
+  if (message.type === "RUN_ACTIVE_JOB") {
+    lastNoActiveJobCheckAt = 0;
+    if (!fulfilmentForceStopped) setTimeout(runSafely, 0);
+    sendResponse({ ok: true });
+    return true;
+  }
   if (message.type !== "CHECK_ASIN_AVAILABILITY") return false;
   try {
     sendResponse(checkAsinAvailability(message.asin, message.deliveryLimitDays));
