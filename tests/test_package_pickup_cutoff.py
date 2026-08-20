@@ -5,6 +5,7 @@ from app.main import (
     normalize_package_pickup_time,
     package_pickup_business_date,
     package_pickup_delivery_timestamp,
+    package_tracker_delivery_date,
     package_tracker_delivery_kind,
 )
 
@@ -79,6 +80,12 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
         self.assertEqual(package_tracker_delivery_kind("Delivered August 18", ""), "delivered")
         self.assertEqual(package_tracker_delivery_kind("Delivery date currently unavailable", ""), "arriving")
         self.assertEqual(package_tracker_delivery_kind("We're sorry your delivery is late", ""), "exception")
+
+    def test_delivered_today_uses_the_brooklyn_calendar_date(self) -> None:
+        self.assertEqual(
+            package_tracker_delivery_date("Delivered today", "", "2026-08-21T01:15:00+00:00"),
+            "2026-08-20T00:00:00-04:00",
+        )
 
 
 if __name__ == "__main__":

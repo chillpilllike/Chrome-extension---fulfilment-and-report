@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-cart-missing-retry-v62";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-duplicate-order-pause-v63";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -27,6 +27,11 @@ window.__nutricityContentCleanup = () => {
 };
 
 const rawSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function fulfilmentPausedError() {
+  const error = new Error("Fulfilment paused by user.");
+  error.fulfilmentPaused = true;
+  return error;
+}
 async function sleep(ms, options = {}) {
   const pauseAware = options.pauseAware !== false;
   const deadline = Date.now() + Math.max(0, Number(ms || 0));
@@ -297,13 +302,17 @@ async function setActiveJob(activeJob, options = {}) {
       activeJob = next;
     }
   }
-  if (activeJob?.job?.group_key && options.allowUnpause !== true) {
+  if (activeJob?.job?.group_key) {
     latest = latest || await getActiveJob();
-    if (latest?.job?.group_key === activeJob.job.group_key && latest.paused && !activeJob.paused) {
+    const sameJob = latest?.job?.group_key === activeJob.job.group_key;
+    const preserveUserPause = sameJob && latest.paused && latest.pausedByUser;
+    const preserveOrdinaryPause = sameJob && options.allowUnpause !== true && latest.paused && !activeJob.paused;
+    if (preserveUserPause || preserveOrdinaryPause) {
       next = {
         ...activeJob,
         paused: true,
         pausedStage: latest.pausedStage || activeJob.pausedStage || activeJob.stage || "product",
+        pausedByUser: Boolean(latest.pausedByUser || activeJob.pausedByUser),
       };
     }
   }
@@ -411,6 +420,12 @@ async function setActiveJob(activeJob, options = {}) {
       return { ok: false, stale: true };
     }
   }
+  // If Pause was clicked while this flow was awaiting a background response,
+  // abort before it can perform the next click or location change. A user pause
+  // always wins even over narrowly scoped automatic-unpause recovery paths.
+  if (next.paused && next.pausedByUser && !activeJob.pausedByUser) {
+    throw fulfilmentPausedError();
+  }
   return send({ type: "SET_ACTIVE_JOB", activeJob: next, page: diagnosticPageInfo(), reason: options.reason || "" });
 }
 
@@ -425,15 +440,15 @@ async function isPaused() {
 }
 
 async function waitIfPaused() {
-  while (!fulfilmentForceStopped && await isPaused()) {
+  if (!fulfilmentForceStopped && await isPaused()) {
     const activeJob = await getActiveJob();
     showPanel(
       "Nutricity fulfilment paused",
-      "Fulfilment is paused. Click Resume to retry this step, or continue if you completed it manually.",
+      "Fulfilment is paused. No page actions will continue until you click Resume.",
       "I did it manually, continue",
       () => continueAfterManualStep(activeJob),
     );
-    await rawSleep(1000);
+    throw fulfilmentPausedError();
   }
 }
 
@@ -671,9 +686,8 @@ async function togglePanelPause(event) {
       );
     } else {
       showPanel("Nutricity fulfilment", `Resuming ${result?.stage || "last step"}.`, null, null);
-      // A paused waitIfPaused() loop resumes by itself. Starting a second run
-      // here could race the first flow all the way to Place Order. Only start a
-      // runner when the previous flow already returned after creating a pause.
+      // Pausing aborts the in-flight page flow. Resume starts a fresh runner so
+      // stale variables cannot continue clicking or navigating in the background.
       if (!window.__nutricityRunning) setTimeout(runSafely, 250);
     }
   } finally {
@@ -5145,8 +5159,36 @@ function selectedDeliveryRadioContext() {
   return selectedRadio ? deliveryRadioContext(selectedRadio) : null;
 }
 
+function deliveryTextCalendarDates(value = "", now = new Date()) {
+  const text = normalizedText(value || "");
+  const monthPattern = "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?";
+  return [...text.matchAll(new RegExp(`\\b(${monthPattern})\\.?\\s+(\\d{1,2})(?:,\\s*(\\d{4}))?`, "gi"))]
+    .map((match) => {
+      const year = Number(match[3] || now.getFullYear());
+      const month = new Date(`${match[1]} 1, ${year}`).getMonth();
+      const date = new Date(year, month, Number(match[2]));
+      if (!match[3] && date < new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)) {
+        date.setFullYear(date.getFullYear() + 1);
+      }
+      return date;
+    })
+    .filter((date) => Number.isFinite(date.getTime()));
+}
+
+function deliveryTextIncludesWarehouseClosedDay(value = "") {
+  const text = normalizedText(value || "");
+  if (/\b(?:sat(?:urday)?|sun(?:day)?)\b/i.test(text)) return true;
+  return deliveryTextCalendarDates(text).some((date) => [0, 6].includes(date.getDay()));
+}
+
+function deliveryTextNamesWarehouseOpenDay(value = "") {
+  const text = normalizedText(value || "");
+  if (/\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?)\b/i.test(text)) return true;
+  return deliveryTextCalendarDates(text).some((date) => date.getDay() >= 1 && date.getDay() <= 5);
+}
+
 function deliveryContextIncludesWarehouseClosedDay(context) {
-  return /\b(?:sat(?:urday)?|sun(?:day)?)\b/i.test(normalizedText(context?.text || ""));
+  return deliveryTextIncludesWarehouseClosedDay(context?.text || "");
 }
 
 function deliveryContextHasSplitPromise(context) {
@@ -5167,9 +5209,7 @@ function deliveryContextIsNotConsolidated(context) {
 }
 
 function deliveryContextNamesWarehouseOpenDay(context) {
-  return /\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?)\b/i.test(
-    normalizedText(context?.text || ""),
-  );
+  return deliveryTextNamesWarehouseOpenDay(context?.text || "");
 }
 
 function consolidatedWeekdayDeliveryOption() {
@@ -5195,6 +5235,56 @@ function consolidatedWeekdayDeliverySelected() {
     && !deliveryContextIsNotConsolidated(selected)
     && deliveryContextNamesWarehouseOpenDay(selected),
   );
+}
+
+function preferredAmazonDayWeekdayOption() {
+  return [...document.querySelectorAll("input[type='radio']")]
+    .filter((radio) => !radio.disabled)
+    .map(deliveryRadioContext)
+    .find((context) => (
+      context.radio
+      && context.control
+      && isAmazonDayDeliveryContext(context)
+      && !deliveryContextIsNotConsolidated(context)
+      && deliveryContextNamesWarehouseOpenDay(context)
+    )) || null;
+}
+
+function preferredAmazonDayWeekdaySelected() {
+  const selected = selectedDeliveryRadioContext();
+  return Boolean(
+    selected
+    && isAmazonDayDeliveryContext(selected)
+    && !deliveryContextIsNotConsolidated(selected)
+    && deliveryContextNamesWarehouseOpenDay(selected),
+  );
+}
+
+async function ensurePreferredAmazonDayWeekdayDelivery(activeJob) {
+  const option = preferredAmazonDayWeekdayOption();
+  if (!option?.control || preferredAmazonDayWeekdaySelected()) return true;
+  showPanel(
+    "Consolidated weekday delivery",
+    `Selecting Amazon's consolidated Monday-Friday delivery option: ${option.text}`,
+    null,
+    null,
+  );
+  await sendDiagnostic("Selecting the consolidated Amazon Day weekday delivery.", {
+    selected_option_text: selectedDeliveryRadioContext()?.text || "",
+    replacement_option_text: option.text,
+  });
+  await clickElement(option.control, "consolidated Amazon Day weekday delivery option");
+  const confirmed = await waitUntil(preferredAmazonDayWeekdaySelected, 12000, 300);
+  if (!confirmed) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Amazon offered a consolidated Monday-Friday Amazon Day delivery, but did not confirm its selection. Attempted option: ${option.text}`,
+      "checkout",
+    );
+    return false;
+  }
+  await sleep(1200);
+  return true;
 }
 
 async function ensureWarehouseOpenDayDelivery(activeJob) {
@@ -5313,6 +5403,12 @@ async function ensureRewardedLaterDelivery(activeJob) {
   const warehouseDaySelection = await ensureWarehouseOpenDayDelivery(activeJob);
   if (warehouseDaySelection !== null) return warehouseDaySelection;
 
+  // Dispatch benefits from one predictable weekday delivery. Whenever Amazon
+  // exposes an eligible Amazon Day option, prefer it over an earlier default
+  // even when that default is itself Monday-Friday.
+  if (!await ensurePreferredAmazonDayWeekdayDelivery(activeJob)) return false;
+  if (preferredAmazonDayWeekdaySelected()) return true;
+
   const state = await getExtensionState();
   const brooklynDay = brooklynWeekday();
   const shouldPreferReward = state.preferRewardedLaterDelivery === true
@@ -5374,15 +5470,18 @@ async function ensureFinalConsolidatedDelivery(activeJob) {
     const stableText = selectedDeliveryRadioContext()?.text || "";
     await sleep(1800);
     const afterSettle = selectedDeliveryRadioContext();
+    const finalPromiseText = checkoutDeliveryPromiseText();
     if (
       afterSettle
       && !deliveryContextIsNotConsolidated(afterSettle)
       && deliveryContextNamesWarehouseOpenDay(afterSettle)
+      && !deliveryTextIncludesWarehouseClosedDay(finalPromiseText)
       && normalizedText(afterSettle.text || "") === normalizedText(stableText || afterSettle.text || "")
     ) {
       await sendDiagnostic("Final consolidated delivery selection remained stable before Place Order.", {
         group_key: activeJob?.job?.group_key || "",
         option_text: afterSettle.text,
+        checkout_promise_text: finalPromiseText,
         stability_attempt: attempt,
       });
       return true;
@@ -5399,11 +5498,8 @@ async function ensureFinalConsolidatedDelivery(activeJob) {
 }
 
 function checkoutDeliveryPromiseText() {
-  const optionRows = [...document.querySelectorAll("label, .a-radio-label")]
-    .filter((element) => visible(element) && element.querySelector?.(".delivery-promise-text, .delivery-option-text"))
-    .slice(0, 40)
-    .map((element) => normalizedText(element.textContent || ""))
-    .filter((text) => text && text.length <= 500);
+  const selectedOption = selectedDeliveryRadioContext();
+  const selectedOptionText = normalizedText(selectedOption?.text || "");
   const selectors = [
     "h2.address-promise-text",
     ".address-promise-text",
@@ -5413,11 +5509,15 @@ function checkoutDeliveryPromiseText() {
     "[class*='delivery-promise' i]",
   ];
   const elementCandidates = [...document.querySelectorAll(selectors.join(", "))]
-    .filter((element) => visible(element) && !element.closest?.("#nutricity-panel, .a-popover, .a-popover-preload"))
+    .filter((element) => {
+      if (!visible(element) || element.closest?.("#nutricity-panel, .a-popover, .a-popover-preload")) return false;
+      const optionRadio = element.closest?.("label, .a-radio, .rcx-checkout-delivery-option-a-control-row")?.querySelector?.("input[type='radio']");
+      return !optionRadio || optionRadio.checked;
+    })
     .slice(0, 80)
     .map((element) => normalizedText(element.textContent || ""))
     .filter((text) => text && /arriv|deliver|shipping|delivery/i.test(text) && text.length <= 300);
-  const candidates = [...optionRows, ...elementCandidates];
+  const candidates = [selectedOptionText, ...elementCandidates].filter(Boolean);
   const unique = [...new Set(candidates)];
   const month = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}\b/i;
   const dated = unique.filter((text) => month.test(text) || /arriving\s+(?:today|tomorrow)|deliver(?:y|ing)?\s+(?:today|tomorrow)/i.test(text));
@@ -5479,6 +5579,14 @@ async function checkoutDeliveryWindowIsAllowed(activeJob) {
     const parsed = checkoutDeliveryPromise(deliveryLimitDays);
     return parsed.text || null;
   }, 5000, 500) || checkoutDeliveryPromise(deliveryLimitDays);
+  if (deliveryTextIncludesWarehouseClosedDay(promise.text)) {
+    await pauseForManualCheckout(
+      activeJob,
+      `Checkout is blocked because the final Amazon delivery promise falls on Saturday or Sunday. Select a Monday-Friday delivery before continuing. Amazon promise: ${promise.text}`,
+      "checkout",
+    );
+    return false;
+  }
   if (!promise.text) {
     sendDiagnostic(`Checkout delivery promise was not visible; continuing without the ${deliveryLimitDays}-day guard.`, {
       order: activeJobOrderLabel(activeJob) || activeJob?.job?.group_key || "",
@@ -6768,9 +6876,13 @@ function amazonPostSubmitUnplacedIssue() {
   return "";
 }
 
+function amazonDuplicateOrderRoute() {
+  return /\/checkout\/.*\/duplicateOrder/i.test(location.pathname);
+}
+
 function amazonDuplicateOrderPage() {
   const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
-  return /\/checkout\/.*\/duplicateOrder/i.test(location.pathname)
+  return amazonDuplicateOrderRoute()
     || (text.includes("this is a pending order") && text.includes("do you want to place the same order again"));
 }
 
@@ -6826,12 +6938,11 @@ async function handleAmazonDuplicateOrderPage(activeJob) {
     );
     return;
   }
-  const duplicatePageIsAfterCheckoutSubmit =
-    activeJob.stage === "complete_pending" ||
-    activeJob.stage === "checkout" ||
-    activeJob.pausedStage === "complete_pending" ||
-    activeJob.pausedStage === "checkout" ||
-    checkoutWasStarted(activeJob);
+  const duplicatePageIsAfterCheckoutSubmit = Boolean(
+    activeJob.amazonSubmittedAt
+    || activeJob.placeOrderClickStartedAt
+    || submittedStage(activeJob)
+  );
   if (!duplicatePageIsAfterCheckoutSubmit) {
     activeJob.paused = true;
     activeJob.pausedStage = activeJob.stage || "checkout";
@@ -6868,7 +6979,12 @@ async function handleAmazonDuplicateOrderPage(activeJob) {
     await reportAmazonOrders(activeJob, [rememberedOrder]);
     return;
   }
-  const placeOrder = findButtonByText(["place your order"]);
+  showPanel("Final step", "Amazon opened a pending duplicate-order confirmation. Waiting for its final Place your order button.", null, null);
+  const placeOrder = await waitUntil(() => {
+    if (!amazonDuplicateOrderRoute() && !amazonDuplicateOrderPage()) return null;
+    const control = findPlaceOrderButton() || findButtonByText(["place your order"]);
+    return control && !control.disabled ? control : null;
+  }, 15000, 250);
   if (!placeOrder || placeOrder.disabled) {
     await pauseForManualCheckout(activeJob, "Amazon duplicate pending-order screen did not show a usable Place your order button.", "complete_pending");
     return;
@@ -6880,8 +6996,11 @@ async function handleAmazonDuplicateOrderPage(activeJob) {
     "complete_pending",
   )) return;
   showPanel("Final step", "Amazon asked for duplicate-order confirmation. Clicking Place your order once.", null, null);
-  if (!await protectBeforeAmazonSubmit(activeJob, "complete_pending")) return;
+  // The original checkout Place Order click was protected already. This page is
+  // Amazon's continuation of that same submission; protecting it again invokes
+  // our duplicate-submit guard and incorrectly diverts the worker to history.
   activeJob.amazonDuplicateOrderConfirmed = true;
+  activeJob.placeOrderClickStartedAt = Date.now();
   activeJob.stage = "complete_pending";
   await setActiveJob(activeJob);
   await clickElement(placeOrder, "duplicate-order Place your order button");
@@ -8886,8 +9005,16 @@ async function run() {
       build: CONTENT_SCRIPT_BUILD,
     });
   }
-  if (await guardUnexpectedAmazonPage(activeJob)) return;
   if (activeJob.paused) {
+    if (activeJob.pausedByUser) {
+      showPanel(
+        "Nutricity fulfilment paused",
+        "Fulfilment is paused. No page actions will continue until you click Resume.",
+        "I did it manually, continue",
+        () => continueAfterManualStep(activeJob),
+      );
+      return;
+    }
     if (await autoResumeResolvedCheckoutPause(activeJob)) {
       setTimeout(runSafely, 250);
       return;
@@ -8900,7 +9027,9 @@ async function run() {
     );
     return;
   }
-  if (amazonDuplicateOrderPage()) {
+  // Handle this location before generic page guards and submitted-order history
+  // recovery. The DOM can be blank briefly while Amazon renders the button.
+  if (amazonDuplicateOrderRoute() || amazonDuplicateOrderPage()) {
     try {
       return await handleAmazonDuplicateOrderPage(activeJob);
     } catch (error) {
@@ -8908,6 +9037,7 @@ async function run() {
       return;
     }
   }
+  if (await guardUnexpectedAmazonPage(activeJob)) return;
   const postSubmitUnplaced = amazonPostSubmitUnplacedIssue();
   if (postSubmitUnplaced && submittedOrPausedStage(activeJob)) {
     await reportPostSubmitUnplaced(activeJob, postSubmitUnplaced);
@@ -9127,6 +9257,8 @@ async function runSafely() {
   window.__nutricityRunningAt = Date.now();
   try {
     await run();
+  } catch (error) {
+    if (!error?.fulfilmentPaused) throw error;
   } finally {
     window.__nutricityRunning = false;
     window.__nutricityRunningAt = 0;

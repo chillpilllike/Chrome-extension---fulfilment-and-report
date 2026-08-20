@@ -33569,14 +33569,17 @@ def package_tracker_delivery_kind(package_status: Any, promise: Any) -> str:
 
 def package_tracker_delivery_date(package_status: Any, promise: Any, updated_at: Any) -> str:
     text = f"{clean_text(package_status)} {clean_text(promise)}"
+    reference = parse_iso_date(clean_text(updated_at)) or datetime.now(timezone.utc)
     match = re.search(
         r"\b(?:delivered(?:\s+on)?\s+)?(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:,?\s+(\d{4}))?\b",
         text,
         re.IGNORECASE,
     )
     if not match:
+        if re.search(r"\bdelivered\s+today\b", text, re.IGNORECASE):
+            brooklyn_date = reference.astimezone(PACKAGE_PICKUP_TIMEZONE).date()
+            return datetime.combine(brooklyn_date, datetime.min.time(), tzinfo=PACKAGE_PICKUP_TIMEZONE).isoformat()
         return ""
-    reference = parse_iso_date(clean_text(updated_at)) or datetime.now(timezone.utc)
     year = int(match.group(3) or reference.year)
     try:
         parsed = datetime.strptime(f"{match.group(1)[:3]} {match.group(2)} {year}", "%b %d %Y").replace(tzinfo=timezone.utc)
@@ -34191,10 +34194,18 @@ def api_public_package_tracker(
                              AND COALESCE(l.amazon_cancelled_at, '') = ''
                        ) AS delivered_count,
                        BOOL_OR(COALESCE(l.amazon_cancelled_at, '') != '' OR LOWER(COALESCE(l.tracking_status, '') || ' ' || COALESCE(l.amazon_status, '')) LIKE '%cancel%') AS has_cancelled_history,
-                       MAX(CASE WHEN line_delivery.parts IS NOT NULL THEN TO_CHAR(
-                           TO_DATE(LEFT(line_delivery.parts[1], 3) || ' ' || line_delivery.parts[2] || ' ' || COALESCE(line_delivery.parts[3], SUBSTRING(l.updated_at, 1, 4)), 'Mon DD YYYY'),
-                           'YYYY-MM-DD'
-                       ) ELSE '' END) AS delivery_date,
+                       MAX(CASE
+                           WHEN line_delivery.parts IS NOT NULL THEN TO_CHAR(
+                               TO_DATE(LEFT(line_delivery.parts[1], 3) || ' ' || line_delivery.parts[2] || ' ' || COALESCE(line_delivery.parts[3], SUBSTRING(l.updated_at, 1, 4)), 'Mon DD YYYY'),
+                               'YYYY-MM-DD'
+                           )
+                           WHEN LOWER(COALESCE(l.tracking_status, '') || ' ' || COALESCE(l.tracking_payload, '')) LIKE '%delivered today%'
+                           THEN TO_CHAR(
+                               COALESCE(NULLIF(l.tracking_checked_at, ''), l.updated_at)::timestamptz AT TIME ZONE 'America/New_York',
+                               'YYYY-MM-DD'
+                           )
+                           ELSE ''
+                       END) AS delivery_date,
                        MAX(COALESCE(NULLIF(l.tracking_checked_at, ''), NULLIF(l.ordered_at, ''), l.updated_at)) AS effective_date,
                        MAX(l.updated_at) AS updated_at,
                        STRING_AGG(UPPER(COALESCE(l.odoo_order_name, '') || ' ' || COALESCE(l.amazon_order_id, '') || ' ' ||
@@ -34223,10 +34234,18 @@ def api_public_package_tracker(
                              AND LOWER(COALESCE(p.package_status, '') || ' ' || COALESCE(p.promise, '')) NOT LIKE '%cancel%'
                        ) AS delivered_count,
                        BOOL_OR(LOWER(COALESCE(p.package_status, '') || ' ' || COALESCE(p.promise, '')) LIKE '%cancel%') AS has_cancelled_history,
-                       MAX(CASE WHEN package_delivery.parts IS NOT NULL THEN TO_CHAR(
-                           TO_DATE(LEFT(package_delivery.parts[1], 3) || ' ' || package_delivery.parts[2] || ' ' || COALESCE(package_delivery.parts[3], SUBSTRING(p.updated_at, 1, 4)), 'Mon DD YYYY'),
-                           'YYYY-MM-DD'
-                       ) ELSE '' END) AS delivery_date,
+                       MAX(CASE
+                           WHEN package_delivery.parts IS NOT NULL THEN TO_CHAR(
+                               TO_DATE(LEFT(package_delivery.parts[1], 3) || ' ' || package_delivery.parts[2] || ' ' || COALESCE(package_delivery.parts[3], SUBSTRING(p.updated_at, 1, 4)), 'Mon DD YYYY'),
+                               'YYYY-MM-DD'
+                           )
+                           WHEN LOWER(COALESCE(p.package_status, '') || ' ' || COALESCE(p.promise, '')) LIKE '%delivered today%'
+                           THEN TO_CHAR(
+                               COALESCE(NULLIF(p.received_at, ''), p.updated_at)::timestamptz AT TIME ZONE 'America/New_York',
+                               'YYYY-MM-DD'
+                           )
+                           ELSE ''
+                       END) AS delivery_date,
                        MAX(COALESCE(NULLIF(p.received_at, ''), NULLIF(p.dispatch_date, ''), p.updated_at)) AS effective_date,
                        MAX(p.updated_at) AS updated_at,
                        STRING_AGG(UPPER(COALESCE(p.odoo_order_name, '') || ' ' || COALESCE(p.recipient_ref, '') || ' ' ||

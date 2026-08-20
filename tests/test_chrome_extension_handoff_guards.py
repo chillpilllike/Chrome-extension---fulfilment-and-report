@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.81")
+        self.assertEqual(MANIFEST["version"], "0.1.84")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -370,6 +370,22 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('/\\bnext[ -]?day\\b/', next_day)
         self.assertIn('!isAmazonDayDeliveryContext(context)', next_day)
 
+    def test_available_amazon_day_weekday_beats_earlier_default(self) -> None:
+        helper_start = CONTENT.index("function preferredAmazonDayWeekdayOption()")
+        helper_end = CONTENT.index("async function ensureWarehouseOpenDayDelivery", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        self.assertIn("isAmazonDayDeliveryContext(context)", helper)
+        self.assertIn("!deliveryContextIsNotConsolidated(context)", helper)
+        self.assertIn("deliveryContextNamesWarehouseOpenDay(context)", helper)
+        reward_start = CONTENT.index("async function ensureRewardedLaterDelivery")
+        reward_end = CONTENT.index("function checkoutDeliveryPromiseText", reward_start)
+        reward = CONTENT[reward_start:reward_end]
+        self.assertIn("ensurePreferredAmazonDayWeekdayDelivery(activeJob)", reward)
+        self.assertLess(
+            reward.index("ensurePreferredAmazonDayWeekdayDelivery(activeJob)"),
+            reward.index("ensureFreeNextDayDelivery(activeJob, brooklynDay)"),
+        )
+
     def test_split_weekend_delivery_is_replaced_before_preferences_apply(self) -> None:
         helper_start = CONTENT.index("function selectedDeliveryRadioContext()")
         reward_start = CONTENT.index("async function ensureRewardedLaterDelivery", helper_start)
@@ -393,7 +409,24 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("selectedDeliveryRadioContext()", guard)
         self.assertIn("deliveryContextIsNotConsolidated(selectedDelivery)", guard)
         self.assertIn("Checkout is blocked because the selected Amazon delivery is split across dates", guard)
+        self.assertIn("deliveryTextIncludesWarehouseClosedDay(promise.text)", guard)
+        self.assertIn("final Amazon delivery promise falls on Saturday or Sunday", guard)
         self.assertIn("return false;", guard)
+
+    def test_date_only_delivery_promises_are_checked_for_weekends(self) -> None:
+        helper_start = CONTENT.index('function deliveryTextCalendarDates(value = "", now = new Date())')
+        helper_end = CONTENT.index("function deliveryContextHasSplitPromise", helper_start)
+        helpers = CONTENT[helper_start:helper_end]
+        self.assertIn("date.getDay()", helpers)
+        self.assertIn("[0, 6].includes", helpers)
+        self.assertIn("date.getDay() >= 1 && date.getDay() <= 5", helpers)
+
+    def test_checkout_promise_ignores_unselected_delivery_rows(self) -> None:
+        promise_start = CONTENT.index("function checkoutDeliveryPromiseText()")
+        promise_end = CONTENT.index("function checkoutDeliveryPromise(limitDays", promise_start)
+        promise = CONTENT[promise_start:promise_end]
+        self.assertIn("selectedDeliveryRadioContext()", promise)
+        self.assertIn("!optionRadio || optionRadio.checked", promise)
 
     def test_final_delivery_selection_must_stay_consolidated_before_submit(self) -> None:
         final_start = CONTENT.index("async function ensureFinalConsolidatedDelivery")
@@ -510,6 +543,43 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("await checkoutDeliveryWindowIsAllowed(activeJob)", recovery)
         self.assertIn("await clickElement(placeOrder", recovery)
         self.assertNotIn("protectBeforeAmazonSubmit", recovery.replace("// protectBeforeAmazonSubmit", "// protection"))
+
+    def test_duplicate_order_confirmation_reuses_original_submit_protection(self) -> None:
+        handler_start = CONTENT.index("async function handleAmazonDuplicateOrderPage(activeJob)")
+        handler_end = CONTENT.index("function orderDetailsUrl", handler_start)
+        handler = CONTENT[handler_start:handler_end]
+        self.assertIn("activeJob.amazonSubmittedAt", handler)
+        self.assertIn("activeJob.placeOrderClickStartedAt", handler)
+        self.assertIn("await waitUntil(() =>", handler)
+        self.assertIn("activeJob.amazonDuplicateOrderConfirmed = true", handler)
+        self.assertIn('clickElement(placeOrder, "duplicate-order Place your order button")', handler)
+        executable = handler.replace("// protectBeforeAmazonSubmit", "// original protection")
+        self.assertNotIn("await protectBeforeAmazonSubmit", executable)
+        run_start = CONTENT.index("async function run()")
+        run_end = CONTENT.index("async function runSafely()", run_start)
+        run = CONTENT[run_start:run_end]
+        duplicate_route = run.index("amazonDuplicateOrderRoute() || amazonDuplicateOrderPage()")
+        unexpected_guard = run.index("guardUnexpectedAmazonPage(activeJob)")
+        submitted_recovery = run.index("activeJobWasSubmittedToAmazon(activeJob)")
+        self.assertLess(duplicate_route, unexpected_guard)
+        self.assertLess(duplicate_route, submitted_recovery)
+
+    def test_user_pause_aborts_inflight_flow_and_cannot_auto_resume(self) -> None:
+        pause_start = CONTENT.index("async function waitIfPaused()")
+        pause_end = CONTENT.index("async function waitForPageReady", pause_start)
+        pause = CONTENT[pause_start:pause_end]
+        self.assertIn("throw fulfilmentPausedError()", pause)
+        self.assertNotIn("while (", pause)
+        run_start = CONTENT.index("async function run()")
+        run_end = CONTENT.index("async function runSafely()", run_start)
+        run = CONTENT[run_start:run_end]
+        user_pause = run.index("if (activeJob.pausedByUser)")
+        auto_resume = run.index("autoResumeResolvedCheckoutPause(activeJob)")
+        self.assertLess(user_pause, auto_resume)
+        self.assertIn("activeJob.pausedByUser = true", BACKGROUND)
+        self.assertIn("pausedByUser: Boolean(latest.pausedByUser || activeJob.pausedByUser)", CONTENT)
+        self.assertIn("const preserveUserPause = sameJob && latest.paused && latest.pausedByUser", CONTENT)
+        self.assertIn("throw fulfilmentPausedError()", CONTENT)
 
     def test_order_history_recipient_collapses_amazon_duplicate_text(self) -> None:
         parser_start = CONTENT.index('function recipientFromOrderHistoryText(text = "")')

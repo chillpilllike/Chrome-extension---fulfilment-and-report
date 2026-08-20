@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-21-cart-missing-retry-v62";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-21-duplicate-order-pause-v63";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -2316,10 +2316,12 @@ async function togglePause(windowId) {
   const nextPaused = !activeJob.paused;
   if (nextPaused) {
     activeJob.pausedStage = activeJob.stage || activeJob.pausedStage || "product";
+    activeJob.pausedByUser = true;
   } else if (activeJob.pausedStage) {
     activeJob.stage = activeJob.pausedStage;
     activeJob.pausedStage = null;
   }
+  if (!nextPaused) activeJob.pausedByUser = false;
   activeJob.paused = nextPaused;
   activeJob.pauseRevision = Date.now();
   await setWindowJob(windowId, activeJob);
