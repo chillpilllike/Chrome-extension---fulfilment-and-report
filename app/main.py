@@ -4195,7 +4195,20 @@ def upsert_amazon_history_unmatched(conn: Any, records: list[dict[str, Any]], ma
         )
     for record in records:
         order_id = record["amazon_order_id"]
-        if not order_id or record.get("cancelled"):
+        if not order_id:
+            continue
+        if record.get("cancelled"):
+            # A previously cached active card can later become cancelled.
+            # Resolve and label that same history row instead of leaving stale
+            # evidence that could satisfy a future Chrome pre-claim match.
+            conn.execute(
+                """
+                UPDATE amazon_order_history_unmatched
+                SET status=?, last_seen_at=?, resolved_at=COALESCE(resolved_at, ?)
+                WHERE amazon_order_id=?
+                """,
+                (clean_text(record.get("status")) or "Cancelled", now, now, order_id),
+            )
             continue
         resolved_at = now if order_id in matched_ids else None
         if order_id not in matched_ids:
@@ -28567,10 +28580,17 @@ def exact_amazon_history_match_for_chrome_job(job: dict[str, Any]) -> Optional[d
             ).fetchall()
             if clean_text(row["amazon_order_id"])
         }
+        known_cancelled_ids = {
+            clean_text(row["amazon_cancelled_order_id"])
+            for row in conn.execute(
+                "SELECT DISTINCT amazon_cancelled_order_id FROM order_lines WHERE COALESCE(amazon_cancelled_order_id, '') != ''"
+            ).fetchall()
+            if clean_text(row["amazon_cancelled_order_id"])
+        }
     matches: list[dict[str, Any]] = []
     for row in history_rows:
         amazon_order_id = clean_text(row.get("amazon_order_id"))
-        if not amazon_order_id or amazon_order_id in cancelled_ids or amazon_order_id in linked_ids:
+        if not amazon_order_id or amazon_order_id in cancelled_ids or amazon_order_id in known_cancelled_ids or amazon_order_id in linked_ids:
             continue
         recipient_refs = set(amazon_history_order_refs_from_text(row.get("recipient") or ""))
         if not order_names.issubset(recipient_refs):
@@ -35308,6 +35328,14 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             f"""
             UPDATE order_lines
             SET state='pulled',
+                amazon_cancelled_order_id=CASE
+                  WHEN COALESCE(amazon_order_id, '') != '' THEN amazon_order_id
+                  ELSE amazon_cancelled_order_id
+                END,
+                amazon_cancelled_at=CASE
+                  WHEN COALESCE(amazon_order_id, '') != '' THEN ?
+                  ELSE amazon_cancelled_at
+                END,
                 amazon_order_id=NULL,
                 amazon_order_url=NULL,
                 amazon_account_id=NULL,
@@ -35333,7 +35361,7 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             WHERE store_id=?
               AND id IN ({placeholders})
             """,
-            [now, payload.store_id, *selected_ids],
+            [now, now, payload.store_id, *selected_ids],
         )
         conn.execute(
             f"""

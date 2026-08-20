@@ -413,6 +413,26 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertLess(fresh_control, protection)
         self.assertIn("!placeOrder.isConnected", checkout)
 
+    def test_cancelled_amazon_history_cannot_reconcile_a_fresh_job(self) -> None:
+        matcher_start = APP.index("def exact_amazon_history_match_for_chrome_job")
+        matcher_end = APP.index("def complete_chrome_job_from_exact_history_match", matcher_start)
+        matcher = APP[matcher_start:matcher_end]
+        self.assertIn("known_cancelled_ids", matcher)
+        self.assertIn("amazon_order_id in known_cancelled_ids", matcher)
+        history_start = APP.index("def upsert_amazon_history_unmatched")
+        history_end = APP.index("def asin_product_url", history_start)
+        history = APP[history_start:history_end]
+        self.assertIn('if record.get("cancelled"):', history)
+        self.assertIn("resolved_at=COALESCE(resolved_at, ?)", history)
+
+    def test_reset_fulfilment_preserves_cancelled_amazon_order_id(self) -> None:
+        reset_start = APP.index("def api_reset_line_fulfilment")
+        reset_end = APP.index('@app.put("/api/lines/{line_id}/spaid")', reset_start)
+        reset = APP[reset_start:reset_end]
+        self.assertIn("amazon_cancelled_order_id=CASE", reset)
+        self.assertIn("THEN amazon_order_id", reset)
+        self.assertIn("amazon_cancelled_at=CASE", reset)
+
     def test_place_order_lookup_returns_a_native_control_not_amazon_wrapper(self) -> None:
         finder_start = CONTENT.index("function findPlaceOrderButton()")
         finder_end = CONTENT.index("function findSnsPaymentConfirmationCheckbox", finder_start)
