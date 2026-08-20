@@ -878,3 +878,268 @@ small {
     text-align: left;
   }
 }
+
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("/assets/inter-latin-wght-normal-Dx4kXJAl.woff2") format("woff2-variations");
+}
+
+html,
+body,
+button,
+input,
+select,
+textarea {
+  font-family: "Inter Variable", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+}
+
+.public-access-body {
+  min-height: 100%;
+  margin: 0;
+  background: #fff;
+  color: #182433;
+  font-family: "Inter Variable", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.public-access-body button,
+.public-access-body input {
+  font-family: inherit;
+}
+
+.access-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+}
+
+.access-sidebar {
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+  padding: 18px 16px;
+  border-right: 1px solid #e5e7eb;
+  background: #fff;
+}
+
+.access-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.access-mark {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 7px;
+  background: #206bc4;
+  color: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.access-mark svg {
+  width: 20px;
+  height: 20px;
+}
+
+.access-brand strong {
+  display: block;
+  color: #182433;
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.access-brand span span {
+  display: block;
+  margin-top: 2px;
+  color: #667382;
+  font-size: 12px;
+}
+
+.access-nav-label {
+  margin: 24px 8px 9px;
+  color: #8a96a3;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.access-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #f3f4f6;
+  color: #344054;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.access-nav-item svg {
+  width: 18px;
+  height: 18px;
+  color: #667382;
+}
+
+.access-sidebar-note {
+  margin: auto 0 0;
+  padding: 14px 12px 2px;
+  color: #667382;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.access-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  background: #fff;
+}
+
+.access-topbar {
+  height: 57px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #fff;
+}
+
+.access-content {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 48px 24px;
+}
+
+.access-wrap {
+  width: 100%;
+  max-width: 420px;
+}
+
+.access-eyebrow {
+  margin-bottom: 8px;
+  color: #667382;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.access-heading {
+  margin: 0;
+  color: #182433;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+
+.access-description {
+  margin: 8px 0 22px;
+  color: #667382;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.access-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 2px 5px rgba(24, 36, 51, 0.04);
+}
+
+.access-card-body {
+  padding: 24px;
+}
+
+.access-label {
+  margin-bottom: 8px;
+  color: #344054;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.access-input {
+  height: 42px;
+  border-color: #d7dce1;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.access-input:focus {
+  border-color: #206bc4;
+  box-shadow: 0 0 0 3px rgba(32, 107, 196, 0.12);
+}
+
+.access-button {
+  height: 42px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+.access-alert {
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.access-help {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 16px;
+  color: #667382;
+  font-size: 12px;
+}
+
+.access-help svg {
+  width: 15px;
+  height: 15px;
+  color: #2fb344;
+}
+
+@media (max-width: 767.98px) {
+  .access-shell {
+    display: block;
+  }
+
+  .access-sidebar {
+    min-height: 0;
+    padding: 12px 16px;
+    border-right: 0;
+    border-bottom: 1px solid #e5e7eb;
+  }
+
+  .access-brand {
+    padding: 0;
+    border: 0;
+  }
+
+  .access-nav-label,
+  .access-nav-item,
+  .access-sidebar-note,
+  .access-topbar {
+    display: none;
+  }
+
+  .access-content {
+    min-height: calc(100vh - 61px);
+    align-items: start;
+    padding: 32px 18px;
+  }
+
+  .access-wrap {
+    margin-top: 7vh;
+  }
+
+  .access-card-body {
+    padding: 20px;
+  }
+}

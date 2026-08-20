@@ -155,7 +155,7 @@ class PostgresConnection:
                     try:
                         _pool.putconn(raw, close=True)
                     except Exception:
-                        _reset_pool()
+                        pass
                     raise psycopg2.InterfaceError("PostgreSQL pool returned a closed connection.")
                 try:
                     with raw.cursor() as cursor:
@@ -165,13 +165,11 @@ class PostgresConnection:
                     try:
                         _pool.putconn(raw, close=True)
                     except Exception:
-                        _reset_pool()
+                        pass
                     raise
                 return cls(raw, pooled=True)
             except (pool.PoolError, psycopg2.OperationalError, psycopg2.InterfaceError) as error:
                 last_error = error
-                if isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError)):
-                    _reset_pool()
                 time.sleep(0.2 * (attempt + 1))
         raise last_error or RuntimeError("Could not get a PostgreSQL connection from the pool.")
 
@@ -217,14 +215,13 @@ class PostgresConnection:
         try:
             self._raw.commit()
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            _reset_pool()
             raise
 
     def rollback(self) -> None:
         try:
             self._raw.rollback()
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            _reset_pool()
+            pass
 
     def close(self) -> None:
         global _pool
@@ -234,7 +231,10 @@ class PostgresConnection:
                     _pool.putconn(self._raw, close=getattr(self._raw, "closed", 0) != 0)
                     return
                 except (pool.PoolError, psycopg2.OperationalError, psycopg2.InterfaceError):
-                    _reset_pool()
+                    try:
+                        self._raw.close()
+                    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                        pass
             return
         try:
             self._raw.close()

@@ -20,18 +20,19 @@ import GripVertical from "@tabler/icons-react/dist/esm/icons/IconGripVertical.mj
 import Home from "@tabler/icons-react/dist/esm/icons/IconHome.mjs"
 import Link from "@tabler/icons-react/dist/esm/icons/IconLink.mjs"
 import Lock from "@tabler/icons-react/dist/esm/icons/IconLock.mjs"
-import Moon from "@tabler/icons-react/dist/esm/icons/IconMoon.mjs"
 import PackageCheck from "@tabler/icons-react/dist/esm/icons/IconPackage.mjs"
 import IconPin from "@tabler/icons-react/dist/esm/icons/IconPin.mjs"
 import Plus from "@tabler/icons-react/dist/esm/icons/IconPlus.mjs"
 import RefreshCw from "@tabler/icons-react/dist/esm/icons/IconRefresh.mjs"
 import Search from "@tabler/icons-react/dist/esm/icons/IconSearch.mjs"
 import Settings from "@tabler/icons-react/dist/esm/icons/IconSettings.mjs"
-import Sun from "@tabler/icons-react/dist/esm/icons/IconSun.mjs"
 import ShoppingCart from "@tabler/icons-react/dist/esm/icons/IconShoppingCart.mjs"
 import Trash2 from "@tabler/icons-react/dist/esm/icons/IconTrash.mjs"
 import Logout from "@tabler/icons-react/dist/esm/icons/IconLogout.mjs"
 import UserCircle from "@tabler/icons-react/dist/esm/icons/IconUserCircle.mjs"
+import Menu2 from "@tabler/icons-react/dist/esm/icons/IconMenu2.mjs"
+import Clock from "@tabler/icons-react/dist/esm/icons/IconClock.mjs"
+import TruckDelivery from "@tabler/icons-react/dist/esm/icons/IconTruckDelivery.mjs"
 import { Popover } from "@base-ui/react/popover"
 import { BrowserMultiFormatReader, type IScannerControls } from "@zxing/browser"
 
@@ -65,6 +66,7 @@ const KNOWN_APP_PAGES = new Set([
   "dispatch-sorting",
   "dispatch-status",
   "package-tracker",
+  "package-pickups",
   "payment-failed",
   "amazon-otp",
   "epost",
@@ -84,7 +86,7 @@ const KNOWN_APP_PAGES = new Set([
   "cancelled-orders",
   "settings",
 ])
-const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "dispatch-sorting", "package-tracker", "amazon-otp", "epost"])
+const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "dispatch-sorting", "package-tracker", "package-pickups", "amazon-otp", "epost"])
 
 function appPageFromLocation() {
   if (typeof window === "undefined") return "home"
@@ -602,6 +604,72 @@ type DispatchStatusSummary = {
   sla_days: number
 }
 
+type PackagePickupRow = {
+  source_type: "amazon" | "manual_amazon" | "count_amazon" | "non_amazon"
+  source_id: number
+  store_id: number
+  odoo_order_name: string
+  amazon_order_id: string
+  amazon_order_url: string
+  tracking_id?: string
+  tracking_url?: string
+  carrier?: string
+  delivery_status?: string
+  delivered_at: string
+  delivered_display: string
+  package_type: "Amazon" | "Amazon (manual)" | "Amazon (counted)" | "Non-Amazon"
+  shopify_status: string
+  shopify_fulfilled: boolean
+  received: boolean
+  received_at: string
+  not_received?: boolean
+  not_received_at?: string
+  confirmation_status?: "received" | "not_received" | "unconfirmed"
+  position?: number
+  needs_details?: boolean
+  tracking_input?: string
+}
+
+type PickupBulkRow = {
+  key: string
+  source_id?: number
+  package_type: "amazon" | "non_amazon"
+  odoo_order_name: string
+  tracking_input: string
+}
+
+type PackagePickupCard = {
+  pickup_date: string
+  amazon_picked_up: number
+  non_amazon_picked_up: number
+  amazon_reported_delivered: number
+  reported_delivered: number
+  missing_amazon: number
+  unreported_amazon: number
+  physical_total: number
+  shopify_fulfilled: number
+  amazon_packages: PackagePickupRow[]
+  manual_amazon_packages?: PackagePickupRow[]
+  non_amazon_packages: PackagePickupRow[]
+}
+
+type PackagePickupData = {
+  ok: boolean
+  timezone: string
+  cutoff: string
+  date_from: string
+  date_to: string
+  summary: {
+    amazon_reported_delivered: number
+    amazon_picked_up: number
+    non_amazon_picked_up: number
+    missing_amazon: number
+    unreported_amazon: number
+    shopify_fulfilled: number
+  }
+  cards: PackagePickupCard[]
+}
+
 type DispatchStatusRow = {
   id: string
   store_id: number
@@ -677,6 +745,14 @@ type PackageTrackerOrderCard = {
   updated_at: string
   packages: PackageTrackerAmazonOrder[]
   previous_orders: PackageTrackerAmazonOrder[]
+  product_guard?: {
+    complete: boolean
+    expected_products: number
+    displayed_products: number
+    recovered_products: number
+    missing_product_keys: string[]
+    unverified_amazon_orders: string[]
+  }
   quantity_analysis?: {
     suspected_duplicate: boolean
     duplicate_items: Array<{
@@ -1188,6 +1264,7 @@ const defaultUiCopy: UiCopy = {
   "dispatch-sorting": { title: "Dispatch Sorting", description: "Scan Amazon packages, match orders instantly, and place them into totes." },
   "dispatch-status": { title: "Dispatch Status", description: "Track Odoo order to dispatch timing, ePost movement, and delay risk." },
   "package-tracker": { title: "Package Tracker", description: "Public Amazon delivery cards grouped and guarded by exact Odoo recipient references." },
+  "package-pickups": { title: "Package Pickup Check", description: "Compare packages Amazon reported on each Brooklyn delivery date with the next physical team pickup." },
   "payment-failed": { title: "Payment Failed", description: "Review Amazon orders that need payment revision." },
   "amazon-otp": { title: "Amazon OTP", description: "Match OTP emails to Amazon and Odoo orders." },
   epost: { title: "ePost Tracking", description: "Monitor ePost Global shipment events." },
@@ -2746,12 +2823,14 @@ function ManualFulfilmentDialog({
     url: string
     third_party: boolean
     total_cost: number
+    estimated_delivery_at: string
   }) => Promise<void>
 }) {
   const [thirdParty, setThirdParty] = useState(false)
   const [reference, setReference] = useState("")
   const [url, setUrl] = useState("")
   const [totalCost, setTotalCost] = useState("")
+  const [estimatedDeliveryAt, setEstimatedDeliveryAt] = useState("")
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     if (!open) return
@@ -2759,6 +2838,7 @@ function ManualFulfilmentDialog({
     setReference("")
     setUrl("")
     setTotalCost("")
+    setEstimatedDeliveryAt("")
     setBusy(false)
   }, [open])
   const costValue = Number(totalCost || 0)
@@ -2803,6 +2883,15 @@ function ManualFulfilmentDialog({
               onChange={setTotalCost}
             />
           )}
+          <TextField
+            label="Estimated delivery date and time"
+            type="datetime-local"
+            value={estimatedDeliveryAt}
+            onChange={setEstimatedDeliveryAt}
+          />
+          <p className="-mt-2 text-xs text-muted-foreground">
+            Used by Package Pickup Check to place this manual fulfilment on the correct delivery-date card.
+          </p>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
@@ -2816,6 +2905,7 @@ function ManualFulfilmentDialog({
                   url,
                   third_party: thirdParty,
                   total_cost: costValue,
+                  estimated_delivery_at: estimatedDeliveryAt,
                 })
               } finally {
                 setBusy(false)
@@ -3158,7 +3248,7 @@ function App() {
   const [costlyPage, setCostlyPage] = useState(1)
   const [costlyTotal, setCostlyTotal] = useState(0)
   const [page, setPage] = useState(initialPage)
-  const [openNavGroup, setOpenNavGroup] = useState<string | null>(null)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const navTabsRef = useRef<HTMLDivElement | null>(null)
   const ordersSelectionAnchor = useRef<number | null>(null)
   const ordersShiftKeyDown = useRef(false)
@@ -3758,23 +3848,15 @@ function App() {
   }, [profitLossPeriod])
 
   useEffect(() => {
-    if (!openNavGroup) return
-    const closeOnOutsideClick = (event: PointerEvent) => {
-      const navTabs = navTabsRef.current
-      if (navTabs && event.target instanceof Node && !navTabs.contains(event.target)) {
-        setOpenNavGroup(null)
-      }
-    }
+    if (!mobileNavOpen) return
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpenNavGroup(null)
+      if (event.key === "Escape") setMobileNavOpen(false)
     }
-    document.addEventListener("pointerdown", closeOnOutsideClick)
     document.addEventListener("keydown", closeOnEscape)
     return () => {
-      document.removeEventListener("pointerdown", closeOnOutsideClick)
       document.removeEventListener("keydown", closeOnEscape)
     }
-  }, [openNavGroup])
+  }, [mobileNavOpen])
 
   useEffect(() => {
     if (page !== "inventory") return
@@ -4596,6 +4678,7 @@ function App() {
         ["tracking", "Amazon Tracking", PackageCheck],
         ["dispatch-sorting", "Dispatch Sorting", PackageCheck],
         ["package-tracker", "Package Tracker", PackageCheck],
+        ["package-pickups", "Package Pickup Check", TruckDelivery],
         ["dispatch-status", "Dispatch Status", PackageCheck],
         ["payment-failed", "Payment Failed", AlertCircle],
         ["amazon-otp", "Amazon OTP", Bell],
@@ -4624,6 +4707,7 @@ function App() {
         ["tracking", "Amazon Tracking", PackageCheck],
         ["dispatch-sorting", "Dispatch Sorting", PackageCheck],
         ["package-tracker", "Package Tracker", PackageCheck],
+        ["package-pickups", "Package Pickup Check", TruckDelivery],
         ["fulfilment-pending", "Pending Dispatch", AlertCircle],
         ["dispatch-status", "Dispatch Status", PackageCheck],
         ["amazon-otp", "Amazon OTP", Bell],
@@ -4632,7 +4716,6 @@ function App() {
     },
   ] as const
   const visibleNavGroups = publicVisitor ? publicNavGroups : navGroups
-  const activeNavGroup = visibleNavGroups.find((group) => group.items.some((item) => item[0] === page))
   const currentPageNeedsAdmin = !currentPageIsPublic && !adminTokenSaved && !data
 
   if (currentPageNeedsAdmin) {
@@ -4735,128 +4818,66 @@ function App() {
         </DialogContent>
       </Dialog>
       <AdminAccessDialog open={adminAccessOpen} onSubmit={handleAdminTokenSave} onClose={() => setAdminAccessOpen(false)} error={adminAuthError} busy={adminAuthBusy} />
-      <header className="navbar navbar-expand-md d-print-none">
-        <div className="container-xl flex items-center justify-between gap-4 py-3">
-          <button className="navbar-brand" onClick={() => setPage(publicVisitor ? "tracking" : "home")}>
-            <div className="avatar avatar-sm bg-primary text-primary-fg">
-              <HeaderIcon className="size-4" />
-            </div>
-            <div>
-              <h1 className="navbar-brand-title">{headerCopy.title}</h1>
-              <p className="navbar-brand-subtitle">{headerCopy.description}</p>
-            </div>
+      {mobileNavOpen && <button type="button" className="app-sidebar-backdrop d-print-none" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
+      <aside className={`app-sidebar d-print-none ${mobileNavOpen ? "is-open" : ""}`} ref={navTabsRef}>
+        <div className="app-sidebar-brand">
+          <button className="navbar-brand" onClick={() => { setPage(publicVisitor ? "tracking" : "home"); setMobileNavOpen(false) }}>
+            <div className="avatar avatar-sm bg-primary text-primary-fg"><HeaderIcon className="size-4" /></div>
+            <div><h1 className="navbar-brand-title">{headerCopy.title}</h1><p className="navbar-brand-subtitle">Fulfilment operations</p></div>
           </button>
+          <button type="button" className="btn btn-icon app-sidebar-close" onClick={() => setMobileNavOpen(false)} aria-label="Close navigation"><X className="size-5" /></button>
+        </div>
+        <nav className="app-sidebar-nav" aria-label="Main navigation">
           {!publicVisitor && (
-            <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey("app_header")} title="Edit header text">
-              <Edit className="size-4" />
-            </Button>
-          )}
-          <div className="flex items-center gap-2">
-            <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Day mode"><Sun className="size-5" /></button>
-            <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Dark mode"><Moon className="size-5" /></button>
-            {!publicVisitor && (
-              <div className="notification-menu">
-                <button className="btn btn-icon relative" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Notifications" onClick={() => setNotificationsOpen((open) => !open)}>
-                  <Bell className="size-5" />
-                  {notifications.length > 0 && <span className="notification-count">{notifications.length > 99 ? "99+" : notifications.length}</span>}
-                </button>
-                {notificationsOpen && (
-                  <div className="notification-dropdown" role="dialog" aria-label="Notifications">
-                    <div className="notification-dropdown-header">
-                      <span>Notifications</span>
-                      <span className="text-xs text-muted-foreground">Click an item to clear it</span>
-                    </div>
-                    {notifications.length === 0 ? (
-                      <div className="notification-empty">No active notifications.</div>
-                    ) : notifications.map((item) => (
-                      <div key={item.id} className={`notification-item ${item.pinned ? "is-pinned" : ""}`} onClick={() => void dismissNotification(item)}>
-                        <div className="notification-item-top">
-                          <span className={`badge ${item.kind === "late_delivery" ? "bg-red-lt text-red" : "bg-blue-lt text-blue"}`}>{item.title}</span>
-                          <button type="button" className="btn btn-icon btn-sm" title={item.pinned ? "Unpin notification" : "Pin notification"} onClick={(event) => { event.stopPropagation(); void toggleNotificationPin(item) }}>
-                            <IconPin className={`size-4 ${item.pinned ? "text-blue" : "text-muted-foreground"}`} />
-                          </button>
-                        </div>
-                        <div className="notification-message">{item.message}</div>
-                        {item.odoo_order_name && <div className="notification-meta">Order: {item.odoo_order_name}</div>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-            <button className={`btn btn-icon ${adminTokenSaved ? "text-green" : "text-yellow"}`} data-bs-toggle="tooltip" data-bs-placement="bottom" title={adminTokenSaved ? "Admin code saved on this PC" : "Enter admin code"} onClick={() => { setAdminAuthError(""); setAdminAccessOpen(true) }}>
-              <Lock className="size-5" />
+            <button className={`app-sidebar-link ${page === "home" ? "active" : ""}`} onClick={() => { setPage("home"); setMobileNavOpen(false) }}>
+              <Home className="size-5" /><span>Dashboard</span>
             </button>
-            {!publicVisitor && (
-              <button className="nav-link d-flex lh-1 text-reset" onClick={() => setPage("settings")}>
-                <div className="avatar avatar-sm bg-blue-lt text-blue"><UserCircle className="size-5" /></div>
-                <div className="hidden text-left text-sm md:block">
-                  <div className="font-medium">Admin Team</div>
-                  <div className="text-xs text-muted-foreground">{adminTokenSaved ? "Access saved" : "Code required"}</div>
+          )}
+          {visibleNavGroups.map((group) => (
+            <div className="app-sidebar-group" key={group.key}>
+              <div className="app-sidebar-label">{group.label}</div>
+              {group.items.map(([key, label, ItemIcon]) => (
+                <button key={key} className={`app-sidebar-link ${page === key ? "active" : ""}`} onClick={() => { setPage(key); setMobileNavOpen(false) }}>
+                  <ItemIcon className="size-5" /><span>{label}</span>
+                </button>
+              ))}
+            </div>
+          ))}
+        </nav>
+        <div className="app-sidebar-footer">
+          {!publicVisitor && <button className={`app-sidebar-link ${page === "settings" ? "active" : ""}`} onClick={() => { setPage("settings"); setMobileNavOpen(false) }}><Settings className="size-5" /><span>Settings</span></button>}
+          <button className="app-sidebar-user" onClick={() => { if (!publicVisitor) setPage("settings") }}>
+            <span className="avatar avatar-sm bg-blue-lt text-blue"><UserCircle className="size-5" /></span>
+            <span><strong>{publicVisitor ? "Dispatch Team" : "Admin Team"}</strong><small>{adminTokenSaved ? "Access saved" : "Code required"}</small></span>
+          </button>
+        </div>
+      </aside>
+      <div className="app-main">
+      <header className="app-topbar d-print-none">
+        <button type="button" className="btn btn-icon app-menu-button" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu2 className="size-5" /></button>
+        <div className="app-topbar-title"><strong>{pageTitle}</strong><span>{currentPageCopy.description}</span></div>
+        <div className="app-topbar-actions">
+          {!publicVisitor && <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey("app_header")} title="Edit app text"><Edit className="size-4" /></Button>}
+          {!publicVisitor && (
+            <div className="notification-menu">
+              <button className="btn btn-icon relative" title="Notifications" onClick={() => setNotificationsOpen((open) => !open)}><Bell className="size-5" />{notifications.length > 0 && <span className="notification-count">{notifications.length > 99 ? "99+" : notifications.length}</span>}</button>
+              {notificationsOpen && (
+                <div className="notification-dropdown" role="dialog" aria-label="Notifications">
+                  <div className="notification-dropdown-header"><span>Notifications</span><span className="text-xs text-muted-foreground">Click an item to clear it</span></div>
+                  {notifications.length === 0 ? <div className="notification-empty">No active notifications.</div> : notifications.map((item) => (
+                    <div key={item.id} className={`notification-item ${item.pinned ? "is-pinned" : ""}`} onClick={() => void dismissNotification(item)}>
+                      <div className="notification-item-top"><span className={`badge ${item.kind === "late_delivery" ? "bg-red-lt text-red" : "bg-blue-lt text-blue"}`}>{item.title}</span><button type="button" className="btn btn-icon btn-sm" title={item.pinned ? "Unpin notification" : "Pin notification"} onClick={(event) => { event.stopPropagation(); void toggleNotificationPin(item) }}><IconPin className={`size-4 ${item.pinned ? "text-blue" : "text-muted-foreground"}`} /></button></div>
+                      <div className="notification-message">{item.message}</div>{item.odoo_order_name && <div className="notification-meta">Order: {item.odoo_order_name}</div>}
+                    </div>
+                  ))}
                 </div>
-              </button>
-            )}
-            {adminTokenSaved && (
-              <button className="btn btn-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Forget admin code on this PC" onClick={clearAdminToken}>
-                <Logout className="size-5" />
-              </button>
-            )}
-          </div>
+              )}
+            </div>
+          )}
+          <button className={`btn btn-icon ${adminTokenSaved ? "text-green" : "text-yellow"}`} title={adminTokenSaved ? "Admin code saved" : "Enter admin code"} onClick={() => { setAdminAuthError(""); setAdminAccessOpen(true) }}><Lock className="size-5" /></button>
+          {adminTokenSaved && <button className="btn btn-icon" title="Forget admin code" onClick={clearAdminToken}><Logout className="size-5" /></button>}
         </div>
       </header>
-      <nav className="navbar-tabs d-print-none" ref={navTabsRef}>
-        <div className="container-xl flex items-center justify-between gap-4">
-          <ul className="navbar-nav nav-tabs">
-            {!publicVisitor && (
-              <li className={`nav-item ${page === "home" ? "active" : ""}`}>
-                <button className={`nav-link ${page === "home" ? "active" : ""}`} onClick={() => { setPage("home"); setOpenNavGroup(null) }}>
-                  <span className="nav-link-icon"><Home className="size-4" /></span>
-                  <span className="nav-link-title">Home</span>
-                </button>
-              </li>
-            )}
-            {visibleNavGroups.map((group) => {
-              const Icon = group.icon
-              const groupActive = activeNavGroup?.key === group.key
-              return (
-                <li key={group.key} className={`nav-item dropdown ${groupActive ? "active" : ""}`}>
-                  <button
-                    className={`nav-link dropdown-toggle ${groupActive ? "active" : ""}`}
-                    onClick={() => setOpenNavGroup(openNavGroup === group.key ? null : group.key)}
-                    aria-expanded={openNavGroup === group.key}
-                  >
-                    <span className="nav-link-icon"><Icon className="size-4" /></span>
-                    <span className="nav-link-title">{group.label}</span>
-                    <ChevronDown className={`size-4 transition-transform ${openNavGroup === group.key ? "rotate-180" : ""}`} />
-                  </button>
-                  {openNavGroup === group.key && (
-                    <div className="dropdown-menu show">
-                      {group.items.map(([key, label, ItemIcon]) => (
-                        <button
-                          key={key}
-                          className={`dropdown-item ${page === key ? "active" : ""}`}
-                          onClick={() => {
-                            setPage(key)
-                            setOpenNavGroup(null)
-                          }}
-                        >
-                          <ItemIcon className="size-4" />
-                          <span>{label}</span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </li>
-              )
-            })}
-          </ul>
-          {!publicVisitor && <button className={`nav-link ms-auto ${page === "settings" ? "active" : ""}`} onClick={() => { setPage("settings"); setOpenNavGroup(null) }}>
-              <span className="nav-link-icon"><Settings className="size-4" /></span>
-              <span className="nav-link-title">Settings</span>
-            </button>}
-        </div>
-      </nav>
-
       <main className="page-wrapper">
       <div className="page-header d-print-none">
         <div className="container-xl">
@@ -4910,6 +4931,15 @@ function App() {
             onNavigate={setPage}
             onDispatchFilter={(status) => { setDispatchStatusFilter(status); setDispatchPage(1); setPage("dispatch-status") }}
             onRefresh={() => refresh()}
+          />
+        )}
+
+        {page === "package-pickups" && (
+          <PackagePickupPage
+            storeId={storeId}
+            stores={stores}
+            onStoreChange={updateStoreView}
+            onResult={setModal}
           />
         )}
 
@@ -5850,6 +5880,7 @@ function App() {
       </div>
       </div>
       </main>
+      </div>
       <AppVersionBadge />
     </div>
     </TooltipProvider>
@@ -6262,6 +6293,587 @@ function HomeDashboard({
           </CardContent>
         </Card>
       </section>
+    </div>
+  )
+}
+
+function brooklynDateInput(offsetDays = 0) {
+  const now = new Date()
+  now.setDate(now.getDate() + offsetDays)
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now)
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  return `${value.year}-${value.month}-${value.day}`
+}
+
+function pickupDateLabel(value: string) {
+  if (!value) return ""
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(`${value}T12:00:00Z`))
+}
+
+function PackagePickupPage({
+  storeId,
+  stores,
+  onStoreChange,
+  onResult,
+}: {
+  storeId: string
+  stores: Store[]
+  onStoreChange: (value: string) => void
+  onResult: (modal: ModalState) => void
+}) {
+  const [dateFrom, setDateFrom] = useState(() => brooklynDateInput(-92))
+  const [dateTo, setDateTo] = useState(() => brooklynDateInput())
+  const [data, setData] = useState<PackagePickupData | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [searchField, setSearchField] = useState("all")
+  const [exactSearch, setExactSearch] = useState("")
+  const [showPackageSearch, setShowPackageSearch] = useState(false)
+  const [savingDate, setSavingDate] = useState("")
+  const [receivingId, setReceivingId] = useState("")
+  const [pickupTimeOpen, setPickupTimeOpen] = useState(false)
+  const [pickupHour, setPickupHour] = useState("9")
+  const [pickupMinute, setPickupMinute] = useState("30")
+  const [pickupPeriod, setPickupPeriod] = useState<"AM" | "PM">("AM")
+  const [pickupTimeSaving, setPickupTimeSaving] = useState(false)
+  const [bulkPickupDate, setBulkPickupDate] = useState("")
+  const [bulkRows, setBulkRows] = useState<PickupBulkRow[]>([])
+  const [bulkDialogMode, setBulkDialogMode] = useState<"count" | "add" | "edit">("add")
+  const [bulkSaving, setBulkSaving] = useState(false)
+  const [deletingRowId, setDeletingRowId] = useState("")
+  const [pickupPage, setPickupPage] = useState(1)
+  const pickupDaysPerPage = 15
+  const [expandedDates, setExpandedDates] = useState<Set<string>>(new Set())
+  const [drafts, setDrafts] = useState<Record<string, { amazon: string; nonAmazon: string; orderNumbers: string }>>({})
+
+  async function load() {
+    setLoading(true)
+    try {
+      const query = new URLSearchParams({ date_from: dateFrom, date_to: dateTo })
+      if (storeId) query.set("store_id", storeId)
+      const result = await api<PackagePickupData>(`/api/package-pickups?${query.toString()}`)
+      setData(result)
+      setDrafts(Object.fromEntries(result.cards.map((card) => [
+        card.pickup_date,
+        {
+          amazon: String(card.amazon_picked_up),
+          nonAmazon: String(card.non_amazon_picked_up),
+          orderNumbers: card.non_amazon_packages.map((row) => row.odoo_order_name).filter(Boolean).join("\n"),
+        },
+      ])))
+    } catch (error) {
+      onResult({ ok: false, title: "Package Pickup Check", message: String(error) })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void load()
+    // Filters are the source of truth for this operational view.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeId, dateFrom, dateTo])
+
+  function updateDraft(pickupDate: string, key: "amazon" | "nonAmazon" | "orderNumbers", value: string) {
+    setDrafts((current) => ({
+      ...current,
+      [pickupDate]: {
+        amazon: current[pickupDate]?.amazon || "0",
+        nonAmazon: current[pickupDate]?.nonAmazon || "0",
+        orderNumbers: current[pickupDate]?.orderNumbers || "",
+        [key]: value,
+      },
+    }))
+  }
+
+  async function saveCounts(card: PackagePickupCard) {
+    const draft = drafts[card.pickup_date] || { amazon: "0", nonAmazon: "0", orderNumbers: "" }
+    const amazonCount = Math.max(0, Number.parseInt(draft.amazon || "0", 10) || 0)
+    const nonAmazonCount = Math.max(0, Number.parseInt(draft.nonAmazon || "0", 10) || 0)
+    const orderNumbers = draft.orderNumbers.split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean)
+    if (orderNumbers.length > nonAmazonCount) {
+      onResult({ ok: false, title: "Non-Amazon pickups", message: "There are more order numbers than the entered non-Amazon package count." })
+      return
+    }
+    setSavingDate(card.pickup_date)
+    try {
+      const result = await api<PackagePickupData>("/api/package-pickups/counts", {
+        method: "POST",
+        body: JSON.stringify({
+          store_id: storeId ? Number(storeId) : null,
+          pickup_date: card.pickup_date,
+          amazon_picked_up: amazonCount,
+          non_amazon_picked_up: nonAmazonCount,
+          amazon_unreported_count: Math.max(
+            0,
+            amazonCount - card.amazon_reported_delivered - (card.manual_amazon_packages || []).filter((row) => row.source_type === "manual_amazon").length,
+          ),
+          non_amazon_order_numbers: orderNumbers,
+        }),
+      })
+      await load()
+      const savedCard = result.cards.find((item) => item.pickup_date === card.pickup_date)
+      const detailRows = [
+        ...((savedCard?.manual_amazon_packages || []).filter((row) => row.source_type === "count_amazon" && row.needs_details)),
+        ...((savedCard?.non_amazon_packages || []).filter((row) => row.needs_details)),
+      ]
+      if (detailRows.length) {
+        setBulkDialogMode("count")
+        setBulkPickupDate(card.pickup_date)
+        setBulkRows(detailRows.map((row) => ({
+          key: `${row.source_type}:${row.source_id}`,
+          source_id: row.source_id,
+          package_type: row.source_type === "count_amazon" ? "amazon" : "non_amazon",
+          odoo_order_name: row.odoo_order_name || "",
+          tracking_input: row.tracking_input || "",
+        })))
+      } else {
+        onResult({ ok: true, title: "Pickup count saved", message: `${pickupDateLabel(card.pickup_date)} has been updated.` })
+      }
+    } catch (error) {
+      onResult({ ok: false, title: "Pickup count failed", message: String(error) })
+    } finally {
+      setSavingDate("")
+    }
+  }
+
+  function pickupTimeLabel(value: string) {
+    const [hourValue, minuteValue] = (value || "09:30").split(":").map(Number)
+    const period = hourValue >= 12 ? "PM" : "AM"
+    const hour = hourValue % 12 || 12
+    return `${hour}:${String(minuteValue || 0).padStart(2, "0")} ${period}`
+  }
+
+  function openPickupTimeEditor() {
+    const [hourValue, minuteValue] = (data?.cutoff || "09:30").split(":").map(Number)
+    setPickupHour(String(hourValue % 12 || 12))
+    setPickupMinute(String(minuteValue || 0).padStart(2, "0"))
+    setPickupPeriod(hourValue >= 12 ? "PM" : "AM")
+    setPickupTimeOpen(true)
+  }
+
+  async function savePickupTime() {
+    let hour = Number(pickupHour) % 12
+    if (pickupPeriod === "PM") hour += 12
+    const pickupTime = `${String(hour).padStart(2, "0")}:${pickupMinute}`
+    setPickupTimeSaving(true)
+    try {
+      await api<{ ok: boolean; pickup_time: string }>("/api/package-pickups/settings", {
+        method: "POST",
+        body: JSON.stringify({ pickup_time: pickupTime }),
+      })
+      setPickupTimeOpen(false)
+      await load()
+      onResult({ ok: true, title: "Pickup time saved", message: `Team pickup time is now ${pickupTimeLabel(pickupTime)} Brooklyn time.` })
+    } catch (error) {
+      onResult({ ok: false, title: "Could not save pickup time", message: String(error) })
+    } finally {
+      setPickupTimeSaving(false)
+    }
+  }
+
+  async function markConfirmation(row: PackagePickupRow, status: "received" | "not_received" | "unconfirmed") {
+    const key = `${row.source_type}:${row.source_id}:${status}`
+    setReceivingId(key)
+    try {
+      await api<{ ok: boolean; status: string }>("/api/package-pickups/received", {
+        method: "POST",
+        body: JSON.stringify({ source_type: row.source_type, source_id: row.source_id, status }),
+      })
+      await load()
+      const statusLabel = status === "received" ? "Received" : status === "not_received" ? "Not received" : "Unconfirmed"
+      onResult({ ok: true, title: `Package ${statusLabel.toLowerCase()}`, message: `${row.odoo_order_name || row.package_type} is now ${statusLabel.toLowerCase()}.` })
+    } catch (error) {
+      onResult({ ok: false, title: "Confirmation update failed", message: String(error) })
+    } finally {
+      setReceivingId("")
+    }
+  }
+
+  function openBulkPickupRows(pickupDate: string) {
+    setBulkDialogMode("add")
+    setBulkPickupDate(pickupDate)
+    setBulkRows([{ key: `new:${Date.now()}`, package_type: "amazon", odoo_order_name: "", tracking_input: "" }])
+  }
+
+  function editExtraPickupRow(pickupDate: string, row: PackagePickupRow) {
+    setBulkDialogMode("edit")
+    setBulkPickupDate(pickupDate)
+    setBulkRows([{
+      key: `${row.source_type}:${row.source_id}`,
+      source_id: row.source_id,
+      package_type: row.source_type === "count_amazon" ? "amazon" : "non_amazon",
+      odoo_order_name: row.odoo_order_name || "",
+      tracking_input: row.tracking_input || "",
+    }])
+  }
+
+  function closeBulkPickupRows() {
+    if (bulkSaving) return
+    setBulkPickupDate("")
+    setBulkRows([])
+    setBulkDialogMode("add")
+  }
+
+  function updateBulkRow(key: string, patch: Partial<PickupBulkRow>) {
+    setBulkRows((current) => current.map((row) => row.key === key ? { ...row, ...patch } : row))
+  }
+
+  async function saveBulkPickupRows(event: ReactFormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const invalidTrackingIndex = bulkRows.findIndex((row) => {
+      const value = row.tracking_input.toUpperCase().replace(/[^A-Z0-9]/g, "")
+      return value.length < 5
+    })
+    if (invalidTrackingIndex >= 0) {
+      onResult({ ok: false, title: "Tracking required", message: `Package ${invalidTrackingIndex + 1} needs the full tracking ID or at least its last 5 letters or numbers.` })
+      return
+    }
+    const missingNonAmazonOrder = bulkRows.findIndex((row) => row.package_type === "non_amazon" && (!row.odoo_order_name.trim() || /^Non-Amazon Package \d+$/i.test(row.odoo_order_name.trim())))
+    if (missingNonAmazonOrder >= 0) {
+      onResult({ ok: false, title: "Odoo order required", message: `Non-Amazon package ${missingNonAmazonOrder + 1} needs the Odoo order number shown on the package.` })
+      return
+    }
+    setBulkSaving(true)
+    try {
+      await api<PackagePickupData>("/api/package-pickups/bulk-details", {
+        method: "POST",
+        body: JSON.stringify({
+          store_id: storeId ? Number(storeId) : null,
+          pickup_date: bulkPickupDate,
+          rows: bulkRows.map(({ source_id, package_type, odoo_order_name, tracking_input }) => ({ source_id, package_type, odoo_order_name, tracking_input })),
+        }),
+      })
+      const savedDate = bulkPickupDate
+      setBulkPickupDate("")
+      setBulkRows([])
+      setBulkDialogMode("add")
+      setExpandedDates((current) => new Set(current).add(savedDate))
+      await load()
+      onResult({ ok: true, title: "Package details saved", message: `${bulkRows.length} pickup package row${bulkRows.length === 1 ? "" : "s"} updated together.` })
+    } catch (error) {
+      onResult({ ok: false, title: "Could not save package details", message: String(error) })
+    } finally {
+      setBulkSaving(false)
+    }
+  }
+
+  async function deleteExtraPickupRow(row: PackagePickupRow) {
+    if (!window.confirm(`Delete ${row.odoo_order_name || row.package_type}? The pickup count will be reduced by one.`)) return
+    const key = `${row.source_type}:${row.source_id}`
+    setDeletingRowId(key)
+    try {
+      await api<{ ok: boolean }>("/api/package-pickups/delete-row", {
+        method: "POST",
+        body: JSON.stringify({ source_type: row.source_type, source_id: row.source_id }),
+      })
+      await load()
+      onResult({ ok: true, title: "Extra row deleted", message: "The team-added package row and its pickup count were corrected." })
+    } catch (error) {
+      onResult({ ok: false, title: "Could not delete row", message: String(error) })
+    } finally {
+      setDeletingRowId("")
+    }
+  }
+
+  const summary = data?.summary || { amazon_reported_delivered: 0, amazon_picked_up: 0, non_amazon_picked_up: 0, missing_amazon: 0, unreported_amazon: 0, shopify_fulfilled: 0 }
+  const normalizedExactSearch = exactSearch.trim().toUpperCase()
+  const normalizedTrackingSearch = normalizedExactSearch.replace(/[^A-Z0-9]/g, "")
+  function rowMatchesExactSearch(row: PackagePickupRow) {
+    if (!normalizedExactSearch) return true
+    const odooOrder = String(row.odoo_order_name || "").trim().toUpperCase()
+    const amazonOrder = String(row.amazon_order_id || "").trim().toUpperCase()
+    const trackingId = String(row.tracking_id || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "")
+    if (searchField === "odoo_order") return odooOrder === normalizedExactSearch
+    if (searchField === "amazon_order") return amazonOrder === normalizedExactSearch
+    if (searchField === "tracking_id") return trackingId === normalizedTrackingSearch
+    return odooOrder === normalizedExactSearch || amazonOrder === normalizedExactSearch || trackingId === normalizedTrackingSearch
+  }
+  const visibleCards = (data?.cards || []).filter((card) => (
+    !normalizedExactSearch || [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages].some(rowMatchesExactSearch)
+  ))
+  const exactMatchCount = visibleCards.reduce((total, card) => (
+    total + [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages].filter(rowMatchesExactSearch).length
+  ), 0)
+  const pickupPageCount = Math.max(1, Math.ceil(visibleCards.length / pickupDaysPerPage))
+  const safePickupPage = Math.min(pickupPage, pickupPageCount)
+  const pagedPickupCards = visibleCards.slice((safePickupPage - 1) * pickupDaysPerPage, safePickupPage * pickupDaysPerPage)
+
+  useEffect(() => {
+    setPickupPage(1)
+  }, [storeId, dateFrom, dateTo, searchField, exactSearch])
+
+  useEffect(() => {
+    if (pickupPage > pickupPageCount) setPickupPage(pickupPageCount)
+  }, [pickupPage, pickupPageCount])
+
+  return (
+    <div className="pickup-page grid gap-4">
+      <Dialog open={pickupTimeOpen} onOpenChange={(open) => { if (!pickupTimeSaving) setPickupTimeOpen(open) }}>
+        <DialogContent className="pickup-time-dialog">
+          <DialogHeader>
+            <DialogTitle>Edit team pickup time</DialogTitle>
+            <DialogDescription>This changes the displayed Brooklyn pickup time only. Packages remain grouped by their Amazon delivery date.</DialogDescription>
+          </DialogHeader>
+          <div className="pickup-time-form">
+            <label><span>Hour</span><select className="form-select" value={pickupHour} onChange={(event) => setPickupHour(event.target.value)}>{Array.from({ length: 12 }, (_, index) => String(index + 1)).map((hour) => <option key={hour} value={hour}>{hour}</option>)}</select></label>
+            <label><span>Minute</span><select className="form-select" value={pickupMinute} onChange={(event) => setPickupMinute(event.target.value)}>{Array.from({ length: 60 }, (_, index) => String(index).padStart(2, "0")).map((minute) => <option key={minute} value={minute}>{minute}</option>)}</select></label>
+            <label><span>AM / PM</span><select className="form-select" value={pickupPeriod} onChange={(event) => setPickupPeriod(event.target.value as "AM" | "PM")}><option value="AM">AM</option><option value="PM">PM</option></select></label>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPickupTimeOpen(false)} disabled={pickupTimeSaving}>Cancel</Button>
+            <Button onClick={() => void savePickupTime()} disabled={pickupTimeSaving}>{pickupTimeSaving ? "Saving…" : "Save pickup time"}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(bulkPickupDate)} onOpenChange={(open) => { if (!open) closeBulkPickupRows() }}>
+        <DialogContent className="pickup-bulk-dialog">
+          <form onSubmit={saveBulkPickupRows}>
+            <DialogHeader>
+              <DialogTitle>{bulkDialogMode === "edit" ? "Edit pickup package" : bulkDialogMode === "count" ? "Complete pickup package details" : "Add pickup package details"}</DialogTitle>
+              <DialogDescription>
+                Complete all extra packages together. Tracking or its last 5 is required. Odoo order is optional for Amazon and required for non-Amazon. Numbered rows remain saved if you close.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="pickup-bulk-form">
+              <div className="manual-pickup-date">
+                <span>Delivery-date card</span>
+                <strong>{pickupDateLabel(bulkPickupDate)}</strong>
+                <small>Recorded against packages Amazon delivered on this Brooklyn date.</small>
+              </div>
+              <div className="pickup-bulk-list">
+                <div className="pickup-bulk-row pickup-bulk-header"><span>#</span><span>Package type</span><span>Odoo order</span><span>Tracking ID / last 5</span><span></span></div>
+                {bulkRows.map((row, index) => (
+                  <div className="pickup-bulk-row" key={row.key}>
+                    <strong className="pickup-bulk-number">{index + 1}</strong>
+                    <label><span>Package type</span><select className="form-select" value={row.package_type} disabled={Boolean(row.source_id)} onChange={(event) => updateBulkRow(row.key, { package_type: event.target.value as PickupBulkRow["package_type"] })}><option value="amazon">Amazon</option><option value="non_amazon">Non-Amazon</option></select></label>
+                    <label><span>Odoo order {row.package_type === "amazon" ? "(optional)" : ""}</span><Input value={row.odoo_order_name} onChange={(event) => updateBulkRow(row.key, { odoo_order_name: event.target.value })} placeholder={row.package_type === "amazon" ? "Optional recipient Odoo order" : "Required Odoo order"} /></label>
+                    <label><span>Tracking ID / last 5</span><Input value={row.tracking_input} onChange={(event) => updateBulkRow(row.key, { tracking_input: event.target.value })} placeholder="Full tracking or last 5" /></label>
+                    <Button className="pickup-bulk-remove" type="button" variant="ghost" size="sm" title="Remove this unsaved row" aria-label={`Remove package ${index + 1}`} disabled={Boolean(row.source_id) || bulkRows.length === 1} onClick={() => setBulkRows((current) => current.filter((item) => item.key !== row.key))}><Trash2 className="size-4" /></Button>
+                  </div>
+                ))}
+              </div>
+              <div className="pickup-bulk-actions">
+                <Button type="button" variant="outline" size="sm" onClick={() => setBulkRows((current) => [...current, { key: `new:${Date.now()}:${current.length}`, package_type: current.at(-1)?.package_type || "amazon", odoo_order_name: "", tracking_input: "" }])}><Plus className="size-4" /> Add another package</Button>
+                <p>Amazon rows are matched automatically using the tracking ID. The optional Odoo order helps only when more than one tracking candidate exists.</p>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={closeBulkPickupRows} disabled={bulkSaving}>Close</Button>
+              <Button type="submit" disabled={bulkSaving}>{bulkSaving ? "Saving…" : bulkDialogMode === "edit" ? "Save changes" : `Save ${bulkRows.length} package${bulkRows.length === 1 ? "" : "s"}`}</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <section className="pickup-toolbar">
+        <div className="pickup-toolbar-body">
+          <div className="pickup-filter-grid">
+            <SelectField label="Store" value={storeId} onChange={onStoreChange}>
+              <option value="">All stores</option>
+              {stores.map((store) => <option key={store.id} value={store.id}>{store.name}</option>)}
+            </SelectField>
+            <TextField label="From delivery date" type="date" value={dateFrom} onChange={setDateFrom} />
+            <TextField label="To delivery date" type="date" value={dateTo} onChange={setDateTo} />
+            <button type="button" className="pickup-cutoff-chip" onClick={openPickupTimeEditor} title="Edit team pickup time"><Clock className="size-4" /><span>Team pickup <strong>{pickupTimeLabel(data?.cutoff || "09:30")}</strong></span><Edit className="size-3.5" /></button>
+          </div>
+          <div className="pickup-toolbar-actions">
+            <Button variant="outline" size="sm" onClick={() => setShowPackageSearch((current) => !current)} aria-expanded={showPackageSearch}>
+              <Search className="size-4" /> {showPackageSearch ? "Hide package search" : "Search packages"}
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+              <RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} /> {loading ? "Refreshing…" : "Refresh"}
+            </Button>
+          </div>
+          {showPackageSearch && (
+            <div className="pickup-search-grid pickup-search-panel">
+              <SelectField label="Exact search field" value={searchField} onChange={setSearchField}>
+                <option value="all">All fields</option>
+                <option value="odoo_order">Odoo order</option>
+                <option value="amazon_order">Amazon order</option>
+                <option value="tracking_id">Tracking ID</option>
+              </SelectField>
+              <div className="grid min-w-0 gap-1.5">
+                <Label>Exact order or tracking number</Label>
+                <SearchBox value={exactSearch} onChange={setExactSearch} placeholder="Enter the complete Odoo, Amazon, or tracking number" />
+              </div>
+              {normalizedExactSearch && <div className="pickup-search-result">{exactMatchCount} exact package match{exactMatchCount === 1 ? "" : "es"}</div>}
+            </div>
+          )}
+        </div>
+      </section>
+
+      <div className="pickup-rule-note">
+        <Clock className="size-4" />
+        <span><strong>Delivery-date rule:</strong> packages stay on Amazon's Brooklyn delivery date. At the {pickupTimeLabel(data?.cutoff || "09:30")} pickup, use the prior delivery-date card; today's card may be empty.</span>
+      </div>
+
+      <section className="pickup-summary-strip" aria-label="Selected date range totals">
+        <div><span>Amazon delivered</span><strong>{summary.amazon_reported_delivered}</strong></div>
+        <div><span>Amazon picked up</span><strong>{summary.amazon_picked_up}</strong></div>
+        <div><span>Non-Amazon picked up</span><strong>{summary.non_amazon_picked_up}</strong></div>
+        <div className={summary.missing_amazon || summary.unreported_amazon ? "is-missing" : "is-complete"}><span>Difference</span><strong>{summary.missing_amazon ? `Missing ${summary.missing_amazon}` : summary.unreported_amazon ? `Extra ${summary.unreported_amazon}` : "Matched"}</strong></div>
+      </section>
+
+      {visibleCards.length > pickupDaysPerPage && (
+        <div className="pickup-pagination-bar">
+          <span>Newest delivery dates first · 15 days per page</span>
+          <PaginationControls page={safePickupPage} total={visibleCards.length} perPage={pickupDaysPerPage} onPage={setPickupPage} disabled={loading} label="delivery dates" />
+        </div>
+      )}
+
+      {loading && !data ? <div className="card"><div className="card-body text-secondary">Loading pickup records…</div></div> : null}
+      {pagedPickupCards.map((card) => {
+        const draft = drafts[card.pickup_date] || { amazon: String(card.amazon_picked_up), nonAmazon: String(card.non_amazon_picked_up), orderNumbers: "" }
+        const allCardRows = [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages]
+        const rows = allCardRows.filter(rowMatchesExactSearch)
+        const expanded = expandedDates.has(card.pickup_date) || Boolean(normalizedExactSearch && rows.length)
+        const isMatched = card.missing_amazon === 0 && card.unreported_amazon === 0
+        return (
+          <section key={card.pickup_date} className="pickup-day-card card">
+            <div className="pickup-day-head">
+              <button
+                type="button"
+                className="pickup-day-toggle"
+                onClick={() => setExpandedDates((current) => {
+                  const next = new Set(current)
+                  if (next.has(card.pickup_date)) next.delete(card.pickup_date)
+                  else next.add(card.pickup_date)
+                  return next
+                })}
+                aria-expanded={expanded}
+              >
+                {expanded ? <ChevronDown className="size-5" /> : <ChevronRight className="size-5" />}
+                <span>
+                  <strong>{pickupDateLabel(card.pickup_date)}</strong>
+                  <small>{expanded ? "Hide" : "Show"} {allCardRows.length} package detail{allCardRows.length === 1 ? "" : "s"}</small>
+                </span>
+              </button>
+              <div className="pickup-day-metric"><span>Amazon delivered</span><strong>{card.amazon_reported_delivered}</strong></div>
+              <div className="pickup-count-field"><Label>Amazon picked up</Label><Input type="number" min="0" value={draft.amazon} onChange={(event) => updateDraft(card.pickup_date, "amazon", event.target.value)} /></div>
+              <div className="pickup-count-field"><Label>Non-Amazon picked up</Label><Input type="number" min="0" value={draft.nonAmazon} onChange={(event) => updateDraft(card.pickup_date, "nonAmazon", event.target.value)} /></div>
+              <div className={`pickup-difference ${isMatched ? "is-matched" : "is-missing"}`}>{isMatched ? "Matched" : card.missing_amazon ? `Missing ${card.missing_amazon}` : `Extra ${card.unreported_amazon}`}</div>
+              <div className="pickup-day-actions">
+                <Button variant="outline" size="sm" onClick={() => openBulkPickupRows(card.pickup_date)}>
+                  <Plus className="size-4" /> Add row
+                </Button>
+                <Button className="pickup-save-btn" size="sm" onClick={() => void saveCounts(card)} disabled={savingDate === card.pickup_date}>
+                  {savingDate === card.pickup_date ? "Saving…" : "Save counts"}
+                </Button>
+              </div>
+            </div>
+            {expanded && (
+              <div className="pickup-detail-wrap">
+                {card.missing_amazon > 0 && <div className="pickup-missing-alert"><AlertCircle className="size-4" /> {card.missing_amazon} Amazon-delivered package{card.missing_amazon === 1 ? " is" : "s are"} not in the physical pickup count.</div>}
+                <div className="pickup-table" role="table" aria-label={`${pickupDateLabel(card.pickup_date)} packages`}>
+                  <div className="pickup-table-row pickup-table-header" role="row">
+                    <span>Odoo Order</span><span>Amazon Order</span><span>Tracking ID</span><span>Delivered at</span><span>Type</span><span>Shopify</span><span>Confirmation</span><span>Actions</span>
+                  </div>
+                  {rows.map((row) => {
+                    const receiveKey = `${row.source_type}:${row.source_id}`
+                    const confirmationStatus = row.shopify_fulfilled ? "received" : row.confirmation_status || (row.received ? "received" : row.not_received ? "not_received" : "unconfirmed")
+                    const confirmationBusy = receivingId.startsWith(`${receiveKey}:`)
+                    return (
+                      <div key={receiveKey} className={`pickup-table-row ${row.shopify_fulfilled ? "is-fulfilled" : ""}`} role="row">
+                        <span data-label="Odoo Order"><strong>{row.odoo_order_name || "Not entered"}</strong></span>
+                        <span data-label="Amazon Order">{row.amazon_order_url ? <a href={row.amazon_order_url} target="_blank" rel="noreferrer">{row.amazon_order_id}</a> : "—"}</span>
+                        <span data-label="Tracking ID">
+                          {row.tracking_id ? (
+                            <span className="pickup-tracking-cell">
+                              {row.tracking_url ? <a href={row.tracking_url} target="_blank" rel="noreferrer"><strong>{row.tracking_id}</strong></a> : <strong>{row.tracking_id}</strong>}
+                              <small>{[row.carrier, row.delivery_status].filter(Boolean).join(" · ")}</small>
+                            </span>
+                          ) : row.source_type !== "non_amazon" ? <span className="text-muted-foreground">Not captured</span> : "—"}
+                        </span>
+                        <span data-label="Delivered at">{row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true }) || "Not recorded"}</span>
+                        <span data-label="Type"><span className={`pickup-type ${row.source_type}`}>{row.package_type}</span></span>
+                        <span data-label="Shopify"><span className={`pickup-status ${row.shopify_fulfilled ? "is-fulfilled" : "is-pending"}`}>{row.shopify_fulfilled ? "Fulfilled" : row.shopify_status || "Pending"}</span></span>
+                        <span data-label="Confirmation">
+                          {row.shopify_fulfilled ? (
+                            <span className="pickup-auto-confirmed">
+                              <button type="button" className="pickup-confirm-btn is-received is-active" disabled><Check className="size-3.5" /> Received</button>
+                              <small>Auto-confirmed · Fulfilled in Shopify</small>
+                              {(row.delivered_at || row.delivered_display) && (
+                                <small className="pickup-confirmation-amazon-date">Amazon delivered · {row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                              )}
+                            </span>
+                          ) : <span className="pickup-confirmation-record">
+                            <span className="pickup-confirmation-actions">
+                              {confirmationStatus !== "not_received" && (
+                                <button
+                                  type="button"
+                                  className={`pickup-confirm-btn is-received ${confirmationStatus === "received" ? "is-active" : ""}`}
+                                  disabled={confirmationBusy}
+                                  title="Confirm this package was received"
+                                  onClick={() => void markConfirmation(row, "received")}
+                                >
+                                  <Check className="size-3.5" /> Received
+                                </button>
+                              )}
+                              {confirmationStatus !== "received" && (
+                                <button
+                                  type="button"
+                                  className={`pickup-confirm-btn is-not-received ${confirmationStatus === "not_received" ? "is-active" : ""}`}
+                                  disabled={confirmationBusy}
+                                  title="Confirm this package was not received"
+                                  onClick={() => void markConfirmation(row, "not_received")}
+                                >
+                                  <X className="size-3.5" /> Not received
+                                </button>
+                              )}
+                              {confirmationStatus !== "unconfirmed" && (
+                                <button type="button" className="pickup-confirm-reset" disabled={row.shopify_fulfilled || confirmationBusy} title="Reset to unconfirmed" aria-label={`Reset confirmation for ${row.odoo_order_name || row.package_type}`} onClick={() => void markConfirmation(row, "unconfirmed")}><RefreshCw className="size-3.5" /></button>
+                              )}
+                            </span>
+                            {confirmationStatus === "received" && row.received_at && (
+                              <small className="pickup-confirmation-date">Confirmed received · {formatDateTime(row.received_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                            )}
+                            {confirmationStatus === "not_received" && row.not_received_at && (
+                              <small className="pickup-confirmation-date is-not-received">Confirmed not received · {formatDateTime(row.not_received_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                            )}
+                            {confirmationStatus !== "unconfirmed" && (row.delivered_at || row.delivered_display) && (
+                              <small className="pickup-confirmation-amazon-date">Amazon delivered · {row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                            )}
+                          </span>}
+                        </span>
+                        <span data-label="Actions">
+                          {row.source_type === "count_amazon" || row.source_type === "non_amazon" ? (
+                            <span className="pickup-row-actions">
+                              <button type="button" title="Edit this team-added row" aria-label={`Edit ${row.odoo_order_name || row.package_type}`} onClick={() => editExtraPickupRow(card.pickup_date, row)}><Edit className="size-4" /></button>
+                              <button type="button" className="is-delete" title="Delete this team-added row" aria-label={`Delete ${row.odoo_order_name || row.package_type}`} disabled={deletingRowId === receiveKey} onClick={() => void deleteExtraPickupRow(row)}><Trash2 className="size-4" /></button>
+                            </span>
+                          ) : <span className="text-muted-foreground">—</span>}
+                        </span>
+                      </div>
+                    )
+                  })}
+                  {!rows.length && <div className="pickup-empty">No delivered or non-Amazon pickup rows recorded for this date.</div>}
+                </div>
+              </div>
+            )}
+          </section>
+        )
+      })}
+      {data && normalizedExactSearch && !visibleCards.length && (
+        <div className="card"><div className="card-body text-secondary">No exact package match was found in the selected delivery-date range.</div></div>
+      )}
+      {visibleCards.length > pickupDaysPerPage && (
+        <div className="pickup-pagination-bar is-bottom">
+          <span>Page {safePickupPage} of {pickupPageCount}</span>
+          <PaginationControls page={safePickupPage} total={visibleCards.length} perPage={pickupDaysPerPage} onPage={setPickupPage} disabled={loading} label="delivery dates" />
+        </div>
+      )}
     </div>
   )
 }
@@ -8251,7 +8863,7 @@ function AmazonOtpPage({ onResult }: { onResult: (modal: ModalState) => void }) 
             <Search className="size-4" />
             Search
           </Button>
-          <a className="btn btn-outline-secondary" href="/public/amazon-otp" target="_blank">Open Public Page</a>
+          <a className="btn btn-outline-secondary" href="/amazon-otp" target="_blank">Open Public Page</a>
         </form>
       </div>
       <div className="border-t px-6 py-3">
@@ -8412,14 +9024,6 @@ function packageTrackerAmazonOrderDate(value?: string) {
   return date.toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "short", day: "2-digit" })
 }
 
-function packageTrackerLatestAmazonOrderDate(row: PackageTrackerOrderCard) {
-  return row.packages.reduce((latest, item) => {
-    if (!item.order_date) return latest
-    const timestamp = new Date(item.order_date).getTime()
-    return Number.isFinite(timestamp) && timestamp > latest.timestamp ? { value: item.order_date, timestamp } : latest
-  }, { value: "", timestamp: Number.NEGATIVE_INFINITY }).value
-}
-
 function packageTrackerUnassignedProducts(row: PackageTrackerOrderCard) {
   return row.packages.flatMap((item) => item.unassigned_products || [])
 }
@@ -8438,6 +9042,7 @@ function PackageTrackerDesignPage() {
   const [sortBy, setSortBy] = useState("recent_delivery")
   const [fromDate, setFromDate] = useState("")
   const [toDate, setToDate] = useState("")
+  const [showTrackerFilters, setShowTrackerFilters] = useState(false)
   const [expandedHistory, setExpandedHistory] = useState<string[]>([])
   const [expandedPackages, setExpandedPackages] = useState<string[]>([])
   const [page, setPage] = useState(1)
@@ -8522,23 +9127,13 @@ function PackageTrackerDesignPage() {
   }
 
   return (
-    <div className="d-grid gap-3">
-      <div className="card">
-        <div className="card-header">
-          <div>
-            <h3 className="card-title">Public package tracking</h3>
-            <div className="card-subtitle">Complete Odoo cards move together when sorted. Recipient references guard every Amazon association.</div>
-          </div>
-          <div className="card-actions">
-            <span className="status status-green"><span className="status-dot status-dot-animated" />Recipient guard active</span>
-          </div>
-        </div>
-        <div className="card-body">
-          <div className="row g-3">
-            <div className="col-12 col-xl-4">
-              <label className="form-label" htmlFor="package-tracker-search">Search</label>
-              <div className="row g-2">
-                <div className="col-5">
+    <div className="package-tracker-page d-grid gap-3">
+      <section className="package-tracker-toolbar">
+        <div className="package-tracker-primary-filters">
+          <div className="package-tracker-search">
+            <label className="form-label" htmlFor="package-tracker-search">Search packages</label>
+            <div className="package-tracker-search-controls">
+              <div>
                 <select className="form-select" aria-label="Search field" value={searchField} onChange={(event) => setSearchField(event.target.value)}>
                   <option value="all">All fields</option>
                   <option value="order_number">Order number</option>
@@ -8548,26 +9143,35 @@ function PackageTrackerDesignPage() {
                   <option value="tracking_id">Tracking ID</option>
                   <option value="recipient">Recipient</option>
                 </select>
-                </div>
-                <div className="col-7 input-icon">
-                  <span className="input-icon-addon"><Search className="icon icon-1" /></span>
-                  <input id="package-tracker-search" className="form-control" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search packages…" />
-                </div>
+              </div>
+              <div className="input-icon">
+                <span className="input-icon-addon"><Search className="icon icon-1" /></span>
+                <input id="package-tracker-search" className="form-control" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Odoo, Amazon or tracking number" />
               </div>
             </div>
-            <div className="col-12 col-md-4 col-xl-2">
-              <label className="form-label" htmlFor="package-tracker-status">Status</label>
-              <select id="package-tracker-status" className="form-select" value={status} onChange={(event) => setStatus(event.target.value)}>
-                <option value="all">All orders</option>
-                <option value="arriving">Arriving</option>
-                <option value="partial">Partially delivered</option>
-                <option value="delivered">Fully delivered</option>
-                <option value="shopify_pending">Delivered, Shopify pending</option>
-                <option value="cancelled_history">Has cancelled history</option>
-                <option value="suspected_duplicate">Suspected duplicate orders</option>
-              </select>
-            </div>
-            <div className="col-12 col-md-4 col-xl-2">
+          </div>
+          <div>
+            <label className="form-label" htmlFor="package-tracker-status">Status</label>
+            <select id="package-tracker-status" className="form-select" value={status} onChange={(event) => setStatus(event.target.value)}>
+              <option value="all">All orders</option>
+              <option value="arriving">Arriving</option>
+              <option value="partial">Partially delivered</option>
+              <option value="delivered">Fully delivered</option>
+              <option value="shopify_pending">Delivered, Shopify pending</option>
+              <option value="cancelled_history">Has cancelled history</option>
+              <option value="suspected_duplicate">Suspected duplicate orders</option>
+            </select>
+          </div>
+          <div className="package-tracker-filter-actions">
+            <Button variant="outline" size="sm" onClick={() => setShowTrackerFilters((current) => !current)} aria-expanded={showTrackerFilters}>
+              {showTrackerFilters ? "Hide filters" : "More filters"}<ChevronDown className={`size-4 transition-transform ${showTrackerFilters ? "rotate-180" : ""}`} />
+            </Button>
+            <span className="package-tracker-guard"><Check className="size-4" /> Recipient guard</span>
+          </div>
+        </div>
+        {showTrackerFilters && (
+          <div className="package-tracker-advanced-filters">
+            <div>
               <label className="form-label" htmlFor="package-tracker-sort">Sort full cards by</label>
               <select id="package-tracker-sort" className="form-select" value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
                 <option value="recent_delivery">Recent deliveries first</option>
@@ -8579,11 +9183,11 @@ function PackageTrackerDesignPage() {
                 <option value="odoo">Odoo order number</option>
               </select>
             </div>
-            <div className="col-6 col-md-2 col-xl-2">
+            <div>
               <label className="form-label" htmlFor="package-tracker-from">From date</label>
               <input id="package-tracker-from" className="form-control" type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} />
             </div>
-            <div className="col-6 col-md-2 col-xl-2">
+            <div>
               <div className="d-flex align-items-center justify-content-between">
                 <label className="form-label" htmlFor="package-tracker-to">To date</label>
                 {(fromDate || toDate) && (
@@ -8595,21 +9199,17 @@ function PackageTrackerDesignPage() {
               <input id="package-tracker-to" className="form-control" type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} />
             </div>
           </div>
-        </div>
-        <div className="card-footer">
-          <div className="row g-3 text-center">
-            <div className="col-6 col-md"><div className="h2 m-0">{totals.cards.toLocaleString()}</div><div className="text-secondary">Odoo cards</div></div>
-            <div className="col-6 col-md"><div className="h2 m-0">{totals.packages}</div><div className="text-secondary">Current packages</div></div>
-            <div className="col-6 col-md"><div className="h2 m-0 text-green">{totals.delivered_packages}</div><div className="text-secondary">Delivered packages</div></div>
-            <div className="col-6 col-md"><div className="h2 m-0 text-green">{totals.delivered}</div><div className="text-secondary">Fully delivered</div></div>
-            <div className="col-6 col-md"><div className="h2 m-0 text-yellow">{totals.partial}</div><div className="text-secondary">Partially delivered</div></div>
-            <div className="col-12 col-md"><div className="h2 m-0 text-red">{totals.shopify_pending}</div><div className="text-secondary">Shopify action</div></div>
-          </div>
-        </div>
-      </div>
+        )}
+      </section>
 
-      <div className="card card-sm">
-        <div className="card-body d-flex flex-column flex-md-row align-items-md-center gap-3">
+      <section className="package-tracker-summary" aria-label="Package tracker totals">
+        <div><span>Odoo orders</span><strong>{totals.cards.toLocaleString()}</strong></div>
+        <div><span>Packages</span><strong>{totals.packages.toLocaleString()}</strong></div>
+        <div className="is-delivered"><span>Delivered</span><strong>{totals.delivered_packages.toLocaleString()}</strong></div>
+        <div className={totals.shopify_pending ? "is-action" : "is-delivered"}><span>Shopify action</span><strong>{totals.shopify_pending.toLocaleString()}</strong></div>
+      </section>
+
+      <div className="package-tracker-pagination-bar">
           <PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="Odoo cards" />
           <label className="d-flex align-items-center gap-2 ms-md-auto text-secondary small">
             Cards per page
@@ -8620,7 +9220,6 @@ function PackageTrackerDesignPage() {
             </select>
           </label>
           {loading && <span className="status status-blue"><span className="status-dot status-dot-animated" />Loading</span>}
-        </div>
       </div>
 
       {loadError && <div className="alert alert-danger" role="alert"><AlertCircle className="icon alert-icon" /><div>{loadError}</div></div>}
@@ -8631,16 +9230,25 @@ function PackageTrackerDesignPage() {
         const daysSinceDelivered = packageTrackerDaysSince(summary.completedAt)
         const historyOpen = expandedHistory.includes(row.id)
         const progress = summary.active ? Math.round((summary.delivered / summary.active) * 100) : 0
-        const latestAmazonOrderDate = packageTrackerLatestAmazonOrderDate(row)
         const duplicateItems = row.quantity_analysis?.duplicate_items || []
         const asinMismatches = row.quantity_analysis?.asin_mismatches || []
         const excessQuantity = duplicateItems.reduce((total, item) => total + Number(item.excess_quantity || 0), 0)
         const unassignedProducts = packageTrackerUnassignedProducts(row)
         const stuckPackages = row.packages.filter((item) => item.possibly_stuck)
+        const renderedProductCount = new Set(row.packages.flatMap((item) => item.products.map((product) => `${item.amazon_order_id}:${product.asin}`))).size
+        const productGuard = row.product_guard || {
+          complete: renderedProductCount > 0,
+          expected_products: renderedProductCount,
+          displayed_products: renderedProductCount,
+          recovered_products: 0,
+          missing_product_keys: [],
+          unverified_amazon_orders: [],
+        }
+        const productGuardComplete = productGuard.complete && renderedProductCount >= productGuard.expected_products
         return (
-          <article className="card card-sm" key={row.id}>
+          <article className="package-tracker-order" key={row.id}>
             <div className={`card-status-top bg-${color}`} />
-            <div className="card-body py-2 px-3 border-bottom">
+            <div className="package-tracker-order-head">
               <div className="d-flex flex-column flex-md-row align-items-md-center gap-2 w-100">
                 <div className="flex-fill">
                   <div className="d-flex flex-wrap align-items-baseline gap-2">
@@ -8649,7 +9257,13 @@ function PackageTrackerDesignPage() {
                   </div>
                 </div>
                 <div className="d-flex flex-wrap align-items-center justify-content-md-end gap-1">
-                  <button className="btn btn-outline-primary btn-sm" type="button" onClick={() => syncOrderFulfilment(row)} disabled={syncingOrders.includes(row.id)}>
+                  <button
+                    className="btn btn-outline-primary btn-sm"
+                    type="button"
+                    onClick={() => syncOrderFulfilment(row)}
+                    disabled={syncingOrders.includes(row.id) || !productGuardComplete}
+                    title={productGuardComplete ? "Refresh Shopify fulfilment" : "Blocked until every associated product is displayed"}
+                  >
                     <RefreshCw className={`icon icon-1 ${syncingOrders.includes(row.id) ? "icon-spin" : ""}`} />
                     {syncingOrders.includes(row.id) ? "Syncing…" : "Sync fulfilment"}
                   </button>
@@ -8658,7 +9272,12 @@ function PackageTrackerDesignPage() {
                     {row.recipient_verified ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
                     {row.recipient_verified ? "Recipient verified" : "Check recipient"}
                   </span>
-                  {latestAmazonOrderDate && <span className="badge bg-azure-lt text-azure">Latest Amazon order · {packageTrackerAmazonOrderDate(latestAmazonOrderDate)}</span>}
+                  <span className={`badge ${productGuardComplete ? "bg-green-lt text-green" : "bg-red-lt text-red"}`}>
+                    {productGuardComplete ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
+                    {productGuardComplete
+                      ? `Product guard · ${productGuard.expected_products}/${productGuard.expected_products} shown`
+                      : `BLOCKED · ${renderedProductCount}/${productGuard.expected_products} products shown`}
+                  </span>
                   {duplicateItems.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {excessQuantity} excess unit{excessQuantity === 1 ? "" : "s"}</span>}
                   {asinMismatches.length > 0 && <span className="badge bg-red-lt text-red">ASIN mismatch · {asinMismatches.length}</span>}
                   {unassignedProducts.length > 0 && <span className="badge bg-red-lt text-red">Incomplete shipment mapping</span>}
@@ -8669,7 +9288,16 @@ function PackageTrackerDesignPage() {
               {syncResults[row.id] && <div className={`small mt-1 text-${syncResults[row.id].ok ? "green" : "red"}`}>{syncResults[row.id].message}</div>}
             </div>
 
-            <div className="card-body p-2 p-md-3">
+            <div className="package-tracker-order-body">
+              {!productGuardComplete && (
+                <div className="alert alert-danger py-2 px-3 mb-2" role="alert">
+                  <AlertCircle className="icon alert-icon" />
+                  <div>
+                    <strong>Dispatch blocked: the associated product list is incomplete.</strong>
+                    <div className="small">Refresh the Chrome/Amazon data before sending this order. Missing or unverified Amazon orders: {[...productGuard.missing_product_keys, ...productGuard.unverified_amazon_orders].join(", ") || "unknown"}.</div>
+                  </div>
+                </div>
+              )}
               {summary.needsShopifyDispatch && (
                 <div className="alert alert-danger py-2 px-3 mb-2" role="alert">
                   <div className="d-flex flex-column flex-md-row align-items-md-center gap-2">
@@ -8716,7 +9344,7 @@ function PackageTrackerDesignPage() {
                 </div>
               )}
 
-              <div className="d-grid gap-2">
+              <div className="package-tracker-package-list">
                 {row.packages.map((item, itemIndex) => {
                   const itemColor = item.status_kind === "delivered" ? "success" : item.status_kind === "exception" ? "danger" : item.possibly_stuck ? "orange" : "primary"
                   const packageKey = `${row.id}:${item.amazon_order_id}:${item.tracking_id}:${itemIndex}`
@@ -8724,9 +9352,8 @@ function PackageTrackerDesignPage() {
                   const sameAmazonOrderIndexes = row.packages.flatMap((candidate, candidateIndex) => candidate.amazon_order_id === item.amazon_order_id ? [candidateIndex] : [])
                   const shipmentPosition = sameAmazonOrderIndexes.indexOf(itemIndex) + 1
                   return (
-                    <section className="card card-sm w-100" key={packageKey}>
-                      <div className={`card-status-start bg-${itemColor}`} />
-                      <div className="card-body p-2 p-md-3">
+                    <section className={`package-tracker-package is-${itemColor}`} key={packageKey}>
+                      <div className="package-tracker-package-body">
                         {item.possibly_stuck && (
                           <div className="alert alert-warning py-2 px-3 mb-2" role="alert">
                             <AlertCircle className="icon alert-icon" />
@@ -8739,8 +9366,8 @@ function PackageTrackerDesignPage() {
                             <div><strong>Amazon items are not assigned to a shipment.</strong><div className="small">Verify before dispatch: {(item.unassigned_products || []).map((product) => `${product.title} (${product.asin})`).join(", ")}</div></div>
                           </div>
                         )}
-                        <div className="row g-3 align-items-start">
-                          <div className="col-12 col-md-5 col-xl-6">
+                        <div className="row g-3 align-items-center">
+                          <div className="col-12 col-md-7">
                             <div className="d-grid gap-2">
                               {item.products.map((product, productIndex) => {
                                 const productImages = dispatchProductImagesFrom({ products: [product] })
@@ -8773,14 +9400,21 @@ function PackageTrackerDesignPage() {
                             </div>
                           </div>
 
-                          <div className="col-12 d-md-none">
-                            <button type="button" className="btn btn-outline-secondary btn-sm w-100" onClick={() => togglePackage(packageKey)} aria-expanded={packageExpanded}>
-                              {packageExpanded ? "Hide package details" : "Show package details"}
-                              <ChevronDown className={`icon icon-1 ms-1 transition-transform ${packageExpanded ? "rotate-180" : ""}`} />
-                            </button>
+                          <div className="col-12 col-md-5">
+                            <div className="package-tracker-package-quick">
+                              <div>
+                                <span>{item.delivered_at ? "Delivered" : "Expected"}</span>
+                                <strong>{item.delivered_at ? formatDateTime(item.delivered_at) : item.expected_at ? formatDateTime(item.expected_at) : "No estimate"}</strong>
+                                <small>{item.tracking_id || item.amazon_order_id}</small>
+                              </div>
+                              <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => togglePackage(packageKey)} aria-expanded={packageExpanded}>
+                                {packageExpanded ? "Hide details" : "Details"}
+                                <ChevronDown className={`icon icon-1 ms-1 transition-transform ${packageExpanded ? "rotate-180" : ""}`} />
+                              </button>
+                            </div>
                           </div>
 
-                          <div className={`col-12 col-md-7 col-xl-6 ${packageExpanded ? "d-block" : "d-none"} d-md-block`}>
+                          <div className={`col-12 package-tracker-package-details ${packageExpanded ? "d-block" : "d-none"}`}>
                             <div className="row g-2 small">
                               <div className="col-12 col-sm-6">
                                 <div className="text-secondary fw-bold">Amazon</div>
@@ -8836,7 +9470,7 @@ function PackageTrackerDesignPage() {
               )}
             </div>
 
-            <div className="card-footer py-2 px-3">
+            <div className="package-tracker-order-footer">
               <div className="d-flex flex-column flex-md-row align-items-md-center gap-2">
                 <span className={`badge ${row.shopify_status === "fulfilled" ? "bg-green-lt text-green" : row.shopify_status === "partially_fulfilled" ? "bg-yellow-lt text-yellow" : "bg-red-lt text-red"}`}>Shopify: {row.shopify_status.replaceAll("_", " ")}</span>
                 {row.shopify_status === "fulfilled" && row.shopify_fulfillment_at && (
@@ -8860,7 +9494,7 @@ function PackageTrackerDesignPage() {
 
       {!loading && !rows.length && <div className="empty card"><div className="empty-icon"><Search className="icon" /></div><p className="empty-title">No order cards match</p><p className="empty-subtitle text-secondary">Change the search, date range, or status filter.</p></div>}
 
-      {total > 0 && <div className="card card-sm"><div className="card-body"><PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="Odoo cards" /></div></div>}
+      {total > 0 && <div className="package-tracker-pagination-bar is-bottom"><PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="Odoo cards" /></div>}
 
       <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
         <DialogContent className="max-w-3xl">

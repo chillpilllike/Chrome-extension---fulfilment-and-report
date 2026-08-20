@@ -77,6 +77,12 @@ from app.schemas import (
     LineSpaidPayload,
     ManualAmazonOrderMatchPayload,
     ManualFulfilmentPayload,
+    PackagePickupCountPayload,
+    PackagePickupBulkPayload,
+    PackagePickupDeletePayload,
+    PackagePickupManualAmazonPayload,
+    PackagePickupReceivedPayload,
+    PackagePickupSettingsPayload,
     PlacePayload,
     PullPayload,
     PunchoutReturnUrlPayload,
@@ -160,7 +166,7 @@ _PROFIT_LOSS_CACHE_LOCK = threading.Lock()
 PROFIT_LOSS_CACHE_TTL_SECONDS = 90
 TYPESENSE_SCHEMA_VERSION = "4"
 PUBLIC_PATH_PREFIXES = ("/public", "/api/public", "/api/shopify/fulfilment/oauth/callback", "/track-order", "/track-orders", "/assets", "/static", "/health", "/favicon")
-PUBLIC_FRONTEND_PATHS = {"/tracking", "/fulfilment-pending", "/dispatch-status", "/dispatch-sorting", "/package-tracker", "/amazon-otp", "/epost"}
+PUBLIC_FRONTEND_PATHS = {"/tracking", "/fulfilment-pending", "/dispatch-status", "/dispatch-sorting", "/package-tracker", "/package-pickups", "/amazon-otp", "/epost"}
 PUBLIC_API_PATHS = {
     "/api/tracking/orders",
     "/api/tracking/fulfilment-pending",
@@ -172,12 +178,19 @@ PUBLIC_API_PATHS = {
     "/api/dispatch-sorting/settings",
     "/api/amazon-otp",
     "/api/epost/tracking",
+    "/api/package-pickups",
 }
 PUBLIC_POST_API_PATHS = {
     "/api/shopify/orders/status/sync",
     "/api/tracking/update",
     "/api/dispatch-sorting/scan",
     "/api/dispatch-sorting/settings",
+    "/api/package-pickups/counts",
+    "/api/package-pickups/bulk-details",
+    "/api/package-pickups/delete-row",
+    "/api/package-pickups/manual-amazon",
+    "/api/package-pickups/received",
+    "/api/package-pickups/settings",
 }
 PUBLIC_DISPATCH_POST_PREFIXES = (
     "/api/dispatch-sorting/packages/",
@@ -584,6 +597,7 @@ FRONTEND_SHELL_PATHS = {
     "/dispatch-sorting",
     "/dispatch-status",
     "/package-tracker",
+    "/package-pickups",
     "/payment-failed",
     "/amazon-otp",
     "/epost",
@@ -753,7 +767,7 @@ def public_access_page_response(request: Request, *, error: str = "", next_path:
     if request.url.query and not next_path and not request.query_params.get("next"):
         current_path += f"?{request.url.query}"
     safe_path = current_path if urlsplit(current_path).path.startswith("/") else "/package-tracker"
-    error_html = f'<div class="alert alert-danger py-2">{html.escape(error)}</div>' if error else ""
+    error_html = f'<div class="alert alert-danger access-alert" role="alert">{html.escape(error)}</div>' if error else ""
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="en">
@@ -762,23 +776,48 @@ def public_access_page_response(request: Request, *, error: str = "", next_path:
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Dispatch access required</title>
     <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+    <link rel="stylesheet" href="/static/styles.css?v=10">
   </head>
-  <body class="d-flex flex-column bg-light">
-    <main class="page page-center">
-      <div class="container container-tight py-4">
-        <form class="card card-md" method="post" action="/api/public/access" autocomplete="off">
-          <div class="card-body">
-            <h2 class="card-title text-center mb-3">Dispatch access</h2>
-            <p class="text-secondary text-center">Enter the public access code to continue.</p>
-            {error_html}
-            <input type="hidden" name="next" value="{html.escape(safe_path, quote=True)}">
-            <label class="form-label" for="public-access-code">Access code</label>
-            <input id="public-access-code" class="form-control" type="password" name="code" required autofocus autocomplete="current-password">
-            <div class="form-footer"><button class="btn btn-primary w-100" type="submit">Continue</button></div>
+  <body class="public-access-body">
+    <div class="access-shell">
+      <aside class="access-sidebar">
+        <div class="access-brand">
+          <span class="access-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3 4.5 7.25 12 11.5l7.5-4.25L12 3Z"/><path d="m4.5 7.25 0 9.5L12 21l7.5-4.25v-9.5M12 11.5V21"/></svg>
+          </span>
+          <span><strong>Business Fulfilment</strong><span>Fulfilment operations</span></span>
+        </div>
+        <div class="access-nav-label">Dispatch Team</div>
+        <div class="access-nav-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 11V7a7 7 0 0 1 14 0v4"/><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M12 15v2"/></svg>
+          Secure access
+        </div>
+        <p class="access-sidebar-note">Enter the dispatch access code to open tracking and fulfilment tools.</p>
+      </aside>
+      <main class="access-main">
+        <div class="access-topbar"></div>
+        <div class="access-content">
+          <div class="access-wrap">
+            <div class="access-eyebrow">Dispatch portal</div>
+            <h1 class="access-heading">Welcome back</h1>
+            <p class="access-description">Sign in to access package tracking, dispatch sorting, fulfilment status, Amazon OTP and ePost tools.</p>
+            <form class="access-card" method="post" action="/api/public/access" autocomplete="off">
+              <div class="access-card-body">
+                {error_html}
+                <input type="hidden" name="next" value="{html.escape(safe_path, quote=True)}">
+                <label class="form-label access-label" for="public-access-code">Access code</label>
+                <input id="public-access-code" class="form-control access-input" type="password" name="code" required autofocus autocomplete="current-password" placeholder="Enter access code">
+                <div class="mt-3"><button class="btn btn-primary w-100 access-button" type="submit">Continue to dispatch tools</button></div>
+                <div class="access-help">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>
+                  Access remains active on this device for 30 days.
+                </div>
+              </div>
+            </form>
           </div>
-        </form>
-      </div>
-    </main>
+        </div>
+      </main>
+    </div>
   </body>
 </html>""",
         status_code=401 if error else 200,
@@ -799,6 +838,7 @@ def admin_access_bridge_response(request: Request) -> HTMLResponse:
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Admin Access Required</title>
     <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+    <link rel="stylesheet" href="/static/styles.css?v=10">
   </head>
   <body>
     <main class="container py-5">
@@ -844,7 +884,6 @@ def database_unavailable_cooldown_active(request: Request) -> bool:
 
 def database_unavailable_response(request: Request, update_cooldown: bool = True) -> Response:
     global _DB_UNAVAILABLE_COOLDOWN_UNTIL
-    db_session.close_pool()
     if update_cooldown:
         with _DB_UNAVAILABLE_COOLDOWN_LOCK:
             _DB_UNAVAILABLE_COOLDOWN_UNTIL = time.monotonic() + 10
@@ -863,6 +902,7 @@ def database_unavailable_response(request: Request, update_cooldown: bool = True
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Database Busy</title>
     <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+    <link rel="stylesheet" href="/static/styles.css?v=10">
   </head>
   <body>
     <main class="container py-5">
@@ -1151,6 +1191,52 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS package_pickup_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL DEFAULT 0,
+                pickup_date TEXT NOT NULL,
+                amazon_picked_up INTEGER NOT NULL DEFAULT 0,
+                non_amazon_picked_up INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(store_id, pickup_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS package_pickup_non_amazon (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                check_id INTEGER NOT NULL REFERENCES package_pickup_checks(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL DEFAULT 1,
+                package_type TEXT NOT NULL DEFAULT 'non_amazon',
+                order_number TEXT,
+                tracking_input TEXT,
+                received_at TEXT,
+                not_received_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(check_id, position)
+            );
+
+            CREATE TABLE IF NOT EXISTS package_pickup_manual_amazon (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                pickup_date TEXT NOT NULL,
+                odoo_order_name TEXT NOT NULL,
+                tracking_input TEXT NOT NULL,
+                tracking_suffix TEXT NOT NULL,
+                matched_dispatch_package_id INTEGER REFERENCES amazon_dispatch_packages(id) ON DELETE SET NULL,
+                received_at TEXT,
+                not_received_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(store_id, pickup_date, odoo_order_name, tracking_suffix)
+            );
+
+            CREATE TABLE IF NOT EXISTS package_pickup_delivery_records (
+                package_id INTEGER PRIMARY KEY,
+                delivered_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS ui_copy (
                 key TEXT PRIMARY KEY,
                 title TEXT,
@@ -1376,6 +1462,7 @@ def init_db() -> None:
                 tote_code TEXT,
                 scan_status TEXT NOT NULL DEFAULT 'pending',
                 received_at TEXT,
+                not_received_at TEXT,
                 placed_at TEXT,
                 last_scanned_at TEXT,
                 scan_count INTEGER NOT NULL DEFAULT 0,
@@ -1599,6 +1686,16 @@ def init_db() -> None:
         existing_history_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_order_history_unmatched)").fetchall()}
         if "items_json" not in existing_history_cols:
             conn.execute("ALTER TABLE amazon_order_history_unmatched ADD COLUMN items_json TEXT NOT NULL DEFAULT '[]'")
+        existing_pickup_detail_cols = {r["name"] for r in conn.execute("PRAGMA table_info(package_pickup_non_amazon)").fetchall()}
+        if "package_type" not in existing_pickup_detail_cols:
+            conn.execute("ALTER TABLE package_pickup_non_amazon ADD COLUMN package_type TEXT NOT NULL DEFAULT 'non_amazon'")
+        if "tracking_input" not in existing_pickup_detail_cols:
+            conn.execute("ALTER TABLE package_pickup_non_amazon ADD COLUMN tracking_input TEXT")
+        if "not_received_at" not in existing_pickup_detail_cols:
+            conn.execute("ALTER TABLE package_pickup_non_amazon ADD COLUMN not_received_at TEXT")
+        existing_manual_pickup_cols = {r["name"] for r in conn.execute("PRAGMA table_info(package_pickup_manual_amazon)").fetchall()}
+        if "not_received_at" not in existing_manual_pickup_cols:
+            conn.execute("ALTER TABLE package_pickup_manual_amazon ADD COLUMN not_received_at TEXT")
         existing_dispatch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_dispatch_packages)").fetchall()}
         if "canonical_scan_code" not in existing_dispatch_cols:
             conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN canonical_scan_code TEXT")
@@ -1608,6 +1705,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN last_scanned_code TEXT")
         if "scanned_codes_json" not in existing_dispatch_cols:
             conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN scanned_codes_json TEXT NOT NULL DEFAULT '[]'")
+        if "not_received_at" not in existing_dispatch_cols:
+            conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN not_received_at TEXT")
+        existing_order_line_cols = {r["name"] for r in conn.execute("PRAGMA table_info(order_lines)").fetchall()}
+        if "manual_estimated_delivery_at" not in existing_order_line_cols:
+            conn.execute("ALTER TABLE order_lines ADD COLUMN manual_estimated_delivery_at TEXT")
         existing_scan_event_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_dispatch_scan_events)").fetchall()}
         for column, ddl in {
             "resolved_at": "ALTER TABLE amazon_dispatch_scan_events ADD COLUMN resolved_at TEXT",
@@ -1668,6 +1770,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_odoo_chatter_note_log_lookup ON odoo_chatter_note_log(store_id, odoo_order_id, event_type, amazon_order_id)",
             "CREATE INDEX IF NOT EXISTS idx_partial_fulfilments_store_status ON partial_fulfilments(store_id, status, updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_fulfilment_notifications_open ON fulfilment_notifications(dismissed, pinned DESC, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_package_pickup_checks_date ON package_pickup_checks(pickup_date DESC, store_id)",
+            "CREATE INDEX IF NOT EXISTS idx_package_pickup_non_amazon_check ON package_pickup_non_amazon(check_id, position)",
             "CREATE INDEX IF NOT EXISTS idx_missing_asin_availability_store_status ON missing_asin_availability(store_id, status, last_checked_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_missing_asin_availability_line ON missing_asin_availability(order_line_id, asin)",
         ):
@@ -18451,7 +18555,6 @@ class PostgresShopifyTrackingStateDB:
                 if "pool exhausted" in text or "connection pool exhausted" in text:
                     time.sleep(0.35 * (attempt + 1))
                     continue
-                db_session.close_pool()
                 if attempt < 4:
                     time.sleep(0.25 * (attempt + 1))
                     continue
@@ -25940,7 +26043,6 @@ def api_chrome_order_history_lookup(payload: AmazonHistoryLookupPayload) -> dict
             break
         except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
             last_db_error = exc
-            db_session.close_pool()
             if attempt:
                 raise
             time.sleep(0.2)
@@ -25988,7 +26090,6 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
             break
         except (db_session.psycopg2.OperationalError, db_session.psycopg2.InterfaceError) as exc:
             last_db_error = exc
-            db_session.close_pool()
             if attempt:
                 raise
             time.sleep(0.2)
@@ -29201,6 +29302,863 @@ def api_tracking_fulfilment_pending(
         return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "count": total, "page": page, "per_page": per_page, "total": total, "checked": total}, 300)
 
 
+PACKAGE_PICKUP_TIMEZONE = ZoneInfo("America/New_York")
+PACKAGE_PICKUP_CUTOFF_HOUR = 9
+PACKAGE_PICKUP_CUTOFF_MINUTE = 30
+
+
+def normalize_package_pickup_time(value: Any) -> str:
+    raw = clean_text(value).strip('"')
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw):
+        return "09:30"
+    return raw
+
+
+def package_pickup_time_setting() -> str:
+    raw = get_setting("package_pickup_time", "09:30")
+    try:
+        decoded = json.loads(raw)
+        raw = decoded if isinstance(decoded, str) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return normalize_package_pickup_time(raw)
+
+
+def normalize_package_pickup_confirmation_status(status: Any, legacy_received: Optional[bool] = None) -> str:
+    normalized = clean_text(status).lower().replace("-", "_")
+    if not normalized and legacy_received is not None:
+        normalized = "received" if legacy_received else "unconfirmed"
+    return normalized if normalized in {"received", "not_received", "unconfirmed"} else ""
+
+
+def package_pickup_business_date(value: Any, local_display: Any = "") -> str:
+    """Return the Amazon delivery's Brooklyn calendar date without pickup shifting."""
+    display = clean_text(local_display)
+    delivered: Optional[datetime] = None
+    if display:
+        for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p", "%b %d, %Y", "%B %d, %Y"):
+            try:
+                delivered = datetime.strptime(display, fmt).replace(tzinfo=PACKAGE_PICKUP_TIMEZONE)
+                break
+            except ValueError:
+                continue
+    if delivered is None:
+        parsed = parse_any_datetime(value)
+        if parsed is None:
+            return ""
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delivered = parsed.astimezone(PACKAGE_PICKUP_TIMEZONE)
+    return delivered.date().isoformat()
+
+
+def package_pickup_delivery_timestamp(
+    package: dict[str, Any],
+    delivery_info: dict[str, Any],
+    primary_line: dict[str, Any],
+) -> str:
+    """Keep Amazon's delivery record independent from later team confirmations."""
+    snapshot = clean_text(package.get("pickup_delivered_at"))
+    if snapshot:
+        return snapshot
+    delivered_at = clean_text(delivery_info.get("amazon_delivered_at"))
+    if delivered_at:
+        return delivered_at
+    tracking_recorded_at = clean_text(primary_line.get("updated_at"))
+    package_tracking_updated_at = clean_text(package.get("updated_at"))
+    return (
+        package_tracker_delivery_date(
+            package.get("package_status"),
+            package.get("promise"),
+            tracking_recorded_at or package_tracking_updated_at,
+        )
+        or tracking_recorded_at
+        or package_tracking_updated_at
+    )
+
+
+def package_pickup_shopify_statuses(conn: Any) -> dict[tuple[int, str], dict[str, Any]]:
+    rows = rows_to_dicts(conn.execute(
+        """
+        SELECT store_id, odoo_order_name, fulfillment_status, cancelled_at, synced_at
+        FROM shopify_order_status_cache
+        WHERE COALESCE(odoo_order_name, '') != ''
+        ORDER BY synced_at DESC
+        """
+    ).fetchall())
+    result: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (int(row.get("store_id") or 0), clean_text(row.get("odoo_order_name")).upper())
+        result.setdefault(key, row)
+    return result
+
+
+def package_pickup_is_shopify_fulfilled(status: Any, cancelled_at: Any = "") -> bool:
+    if clean_text(cancelled_at):
+        return False
+    normalized = clean_text(status).upper().replace(" ", "_")
+    return normalized in {"FULFILLED", "PARTIALLY_FULFILLED", "PARTIAL", "SUCCESS"}
+
+
+def package_pickup_tracking_matches(entered_value: Any, package_value: Any) -> bool:
+    entered = normalize_dispatch_scan_code(entered_value)
+    package_tracking = normalize_dispatch_scan_code(package_value)
+    if len(entered) < 5 or not package_tracking:
+        return False
+    return package_tracking == entered if len(entered) > 5 else package_tracking.endswith(entered)
+
+
+def package_pickup_placeholder_rows(package_type: str, count: int) -> list[tuple[int, int, str]]:
+    is_amazon = package_type == "amazon"
+    label = "Amazon" if is_amazon else "Non-Amazon"
+    return [
+        (package_number, -package_number if is_amazon else package_number, f"{label} Package {package_number}")
+        for package_number in range(1, max(0, int(count)) + 1)
+    ]
+
+
+def package_pickup_data(
+    store_id: Optional[int] = None,
+    date_from: str = "",
+    date_to: str = "",
+) -> dict[str, Any]:
+    today = datetime.now(PACKAGE_PICKUP_TIMEZONE).date()
+    start_date = datetime.strptime(date_from, "%Y-%m-%d").date() if date_from else today - timedelta(days=13)
+    end_date = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else today
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    start_date = max(start_date, end_date - timedelta(days=92))
+    with db() as conn:
+        package_params: list[Any] = []
+        store_sql = ""
+        if store_id:
+            store_sql = "AND packages.store_id=?"
+            package_params.append(int(store_id))
+        packages = rows_to_dicts(conn.execute(
+            f"""
+            SELECT packages.*
+            FROM amazon_dispatch_packages packages
+            WHERE LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) ~ '(^|[^a-z])delivered([^a-z]|$)'
+              AND LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) NOT LIKE '%not delivered%'
+              AND LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) NOT LIKE '%cancel%'
+              {store_sql}
+            ORDER BY packages.updated_at DESC
+            LIMIT 10000
+            """,
+            package_params,
+        ).fetchall())
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS package_pickup_delivery_records (
+                package_id INTEGER PRIMARY KEY,
+                delivered_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        saved_delivery_records = {
+            int(row.get("package_id") or 0): clean_text(row.get("delivered_at"))
+            for row in rows_to_dicts(conn.execute(
+                "SELECT package_id, delivered_at FROM package_pickup_delivery_records"
+            ).fetchall())
+        }
+        for package in packages:
+            package["pickup_delivered_at"] = saved_delivery_records.get(int(package.get("id") or 0), "")
+        line_params: list[Any] = []
+        line_store_sql = ""
+        if store_id:
+            line_store_sql = "AND store_id=?"
+            line_params.append(int(store_id))
+        line_rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT id, store_id, odoo_order_id, odoo_order_name, amazon_order_id, amazon_order_url,
+                   tracking_payload, tracking_checked_at, order_engine, manual_estimated_delivery_at, updated_at
+            FROM order_lines
+            WHERE COALESCE(amazon_order_id, '') != '' {line_store_sql}
+            ORDER BY updated_at DESC
+            LIMIT 20000
+            """,
+            line_params,
+        ).fetchall())
+        checks = rows_to_dicts(conn.execute(
+            """
+            SELECT * FROM package_pickup_checks
+            WHERE store_id=? AND pickup_date>=? AND pickup_date<=?
+            ORDER BY pickup_date DESC
+            """,
+            (int(store_id or 0), start_date.isoformat(), end_date.isoformat()),
+        ).fetchall())
+        check_ids = [int(row["id"]) for row in checks]
+        non_amazon_rows: list[dict[str, Any]] = []
+        if check_ids:
+            placeholders = ",".join("?" for _ in check_ids)
+            non_amazon_rows = rows_to_dicts(conn.execute(
+                f"SELECT * FROM package_pickup_non_amazon WHERE check_id IN ({placeholders}) ORDER BY check_id, position",
+                check_ids,
+            ).fetchall())
+        manual_params: list[Any] = [start_date.isoformat(), end_date.isoformat()]
+        manual_store_sql = ""
+        if store_id:
+            manual_store_sql = "AND store_id=?"
+            manual_params.append(int(store_id))
+        manual_amazon_rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT * FROM package_pickup_manual_amazon
+            WHERE pickup_date>=? AND pickup_date<=? {manual_store_sql}
+            ORDER BY pickup_date DESC, id DESC
+            """,
+            manual_params,
+        ).fetchall())
+        packages_by_id = {int(package.get("id") or 0): package for package in packages}
+        manual_pickup_date_by_package_id: dict[int, str] = {}
+        matched_manual_ids: set[int] = set()
+        reconciliation_now = utc_now()
+        for manual in manual_amazon_rows:
+            manual_id = int(manual.get("id") or 0)
+            entered_tracking = normalize_dispatch_scan_code(manual.get("tracking_input"))
+            tracking_suffix = normalize_dispatch_scan_code(manual.get("tracking_suffix"))
+            matched_package = packages_by_id.get(int(manual.get("matched_dispatch_package_id") or 0))
+            if not matched_package:
+                candidates: list[dict[str, Any]] = []
+                for package in packages:
+                    if int(package.get("store_id") or 0) != int(manual.get("store_id") or 0):
+                        continue
+                    if clean_text(package.get("odoo_order_name")).upper() != clean_text(manual.get("odoo_order_name")).upper():
+                        continue
+                    package_tracking = next((
+                        normalize_dispatch_scan_code(value)
+                        for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code"))
+                        if package_tracking_id_is_physical(value)
+                    ), "")
+                    if not package_tracking:
+                        continue
+                    if len(entered_tracking) > 5:
+                        matches_tracking = package_tracking == entered_tracking
+                    else:
+                        matches_tracking = bool(tracking_suffix and package_tracking.endswith(tracking_suffix))
+                    if matches_tracking:
+                        candidates.append(package)
+                if len(candidates) == 1:
+                    matched_package = candidates[0]
+            if not matched_package:
+                continue
+            package_id = int(matched_package.get("id") or 0)
+            matched_manual_ids.add(manual_id)
+            manual_pickup_date_by_package_id[package_id] = clean_text(manual.get("pickup_date"))
+            manual_received_at = clean_text(manual.get("received_at"))
+            manual_not_received_at = clean_text(manual.get("not_received_at"))
+            if manual_received_at or manual_not_received_at:
+                conn.execute(
+                    "UPDATE amazon_dispatch_packages SET received_at=?, not_received_at=?, updated_at=? WHERE id=?",
+                    (manual_received_at or None, manual_not_received_at or None, reconciliation_now, package_id),
+                )
+                matched_package["received_at"] = manual_received_at
+                matched_package["not_received_at"] = manual_not_received_at
+            if int(manual.get("matched_dispatch_package_id") or 0) != package_id:
+                conn.execute(
+                    "UPDATE package_pickup_manual_amazon SET matched_dispatch_package_id=?, updated_at=? WHERE id=?",
+                    (package_id, reconciliation_now, manual_id),
+                )
+                manual["matched_dispatch_package_id"] = package_id
+        # Team-counted Amazon extras can be identified by tracking alone. Odoo is
+        # only used as an optional narrowing hint because the recipient may not
+        # have entered it at pickup time.
+        check_pickup_date_by_id = {int(row.get("id") or 0): clean_text(row.get("pickup_date")) for row in checks}
+        matched_extra_ids: set[int] = set()
+        for entry in non_amazon_rows:
+            if clean_text(entry.get("package_type")).lower() != "amazon":
+                continue
+            entered_tracking = normalize_dispatch_scan_code(entry.get("tracking_input"))
+            if len(entered_tracking) < 5:
+                continue
+            entered_order = clean_text(entry.get("order_number")).upper()
+            if re.fullmatch(r"AMAZON PACKAGE \d+", entered_order):
+                entered_order = ""
+            candidates: list[dict[str, Any]] = []
+            for package in packages:
+                package_id = int(package.get("id") or 0)
+                if package_id in manual_pickup_date_by_package_id:
+                    continue
+                if entered_order and clean_text(package.get("odoo_order_name")).upper() != entered_order:
+                    continue
+                package_tracking = next((
+                    normalize_dispatch_scan_code(value)
+                    for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code"), package.get("last_scanned_code"))
+                    if package_tracking_id_is_physical(value)
+                ), "")
+                if not package_tracking:
+                    continue
+                if package_pickup_tracking_matches(entered_tracking, package_tracking):
+                    candidates.append(package)
+            if len(candidates) != 1:
+                continue
+            matched_package = candidates[0]
+            package_id = int(matched_package.get("id") or 0)
+            manual_pickup_date_by_package_id[package_id] = check_pickup_date_by_id.get(int(entry.get("check_id") or 0), "")
+            received_at = clean_text(entry.get("received_at"))
+            not_received_at = clean_text(entry.get("not_received_at"))
+            if received_at or not_received_at:
+                conn.execute(
+                    "UPDATE amazon_dispatch_packages SET received_at=?, not_received_at=?, updated_at=? WHERE id=?",
+                    (received_at or None, not_received_at or None, reconciliation_now, package_id),
+                )
+                matched_package["received_at"] = received_at
+                matched_package["not_received_at"] = not_received_at
+            conn.execute("DELETE FROM package_pickup_non_amazon WHERE id=?", (int(entry.get("id") or 0),))
+            matched_extra_ids.add(int(entry.get("id") or 0))
+        if matched_extra_ids:
+            non_amazon_rows = [row for row in non_amazon_rows if int(row.get("id") or 0) not in matched_extra_ids]
+        shopify_statuses = package_pickup_shopify_statuses(conn)
+
+    lines_by_amazon: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    lines_by_odoo: dict[tuple[int, str], dict[str, Any]] = {}
+    for line in line_rows:
+        line_store = int(line.get("store_id") or 0)
+        lines_by_amazon.setdefault((line_store, clean_text(line.get("amazon_order_id"))), []).append(line)
+        order_key = (line_store, clean_text(line.get("odoo_order_name")).upper())
+        lines_by_odoo.setdefault(order_key, line)
+
+    check_by_date = {clean_text(row.get("pickup_date")): row for row in checks}
+    non_amazon_by_check: dict[int, list[dict[str, Any]]] = {}
+    for row in non_amazon_rows:
+        non_amazon_by_check.setdefault(int(row.get("check_id") or 0), []).append(row)
+    cards: dict[str, dict[str, Any]] = {}
+
+    def ensure_card(pickup_date: str) -> dict[str, Any]:
+        check = check_by_date.get(pickup_date) or {}
+        return cards.setdefault(pickup_date, {
+            "pickup_date": pickup_date,
+            "amazon_picked_up": int(check.get("amazon_picked_up") or 0),
+            "non_amazon_picked_up": int(check.get("non_amazon_picked_up") or 0),
+            "amazon_packages": [],
+            "manual_amazon_packages": [],
+            "non_amazon_packages": [],
+        })
+
+    pickup_delivery_snapshots: list[tuple[str, int]] = []
+    for package in packages:
+        if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
+            continue
+        line_matches = lines_by_amazon.get((int(package.get("store_id") or 0), clean_text(package.get("amazon_order_id"))), [])
+        primary_line = next((line for line in line_matches if clean_text(line.get("odoo_order_name")).upper() == clean_text(package.get("odoo_order_name")).upper()), None)
+        primary_line = primary_line or (line_matches[0] if line_matches else {})
+        tracking_id = next((
+            normalize_dispatch_scan_code(value)
+            for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code"))
+            if package_tracking_id_is_physical(value)
+        ), "")
+        matched_tracking_part: dict[str, Any] = {}
+        matched_tracking_checked_at = ""
+        if tracking_id:
+            for line in line_matches:
+                for part in parse_tracking_packages(clean_text(line.get("tracking_payload"))):
+                    part_tracking_id = next((
+                        normalize_dispatch_scan_code(part.get(key))
+                        for key in ("tracking_id", "trackingId", "tracking_number", "trackingNumber")
+                        if package_tracking_id_is_physical(part.get(key))
+                    ), "")
+                    if part_tracking_id == tracking_id:
+                        matched_tracking_part = part
+                        matched_tracking_checked_at = clean_text(line.get("tracking_checked_at"))
+                        break
+                if matched_tracking_part:
+                    break
+        delivery_source = matched_tracking_part or {
+            "status": clean_text(package.get("package_status")),
+            "promise": clean_text(package.get("promise")),
+        }
+        delivery_info = amazon_delivery_info_from_payload(
+            json.dumps([delivery_source]),
+            matched_tracking_checked_at or clean_text(primary_line.get("tracking_checked_at")) or clean_text(package.get("updated_at")),
+        )
+        delivered_at = package_pickup_delivery_timestamp(package, delivery_info, primary_line)
+        delivered_display = clean_text(delivery_info.get("amazon_delivered_display"))
+        package_id = int(package.get("id") or 0)
+        if delivered_at and not clean_text(package.get("pickup_delivered_at")):
+            pickup_delivery_snapshots.append((delivered_at, package_id))
+        pickup_date = package_pickup_business_date(delivered_at, delivered_display)
+        if not pickup_date or pickup_date < start_date.isoformat() or pickup_date > end_date.isoformat():
+            continue
+        order_name = clean_text(package.get("odoo_order_name") or primary_line.get("odoo_order_name"))
+        status = shopify_statuses.get((int(package.get("store_id") or 0), order_name.upper()), {})
+        fulfilled = package_pickup_is_shopify_fulfilled(status.get("fulfillment_status"), status.get("cancelled_at"))
+        received_at = clean_text(package.get("received_at"))
+        not_received_at = clean_text(package.get("not_received_at"))
+        received = bool(received_at)
+        carrier = clean_text(package.get("carrier") or matched_tracking_part.get("carrier") or matched_tracking_part.get("carrier_name"))
+        if len(carrier) > 40 or re.search(r"\b(sorry|delivery|delivered|package|estimate|notify|updates?)\b", carrier, re.IGNORECASE):
+            carrier = "Amazon"
+        ensure_card(pickup_date)["amazon_packages"].append({
+            "source_type": "amazon",
+            "source_id": package_id,
+            "store_id": int(package.get("store_id") or 0),
+            "odoo_order_name": order_name,
+            "amazon_order_id": clean_text(package.get("amazon_order_id")),
+            "amazon_order_url": clean_text(package.get("amazon_order_url") or primary_line.get("amazon_order_url")),
+            "tracking_id": tracking_id,
+            "tracking_url": clean_text(package.get("tracking_url") or matched_tracking_part.get("tracking_url") or matched_tracking_part.get("trackingUrl")),
+            "carrier": carrier or "Amazon",
+            "delivery_status": clean_text(package.get("package_status") or package.get("promise") or matched_tracking_part.get("status")) or "Delivered",
+            "delivered_at": delivered_at,
+            "delivered_display": delivered_display,
+            "package_type": "Amazon",
+            "shopify_status": clean_text(status.get("fulfillment_status")) or "Pending",
+            "shopify_fulfilled": fulfilled,
+            "received": received,
+            "received_at": received_at,
+            "not_received": bool(not_received_at),
+            "not_received_at": not_received_at,
+            "confirmation_status": "received" if received_at else "not_received" if not_received_at else "unconfirmed",
+        })
+
+    if pickup_delivery_snapshots:
+        with db() as conn:
+            snapshot_created_at = utc_now()
+            conn.execute_values(
+                """
+                INSERT INTO package_pickup_delivery_records (delivered_at, package_id, created_at)
+                VALUES ?
+                ON CONFLICT(package_id) DO NOTHING
+                """,
+                [(delivered_at, package_id, snapshot_created_at) for delivered_at, package_id in pickup_delivery_snapshots],
+                template="(?, ?, ?)",
+            )
+
+    for manual in manual_amazon_rows:
+        manual_id = int(manual.get("id") or 0)
+        if manual_id in matched_manual_ids:
+            continue
+        pickup_date = clean_text(manual.get("pickup_date"))
+        if not pickup_date or pickup_date < start_date.isoformat() or pickup_date > end_date.isoformat():
+            continue
+        manual_store_id = int(manual.get("store_id") or 0)
+        order_name = clean_text(manual.get("odoo_order_name")).upper()
+        linked = lines_by_odoo.get((manual_store_id, order_name), {})
+        shopify = shopify_statuses.get((manual_store_id, order_name), {})
+        fulfilled = package_pickup_is_shopify_fulfilled(shopify.get("fulfillment_status"), shopify.get("cancelled_at"))
+        tracking_input = normalize_dispatch_scan_code(manual.get("tracking_input"))
+        tracking_display = tracking_input if len(tracking_input) > 4 else f"••••{tracking_input}"
+        ensure_card(pickup_date)["manual_amazon_packages"].append({
+            "source_type": "manual_amazon",
+            "source_id": manual_id,
+            "store_id": manual_store_id,
+            "odoo_order_name": order_name,
+            "amazon_order_id": clean_text(linked.get("amazon_order_id")),
+            "amazon_order_url": clean_text(linked.get("amazon_order_url")),
+            "tracking_id": tracking_display,
+            "tracking_url": "",
+            "carrier": "Amazon",
+            "delivery_status": "Awaiting Chrome extension sync",
+            "delivered_at": "",
+            "delivered_display": "Awaiting Chrome sync",
+            "package_type": "Amazon (manual)",
+            "shopify_status": clean_text(shopify.get("fulfillment_status")) or "Pending",
+            "shopify_fulfilled": fulfilled,
+            "received": bool(clean_text(manual.get("received_at"))),
+            "received_at": clean_text(manual.get("received_at")),
+            "not_received": bool(clean_text(manual.get("not_received_at"))),
+            "not_received_at": clean_text(manual.get("not_received_at")),
+            "confirmation_status": "received" if clean_text(manual.get("received_at")) else "not_received" if clean_text(manual.get("not_received_at")) else "unconfirmed",
+            "tracking_suffix": clean_text(manual.get("tracking_suffix")),
+        })
+
+    for pickup_date, check in check_by_date.items():
+        if pickup_date < start_date.isoformat() or pickup_date > end_date.isoformat():
+            continue
+        card = ensure_card(pickup_date)
+        for entry in non_amazon_by_check.get(int(check.get("id") or 0), []):
+            entry_type = clean_text(entry.get("package_type")).lower() or "non_amazon"
+            order_number = clean_text(entry.get("order_number"))
+            is_default_order = bool(re.fullmatch(r"(?:Amazon|Non-Amazon) Package \d+", order_number, re.IGNORECASE))
+            linked = lines_by_odoo.get((int(store_id or 0), order_number.upper()), {}) if order_number and store_id else {}
+            if not linked and order_number and not is_default_order:
+                linked = next((line for (line_store, key), line in lines_by_odoo.items() if key == order_number.upper() and (not store_id or line_store == int(store_id))), {})
+            linked_store = int(linked.get("store_id") or store_id or 0)
+            linked_order = clean_text(linked.get("odoo_order_name") or order_number)
+            status = shopify_statuses.get((linked_store, linked_order.upper()), {})
+            fulfilled = package_pickup_is_shopify_fulfilled(status.get("fulfillment_status"), status.get("cancelled_at"))
+            tracking_input = normalize_dispatch_scan_code(entry.get("tracking_input"))
+            tracking_display = tracking_input if len(tracking_input) > 4 else (f"••••{tracking_input}" if tracking_input else "")
+            pickup_row = {
+                "source_type": "count_amazon" if entry_type == "amazon" else "non_amazon",
+                "source_id": int(entry.get("id") or 0),
+                "store_id": linked_store,
+                "odoo_order_name": linked_order,
+                "amazon_order_id": "",
+                "amazon_order_url": "",
+                "tracking_id": tracking_display,
+                "delivered_at": clean_text(linked.get("manual_estimated_delivery_at")),
+                "delivered_display": "Awaiting Chrome sync" if entry_type == "amazon" else "",
+                "delivery_status": "Package details needed" if is_default_order else "Manually entered pickup",
+                "package_type": "Amazon (counted)" if entry_type == "amazon" else "Non-Amazon",
+                "shopify_status": clean_text(status.get("fulfillment_status")) or "Pending",
+                "shopify_fulfilled": fulfilled,
+                "received": bool(clean_text(entry.get("received_at"))),
+                "received_at": clean_text(entry.get("received_at")),
+                "not_received": bool(clean_text(entry.get("not_received_at"))),
+                "not_received_at": clean_text(entry.get("not_received_at")),
+                "confirmation_status": "received" if clean_text(entry.get("received_at")) else "not_received" if clean_text(entry.get("not_received_at")) else "unconfirmed",
+                "position": int(entry.get("position") or 0),
+                "needs_details": (not tracking_input) if entry_type == "amazon" else (is_default_order or not tracking_input),
+                "tracking_input": clean_text(entry.get("tracking_input")),
+            }
+            card["manual_amazon_packages" if entry_type == "amazon" else "non_amazon_packages"].append(pickup_row)
+
+    for pickup_date in check_by_date:
+        ensure_card(pickup_date)
+    cursor = start_date
+    while cursor <= end_date:
+        if cursor.weekday() < 5:
+            ensure_card(cursor.isoformat())
+        cursor += timedelta(days=1)
+    card_rows = sorted(cards.values(), key=lambda card: card["pickup_date"], reverse=True)
+    for card in card_rows:
+        card["amazon_reported_delivered"] = len(card["amazon_packages"])
+        card["reported_delivered"] = len(card["amazon_packages"])
+        card["missing_amazon"] = max(0, len(card["amazon_packages"]) - int(card["amazon_picked_up"]))
+        card["unreported_amazon"] = max(0, int(card["amazon_picked_up"]) - len(card["amazon_packages"]))
+        card["physical_total"] = int(card["amazon_picked_up"]) + int(card["non_amazon_picked_up"])
+        card["shopify_fulfilled"] = sum(1 for row in [*card["amazon_packages"], *card["manual_amazon_packages"], *card["non_amazon_packages"]] if row["shopify_fulfilled"])
+    summary = {
+        "amazon_reported_delivered": sum(card["amazon_reported_delivered"] for card in card_rows),
+        "amazon_picked_up": sum(int(card["amazon_picked_up"]) for card in card_rows),
+        "non_amazon_picked_up": sum(int(card["non_amazon_picked_up"]) for card in card_rows),
+        "missing_amazon": sum(int(card["missing_amazon"]) for card in card_rows),
+        "unreported_amazon": sum(int(card["unreported_amazon"]) for card in card_rows),
+        "shopify_fulfilled": sum(int(card["shopify_fulfilled"]) for card in card_rows),
+    }
+    return {
+        "ok": True,
+        "timezone": "America/New_York",
+        "cutoff": package_pickup_time_setting(),
+        "date_from": start_date.isoformat(),
+        "date_to": end_date.isoformat(),
+        "summary": summary,
+        "cards": card_rows,
+    }
+
+
+@app.get("/api/package-pickups")
+def api_package_pickups(store_id: Optional[int] = None, date_from: str = "", date_to: str = "") -> dict[str, Any]:
+    try:
+        return package_pickup_data(store_id, clean_text(date_from), clean_text(date_to))
+    except ValueError as exc:
+        raise HTTPException(400, "Dates must use YYYY-MM-DD format.") from exc
+
+
+@app.post("/api/package-pickups/settings")
+def api_package_pickup_settings(payload: PackagePickupSettingsPayload) -> dict[str, Any]:
+    normalized = normalize_package_pickup_time(payload.pickup_time)
+    if normalized != clean_text(payload.pickup_time):
+        raise HTTPException(400, "Pickup time must use a valid 24-hour HH:MM value.")
+    set_setting("package_pickup_time", normalized)
+    return {"ok": True, "pickup_time": normalized}
+
+
+@app.post("/api/package-pickups/counts")
+def api_package_pickup_counts(payload: PackagePickupCountPayload) -> dict[str, Any]:
+    try:
+        datetime.strptime(payload.pickup_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(400, "Pickup date must use YYYY-MM-DD format.") from exc
+    store_id = int(payload.store_id or 0)
+    order_numbers = [clean_text(value) for value in payload.non_amazon_order_numbers]
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO package_pickup_checks
+                (store_id, pickup_date, amazon_picked_up, non_amazon_picked_up, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(store_id, pickup_date) DO UPDATE SET
+                amazon_picked_up=excluded.amazon_picked_up,
+                non_amazon_picked_up=excluded.non_amazon_picked_up,
+                updated_at=excluded.updated_at
+            """,
+            (store_id, payload.pickup_date, payload.amazon_picked_up, payload.non_amazon_picked_up, now, now),
+        )
+        check = conn.execute(
+            "SELECT id FROM package_pickup_checks WHERE store_id=? AND pickup_date=?",
+            (store_id, payload.pickup_date),
+        ).fetchone()
+        check_id = int(check["id"])
+        for package_number, position, default_order_number in package_pickup_placeholder_rows("non_amazon", payload.non_amazon_picked_up):
+            order_number = order_numbers[package_number - 1] if package_number <= len(order_numbers) else default_order_number
+            conn.execute(
+                """
+                INSERT INTO package_pickup_non_amazon
+                    (check_id, position, package_type, order_number, tracking_input, received_at, created_at, updated_at)
+                VALUES (?, ?, 'non_amazon', ?, NULL, NULL, ?, ?)
+                ON CONFLICT(check_id, position) DO UPDATE SET
+                    order_number=CASE
+                        WHEN package_pickup_non_amazon.order_number IS NULL OR package_pickup_non_amazon.order_number LIKE 'Non-Amazon Package %'
+                        THEN excluded.order_number ELSE package_pickup_non_amazon.order_number END,
+                    updated_at=excluded.updated_at
+                """,
+                (check_id, position, order_number, now, now),
+            )
+        conn.execute(
+            "DELETE FROM package_pickup_non_amazon WHERE check_id=? AND package_type='non_amazon' AND position>?",
+            (check_id, payload.non_amazon_picked_up),
+        )
+        for package_number, position, default_order_number in package_pickup_placeholder_rows("amazon", payload.amazon_unreported_count):
+            conn.execute(
+                """
+                INSERT INTO package_pickup_non_amazon
+                    (check_id, position, package_type, order_number, tracking_input, received_at, created_at, updated_at)
+                VALUES (?, ?, 'amazon', ?, NULL, NULL, ?, ?)
+                ON CONFLICT(check_id, position) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (check_id, position, default_order_number, now, now),
+            )
+        conn.execute(
+            "DELETE FROM package_pickup_non_amazon WHERE check_id=? AND package_type='amazon' AND position<?",
+            (check_id, -payload.amazon_unreported_count),
+        )
+    return package_pickup_data(payload.store_id, payload.pickup_date, payload.pickup_date)
+
+
+def package_pickup_compact_extra_positions(conn: Any, check_id: int, package_type: str, now: str) -> None:
+    is_amazon = package_type == "amazon"
+    rows = conn.execute(
+        f"SELECT id, position, order_number FROM package_pickup_non_amazon WHERE check_id=? AND package_type=? ORDER BY position {'DESC' if is_amazon else 'ASC'}",
+        (check_id, package_type),
+    ).fetchall()
+    label = "Amazon" if is_amazon else "Non-Amazon"
+    for package_number, row in enumerate(rows, start=1):
+        position = -package_number if is_amazon else package_number
+        current_order = clean_text(row["order_number"])
+        normalized_order = f"{label} Package {package_number}" if re.fullmatch(r"(?:Amazon|Non-Amazon) Package \d+", current_order, re.IGNORECASE) else current_order
+        conn.execute(
+            "UPDATE package_pickup_non_amazon SET position=?, order_number=?, updated_at=? WHERE id=?",
+            (position, normalized_order, now, int(row["id"])),
+        )
+
+
+@app.post("/api/package-pickups/bulk-details")
+def api_package_pickup_bulk_details(payload: PackagePickupBulkPayload) -> dict[str, Any]:
+    try:
+        datetime.strptime(payload.pickup_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(400, "Pickup date must use YYYY-MM-DD format.") from exc
+    now = utc_now()
+    requested_store_id = int(payload.store_id or 0)
+    with db() as conn:
+        check = conn.execute(
+            "SELECT * FROM package_pickup_checks WHERE store_id=? AND pickup_date=?",
+            (requested_store_id, payload.pickup_date),
+        ).fetchone()
+        if not check:
+            conn.execute(
+                """INSERT INTO package_pickup_checks
+                   (store_id, pickup_date, amazon_picked_up, non_amazon_picked_up, created_at, updated_at)
+                   VALUES (?, ?, 0, 0, ?, ?)""",
+                (requested_store_id, payload.pickup_date, now, now),
+            )
+            check = conn.execute(
+                "SELECT * FROM package_pickup_checks WHERE store_id=? AND pickup_date=?",
+                (requested_store_id, payload.pickup_date),
+            ).fetchone()
+        check_id = int(check["id"])
+        for row_payload in payload.rows:
+            package_type = clean_text(row_payload.package_type).lower().replace("-", "_")
+            if package_type not in {"amazon", "non_amazon"}:
+                raise HTTPException(400, "Package type must be Amazon or Non-Amazon.")
+            order_name = clean_text(row_payload.odoo_order_name)
+            tracking_input = normalize_dispatch_scan_code(row_payload.tracking_input)
+            if len(tracking_input) < 5 or len(tracking_input) > 64 or not re.fullmatch(r"[A-Z0-9]+", tracking_input):
+                raise HTTPException(400, "Each extra package needs the full tracking ID or at least its last 5 letters or numbers.")
+            existing = None
+            if row_payload.source_id:
+                existing = conn.execute(
+                    "SELECT * FROM package_pickup_non_amazon WHERE id=? AND check_id=?",
+                    (row_payload.source_id, check_id),
+                ).fetchone()
+                if not existing:
+                    raise HTTPException(404, "One of the pickup package rows no longer exists. Refresh and try again.")
+                if clean_text(existing["package_type"]).lower() != package_type:
+                    raise HTTPException(400, "The package type of a saved count row cannot be changed. Add a new row instead.")
+
+            is_default = not order_name or bool(re.fullmatch(r"(?:Amazon|Non-Amazon) Package \d+", order_name, re.IGNORECASE))
+            if package_type == "non_amazon" and is_default:
+                raise HTTPException(400, "Each non-Amazon package needs its Odoo order number.")
+
+            default_number = abs(int(existing["position"])) if existing else 0
+            if not existing:
+                if package_type == "non_amazon":
+                    position = int(conn.execute(
+                        "SELECT COALESCE(MAX(position), 0)+1 AS position FROM package_pickup_non_amazon WHERE check_id=? AND position>0",
+                        (check_id,),
+                    ).fetchone()["position"])
+                    conn.execute("UPDATE package_pickup_checks SET non_amazon_picked_up=non_amazon_picked_up+1, updated_at=? WHERE id=?", (now, check_id))
+                else:
+                    position = int(conn.execute(
+                        "SELECT COALESCE(MIN(position), 0)-1 AS position FROM package_pickup_non_amazon WHERE check_id=? AND position<0",
+                        (check_id,),
+                    ).fetchone()["position"])
+                    conn.execute("UPDATE package_pickup_checks SET amazon_picked_up=amazon_picked_up+1, updated_at=? WHERE id=?", (now, check_id))
+                default_number = abs(position)
+                conn.execute(
+                    """INSERT INTO package_pickup_non_amazon
+                       (check_id, position, package_type, order_number, tracking_input, received_at, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, NULL, ?, ?)""",
+                    (check_id, position, package_type, order_name or f"{'Amazon' if package_type == 'amazon' else 'Non-Amazon'} Package {default_number}", tracking_input or None, now, now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE package_pickup_non_amazon SET order_number=?, tracking_input=?, updated_at=? WHERE id=?",
+                    (order_name or f"{'Amazon' if package_type == 'amazon' else 'Non-Amazon'} Package {default_number}", tracking_input or None, now, row_payload.source_id),
+                )
+        package_pickup_compact_extra_positions(conn, check_id, "amazon", now)
+        package_pickup_compact_extra_positions(conn, check_id, "non_amazon", now)
+    return package_pickup_data(payload.store_id, payload.pickup_date, payload.pickup_date)
+
+
+@app.post("/api/package-pickups/manual-amazon")
+def api_package_pickup_manual_amazon(payload: PackagePickupManualAmazonPayload) -> dict[str, Any]:
+    try:
+        datetime.strptime(payload.pickup_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(400, "Pickup date must use YYYY-MM-DD format.") from exc
+    order_name = clean_text(payload.odoo_order_name).upper()
+    if not order_name:
+        raise HTTPException(400, "Odoo order number is required.")
+    tracking_input = normalize_dispatch_scan_code(payload.tracking_input)
+    if len(tracking_input) < 5:
+        raise HTTPException(400, "Enter the full tracking ID or at least its last 5 characters.")
+    if len(tracking_input) > 64 or not re.fullmatch(r"[A-Z0-9]+", tracking_input):
+        raise HTTPException(400, "Tracking ID may contain only letters and numbers.")
+    tracking_suffix = tracking_input[-5:]
+    now = utc_now()
+    with db() as conn:
+        order_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT DISTINCT store_id
+            FROM order_lines
+            WHERE UPPER(COALESCE(odoo_order_name, ''))=?
+              AND (? IS NULL OR store_id=?)
+            ORDER BY store_id
+            """,
+            (order_name, payload.store_id, payload.store_id),
+        ).fetchall())
+        if not order_rows:
+            raise HTTPException(404, "Odoo order was not found. Check the recipient order number and selected store.")
+        if len(order_rows) > 1 and not payload.store_id:
+            raise HTTPException(409, "This Odoo order exists in more than one store. Select the store before adding the row.")
+        resolved_store_id = int(payload.store_id or order_rows[0]["store_id"])
+        conn.execute(
+            """
+            INSERT INTO package_pickup_manual_amazon
+                (store_id, pickup_date, odoo_order_name, tracking_input, tracking_suffix,
+                 matched_dispatch_package_id, received_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            ON CONFLICT(store_id, pickup_date, odoo_order_name, tracking_suffix) DO UPDATE SET
+                tracking_input=CASE
+                    WHEN LENGTH(excluded.tracking_input) > LENGTH(package_pickup_manual_amazon.tracking_input)
+                    THEN excluded.tracking_input ELSE package_pickup_manual_amazon.tracking_input END,
+                updated_at=excluded.updated_at
+            """,
+            (resolved_store_id, payload.pickup_date, order_name, tracking_input, tracking_suffix, now, now),
+        )
+    return package_pickup_data(resolved_store_id, payload.pickup_date, payload.pickup_date)
+
+
+@app.post("/api/package-pickups/received")
+def api_package_pickup_received(payload: PackagePickupReceivedPayload) -> dict[str, Any]:
+    source_type = clean_text(payload.source_type).lower()
+    if source_type not in {"amazon", "manual_amazon", "count_amazon", "non_amazon"}:
+        raise HTTPException(400, "Unknown pickup package type.")
+    confirmation_status = normalize_package_pickup_confirmation_status(payload.status, payload.received)
+    if not confirmation_status:
+        raise HTTPException(400, "Confirmation must be Received, Not received, or Unconfirmed.")
+    now = utc_now()
+    received_at = now if confirmation_status == "received" else None
+    not_received_at = now if confirmation_status == "not_received" else None
+    with db() as conn:
+        shopify_statuses = package_pickup_shopify_statuses(conn)
+        if source_type == "amazon":
+            row = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (payload.source_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "Amazon package was not found.")
+            status = shopify_statuses.get((int(row["store_id"] or 0), clean_text(row["odoo_order_name"]).upper()), {})
+            if package_pickup_is_shopify_fulfilled(status.get("fulfillment_status"), status.get("cancelled_at")):
+                raise HTTPException(409, "This Odoo order is already fulfilled in Shopify, so Received is locked.")
+            conn.execute(
+                """UPDATE amazon_dispatch_packages
+                   SET received_at=?, not_received_at=?,
+                       scan_status=CASE WHEN ?='received' AND COALESCE(scan_status, '') IN ('', 'pending') THEN 'received_unopened' ELSE scan_status END
+                   WHERE id=?""",
+                (received_at, not_received_at, confirmation_status, payload.source_id),
+            )
+        elif source_type == "manual_amazon":
+            row = conn.execute("SELECT * FROM package_pickup_manual_amazon WHERE id=?", (payload.source_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "Manual Amazon package was not found.")
+            status = shopify_statuses.get((int(row["store_id"] or 0), clean_text(row["odoo_order_name"]).upper()), {})
+            if package_pickup_is_shopify_fulfilled(status.get("fulfillment_status"), status.get("cancelled_at")):
+                raise HTTPException(409, "This Odoo order is already fulfilled in Shopify, so Received is locked.")
+            conn.execute(
+                "UPDATE package_pickup_manual_amazon SET received_at=?, not_received_at=?, updated_at=? WHERE id=?",
+                (received_at, not_received_at, now, payload.source_id),
+            )
+        else:
+            row = conn.execute(
+                """
+                SELECT entry.*, checks.store_id
+                FROM package_pickup_non_amazon entry
+                JOIN package_pickup_checks checks ON checks.id=entry.check_id
+                WHERE entry.id=?
+                """,
+                (payload.source_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "Counted pickup package was not found.")
+            order_number = clean_text(row["order_number"])
+            status = shopify_statuses.get((int(row["store_id"] or 0), order_number.upper()), {}) if order_number else {}
+            if package_pickup_is_shopify_fulfilled(status.get("fulfillment_status"), status.get("cancelled_at")):
+                raise HTTPException(409, "This Odoo order is already fulfilled in Shopify, so Received is locked.")
+            conn.execute(
+                "UPDATE package_pickup_non_amazon SET received_at=?, not_received_at=?, updated_at=? WHERE id=?",
+                (received_at, not_received_at, now, payload.source_id),
+            )
+    return {
+        "ok": True,
+        "status": confirmation_status,
+        "received_at": received_at or "",
+        "not_received_at": not_received_at or "",
+    }
+
+
+@app.post("/api/package-pickups/delete-row")
+def api_package_pickup_delete_row(payload: PackagePickupDeletePayload) -> dict[str, Any]:
+    source_type = clean_text(payload.source_type).lower()
+    expected_type = "amazon" if source_type == "count_amazon" else "non_amazon" if source_type == "non_amazon" else ""
+    if not expected_type:
+        raise HTTPException(400, "Only team-added extra package rows can be deleted.")
+    now = utc_now()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT entry.*, checks.amazon_picked_up, checks.non_amazon_picked_up
+            FROM package_pickup_non_amazon entry
+            JOIN package_pickup_checks checks ON checks.id=entry.check_id
+            WHERE entry.id=?
+            """,
+            (payload.source_id,),
+        ).fetchone()
+        if not row or clean_text(row["package_type"]).lower() != expected_type:
+            raise HTTPException(404, "The extra pickup row was not found.")
+        check_id = int(row["check_id"])
+        conn.execute("DELETE FROM package_pickup_non_amazon WHERE id=?", (payload.source_id,))
+        count_column = "amazon_picked_up" if expected_type == "amazon" else "non_amazon_picked_up"
+        conn.execute(
+            f"UPDATE package_pickup_checks SET {count_column}=CASE WHEN {count_column}>0 THEN {count_column}-1 ELSE 0 END, updated_at=? WHERE id=?",
+            (now, check_id),
+        )
+        package_pickup_compact_extra_positions(conn, check_id, expected_type, now)
+    return {"ok": True}
+
+
 @app.get("/api/dispatch-status")
 def api_dispatch_status(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", q: str = "") -> dict[str, Any]:
     cache_key = ("dispatch-status", store_id, page, per_page, clean_text(status), clean_text(q))
@@ -30776,6 +31734,9 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
     url = clean_text(payload.url)
     third_party = bool(payload.third_party)
     total_cost = float(payload.total_cost or 0)
+    estimated_delivery_at = clean_text(payload.estimated_delivery_at)
+    if estimated_delivery_at and not parse_any_datetime(estimated_delivery_at):
+        raise HTTPException(400, "Enter a valid estimated delivery date and time.")
     if not line_ids:
         raise HTTPException(400, "Select at least one order line.")
     if not reference and not url:
@@ -30869,6 +31830,7 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
                         amazon_unit_price=?,
                         amazon_total_price=?,
                         chrome_profit_total=?,
+                        manual_estimated_delivery_at=?,
                         fulfilment_note=CASE
                           WHEN COALESCE(fulfilment_note, '') = '' THEN ?
                           ELSE fulfilment_note || ' | ' || ?
@@ -30884,6 +31846,7 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
                         (line_cost / quantity) if quantity else line_cost,
                         line_cost,
                         store_total - line_cost,
+                        estimated_delivery_at or None,
                         f"{note}; cost {line_cost:.2f}",
                         f"{note}; cost {line_cost:.2f}",
                         now,
@@ -30909,12 +31872,13 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
                         amazon_status='ordered',
                         state='ordered',
                         missing_asin=NULL,
+                        manual_estimated_delivery_at=?,
                         last_error=NULL,
                         ordered_at=COALESCE(ordered_at, ?),
                         updated_at=?
                     WHERE id=?
                     """,
-                    (amazon_order_id, amazon_order_url, now, now, row["id"]),
+                    (amazon_order_id, amazon_order_url, estimated_delivery_at or None, now, now, row["id"]),
                 )
         for row in rows:
             updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
@@ -30931,6 +31895,8 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
             if url:
                 note += f"\nThird-party order link: {url}"
             note += f"\nThird-party total cost: {total_cost:.2f}"
+            if estimated_delivery_at:
+                note += f"\nEstimated delivery: {estimated_delivery_at}"
             for order_id in sorted({int(row["odoo_order_id"]) for row in rows}):
                 odoo.post_order_note(order_id, note)
         except Exception:
@@ -31218,9 +32184,9 @@ def package_tracker_delivery_kind(package_status: Any, promise: Any) -> str:
     value = f"{clean_text(package_status)} {clean_text(promise)}".lower()
     if "cancel" in value or "refund issued" in value or "refunded" in value:
         return "cancelled"
-    if "deliver" in value and not any(token in value for token in ("not delivered", "unable to deliver", "delivery attempted")):
+    if re.search(r"\bdelivered\b", value) and not any(token in value for token in ("not delivered", "unable to deliver", "delivery attempted")):
         return "delivered"
-    if any(token in value for token in ("delay", "exception", "problem", "failed", "unable", "attempted", "lost", "return")):
+    if any(token in value for token in ("delay", "late", "exception", "problem", "failed", "unable", "attempted", "lost", "return")):
         return "exception"
     return "arriving"
 
@@ -31497,6 +32463,96 @@ def package_tracker_allowed_asins_for_order(
     return allowed
 
 
+def package_tracker_single_package_history_products(
+    order_packages: list[dict[str, Any]],
+    history: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Use Amazon's order items as the complete product list for one-package orders."""
+    if len(order_packages) != 1:
+        return []
+    return [
+        dict(product)
+        for product in normalize_amazon_product_items(parse_json_list_value(history.get("items_json")))
+        if normalize_asin(product.get("asin"))
+    ]
+
+
+def package_tracker_enforce_product_guard(
+    packages: list[dict[str, Any]],
+    history_by_order_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Ensure every product associated by Amazon is rendered on exactly one package row."""
+    packages_by_order: dict[str, list[dict[str, Any]]] = {}
+    for package in packages:
+        packages_by_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
+
+    expected_total = 0
+    displayed_total = 0
+    recovered_total = 0
+    missing_keys: list[str] = []
+    unverified_orders: list[str] = []
+    for amazon_order_id, order_packages in packages_by_order.items():
+        history_products = [
+            dict(product)
+            for product in normalize_amazon_product_items(
+                parse_json_list_value(history_by_order_id.get(amazon_order_id, {}).get("items_json"))
+            )
+            if normalize_asin(product.get("asin"))
+        ]
+        expected_by_asin = {
+            normalize_asin(product.get("asin")): product
+            for product in history_products
+            if normalize_asin(product.get("asin"))
+        }
+        if not expected_by_asin:
+            for package in order_packages:
+                for product in package.get("products") or []:
+                    asin = normalize_asin(product.get("asin"))
+                    if asin:
+                        expected_by_asin.setdefault(asin, dict(product))
+        if not expected_by_asin:
+            unverified_orders.append(amazon_order_id or "unknown")
+            continue
+
+        displayed_asins = {
+            normalize_asin(product.get("asin"))
+            for package in order_packages
+            for product in (package.get("products") or [])
+            if normalize_asin(product.get("asin"))
+        }
+        missing_asins = [asin for asin in expected_by_asin if asin not in displayed_asins]
+        if missing_asins:
+            target = order_packages[0]
+            target_products = target.setdefault("products", [])
+            target_unassigned = target.setdefault("unassigned_products", [])
+            for asin in missing_asins:
+                recovered = dict(expected_by_asin[asin])
+                recovered["guard_recovered"] = True
+                target_products.append(recovered)
+                target_unassigned.append(dict(recovered))
+                recovered_total += 1
+
+        displayed_after = {
+            normalize_asin(product.get("asin"))
+            for package in order_packages
+            for product in (package.get("products") or [])
+            if normalize_asin(product.get("asin"))
+        }
+        still_missing = [asin for asin in expected_by_asin if asin not in displayed_after]
+        missing_keys.extend(f"{amazon_order_id}:{asin}" for asin in still_missing)
+        expected_total += len(expected_by_asin)
+        displayed_total += len(set(expected_by_asin).intersection(displayed_after))
+
+    return {
+        "complete": not missing_keys and not unverified_orders,
+        "expected_products": expected_total,
+        "displayed_products": displayed_total,
+        "recovered_products": recovered_total,
+        "missing_product_keys": missing_keys,
+        "unverified_amazon_orders": unverified_orders,
+    }
+
+
 def package_tracker_quantity_analysis(
     lines: list[dict[str, Any]],
     packages: list[dict[str, Any]],
@@ -31540,6 +32596,14 @@ def package_tracker_quantity_analysis(
             entry["amazon_order_ids"].add(amazon_order_id)
 
     for amazon_order_id, order_packages in packages_by_order.items():
+        authoritative_history_products = package_tracker_single_package_history_products(
+            order_packages,
+            history_by_order_id.get(amazon_order_id, {}),
+        )
+        if authoritative_history_products:
+            for product in authoritative_history_products:
+                add_amazon_item(product.get("asin"), product.get("quantity"), amazon_order_id)
+            continue
         allowed_asins = package_tracker_allowed_asins_for_order(
             lines,
             amazon_order_id,
@@ -32033,6 +33097,9 @@ def api_public_package_tracker(
         for package in card_package_rows:
             history = history_by_order_id.get(clean_text(package.get("amazon_order_id")), {})
             amazon_order_id = clean_text(package.get("amazon_order_id"))
+            order_packages = package_rows_by_amazon_order.get(amazon_order_id, [])
+            history_products = [dict(item) for item in parse_json_list_value(history.get("items_json")) if isinstance(item, dict)]
+            authoritative_history_products = package_tracker_single_package_history_products(order_packages, history)
             allowed_asins = package_tracker_allowed_asins_for_order(
                 lines_by_key.get((store_id, order_name), []),
                 amazon_order_id,
@@ -32042,24 +33109,25 @@ def api_public_package_tracker(
             delivered_at = clean_text(package.get("received_at")) if kind == "delivered" else ""
             if kind == "delivered" and not delivered_at:
                 delivered_at = package_tracker_delivery_date(package.get("package_status"), package.get("promise"), package.get("updated_at"))
-            products = [dict(item) for item in parse_json_list_value(package.get("products_json")) if isinstance(item, dict)]
-            if allowed_asins:
-                products = [product for product in products if normalize_asin(product.get("asin")) in allowed_asins]
-            package_asins = list(dict.fromkeys(
-                normalize_asin(asin)
-                for asin in parse_json_list_value(package.get("asins_json"))
-                if normalize_asin(asin) and (not allowed_asins or normalize_asin(asin) in allowed_asins)
-            ))
-            represented_asins = {normalize_asin(product.get("asin")) for product in products if normalize_asin(product.get("asin"))}
-            products.extend(
-                {"asin": asin, "title": asin, "image_url": "", "url": f"https://www.amazon.com/dp/{quote_plus(asin)}"}
-                for asin in package_asins
-                if asin not in represented_asins
-            )
+            products = [dict(product) for product in authoritative_history_products]
+            if not products:
+                products = [dict(item) for item in parse_json_list_value(package.get("products_json")) if isinstance(item, dict)]
+                if allowed_asins:
+                    products = [product for product in products if normalize_asin(product.get("asin")) in allowed_asins]
+                package_asins = list(dict.fromkeys(
+                    normalize_asin(asin)
+                    for asin in parse_json_list_value(package.get("asins_json"))
+                    if normalize_asin(asin) and (not allowed_asins or normalize_asin(asin) in allowed_asins)
+                ))
+                represented_asins = {normalize_asin(product.get("asin")) for product in products if normalize_asin(product.get("asin"))}
+                products.extend(
+                    {"asin": asin, "title": asin, "image_url": "", "url": f"https://www.amazon.com/dp/{quote_plus(asin)}"}
+                    for asin in package_asins
+                    if asin not in represented_asins
+                )
             missing_history_products = missing_history_products_by_order.get(amazon_order_id, [])
-            if missing_history_products and len(package_rows_by_amazon_order.get(amazon_order_id, [])) == 1:
+            if missing_history_products and len(order_packages) == 1 and not authoritative_history_products:
                 products.extend(dict(product) for product in missing_history_products)
-            history_products = [dict(item) for item in parse_json_list_value(history.get("items_json")) if isinstance(item, dict)]
             history_asins = list(dict.fromkeys(normalize_asin(item.get("asin")) for item in history_products if normalize_asin(item.get("asin"))))
             normalized_history_by_asin = {
                 normalize_asin(item.get("asin")): item
@@ -32236,6 +33304,7 @@ def api_public_package_tracker(
             ),
             reverse=True,
         )
+        product_guard = package_tracker_enforce_product_guard(current_packages, history_by_order_id)
         quantity_analysis = package_tracker_quantity_analysis(
             lines_by_key.get((store_id, order_name), []),
             card_package_rows,
@@ -32254,6 +33323,7 @@ def api_public_package_tracker(
             "updated_at": clean_text(group.get("updated_at")),
             "packages": current_packages,
             "previous_orders": previous_orders,
+            "product_guard": product_guard,
             "quantity_analysis": quantity_analysis,
         })
 
@@ -32272,39 +33342,29 @@ def api_public_package_tracker(
     return fast_page_cache_set(cache_key, result, 60)
 
 
-def public_table_page(title: str, rows: list[dict[str, Any]]) -> HTMLResponse:
-    columns = list(rows[0].keys()) if rows else ["status"]
-    body = "".join(
-        "<tr>" + "".join(f"<td>{html.escape(str(row.get(column) or ''))}</td>" for column in columns) + "</tr>"
-        for row in rows
-    )
-    head = "".join(f"<th>{html.escape(column.replace('_', ' ').title())}</th>" for column in columns)
-    return HTMLResponse(
-        f"""
-        <!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-        <link rel='stylesheet' href='/static/vendor/tabler/css/tabler.min.css'><title>{html.escape(title)}</title></head>
-        <body><div class='page'><main class='page-wrapper'><div class='page-header'><div class='container-xl'>
-        <div class='page-pretitle'>Public view</div><h1 class='page-title'>{html.escape(title)}</h1></div></div>
-        <div class='page-body'><div class='container-xl'><div class='card'><div class='table-responsive'>
-        <table class='table table-vcenter'><thead><tr>{head}</tr></thead><tbody>{body or f"<tr><td colspan='{len(columns)}' class='text-secondary'>No rows.</td></tr>"}</tbody></table>
-        </div></div></div></div></main></div></body></html>
-        """
-    )
+def redesigned_public_page_redirect(request: Request, path: str) -> RedirectResponse:
+    query = f"?{request.url.query}" if request.url.query else ""
+    return RedirectResponse(f"{path}{query}", status_code=307, headers={"Cache-Control": "no-store"})
 
 
-@app.get("/public/epost", response_class=HTMLResponse)
-def public_epost_page(store_id: Optional[int] = None, status: str = "pending") -> HTMLResponse:
-    return public_table_page("ePost Tracking", api_public_epost(store_id, status)["rows"])
+@app.get("/public/epost")
+def public_epost_page(request: Request) -> RedirectResponse:
+    return redesigned_public_page_redirect(request, "/epost")
 
 
-@app.get("/public/pending", response_class=HTMLResponse)
-def public_pending_page(store_id: Optional[int] = None) -> HTMLResponse:
-    return public_table_page("Pending Odoo Fulfilment", api_public_pending(store_id)["rows"])
+@app.get("/public/pending")
+def public_pending_page(request: Request) -> RedirectResponse:
+    return redesigned_public_page_redirect(request, "/fulfilment-pending")
 
 
-@app.get("/public/tracking", response_class=HTMLResponse)
-def public_tracking_page(store_id: Optional[int] = None) -> HTMLResponse:
-    return public_table_page("Amazon Tracking", api_public_tracking(store_id)["rows"])
+@app.get("/public/tracking")
+def public_tracking_page(request: Request) -> RedirectResponse:
+    return redesigned_public_page_redirect(request, "/tracking")
+
+
+@app.get("/public/package-pickups")
+def public_package_pickups_page(request: Request) -> RedirectResponse:
+    return redesigned_public_page_redirect(request, "/package-pickups")
 
 
 @app.get("/track-order/{slug}", response_class=HTMLResponse)
@@ -32409,8 +33469,13 @@ def track_orders_sync_row(slug: str, tracking_id: int, store_id: Optional[int] =
     )
 
 
-@app.get("/public/amazon-otp", response_class=HTMLResponse)
-def public_amazon_otp_page(q: str = "") -> HTMLResponse:
+@app.get("/public/amazon-otp")
+def public_amazon_otp_page(request: Request) -> RedirectResponse:
+    return redesigned_public_page_redirect(request, "/amazon-otp")
+
+
+@app.get("/_legacy/public/amazon-otp", response_class=HTMLResponse)
+def legacy_public_amazon_otp_page(q: str = "") -> HTMLResponse:
     initial_q = html.escape(q)
     return HTMLResponse(
         f"""
@@ -32420,6 +33485,7 @@ def public_amazon_otp_page(q: str = "") -> HTMLResponse:
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <link rel="stylesheet" href="/static/vendor/tabler/css/tabler.min.css">
+          <link rel="stylesheet" href="/static/styles.css?v=10">
           <title>Amazon OTP Lookup</title>
         </head>
         <body>

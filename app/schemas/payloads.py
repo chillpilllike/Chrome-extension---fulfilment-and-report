@@ -183,6 +183,52 @@ class ManualFulfilmentPayload(BaseModel):
     url: str = ""
     third_party: bool = False
     total_cost: float = 0
+    estimated_delivery_at: str = ""
+
+
+class PackagePickupCountPayload(BaseModel):
+    store_id: Optional[int] = None
+    pickup_date: str
+    amazon_picked_up: int = Field(default=0, ge=0, le=100000)
+    non_amazon_picked_up: int = Field(default=0, ge=0, le=100000)
+    amazon_unreported_count: int = Field(default=0, ge=0, le=100000)
+    non_amazon_order_numbers: list[str] = Field(default_factory=list)
+
+
+class PackagePickupBulkRowPayload(BaseModel):
+    source_id: Optional[int] = None
+    package_type: str
+    odoo_order_name: str = ""
+    tracking_input: str = ""
+
+
+class PackagePickupBulkPayload(BaseModel):
+    store_id: Optional[int] = None
+    pickup_date: str
+    rows: list[PackagePickupBulkRowPayload] = Field(default_factory=list)
+
+
+class PackagePickupManualAmazonPayload(BaseModel):
+    store_id: Optional[int] = None
+    pickup_date: str
+    odoo_order_name: str
+    tracking_input: str
+
+
+class PackagePickupReceivedPayload(BaseModel):
+    source_type: str
+    source_id: int
+    status: str = ""
+    received: Optional[bool] = None
+
+
+class PackagePickupSettingsPayload(BaseModel):
+    pickup_time: str
+
+
+class PackagePickupDeletePayload(BaseModel):
+    source_type: str
+    source_id: int
 
 
 class ChromeJobHeartbeatPayload(BaseModel):
