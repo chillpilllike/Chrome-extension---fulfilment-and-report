@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.97")
+        self.assertEqual(MANIFEST["version"], "0.1.98")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -683,6 +683,15 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         confirmation = checkout.index("if (!await ensureSnsPaymentConfirmation(activeJob)) return;")
         protection = checkout.index('protectBeforeAmazonSubmit(activeJob, "checkout")')
         self.assertLess(confirmation, protection)
+
+    def test_subscribe_payment_confirmation_clicks_native_checkbox_first(self) -> None:
+        helper_start = CONTENT.index("async function ensureSnsPaymentConfirmation(activeJob)")
+        helper_end = CONTENT.index("async function recoverBlockedSnsSubmit", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        native_click = helper.index('clickElement(checkbox, "Subscribe & Save payment confirmation checkbox")')
+        fallback_click = helper.index('clickElement(label, "Subscribe & Save payment confirmation label")')
+        self.assertLess(native_click, fallback_click)
+        self.assertIn("const freshCheckbox = findSnsPaymentConfirmationCheckbox();", helper)
 
     def test_blocked_subscribe_submit_reuses_existing_protection(self) -> None:
         recovery_start = CONTENT.index("async function recoverBlockedSnsSubmit(activeJob)")

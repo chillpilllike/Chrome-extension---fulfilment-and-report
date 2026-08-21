@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-selected-delivery-promise-v76";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-native-sns-payment-checkbox-v77";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5158,10 +5158,22 @@ async function ensureSnsPaymentConfirmation(activeJob) {
   if (!checkbox || checkbox.checked) return true;
   if (!snsPaymentConfirmationIsBlocking()) return true;
 
-  const label = document.querySelector(`label[for='${checkbox.id}']`) || checkbox.closest?.("label");
   showPanel("Nutricity checkout", "Accepting the selected payment method for Subscribe & Save.", null, null);
-  await clickElement(label || checkbox, "Subscribe & Save payment confirmation checkbox");
-  const checked = await waitUntil(() => findSnsPaymentConfirmationCheckbox()?.checked === true, 3000, 100);
+  // Amazon's checkout label can be replaced while its blocker hydrates. Click
+  // the native checkbox first, then re-query and use the label only as a
+  // fallback so a detached label cannot leave the purchase permanently paused.
+  await clickElement(checkbox, "Subscribe & Save payment confirmation checkbox");
+  let checked = await waitUntil(() => findSnsPaymentConfirmationCheckbox()?.checked === true, 1800, 100);
+  if (!checked) {
+    const freshCheckbox = findSnsPaymentConfirmationCheckbox();
+    const label = freshCheckbox?.id
+      ? document.querySelector(`label[for='${CSS.escape(freshCheckbox.id)}']`)
+      : freshCheckbox?.closest?.("label");
+    if (label) {
+      await clickElement(label, "Subscribe & Save payment confirmation label");
+      checked = await waitUntil(() => findSnsPaymentConfirmationCheckbox()?.checked === true, 3000, 100);
+    }
+  }
   if (!checked) {
     await pauseForManualCheckout(activeJob, "Amazon requires confirmation of the Subscribe & Save payment method, but the checkbox did not stay selected.");
     return false;
