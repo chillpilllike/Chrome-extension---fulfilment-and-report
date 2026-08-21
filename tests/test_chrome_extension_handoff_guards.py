@@ -46,7 +46,21 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.91")
+        self.assertEqual(MANIFEST["version"], "0.1.92")
+
+    def test_subscription_frequency_supports_business_and_consumer_doms(self) -> None:
+        choose_start = CONTENT.index("async function chooseSubscribeFrequencySixMonths()")
+        choose_end = CONTENT.index("function findSixMonthSubscribeFrequencyPopoverOption", choose_start)
+        choose = CONTENT[choose_start:choose_end]
+        confirm_start = CONTENT.index("function subscribeFrequencyIsSixMonths()")
+        confirm_end = CONTENT.index("async function selectNativeSubscribeFrequency", confirm_start)
+        confirm = CONTENT[confirm_start:confirm_end]
+        self.assertIn("#replenishment-onml-frequency-trigger", choose)
+        self.assertIn("nativeFrequencies.find(visible)", choose)
+        self.assertIn("findSixMonthBusinessFrequencyOption", choose)
+        self.assertIn('select#rcxOrdFreqSns, select#rcxOrdFreqOnml', confirm)
+        self.assertIn('/^6M\\|(?:sns|onml)$/i.test(String(select.value || ""))', confirm)
+        self.assertNotIn('document.querySelector("#rcxOrdFreqSns")', confirm)
 
     def test_payment_selection_uses_exact_card_and_native_continue_control(self) -> None:
         self.assertIn("function paymentRadioForDigits(digits)", CONTENT)

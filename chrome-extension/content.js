@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-payment-summary-readiness-v70";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-hybrid-subscription-frequency-v71";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -2704,15 +2704,19 @@ async function chooseSubscribeFrequencySixMonths() {
     if (confirmed) await waitForStableDom(700, 5000);
     return confirmed;
   }
-  const nativeFrequency = [...document.querySelectorAll("#snsAccordionRowMiddle select, #snsAccordionRow select, #snsAccordionRowContent select, #reinvent_price_desktop_snsAccordionRowMiddle select")]
-    .find((select) => [...select.options || []].some((option) => /\b(weeks?|months?)\b/i.test(option.textContent || "") || /\d+[WM]\|sns/i.test(String(option.value || ""))));
+  const nativeFrequencies = [...document.querySelectorAll("#snsAccordionRowMiddle select, #snsAccordionRow select, #snsAccordionRowContent select, #reinvent_price_desktop_snsAccordionRowMiddle select")]
+    .filter((select) => [...select.options || []].some((option) => /\b(weeks?|months?)\b/i.test(option.textContent || "") || /\d+[WM]\|(?:sns|onml)/i.test(String(option.value || ""))));
+  // Business pages keep parallel SNS/ONML selects and hide the inactive one.
+  // Drive the visible select so Amazon's AUI dropdown state is updated, while
+  // retaining a fallback for layouts that visually hide the native control.
+  const nativeFrequency = nativeFrequencies.find(visible) || nativeFrequencies[0] || null;
   const nativeContainerButton = nativeFrequency?.closest?.(".a-dropdown-container")?.querySelector?.(".a-button-dropdown, [data-action='a-dropdown-button']");
-  const explicitButton = document.querySelector("#rcxOrdFreqSns, #rcxOrdFreqSns-announce")?.closest?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button");
+  const explicitButton = nativeFrequency?.closest?.(".a-dropdown-container")?.querySelector?.("[data-action='a-dropdown-button'], .a-button-dropdown, span.a-button");
   const frequencyButton = findSubscribeFrequencyDropdownButton();
   const dropdownButton = explicitButton || nativeContainerButton || frequencyButton;
   if (!dropdownButton || !visible(dropdownButton)) return selectNativeSubscribeFrequency(nativeFrequency);
   await clickElement(dropdownButton, "Subscribe & Save delivery schedule dropdown");
-  const frequencyOption = await waitUntil(findLastSubscribeFrequencyOption, 5000);
+  const frequencyOption = await waitUntil(findSixMonthBusinessFrequencyOption, 5000);
   if (!frequencyOption) return selectNativeSubscribeFrequency(nativeFrequency);
   const selectedText = (frequencyOption.textContent || "").replace(/\s+/g, " ").trim();
   showPanel("Subscribe & Save", `Selecting delivery every ${selectedText}.`, null, null);
@@ -2742,15 +2746,41 @@ function findSixMonthSubscribeFrequencyPopoverOption() {
   return row.querySelector("[data-action='a-accordion'][role='button'], a, button") || row;
 }
 
+function findSixMonthBusinessFrequencyOption() {
+  const popovers = [...document.querySelectorAll(".a-popover-wrapper, .a-popover-inner")]
+    .filter((popover) => visible(popover) && /\b6\s*months?\b/i.test(popover.innerText || popover.textContent || ""));
+  const options = popovers
+    .flatMap((popover) => [...popover.querySelectorAll("a.a-dropdown-link, a[role='option']")])
+    .filter((link, index, all) => {
+      const text = normalizedText(link.textContent || "");
+      const value = String(link.getAttribute("data-value") || "");
+      return all.indexOf(link) === index
+        && visible(link)
+        && (/^6\s*months?$/.test(text) || /^6M\|(?:sns|onml)$/i.test(value));
+    });
+  return options[0] || null;
+}
+
 function subscribeFrequencyIsSixMonths() {
-  const visibleTrigger = [
+  const consumerTrigger = [
     document.querySelector("#replenishment-onml-frequency-trigger"),
     document.querySelector("#replenishment-sns-frequency-trigger"),
-    document.querySelector("#rcxOrdFreqSns-announce"),
-    document.querySelector("#rcxOrdFreqSns"),
   ].find(visible);
-  const triggerText = normalizedText(visibleTrigger?.innerText || visibleTrigger?.textContent || "");
-  if (/\b6\s*months?\b/.test(triggerText)) return true;
+  const consumerText = normalizedText(consumerTrigger?.innerText || consumerTrigger?.textContent || "");
+  if (/\b6\s*months?\b/.test(consumerText)) return true;
+
+  const businessPrompt = [
+    document.querySelector("#rcxOrdFreqSns-announce"),
+    document.querySelector("#rcxOrdFreqOnml-announce"),
+  ].find(visible);
+  const businessPromptText = normalizedText(businessPrompt?.innerText || businessPrompt?.textContent || "");
+  if (/\b6\s*months?\b/.test(businessPromptText)) return true;
+
+  const businessSelects = [...document.querySelectorAll("select#rcxOrdFreqSns, select#rcxOrdFreqOnml")];
+  if (businessSelects.some((select) => {
+    const selectedText = normalizedText(select.options?.[select.selectedIndex]?.textContent || "");
+    return /^6M\|(?:sns|onml)$/i.test(String(select.value || "")) && /^6\s*months?$/.test(selectedText);
+  })) return true;
 
   const valueInput = document.querySelector("input[id*='recurringDelivery'][id*='frequency'][id$='[value]']");
   const unitInput = document.querySelector("input[id*='recurringDelivery'][id*='frequency'][id$='[unit]']");
@@ -2765,7 +2795,10 @@ function subscribeFrequencyIsSixMonths() {
 async function selectNativeSubscribeFrequency(select) {
   if (!select?.options?.length) return false;
   const options = [...select.options].filter((option) => /sns/i.test(String(option.value || "")) || /\b(weeks?|months?)\b/i.test(option.textContent || ""));
-  const target = options.at(-1);
+  const target = options.find((option) => (
+    /^6M\|(?:sns|onml)$/i.test(String(option.value || ""))
+    || /^6\s*months?$/.test(normalizedText(option.textContent || ""))
+  ));
   if (!target) return false;
   const selectedText = (target.textContent || "").replace(/\s+/g, " ").trim();
   showPanel("Subscribe & Save", `Selecting delivery every ${selectedText}.`, null, null);
