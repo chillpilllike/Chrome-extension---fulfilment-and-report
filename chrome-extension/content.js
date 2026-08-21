@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-controls-fallback-v79";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-post-protection-place-order-v80";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -7118,6 +7118,19 @@ async function handleCheckout(activeJob) {
     )) return;
     showPanel("Final step", "Clicking Place your order now.", null, null);
     if (!await protectBeforeAmazonSubmit(activeJob, "checkout")) return;
+    // The durable pre-submit API call can take long enough for Amazon to
+    // replace its final action block. Never click the pre-protection node: a
+    // detached input accepts `.click()` without submitting anything, leaving
+    // the protected job stuck in order history with no Amazon order.
+    placeOrder = await waitUntil(findPlaceOrderButton, 10000, 250) || findPlaceOrderButton();
+    if (!placeOrder || placeOrder.disabled || !placeOrder.isConnected || !isNativePlaceOrderControl(placeOrder)) {
+      await pauseForManualCheckout(
+        activeJob,
+        "Amazon replaced the Place your order control while the submission guard was being saved. The protected order remains held and was not clicked.",
+        "complete_pending",
+      );
+      return;
+    }
     activeJob.placeOrderClickStartedAt = Date.now();
     activeJob.placeOrderControl = {
       tag: String(placeOrder.tagName || "").toLowerCase(),

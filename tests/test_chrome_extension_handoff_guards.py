@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.100")
+        self.assertEqual(MANIFEST["version"], "0.1.101")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -609,6 +609,20 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertLess(final_delivery, fresh_control)
         self.assertLess(fresh_control, protection)
         self.assertIn("!placeOrder.isConnected", checkout)
+
+    def test_place_order_control_is_requeried_after_submit_protection(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        protection = checkout.index('protectBeforeAmazonSubmit(activeJob, "checkout")')
+        fresh_after_protection = checkout.index(
+            "placeOrder = await waitUntil(findPlaceOrderButton, 10000, 250) || findPlaceOrderButton();",
+            protection,
+        )
+        click = checkout.index('clickElement(placeOrder, "Place your order button")', fresh_after_protection)
+        self.assertLess(protection, fresh_after_protection)
+        self.assertLess(fresh_after_protection, click)
+        self.assertIn("!placeOrder.isConnected", checkout[fresh_after_protection:click])
 
     def test_cancelled_amazon_history_cannot_reconcile_a_fresh_job(self) -> None:
         matcher_start = APP.index("def exact_amazon_history_match_for_chrome_job")
