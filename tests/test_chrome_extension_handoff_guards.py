@@ -46,7 +46,32 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.93")
+        self.assertEqual(MANIFEST["version"], "0.1.94")
+
+    def test_checkout_enforces_warehouse_delivery_hours_before_delivery_selection(self) -> None:
+        self.assertIn('"MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"', CONTENT)
+        self.assertIn('const WAREHOUSE_DELIVERY_WEEKENDS = ["SATURDAY", "SUNDAY"]', CONTENT)
+        self.assertIn('const WAREHOUSE_DELIVERY_START = "10:00"', CONTENT)
+        self.assertIn('const WAREHOUSE_DELIVERY_END = "17:00"', CONTENT)
+        preferences_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences(activeJob)")
+        preferences_end = CONTENT.index("async function ensurePreferredAmazonDayWeekdayDelivery", preferences_start)
+        preferences = CONTENT[preferences_start:preferences_end]
+        self.assertIn('"#edit-delivery-preferences-link, a"', preferences)
+        self.assertIn('querySelector("#deliveryTimesEditLink")', preferences)
+        self.assertIn('querySelector("#businessHoursExpandLink")', preferences)
+        self.assertIn("setWarehouseDeliveryClosed(closed, true)", preferences)
+        self.assertIn("warehouseDeliveryControlsMatch(dialog)", preferences)
+        self.assertIn("adpSubmitButton_", preferences)
+        self.assertIn("deliveryPreferencesSummaryIsWarehouseSchedule(dialog)", preferences)
+
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        preferences_guard = checkout.index("ensureWarehouseDeliveryPreferences(activeJob)")
+        delivery_selection = checkout.index("ensureRewardedLaterDelivery(activeJob)")
+        submit_protection = checkout.index('protectBeforeAmazonSubmit(activeJob, "checkout")')
+        self.assertLess(preferences_guard, delivery_selection)
+        self.assertLess(preferences_guard, submit_protection)
 
     def test_force_stop_is_silent_and_stops_all_page_work(self) -> None:
         stop_start = CONTENT.index("function stopContentAutomation(")

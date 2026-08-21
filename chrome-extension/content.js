@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-silent-force-stop-v72";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-checkout-delivery-hours-v73";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5412,6 +5412,185 @@ function preferredAmazonDayWeekdaySelected() {
   );
 }
 
+const WAREHOUSE_DELIVERY_WEEKDAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"];
+const WAREHOUSE_DELIVERY_WEEKENDS = ["SATURDAY", "SUNDAY"];
+const WAREHOUSE_DELIVERY_START = "10:00";
+const WAREHOUSE_DELIVERY_END = "17:00";
+
+function visibleDeliveryPreferencesDialog() {
+  return [...document.querySelectorAll("[role='dialog'][aria-hidden='false'], .a-popover-modal[role='dialog']")]
+    .find((dialog) => visible(dialog) && /your delivery preferences|edit delivery instructions/i.test(normalizedText(dialog.textContent || "")))
+    || null;
+}
+
+function deliveryPreferencesSummaryIsWarehouseSchedule(dialog = visibleDeliveryPreferencesDialog()) {
+  const edit = dialog?.querySelector("#deliveryTimesEditLink");
+  const section = edit?.closest(".a-expander-inner, .a-expander-content") || edit?.parentElement;
+  const text = normalizedText(section?.innerText || section?.textContent || "").toLowerCase();
+  return /monday\s*-\s*friday/.test(text)
+    && /10:00\s*am\s*-\s*0?5:00\s*pm/.test(text)
+    && /saturday\s*-\s*sunday/.test(text)
+    && /closed for deliveries/.test(text);
+}
+
+function warehouseDeliveryDayControl(dialog, day, kind) {
+  return dialog?.querySelector(`[id^='${day}${kind}_']`) || null;
+}
+
+function warehouseDeliveryControlsMatch(dialog) {
+  return WAREHOUSE_DELIVERY_WEEKDAYS.every((day) => (
+    warehouseDeliveryDayControl(dialog, day, "StartTime")?.value === WAREHOUSE_DELIVERY_START
+    && warehouseDeliveryDayControl(dialog, day, "EndTime")?.value === WAREHOUSE_DELIVERY_END
+    && warehouseDeliveryDayControl(dialog, day, "ClosedCheckbox")?.checked === false
+  )) && WAREHOUSE_DELIVERY_WEEKENDS.every((day) => (
+    warehouseDeliveryDayControl(dialog, day, "ClosedCheckbox")?.checked === true
+  ));
+}
+
+function setWarehouseDeliverySelect(select, value) {
+  if (!select || ![...select.options || []].some((option) => option.value === value)) return false;
+  if (select.value === value) return true;
+  select.value = value;
+  select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  return select.value === value;
+}
+
+function setWarehouseDeliveryClosed(checkbox, closed) {
+  if (!checkbox) return false;
+  if (checkbox.checked !== closed) checkbox.click();
+  return checkbox.checked === closed;
+}
+
+async function closeDeliveryPreferencesDialog(dialog = visibleDeliveryPreferencesDialog()) {
+  const close = dialog?.querySelector("button[data-action='a-popover-close'], button.a-button-close");
+  if (close) await clickElement(close, "Close delivery preferences", { preClickDelayMs: 0, delayMs: 200 });
+}
+
+async function pauseForDeliveryPreferences(activeJob, message, dialog = visibleDeliveryPreferencesDialog()) {
+  await closeDeliveryPreferencesDialog(dialog);
+  await pauseForManualCheckout(activeJob, message, "checkout");
+  return false;
+}
+
+async function ensureWarehouseDeliveryPreferences(activeJob) {
+  const editPreferences = await waitUntil(
+    () => [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
+      .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "edit delivery preferences"),
+    6000,
+    250,
+  );
+  if (!editPreferences) {
+    return pauseForDeliveryPreferences(
+      activeJob,
+      "Amazon checkout did not expose Edit delivery preferences. Fulfilment is paused so warehouse delivery hours cannot be skipped.",
+    );
+  }
+
+  showPanel("Delivery preferences", "Verifying Monday-Friday 10:00 AM-5:00 PM and closing Saturday-Sunday.", null, null);
+  await clickElement(editPreferences, "Edit delivery preferences", { delayMs: 300 });
+  let dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
+  const editDeliveryTimes = await waitUntil(
+    () => visibleDeliveryPreferencesDialog()?.querySelector("#deliveryTimesEditLink") || null,
+    10000,
+    200,
+  );
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!dialog || !editDeliveryTimes) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon opened delivery preferences but did not expose the Delivery Times edit control.", dialog);
+  }
+  if (deliveryPreferencesSummaryIsWarehouseSchedule(dialog)) {
+    await closeDeliveryPreferencesDialog(dialog);
+    await sendDiagnostic("Verified checkout delivery preferences.", {
+      group_key: activeJob?.job?.group_key || "",
+      weekdays: "Monday-Friday 10:00-17:00",
+      weekends: "closed",
+      changed: false,
+    });
+    return true;
+  }
+
+  await clickElement(editDeliveryTimes, "Edit delivery times", { delayMs: 250 });
+  dialog = await waitUntil(visibleDeliveryPreferencesDialog, 5000, 150);
+  const expandDays = await waitUntil(
+    () => visibleDeliveryPreferencesDialog()?.querySelector("#businessHoursExpandLink") || null,
+    5000,
+    150,
+  );
+  if (expandDays && visible(expandDays)) {
+    await clickElement(expandDays, "Expand delivery days", { preClickDelayMs: 0, delayMs: 250 });
+  }
+  dialog = visibleDeliveryPreferencesDialog();
+  const mondayStart = await waitUntil(
+    () => warehouseDeliveryDayControl(visibleDeliveryPreferencesDialog(), "MONDAY", "StartTime"),
+    5000,
+    150,
+  );
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!dialog || !mondayStart) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not expose the expanded Monday-Sunday delivery-hour controls.", dialog);
+  }
+
+  let changed = false;
+  let controlsReady = true;
+  for (const day of WAREHOUSE_DELIVERY_WEEKDAYS) {
+    const start = warehouseDeliveryDayControl(dialog, day, "StartTime");
+    const end = warehouseDeliveryDayControl(dialog, day, "EndTime");
+    const closed = warehouseDeliveryDayControl(dialog, day, "ClosedCheckbox");
+    changed = changed || start?.value !== WAREHOUSE_DELIVERY_START || end?.value !== WAREHOUSE_DELIVERY_END || closed?.checked !== false;
+    const openAccepted = setWarehouseDeliveryClosed(closed, false);
+    const startAccepted = setWarehouseDeliverySelect(start, WAREHOUSE_DELIVERY_START);
+    const endAccepted = setWarehouseDeliverySelect(end, WAREHOUSE_DELIVERY_END);
+    controlsReady = openAccepted && startAccepted && endAccepted && controlsReady;
+  }
+  for (const day of WAREHOUSE_DELIVERY_WEEKENDS) {
+    const closed = warehouseDeliveryDayControl(dialog, day, "ClosedCheckbox");
+    changed = changed || closed?.checked !== true;
+    const closedAccepted = setWarehouseDeliveryClosed(closed, true);
+    controlsReady = closedAccepted && controlsReady;
+  }
+  await sleep(250);
+  if (!controlsReady || !warehouseDeliveryControlsMatch(dialog)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not accept the required weekday hours and weekend closures.", dialog);
+  }
+
+  const save = dialog.querySelector("span[id^='adpSubmitButton_'] input[type='submit'], input[type='submit'][aria-labelledby^='adpSubmitButton_']");
+  if (!save || !visible(save)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon delivery preferences did not expose a usable Save button.", dialog);
+  }
+  await clickElement(save, "Save delivery preferences", { preClickDelayMs: 100, delayMs: 800 });
+  const closed = await waitUntil(() => !visibleDeliveryPreferencesDialog(), 10000, 200);
+  if (!closed) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not confirm saving the delivery preferences.", visibleDeliveryPreferencesDialog());
+  }
+
+  const refreshedLink = await waitUntil(
+    () => [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
+      .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "edit delivery preferences"),
+    10000,
+    250,
+  );
+  if (!refreshedLink) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon saved delivery preferences but the checkout did not return for verification.");
+  }
+  await clickElement(refreshedLink, "Recheck delivery preferences", { delayMs: 300 });
+  dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
+  await waitUntil(() => visibleDeliveryPreferencesDialog()?.querySelector("#deliveryTimesEditLink") || null, 10000, 200);
+  dialog = visibleDeliveryPreferencesDialog();
+  const verified = deliveryPreferencesSummaryIsWarehouseSchedule(dialog);
+  await closeDeliveryPreferencesDialog(dialog);
+  if (!verified) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain Monday-Friday 10:00 AM-5:00 PM with Saturday-Sunday closed.");
+  }
+  await sendDiagnostic("Saved and verified checkout delivery preferences.", {
+    group_key: activeJob?.job?.group_key || "",
+    weekdays: "Monday-Friday 10:00-17:00",
+    weekends: "closed",
+    changed,
+  });
+  return true;
+}
+
 async function ensurePreferredAmazonDayWeekdayDelivery(activeJob) {
   const option = preferredAmazonDayWeekdayOption();
   if (!option?.control || preferredAmazonDayWeekdaySelected()) return true;
@@ -6736,6 +6915,7 @@ async function handleCheckout(activeJob) {
     return;
   }
   if (!await ensurePreferredCheckoutPayment(activeJob)) return;
+  if (!await ensureWarehouseDeliveryPreferences(activeJob)) return;
   if (!await ensureCheckoutOnlyExpectedUnits(activeJob)) return;
   if (!await ensureSubscribeCheckoutQuantity(activeJob)) return;
   if (!await ensureRewardedLaterDelivery(activeJob)) return;
