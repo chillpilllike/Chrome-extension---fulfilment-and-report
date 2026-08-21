@@ -46,7 +46,21 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.87")
+        self.assertEqual(MANIFEST["version"], "0.1.88")
+
+    def test_payment_selection_uses_exact_card_and_native_continue_control(self) -> None:
+        self.assertIn("function paymentRadioForDigits(digits)", CONTENT)
+        self.assertIn("document.querySelector(`label[for='${CSS.escape(radio.id)}']`)", CONTENT)
+        self.assertIn("function nativePaymentContinueControl(element)", CONTENT)
+        self.assertIn("candidates.map(nativePaymentContinueControl)", CONTENT)
+        self.assertIn("const continueButton = nativePaymentContinueControl(payment?.continueButton);", CONTENT)
+        self.assertNotIn("radio.checked = true", CONTENT)
+
+    def test_payment_selection_must_remain_checked_after_amazon_rerender(self) -> None:
+        self.assertIn("const clicked = await clickPaymentRadio(payment.radio);", CONTENT)
+        self.assertIn("const stableSelection = clicked && await waitUntil", CONTENT)
+        self.assertIn("const current = paymentRadioForDigits(selectedDigits);", CONTENT)
+        self.assertIn("Amazon changed the payment form before the selected card could be confirmed.", CONTENT)
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")

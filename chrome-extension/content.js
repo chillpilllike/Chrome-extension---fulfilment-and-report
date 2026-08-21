@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-consumer-six-month-frequency-v66";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-consumer-card-selection-v67";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -4913,64 +4913,58 @@ function paymentRadioIsSelected(radio) {
   return /\bselected\b/i.test(text) && /\bending\s+in\s+\d{4}\b/i.test(text);
 }
 
+function paymentRadioForDigits(digits) {
+  if (!digits) return null;
+  return [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
+    .find((radio) => !radio.disabled && cardDigitsForPaymentRadio(radio) === digits) || null;
+}
+
 async function clickPaymentRadio(radio) {
   const row = paymentRowForRadio(radio);
-  const rowText = normalizedText(row?.innerText || row?.textContent || "");
   const preferredDigits = cardDigitsForPaymentRadio(radio);
+  const exactLabel = radio.id
+    ? document.querySelector(`label[for='${CSS.escape(radio.id)}']`)
+    : null;
   const textTargets = preferredDigits
-    ? [...row?.querySelectorAll?.("span, div, label, input, button, a") || []].filter((element) => {
+    ? [...row?.querySelectorAll?.("label, [role='radio'], .pmts-instrument-box, .a-radio") || []].filter((element) => {
       const text = normalizedText(element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
       return text.includes(preferredDigits) || text.match(new RegExp(`ending\\s+in\\s+${preferredDigits}`, "i"));
     })
     : [];
   const targets = [
-    radio.closest?.("label"),
-    row?.querySelector?.("label"),
-    ...textTargets,
-    row?.querySelector?.(".pmts-instrument-box, .a-box-inner, .a-radio, [role='radio']"),
-    row,
+    exactLabel,
     radio,
+    radio.closest?.("label"),
+    ...textTargets,
   ].filter(Boolean);
 
   for (const target of targets) {
-    const targetText = normalizedText(target.innerText || target.textContent || target.getAttribute?.("aria-label") || "");
-    if (preferredDigits && target !== radio && targetText && !targetText.includes(preferredDigits) && !rowText.includes(preferredDigits)) {
-      continue;
-    }
     try {
       await clickElement(target, "Payment method row", { preClickDelayMs: 80, delayMs: 120 });
-      await sleep(100);
-      if (paymentRadioIsSelected(radio)) return true;
+      const selected = await waitUntil(() => {
+        const current = paymentRadioForDigits(preferredDigits) || radio;
+        return paymentRadioIsSelected(current) ? current : false;
+      }, 900, 100);
+      if (selected) return true;
     } catch (err) {
       // Try the next candidate; Amazon often hides the real radio and binds the row instead.
     }
   }
-
-  try {
-    radio.checked = true;
-    radio.dispatchEvent(new Event("input", { bubbles: true }));
-    radio.dispatchEvent(new Event("change", { bubbles: true }));
-    radio.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-    await sleep(350);
-  } catch (err) {
-    // Ignore and let the caller decide whether manual checkout is needed.
-  }
-  return paymentRadioIsSelected(radio);
+  const current = paymentRadioForDigits(preferredDigits) || radio;
+  return paymentRadioIsSelected(current);
 }
 
-function findPaymentSelection(preferences = []) {
-  const radio = findPaymentRadioForPreferences(preferences);
-  if (!radio) return null;
+function nativePaymentContinueControl(element) {
+  if (!element) return null;
+  if (element.matches?.("button, input[type='submit'], input[type='button']")) return element;
+  return element.querySelector?.(
+    "button, input[type='submit'], input[type='button'], input[data-csa-c-slot-id*='continue-payselect']",
+  ) || null;
+}
 
-  const paymentRoot = paymentRowForRadio(radio)?.closest?.(
-    "form, [data-testid*='pay'], [data-csa-c-slot-id*='payselect'], [data-pmts-component-id], .pmts-portal-component, body",
-  ) || document;
-  const visiblePaymentContinueButtons = () => [...document.querySelectorAll(
+function visiblePaymentContinueButtons() {
+  const candidates = [...document.querySelectorAll(
     [
-      "span.a-button",
-      "button",
-      "input[type='submit']",
-      "input[type='button']",
       "input[data-csa-c-slot-id*='continue-payselect']",
       "button[data-csa-c-slot-id*='continue-payselect']",
       "input[data-testid='bottom-continue-button'][data-csa-c-slot-id*='payselect']",
@@ -4980,8 +4974,13 @@ function findPaymentSelection(preferences = []) {
       "input[name='ppw-widgetEvent:SetPaymentPlanSelectContinueEvent']",
       "input[name='ppw-widgetEvent:SetPaymentPlanContinueEvent']",
       "input[aria-labelledby*='continue']",
+      "span.a-button",
+      "button",
+      "input[type='submit']",
+      "input[type='button']",
     ].join(", "),
-  )]
+  )];
+  return [...new Set(candidates.map(nativePaymentContinueControl).filter(Boolean))]
     .filter((element) => {
       if (!visible(element) || element.disabled) return false;
       const text = normalizedText(element.value || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
@@ -4995,55 +4994,21 @@ function findPaymentSelection(preferences = []) {
         name.includes("setpaymentplanselectcontinueevent") ||
         name.includes("setpaymentplancontinueevent");
     });
+}
 
+function findPaymentSelection(preferences = []) {
+  const radio = findPaymentRadioForPreferences(preferences);
+  if (!radio) return null;
   const textContinue = visiblePaymentContinueButtons().find((element) => {
     const text = normalizedText(element.value || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
     return text.includes("use this payment method") || text.includes("use this card") || text.includes("continue");
   });
   if (textContinue) return { radio, continueButton: textContinue };
-
-  const exactContinue = [...document.querySelectorAll(
-    [
-      "input[data-csa-c-slot-id*='continue-payselect']",
-      "button[data-csa-c-slot-id*='continue-payselect']",
-      "input[data-testid='bottom-continue-button'][data-csa-c-slot-id*='payselect']",
-      "input[data-testid='secondary-continue-button'][data-csa-c-slot-id*='payselect']",
-      "button[data-testid='bottom-continue-button'][data-csa-c-slot-id*='payselect']",
-      "button[data-testid='secondary-continue-button'][data-csa-c-slot-id*='payselect']",
-      "input[name='ppw-widgetEvent:SetPaymentPlanSelectContinueEvent']",
-      "input[name='ppw-widgetEvent:SetPaymentPlanContinueEvent']",
-      "input[aria-labelledby*='continue']",
-    ].join(", "),
-  )]
-    .find((element) => visible(element) && !element.disabled);
-  if (exactContinue) return { radio, continueButton: exactContinue };
-
-  const continueButton = [...paymentRoot.querySelectorAll("span.a-button, button, input[type='submit'], input[type='button']")].find((element) => {
-    const text = normalizedText(element.value || element.innerText || element.textContent);
-    return visible(element) && !element.disabled && (
-      text.includes("use this payment method") ||
-      text.includes("use this card") ||
-      text === "continue" ||
-      text.includes("continue")
-    );
-  });
-  return radio && continueButton ? { radio, continueButton } : null;
+  return null;
 }
 
 function alternatePaymentContinueButtons(primary = null) {
-  return [...document.querySelectorAll(
-    "span.a-button, button, input[type='submit'], input[type='button'], input[data-csa-c-slot-id*='continue-payselect']",
-  )]
-    .filter((element) => {
-      if (!visible(element) || element.disabled || element === primary) return false;
-      const text = normalizedText(element.value || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
-      const slot = normalizedText(element.getAttribute?.("data-csa-c-slot-id") || "");
-      return text.includes("use this payment method") ||
-        text.includes("use this card") ||
-        text === "continue" ||
-        text.includes("continue") ||
-        slot.includes("continue-payselect");
-    });
+  return visiblePaymentContinueButtons().filter((element) => element !== primary);
 }
 
 function findChangePaymentButton() {
@@ -5854,23 +5819,37 @@ async function handlePaymentSelection(activeJob) {
     }).catch(() => {});
     showPanel("Nutricity checkout", selectedDigits ? `Selecting card ending in ${selectedDigits}.` : "Selecting Amazon payment method.", null, null);
     if (!paymentRadioIsSelected(payment.radio)) {
-      await clickPaymentRadio(payment.radio);
-      await waitUntil(() => paymentRadioIsSelected(payment.radio), 1500, 150);
+      const clicked = await clickPaymentRadio(payment.radio);
+      const stableSelection = clicked && await waitUntil(() => {
+        const current = paymentRadioForDigits(selectedDigits);
+        return current && paymentRadioIsSelected(current) ? current : false;
+      }, 2200, 150);
+      if (!stableSelection) {
+        await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${selectedDigits || cardPreferences.join(" or ")}.`);
+        return true;
+      }
     }
     if (cardPreferences.length && selectedDigits && !cardPreferences.includes(selectedDigits)) {
       await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
-    if (cardPreferences.length && !paymentRadioIsSelected(payment.radio)) {
+    const currentPreferredRadio = paymentRadioForDigits(selectedDigits);
+    if (cardPreferences.length && (!currentPreferredRadio || !paymentRadioIsSelected(currentPreferredRadio))) {
       await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
-    await clickElement(payment.continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
+    payment = findPaymentSelection(cardPreferences);
+    const continueButton = nativePaymentContinueControl(payment?.continueButton);
+    if (!payment || !continueButton) {
+      await pauseForManualCheckout(activeJob, "Amazon changed the payment form before the selected card could be confirmed.");
+      return true;
+    }
+    await clickElement(continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
     let progress = await waitForCheckoutPaymentProgress(cardPreferences, 4500, { stopOnTransition: true });
     let advanced = Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
     if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
-      const alternate = alternatePaymentContinueButtons(payment.continueButton)[0];
+      const alternate = alternatePaymentContinueButtons(continueButton)[0];
       if (alternate) {
         showPanel("Nutricity checkout", "Retrying Amazon payment continue button.", null, null);
         await clickElement(alternate, "alternate Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
