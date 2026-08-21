@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.99")
+        self.assertEqual(MANIFEST["version"], "0.1.100")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -99,7 +99,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("adpSubmitButton_", preferences)
         self.assertIn("const existingSummaryVerified = await waitUntil(", preferences)
         self.assertIn("deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog())", preferences)
-        self.assertIn("const verified = Boolean(await waitUntil(", preferences)
+        self.assertIn("let verified = Boolean(await waitUntil(", preferences)
+        self.assertIn("verifyWarehouseDeliveryControlsFromSummary", preferences)
+
+    def test_delivery_preferences_fall_back_to_all_seven_saved_controls(self) -> None:
+        helper_start = CONTENT.index("async function verifyWarehouseDeliveryControlsFromSummary")
+        helper_end = CONTENT.index("function setWarehouseDeliverySelect", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        self.assertIn('querySelector("#deliveryTimesEditLink")', helper)
+        self.assertIn('querySelector("#businessHoursExpandLink")', helper)
+        self.assertIn('warehouseDeliveryDayControl(visibleDeliveryPreferencesDialog(), "MONDAY", "StartTime")', helper)
+        self.assertIn("warehouseDeliveryControlsMatch(currentDialog)", helper)
 
         checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
         checkout_end = CONTENT.index("function extractOrderId()", checkout_start)

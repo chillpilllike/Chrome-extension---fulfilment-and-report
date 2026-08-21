@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-summary-settle-v78";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-controls-fallback-v79";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5472,8 +5472,10 @@ const WAREHOUSE_DELIVERY_START = "10:00";
 const WAREHOUSE_DELIVERY_END = "17:00";
 
 function visibleDeliveryPreferencesDialog() {
-  return [...document.querySelectorAll("[role='dialog'][aria-hidden='false'], .a-popover-modal[role='dialog']")]
-    .find((dialog) => visible(dialog) && /your delivery preferences|edit delivery instructions/i.test(normalizedText(dialog.textContent || "")))
+  const dialogs = [...document.querySelectorAll("[role='dialog'][aria-hidden='false'], .a-popover-modal[role='dialog']")]
+    .filter((dialog) => visible(dialog) && /your delivery preferences|edit delivery instructions/i.test(normalizedText(dialog.textContent || "")));
+  return [...dialogs].reverse().find((dialog) => dialog.querySelector("#deliveryTimesEditLink, [id^='MONDAYStartTime_']"))
+    || dialogs.at(-1)
     || null;
 }
 
@@ -5499,6 +5501,28 @@ function warehouseDeliveryControlsMatch(dialog) {
   )) && WAREHOUSE_DELIVERY_WEEKENDS.every((day) => (
     warehouseDeliveryDayControl(dialog, day, "ClosedCheckbox")?.checked === true
   ));
+}
+
+async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDeliveryPreferencesDialog()) {
+  const editDeliveryTimes = dialog?.querySelector("#deliveryTimesEditLink");
+  if (!editDeliveryTimes) return false;
+  await clickElement(editDeliveryTimes, "Verify saved delivery times", { delayMs: 250 });
+  let currentDialog = await waitUntil(visibleDeliveryPreferencesDialog, 5000, 150);
+  const expandDays = await waitUntil(
+    () => visibleDeliveryPreferencesDialog()?.querySelector("#businessHoursExpandLink") || null,
+    5000,
+    150,
+  );
+  if (expandDays && visible(expandDays)) {
+    await clickElement(expandDays, "Expand saved delivery days", { preClickDelayMs: 0, delayMs: 250 });
+  }
+  await waitUntil(
+    () => warehouseDeliveryDayControl(visibleDeliveryPreferencesDialog(), "MONDAY", "StartTime"),
+    5000,
+    150,
+  );
+  currentDialog = visibleDeliveryPreferencesDialog();
+  return Boolean(currentDialog && warehouseDeliveryControlsMatch(currentDialog));
 }
 
 function setWarehouseDeliverySelect(select, value) {
@@ -5639,11 +5663,15 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
   // Amazon inserts the Edit link before it hydrates the compact Monday-Friday
   // summary. Give that summary time to settle instead of treating the
   // temporarily empty section as a failed save.
-  const verified = Boolean(await waitUntil(
+  let verified = Boolean(await waitUntil(
     () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
     6000,
     200,
   ));
+  if (!verified) {
+    verified = await verifyWarehouseDeliveryControlsFromSummary(visibleDeliveryPreferencesDialog());
+  }
+  dialog = visibleDeliveryPreferencesDialog();
   await closeDeliveryPreferencesDialog(dialog);
   if (!verified) {
     return pauseForDeliveryPreferences(activeJob, "Amazon did not retain Monday-Friday 10:00 AM-5:00 PM with Saturday-Sunday closed.");
