@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-native-sns-payment-checkbox-v77";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-summary-settle-v78";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5553,7 +5553,12 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
   if (!dialog || !editDeliveryTimes) {
     return pauseForDeliveryPreferences(activeJob, "Amazon opened delivery preferences but did not expose the Delivery Times edit control.", dialog);
   }
-  if (deliveryPreferencesSummaryIsWarehouseSchedule(dialog)) {
+  const existingSummaryVerified = await waitUntil(
+    () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
+    3000,
+    150,
+  );
+  if (existingSummaryVerified) {
     await closeDeliveryPreferencesDialog(dialog);
     await sendDiagnostic("Verified checkout delivery preferences.", {
       group_key: activeJob?.job?.group_key || "",
@@ -5631,7 +5636,14 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
   dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
   await waitUntil(() => visibleDeliveryPreferencesDialog()?.querySelector("#deliveryTimesEditLink") || null, 10000, 200);
   dialog = visibleDeliveryPreferencesDialog();
-  const verified = deliveryPreferencesSummaryIsWarehouseSchedule(dialog);
+  // Amazon inserts the Edit link before it hydrates the compact Monday-Friday
+  // summary. Give that summary time to settle instead of treating the
+  // temporarily empty section as a failed save.
+  const verified = Boolean(await waitUntil(
+    () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
+    6000,
+    200,
+  ));
   await closeDeliveryPreferencesDialog(dialog);
   if (!verified) {
     return pauseForDeliveryPreferences(activeJob, "Amazon did not retain Monday-Friday 10:00 AM-5:00 PM with Saturday-Sunday closed.");

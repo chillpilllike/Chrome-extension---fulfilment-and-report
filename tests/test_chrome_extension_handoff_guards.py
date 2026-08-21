@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.98")
+        self.assertEqual(MANIFEST["version"], "0.1.99")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -97,7 +97,9 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("setWarehouseDeliveryClosed(closed, true)", preferences)
         self.assertIn("warehouseDeliveryControlsMatch(dialog)", preferences)
         self.assertIn("adpSubmitButton_", preferences)
-        self.assertIn("deliveryPreferencesSummaryIsWarehouseSchedule(dialog)", preferences)
+        self.assertIn("const existingSummaryVerified = await waitUntil(", preferences)
+        self.assertIn("deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog())", preferences)
+        self.assertIn("const verified = Boolean(await waitUntil(", preferences)
 
         checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
         checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
