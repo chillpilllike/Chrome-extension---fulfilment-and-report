@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-consumer-card-selection-v67";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-payment-readiness-v68";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5804,7 +5804,8 @@ async function handlePaymentSelection(activeJob) {
     let payment = findPaymentSelection(cardPreferences);
     if (!payment) {
       if (!findPaymentRadio()) return false;
-      payment = await waitUntil(() => findPaymentSelection(cardPreferences), 2500, 150);
+      showPanel("Nutricity checkout", "Waiting for Amazon to finish loading the payment controls.", null, null);
+      payment = await waitUntil(() => findPaymentSelection(cardPreferences), 12000, 200);
       if (!payment) {
         await pauseForManualCheckout(activeJob, "Amazon is asking for a payment method, but I could not find the payment Continue button.");
         return true;

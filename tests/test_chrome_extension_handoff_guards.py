@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.88")
+        self.assertEqual(MANIFEST["version"], "0.1.89")
 
     def test_payment_selection_uses_exact_card_and_native_continue_control(self) -> None:
         self.assertIn("function paymentRadioForDigits(digits)", CONTENT)
@@ -61,6 +61,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("const stableSelection = clicked && await waitUntil", CONTENT)
         self.assertIn("const current = paymentRadioForDigits(selectedDigits);", CONTENT)
         self.assertIn("Amazon changed the payment form before the selected card could be confirmed.", CONTENT)
+
+    def test_payment_controls_get_a_slow_render_readiness_window(self) -> None:
+        self.assertIn("Waiting for Amazon to finish loading the payment controls.", CONTENT)
+        self.assertIn("findPaymentSelection(cardPreferences), 12000, 200", CONTENT)
+
+    def test_resume_injects_current_build_and_wakes_worker(self) -> None:
+        toggle_start = BACKGROUND.index("async function togglePause(windowId)")
+        toggle_end = BACKGROUND.index("async function completeJob", toggle_start)
+        toggle = BACKGROUND[toggle_start:toggle_end]
+        self.assertIn("if (!nextPaused)", toggle)
+        self.assertIn("await injectActiveAmazonTabInWindow(windowId);", toggle)
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")

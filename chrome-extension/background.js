@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-21-consumer-card-selection-v67";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-21-payment-readiness-v68";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -2325,6 +2325,12 @@ async function togglePause(windowId) {
   activeJob.paused = nextPaused;
   activeJob.pauseRevision = Date.now();
   await setWindowJob(windowId, activeJob);
+  if (!nextPaused) {
+    // Resume must always wake the active Amazon tab through the current build.
+    // This also replaces a stale content script after an unpacked-extension
+    // reload and avoids waiting for a background-tab polling interval.
+    await injectActiveAmazonTabInWindow(windowId);
+  }
   await log(`${activeJob.paused ? "Paused" : "Resumed"} ${activeJob.job.group_key}.`, windowId);
   return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
