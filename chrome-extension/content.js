@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-payment-readiness-v68";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-textless-payment-control-v69";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -4999,11 +4999,12 @@ function visiblePaymentContinueButtons() {
 function findPaymentSelection(preferences = []) {
   const radio = findPaymentRadioForPreferences(preferences);
   if (!radio) return null;
-  const textContinue = visiblePaymentContinueButtons().find((element) => {
-    const text = normalizedText(element.value || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
-    return text.includes("use this payment method") || text.includes("use this card") || text.includes("continue");
-  });
-  if (textContinue) return { radio, continueButton: textContinue };
+  // Amazon's native pay-select submit input can be fully clickable while its
+  // value and text are both empty. visiblePaymentContinueButtons already
+  // validates its continue-payselect slot, so do not discard it here based on
+  // a second text-only test.
+  const continueButton = visiblePaymentContinueButtons()[0];
+  if (continueButton) return { radio, continueButton };
   return null;
 }
 

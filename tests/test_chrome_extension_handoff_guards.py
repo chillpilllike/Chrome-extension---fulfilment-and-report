@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.89")
+        self.assertEqual(MANIFEST["version"], "0.1.90")
 
     def test_payment_selection_uses_exact_card_and_native_continue_control(self) -> None:
         self.assertIn("function paymentRadioForDigits(digits)", CONTENT)
@@ -65,6 +65,14 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
     def test_payment_controls_get_a_slow_render_readiness_window(self) -> None:
         self.assertIn("Waiting for Amazon to finish loading the payment controls.", CONTENT)
         self.assertIn("findPaymentSelection(cardPreferences), 12000, 200", CONTENT)
+
+    def test_textless_native_payment_continue_is_not_discarded(self) -> None:
+        selection_start = CONTENT.index("function findPaymentSelection(preferences = [])")
+        selection_end = CONTENT.index("function alternatePaymentContinueButtons", selection_start)
+        selection = CONTENT[selection_start:selection_end]
+        self.assertIn("const continueButton = visiblePaymentContinueButtons()[0];", selection)
+        self.assertIn("return { radio, continueButton }", selection)
+        self.assertNotIn("textContinue", selection)
 
     def test_resume_injects_current_build_and_wakes_worker(self) -> None:
         toggle_start = BACKGROUND.index("async function togglePause(windowId)")
