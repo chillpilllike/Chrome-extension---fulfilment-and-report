@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.103")
+        self.assertEqual(MANIFEST["version"], "0.1.104")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -354,6 +354,13 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertLess(guard, api_call)
         self.assertIn('invalid_order_id: true', complete)
         self.assertIn('activeJob.stage = "find_order_id";', complete)
+
+    def test_content_completion_message_cannot_hang_forever(self) -> None:
+        report_start = CONTENT.index("async function reportAmazonOrders(activeJob, orders)")
+        report_end = CONTENT.index("async function autoResumeResolvedCheckoutPause", report_start)
+        report = CONTENT[report_start:report_end]
+        self.assertIn('result = await sendWithTimeout({\n        type: "COMPLETE_JOB"', report)
+        self.assertIn("}, 55000);", report)
 
     def test_submitted_history_timeout_holds_queue_instead_of_failing_job(self) -> None:
         history_start = CONTENT.index("async function handleOrderHistory(activeJob)")

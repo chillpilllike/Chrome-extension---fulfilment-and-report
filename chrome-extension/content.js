@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-unplaced-submit-reset-v82";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-report-message-timeout-v83";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -9340,7 +9340,7 @@ async function reportAmazonOrders(activeJob, orders) {
   let result = null;
   try {
     for (let attempt = 1; attempt <= 4; attempt += 1) {
-      result = await send({
+      result = await sendWithTimeout({
         type: "COMPLETE_JOB",
         groupKey: activeJob?.job?.group_key || "",
         workerId: activeJob?.workerId || "",
@@ -9352,7 +9352,7 @@ async function reportAmazonOrders(activeJob, orders) {
         amazonRecipient: uniqueOrders[0]?.recipient || "",
         amazonAsins: uniqueOrders[0]?.asins || [],
         page: diagnosticPageInfo(),
-      });
+      }, 55000);
       if (result?.ok) break;
       const message = normalizedText(result?.message || "");
       const transient = /internal server error|pool|timeout|failed to fetch|network|temporarily/.test(message);
