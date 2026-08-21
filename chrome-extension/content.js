@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-stable-mixed-sns-fallback-v87";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-preferences-hydration-v88";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5619,12 +5619,11 @@ async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDelive
   if (expandDays && visible(expandDays)) {
     await clickElement(expandDays, "Expand saved delivery days", { preClickDelayMs: 0, delayMs: 250 });
   }
-  await waitUntil(
-    () => warehouseDeliveryDayControl(visibleDeliveryPreferencesDialog(), "MONDAY", "StartTime"),
-    5000,
-    150,
-  );
-  currentDialog = visibleDeliveryPreferencesDialog();
+  const fullyHydratedDialog = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && warehouseDeliveryControlsMatch(candidate) ? candidate : null;
+  }, 10000, 200);
+  currentDialog = fullyHydratedDialog || visibleDeliveryPreferencesDialog();
   return Boolean(currentDialog && warehouseDeliveryControlsMatch(currentDialog));
 }
 
