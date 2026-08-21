@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-textless-payment-control-v69";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-payment-summary-readiness-v70";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5925,8 +5925,10 @@ async function ensurePreferredCheckoutPayment(activeJob) {
     showPanel("Nutricity checkout", `Selecting preferred checkout card ending in ${cardPreferences.join(" or ")}.`, null, null);
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    const progress = await waitForCheckoutPaymentProgress(cardPreferences, 1800);
-    const confirmedDigits = progress?.selectedDigits || checkoutSelectedCardDigits();
+    // Amazon can expose the final review button before its selected-payment
+    // summary hydrates. Wait for the preferred card evidence itself; the final
+    // button is not proof that Amazon retained the chosen card.
+    const confirmedDigits = await waitForPreferredCheckoutPayment(cardPreferences, 10000);
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
       return true;
@@ -5963,8 +5965,7 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   if (findPaymentRadio() || await waitUntil(findPaymentRadio, 1800, 150)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    const progress = await waitForCheckoutPaymentProgress(cardPreferences, 2200);
-    const confirmedDigits = progress?.selectedDigits || checkoutSelectedCardDigits();
+    const confirmedDigits = await waitForPreferredCheckoutPayment(cardPreferences, 10000);
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
       return true;
@@ -5992,8 +5993,7 @@ async function ensurePreferredCheckoutPayment(activeJob) {
   if (findPaymentRadio() || await waitUntil(findPaymentRadio, 2500, 150)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
-    const progress = await waitForCheckoutPaymentProgress(cardPreferences, 2200);
-    const confirmedDigits = progress?.selectedDigits || checkoutSelectedCardDigits();
+    const confirmedDigits = await waitForPreferredCheckoutPayment(cardPreferences, 10000);
     if (confirmedDigits && cardPreferences.includes(confirmedDigits)) {
       showPanel("Nutricity checkout", `Verified checkout card ending in ${confirmedDigits}.`, null, null);
       return true;

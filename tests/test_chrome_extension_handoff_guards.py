@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.90")
+        self.assertEqual(MANIFEST["version"], "0.1.91")
 
     def test_payment_selection_uses_exact_card_and_native_continue_control(self) -> None:
         self.assertIn("function paymentRadioForDigits(digits)", CONTENT)
@@ -73,6 +73,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("const continueButton = visiblePaymentContinueButtons()[0];", selection)
         self.assertIn("return { radio, continueButton }", selection)
         self.assertNotIn("textContinue", selection)
+
+    def test_final_review_waits_for_preferred_card_summary_evidence(self) -> None:
+        ensure_start = CONTENT.index("async function ensurePreferredCheckoutPayment(activeJob)")
+        ensure_end = CONTENT.index("async function openAddressEditorIfAvailable", ensure_start)
+        ensure = CONTENT[ensure_start:ensure_end]
+        self.assertGreaterEqual(
+            ensure.count("await waitForPreferredCheckoutPayment(cardPreferences, 10000)"),
+            3,
+        )
+        self.assertNotIn("waitForCheckoutPaymentProgress(cardPreferences, 1800)", ensure)
+        self.assertNotIn("waitForCheckoutPaymentProgress(cardPreferences, 2200)", ensure)
 
     def test_resume_injects_current_build_and_wakes_worker(self) -> None:
         toggle_start = BACKGROUND.index("async function togglePause(windowId)")
