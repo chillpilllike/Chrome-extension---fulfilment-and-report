@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-checkout-delivery-hours-v73";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-single-worker-tab-v74";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -448,7 +448,8 @@ async function isPaused() {
 }
 
 async function waitIfPaused() {
-  if (!fulfilmentForceStopped && await isPaused()) {
+  if (fulfilmentForceStopped) throw fulfilmentPausedError();
+  if (await isPaused()) {
     const activeJob = await getActiveJob();
     showPanel(
       "Nutricity fulfilment paused",
@@ -9625,6 +9626,26 @@ async function runSafely() {
   }
 }
 
+function startContentAutomationLoops() {
+  if (!runIntervalId) {
+    runIntervalId = setInterval(runSafely, 5000);
+  }
+  if (!panelIntervalId) {
+    panelIntervalId = setInterval(() => {
+      if (!fulfilmentForceStopped && window.__nutricityHadActiveJob) keepPanelAlive().catch(() => undefined);
+    }, 1000);
+  }
+  ensureOrderHistoryAnnotationLoop();
+}
+
+function activateContentAutomation() {
+  fulfilmentForceStopped = false;
+  lastNoActiveJobCheckAt = 0;
+  startContentAutomationLoops();
+  scheduleOrderHistoryAnnotation(250);
+  if (!window.__nutricityRunning) setTimeout(runSafely, 0);
+}
+
 if (document.hidden) {
   lastNoActiveJobCheckAt = Date.now();
 } else {
@@ -9632,13 +9653,9 @@ if (document.hidden) {
 }
 scheduleOrderHistoryAnnotation(250);
 registerContentCleanup(() => clearTimeout(orderHistoryAnnotationTimer));
-runIntervalId = setInterval(runSafely, 5000);
+startContentAutomationLoops();
 registerContentCleanup(() => clearInterval(runIntervalId));
-panelIntervalId = setInterval(() => {
-  if (!fulfilmentForceStopped && window.__nutricityHadActiveJob) keepPanelAlive().catch(() => undefined);
-}, 1000);
 registerContentCleanup(() => clearInterval(panelIntervalId));
-ensureOrderHistoryAnnotationLoop();
 
 const onPageShow = () => {
   lastNoActiveJobCheckAt = 0;
@@ -9695,9 +9712,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type === "RUN_ACTIVE_JOB") {
-    lastNoActiveJobCheckAt = 0;
-    if (!fulfilmentForceStopped) setTimeout(runSafely, 0);
+    activateContentAutomation();
     sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "NUTRICITY_DISABLE_NON_WORKER") {
+    stopContentAutomation("This Amazon tab is not the designated fulfilment worker.");
+    sendResponse({ ok: true, disabled: true });
     return true;
   }
   if (message.type !== "CHECK_ASIN_AVAILABILITY") return false;

@@ -46,7 +46,27 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.94")
+        self.assertEqual(MANIFEST["version"], "0.1.95")
+
+    def test_only_the_designated_amazon_tab_can_run_a_job(self) -> None:
+        self.assertIn("activeJob.targetTabId = targetTabId", BACKGROUND)
+        self.assertIn('type: "NUTRICITY_DISABLE_NON_WORKER"', BACKGROUND)
+        self.assertIn('message.type === "NUTRICITY_DISABLE_NON_WORKER"', CONTENT)
+        self.assertIn("ignored_non_worker_tab: true", BACKGROUND)
+        self.assertIn("inactiveWorkerTab: true", BACKGROUND)
+        updated_start = BACKGROUND.index("chrome.tabs.onUpdated.addListener")
+        updated_end = BACKGROUND.index("chrome.windows.onRemoved.addListener", updated_start)
+        updated = BACKGROUND[updated_start:updated_end]
+        self.assertIn("activeJob.targetTabId", updated)
+        self.assertIn("Number(activeJob.targetTabId) !== Number(tabId)", updated)
+
+    def test_force_stop_aborts_an_inflight_page_action(self) -> None:
+        wait_start = CONTENT.index("async function waitIfPaused()")
+        wait_end = CONTENT.index("async function waitForPageReady", wait_start)
+        self.assertIn("if (fulfilmentForceStopped) throw fulfilmentPausedError();", CONTENT[wait_start:wait_end])
+        self.assertIn("function activateContentAutomation()", CONTENT)
+        run_message = CONTENT.index('if (message.type === "RUN_ACTIVE_JOB")')
+        self.assertIn("activateContentAutomation();", CONTENT[run_message:run_message + 180])
 
     def test_checkout_enforces_warehouse_delivery_hours_before_delivery_selection(self) -> None:
         self.assertIn('"MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"', CONTENT)
