@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.104")
+        self.assertEqual(MANIFEST["version"], "0.1.105")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -389,6 +389,15 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("activeJob.cartCleared = false;", reset)
         self.assertIn("await navigateWindowToCart(windowId)", reset)
         self.assertIn("allowSubmittedReset: true", reset)
+        self.assertIn("activeJob.resetRevision = Date.now();", reset)
+
+    def test_stale_history_page_cannot_overwrite_a_reset_job(self) -> None:
+        setter_start = BACKGROUND.index("async function setWindowJob(windowId, activeJob")
+        setter_end = BACKGROUND.index("async function clearStoredJobGroup", setter_start)
+        setter = BACKGROUND[setter_start:setter_end]
+        self.assertIn("Number(current?.resetRevision || 0) > Number(activeJob?.resetRevision || 0)", setter)
+        self.assertIn("options.allowSubmittedReset !== true", setter)
+        self.assertIn("Ignored stale pre-reset update", setter)
 
     def test_background_uncertain_submit_never_releases_or_cleans_queue(self) -> None:
         uncertain_start = BACKGROUND.index("async function submitUncertain")

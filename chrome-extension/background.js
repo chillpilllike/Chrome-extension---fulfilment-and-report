@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-report-message-timeout-v83";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-reset-revision-guard-v84";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -129,6 +129,23 @@ async function setWindowJob(windowId, activeJob, options = {}) {
   const key = String(windowId || "");
   const current = windowId ? next[key] || null : state.activeJob || null;
   const sameGroup = current?.job?.group_key && activeJob?.job?.group_key === current.job.group_key;
+  if (
+    sameGroup
+    && Number(current?.resetRevision || 0) > Number(activeJob?.resetRevision || 0)
+    && options.allowSubmittedReset !== true
+  ) {
+    await diagnosticLog(`Ignored stale pre-reset update for ${activeJob.job.group_key}.`, {
+      windowId,
+      activeJob: current,
+      level: "warn",
+      details: {
+        current_reset_revision: Number(current.resetRevision || 0),
+        incoming_reset_revision: Number(activeJob.resetRevision || 0),
+        reason: options.reason || "",
+      },
+    });
+    return;
+  }
   if (sameGroup && activeJobHasReportedOrderId(current)) {
     const currentAttemptedAt = Number(current.reportAttemptedAt || 0);
     const incomingAttemptedAt = Number(activeJob.reportAttemptedAt || 0);
@@ -1894,6 +1911,7 @@ async function resetDuplicateFulfilment(windowId) {
   activeJob.itemIndex = 0;
   activeJob.cartCleared = false;
   activeJob.resetUnplacedSubmit = true;
+  activeJob.resetRevision = Date.now();
   for (const key of [
     "amazonSubmittedAt",
     "placeOrderClickStartedAt",
