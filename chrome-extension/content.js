@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-duplicate-order-pause-v63";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-multi-item-subscription-cart-v64";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -2351,7 +2351,7 @@ function markPromotions() {
   return nodes.length;
 }
 
-async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
+async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null, options = {}) {
   await waitForElement(["#corePrice_feature_div .a-price", "#apex_desktop .a-price", "#snsAccordionRowMiddle, #snsAccordionRow, #snsAccordionRowContent, [data-csa-c-slot-id*='sns']"], 12000);
   const { regular: pagePrice, sns: snsPrice } = productPriceSnapshot();
   if (!pagePrice || !snsPrice || snsPrice >= pagePrice) {
@@ -2403,6 +2403,31 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     error.requestedQuantity = requestedQuantity;
     throw error;
   }
+  if (options.requireCartAdd) {
+    const subscriptionCartButton = findSubscribeAddToCartTarget();
+    if (!subscriptionCartButton) {
+      const error = new Error("Subscribe & Save is cheaper for this multi-item order, but Amazon did not show Add subscription to cart. Fulfilment paused instead of opening a single-item subscription checkout.");
+      error.failureCode = "";
+      throw error;
+    }
+    if (activeJob) {
+      const asin = currentAsinFromUrl();
+      activeJob.stage = "add_clicked";
+      activeJob.addClickedAt = Date.now();
+      activeJob.subscribeAndSave = false;
+      activeJob.subscriptionCartAsins = [...new Set([...(activeJob.subscriptionCartAsins || []), asin].filter(Boolean))];
+      markItemAdded(activeJob);
+      await setActiveJob(activeJob);
+    }
+    showPanel("Subscribe & Save", "Adding this subscription to the shared cart before continuing to the next product.", null, null);
+    const added = await clickElement(subscriptionCartButton, "Add subscription to cart button");
+    if (!added) {
+      const error = new Error("Amazon showed Add subscription to cart, but the extension could not click it. Fulfilment paused before continuing to the next product.");
+      error.failureCode = "";
+      throw error;
+    }
+    return true;
+  }
   const subscribeButtons = findSubscribeSubmitTargets();
   if (subscribeButtons.length) {
     for (const subscribeButton of subscribeButtons) {
@@ -2424,6 +2449,32 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null) {
     return true;
   }
   return false;
+}
+
+function findSubscribeAddToCartTarget() {
+  const roots = [...document.querySelectorAll(subscribeAndSaveRootSelector())].filter(visible);
+  const selectors = [
+    "input#add-to-cart-button[name='submit.add-to-cart']",
+    "input[name='submit.add-to-cart']",
+    "button#add-to-cart-button",
+    "button[name='submit.add-to-cart']",
+  ];
+  for (const root of roots) {
+    for (const selector of selectors) {
+      const target = [...root.querySelectorAll(selector)].find((element) => {
+        const label = normalizedText([
+          element.value,
+          element.getAttribute("aria-label"),
+          element.getAttribute("title"),
+          element.innerText,
+          element.textContent,
+        ].filter(Boolean).join(" "));
+        return visible(element) && !element.disabled && label.includes("add subscription to cart");
+      });
+      if (target) return target;
+    }
+  }
+  return null;
 }
 
 function findSubscribeSubmitTargets() {
@@ -3441,9 +3492,15 @@ async function handleProduct(activeJob) {
     await sleep(1800);
   }
   const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
-  const useSubscribeAndSave = snsIsCheaper && !mixedAsinAfterVariant;
+  const useSubscribeAndSave = Boolean(snsIsCheaper);
   const priceForDecision = useSubscribeAndSave ? priceSnapshot.sns : (priceSnapshot.regular || priceSnapshot.best);
-  await recordAmazonPrice(activeJob, item, priceForDecision, useSubscribeAndSave ? "subscribe-save" : "product", purchaseItem);
+  await recordAmazonPrice(
+    activeJob,
+    item,
+    priceForDecision,
+    useSubscribeAndSave ? (mixedAsinAfterVariant ? "subscribe-save-cart" : "subscribe-save") : "product",
+    purchaseItem,
+  );
   const quantity = Number(purchaseItem.quantity || 1);
   const storeTotal = Number(item.store_total_price || Number(item.store_unit_price || 0) * Number(item.quantity || 1) || 0);
   const amazonTotal = Number(priceForDecision || 0) * quantity;
@@ -3465,17 +3522,9 @@ async function handleProduct(activeJob) {
     }
   }
 
-  if (mixedAsinAfterVariant && snsIsCheaper) {
-    showPanel(
-      "Subscribe & Save skipped",
-      `This order has multiple different ASINs, so ${purchaseItem.asin} will be added with regular Add to cart even though Subscribe & Save is cheaper (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}).`,
-      null,
-      null,
-    );
-    await sleep(900);
-  }
-
-  const subscribed = useSubscribeAndSave ? await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob) : false;
+  const subscribed = useSubscribeAndSave
+    ? await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob, { requireCartAdd: mixedAsinAfterVariant })
+    : false;
   if (!subscribed) {
     if (useSubscribeAndSave) {
       throw new Error(`Subscribe & Save is cheaper (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}), but the extension did not complete the Subscribe & Save selection. Fulfilment paused before changing regular quantity.`);

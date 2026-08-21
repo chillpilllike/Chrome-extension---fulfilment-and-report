@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.84")
+        self.assertEqual(MANIFEST["version"], "0.1.85")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -543,6 +543,33 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("await checkoutDeliveryWindowIsAllowed(activeJob)", recovery)
         self.assertIn("await clickElement(placeOrder", recovery)
         self.assertNotIn("protectBeforeAmazonSubmit", recovery.replace("// protectBeforeAmazonSubmit", "// protection"))
+
+    def test_mixed_asin_subscriptions_use_cart_instead_of_single_item_checkout(self) -> None:
+        product_start = CONTENT.index("async function handleProduct(activeJob)")
+        product_end = CONTENT.index("async function handleAddClicked(activeJob)", product_start)
+        product = CONTENT[product_start:product_end]
+        self.assertIn("const useSubscribeAndSave = Boolean(snsIsCheaper);", product)
+        self.assertIn("{ requireCartAdd: mixedAsinAfterVariant }", product)
+        self.assertIn('"subscribe-save-cart"', product)
+        self.assertNotIn("Subscribe & Save skipped", product)
+
+    def test_subscription_cart_button_is_detected_by_meaning_inside_sns_root(self) -> None:
+        finder_start = CONTENT.index("function findSubscribeAddToCartTarget()")
+        finder_end = CONTENT.index("function findSubscribeSubmitTargets()", finder_start)
+        finder = CONTENT[finder_start:finder_end]
+        self.assertIn("subscribeAndSaveRootSelector()", finder)
+        self.assertIn("input#add-to-cart-button[name='submit.add-to-cart']", finder)
+        self.assertIn('label.includes("add subscription to cart")', finder)
+
+        apply_start = CONTENT.index("async function applySubscribeAndSaveIfCheaper")
+        apply_end = CONTENT.index("function findSubscribeAddToCartTarget()", apply_start)
+        apply_flow = CONTENT[apply_start:apply_end]
+        cart_branch = apply_flow.index("if (options.requireCartAdd)")
+        direct_checkout = apply_flow.index("const subscribeButtons = findSubscribeSubmitTargets()")
+        self.assertLess(cart_branch, direct_checkout)
+        self.assertIn('activeJob.stage = "add_clicked"', apply_flow[cart_branch:direct_checkout])
+        self.assertIn('activeJob.subscribeAndSave = false', apply_flow[cart_branch:direct_checkout])
+        self.assertNotIn('activeJob.stage = "subscribe_checkout"', apply_flow[cart_branch:direct_checkout])
 
     def test_duplicate_order_confirmation_reuses_original_submit_protection(self) -> None:
         handler_start = CONTENT.index("async function handleAmazonDuplicateOrderPage(activeJob)")
