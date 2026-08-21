@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-mixed-sns-fallback-v86";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-stable-mixed-sns-fallback-v87";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -2520,6 +2520,30 @@ function findSubscribeAddToCartTarget() {
   return null;
 }
 
+function findRegularAddToCartTarget() {
+  const selectors = [
+    "#add-to-cart-button",
+    "input[name='submit.add-to-cart']",
+    "#buybox-add-to-cart-button input",
+  ];
+  const candidates = selectors.flatMap((selector) => [...document.querySelectorAll(selector)]);
+  return [...new Set(candidates)].find((element) => {
+    if (!visible(element) || element.disabled) return false;
+    const label = normalizedText([
+      element.value,
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+      element.innerText,
+      element.textContent,
+      element.getAttribute("aria-labelledby")
+        ? document.getElementById(element.getAttribute("aria-labelledby"))?.textContent
+        : "",
+    ].filter(Boolean).join(" "));
+    if (label.includes("add subscription to cart")) return false;
+    return !element.closest(subscribeAndSaveRootSelector());
+  }) || null;
+}
+
 function findSubscribeSubmitTargets() {
   const selectors = [
     "#rcx-subscribe-submit-button input",
@@ -3667,11 +3691,21 @@ async function handleProduct(activeJob) {
     await sleep(1800);
   }
   const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
-  let useSubscribeAndSave = Boolean(snsIsCheaper);
+  const mixedSnsFallbackAsins = Array.isArray(activeJob.mixedSnsOneTimeFallbackAsins)
+    ? activeJob.mixedSnsOneTimeFallbackAsins.map((value) => String(value || "").toUpperCase())
+    : [];
+  const mixedSnsFallbackRecorded = mixedAsinAfterVariant
+    && mixedSnsFallbackAsins.includes(String(purchaseItem.asin || "").toUpperCase());
+  let useSubscribeAndSave = Boolean(snsIsCheaper && !mixedSnsFallbackRecorded);
   if (useSubscribeAndSave && mixedAsinAfterVariant) {
     const snsActivated = await activateSubscribeAndSaveOption();
     if (snsActivated) await waitUntil(snsQuantityControlVisible, 5000, 250);
     if (!findSubscribeAddToCartTarget()) {
+      activeJob.mixedSnsOneTimeFallbackAsins = [...new Set([
+        ...mixedSnsFallbackAsins,
+        String(purchaseItem.asin || "").toUpperCase(),
+      ].filter(Boolean))];
+      await setActiveJob(activeJob, { reason: "persist_mixed_sns_one_time_fallback" });
       const oneTimeActivated = await activateOneTimePurchaseOption();
       if (!oneTimeActivated) {
         const error = new Error("Amazon does not offer Add subscription to cart for this multi-item order, and the extension could not restore One-time purchase. Fulfilment paused before adding anything.");
@@ -3685,6 +3719,14 @@ async function handleProduct(activeJob) {
         null,
         null,
       );
+    }
+  }
+  if (mixedSnsFallbackRecorded && !oneTimePurchaseIsActive()) {
+    const oneTimeActivated = await activateOneTimePurchaseOption();
+    if (!oneTimeActivated) {
+      const error = new Error("Amazon rerendered the mixed-item product page without retaining One-time purchase. Fulfilment paused before clicking any Add button.");
+      error.failureCode = "";
+      throw error;
     }
   }
   const priceForDecision = useSubscribeAndSave ? priceSnapshot.sns : (priceSnapshot.regular || priceSnapshot.best);
@@ -3778,7 +3820,12 @@ async function handleProduct(activeJob) {
       showPanel("Missing ASINs", `${message} Order moved to Missing ASINs.`, null, null);
       return;
     }
-    const addButton = await waitForElement(["#add-to-cart-button", "input[name='submit.add-to-cart']", "#buybox-add-to-cart-button input"], 18000);
+    const addButton = await waitUntil(findRegularAddToCartTarget, 18000, 300);
+    if (!addButton) {
+      const error = new Error(`Amazon did not expose a verified One-time purchase Add to cart button for ASIN ${purchaseItem.asin}. Fulfilment paused before clicking a subscription control by mistake.`);
+      error.failureCode = "";
+      throw error;
+    }
     activeJob.stage = "add_clicked";
     activeJob.addClickedAt = Date.now();
     markItemAdded(activeJob);

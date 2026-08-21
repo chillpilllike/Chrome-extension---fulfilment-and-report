@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.107")
+        self.assertEqual(MANIFEST["version"], "0.1.108")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -425,6 +425,25 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("function findOneTimePurchaseAccordionTarget()", CONTENT)
         self.assertIn("async function activateOneTimePurchaseOption()", CONTENT)
 
+    def test_multi_item_subscription_fallback_survives_amazon_rerenders(self) -> None:
+        product_start = CONTENT.index("async function handleProduct(activeJob)")
+        product_end = CONTENT.index("async function handleAddClicked", product_start)
+        product = CONTENT[product_start:product_end]
+        self.assertIn("mixedSnsOneTimeFallbackAsins", product)
+        self.assertIn('reason: "persist_mixed_sns_one_time_fallback"', product)
+        self.assertIn("snsIsCheaper && !mixedSnsFallbackRecorded", product)
+        self.assertIn("mixedSnsFallbackRecorded && !oneTimePurchaseIsActive()", product)
+
+    def test_regular_cart_add_never_uses_subscription_cart_control(self) -> None:
+        finder_start = CONTENT.index("function findRegularAddToCartTarget()")
+        finder_end = CONTENT.index("function findSubscribeSubmitTargets()", finder_start)
+        finder = CONTENT[finder_start:finder_end]
+        self.assertIn('label.includes("add subscription to cart")', finder)
+        self.assertIn("!element.closest(subscribeAndSaveRootSelector())", finder)
+        product_start = CONTENT.index("async function handleProduct(activeJob)")
+        product_end = CONTENT.index("async function handleAddClicked", product_start)
+        self.assertIn("await waitUntil(findRegularAddToCartTarget, 18000, 300)", CONTENT[product_start:product_end])
+
     def test_background_uncertain_submit_never_releases_or_cleans_queue(self) -> None:
         uncertain_start = BACKGROUND.index("async function submitUncertain")
         uncertain_end = BACKGROUND.index("async function markLineMissing", uncertain_start)
@@ -796,7 +815,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         product_start = CONTENT.index("async function handleProduct(activeJob)")
         product_end = CONTENT.index("async function handleAddClicked(activeJob)", product_start)
         product = CONTENT[product_start:product_end]
-        self.assertIn("let useSubscribeAndSave = Boolean(snsIsCheaper);", product)
+        self.assertIn("let useSubscribeAndSave = Boolean(snsIsCheaper && !mixedSnsFallbackRecorded);", product)
         self.assertIn("{ requireCartAdd: mixedAsinAfterVariant }", product)
         self.assertIn('"subscribe-save-cart"', product)
         self.assertNotIn("Subscribe & Save skipped", product)
