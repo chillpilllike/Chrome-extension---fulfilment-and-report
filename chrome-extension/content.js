@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-hybrid-subscription-frequency-v71";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-silent-force-stop-v72";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -59,6 +59,7 @@ let orderHistoryAnnotationInFlight = false;
 let orderHistoryAnnotationInFlightAt = 0;
 let orderHistoryLastAnnotatedAt = 0;
 let orderHistoryScrollTimer = null;
+let orderHistoryAnnotationTimer = null;
 const orderHistoryLookupCache = new Map();
 const orderHistoryOdooDirectInFlight = new Set();
 const orderHistorySyncInProgress = new Map();
@@ -221,19 +222,26 @@ function stopContentAutomation(message = "Force stopped. No further fulfilment s
   fulfilmentForceStopped = true;
   if (runIntervalId) clearInterval(runIntervalId);
   if (panelIntervalId) clearInterval(panelIntervalId);
+  if (historyIntervalId) clearInterval(historyIntervalId);
+  if (orderHistoryScrollTimer) clearTimeout(orderHistoryScrollTimer);
+  if (orderHistoryAnnotationTimer) clearTimeout(orderHistoryAnnotationTimer);
   runIntervalId = null;
   panelIntervalId = null;
+  historyIntervalId = null;
+  orderHistoryScrollTimer = null;
+  orderHistoryAnnotationTimer = null;
+  orderHistoryAnnotationScheduled = false;
   window.__nutricityRunning = false;
   window.__nutricityRunningAt = 0;
-  showPanel("Nutricity fulfilment stopped", message, null, null);
-  ensureOrderHistoryAnnotationLoop();
-  scheduleOrderHistoryAnnotation(0);
+  // Force stop is a global safety latch, not a page-level error. Amazon tabs
+  // that are not running a job must remain untouched and completely idle.
+  document.querySelector("#nutricity-panel")?.remove();
 }
 
 function ensureOrderHistoryAnnotationLoop() {
-  if (historyIntervalId) return;
+  if (fulfilmentForceStopped || historyIntervalId) return;
   historyIntervalId = setInterval(() => {
-    if (document.hidden || !/amazon\.com$/i.test(location.hostname)) return;
+    if (fulfilmentForceStopped || document.hidden || !/amazon\.com$/i.test(location.hostname)) return;
     if (!isOrderHistoryPage() && !isOrderDetailsPage()) return;
     scheduleOrderHistoryAnnotation(1200);
   }, 15000);
@@ -8385,7 +8393,7 @@ async function annotateAmazonOrderHistoryDirectOdoo(pairs = []) {
 }
 
 async function annotateAmazonOrderHistory() {
-  if (!extensionContextAlive || !/amazon\.com$/i.test(location.hostname) || (!isOrderHistoryPage() && !isOrderDetailsPage())) return;
+  if (fulfilmentForceStopped || !extensionContextAlive || !/amazon\.com$/i.test(location.hostname) || (!isOrderHistoryPage() && !isOrderDetailsPage())) return;
   orderHistoryLastAnnotatedAt = Date.now();
   const pairs = [];
   const unknown = [];
@@ -8429,6 +8437,7 @@ async function annotateAmazonOrderHistory() {
       ok: false,
       message: error?.message || String(error || "The local app lookup failed."),
     }));
+    if (fulfilmentForceStopped) return;
     if (!result?.ok) {
       const message = result?.message || result?.error || "The app lookup did not return a usable response.";
       if (isTransientOrderHistoryLookupError(message)) {
@@ -8508,21 +8517,23 @@ async function annotateAmazonOrderHistory() {
   } finally {
     orderHistoryAnnotationInFlight = false;
     orderHistoryAnnotationInFlightAt = 0;
-    if (orderHistoryNeedsMoreAnnotation()) {
+    if (!fulfilmentForceStopped && orderHistoryNeedsMoreAnnotation()) {
       scheduleOrderHistoryAnnotation(1200);
     }
   }
 }
 
 function scheduleOrderHistoryAnnotation(delay = 350) {
-  if (orderHistoryAnnotationScheduled) return;
+  if (fulfilmentForceStopped || orderHistoryAnnotationScheduled) return;
   if (document.hidden || !/amazon\.com$/i.test(location.hostname)) return;
   if (!isOrderHistoryPage() && !isOrderDetailsPage()) return;
   const sinceLastRun = Date.now() - Number(orderHistoryLastAnnotatedAt || 0);
   const safeDelay = sinceLastRun < 1000 ? Math.max(delay, 1000 - sinceLastRun) : delay;
   orderHistoryAnnotationScheduled = true;
-  setTimeout(() => {
+  orderHistoryAnnotationTimer = setTimeout(() => {
+    orderHistoryAnnotationTimer = null;
     orderHistoryAnnotationScheduled = false;
+    if (fulfilmentForceStopped) return;
     annotateAmazonOrderHistory().catch(() => {});
   }, safeDelay);
 }
@@ -9440,6 +9451,7 @@ if (document.hidden) {
   setTimeout(runSafely, 250);
 }
 scheduleOrderHistoryAnnotation(250);
+registerContentCleanup(() => clearTimeout(orderHistoryAnnotationTimer));
 runIntervalId = setInterval(runSafely, 5000);
 registerContentCleanup(() => clearInterval(runIntervalId));
 panelIntervalId = setInterval(() => {

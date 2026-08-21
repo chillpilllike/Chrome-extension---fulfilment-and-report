@@ -46,7 +46,32 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.92")
+        self.assertEqual(MANIFEST["version"], "0.1.93")
+
+    def test_force_stop_is_silent_and_stops_all_page_work(self) -> None:
+        stop_start = CONTENT.index("function stopContentAutomation(")
+        stop_end = CONTENT.index("function ensureOrderHistoryAnnotationLoop()", stop_start)
+        stop = CONTENT[stop_start:stop_end]
+
+        self.assertNotIn("showPanel(", stop)
+        self.assertNotIn("ensureOrderHistoryAnnotationLoop();", stop)
+        self.assertNotIn("scheduleOrderHistoryAnnotation(0);", stop)
+        self.assertIn('document.querySelector("#nutricity-panel")?.remove();', stop)
+        self.assertIn("clearInterval(historyIntervalId)", stop)
+        self.assertIn("clearTimeout(orderHistoryScrollTimer)", stop)
+        self.assertIn("clearTimeout(orderHistoryAnnotationTimer)", stop)
+
+    def test_force_stop_blocks_order_history_dom_work(self) -> None:
+        annotate_start = CONTENT.index("async function annotateAmazonOrderHistory()")
+        annotate_end = CONTENT.index("function scheduleOrderHistoryAnnotation", annotate_start)
+        annotate = CONTENT[annotate_start:annotate_end]
+        schedule_start = annotate_end
+        schedule_end = CONTENT.index("function activeJobOrderNames", schedule_start)
+        schedule = CONTENT[schedule_start:schedule_end]
+
+        self.assertIn("if (fulfilmentForceStopped", annotate)
+        self.assertIn("if (fulfilmentForceStopped || orderHistoryAnnotationScheduled) return;", schedule)
+        self.assertIn("if (fulfilmentForceStopped) return;", schedule)
 
     def test_subscription_frequency_supports_business_and_consumer_doms(self) -> None:
         choose_start = CONTENT.index("async function chooseSubscribeFrequencySixMonths()")
