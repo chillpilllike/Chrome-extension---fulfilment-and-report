@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-multi-item-subscription-cart-v64";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-dual-account-checkout-v65";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -941,7 +941,13 @@ function snsQuantityControlVisible() {
   if (!subscribeAndSaveAccordionIsActive()) return false;
   return Boolean([...document.querySelectorAll(subscribeAndSaveRootSelector())].find((root) => {
     if (!visible(root)) return false;
-    const control = root.querySelector("select[id*='sns'][id*='predefinedQuantitiesDropdown'], input#rcxsubsQuan, input[id*='sns'][id$='freeQuantityTextInput']");
+    const control = root.querySelector([
+      "select[id*='sns'][id*='predefinedQuantitiesDropdown']",
+      "select#rcxsubsQuan",
+      "select[name='rcxsubsQuan']",
+      "input#rcxsubsQuan",
+      "input[id*='sns'][id$='freeQuantityTextInput']",
+    ].join(", "));
     return visible(control) || visible(control?.closest?.("td, table, .a-section, .a-dropdown-container"));
   }));
 }
@@ -1468,14 +1474,42 @@ function cartVerificationMatches(activeJob) {
   ));
 }
 
+function amazonAccountExperience() {
+  const url = new URL(location.href);
+  const purchaseProgram = normalizedText(url.searchParams.get("purchasePrograms") || "");
+  if (
+    purchaseProgram === "amazon_business"
+    || url.pathname.includes("/checkout/entry/cart/amazon_business")
+    || url.searchParams.get("referrer") === "businessCart"
+  ) return "business";
+
+  // Restrict visual account detection to Amazon's active header/checkout
+  // chrome. Consumer pages advertise Amazon Business in their footer, so a
+  // body-text or unrestricted link search produces a dangerous false positive.
+  const businessShell = [
+    ...document.querySelectorAll(
+      [
+        "header [aria-label*='Amazon Business' i]",
+        "#navbar [aria-label*='Amazon Business' i]",
+        "#nav-logo [aria-label*='Amazon Business' i]",
+        "a[href*='ref_=ab_checkout_logo']",
+        "a[href*='businessprime'][data-csa-c-slot-id]",
+      ].join(", "),
+    ),
+  ].find(visible);
+  if (businessShell) return "business";
+
+  const consumerShell = [
+    document.querySelector("#navbar"),
+    document.querySelector("#nav-main"),
+    document.querySelector("#nav-link-accountList"),
+    document.querySelector("a[href*='ref_=nav_logo']"),
+  ].find(visible);
+  return consumerShell ? "consumer" : "unknown";
+}
+
 function isAmazonBusinessPage() {
-  const text = String(document.body?.innerText || document.body?.textContent || "").toLowerCase();
-  return (
-    text.includes("prime business")
-    || text.includes("amazon business")
-    || text.includes("account for ")
-    || Boolean(document.querySelector("[href*='businessprime'], [href*='amazonbusiness'], [aria-label*='Amazon Business' i]"))
-  );
+  return amazonAccountExperience() === "business";
 }
 
 async function ensureCheckoutOnlyExpectedUnits(activeJob) {
@@ -6455,6 +6489,16 @@ async function handleCheckout(activeJob) {
     "a[href*='/checkout/entry/cart/amazon_business']",
     "a[href*='proceedToCheckout=1']",
   ], 18000);
+  const accountExperience = amazonAccountExperience();
+  if (activeJob.amazonAccountExperience !== accountExperience) {
+    activeJob.amazonAccountExperience = accountExperience;
+    await setActiveJob(activeJob);
+    await sendDiagnostic("Detected Amazon checkout account experience.", {
+      group_key: activeJob.job?.group_key || "",
+      account_experience: accountExperience,
+      checkout_url: location.href,
+    });
+  }
   if (await handleBusinessCheckoutInterstitial()) return;
   if (await handleCheckoutLimitPurchase(activeJob)) return;
   const checkoutRecipient = recipientName(activeJob);

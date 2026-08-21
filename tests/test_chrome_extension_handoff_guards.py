@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.85")
+        self.assertEqual(MANIFEST["version"], "0.1.86")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -570,6 +570,31 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('activeJob.stage = "add_clicked"', apply_flow[cart_branch:direct_checkout])
         self.assertIn('activeJob.subscribeAndSave = false', apply_flow[cart_branch:direct_checkout])
         self.assertNotIn('activeJob.stage = "subscribe_checkout"', apply_flow[cart_branch:direct_checkout])
+
+    def test_consumer_subscribe_quantity_select_is_supported(self) -> None:
+        quantity_start = CONTENT.index("function snsQuantityControlVisible()")
+        quantity_end = CONTENT.index("function productTitleText()", quantity_start)
+        quantity_guard = CONTENT[quantity_start:quantity_end]
+        self.assertIn('"select#rcxsubsQuan"', quantity_guard)
+        self.assertIn('"select[name=\'rcxsubsQuan\']"', quantity_guard)
+
+    def test_account_detection_does_not_use_consumer_footer_marketing(self) -> None:
+        detector_start = CONTENT.index("function amazonAccountExperience()")
+        detector_end = CONTENT.index("async function ensureCheckoutOnlyExpectedUnits", detector_start)
+        detector = CONTENT[detector_start:detector_end]
+        self.assertIn('purchaseProgram === "amazon_business"', detector)
+        self.assertIn("header [aria-label*='Amazon Business' i]", detector)
+        self.assertIn('return consumerShell ? "consumer" : "unknown";', detector)
+        self.assertNotIn("document.body", detector)
+        self.assertNotIn('text.includes("amazon business")', detector)
+
+    def test_checkout_records_detected_account_experience(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        self.assertIn("const accountExperience = amazonAccountExperience();", checkout)
+        self.assertIn("activeJob.amazonAccountExperience = accountExperience;", checkout)
+        self.assertIn('account_experience: accountExperience', checkout)
 
     def test_duplicate_order_confirmation_reuses_original_submit_protection(self) -> None:
         handler_start = CONTENT.index("async function handleAmazonDuplicateOrderPage(activeJob)")
