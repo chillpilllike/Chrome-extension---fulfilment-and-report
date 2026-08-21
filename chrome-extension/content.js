@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-reset-revision-guard-v84";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-mandatory-cart-cleanup-v85";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {

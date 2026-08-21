@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-reset-revision-guard-v84";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-mandatory-cart-cleanup-v85";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -896,7 +896,6 @@ function jobWasSubmittedToAmazon(job) {
 
 function activeJobBlocksNext(activeJob) {
   if (!activeJob?.job?.group_key) return false;
-  if (activeJob.stage === "cleanup_after_failure") return false;
   return true;
 }
 
@@ -1469,7 +1468,10 @@ async function claimNextJobInWindow(windowId) {
   if (submittedRecovery?.activeJob) return submittedRecovery.activeJob;
   const { activeJob: currentJob } = await getWindowState(windowId);
   if (currentJob?.stage === "cleanup_after_failure" || currentJob?.cleanupAfterFailure) {
-    await setWindowJob(windowId, null);
+    await navigateWindowToCart(windowId);
+    await injectActiveAmazonTabInWindow(windowId);
+    await log(`Kept ${currentJob.job.group_key} active until its failed-order cart cleanup finishes.`, windowId);
+    return currentJob;
   }
   if (activeJobBlocksNext(currentJob)) {
     await log(`Kept ${currentJob.job.group_key}; current job is not closed yet.`, windowId);

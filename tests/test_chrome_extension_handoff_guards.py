@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.105")
+        self.assertEqual(MANIFEST["version"], "0.1.106")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -398,6 +398,20 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("Number(current?.resetRevision || 0) > Number(activeJob?.resetRevision || 0)", setter)
         self.assertIn("options.allowSubmittedReset !== true", setter)
         self.assertIn("Ignored stale pre-reset update", setter)
+
+    def test_next_claim_cannot_discard_required_cart_cleanup(self) -> None:
+        blocker_start = BACKGROUND.index("function activeJobBlocksNext(activeJob)")
+        blocker_end = BACKGROUND.index("function activeJobLineIds", blocker_start)
+        blocker = BACKGROUND[blocker_start:blocker_end]
+        self.assertNotIn('activeJob.stage === "cleanup_after_failure"', blocker)
+        claim_start = BACKGROUND.index("async function claimNextJobInWindow(windowId)")
+        claim_end = BACKGROUND.index("async function finishCleanupAndClaimNext", claim_start)
+        claim = BACKGROUND[claim_start:claim_end]
+        cleanup_branch = claim[claim.index('if (currentJob?.stage === "cleanup_after_failure"'):]
+        self.assertNotIn("await setWindowJob(windowId, null);", cleanup_branch.split("if (activeJobBlocksNext", 1)[0])
+        self.assertIn("await navigateWindowToCart(windowId);", cleanup_branch)
+        self.assertIn("await injectActiveAmazonTabInWindow(windowId);", cleanup_branch)
+        self.assertIn("return currentJob;", cleanup_branch)
 
     def test_background_uncertain_submit_never_releases_or_cleans_queue(self) -> None:
         uncertain_start = BACKGROUND.index("async function submitUncertain")
