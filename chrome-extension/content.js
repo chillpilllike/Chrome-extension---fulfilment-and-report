@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-unplaced-submit-reset-v81";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-unplaced-submit-reset-v82";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -9157,7 +9157,17 @@ async function handleOrderHistory(activeJob) {
       activeJob.pausedStage = "find_order_id";
       activeJob.lastError = message;
       await setActiveJob(activeJob);
-      showPanel("Chrome fulfilment held for verification", message, null, null);
+      showPanel(
+        "Chrome fulfilment held for verification",
+        message,
+        "Reset and retry unplaced order",
+        async () => {
+          const result = await send({ type: "RESET_DUPLICATE_FULFILMENT" });
+          if (!result?.ok) {
+            showPanel("Reset failed", result?.message || "Could not reset the protected unplaced order.", null, null);
+          }
+        },
+      );
       return;
     }
     showPanel("Nutricity fulfilment", `Looking for recent Amazon order for ${activeJob.job.recipient_name}.`, null, null);

@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.102")
+        self.assertEqual(MANIFEST["version"], "0.1.103")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -363,8 +363,12 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('activeJob.pausedStage = "find_order_id";', history)
         self.assertIn("the queue will not continue", history)
         self.assertNotIn("location.reload()", history)
-        self.assertIn("Reset and retry unplaced order", history)
-        self.assertIn('type: "RESET_DUPLICATE_FULFILMENT"', history)
+        self.assertEqual(history.count("Reset and retry unplaced order"), 2)
+        self.assertEqual(history.count('type: "RESET_DUPLICATE_FULFILMENT"'), 2)
+        no_match_start = history.index("if (!orders.length && !rememberedOrder)")
+        no_match = history[no_match_start:]
+        self.assertIn("Reset and retry unplaced order", no_match)
+        self.assertIn('type: "RESET_DUPLICATE_FULFILMENT"', no_match)
 
     def test_unplaced_submit_reset_clears_server_and_local_submit_markers(self) -> None:
         reset_start = BACKGROUND.index("async function resetDuplicateFulfilment(windowId)")
