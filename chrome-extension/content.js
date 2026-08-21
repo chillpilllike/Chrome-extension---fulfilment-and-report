@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-native-delivery-radio-v75";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-selected-delivery-promise-v76";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5873,6 +5873,12 @@ async function ensureFinalConsolidatedDelivery(activeJob) {
 function checkoutDeliveryPromiseText() {
   const selectedOption = selectedDeliveryRadioContext();
   const selectedOptionText = normalizedText(selectedOption?.text || "");
+  // The checked radio is the authoritative promise. Amazon can leave the
+  // checkout section heading on its old date for several seconds after a
+  // delivery-radio change (for example, "Arriving Aug 22" after Monday Aug 24
+  // is selected). Mixing that stale heading back into the candidates can make
+  // the final guard reject the confirmed weekday selection and never submit.
+  if (selectedOptionText) return selectedOptionText;
   const selectors = [
     "h2.address-promise-text",
     ".address-promise-text",
@@ -5890,7 +5896,7 @@ function checkoutDeliveryPromiseText() {
     .slice(0, 80)
     .map((element) => normalizedText(element.textContent || ""))
     .filter((text) => text && /arriv|deliver|shipping|delivery/i.test(text) && text.length <= 300);
-  const candidates = [selectedOptionText, ...elementCandidates].filter(Boolean);
+  const candidates = elementCandidates.filter(Boolean);
   const unique = [...new Set(candidates)];
   const month = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}\b/i;
   const dated = unique.filter((text) => month.test(text) || /arriving\s+(?:today|tomorrow)|deliver(?:y|ing)?\s+(?:today|tomorrow)/i.test(text));

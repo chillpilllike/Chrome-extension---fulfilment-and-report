@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.96")
+        self.assertEqual(MANIFEST["version"], "0.1.97")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -570,6 +570,15 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         promise = CONTENT[promise_start:promise_end]
         self.assertIn("selectedDeliveryRadioContext()", promise)
         self.assertIn("!optionRadio || optionRadio.checked", promise)
+
+    def test_checked_delivery_radio_beats_stale_checkout_heading(self) -> None:
+        promise_start = CONTENT.index("function checkoutDeliveryPromiseText()")
+        promise_end = CONTENT.index("function checkoutDeliveryPromise(limitDays", promise_start)
+        promise = CONTENT[promise_start:promise_end]
+        selected_return = promise.index("if (selectedOptionText) return selectedOptionText;")
+        heading_scan = promise.index("document.querySelectorAll(selectors.join")
+        self.assertLess(selected_return, heading_scan)
+        self.assertNotIn("[selectedOptionText, ...elementCandidates]", promise)
 
     def test_final_delivery_selection_must_stay_consolidated_before_submit(self) -> None:
         final_start = CONTENT.index("async function ensureFinalConsolidatedDelivery")
