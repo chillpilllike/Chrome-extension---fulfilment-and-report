@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-mandatory-cart-cleanup-v85";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-mixed-sns-fallback-v86";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -2576,6 +2576,43 @@ async function activateSubscribeAndSaveOption() {
   return await waitUntil(subscribeAndSaveIsActive, 3000, 250);
 }
 
+function findOneTimePurchaseAccordionTarget() {
+  const rows = [
+    ...document.querySelectorAll("#buyBoxAccordion > .a-box, #buyBoxAccordion [data-a-accordion-row-name], #accordionRows > .a-box"),
+  ].filter((row, index, all) => all.indexOf(row) === index && visible(row));
+  for (const row of rows) {
+    const text = normalizedText(row.innerText || row.textContent || "");
+    if (!text.includes("one-time purchase")) continue;
+    const target = row.querySelector("[data-action='a-accordion'][role='button'], .a-accordion-row[role='button'], .accordion-header[role='button']")
+      || row.closest?.("[data-action='a-accordion'][role='button'], .a-accordion-row[role='button']")
+      || row;
+    if (target && visible(target)) return target;
+  }
+  return null;
+}
+
+function oneTimePurchaseIsActive() {
+  const target = findOneTimePurchaseAccordionTarget();
+  if (!target) return false;
+  const row = target.closest?.(".a-box, [data-a-accordion-row-name]") || target;
+  return target.getAttribute?.("aria-expanded") === "true"
+    || Boolean(row.querySelector?.(".a-accordion-radio-active, [role='radio'][aria-checked='true']"));
+}
+
+async function activateOneTimePurchaseOption() {
+  if (oneTimePurchaseIsActive()) return true;
+  const target = findOneTimePurchaseAccordionTarget();
+  if (!target) return false;
+  showPanel("Multi-item checkout", "Switching back to One-time purchase so all items can share one Amazon order.", null, null);
+  target.scrollIntoView({ block: "center", behavior: "smooth" });
+  await sleep(250);
+  target.focus?.();
+  dispatchAmazonClickSequence(target);
+  dispatchClickAtElementCenter(target);
+  await waitForStableDom(700, 5000);
+  return oneTimePurchaseIsActive() || await waitUntil(oneTimePurchaseIsActive, 3000, 250);
+}
+
 function dispatchAmazonClickSequence(element) {
   const pointerEvent = typeof PointerEvent === "function" ? PointerEvent : MouseEvent;
   element.dispatchEvent(new pointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerType: "mouse", view: window }));
@@ -3630,7 +3667,26 @@ async function handleProduct(activeJob) {
     await sleep(1800);
   }
   const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
-  const useSubscribeAndSave = Boolean(snsIsCheaper);
+  let useSubscribeAndSave = Boolean(snsIsCheaper);
+  if (useSubscribeAndSave && mixedAsinAfterVariant) {
+    const snsActivated = await activateSubscribeAndSaveOption();
+    if (snsActivated) await waitUntil(snsQuantityControlVisible, 5000, 250);
+    if (!findSubscribeAddToCartTarget()) {
+      const oneTimeActivated = await activateOneTimePurchaseOption();
+      if (!oneTimeActivated) {
+        const error = new Error("Amazon does not offer Add subscription to cart for this multi-item order, and the extension could not restore One-time purchase. Fulfilment paused before adding anything.");
+        error.failureCode = "";
+        throw error;
+      }
+      useSubscribeAndSave = false;
+      showPanel(
+        "Multi-item checkout",
+        "Subscribe & Save is cheaper, but Amazon only offers a separate Subscribe checkout. Using One-time purchase so every item stays in the same Amazon order.",
+        null,
+        null,
+      );
+    }
+  }
   const priceForDecision = useSubscribeAndSave ? priceSnapshot.sns : (priceSnapshot.regular || priceSnapshot.best);
   await recordAmazonPrice(
     activeJob,

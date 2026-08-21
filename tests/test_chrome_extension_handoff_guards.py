@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.106")
+        self.assertEqual(MANIFEST["version"], "0.1.107")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -412,6 +412,18 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("await navigateWindowToCart(windowId);", cleanup_branch)
         self.assertIn("await injectActiveAmazonTabInWindow(windowId);", cleanup_branch)
         self.assertIn("return currentJob;", cleanup_branch)
+
+    def test_multi_item_subscription_without_cart_button_falls_back_to_one_time(self) -> None:
+        product_start = CONTENT.index("async function handleProduct(activeJob)")
+        product_end = CONTENT.index("async function handleAddClicked", product_start)
+        product = CONTENT[product_start:product_end]
+        self.assertIn("if (useSubscribeAndSave && mixedAsinAfterVariant)", product)
+        self.assertIn("if (!findSubscribeAddToCartTarget())", product)
+        self.assertIn("await activateOneTimePurchaseOption()", product)
+        self.assertIn("useSubscribeAndSave = false;", product)
+        self.assertIn("Using One-time purchase so every item stays in the same Amazon order.", product)
+        self.assertIn("function findOneTimePurchaseAccordionTarget()", CONTENT)
+        self.assertIn("async function activateOneTimePurchaseOption()", CONTENT)
 
     def test_background_uncertain_submit_never_releases_or_cleans_queue(self) -> None:
         uncertain_start = BACKGROUND.index("async function submitUncertain")
@@ -784,7 +796,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         product_start = CONTENT.index("async function handleProduct(activeJob)")
         product_end = CONTENT.index("async function handleAddClicked(activeJob)", product_start)
         product = CONTENT[product_start:product_end]
-        self.assertIn("const useSubscribeAndSave = Boolean(snsIsCheaper);", product)
+        self.assertIn("let useSubscribeAndSave = Boolean(snsIsCheaper);", product)
         self.assertIn("{ requireCartAdd: mixedAsinAfterVariant }", product)
         self.assertIn('"subscribe-save-cart"', product)
         self.assertNotIn("Subscribe & Save skipped", product)
