@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-post-protection-place-order-v80";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-unplaced-submit-reset-v81";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -173,7 +173,10 @@ async function setWindowJob(windowId, activeJob, options = {}) {
   const allowedSubmittedCleanup = options.allowSubmittedCleanup === true
     && activeJob?.stage === "cleanup_after_failure"
     && activeJob?.cleanupAfterFailure === true;
-  if (sameGroup && orderSubmitStarted(current) && !orderSubmitStarted(activeJob) && !allowedSubmittedCleanup) {
+  const allowedSubmittedReset = options.allowSubmittedReset === true
+    && activeJob?.stage === "product"
+    && activeJob?.resetUnplacedSubmit === true;
+  if (sameGroup && orderSubmitStarted(current) && !orderSubmitStarted(activeJob) && !allowedSubmittedCleanup && !allowedSubmittedReset) {
     return;
   }
   if (windowId && activeJob) {
@@ -1874,11 +1877,38 @@ async function resetDuplicateFulfilment(windowId) {
       line_ids: activeJob.job.line_ids || [],
     }),
   });
+  activeJob.job = {
+    ...activeJob.job,
+    amazon_status: "",
+    submitted_to_amazon: false,
+    items: (activeJob.job.items || []).map((item) => ({
+      ...item,
+      amazon_status: "",
+      submitted_to_amazon: false,
+    })),
+  };
   activeJob.duplicateOrder = null;
   activeJob.paused = false;
   activeJob.pausedStage = null;
-  activeJob.stage = "checkout";
-  await setWindowJob(windowId, activeJob);
+  activeJob.stage = "product";
+  activeJob.itemIndex = 0;
+  activeJob.cartCleared = false;
+  activeJob.resetUnplacedSubmit = true;
+  for (const key of [
+    "amazonSubmittedAt",
+    "placeOrderClickStartedAt",
+    "orderHistoryLookupStartedAt",
+    "amazonConfirmationUrl",
+    "reportedOrderId",
+    "reportAttemptedAt",
+    "lastError",
+  ]) delete activeJob[key];
+  await setWindowJob(windowId, activeJob, { allowSubmittedReset: true, reason: "reset_unplaced_submit" });
+  const targetTabId = await navigateWindowToCart(windowId);
+  activeJob.targetTabId = targetTabId;
+  delete activeJob.resetUnplacedSubmit;
+  await setWindowJob(windowId, activeJob, { reason: "restart_reset_unplaced_submit" });
+  await injectActiveAmazonTabInWindow(windowId);
   await log(result.message || `Cleared existing Amazon order for ${activeJob.job.group_key}.`, windowId);
   return result;
 }

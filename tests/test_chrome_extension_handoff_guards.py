@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.101")
+        self.assertEqual(MANIFEST["version"], "0.1.102")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -363,6 +363,21 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('activeJob.pausedStage = "find_order_id";', history)
         self.assertIn("the queue will not continue", history)
         self.assertNotIn("location.reload()", history)
+        self.assertIn("Reset and retry unplaced order", history)
+        self.assertIn('type: "RESET_DUPLICATE_FULFILMENT"', history)
+
+    def test_unplaced_submit_reset_clears_server_and_local_submit_markers(self) -> None:
+        reset_start = BACKGROUND.index("async function resetDuplicateFulfilment(windowId)")
+        reset_end = BACKGROUND.index("async function releaseStoredJob", reset_start)
+        reset = BACKGROUND[reset_start:reset_end]
+        self.assertIn("/reset-fulfilment", reset)
+        self.assertIn('amazon_status: ""', reset)
+        self.assertIn("submitted_to_amazon: false", reset)
+        self.assertIn('activeJob.stage = "product";', reset)
+        self.assertIn("activeJob.itemIndex = 0;", reset)
+        self.assertIn("activeJob.cartCleared = false;", reset)
+        self.assertIn("await navigateWindowToCart(windowId)", reset)
+        self.assertIn("allowSubmittedReset: true", reset)
 
     def test_background_uncertain_submit_never_releases_or_cleans_queue(self) -> None:
         uncertain_start = BACKGROUND.index("async function submitUncertain")
