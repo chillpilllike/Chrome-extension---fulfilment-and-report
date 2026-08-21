@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-single-worker-tab-v74";
+const CONTENT_SCRIPT_BUILD = "2026-08-22-native-delivery-radio-v75";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5253,6 +5253,47 @@ function deliveryRadioContext(radio) {
   };
 }
 
+function deliveryRadioSelectionMatches(context) {
+  const expectedId = String(context?.radio?.id || "");
+  const expectedName = String(context?.radio?.name || "");
+  const expectedValue = String(context?.radio?.value || "");
+  return [...document.querySelectorAll("input[type='radio']:checked")].some((radio) => (
+    expectedId && radio.id === expectedId
+  ) || (
+    expectedName && expectedValue && radio.name === expectedName && String(radio.value || "") === expectedValue
+  ));
+}
+
+function currentDeliveryRadio(context) {
+  const id = String(context?.radio?.id || "");
+  if (id) {
+    const byId = document.getElementById(id);
+    if (byId?.matches?.("input[type='radio']")) return byId;
+  }
+  const name = String(context?.radio?.name || "");
+  const value = String(context?.radio?.value || "");
+  return [...document.querySelectorAll("input[type='radio']")].find((radio) => (
+    !radio.disabled && name && value && radio.name === name && String(radio.value || "") === value
+  )) || null;
+}
+
+async function clickDeliveryRadioContext(context, label) {
+  const nativeRadio = currentDeliveryRadio(context);
+  if (nativeRadio && visible(nativeRadio)) {
+    await clickElement(nativeRadio, label, { preClickDelayMs: 100, delayMs: 350 });
+    if (await waitUntil(() => deliveryRadioSelectionMatches(context), 5000, 150)) return true;
+  }
+
+  const refreshed = currentDeliveryRadio(context);
+  const fallbackContext = refreshed ? deliveryRadioContext(refreshed) : context;
+  const fallback = fallbackContext?.control;
+  if (fallback && fallback !== refreshed && visible(fallback)) {
+    await clickElement(fallback, `${label} label`, { preClickDelayMs: 100, delayMs: 350 });
+    if (await waitUntil(() => deliveryRadioSelectionMatches(context), 5000, 150)) return true;
+  }
+  return deliveryRadioSelectionMatches(context);
+}
+
 function checkoutOffersOnePercentDeliveryReward() {
   const text = normalizedText(document.body?.innerText || document.body?.textContent || "");
   return /(?:earn|earning|get|receive|additional|extra)[^.]{0,160}1%[^.]{0,160}(?:back|reward|rewards)/i.test(text)
@@ -5605,7 +5646,7 @@ async function ensurePreferredAmazonDayWeekdayDelivery(activeJob) {
     selected_option_text: selectedDeliveryRadioContext()?.text || "",
     replacement_option_text: option.text,
   });
-  await clickElement(option.control, "consolidated Amazon Day weekday delivery option");
+  await clickDeliveryRadioContext(option, "consolidated Amazon Day weekday delivery option");
   const confirmed = await waitUntil(preferredAmazonDayWeekdaySelected, 12000, 300);
   if (!confirmed) {
     await pauseForManualCheckout(
@@ -5644,7 +5685,7 @@ async function ensureWarehouseOpenDayDelivery(activeJob) {
     replacement_option_text: weekdayOption.text,
     replacement_is_amazon_day: isAmazonDayDeliveryContext(weekdayOption),
   });
-  await clickElement(weekdayOption.control, "consolidated Monday-Friday delivery option");
+  await clickDeliveryRadioContext(weekdayOption, "consolidated Monday-Friday delivery option");
   const confirmed = await waitUntil(consolidatedWeekdayDeliverySelected, 12000, 300);
   if (!confirmed) {
     await pauseForManualCheckout(
@@ -5711,7 +5752,7 @@ async function ensureFreeNextDayDelivery(activeJob, brooklynDay) {
     null,
     null,
   );
-  await clickElement(nextDay.control, "free next-day delivery option");
+  await clickDeliveryRadioContext(nextDay, "free next-day delivery option");
   // Amazon replaces the delivery-option markup after selection.  Re-query the
   // checked radio instead of reading `.checked` from the label/control or a
   // detached pre-click radio node.
@@ -5773,7 +5814,7 @@ async function ensureRewardedLaterDelivery(activeJob) {
     option_count: rewardOption.optionCount,
     option_text: rewardOption.text,
   });
-  await clickElement(rewardOption.control, "later delivery option with 1% reward");
+  await clickDeliveryRadioContext(rewardOption, "later delivery option with 1% reward");
   const selected = await waitUntil(rewardedLaterDeliverySelected, 12000, 300);
   if (!selected) {
     await pauseForManualCheckout(

@@ -46,7 +46,22 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.95")
+        self.assertEqual(MANIFEST["version"], "0.1.96")
+
+    def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
+        helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
+        helper_end = CONTENT.index("function checkoutOffersOnePercentDeliveryReward", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        self.assertIn("const nativeRadio = currentDeliveryRadio(context);", helper)
+        self.assertIn("await clickElement(nativeRadio, label", helper)
+        self.assertIn("deliveryRadioSelectionMatches(context)", helper)
+        self.assertLess(helper.index("clickElement(nativeRadio"), helper.index("clickElement(fallback"))
+        self.assertNotIn('clickElement(option.control, "consolidated Amazon Day weekday delivery option")', CONTENT)
+        self.assertNotIn('clickElement(weekdayOption.control, "consolidated Monday-Friday delivery option")', CONTENT)
+        self.assertIn('clickDeliveryRadioContext(option, "consolidated Amazon Day weekday delivery option")', CONTENT)
+        self.assertIn('clickDeliveryRadioContext(weekdayOption, "consolidated Monday-Friday delivery option")', CONTENT)
+        self.assertIn('clickDeliveryRadioContext(nextDay, "free next-day delivery option")', CONTENT)
+        self.assertIn('clickDeliveryRadioContext(rewardOption, "later delivery option with 1% reward")', CONTENT)
 
     def test_only_the_designated_amazon_tab_can_run_a_job(self) -> None:
         self.assertIn("activeJob.targetTabId = targetTabId", BACKGROUND)
