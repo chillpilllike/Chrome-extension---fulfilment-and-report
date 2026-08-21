@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-21-dual-account-checkout-v65";
+const CONTENT_SCRIPT_BUILD = "2026-08-21-consumer-six-month-frequency-v66";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -2657,7 +2657,12 @@ function findSubscribeAndSaveRadio(root = null) {
 async function configureSubscribeAndSaveDelivery() {
   showPanel("Nutricity fulfilment", "Checking Subscribe & Save delivery preferences.", null, null);
   await chooseSubscribeSoonerDelivery();
-  await chooseSubscribeFrequencySixMonths();
+  const frequencyConfigured = await chooseSubscribeFrequencySixMonths();
+  if (!frequencyConfigured) {
+    const error = new Error("Subscribe & Save is selected, but Amazon did not confirm a six-month delivery frequency. Fulfilment paused before adding the subscription to cart.");
+    error.failureCode = "";
+    throw error;
+  }
 }
 
 async function chooseSubscribeSoonerDelivery() {
@@ -2684,6 +2689,21 @@ async function chooseSubscribeSoonerDelivery() {
 
 async function chooseSubscribeFrequencySixMonths() {
   showPanel("Subscribe & Save", "Opening delivery every dropdown.", null, null);
+  if (subscribeFrequencyIsSixMonths()) return true;
+  const popoverTrigger = [
+    document.querySelector("#replenishment-onml-frequency-trigger"),
+    document.querySelector("#replenishment-sns-frequency-trigger"),
+  ].find(visible);
+  if (popoverTrigger) {
+    await clickElement(popoverTrigger, "Subscribe & Save delivery schedule popover");
+    const sixMonthOption = await waitUntil(findSixMonthSubscribeFrequencyPopoverOption, 5000, 150);
+    if (!sixMonthOption) return false;
+    showPanel("Subscribe & Save", "Selecting delivery every 6 months.", null, null);
+    await clickElement(sixMonthOption, "Subscribe & Save 6 months schedule");
+    const confirmed = await waitUntil(subscribeFrequencyIsSixMonths, 5000, 150);
+    if (confirmed) await waitForStableDom(700, 5000);
+    return confirmed;
+  }
   const nativeFrequency = [...document.querySelectorAll("#snsAccordionRowMiddle select, #snsAccordionRow select, #snsAccordionRowContent select, #reinvent_price_desktop_snsAccordionRowMiddle select")]
     .find((select) => [...select.options || []].some((option) => /\b(weeks?|months?)\b/i.test(option.textContent || "") || /\d+[WM]\|sns/i.test(String(option.value || ""))));
   const nativeContainerButton = nativeFrequency?.closest?.(".a-dropdown-container")?.querySelector?.(".a-button-dropdown, [data-action='a-dropdown-button']");
@@ -2697,8 +2717,49 @@ async function chooseSubscribeFrequencySixMonths() {
   const selectedText = (frequencyOption.textContent || "").replace(/\s+/g, " ").trim();
   showPanel("Subscribe & Save", `Selecting delivery every ${selectedText}.`, null, null);
   await clickElement(frequencyOption, `Subscribe & Save ${selectedText} schedule`);
-  await waitForStableDom(700, 5000);
-  return true;
+  const confirmed = await waitUntil(subscribeFrequencyIsSixMonths, 5000, 150);
+  if (confirmed) await waitForStableDom(700, 5000);
+  return confirmed;
+}
+
+function findSixMonthSubscribeFrequencyPopoverOption() {
+  const candidates = [
+    ...document.querySelectorAll(
+      [
+        "[data-frequency-value^='6M|onml']",
+        "[data-frequency-value^='6M|sns']",
+        "[data-frequency-label='6 months']",
+        "#onmlFrequencyAccordionRow-10",
+        "#snsFrequencyAccordionRow-10",
+      ].join(", "),
+    ),
+  ];
+  const row = candidates.find((element) => {
+    const inOpenPopover = element.closest(".a-popover-wrapper, .a-popover-inner, [role='dialog']");
+    return visible(element) && Boolean(inOpenPopover);
+  });
+  if (!row) return null;
+  return row.querySelector("[data-action='a-accordion'][role='button'], a, button") || row;
+}
+
+function subscribeFrequencyIsSixMonths() {
+  const visibleTrigger = [
+    document.querySelector("#replenishment-onml-frequency-trigger"),
+    document.querySelector("#replenishment-sns-frequency-trigger"),
+    document.querySelector("#rcxOrdFreqSns-announce"),
+    document.querySelector("#rcxOrdFreqSns"),
+  ].find(visible);
+  const triggerText = normalizedText(visibleTrigger?.innerText || visibleTrigger?.textContent || "");
+  if (/\b6\s*months?\b/.test(triggerText)) return true;
+
+  const valueInput = document.querySelector("input[id*='recurringDelivery'][id*='frequency'][id$='[value]']");
+  const unitInput = document.querySelector("input[id*='recurringDelivery'][id*='frequency'][id$='[unit]']");
+  if (String(valueInput?.value || "") === "6" && String(unitInput?.value || "").toUpperCase() === "M") return true;
+
+  return [
+    document.querySelector("#onmlFrequencySelectedIndex"),
+    document.querySelector("#snsFrequencySelectedIndex"),
+  ].some((input) => String(input?.value || "") === "10");
 }
 
 async function selectNativeSubscribeFrequency(select) {
@@ -2711,8 +2772,9 @@ async function selectNativeSubscribeFrequency(select) {
   select.value = target.value;
   select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
   select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-  await waitForStableDom(700, 5000);
-  return true;
+  const confirmed = await waitUntil(subscribeFrequencyIsSixMonths, 5000, 150);
+  if (confirmed) await waitForStableDom(700, 5000);
+  return confirmed;
 }
 
 function findSubscribeFrequencyDropdownButton() {

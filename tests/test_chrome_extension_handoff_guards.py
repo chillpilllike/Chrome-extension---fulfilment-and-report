@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.86")
+        self.assertEqual(MANIFEST["version"], "0.1.87")
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -577,6 +577,25 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         quantity_guard = CONTENT[quantity_start:quantity_end]
         self.assertIn('"select#rcxsubsQuan"', quantity_guard)
         self.assertIn('"select[name=\'rcxsubsQuan\']"', quantity_guard)
+
+    def test_consumer_frequency_popover_selects_and_verifies_six_months(self) -> None:
+        chooser_start = CONTENT.index("async function chooseSubscribeFrequencySixMonths()")
+        chooser_end = CONTENT.index("function findSubscribeFrequencyDropdownButton()", chooser_start)
+        chooser = CONTENT[chooser_start:chooser_end]
+        self.assertIn('document.querySelector("#replenishment-onml-frequency-trigger")', chooser)
+        self.assertIn('"[data-frequency-value^=\'6M|onml\']"', chooser)
+        self.assertIn('"#onmlFrequencyAccordionRow-10"', chooser)
+        self.assertIn("waitUntil(subscribeFrequencyIsSixMonths", chooser)
+        self.assertIn('String(valueInput?.value || "") === "6"', chooser)
+        self.assertIn('String(unitInput?.value || "").toUpperCase() === "M"', chooser)
+
+    def test_subscription_cart_add_requires_confirmed_six_month_frequency(self) -> None:
+        configure_start = CONTENT.index("async function configureSubscribeAndSaveDelivery()")
+        configure_end = CONTENT.index("async function chooseSubscribeSoonerDelivery()", configure_start)
+        configure = CONTENT[configure_start:configure_end]
+        self.assertIn("const frequencyConfigured = await chooseSubscribeFrequencySixMonths();", configure)
+        self.assertIn("if (!frequencyConfigured)", configure)
+        self.assertIn("paused before adding the subscription to cart", configure)
 
     def test_account_detection_does_not_use_consumer_footer_marketing(self) -> None:
         detector_start = CONTENT.index("function amazonAccountExperience()")
