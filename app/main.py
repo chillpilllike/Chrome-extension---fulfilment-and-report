@@ -13802,6 +13802,28 @@ def resolve_payment_failure_for_order(conn: Any, amazon_order_id: str, now: Opti
     return int(getattr(cursor, "rowcount", 0) or 0)
 
 
+def resolve_payment_failure_and_clear_dispatch(conn: Any, amazon_order_id: str, now: Optional[str] = None) -> int:
+    order_id = clean_text(amazon_order_id)
+    if not order_id:
+        return 0
+    resolved = resolve_payment_failure_for_order(conn, order_id, now)
+    if not resolved:
+        return 0
+    dispatch_clear_packages_for_amazon_order(conn, order_id)
+    failure_row = conn.execute(
+        "SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?",
+        (order_id,),
+    ).fetchone()
+    if failure_row:
+        _TYPESENSE_INDEX_EXECUTOR.submit(
+            lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync(
+                "amazon_payment_failures",
+                payment_failure_search_document(snapshot),
+            )
+        )
+    return resolved
+
+
 def cleanup_stale_payment_failures(conn: Any, amazon_order_id: str = "") -> int:
     order_id = clean_text(amazon_order_id)
     params: list[Any] = []
@@ -13815,24 +13837,33 @@ def cleanup_stale_payment_failures(conn: Any, amazon_order_id: str = "") -> int:
         FROM amazon_payment_failures f
         WHERE f.status='open'
           {order_filter}
-          AND EXISTS (
-              SELECT 1
-              FROM order_lines ol
-              WHERE ol.amazon_order_id=f.amazon_order_id
-                AND (
-                    LOWER(COALESCE(ol.tracking_status, '')) IN ('delivered', 'shipped', 'ordered')
-                    OR ol.state='delivered'
-                    OR COALESCE(ol.tracking_payload, '') NOT IN ('', '[]')
-                )
-          )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM order_lines ol
-              WHERE ol.amazon_order_id=f.amazon_order_id
-                AND (
-                    ol.tracking_status='Payment revision needed'
-                    OR ol.last_error='Payment revision needed. Please update your payment method.'
-                )
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM order_lines ol
+                  WHERE ol.amazon_cancelled_order_id=f.amazon_order_id
+              )
+              OR (
+                  EXISTS (
+                      SELECT 1
+                      FROM order_lines ol
+                      WHERE ol.amazon_order_id=f.amazon_order_id
+                        AND (
+                            LOWER(COALESCE(ol.tracking_status, '')) IN ('delivered', 'shipped', 'ordered')
+                            OR ol.state='delivered'
+                            OR COALESCE(ol.tracking_payload, '') NOT IN ('', '[]')
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM order_lines ol
+                      WHERE ol.amazon_order_id=f.amazon_order_id
+                        AND (
+                            ol.tracking_status='Payment revision needed'
+                            OR ol.last_error='Payment revision needed. Please update your payment method.'
+                        )
+                  )
+              )
           )
         """,
         params,
@@ -13843,11 +13874,7 @@ def cleanup_stale_payment_failures(conn: Any, amazon_order_id: str = "") -> int:
         current_order_id = clean_text(row.get("amazon_order_id"))
         if not current_order_id:
             continue
-        cleaned += resolve_payment_failure_for_order(conn, current_order_id, now)
-        dispatch_clear_packages_for_amazon_order(conn, current_order_id)
-        failure_row = conn.execute("SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?", (current_order_id,)).fetchone()
-        if failure_row:
-            _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync("amazon_payment_failures", payment_failure_search_document(snapshot)))
+        cleaned += resolve_payment_failure_and_clear_dispatch(conn, current_order_id, now)
     if cleaned:
         fast_page_cache_clear_matching({
             "dispatch-sorting-summary",
@@ -13855,6 +13882,7 @@ def cleanup_stale_payment_failures(conn: Any, amazon_order_id: str = "") -> int:
             "dispatch-status",
             "dispatch-status-summary",
             "tracking-orders",
+            "payment-failures",
         })
     return cleaned
 
@@ -13915,6 +13943,16 @@ def payment_failure_rows(store_id: Optional[int] = None, page: int = 1, per_page
     if status and status != "all":
         where.append("status=?")
         params.append(status)
+    if status == "open":
+        where.append(
+            """
+            NOT EXISTS (
+                SELECT 1
+                FROM order_lines ol
+                WHERE ol.amazon_cancelled_order_id=amazon_payment_failures.amazon_order_id
+            )
+            """
+        )
     where_sql = " AND ".join(where) if where else "1=1"
     with db() as conn:
         rows = rows_to_dicts(
@@ -32190,6 +32228,27 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     bool(line_delivered),
                 ),
             )
+            resolved_payment_failure = resolve_payment_failure_for_order(conn, amazon_order_id, now)
+            if resolved_payment_failure:
+                failure_row = conn.execute(
+                    "SELECT * FROM amazon_payment_failures WHERE amazon_order_id=?",
+                    (amazon_order_id,),
+                ).fetchone()
+                if failure_row:
+                    _TYPESENSE_INDEX_EXECUTOR.submit(
+                        lambda snapshot=row_to_dict(failure_row) or {}: _index_named_document_sync(
+                            "amazon_payment_failures",
+                            payment_failure_search_document(snapshot),
+                        )
+                    )
+                fast_page_cache_clear_matching({
+                    "dispatch-sorting-summary",
+                    "dispatch-sorting-summary-base",
+                    "dispatch-status",
+                    "dispatch-status-summary",
+                    "tracking-orders",
+                    "payment-failures",
+                })
             if cursor.rowcount <= 0:
                 refreshed_packages, affected_line_ids = refresh_dispatch_packages_from_tracking(
                     conn,
@@ -32331,6 +32390,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 "updated": cursor.rowcount + related_updated,
                 "tracking_status": status,
                 "dispatch_packages_updated": refreshed_packages + related_packages,
+                "payment_failure_resolved": bool(resolved_payment_failure),
             }
         rows = []
         for attempt in range(2):
@@ -32466,11 +32526,23 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
                     if updated_row:
                         index_order_line(updated_row)
+                payment_failure_resolved = bool(
+                    resolve_payment_failure_and_clear_dispatch(conn, amazon_order_id, now)
+                )
+                fast_page_cache_clear_matching({
+                    "dispatch-sorting-summary",
+                    "dispatch-sorting-summary-base",
+                    "dispatch-status",
+                    "dispatch-status-summary",
+                    "tracking-orders",
+                    "payment-failures",
+                })
                 return {
                     "ok": True,
                     "updated": 0,
                     "ignored": True,
                     "tracking_status": "Older Amazon cancellation ignored",
+                    "payment_failure_resolved": payment_failure_resolved,
                     "message": f"Ignored cancelled historical Amazon order {amazon_order_id}; current/latest fulfilment was kept.",
                 }
             history_updated, history_packages = update_history_matched_order_from_tracking(
@@ -32592,8 +32664,25 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     updated_rows.append(updated_row)
             for updated_row in updated_rows:
                 index_order_line(updated_row)
+            payment_failure_resolved = bool(
+                resolve_payment_failure_and_clear_dispatch(conn, amazon_order_id, now)
+            )
+            fast_page_cache_clear_matching({
+                "dispatch-sorting-summary",
+                "dispatch-sorting-summary-base",
+                "dispatch-status",
+                "dispatch-status-summary",
+                "tracking-orders",
+                "payment-failures",
+            })
             threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
-            return {"ok": True, "updated": len(updated_rows), "tracking_status": "Amazon cancelled", "order_cancelled": True}
+            return {
+                "ok": True,
+                "updated": len(updated_rows),
+                "tracking_status": "Amazon cancelled",
+                "order_cancelled": True,
+                "payment_failure_resolved": payment_failure_resolved,
+            }
         if payload_has_payment_revision(payload):
             now = utc_now()
             message = "Payment revision needed. Please update your payment method."
@@ -32664,6 +32753,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 "dispatch-status",
                 "dispatch-status-summary",
                 "tracking-orders",
+                "payment-failures",
             })
             send_email_alert_async(
                 f"Amazon payment revision needed: {amazon_order_id}",
@@ -32681,6 +32771,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 "dispatch-status",
                 "dispatch-status-summary",
                 "tracking-orders",
+                "payment-failures",
             })
         updated = 0
         updated_rows_for_index = []
@@ -32934,6 +33025,7 @@ def api_tracking_payment_failure_resolve(amazon_order_id: str) -> dict[str, Any]
         "dispatch-sorting-summary-base",
         "dispatch-status",
         "dispatch-status-summary",
+        "payment-failures",
     })
     return {"ok": True, "message": f"Marked payment issue resolved for {amazon_order_id}. Removed {removed_scan_rows} stale dispatch scan row(s)."}
 
