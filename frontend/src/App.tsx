@@ -1948,7 +1948,7 @@ function loadOrderColumns() {
   }
 }
 
-function formatDateTime(value?: string, options: { timeZone?: string; showTimeZone?: boolean } = {}) {
+function formatDateTime(value?: string, options: { timeZone?: string; showTimeZone?: boolean; weekday?: "long" | "short" } = {}) {
   if (!value) return ""
   const normalized = value.includes("T") ? value : value.replace(" ", "T")
   const hasTime = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(normalized)
@@ -1960,10 +1960,15 @@ function formatDateTime(value?: string, options: { timeZone?: string; showTimeZo
     year: "numeric",
     month: "short",
     day: "2-digit",
+    ...(options.weekday ? { weekday: options.weekday } : {}),
     hour: "2-digit",
     minute: "2-digit",
     ...(options.showTimeZone ? { timeZoneName: "short" as const } : {}),
   })
+}
+
+function formatPackageTrackerDateTime(value?: string) {
+  return formatDateTime(value, { weekday: "long" })
 }
 
 function formatDispatchDateTime(value?: string) {
@@ -9456,7 +9461,7 @@ function PackageTrackerDesignPage() {
                             <div className="package-tracker-package-quick">
                               <div>
                                 <span>{item.delivered_at ? "Delivered" : "Expected"}</span>
-                                <strong>{item.delivered_at ? formatDateTime(item.delivered_at) : item.expected_at ? formatDateTime(item.expected_at) : "No estimate"}</strong>
+                                <strong>{item.delivered_at ? formatPackageTrackerDateTime(item.delivered_at) : item.expected_at ? formatPackageTrackerDateTime(item.expected_at) : "No estimate"}</strong>
                                 <small>{item.tracking_id || item.amazon_order_id}</small>
                               </div>
                               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => togglePackage(packageKey)} aria-expanded={packageExpanded}>
@@ -9485,7 +9490,7 @@ function PackageTrackerDesignPage() {
                               </div>
                               <div className="col-6 col-lg-3">
                                 <div className="text-secondary fw-bold">Delivered / ETA</div>
-                                <strong>{item.delivered_at ? formatDateTime(item.delivered_at) : item.expected_at ? formatDateTime(item.expected_at) : "No estimate"}</strong>
+                                <strong>{item.delivered_at ? formatPackageTrackerDateTime(item.delivered_at) : item.expected_at ? formatPackageTrackerDateTime(item.expected_at) : "No estimate"}</strong>
                               </div>
                               <div className="col-6 col-lg-3">
                                 <div className="text-secondary fw-bold">Dispatch</div>
@@ -9531,7 +9536,7 @@ function PackageTrackerDesignPage() {
                 <span className="text-secondary small">Synced {formatDateTime(row.shopify_synced_at)}</span>
                 <span className="text-secondary small ms-md-auto">{summary.fullyDelivered
                   ? daysSinceDelivered === null ? "Full delivery date not recorded" : `${daysSinceDelivered} day${daysSinceDelivered === 1 ? "" : "s"} since full delivery`
-                  : `Next delivery ${summary.nextExpectedAt ? formatDateTime(summary.nextExpectedAt) : "not estimated"}`}</span>
+                  : `Next delivery ${summary.nextExpectedAt ? formatPackageTrackerDateTime(summary.nextExpectedAt) : "not estimated"}`}</span>
                 {row.previous_orders.length > 0 && (
                   <button className="btn btn-outline-secondary btn-sm" type="button" onClick={() => toggleHistory(row.id)} aria-expanded={historyOpen}>
                     <ChevronDown className={`icon icon-1 ${historyOpen ? "rotate-180" : ""}`} />
