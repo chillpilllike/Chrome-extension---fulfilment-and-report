@@ -8,7 +8,8 @@ DOCKERFILE = (ROOT / "Dockerfile").read_text()
 
 class TrackingBrowserlessImageTests(unittest.TestCase):
     def test_production_image_installs_playwright_chromium(self) -> None:
-        self.assertIn("python -m playwright install --with-deps chromium", DOCKERFILE)
+        self.assertIn("python -m playwright install chromium", DOCKERFILE)
+        self.assertIn("libnss3", DOCKERFILE)
 
 
 if __name__ == "__main__":

@@ -556,7 +556,9 @@ function orderCardTrackingPackages(card, orderId) {
     .filter((link) => {
       const text = clean(link.textContent);
       const href = link.getAttribute("href") || "";
-      return /track package|tracking/i.test(text) || /ship-track|progress-tracker\/package/i.test(href);
+      const url = new URL(href, location.origin);
+      const trackingPath = /ship-track/i.test(url.pathname) || /\/progress-tracker\/package\/?$/i.test(url.pathname);
+      return trackingPath && (/track package|tracking/i.test(text) || url.searchParams.has("orderID") || url.searchParams.has("orderId"));
     });
   const packages = [];
   const seen = new Set();
@@ -859,7 +861,8 @@ async function parseOrderDetails() {
       const text = clean(link.textContent);
       const href = link.getAttribute("href") || "";
       const url = new URL(href, location.origin);
-      return url.searchParams.get("orderID") || url.searchParams.get("orderId") || /track package|tracking/i.test(text);
+      const trackingPath = /ship-track/i.test(url.pathname) || /\/progress-tracker\/package\/?$/i.test(url.pathname);
+      return trackingPath && (url.searchParams.get("orderID") || url.searchParams.get("orderId") || /track package|tracking/i.test(text));
     });
   const packages = [];
   const seen = new Set();

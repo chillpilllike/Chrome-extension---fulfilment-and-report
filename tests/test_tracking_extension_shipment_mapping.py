@@ -18,10 +18,13 @@ class TrackingExtensionShipmentMappingTests(unittest.TestCase):
         self.assertLess(helper.index("if (shipmentGrid) return shipmentGrid;"), helper.index("if (shipmentComponent) return shipmentComponent;"))
 
     def test_tracking_extension_version_was_bumped(self):
-        self.assertEqual(MANIFEST["version"], "0.1.69")
+        self.assertEqual(MANIFEST["version"], "0.1.70")
 
     def test_current_amazon_progress_tracker_links_are_parsed(self):
         self.assertGreaterEqual(CONTENT.count("a[href*='/progress-tracker/package']"), 2)
+
+    def test_progress_tracker_cancel_links_are_not_packages(self):
+        self.assertGreaterEqual(CONTENT.count(r"/\/progress-tracker\/package\/?$/i"), 2)
 
     def test_weekday_delivery_promises_are_resolved(self):
         start = CONTENT.index("function promiseDetails(text)")
