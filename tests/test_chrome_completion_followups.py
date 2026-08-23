@@ -1,8 +1,10 @@
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
 from types import SimpleNamespace
 
 from app.main import (
+    OdooClient,
     chrome_complete_followups,
     chrome_complete_shopify_followup,
     complete_chrome_job_from_exact_history_match,
@@ -62,13 +64,33 @@ class ChromeCompletionFollowupTests(unittest.TestCase):
         enqueue_note.assert_called_once()
         note_body = enqueue_note.call_args.args[4]
         self.assertIn("111-6417852-2612223", note_body)
-        self.assertIn("Verified item: B0FHMMH8Q4 × 1", note_body)
-        self.assertGreater(note_body.index("Amazon order link:"), note_body.index("Amazon account:"))
-        self.assertTrue(note_body.endswith("</a></p>"))
+        self.assertIn("<strong>Items:</strong><br>B0FHMMH8Q4 × 1", note_body)
+        self.assertIn("<strong>Amazon account:</strong> Sergey", note_body)
+        self.assertIn(">Open Amazon order</a>", note_body)
+        self.assertNotIn(">https://www.amazon.com", note_body)
+        self.assertTrue(note_body.endswith("Open Amazon order</a></p>"))
         sync_tags.assert_called_once_with({(1, 23257)})
         write_report.assert_called_once_with(1)
         enqueue_shopify.assert_not_called()
         self.assertTrue(confirmed)
+
+    def test_odoo_posts_generated_chatter_as_html_instead_of_escaped_tags(self) -> None:
+        client = OdooClient.__new__(OdooClient)
+        client.execute = Mock(return_value=True)
+
+        client.post_order_note(22949, "<p><strong>Amazon Chrome order placed: 111-2274073-4831420</strong></p>")
+
+        client.execute.assert_called_once_with(
+            "sale.order",
+            "message_post",
+            [[22949]],
+            {
+                "body": "<p><strong>Amazon Chrome order placed: 111-2274073-4831420</strong></p>",
+                "body_is_html": True,
+                "message_type": "comment",
+                "subtype_xmlid": "mail.mt_note",
+            },
+        )
 
     def test_existing_posted_chatter_note_is_confirmed_idempotently(self) -> None:
         rows = [{

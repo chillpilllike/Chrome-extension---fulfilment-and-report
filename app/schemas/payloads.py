@@ -261,6 +261,7 @@ class ChromeTrackingBrowserlessRunPayload(BaseModel):
     worker_id: str = ""
     store_id: Optional[int] = None
     max_orders: int = 0
+    amazon_order_ids: list[str] = Field(default_factory=list)
 
 
 class EpostBrowserlessRunPayload(BaseModel):

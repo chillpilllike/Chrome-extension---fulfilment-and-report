@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-21-cart-missing-retry-v62";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-preferences-hydration-v88";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -129,6 +129,23 @@ async function setWindowJob(windowId, activeJob, options = {}) {
   const key = String(windowId || "");
   const current = windowId ? next[key] || null : state.activeJob || null;
   const sameGroup = current?.job?.group_key && activeJob?.job?.group_key === current.job.group_key;
+  if (
+    sameGroup
+    && Number(current?.resetRevision || 0) > Number(activeJob?.resetRevision || 0)
+    && options.allowSubmittedReset !== true
+  ) {
+    await diagnosticLog(`Ignored stale pre-reset update for ${activeJob.job.group_key}.`, {
+      windowId,
+      activeJob: current,
+      level: "warn",
+      details: {
+        current_reset_revision: Number(current.resetRevision || 0),
+        incoming_reset_revision: Number(activeJob.resetRevision || 0),
+        reason: options.reason || "",
+      },
+    });
+    return;
+  }
   if (sameGroup && activeJobHasReportedOrderId(current)) {
     const currentAttemptedAt = Number(current.reportAttemptedAt || 0);
     const incomingAttemptedAt = Number(activeJob.reportAttemptedAt || 0);
@@ -173,7 +190,10 @@ async function setWindowJob(windowId, activeJob, options = {}) {
   const allowedSubmittedCleanup = options.allowSubmittedCleanup === true
     && activeJob?.stage === "cleanup_after_failure"
     && activeJob?.cleanupAfterFailure === true;
-  if (sameGroup && orderSubmitStarted(current) && !orderSubmitStarted(activeJob) && !allowedSubmittedCleanup) {
+  const allowedSubmittedReset = options.allowSubmittedReset === true
+    && activeJob?.stage === "product"
+    && activeJob?.resetUnplacedSubmit === true;
+  if (sameGroup && orderSubmitStarted(current) && !orderSubmitStarted(activeJob) && !allowedSubmittedCleanup && !allowedSubmittedReset) {
     return;
   }
   if (windowId && activeJob) {
@@ -876,7 +896,6 @@ function jobWasSubmittedToAmazon(job) {
 
 function activeJobBlocksNext(activeJob) {
   if (!activeJob?.job?.group_key) return false;
-  if (activeJob.stage === "cleanup_after_failure") return false;
   return true;
 }
 
@@ -955,13 +974,15 @@ async function blockingActiveJob(windowId = null) {
 }
 
 async function navigateWindowToCart(windowId) {
-  if (!windowId) return;
+  if (!windowId) return null;
   const tabs = await chrome.tabs.query({ windowId });
   const tab = tabs.find((item) => item.active) || tabs[0];
   if (tab?.id) {
     const updated = await chrome.tabs.update(tab.id, { url: "https://www.amazon.com/cart?ref_=sw_gtc", active: true });
     await injectContentScriptWhenReady(updated?.id || tab.id);
+    return updated?.id || tab.id;
   }
+  return null;
 }
 
 async function navigateWindowToProduct(windowId, asin) {
@@ -1112,7 +1133,9 @@ async function injectActiveAmazonTabInWindow(windowId) {
     windowId,
     url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"],
   });
-  const tab = tabs.find((item) => item.active) || tabs[0];
+  const { activeJob } = await getWindowState(windowId);
+  const preferredTabId = Number(activeJob?.targetTabId || 0) || null;
+  const tab = tabs.find((item) => item.id === preferredTabId) || tabs.find((item) => item.active) || tabs[0];
   if (!tab?.id) {
     await diagnosticLog("Could not find an Amazon tab in the active worker window.", {
       windowId,
@@ -1120,6 +1143,15 @@ async function injectActiveAmazonTabInWindow(windowId) {
       details: { window_id: windowId },
     });
     return false;
+  }
+  if (activeJob?.job?.group_key && activeJob.targetTabId !== tab.id) {
+    activeJob.targetTabId = tab.id;
+    await setWindowJob(windowId, activeJob, { reason: "bind_designated_worker_tab" });
+  }
+  for (const otherTab of tabs) {
+    if (!otherTab?.id || otherTab.id === tab.id) continue;
+    await injectContentScript(otherTab.id).catch(() => false);
+    await chrome.tabs.sendMessage(otherTab.id, { type: "NUTRICITY_DISABLE_NON_WORKER" }).catch(() => undefined);
   }
   const injected = await injectContentScriptWhenReady(tab.id);
   if (!injected) {
@@ -1260,16 +1292,18 @@ async function startNextJob(sourceWindowId = null) {
   const incognito = await windowIsIncognito(sourceWindowId);
   let createdWindow;
   let targetWindowId = null;
+  let targetTabId = null;
   const reusableAmazonTabs = sourceWindowId ? await amazonTabsInWindow(sourceWindowId) : [];
   try {
     if (reusableAmazonTabs.length) {
       targetWindowId = sourceWindowId;
-      await navigateWindowToCart(targetWindowId);
+      targetTabId = await navigateWindowToCart(targetWindowId);
       createdWindow = await chrome.windows.get(targetWindowId).catch(() => null);
       await log(`Reusing Amazon worker window ${targetWindowId} for ${job.group_key}.`, targetWindowId);
     } else {
       createdWindow = await createAmazonWorkerWindow(incognito);
       targetWindowId = createdWindow?.id || null;
+      targetTabId = createdWindow?.tabs?.[0]?.id || null;
     }
   } catch (error) {
     try {
@@ -1291,6 +1325,7 @@ async function startNextJob(sourceWindowId = null) {
   }
   const activeJob = activeJobFor(job, workerId, targetWindowId);
   activeJob.incognito = incognito;
+  activeJob.targetTabId = targetTabId;
   await setWindowJob(targetWindowId, activeJob);
   const injected = await injectActiveAmazonTabInWindow(targetWindowId);
   if (!injected) {
@@ -1433,7 +1468,10 @@ async function claimNextJobInWindow(windowId) {
   if (submittedRecovery?.activeJob) return submittedRecovery.activeJob;
   const { activeJob: currentJob } = await getWindowState(windowId);
   if (currentJob?.stage === "cleanup_after_failure" || currentJob?.cleanupAfterFailure) {
-    await setWindowJob(windowId, null);
+    await navigateWindowToCart(windowId);
+    await injectActiveAmazonTabInWindow(windowId);
+    await log(`Kept ${currentJob.job.group_key} active until its failed-order cart cleanup finishes.`, windowId);
+    return currentJob;
   }
   if (activeJobBlocksNext(currentJob)) {
     await log(`Kept ${currentJob.job.group_key}; current job is not closed yet.`, windowId);
@@ -1493,14 +1531,15 @@ async function claimNextJobInWindow(windowId) {
       throw new Error("Could not create a replacement Amazon worker window for the next queued order.");
     }
   }
-  const activeJob = activeJobFor(job, workerId, windowId);
-  activeJob.startedAfterPreviousJob = true;
   await log(`Started next ${job.group_key} with ${job.items.length} item(s); clearing Amazon cart before product add.`, windowId);
   // Do not publish the new job while the previous Amazon order-history page is
   // still alive. Its safety guard would correctly pause an unsubmitted job on
   // history, racing the navigation below and leaving the new server claim
   // stranded. Navigate first, then expose and explicitly wake the new job.
-  await navigateWindowToCart(windowId);
+  const targetTabId = await navigateWindowToCart(windowId);
+  const activeJob = activeJobFor(job, workerId, windowId);
+  activeJob.targetTabId = targetTabId;
+  activeJob.startedAfterPreviousJob = true;
   await setWindowJob(windowId, activeJob);
   await injectActiveAmazonTabInWindow(windowId);
   return activeJob;
@@ -1621,6 +1660,8 @@ async function recoverSubmittedJobInWindow(windowId) {
     amazonSubmittedAt: Date.now(),
     lastHeartbeatAt: Date.now(),
   };
+  const historyTabs = await amazonTabsInWindow(targetWindowId);
+  activeJob.targetTabId = historyTabs.find((tab) => tab.active)?.id || historyTabs[0]?.id || null;
   await setWindowJob(targetWindowId, activeJob);
   await injectActiveAmazonTabInWindow(targetWindowId);
   await log(`Recovered submitted ${job.group_key}; opened order history to look up Amazon order ID.`, targetWindowId);
@@ -1855,11 +1896,39 @@ async function resetDuplicateFulfilment(windowId) {
       line_ids: activeJob.job.line_ids || [],
     }),
   });
+  activeJob.job = {
+    ...activeJob.job,
+    amazon_status: "",
+    submitted_to_amazon: false,
+    items: (activeJob.job.items || []).map((item) => ({
+      ...item,
+      amazon_status: "",
+      submitted_to_amazon: false,
+    })),
+  };
   activeJob.duplicateOrder = null;
   activeJob.paused = false;
   activeJob.pausedStage = null;
-  activeJob.stage = "checkout";
-  await setWindowJob(windowId, activeJob);
+  activeJob.stage = "product";
+  activeJob.itemIndex = 0;
+  activeJob.cartCleared = false;
+  activeJob.resetUnplacedSubmit = true;
+  activeJob.resetRevision = Date.now();
+  for (const key of [
+    "amazonSubmittedAt",
+    "placeOrderClickStartedAt",
+    "orderHistoryLookupStartedAt",
+    "amazonConfirmationUrl",
+    "reportedOrderId",
+    "reportAttemptedAt",
+    "lastError",
+  ]) delete activeJob[key];
+  await setWindowJob(windowId, activeJob, { allowSubmittedReset: true, reason: "reset_unplaced_submit" });
+  const targetTabId = await navigateWindowToCart(windowId);
+  activeJob.targetTabId = targetTabId;
+  delete activeJob.resetUnplacedSubmit;
+  await setWindowJob(windowId, activeJob, { reason: "restart_reset_unplaced_submit" });
+  await injectActiveAmazonTabInWindow(windowId);
   await log(result.message || `Cleared existing Amazon order for ${activeJob.job.group_key}.`, windowId);
   return result;
 }
@@ -1952,6 +2021,7 @@ async function transferSubmittedJobToThankYouWindow(tab = {}) {
   const transferred = {
     ...source,
     targetWindowId: windowId,
+    targetTabId: tab.id || source.targetTabId || null,
     stage: orderId ? "complete_pending" : "find_order_id",
     paused: false,
     pausedStage: null,
@@ -2011,6 +2081,7 @@ async function recoverBlankThankYouTab(tab = {}) {
   latest.amazonSubmittedAt = latest.amazonSubmittedAt || Date.now();
   latest.thankYouUrlRecoveredAt = Date.now();
   latest.amazonConfirmationUrl = latest.amazonConfirmationUrl || tab.url || "";
+  latest.targetTabId = tab.id || latest.targetTabId || null;
   await setWindowJob(windowId, latest);
   await diagnosticLog("Background thank-you URL guard opened order history.", {
     windowId,
@@ -2316,13 +2387,21 @@ async function togglePause(windowId) {
   const nextPaused = !activeJob.paused;
   if (nextPaused) {
     activeJob.pausedStage = activeJob.stage || activeJob.pausedStage || "product";
+    activeJob.pausedByUser = true;
   } else if (activeJob.pausedStage) {
     activeJob.stage = activeJob.pausedStage;
     activeJob.pausedStage = null;
   }
+  if (!nextPaused) activeJob.pausedByUser = false;
   activeJob.paused = nextPaused;
   activeJob.pauseRevision = Date.now();
   await setWindowJob(windowId, activeJob);
+  if (!nextPaused) {
+    // Resume must always wake the active Amazon tab through the current build.
+    // This also replaces a stale content script after an unpacked-extension
+    // reload and avoids waiting for a background-tab polling interval.
+    await injectActiveAmazonTabInWindow(windowId);
+  }
   await log(`${activeJob.paused ? "Paused" : "Resumed"} ${activeJob.job.group_key}.`, windowId);
   return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
@@ -3005,6 +3084,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const state = await getSettings();
     const activeJob = tab.windowId ? state.activeJobsByWindow?.[String(tab.windowId)] : null;
     if (!activeJob?.job?.group_key) return;
+    if (activeJob.targetTabId && Number(activeJob.targetTabId) !== Number(tabId)) {
+      await injectContentScript(tabId);
+      await chrome.tabs.sendMessage(tabId, { type: "NUTRICITY_DISABLE_NON_WORKER" }).catch(() => undefined);
+      return;
+    }
+    if (!activeJob.targetTabId) {
+      activeJob.targetTabId = tabId;
+      await setWindowJob(tab.windowId, activeJob, { reason: "bind_worker_tab_after_navigation" });
+    }
     await injectContentScript(tabId);
   })().catch((error) => log(`Could not inject Nutricity content script after Amazon navigation: ${error.message}`, tab?.windowId || null));
 });
@@ -3026,6 +3114,23 @@ chrome.windows.onRemoved.addListener((windowId) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const windowId = messageWindowId(message, sender);
+    const senderTabId = Number(sender.tab?.id || 0) || null;
+    const senderIsAmazon = /^https:\/\/(?:www\.)?amazon\.com\//i.test(String(sender.tab?.url || ""));
+    const workerOnlyMessages = new Set([
+      "GET_ACTIVE_JOB", "RECOVER_SUBMITTED_JOB", "SET_ACTIVE_JOB", "HEARTBEAT_JOB",
+      "MARK_ORDER_SUBMITTED", "COMPLETE_JOB", "MARK_LINE_MISSING", "POST_SUBMIT_UNPLACED",
+      "SUBMIT_UNCERTAIN", "FAIL_JOB", "COSTLY_JOB", "CHECK_EXISTING_AMAZON_ORDER",
+      "CLAIM_NEXT_IN_WINDOW", "FINISH_CLEANUP_AND_CLAIM_NEXT",
+    ]);
+    if (senderIsAmazon && senderTabId && workerOnlyMessages.has(message.type)) {
+      const { activeJob: designatedJob } = await getWindowState(windowId);
+      if (designatedJob?.targetTabId && Number(designatedJob.targetTabId) !== senderTabId) {
+        if (["GET_ACTIVE_JOB", "RECOVER_SUBMITTED_JOB"].includes(message.type)) {
+          return { ok: true, activeJob: null, inactiveWorkerTab: true };
+        }
+        return { ok: false, ignored_non_worker_tab: true, message: "Ignored fulfilment message from a non-worker Amazon tab." };
+      }
+    }
     if (message.type === "FORCE_STOP_ALL") return forceStopAll(windowId);
     if (message.type === "FORCE_CLEAR_QUEUE") return forceClearQueue(windowId);
     if (message.type === "CLEAR_FORCE_STOP") {
@@ -3099,7 +3204,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === "RECOVER_SUBMITTED_JOB") {
       if (await forceStopActive()) return { ok: true, recovered: false, activeJob: null, forceStopped: true };
-      return recoverSubmittedJobInWindow(windowId);
+      const recovered = await recoverSubmittedJobInWindow(windowId);
+      if (senderIsAmazon && senderTabId && recovered?.activeJob?.targetTabId && Number(recovered.activeJob.targetTabId) !== senderTabId) {
+        return { ok: true, recovered: false, activeJob: null, inactiveWorkerTab: true };
+      }
+      return recovered;
     }
     if (message.type === "RUN_MISSING_ASIN_AVAILABILITY_CHECK") {
       if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; availability check stopped." };
@@ -3109,6 +3218,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "GET_ACTIVE_JOB") {
       if (await forceStopActive()) return { ok: true, activeJob: null, forceStopped: true };
       let { activeJob } = await getWindowState(windowId);
+      if (activeJob?.job && senderIsAmazon && senderTabId && !activeJob.targetTabId) {
+        activeJob.targetTabId = senderTabId;
+        await setWindowJob(windowId, activeJob, { reason: "bind_worker_tab_from_active_job_request" });
+      }
       if (!activeJob?.job && windowId) {
         const state = await getSettings();
         const globalJob = state.activeJob?.job?.group_key ? state.activeJob : null;
@@ -3117,6 +3230,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ));
         if (globalJob?.job && !groupAlreadyAttached) {
           globalJob.targetWindowId = windowId;
+          globalJob.targetTabId = senderIsAmazon ? senderTabId : null;
           await setWindowJob(windowId, globalJob);
           activeJob = globalJob;
           await log(`Reattached ${globalJob.job.group_key} to Amazon window ${windowId}.`, windowId);
@@ -3126,6 +3240,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const recovered = await recoverSubmittedJobInWindow(windowId);
         if (recovered?.activeJob) {
           activeJob = recovered.activeJob;
+          if (senderIsAmazon && senderTabId && activeJob.targetTabId && Number(activeJob.targetTabId) !== senderTabId) {
+            return { ok: true, activeJob: null, inactiveWorkerTab: true };
+          }
           return { ok: true, activeJob };
         }
       }

@@ -188,6 +188,18 @@ function promiseDetails(text) {
         year += 1;
         expected = new Date(year, monthIndex, day);
       }
+    } else {
+      const weekdayMatch = promise.match(/\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/i);
+      if (weekdayMatch) {
+        const targetDay = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(weekdayMatch[1].toLowerCase());
+        let dayOffset = targetDay - base.getDay();
+        if (/\bdelivered\b/i.test(promise)) {
+          if (dayOffset > 0) dayOffset -= 7;
+        } else if (dayOffset < 0) {
+          dayOffset += 7;
+        }
+        expected = new Date(base.getFullYear(), base.getMonth(), base.getDate() + dayOffset);
+      }
     }
   }
   return {
@@ -540,11 +552,13 @@ function orderCardItems(card) {
 }
 
 function orderCardTrackingPackages(card, orderId) {
-  const links = [...card.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track']")]
+  const links = [...card.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track'], a[href*='/progress-tracker/package']")]
     .filter((link) => {
       const text = clean(link.textContent);
       const href = link.getAttribute("href") || "";
-      return /track package|tracking/i.test(text) || /ship-track/i.test(href);
+      const url = new URL(href, location.origin);
+      const trackingPath = /ship-track/i.test(url.pathname) || /\/progress-tracker\/package\/?$/i.test(url.pathname);
+      return trackingPath && (/track package|tracking/i.test(text) || url.searchParams.has("orderID") || url.searchParams.has("orderId"));
     });
   const packages = [];
   const seen = new Set();
@@ -827,11 +841,14 @@ function productItemsFrom(root, limit = 50) {
 }
 
 function shipmentRootForTrackingLink(link) {
-  const shipmentComponent = link.closest("[data-component='shipments']");
-  if (shipmentComponent) return shipmentComponent;
   const rightGrid = link.closest("[data-component='shipmentsRightGrid'], [data-component='shipmentConnections']");
   const shipmentGrid = rightGrid?.closest(".a-fixed-right-grid-inner");
   if (shipmentGrid) return shipmentGrid;
+  // `data-component="shipments"` wraps every shipment on current Amazon
+  // order-detail pages. Using it first mixes every product into every tracking
+  // package. Prefer the one-track-link grid that owns the product section.
+  const shipmentComponent = link.closest("[data-component='shipments']");
+  if (shipmentComponent) return shipmentComponent;
   return link.closest(".a-box, [data-component='orderCard']") || document.body;
 }
 
@@ -839,12 +856,13 @@ async function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
   const paymentRevision = parsePaymentRevision();
   const cancellation = parseOrderCancellation();
-  const links = [...document.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track']")]
+  const links = [...document.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track'], a[href*='/progress-tracker/package']")]
     .filter((link) => {
       const text = clean(link.textContent);
       const href = link.getAttribute("href") || "";
       const url = new URL(href, location.origin);
-      return url.searchParams.get("orderID") || url.searchParams.get("orderId") || /track package|tracking/i.test(text);
+      const trackingPath = /ship-track/i.test(url.pathname) || /\/progress-tracker\/package\/?$/i.test(url.pathname);
+      return trackingPath && (url.searchParams.get("orderID") || url.searchParams.get("orderId") || /track package|tracking/i.test(text));
     });
   const packages = [];
   const seen = new Set();

@@ -2352,9 +2352,38 @@ body,
 
 .package-tracker-order-body { padding: .75rem .9rem; }
 
+.package-tracker-amazon-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: .35rem;
+    padding: .65rem .75rem;
+    border: 1px solid #e7ecf2;
+    border-radius: .4rem;
+    background: #f8fafc;
+}
+
+.package-tracker-amazon-summary span {
+    display: block;
+    margin-bottom: .1rem;
+    color: #7a8795;
+    font-size: .68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.package-tracker-amazon-summary strong {
+    color: #52606d;
+    font-size: .76rem;
+    white-space: nowrap;
+}
+
 .package-tracker-package-list {
-    margin-top: .4rem;
-    border-top: 1px solid #e7ecf2;
+    margin-top: .5rem;
+    border: 1px solid #e7ecf2;
+    border-radius: .4rem;
+    overflow: hidden;
 }
 
 .package-tracker-package {
@@ -2368,8 +2397,8 @@ body,
     position: absolute;
     top: .7rem;
     bottom: .7rem;
-    left: 0;
-    width: 3px;
+    left: .35rem;
+    width: 2px;
     border-radius: 999px;
     background: #206bc4;
     content: "";
@@ -2379,7 +2408,7 @@ body,
 .package-tracker-package.is-orange::before,
 .package-tracker-package.is-warning::before { background: #f59f00; }
 
-.package-tracker-package-body { padding: .8rem .65rem .8rem 1rem; }
+.package-tracker-package-body { padding: .75rem .75rem .75rem 1.05rem; }
 
 .package-tracker-package-quick {
     display: flex;

@@ -1,7 +1,13 @@
 import json
 import unittest
 
-from app.main import package_tracker_enforce_product_guard, package_tracker_single_package_history_products
+from app.main import (
+    package_tracker_enforce_product_guard,
+    package_tracker_fallback_asins_by_package,
+    package_tracker_history_products_by_package,
+    package_tracker_quantity_analysis,
+    package_tracker_single_package_history_products,
+)
 
 
 class PackageTrackerProductTests(unittest.TestCase):
@@ -55,6 +61,60 @@ class PackageTrackerProductTests(unittest.TestCase):
 
         self.assertFalse(guard["complete"])
         self.assertEqual(guard["unverified_amazon_orders"], ["111-2"])
+
+    def test_split_shipments_do_not_repeat_order_level_fallback_asins(self):
+        packages = [
+            {"id": 10, "package_index": 1, "amazon_order_id": "111-3", "asins_json": '["B000000001"]', "products_json": "[]"},
+            {"id": 11, "package_index": 2, "amazon_order_id": "111-3", "asins_json": '["B000000001"]', "products_json": "[]"},
+        ]
+        lines = [{"amazon_order_id": "111-3", "asin": "B000000001", "quantity": 1}]
+
+        allocations = package_tracker_fallback_asins_by_package(packages, lines, "111-3")
+
+        self.assertEqual(allocations, {10: ["B000000001"], 11: []})
+        analysis = package_tracker_quantity_analysis(lines, packages, {})
+        self.assertFalse(analysis["suspected_duplicate"])
+
+    def test_split_shipments_keep_repeated_asin_when_odoo_quantity_proves_two_units(self):
+        packages = [
+            {"id": 20, "package_index": 1, "amazon_order_id": "111-4", "asins_json": '["B000000002"]', "products_json": "[]"},
+            {"id": 21, "package_index": 2, "amazon_order_id": "111-4", "asins_json": '["B000000002"]', "products_json": "[]"},
+        ]
+        lines = [{"amazon_order_id": "111-4", "asin": "B000000002", "quantity": 2}]
+
+        allocations = package_tracker_fallback_asins_by_package(packages, lines, "111-4")
+
+        self.assertEqual(allocations, {20: ["B000000002"], 21: ["B000000002"]})
+
+    def test_amazon_history_items_map_one_to_one_to_empty_split_shipments(self):
+        packages = [
+            {"id": 30, "package_index": 1, "products_json": "[]"},
+            {"id": 31, "package_index": 2, "products_json": "[]"},
+        ]
+        history = {
+            "items_json": json.dumps([
+                {"asin": "B000000003", "title": "Shipment one"},
+                {"asin": "B000000004", "title": "Shipment two", "quantity": 2, "quantity_verified": True},
+            ])
+        }
+
+        allocations = package_tracker_history_products_by_package(packages, history)
+
+        self.assertEqual([product["asin"] for product in allocations[30]], ["B000000003"])
+        self.assertEqual([product["asin"] for product in allocations[31]], ["B000000004"])
+        self.assertEqual(allocations[31][0]["quantity"], 2)
+
+    def test_history_products_are_counted_once_across_split_shipments(self):
+        packages = [
+            {"id": 40, "package_index": 1, "amazon_order_id": "111-5", "asins_json": '["B000000005"]', "products_json": "[]"},
+            {"id": 41, "package_index": 2, "amazon_order_id": "111-5", "asins_json": '["B000000005"]', "products_json": "[]"},
+        ]
+        lines = [{"amazon_order_id": "111-5", "asin": "B000000005", "quantity": 1}]
+        history = {"111-5": {"items_json": '[{"asin":"B000000005","quantity_verified":true}]'}}
+
+        analysis = package_tracker_quantity_analysis(lines, packages, history)
+
+        self.assertFalse(analysis["suspected_duplicate"])
 
 
 if __name__ == "__main__":

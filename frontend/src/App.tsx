@@ -1948,7 +1948,7 @@ function loadOrderColumns() {
   }
 }
 
-function formatDateTime(value?: string, options: { timeZone?: string; showTimeZone?: boolean } = {}) {
+function formatDateTime(value?: string, options: { timeZone?: string; showTimeZone?: boolean; weekday?: "long" | "short" } = {}) {
   if (!value) return ""
   const normalized = value.includes("T") ? value : value.replace(" ", "T")
   const hasTime = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(normalized)
@@ -1960,10 +1960,15 @@ function formatDateTime(value?: string, options: { timeZone?: string; showTimeZo
     year: "numeric",
     month: "short",
     day: "2-digit",
+    ...(options.weekday ? { weekday: options.weekday } : {}),
     hour: "2-digit",
     minute: "2-digit",
     ...(options.showTimeZone ? { timeZoneName: "short" as const } : {}),
   })
+}
+
+function formatPackageTrackerDateTime(value?: string) {
+  return formatDateTime(value, { weekday: "long" })
 }
 
 function formatDispatchDateTime(value?: string) {
@@ -9263,6 +9268,7 @@ function PackageTrackerDesignPage() {
         const excessQuantity = duplicateItems.reduce((total, item) => total + Number(item.excess_quantity || 0), 0)
         const unassignedProducts = packageTrackerUnassignedProducts(row)
         const stuckPackages = row.packages.filter((item) => item.possibly_stuck)
+        const currentAmazonOrders = Array.from(new Map(row.packages.map((item) => [item.amazon_order_id, item.amazon_order_url])).entries())
         const renderedProductCount = new Set(row.packages.flatMap((item) => item.products.map((product) => `${item.amazon_order_id}:${product.asin}`))).size
         const productGuard = row.product_guard || {
           complete: renderedProductCount > 0,
@@ -9283,34 +9289,33 @@ function PackageTrackerDesignPage() {
                     {row.odoo_orders.map((order) => <a key={order.name} href={order.url} className="h3 m-0 text-reset">{order.name}</a>)}
                     <span className="text-secondary small text-break">Recipient: <strong className="text-body">{row.recipient}</strong></span>
                   </div>
+                  <div className="text-secondary small mt-1">
+                    {row.recipient_verified && productGuardComplete
+                      ? `${productGuard.expected_products} Amazon item${productGuard.expected_products === 1 ? "" : "s"} verified`
+                      : "Review the highlighted matching issue before dispatch"}
+                  </div>
                 </div>
                 <div className="d-flex flex-wrap align-items-center justify-content-md-end gap-1">
-                  <button
-                    className="btn btn-outline-primary btn-sm"
-                    type="button"
-                    onClick={() => syncOrderFulfilment(row)}
-                    disabled={syncingOrders.includes(row.id) || !productGuardComplete}
-                    title={productGuardComplete ? "Refresh Shopify fulfilment" : "Blocked until every associated product is displayed"}
-                  >
-                    <RefreshCw className={`icon icon-1 ${syncingOrders.includes(row.id) ? "icon-spin" : ""}`} />
-                    {syncingOrders.includes(row.id) ? "Syncing…" : "Sync fulfilment"}
-                  </button>
+                  {row.shopify_status !== "fulfilled" && (
+                    <button
+                      className="btn btn-outline-secondary btn-sm"
+                      type="button"
+                      onClick={() => syncOrderFulfilment(row)}
+                      disabled={syncingOrders.includes(row.id) || !productGuardComplete}
+                      title={productGuardComplete ? "Refresh Shopify fulfilment" : "Blocked until every associated product is displayed"}
+                    >
+                      <RefreshCw className={`icon icon-1 ${syncingOrders.includes(row.id) ? "icon-spin" : ""}`} />
+                      {syncingOrders.includes(row.id) ? "Syncing…" : "Sync Shopify"}
+                    </button>
+                  )}
                   <span className={`status status-${color}`}><span className="status-dot" />{packageTrackerStatusLabel(row)}</span>
-                  <span className={`badge ${row.recipient_verified ? "bg-green-lt text-green" : "bg-red-lt text-red"}`}>
-                    {row.recipient_verified ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
-                    {row.recipient_verified ? "Recipient verified" : "Check recipient"}
-                  </span>
-                  <span className={`badge ${productGuardComplete ? "bg-green-lt text-green" : "bg-red-lt text-red"}`}>
-                    {productGuardComplete ? <Check className="icon icon-1" /> : <AlertCircle className="icon icon-1" />}
-                    {productGuardComplete
-                      ? `Product guard · ${productGuard.expected_products}/${productGuard.expected_products} shown`
-                      : `BLOCKED · ${renderedProductCount}/${productGuard.expected_products} products shown`}
-                  </span>
+                  {!row.recipient_verified && <span className="badge bg-red-lt text-red"><AlertCircle className="icon icon-1" />Check recipient</span>}
+                  {!productGuardComplete && <span className="badge bg-red-lt text-red"><AlertCircle className="icon icon-1" />BLOCKED · {renderedProductCount}/{productGuard.expected_products} items</span>}
                   {duplicateItems.length > 0 && <span className="badge bg-orange-lt text-orange">Suspected duplicate · {excessQuantity} excess unit{excessQuantity === 1 ? "" : "s"}</span>}
-                  {asinMismatches.length > 0 && <span className="badge bg-red-lt text-red">ASIN mismatch · {asinMismatches.length}</span>}
-                  {unassignedProducts.length > 0 && <span className="badge bg-red-lt text-red">Incomplete shipment mapping</span>}
+                  {asinMismatches.length > 0 && <span className="badge bg-orange-lt text-orange">Amazon/Odoo item mismatch · {asinMismatches.length}</span>}
+                  {unassignedProducts.length > 0 && <span className="badge bg-orange-lt text-orange">Shipment assignment needed</span>}
                   {stuckPackages.length > 0 && <span className="badge bg-orange-lt text-orange">Possibly stuck · {stuckPackages.length} package{stuckPackages.length === 1 ? "" : "s"}</span>}
-                  <span className="text-secondary small">{summary.delivered}/{summary.active} delivered</span>
+                  <span className="text-secondary small">{summary.delivered} of {summary.active} packages delivered</span>
                 </div>
               </div>
               {syncResults[row.id] && <div className={`small mt-1 text-${syncResults[row.id].ok ? "green" : "red"}`}>{syncResults[row.id].message}</div>}
@@ -9372,6 +9377,16 @@ function PackageTrackerDesignPage() {
                 </div>
               )}
 
+              <div className="package-tracker-amazon-summary">
+                <div>
+                  <span>Amazon order</span>
+                  <div className="d-flex flex-wrap gap-2">
+                    {currentAmazonOrders.map(([orderId, orderUrl]) => <a key={orderId} href={orderUrl} target="_blank" rel="noreferrer" className="fw-semibold">{orderId}</a>)}
+                  </div>
+                </div>
+                <strong>{row.packages.length} shipment{row.packages.length === 1 ? "" : "s"}</strong>
+              </div>
+
               <div className="package-tracker-package-list">
                 {row.packages.map((item, itemIndex) => {
                   const itemColor = item.status_kind === "delivered" ? "success" : item.status_kind === "exception" ? "danger" : item.possibly_stuck ? "orange" : "primary"
@@ -9414,13 +9429,14 @@ function PackageTrackerDesignPage() {
                                         </a>
                                       </h4>
                                       <div className="d-flex flex-wrap align-items-center gap-1 text-secondary small text-break">
-                                        <a href={productUrl} target="_blank" rel="noreferrer" className="font-monospace fw-semibold">{product.asin}</a>
+                                        <a href={productUrl} target="_blank" rel="noreferrer" className="fw-semibold">{product.asin}</a>
                                         <span className="badge bg-secondary-lt text-secondary">{`Qty ${Number(product.quantity || 1)}`}</span>
                                       </div>
                                     </div>
                                   </div>
                                 )
                               })}
+                              {item.products.length === 0 && <div className="text-secondary small">No separate product was captured for this shipment.</div>}
                             </div>
                             <div className="d-flex flex-wrap align-items-center gap-1 mt-2">
                               <span className={`badge bg-${itemColor}-lt text-${itemColor}`}>{item.status_kind === "delivered" ? "Delivered" : item.status_kind === "exception" ? "Exception" : item.possibly_stuck ? "Possibly stuck" : "Arriving"}</span>
@@ -9432,7 +9448,7 @@ function PackageTrackerDesignPage() {
                             <div className="package-tracker-package-quick">
                               <div>
                                 <span>{item.delivered_at ? "Delivered" : "Expected"}</span>
-                                <strong>{item.delivered_at ? formatDateTime(item.delivered_at) : item.expected_at ? formatDateTime(item.expected_at) : "No estimate"}</strong>
+                                <strong>{item.delivered_at ? formatPackageTrackerDateTime(item.delivered_at) : item.expected_at ? formatPackageTrackerDateTime(item.expected_at) : "No estimate"}</strong>
                                 <small>{item.tracking_id || item.amazon_order_id}</small>
                               </div>
                               <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => togglePackage(packageKey)} aria-expanded={packageExpanded}>
@@ -9446,12 +9462,12 @@ function PackageTrackerDesignPage() {
                             <div className="row g-2 small">
                               <div className="col-12 col-sm-6">
                                 <div className="text-secondary fw-bold">Amazon</div>
-                                <a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id}</a>
+                                <a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="fw-semibold text-break">{item.amazon_order_id}</a>
                                 {item.order_date && <div className="text-secondary">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}
                               </div>
                               <div className="col-12 col-sm-6">
                                 <div className="text-secondary fw-bold">Tracking</div>
-                                {item.tracking_id ? <a href={item.tracking_url} target="_blank" rel="noreferrer" className="font-monospace text-break">{item.tracking_id}</a> : <span className="text-secondary">Not issued</span>}
+                                {item.tracking_id ? <a href={item.tracking_url} target="_blank" rel="noreferrer" className="text-break">{item.tracking_id}</a> : <span className="text-secondary">Not issued</span>}
                                 <div className="text-secondary">{item.carrier}</div>
                               </div>
                               <div className="col-12 col-lg-6">
@@ -9461,7 +9477,7 @@ function PackageTrackerDesignPage() {
                               </div>
                               <div className="col-6 col-lg-3">
                                 <div className="text-secondary fw-bold">Delivered / ETA</div>
-                                <strong>{item.delivered_at ? formatDateTime(item.delivered_at) : item.expected_at ? formatDateTime(item.expected_at) : "No estimate"}</strong>
+                                <strong>{item.delivered_at ? formatPackageTrackerDateTime(item.delivered_at) : item.expected_at ? formatPackageTrackerDateTime(item.expected_at) : "No estimate"}</strong>
                               </div>
                               <div className="col-6 col-lg-3">
                                 <div className="text-secondary fw-bold">Dispatch</div>
@@ -9507,7 +9523,7 @@ function PackageTrackerDesignPage() {
                 <span className="text-secondary small">Synced {formatDateTime(row.shopify_synced_at)}</span>
                 <span className="text-secondary small ms-md-auto">{summary.fullyDelivered
                   ? daysSinceDelivered === null ? "Full delivery date not recorded" : `${daysSinceDelivered} day${daysSinceDelivered === 1 ? "" : "s"} since full delivery`
-                  : `Next delivery ${summary.nextExpectedAt ? formatDateTime(summary.nextExpectedAt) : "not estimated"}`}</span>
+                  : `Next delivery ${summary.nextExpectedAt ? formatPackageTrackerDateTime(summary.nextExpectedAt) : "not estimated"}`}</span>
                 {row.previous_orders.length > 0 && (
                   <button className="btn btn-outline-secondary btn-sm" type="button" onClick={() => toggleHistory(row.id)} aria-expanded={historyOpen}>
                     <ChevronDown className={`icon icon-1 ${historyOpen ? "rotate-180" : ""}`} />
