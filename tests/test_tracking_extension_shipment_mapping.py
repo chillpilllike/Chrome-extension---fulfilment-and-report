@@ -1,5 +1,6 @@
 import json
 import pathlib
+import re
 import unittest
 
 
@@ -17,7 +18,17 @@ class TrackingExtensionShipmentMappingTests(unittest.TestCase):
         self.assertLess(helper.index("if (shipmentGrid) return shipmentGrid;"), helper.index("if (shipmentComponent) return shipmentComponent;"))
 
     def test_tracking_extension_version_was_bumped(self):
-        self.assertEqual(MANIFEST["version"], "0.1.68")
+        self.assertEqual(MANIFEST["version"], "0.1.69")
+
+    def test_current_amazon_progress_tracker_links_are_parsed(self):
+        self.assertGreaterEqual(CONTENT.count("a[href*='/progress-tracker/package']"), 2)
+
+    def test_weekday_delivery_promises_are_resolved(self):
+        start = CONTENT.index("function promiseDetails(text)")
+        end = CONTENT.index("function withPromiseDetails", start)
+        helper = CONTENT[start:end]
+
+        self.assertRegex(helper, re.compile(r"Sunday\|Monday\|Tuesday\|Wednesday\|Thursday\|Friday\|Saturday"))
 
 
 if __name__ == "__main__":

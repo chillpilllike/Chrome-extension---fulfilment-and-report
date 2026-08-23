@@ -9365,7 +9365,7 @@ function PackageTrackerDesignPage() {
                     <div className="small d-grid gap-1 mt-1">
                       {duplicateItems.map((item) => (
                         <span key={item.odoo_asin}>
-                          <span className="font-monospace fw-semibold">{item.odoo_asin}</span>
+                          <span className="fw-semibold">{item.odoo_asin}</span>
                           {item.replacement_asins.length > 0 && <> (replacement: {item.replacement_asins.join(", ")})</>}
                           {` · Odoo ${item.expected_quantity} · Amazon ${item.amazon_quantity} · Excess ${item.excess_quantity}`}
                         </span>
@@ -9389,7 +9389,7 @@ function PackageTrackerDesignPage() {
                 <div>
                   <span>Amazon order</span>
                   <div className="d-flex flex-wrap gap-2">
-                    {currentAmazonOrders.map(([orderId, orderUrl]) => <a key={orderId} href={orderUrl} target="_blank" rel="noreferrer" className="font-monospace fw-semibold">{orderId}</a>)}
+                    {currentAmazonOrders.map(([orderId, orderUrl]) => <a key={orderId} href={orderUrl} target="_blank" rel="noreferrer" className="fw-semibold">{orderId}</a>)}
                   </div>
                 </div>
                 <strong>{row.packages.length} shipment{row.packages.length === 1 ? "" : "s"}</strong>
@@ -9437,7 +9437,7 @@ function PackageTrackerDesignPage() {
                                         </a>
                                       </h4>
                                       <div className="d-flex flex-wrap align-items-center gap-1 text-secondary small text-break">
-                                        <a href={productUrl} target="_blank" rel="noreferrer" className="font-monospace fw-semibold">{product.asin}</a>
+                                        <a href={productUrl} target="_blank" rel="noreferrer" className="fw-semibold">{product.asin}</a>
                                         <span className="badge bg-secondary-lt text-secondary">{`Qty ${Number(product.quantity || 1)}`}</span>
                                       </div>
                                     </div>
@@ -9470,12 +9470,12 @@ function PackageTrackerDesignPage() {
                             <div className="row g-2 small">
                               <div className="col-12 col-sm-6">
                                 <div className="text-secondary fw-bold">Amazon</div>
-                                <a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id}</a>
+                                <a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="fw-semibold text-break">{item.amazon_order_id}</a>
                                 {item.order_date && <div className="text-secondary">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}
                               </div>
                               <div className="col-12 col-sm-6">
                                 <div className="text-secondary fw-bold">Tracking</div>
-                                {item.tracking_id ? <a href={item.tracking_url} target="_blank" rel="noreferrer" className="font-monospace text-break">{item.tracking_id}</a> : <span className="text-secondary">Not issued</span>}
+                                {item.tracking_id ? <a href={item.tracking_url} target="_blank" rel="noreferrer" className="text-break">{item.tracking_id}</a> : <span className="text-secondary">Not issued</span>}
                                 <div className="text-secondary">{item.carrier}</div>
                               </div>
                               <div className="col-12 col-lg-6">
@@ -9510,7 +9510,7 @@ function PackageTrackerDesignPage() {
                         <div className="card card-sm bg-secondary-lt">
                           <div className="card-body">
                             <div className="d-flex flex-column flex-sm-row justify-content-between gap-2">
-                              <div><a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id} <ExternalLink className="icon icon-1" /></a>{item.order_date && <div className="text-secondary small">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}<div className="text-secondary small text-break">{item.products.map((product) => product.title).join(", ")}</div></div>
+                              <div><a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="fw-semibold text-break">{item.amazon_order_id} <ExternalLink className="icon icon-1" /></a>{item.order_date && <div className="text-secondary small">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}<div className="text-secondary small text-break">{item.products.map((product) => product.title).join(", ")}</div></div>
                               <div className="text-sm-end"><span className="badge bg-secondary-lt text-secondary">{item.hidden_reason === "duplicate" ? "Older duplicate" : "Cancelled / replaced"}</span><div className="text-secondary small mt-1">{formatDateTime(item.updated_at)}</div></div>
                             </div>
                           </div>

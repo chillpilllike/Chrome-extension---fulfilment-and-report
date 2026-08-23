@@ -27847,9 +27847,18 @@ def tracking_browserless_order_url(order: dict[str, Any]) -> str:
     return clean_text(order.get("amazon_order_url")) or order_line_amazon_url(order_id)
 
 
-def browserless_tracking_orders(store_id: Optional[int] = None, status: str = "active") -> list[dict[str, Any]]:
+def browserless_tracking_orders(
+    store_id: Optional[int] = None,
+    status: str = "active",
+    amazon_order_ids: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
     orders: list[dict[str, Any]] = []
     seen: set[str] = set()
+    requested_order_ids = {
+        clean_text(order_id)
+        for order_id in (amazon_order_ids or [])
+        if clean_text(order_id)
+    }
     page = 1
     while True:
         payload = api_tracking_orders(store_id=store_id, page=page, per_page=100, status=status)
@@ -27857,6 +27866,8 @@ def browserless_tracking_orders(store_id: Optional[int] = None, status: str = "a
         for order in batch:
             order_id = clean_text(order.get("amazon_order_id"))
             if not order_id or order_id in seen:
+                continue
+            if requested_order_ids and order_id not in requested_order_ids:
                 continue
             if tracking_status_rank(order.get("tracking_status")) >= tracking_status_rank("delivered"):
                 continue
@@ -27871,10 +27882,11 @@ def browserless_tracking_orders(store_id: Optional[int] = None, status: str = "a
 
 
 class TrackingBrowserlessSession:
-    def __init__(self, worker_id: str, store_id: Optional[int], max_orders: int) -> None:
+    def __init__(self, worker_id: str, store_id: Optional[int], max_orders: int, amazon_order_ids: Optional[list[str]] = None) -> None:
         self.worker_id = worker_id
         self.store_id = store_id
         self.max_orders = max(0, int(max_orders or 0))
+        self.amazon_order_ids = list(amazon_order_ids or [])
         self.orders: list[dict[str, Any]] = []
         self.index = 0
         self.packages: list[dict[str, Any]] = []
@@ -27887,7 +27899,7 @@ class TrackingBrowserlessSession:
         return bool(_TRACKING_BROWSERLESS_PROGRESS.get("stop_requested"))
 
     def load_orders(self) -> list[dict[str, Any]]:
-        orders = browserless_tracking_orders(self.store_id)
+        orders = browserless_tracking_orders(self.store_id, amazon_order_ids=self.amazon_order_ids)
         if self.max_orders:
             orders = orders[: self.max_orders]
         self.orders = orders
@@ -28059,7 +28071,7 @@ def run_tracking_browserless_payload(payload: ChromeTrackingBrowserlessRunPayloa
     profile_dir.mkdir(parents=True, exist_ok=True)
     content_js = BASE_DIR / "tracking-extension" / "content.js"
     content_css = BASE_DIR / "tracking-extension" / "content.css"
-    session = TrackingBrowserlessSession(worker_id, payload.store_id, payload.max_orders)
+    session = TrackingBrowserlessSession(worker_id, payload.store_id, payload.max_orders, payload.amazon_order_ids)
     executable = chrome_browserless_executable()
     launch_args = [
         "--disable-blink-features=AutomationControlled",
@@ -28193,7 +28205,7 @@ def api_tracking_browserless_run(payload: ChromeTrackingBrowserlessRunPayload) -
             message="Headless tracking could not start.",
         )
         return {"ok": False, "running": False, "message": progress["message"], "progress": progress}
-    orders = browserless_tracking_orders(payload.store_id)
+    orders = browserless_tracking_orders(payload.store_id, amazon_order_ids=payload.amazon_order_ids)
     if payload.max_orders:
         orders = orders[: max(0, int(payload.max_orders or 0))]
     progress = set_tracking_browserless_progress(
@@ -32124,6 +32136,16 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             order_products,
         ),
     )
+    if (
+        not packages
+        and not payload.order_cancelled
+        and not payload_has_payment_revision(payload)
+        and not tracking_payload_otp(payload, packages)
+    ):
+        raise HTTPException(
+            422,
+            "Empty Amazon tracking update rejected; existing shipment data was preserved.",
+        )
     status = tracking_status_from_packages(packages)
     status_only_payload = bool(packages) and all(package.get("status_only") and not package.get("tracking_id") for package in packages)
     delivered_flag = status == "Delivered" and packages and all(

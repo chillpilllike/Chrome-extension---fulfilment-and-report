@@ -188,6 +188,18 @@ function promiseDetails(text) {
         year += 1;
         expected = new Date(year, monthIndex, day);
       }
+    } else {
+      const weekdayMatch = promise.match(/\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/i);
+      if (weekdayMatch) {
+        const targetDay = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(weekdayMatch[1].toLowerCase());
+        let dayOffset = targetDay - base.getDay();
+        if (/\bdelivered\b/i.test(promise)) {
+          if (dayOffset > 0) dayOffset -= 7;
+        } else if (dayOffset < 0) {
+          dayOffset += 7;
+        }
+        expected = new Date(base.getFullYear(), base.getMonth(), base.getDate() + dayOffset);
+      }
     }
   }
   return {
@@ -540,11 +552,11 @@ function orderCardItems(card) {
 }
 
 function orderCardTrackingPackages(card, orderId) {
-  const links = [...card.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track']")]
+  const links = [...card.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track'], a[href*='/progress-tracker/package']")]
     .filter((link) => {
       const text = clean(link.textContent);
       const href = link.getAttribute("href") || "";
-      return /track package|tracking/i.test(text) || /ship-track/i.test(href);
+      return /track package|tracking/i.test(text) || /ship-track|progress-tracker\/package/i.test(href);
     });
   const packages = [];
   const seen = new Set();
@@ -842,7 +854,7 @@ async function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
   const paymentRevision = parsePaymentRevision();
   const cancellation = parseOrderCancellation();
-  const links = [...document.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track']")]
+  const links = [...document.querySelectorAll("a[href*='ship-track'], a[href*='/gp/your-account/ship-track'], a[href*='/progress-tracker/package']")]
     .filter((link) => {
       const text = clean(link.textContent);
       const href = link.getAttribute("href") || "";
