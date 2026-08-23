@@ -81,6 +81,7 @@ RUN apt-get update \
 
 COPY --from=source /src/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m playwright install --with-deps chromium
 
 COPY --from=source /src/app ./app
 COPY --from=frontend-build /src/frontend/dist ./frontend/dist
