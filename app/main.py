@@ -33889,6 +33889,32 @@ def package_tracker_single_package_history_products(
     ]
 
 
+def package_tracker_tracking_parts_from_lines(source_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect distinct pre-tracking Amazon shipment groups stored across order lines."""
+    parts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in source_lines:
+        for part in parse_tracking_packages(clean_text(line.get("tracking_payload"))):
+            if not isinstance(part, dict):
+                continue
+            identity = clean_text(
+                part.get("tracking_id")
+                or part.get("trackingId")
+                or part.get("tracking_url")
+                or part.get("trackingUrl")
+            )
+            if not identity:
+                identity = json.dumps({
+                    "status": clean_text(part.get("delivery_status") or part.get("order_status") or part.get("promise") or part.get("status")),
+                    "asins": sorted(unique_normalized_asins(part.get("asins") or [])),
+                }, sort_keys=True)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            parts.append(dict(part))
+    return parts or [{}]
+
+
 def package_tracker_history_products_by_package(
     order_packages: list[dict[str, Any]],
     history: dict[str, Any],
@@ -34784,7 +34810,7 @@ def api_public_package_tracker(
                 title = re.sub(r"^\[[^\]]+\]\s*", "", title).strip()
                 if title:
                     product["title"] = title
-            tracking_parts = [part for part in parse_tracking_packages(clean_text(source.get("tracking_payload"))) if isinstance(part, dict)] or [{}]
+            tracking_parts = package_tracker_tracking_parts_from_lines(source_lines)
             for part_index, part in enumerate(tracking_parts):
                 status_text = clean_text(part.get("delivery_status") or part.get("order_status") or part.get("promise") or part.get("status") or source.get("tracking_status") or history.get("status")) or "Status pending"
                 promise = clean_text(part.get("promise"))
@@ -34809,7 +34835,8 @@ def api_public_package_tracker(
                     "tracking_url": clean_text(part.get("tracking_url") or part.get("trackingUrl")) or clean_text(source.get("amazon_order_url")),
                     "carrier": clean_text(part.get("carrier") or part.get("carrier_name")) or "Amazon",
                     "status": status_text, "status_kind": kind,
-                    "expected_at": "", "delivered_at": package_tracker_delivery_date(status_text, promise, source.get("updated_at")) if kind == "delivered" else "",
+                    "expected_at": clean_text(part.get("expected_delivery_date") or part.get("expected_delivery_display")),
+                    "delivered_at": package_tracker_delivery_date(status_text, promise, source.get("updated_at")) if kind == "delivered" else "",
                     "updated_at": clean_text(source.get("tracking_checked_at") or source.get("updated_at")),
                     "dispatch_location": "", "scan_status": "Awaiting package scan",
                     "products": product_values,

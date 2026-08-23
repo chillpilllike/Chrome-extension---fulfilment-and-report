@@ -7,10 +7,25 @@ from app.main import (
     package_tracker_history_products_by_package,
     package_tracker_quantity_analysis,
     package_tracker_single_package_history_products,
+    package_tracker_tracking_parts_from_lines,
 )
 
 
 class PackageTrackerProductTests(unittest.TestCase):
+    def test_line_payloads_preserve_distinct_pre_tracking_shipments(self) -> None:
+        first = {
+            "tracking_payload": '[{"tracking_url":"https://www.amazon.com/progress-tracker/package?shipmentId=one","promise":"Arriving Tuesday","asins":["B000000001"]}]'
+        }
+        duplicate_first = dict(first)
+        second = {
+            "tracking_payload": '[{"tracking_url":"https://www.amazon.com/progress-tracker/package?itemId=two","promise":"Arriving tomorrow","asins":["B000000002"]}]'
+        }
+
+        parts = package_tracker_tracking_parts_from_lines([first, duplicate_first, second])
+
+        self.assertEqual(len(parts), 2)
+        self.assertEqual([part["promise"] for part in parts], ["Arriving Tuesday", "Arriving tomorrow"])
+
     def test_single_package_uses_every_amazon_history_item(self):
         history = {
             "items_json": json.dumps([
