@@ -2,6 +2,10 @@ import json
 import unittest
 
 from app.main import (
+    canonical_tracking_packages,
+    compact_tracking_products,
+    dispatch_codes_from_package,
+    package_tracker_canonical_dispatch_rows,
     package_tracker_enforce_product_guard,
     package_tracker_fallback_asins_by_package,
     package_tracker_history_products_by_package,
@@ -11,6 +15,52 @@ from app.main import (
 
 
 class PackageTrackerProductTests(unittest.TestCase):
+    def test_amazon_shipment_urls_get_distinct_stable_package_keys(self):
+        first = dispatch_codes_from_package(
+            {"tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=113-1&shipmentId=FIRST"},
+            "113-0000000-0000000",
+        )
+        second = dispatch_codes_from_package(
+            {"tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=113-1&shipmentId=SECOND"},
+            "113-0000000-0000000",
+        )
+
+        self.assertTrue(first[0][0].startswith("AMZPKG-"))
+        self.assertNotEqual(first[0][0], second[0][0])
+
+    def test_order_number_is_not_a_physical_package_key(self):
+        codes = dispatch_codes_from_package(
+            {"tracking_url": "https://www.amazon.com/your-orders/order-details?orderID=113-0000000-0000000"},
+            "113-0000000-0000000",
+        )
+
+        self.assertEqual(codes, [])
+
+    def test_status_shadow_is_removed_when_real_shipment_exists(self):
+        packages = canonical_tracking_packages([
+            {"status_only": True, "tracking_url": "https://www.amazon.com/your-orders/order-details?orderID=113-1"},
+            {"tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=REAL"},
+        ])
+        rows = package_tracker_canonical_dispatch_rows([
+            {"amazon_order_id": "113-1111111-1111111", "scan_code": "11311111111111111", "tracking_url": "https://www.amazon.com/your-orders/order-details?orderID=113-1111111-1111111"},
+            {"amazon_order_id": "113-1111111-1111111", "scan_code": "AMZPKG-ABC", "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=REAL"},
+        ])
+
+        self.assertEqual(len(packages), 1)
+        self.assertIn("shipmentId=REAL", packages[0]["tracking_url"])
+        self.assertEqual([row["scan_code"] for row in rows], ["AMZPKG-ABC"])
+
+    def test_verified_quantity_survives_storage_compaction(self):
+        products = compact_tracking_products([
+            {"asin": "B000000001", "quantity": 2, "quantity_verified": True},
+            {"asin": "B000000002", "quantity": 1, "quantity_verified": False},
+        ])
+
+        self.assertEqual(products[0]["quantity"], 2)
+        self.assertTrue(products[0]["quantity_verified"])
+        self.assertNotIn("quantity", products[1])
+        self.assertNotIn("quantity_verified", products[1])
+
     def test_single_package_uses_every_amazon_history_item(self):
         history = {
             "items_json": json.dumps([
@@ -52,7 +102,8 @@ class PackageTrackerProductTests(unittest.TestCase):
         self.assertEqual(guard["displayed_products"], 3)
         self.assertEqual(guard["recovered_products"], 1)
         displayed = [product["asin"] for package in packages for product in package["products"]]
-        self.assertEqual(displayed.count("B000000003"), 1)
+        self.assertEqual(displayed.count("B000000003"), 0)
+        self.assertEqual(packages[0]["unassigned_products"][0]["asin"], "B000000003")
 
     def test_guard_blocks_package_without_any_product_association(self):
         packages = [{"amazon_order_id": "111-2", "products": []}]

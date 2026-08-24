@@ -4763,8 +4763,6 @@ def dispatch_codes_from_package(package: dict[str, Any], amazon_order_id: str = 
         match = re.search(rf"[?&#]{key}=([^&#]+)", url, re.IGNORECASE)
         if match:
             values.append(match.group(1))
-    if amazon_order_id:
-        values.append(amazon_order_id)
     seen: set[str] = set()
     codes: list[tuple[str, str]] = []
     for raw in values:
@@ -4776,7 +4774,66 @@ def dispatch_codes_from_package(package: dict[str, Any], amazon_order_id: str = 
             continue
         seen.add(code)
         codes.append((code, display or code))
+    if codes:
+        return codes
+    if bool(package.get("status_only")):
+        return []
+
+    # Amazon does not always expose a carrier tracking number before dispatch.
+    # Its shipment/item URL parameters are nevertheless stable package identities.
+    # Never use the Amazon order number here: doing so collapses every shipment in
+    # a split order onto one database row and makes an order-level status fallback
+    # look like a physical package.
+    identity_parts: list[str] = []
+    for key in ("shipment_id", "shipmentId", "package_id", "packageId", "package_index", "packageIndex", "item_id", "itemId"):
+        value = clean_text(package.get(key))
+        if value:
+            identity_parts.append(f"{key.lower()}={value}")
+    try:
+        query = parse_qs(urlparse(url).query)
+    except Exception:
+        query = {}
+    for key in ("shipmentId", "packageId", "packageIndex", "itemId"):
+        value = clean_text((query.get(key) or query.get(key.lower()) or [""])[0])
+        if value:
+            identity_parts.append(f"{key.lower()}={value}")
+    if identity_parts:
+        identity = "|".join(dict.fromkeys(identity_parts))
+        digest = hashlib.sha256(f"{clean_text(amazon_order_id)}|{identity}".encode("utf-8")).hexdigest()[:24].upper()
+        return [(f"AMZPKG-{digest}", url or f"Amazon shipment {identity}")]
     return codes
+
+
+def tracking_package_has_shipment_identity(package: dict[str, Any]) -> bool:
+    """True when Amazon supplied package-specific proof, not just an order page."""
+    if not isinstance(package, dict):
+        return False
+    if any(package_tracking_id_is_physical(package.get(key)) for key in (
+        "tracking_id", "trackingId", "tracking_number", "trackingNumber", "tracking_code", "trackingCode",
+    )):
+        return True
+    if bool(package.get("status_only")):
+        return False
+    if any(clean_text(package.get(key)) for key in (
+        "shipment_id", "shipmentId", "package_id", "packageId", "package_index", "packageIndex", "item_id", "itemId",
+    )):
+        return True
+    url = clean_text(package.get("tracking_url") or package.get("trackingUrl"))
+    try:
+        query = parse_qs(urlparse(url).query)
+    except Exception:
+        query = {}
+    return any(clean_text((query.get(key) or query.get(key.lower()) or [""])[0]) for key in (
+        "shipmentId", "packageId", "packageIndex", "itemId", "trackingId",
+    ))
+
+
+def canonical_tracking_packages(packages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop order-level status shadows once package-specific shipments are known."""
+    values = [dict(package) for package in packages if isinstance(package, dict)]
+    if not any(tracking_package_has_shipment_identity(package) for package in values):
+        return values
+    return [package for package in values if tracking_package_has_shipment_identity(package)]
 
 
 def dispatch_physical_package_key(row: dict[str, Any]) -> str:
@@ -5014,7 +5071,9 @@ def parse_tracking_packages(payload_text: str) -> list[dict[str, Any]]:
 
 def dispatch_package_products(package: dict[str, Any]) -> list[dict[str, Any]]:
     products = package.get("products") if isinstance(package.get("products"), list) else []
-    if not products and isinstance(package.get("order_products"), list):
+    # order_products describes the whole Amazon order. It is only a safe package
+    # fallback when there is no package-specific shipment identity.
+    if not products and not tracking_package_has_shipment_identity(package) and isinstance(package.get("order_products"), list):
         products = package.get("order_products") or []
     return [product for product in products if isinstance(product, dict)][:12]
 
@@ -5303,7 +5362,7 @@ def tracking_package_active_pending(package: dict[str, Any]) -> str:
 
 def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, amazon_order_url: str, packages: list[dict[str, Any]]) -> tuple[int, list[int]]:
     order_id = clean_text(amazon_order_id)
-    package_payloads = [package for package in packages if isinstance(package, dict)]
+    package_payloads = canonical_tracking_packages(packages)
     if not order_id or not package_payloads:
         return 0, []
     conn.execute(
@@ -5764,6 +5823,7 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
                 continue
             seen_package_keys.add(key)
             packages.append(package)
+    packages = canonical_tracking_packages(packages)
     if not packages:
         return 0
     now = utc_now()
@@ -5867,6 +5927,7 @@ def dispatch_bulk_package_rows_for_order(order_id: str, rows: list[dict[str, Any
                     continue
                 seen_package_keys.add(key)
                 packages.append(package)
+        packages = canonical_tracking_packages(packages)
         if not packages:
             return order_id, [], 0, ""
 
@@ -14860,7 +14921,10 @@ def compact_tracking_products(values: Any, limit: int = 12) -> list[dict[str, An
             quantity = float(product.get("quantity") or 1)
         except Exception:
             quantity = 1.0
-        if quantity and quantity != 1:
+        quantity_verified = bool(product.get("quantity_verified"))
+        if quantity_verified:
+            compact["quantity_verified"] = True
+        if quantity_verified or (quantity and quantity != 1):
             compact["quantity"] = int(quantity) if quantity.is_integer() else quantity
         products.append(compact)
     return products
@@ -33938,6 +34002,32 @@ def package_tracker_missing_history_products(
     return [dict(history_by_asin[asin]) for asin in sorted(history_asins - package_asins)]
 
 
+def package_tracker_canonical_dispatch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hide stale order-level rows when an Amazon order has real shipment rows."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(clean_text(row.get("amazon_order_id")), []).append(row)
+    visible: list[dict[str, Any]] = []
+    for order_rows in grouped.values():
+        specific: list[dict[str, Any]] = []
+        for row in order_rows:
+            scan_code = normalize_dispatch_scan_code(row.get("scan_code"))
+            canonical_code = normalize_dispatch_scan_code(row.get("canonical_scan_code"))
+            order_code = normalize_dispatch_scan_code(row.get("amazon_order_id"))
+            has_real_carrier_code = (
+                package_tracking_id_is_physical(canonical_code)
+                and canonical_code != order_code
+            )
+            if (
+                has_real_carrier_code
+                or scan_code.startswith("AMZPKG-")
+                or tracking_package_has_shipment_identity({"tracking_url": row.get("tracking_url")})
+            ):
+                specific.append(row)
+        visible.extend(specific or order_rows)
+    return visible
+
+
 def package_tracker_allowed_asins_for_order(
     lines: list[dict[str, Any]],
     amazon_order_id: str,
@@ -34109,14 +34199,15 @@ def package_tracker_enforce_product_guard(
             for asin in missing_asins:
                 recovered = dict(expected_by_asin[asin])
                 recovered["guard_recovered"] = True
-                target_products.append(recovered)
                 target_unassigned.append(dict(recovered))
+                if len(order_packages) == 1:
+                    target_products.append(recovered)
                 recovered_total += 1
 
         displayed_after = {
             normalize_asin(product.get("asin"))
             for package in order_packages
-            for product in (package.get("products") or [])
+            for product in [*(package.get("products") or []), *(package.get("unassigned_products") or [])]
             if normalize_asin(product.get("asin"))
         }
         still_missing = [asin for asin in expected_by_asin if asin not in displayed_after]
@@ -34683,7 +34774,9 @@ def api_public_package_tracker(
         recipient = clean_text(group.get("recipient_ref"))
         current_packages: list[dict[str, Any]] = []
         previous_orders: list[dict[str, Any]] = []
-        card_package_rows = packages_by_key.get((store_id, order_name), [])
+        card_package_rows = package_tracker_canonical_dispatch_rows(
+            packages_by_key.get((store_id, order_name), [])
+        )
         package_rows_by_amazon_order: dict[str, list[dict[str, Any]]] = {}
         for package in card_package_rows:
             package_rows_by_amazon_order.setdefault(clean_text(package.get("amazon_order_id")), []).append(package)
@@ -34793,7 +34886,13 @@ def api_public_package_tracker(
                     existing["image_url"] = product.get("image_url")
                 existing["quantity"] = max(float(existing.get("quantity") or 1), float(product.get("quantity") or 1))
             products = list(products_by_asin.values())
-            tracking_id = next((clean_text(value) for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code")) if package_tracking_id_is_physical(value)), "")
+            order_scan_code = normalize_dispatch_scan_code(amazon_order_id)
+            tracking_id = next((
+                clean_text(value)
+                for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code"))
+                if package_tracking_id_is_physical(value)
+                and normalize_dispatch_scan_code(value) != order_scan_code
+            ), "")
             item = {
                 "amazon_order_id": amazon_order_id,
                 "amazon_order_url": clean_text(package.get("amazon_order_url")) or order_line_amazon_url(package.get("amazon_order_id")),
@@ -34871,14 +34970,20 @@ def api_public_package_tracker(
                 title = re.sub(r"^\[[^\]]+\]\s*", "", title).strip()
                 if title:
                     product["title"] = title
-            tracking_parts = [part for part in parse_tracking_packages(clean_text(source.get("tracking_payload"))) if isinstance(part, dict)] or [{}]
+            tracking_parts = canonical_tracking_packages([
+                part
+                for part in parse_tracking_packages(clean_text(source.get("tracking_payload")))
+                if isinstance(part, dict)
+            ]) or [{}]
             for part_index, part in enumerate(tracking_parts):
                 status_text = clean_text(part.get("delivery_status") or part.get("order_status") or part.get("promise") or part.get("status") or source.get("tracking_status") or history.get("status")) or "Status pending"
                 promise = clean_text(part.get("promise"))
                 kind = "cancelled" if clean_text(source.get("amazon_cancelled_at")) else package_tracker_delivery_kind(status_text, promise)
                 tracking_id = next((clean_text(part.get(key)) for key in ("tracking_id", "trackingId", "tracking_number", "trackingNumber") if package_tracking_id_is_physical(part.get(key))), "")
-                product_values = list(products_by_asin.values())
-                part_products = normalize_amazon_product_items(part.get("products") or part.get("order_products") or [])
+                product_values = list(products_by_asin.values()) if len(tracking_parts) == 1 else []
+                part_products = normalize_amazon_product_items(part.get("products") or [])
+                if not part_products and len(tracking_parts) == 1 and not tracking_package_has_shipment_identity(part):
+                    part_products = normalize_amazon_product_items(part.get("order_products") or [])
                 if part_products:
                     product_values = part_products
                 for product in product_values:
