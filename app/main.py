@@ -34996,7 +34996,9 @@ def api_public_package_tracker(
                 "carrier": clean_text(package.get("carrier")) or "Amazon",
                 "status": clean_text(package.get("package_status")) or clean_text(package.get("promise")) or "Status pending",
                 "status_kind": kind,
-                "expected_at": clean_text(package.get("dispatch_date")) if kind != "delivered" else "",
+                # dispatch_date is an internal rack code (for example D24), not
+                # Amazon's customer-facing delivery estimate.
+                "expected_at": tracking_package_promise_text(package) if kind != "delivered" else "",
                 "delivered_at": delivered_at,
                 "updated_at": clean_text(package.get("updated_at")),
                 "dispatch_location": clean_text(package.get("tote_code")),
