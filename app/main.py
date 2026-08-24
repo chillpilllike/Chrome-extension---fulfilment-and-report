@@ -13760,6 +13760,52 @@ def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
     return bool(asins and line_asins and line_asins.intersection(asins))
 
 
+def tracking_packages_by_line_with_one_to_one_fallback(
+    packages: list[dict[str, Any]],
+    rows: list[Any],
+) -> tuple[dict[int, list[dict[str, Any]]], list[Any]]:
+    """Map a replacement shipment only when one line and one package remain."""
+    mapped: dict[int, list[dict[str, Any]]] = {}
+    claimed_package_ids: set[int] = set()
+    unmatched_rows: list[Any] = []
+    for row in rows:
+        matches = [package for package in packages if package_matches_line(package, row)]
+        if matches:
+            mapped[int(row["id"])] = matches
+            claimed_package_ids.update(id(package) for package in matches)
+        else:
+            unmatched_rows.append(row)
+    unclaimed_packages = [package for package in packages if id(package) not in claimed_package_ids]
+    if len(unmatched_rows) == 1 and len(unclaimed_packages) == 1:
+        mapped[int(unmatched_rows[0]["id"])] = unclaimed_packages
+        unmatched_rows = []
+    return mapped, unmatched_rows
+
+
+def tracking_unambiguous_replacement_product(
+    packages: list[dict[str, Any]],
+    row: Any,
+) -> dict[str, Any]:
+    """Return replacement metadata only for a fallback mapping with one ASIN."""
+    if not packages or any(package_matches_line(package, row) for package in packages):
+        return {}
+    products = normalize_amazon_product_items([
+        product
+        for package in packages
+        for product in (package.get("products") or [])
+        if isinstance(product, dict)
+    ])
+    asins = unique_normalized_asins([
+        *[asin for package in packages for asin in (package.get("asins") or [])],
+        *[product.get("asin") for product in products],
+    ])
+    if len(asins) != 1:
+        return {}
+    product = next((dict(value) for value in products if normalize_asin(value.get("asin")) == asins[0]), {})
+    product["asin"] = asins[0]
+    return product
+
+
 def strip_untrusted_package_item_proof(package: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(package, dict):
         return {}
@@ -32836,14 +32882,31 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
         updated_rows_for_index = []
         package_asins_present = any(package.get("asins") for package in packages)
         downstream_packages = packages
-        unmatched_rows: list[Any] = []
+        packages_by_line_id, unmatched_rows = tracking_packages_by_line_with_one_to_one_fallback(
+            packages,
+            list(rows),
+        )
         for row in rows:
-            line_packages = [package for package in packages if package_matches_line(package, row)]
+            line_packages = packages_by_line_id.get(int(row["id"]), [])
             if not line_packages:
                 if package_asins_present:
-                    unmatched_rows.append(row)
                     continue
                 line_packages = packages
+            replacement_product = tracking_unambiguous_replacement_product(line_packages, row)
+            if replacement_product:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET replacement_asin=COALESCE(NULLIF(replacement_asin, ''), ?),
+                        replacement_product_name=COALESCE(NULLIF(replacement_product_name, ''), ?)
+                    WHERE id=?
+                    """,
+                    (
+                        replacement_product["asin"],
+                        clean_text(replacement_product.get("title")),
+                        row["id"],
+                    ),
+                )
             line_status = tracking_status_from_packages(line_packages)
             line_delivered = line_status == "Delivered" and line_packages and all(
                 tracking_package_delivered(package) for package in line_packages if isinstance(package, dict)
@@ -34200,7 +34263,7 @@ def package_tracker_enforce_product_guard(
                 recovered = dict(expected_by_asin[asin])
                 recovered["guard_recovered"] = True
                 target_unassigned.append(dict(recovered))
-                if len(order_packages) == 1:
+                if len(order_packages) == 1 and not tracking_package_has_shipment_identity(target):
                     target_products.append(recovered)
                 recovered_total += 1
 
@@ -34902,7 +34965,9 @@ def api_public_package_tracker(
                 "carrier": clean_text(package.get("carrier")) or "Amazon",
                 "status": clean_text(package.get("package_status")) or clean_text(package.get("promise")) or "Status pending",
                 "status_kind": kind,
-                "expected_at": clean_text(package.get("dispatch_date")) if kind != "delivered" else "",
+                # dispatch_date is an internal rack code (for example D24), not
+                # Amazon's customer-facing delivery estimate.
+                "expected_at": tracking_package_promise_text(package) if kind != "delivered" else "",
                 "delivered_at": delivered_at,
                 "updated_at": clean_text(package.get("updated_at")),
                 "dispatch_location": clean_text(package.get("tote_code")),

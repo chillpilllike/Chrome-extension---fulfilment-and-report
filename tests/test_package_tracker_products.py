@@ -11,10 +11,54 @@ from app.main import (
     package_tracker_history_products_by_package,
     package_tracker_quantity_analysis,
     package_tracker_single_package_history_products,
+    tracking_packages_by_line_with_one_to_one_fallback,
+    tracking_unambiguous_replacement_product,
 )
 
 
 class PackageTrackerProductTests(unittest.TestCase):
+    def test_unambiguous_fallback_exposes_replacement_metadata(self):
+        product = tracking_unambiguous_replacement_product(
+            [{"asins": ["B000000099"], "products": [{"asin": "B000000099", "title": "Replacement"}]}],
+            {"id": 1, "asin": "B000000001"},
+        )
+
+        self.assertEqual(product["asin"], "B000000099")
+        self.assertEqual(product["title"], "Replacement")
+
+    def test_exact_line_match_is_not_recorded_as_replacement(self):
+        product = tracking_unambiguous_replacement_product(
+            [{"asins": ["B000000001"], "products": [{"asin": "B000000001"}]}],
+            {"id": 1, "asin": "B000000001"},
+        )
+
+        self.assertEqual(product, {})
+
+    def test_one_unmatched_replacement_line_gets_one_remaining_shipment(self):
+        exact = {"asins": ["B000000001"]}
+        replacement = {"asins": ["B000000099"]}
+        rows = [
+            {"id": 1, "asin": "B000000001"},
+            {"id": 2, "asin": "B000000002"},
+        ]
+
+        mapped, unmatched = tracking_packages_by_line_with_one_to_one_fallback(
+            [exact, replacement], rows
+        )
+
+        self.assertEqual(mapped[1], [exact])
+        self.assertEqual(mapped[2], [replacement])
+        self.assertEqual(unmatched, [])
+
+    def test_ambiguous_unmatched_replacements_are_not_guessed(self):
+        rows = [{"id": 1, "asin": "B000000001"}, {"id": 2, "asin": "B000000002"}]
+        mapped, unmatched = tracking_packages_by_line_with_one_to_one_fallback(
+            [{"asins": ["B000000098"]}, {"asins": ["B000000099"]}], rows
+        )
+
+        self.assertEqual(mapped, {})
+        self.assertEqual([row["id"] for row in unmatched], [1, 2])
+
     def test_amazon_shipment_urls_get_distinct_stable_package_keys(self):
         first = dispatch_codes_from_package(
             {"tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=113-1&shipmentId=FIRST"},
@@ -112,6 +156,23 @@ class PackageTrackerProductTests(unittest.TestCase):
 
         self.assertFalse(guard["complete"])
         self.assertEqual(guard["unverified_amazon_orders"], ["111-2"])
+
+    def test_guard_does_not_assign_missing_item_to_known_shipment(self):
+        packages = [{
+            "amazon_order_id": "111-6",
+            "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=KNOWN",
+            "products": [{"asin": "B000000006", "title": "Known shipment item"}],
+        }]
+        history = {"111-6": {"items_json": json.dumps([
+            {"asin": "B000000006", "title": "Known shipment item"},
+            {"asin": "B000000007", "title": "Unmapped shipment item"},
+        ])}}
+
+        guard = package_tracker_enforce_product_guard(packages, history)
+
+        self.assertTrue(guard["complete"])
+        self.assertEqual([product["asin"] for product in packages[0]["products"]], ["B000000006"])
+        self.assertEqual([product["asin"] for product in packages[0]["unassigned_products"]], ["B000000007"])
 
     def test_split_shipments_do_not_repeat_order_level_fallback_asins(self):
         packages = [
