@@ -9443,7 +9443,9 @@ function PackageTrackerDesignPage() {
                                       </h4>
                                       <div className="d-flex flex-wrap align-items-center gap-1 text-secondary small text-break">
                                         <a href={productUrl} target="_blank" rel="noreferrer" className="fw-semibold">{product.asin}</a>
-                                        <span className="badge bg-secondary-lt text-secondary">{`Qty ${Number(product.quantity || 1)}`}</span>
+                                        {product.quantity_verified && (
+                                          <span className="badge bg-secondary-lt text-secondary">{`Qty ${Number(product.quantity || 1)}`}</span>
+                                        )}
                                       </div>
                                     </div>
                                   </div>
