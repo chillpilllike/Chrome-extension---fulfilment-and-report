@@ -13765,6 +13765,28 @@ def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
     return bool(asins and line_asins and line_asins.intersection(asins))
 
 
+def tracking_packages_by_line_with_one_to_one_fallback(
+    packages: list[dict[str, Any]],
+    rows: list[Any],
+) -> tuple[dict[int, list[dict[str, Any]]], list[Any]]:
+    """Map a replacement shipment only when one line and one package remain."""
+    mapped: dict[int, list[dict[str, Any]]] = {}
+    claimed_package_ids: set[int] = set()
+    unmatched_rows: list[Any] = []
+    for row in rows:
+        matches = [package for package in packages if package_matches_line(package, row)]
+        if matches:
+            mapped[int(row["id"])] = matches
+            claimed_package_ids.update(id(package) for package in matches)
+        else:
+            unmatched_rows.append(row)
+    unclaimed_packages = [package for package in packages if id(package) not in claimed_package_ids]
+    if len(unmatched_rows) == 1 and len(unclaimed_packages) == 1:
+        mapped[int(unmatched_rows[0]["id"])] = unclaimed_packages
+        unmatched_rows = []
+    return mapped, unmatched_rows
+
+
 def strip_untrusted_package_item_proof(package: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(package, dict):
         return {}
@@ -32841,12 +32863,14 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
         updated_rows_for_index = []
         package_asins_present = any(package.get("asins") for package in packages)
         downstream_packages = packages
-        unmatched_rows: list[Any] = []
+        packages_by_line_id, unmatched_rows = tracking_packages_by_line_with_one_to_one_fallback(
+            packages,
+            list(rows),
+        )
         for row in rows:
-            line_packages = [package for package in packages if package_matches_line(package, row)]
+            line_packages = packages_by_line_id.get(int(row["id"]), [])
             if not line_packages:
                 if package_asins_present:
-                    unmatched_rows.append(row)
                     continue
                 line_packages = packages
             line_status = tracking_status_from_packages(line_packages)

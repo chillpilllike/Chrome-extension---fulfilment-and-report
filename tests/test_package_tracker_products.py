@@ -12,10 +12,36 @@ from app.main import (
     package_tracker_quantity_analysis,
     package_tracker_single_package_history_products,
     package_tracker_tracking_parts_from_lines,
+    tracking_packages_by_line_with_one_to_one_fallback,
 )
 
 
 class PackageTrackerProductTests(unittest.TestCase):
+    def test_one_unmatched_replacement_line_gets_one_remaining_shipment(self):
+        exact = {"asins": ["B000000001"]}
+        replacement = {"asins": ["B000000099"]}
+        rows = [
+            {"id": 1, "asin": "B000000001"},
+            {"id": 2, "asin": "B000000002"},
+        ]
+
+        mapped, unmatched = tracking_packages_by_line_with_one_to_one_fallback(
+            [exact, replacement], rows
+        )
+
+        self.assertEqual(mapped[1], [exact])
+        self.assertEqual(mapped[2], [replacement])
+        self.assertEqual(unmatched, [])
+
+    def test_ambiguous_unmatched_replacements_are_not_guessed(self):
+        rows = [{"id": 1, "asin": "B000000001"}, {"id": 2, "asin": "B000000002"}]
+        mapped, unmatched = tracking_packages_by_line_with_one_to_one_fallback(
+            [{"asins": ["B000000098"]}, {"asins": ["B000000099"]}], rows
+        )
+
+        self.assertEqual(mapped, {})
+        self.assertEqual([row["id"] for row in unmatched], [1, 2])
+
     def test_line_payloads_preserve_distinct_pre_tracking_shipments(self) -> None:
         first = {
             "tracking_payload": '[{"tracking_url":"https://www.amazon.com/progress-tracker/package?shipmentId=one","promise":"Arriving Tuesday","asins":["B000000001"]}]'
