@@ -13787,6 +13787,30 @@ def tracking_packages_by_line_with_one_to_one_fallback(
     return mapped, unmatched_rows
 
 
+def tracking_unambiguous_replacement_product(
+    packages: list[dict[str, Any]],
+    row: Any,
+) -> dict[str, Any]:
+    """Return replacement metadata only for a fallback mapping with one ASIN."""
+    if not packages or any(package_matches_line(package, row) for package in packages):
+        return {}
+    products = normalize_amazon_product_items([
+        product
+        for package in packages
+        for product in (package.get("products") or [])
+        if isinstance(product, dict)
+    ])
+    asins = unique_normalized_asins([
+        *[asin for package in packages for asin in (package.get("asins") or [])],
+        *[product.get("asin") for product in products],
+    ])
+    if len(asins) != 1:
+        return {}
+    product = next((dict(value) for value in products if normalize_asin(value.get("asin")) == asins[0]), {})
+    product["asin"] = asins[0]
+    return product
+
+
 def strip_untrusted_package_item_proof(package: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(package, dict):
         return {}
@@ -32873,6 +32897,21 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 if package_asins_present:
                     continue
                 line_packages = packages
+            replacement_product = tracking_unambiguous_replacement_product(line_packages, row)
+            if replacement_product:
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET replacement_asin=COALESCE(NULLIF(replacement_asin, ''), ?),
+                        replacement_product_name=COALESCE(NULLIF(replacement_product_name, ''), ?)
+                    WHERE id=?
+                    """,
+                    (
+                        replacement_product["asin"],
+                        clean_text(replacement_product.get("title")),
+                        row["id"],
+                    ),
+                )
             line_status = tracking_status_from_packages(line_packages)
             line_delivered = line_status == "Delivered" and line_packages and all(
                 tracking_package_delivered(package) for package in line_packages if isinstance(package, dict)

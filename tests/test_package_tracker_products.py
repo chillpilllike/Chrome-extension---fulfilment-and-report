@@ -13,10 +13,28 @@ from app.main import (
     package_tracker_single_package_history_products,
     package_tracker_tracking_parts_from_lines,
     tracking_packages_by_line_with_one_to_one_fallback,
+    tracking_unambiguous_replacement_product,
 )
 
 
 class PackageTrackerProductTests(unittest.TestCase):
+    def test_unambiguous_fallback_exposes_replacement_metadata(self):
+        product = tracking_unambiguous_replacement_product(
+            [{"asins": ["B000000099"], "products": [{"asin": "B000000099", "title": "Replacement"}]}],
+            {"id": 1, "asin": "B000000001"},
+        )
+
+        self.assertEqual(product["asin"], "B000000099")
+        self.assertEqual(product["title"], "Replacement")
+
+    def test_exact_line_match_is_not_recorded_as_replacement(self):
+        product = tracking_unambiguous_replacement_product(
+            [{"asins": ["B000000001"], "products": [{"asin": "B000000001"}]}],
+            {"id": 1, "asin": "B000000001"},
+        )
+
+        self.assertEqual(product, {})
+
     def test_one_unmatched_replacement_line_gets_one_remaining_shipment(self):
         exact = {"asins": ["B000000001"]}
         replacement = {"asins": ["B000000099"]}
