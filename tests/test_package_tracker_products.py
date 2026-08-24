@@ -128,6 +128,23 @@ class PackageTrackerProductTests(unittest.TestCase):
         self.assertFalse(guard["complete"])
         self.assertEqual(guard["unverified_amazon_orders"], ["111-2"])
 
+    def test_guard_does_not_assign_missing_item_to_known_shipment(self):
+        packages = [{
+            "amazon_order_id": "111-6",
+            "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=KNOWN",
+            "products": [{"asin": "B000000006", "title": "Known shipment item"}],
+        }]
+        history = {"111-6": {"items_json": json.dumps([
+            {"asin": "B000000006", "title": "Known shipment item"},
+            {"asin": "B000000007", "title": "Unmapped shipment item"},
+        ])}}
+
+        guard = package_tracker_enforce_product_guard(packages, history)
+
+        self.assertTrue(guard["complete"])
+        self.assertEqual([product["asin"] for product in packages[0]["products"]], ["B000000006"])
+        self.assertEqual([product["asin"] for product in packages[0]["unassigned_products"]], ["B000000007"])
+
     def test_split_shipments_do_not_repeat_order_level_fallback_asins(self):
         packages = [
             {"id": 10, "package_index": 1, "amazon_order_id": "111-3", "asins_json": '["B000000001"]', "products_json": "[]"},

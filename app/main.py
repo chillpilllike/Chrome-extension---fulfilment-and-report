@@ -34231,7 +34231,7 @@ def package_tracker_enforce_product_guard(
                 recovered = dict(expected_by_asin[asin])
                 recovered["guard_recovered"] = True
                 target_unassigned.append(dict(recovered))
-                if len(order_packages) == 1:
+                if len(order_packages) == 1 and not tracking_package_has_shipment_identity(target):
                     target_products.append(recovered)
                 recovered_total += 1
 
