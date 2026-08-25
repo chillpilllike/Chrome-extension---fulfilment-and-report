@@ -69,6 +69,10 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl gnupg tini \
+       libglib2.0-0t64 libnss3 libnspr4 libdbus-1-3 libatk1.0-0t64 \
+       libatk-bridge2.0-0t64 libcups2t64 libexpat1 libxcb1 libxkbcommon0 \
+       libatspi2.0-0t64 libx11-6 libxcomposite1 libxdamage1 libxext6 \
+       libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
     && install -d /usr/share/postgresql-common/pgdg \
     && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
        | gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg \
@@ -81,6 +85,7 @@ RUN apt-get update \
 
 COPY --from=source /src/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m playwright install chromium
 
 COPY --from=source /src/app ./app
 COPY --from=frontend-build /src/frontend/dist ./frontend/dist

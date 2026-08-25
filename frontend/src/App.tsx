@@ -2177,6 +2177,7 @@ function dispatchProductImagesFrom(value: { products?: Array<{ asin?: string; ti
 const dispatchThumbnailAutoRetryDelays = [1500, 5000, 15000, 60000]
 
 function DispatchProductThumb({ image, onPreview, itemClass }: { image: DispatchProductImage; onPreview: (image: DispatchProductImage) => void; itemClass: string }) {
+  const imageElement = useRef<HTMLImageElement | null>(null)
   const [attempt, setAttempt] = useState(0)
   const [loaded, setLoaded] = useState(false)
   const [failed, setFailed] = useState(false)
@@ -2196,6 +2197,17 @@ function DispatchProductThumb({ image, onPreview, itemClass }: { image: Dispatch
   }, [attempt, failed])
   const retryKey = attempt === dispatchThumbnailAutoRetryDelays.length ? "retry" : "image_retry"
   const retrySrc = attempt ? `${image.src}${image.src.includes("?") ? "&" : "?"}${retryKey}=${attempt}` : image.src
+  useEffect(() => {
+    const element = imageElement.current
+    if (!element?.complete) return
+    if (element.naturalWidth > 0) {
+      setLoaded(true)
+      setFailed(false)
+    } else {
+      setLoaded(false)
+      setFailed(true)
+    }
+  }, [retrySrc])
   const retriesExhausted = failed && attempt >= dispatchThumbnailAutoRetryDelays.length
   return (
     <button
@@ -2220,6 +2232,7 @@ function DispatchProductThumb({ image, onPreview, itemClass }: { image: Dispatch
         </span>
       ) : (
         <img
+          ref={imageElement}
           src={retrySrc}
           alt={image.title}
           className={cn("h-full w-full object-contain", (!loaded || failed) && "opacity-0")}
@@ -9357,7 +9370,7 @@ function PackageTrackerDesignPage() {
                     <div className="small d-grid gap-1 mt-1">
                       {duplicateItems.map((item) => (
                         <span key={item.odoo_asin}>
-                          <span className="font-monospace fw-semibold">{item.odoo_asin}</span>
+                          <span className="fw-semibold">{item.odoo_asin}</span>
                           {item.replacement_asins.length > 0 && <> (replacement: {item.replacement_asins.join(", ")})</>}
                           {` · Odoo ${item.expected_quantity} · Amazon ${item.amazon_quantity} · Excess ${item.excess_quantity}`}
                         </span>
@@ -9504,7 +9517,7 @@ function PackageTrackerDesignPage() {
                         <div className="card card-sm bg-secondary-lt">
                           <div className="card-body">
                             <div className="d-flex flex-column flex-sm-row justify-content-between gap-2">
-                              <div><a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="font-monospace fw-semibold text-break">{item.amazon_order_id} <ExternalLink className="icon icon-1" /></a>{item.order_date && <div className="text-secondary small">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}<div className="text-secondary small text-break">{item.products.map((product) => product.title).join(", ")}</div></div>
+                              <div><a href={item.amazon_order_url} target="_blank" rel="noreferrer" className="fw-semibold text-break">{item.amazon_order_id} <ExternalLink className="icon icon-1" /></a>{item.order_date && <div className="text-secondary small">Ordered {packageTrackerAmazonOrderDate(item.order_date)}</div>}<div className="text-secondary small text-break">{item.products.map((product) => product.title).join(", ")}</div></div>
                               <div className="text-sm-end"><span className="badge bg-secondary-lt text-secondary">{item.hidden_reason === "duplicate" ? "Older duplicate" : "Cancelled / replaced"}</span><div className="text-secondary small mt-1">{formatDateTime(item.updated_at)}</div></div>
                             </div>
                           </div>

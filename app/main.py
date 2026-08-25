@@ -199,6 +199,9 @@ PUBLIC_DISPATCH_POST_PREFIXES = (
 PUBLIC_DISPATCH_GET_PREFIXES = (
     "/api/dispatch-sorting/packages/",
 )
+UNAUTHENTICATED_PUBLIC_API_PREFIXES = (
+    "/api/public/track-orders/",
+)
 MASTER_ADMIN_ACCESS_TOKEN = os.getenv("MASTER_ADMIN_ACCESS_TOKEN", "1284").strip()
 PUBLIC_ACCESS_CODE = os.getenv("PUBLIC_ACCESS_CODE", "").strip()
 PUBLIC_ACCESS_COOKIE = "public_access_session"
@@ -747,6 +750,8 @@ def request_has_public_access(request: Request) -> bool:
 def request_requires_public_access(request: Request) -> bool:
     path = request.url.path
     if path in {"/public/access", "/api/public/access"}:
+        return False
+    if request.method in {"GET", "HEAD"} and path.startswith(UNAUTHENTICATED_PUBLIC_API_PREFIXES):
         return False
     return bool(
         path in PUBLIC_FRONTEND_PATHS
@@ -34218,6 +34223,32 @@ def package_tracker_single_package_history_products(
         for product in normalize_amazon_product_items(parse_json_list_value(history.get("items_json")))
         if normalize_asin(product.get("asin"))
     ]
+
+
+def package_tracker_tracking_parts_from_lines(source_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect distinct pre-tracking Amazon shipment groups stored across order lines."""
+    parts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in source_lines:
+        for part in parse_tracking_packages(clean_text(line.get("tracking_payload"))):
+            if not isinstance(part, dict):
+                continue
+            identity = clean_text(
+                part.get("tracking_id")
+                or part.get("trackingId")
+                or part.get("tracking_url")
+                or part.get("trackingUrl")
+            )
+            if not identity:
+                identity = json.dumps({
+                    "status": clean_text(part.get("delivery_status") or part.get("order_status") or part.get("promise") or part.get("status")),
+                    "asins": sorted(unique_normalized_asins(part.get("asins") or [])),
+                }, sort_keys=True)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            parts.append(dict(part))
+    return parts or [{}]
 
 
 def package_tracker_history_products_by_package(

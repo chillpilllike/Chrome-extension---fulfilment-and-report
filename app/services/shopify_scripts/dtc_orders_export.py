@@ -603,7 +603,10 @@ def _clean_dict(d: dict) -> dict:
 
 
 def _shopify_error_is_invalid_phone(message: str) -> bool:
-    return "phone" in (message or "").lower() and "invalid" in (message or "").lower()
+    text = (message or "").lower()
+    if "phone" not in text:
+        return False
+    return "invalid" in text or "not valid" in text or "already been taken" in text
 
 
 def _shopify_error_is_invalid_province(message: str) -> bool:
