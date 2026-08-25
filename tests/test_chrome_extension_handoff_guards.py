@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.130")
+        self.assertEqual(MANIFEST["version"], "0.1.131")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -898,6 +898,25 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('behavior: "auto"', fill)
         self.assertNotIn("sleep(500)", fill)
         self.assertNotIn("sleep(800)", fill)
+
+    def test_slow_checkout_delivery_card_render_recovers_before_manual_pause(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        parallel_wait = checkout.index("Amazon paints the final checkout shell before its delivery card")
+        edit_freshness = checkout.index("const addressEditIsFresh", parallel_wait)
+        self.assertLess(parallel_wait, edit_freshness)
+        parallel_block = checkout[parallel_wait:edit_freshness]
+        self.assertIn("checkoutRecipientConfirmed(checkoutRecipient)", parallel_block)
+        self.assertIn("checkoutAddressSelectionPageOpen()", parallel_block)
+        self.assertIn("findChangeDeliveryAddressButton()", parallel_block)
+        self.assertIn("findEditAddressTrigger()", parallel_block)
+        self.assertIn("8000,\n      150,", parallel_block)
+
+        pause_message = 'Could not find the Change delivery address or Edit address link for the Nutricity address.'
+        pause_at = checkout.index(pause_message, edit_freshness)
+        late_recovery = checkout.index("const lateAddressEditor = await openAddressEditorIfAvailable(activeJob);", edit_freshness)
+        self.assertLess(late_recovery, pause_at)
 
     def test_address_list_is_recovered_before_final_recipient_verification(self) -> None:
         self.assertIn("function checkoutAddressSelectionPageOpen()", CONTENT)

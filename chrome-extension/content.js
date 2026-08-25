@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-fast-address-detection-v123";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-address-render-recovery-v124";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -7496,7 +7496,28 @@ async function handleCheckout(activeJob) {
     if (activeJob.paused) return;
   }
 
-  const addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
+  let addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
+  if (
+    !addressAlreadyConfirmed
+    && !findAddressNameInput()
+    && !checkoutAddressSelectionPageOpen()
+  ) {
+    // Amazon paints the final checkout shell before its delivery card. Wait
+    // for all valid address surfaces in parallel; returning on whichever one
+    // appears first preserves the fast path without treating a slow render as
+    // a missing Change/Edit control.
+    await waitUntil(
+      () =>
+        checkoutRecipientConfirmed(checkoutRecipient)
+        || findAddressNameInput()
+        || checkoutAddressSelectionPageOpen()
+        || findChangeDeliveryAddressButton()
+        || findEditAddressTrigger(),
+      8000,
+      150,
+    );
+    addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
+  }
   if (addressAlreadyConfirmed) {
     await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Verified delivery address for ${checkoutRecipient}.`);
   }
@@ -7524,12 +7545,25 @@ async function handleCheckout(activeJob) {
           return;
         }
       } else {
-        await sleep(750);
+        await waitUntil(
+          () =>
+            checkoutRecipientConfirmed(checkoutRecipient)
+            || findAddressNameInput()
+            || findChangeDeliveryAddressButton()
+            || findEditAddressTrigger(),
+          5000,
+          150,
+        );
         if (checkoutRecipientConfirmed(checkoutRecipient)) {
           await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Delivery address shows ${checkoutRecipient}. Continuing checkout.`);
         } else {
-        await pauseForManualCheckout(activeJob, "Could not find the Change delivery address or Edit address link for the Nutricity address.");
-        return;
+          const lateAddressEditor = await openAddressEditorIfAvailable(activeJob);
+          if (lateAddressEditor) {
+            if (!await saveEditedAddress(activeJob, checkoutRecipient)) return;
+          } else {
+            await pauseForManualCheckout(activeJob, "Could not find the Change delivery address or Edit address link for the Nutricity address.");
+            return;
+          }
         }
       }
     } else {
