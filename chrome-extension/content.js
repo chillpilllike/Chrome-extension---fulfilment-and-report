@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-address-render-recovery-v124";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-address-resume-recipient-v125";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -10060,6 +10060,7 @@ async function autoResumeResolvedCheckoutPause(activeJob) {
   if (!/\/checkout/i.test(location.pathname)) return false;
   const pausedStage = String(activeJob?.pausedStage || activeJob?.stage || "");
   if (!["checkout", "editing_address"].includes(pausedStage)) return false;
+  const checkoutRecipient = recipientName(activeJob);
   const placeOrder = findPlaceOrderButton();
   if (
     placeOrder &&

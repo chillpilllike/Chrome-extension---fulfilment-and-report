@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.131")
+        self.assertEqual(MANIFEST["version"], "0.1.132")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -917,6 +917,14 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         pause_at = checkout.index(pause_message, edit_freshness)
         late_recovery = checkout.index("const lateAddressEditor = await openAddressEditorIfAvailable(activeJob);", edit_freshness)
         self.assertLess(late_recovery, pause_at)
+
+    def test_paused_checkout_auto_resume_defines_expected_recipient(self) -> None:
+        resume_start = CONTENT.index("async function autoResumeResolvedCheckoutPause(activeJob)")
+        resume_end = CONTENT.index("async function run()", resume_start)
+        resume = CONTENT[resume_start:resume_end]
+        declaration = resume.index("const checkoutRecipient = recipientName(activeJob);")
+        first_use = resume.index("addressEditedRecipient: checkoutRecipient")
+        self.assertLess(declaration, first_use)
 
     def test_address_list_is_recovered_before_final_recipient_verification(self) -> None:
         self.assertIn("function checkoutAddressSelectionPageOpen()", CONTENT)
