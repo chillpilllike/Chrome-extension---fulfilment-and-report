@@ -20,6 +20,8 @@
 
 Auto ordering never starts merely because Chrome opened or the extension reloaded. The confirmation is required for each browser session. While it is running, **Start Auto Ordering** becomes **Stop Auto Ordering**. Stopping clears the session permission, safely releases an active pre-submit job, and prevents any new claim until the confirmation is ticked and Start is clicked again.
 
+Missing ASIN lines are checked at most once every 48 hours. When every unresolved missing line in an Odoo order is available (including an assigned replacement ASIN), the remaining whole order is automatically returned to the Chrome queue. Third-party fulfilled, cancelled, refunded, already ordered, and safety-blocked lines are not requeued.
+
 The extension opens each Amazon product page, pauses when coupon or promotion text is found, adds items to cart, proceeds through checkout, edits only the full name to `Nutricity <OdooOrderNumber>`, clicks **Place your order**, and reports the Amazon order ID back to the local app when it can detect it.
 
 ## Amazon account types (do not combine these flows)

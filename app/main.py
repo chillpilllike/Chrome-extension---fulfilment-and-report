@@ -218,6 +218,7 @@ _PAYMENT_FAILURE_CLEANUP_LOCK = threading.Lock()
 _CHROME_RECOVER_SUBMITTED_NONE_CACHE: dict[tuple[Optional[int], str], float] = {}
 _CHROME_RECOVER_SUBMITTED_NONE_LOCK = threading.Lock()
 _AUTO_CHROME_QUEUE_CONTROL_LOCK = threading.RLock()
+_MISSING_ASIN_CHECK_CLAIM_LOCK = threading.Lock()
 FAST_PAGE_CACHE_MAX_ENTRIES = int(os.getenv("FAST_PAGE_CACHE_MAX_ENTRIES", "3000") or 3000)
 _DISPATCH_REBUILD_PROGRESS: dict[str, Any] = {
     "status": "idle",
@@ -25173,46 +25174,171 @@ def api_missing(store_id: Optional[int] = None, page: int = 1, per_page: int = 1
     return fast_page_cache_set(cache_key, {"stores": stores, "current_store_id": store_id, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": "postgres"}, 90)
 
 
+MISSING_ASIN_RECHECK_HOURS = 48
+
+
 def missing_asin_check_candidates(limit: int = 40) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit or 40), 100))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=MISSING_ASIN_RECHECK_HOURS)).isoformat(timespec="seconds")
+    now = utc_now()
+    effective_asin_sql = "COALESCE(NULLIF(order_lines.replacement_asin, ''), NULLIF(order_lines.missing_asin, ''), NULLIF(order_lines.asin, ''), '')"
+    with _MISSING_ASIN_CHECK_CLAIM_LOCK:
+        with db() as conn:
+            rows = rows_to_dicts(conn.execute(
+                f"""
+                SELECT order_lines.*,
+                       availability.last_checked_at AS availability_last_checked_at
+                FROM order_lines
+                LEFT JOIN missing_asin_availability AS availability
+                  ON availability.order_line_id=order_lines.id
+                 AND availability.asin={effective_asin_sql}
+                WHERE order_lines.state='missing'
+                  AND COALESCE(order_lines.amazon_order_id, '') = ''
+                  AND {effective_asin_sql} != ''
+                  AND COALESCE(order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+                  AND COALESCE(order_lines.order_engine, '') != 'third_party'
+                  AND (availability.last_checked_at IS NULL OR availability.last_checked_at <= ?)
+                ORDER BY COALESCE(availability.last_checked_at, order_lines.updated_at, order_lines.created_at) ASC,
+                         order_lines.id ASC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall())
+            candidates = []
+            for row in rows:
+                asin = normalize_asin(row.get("replacement_asin") or row.get("missing_asin") or row.get("asin") or "")
+                if not asin:
+                    continue
+                product_name = clean_text(row.get("replacement_product_name") or row.get("product_name"))
+                conn.execute(
+                    """
+                    INSERT INTO missing_asin_availability (
+                        order_line_id, store_id, asin, product_name, odoo_order_id, odoo_order_name,
+                        status, availability_message, checked_by, first_seen_at, last_checked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'checking', ?, 'Chrome availability reservation', ?, ?)
+                    ON CONFLICT(order_line_id, asin) DO UPDATE SET
+                        status='checking',
+                        availability_message=excluded.availability_message,
+                        checked_by=excluded.checked_by,
+                        last_checked_at=excluded.last_checked_at
+                    """,
+                    (
+                        row["id"], row["store_id"], asin, product_name,
+                        row["odoo_order_id"], row["odoo_order_name"],
+                        f"Reserved for its once-per-{MISSING_ASIN_RECHECK_HOURS}-hour availability check.",
+                        now, now,
+                    ),
+                )
+                candidates.append({
+                    "line_id": row["id"],
+                    "store_id": row["store_id"],
+                    "odoo_order_id": row["odoo_order_id"],
+                    "odoo_order_name": row["odoo_order_name"],
+                    "asin": asin,
+                    "product_name": product_name,
+                    "quantity": row.get("quantity") or 1,
+                    "amazon_url": asin_product_url(asin),
+                })
+            return candidates
+
+
+def auto_queue_ready_missing_order(store_id: int, odoo_order_id: int) -> tuple[int, str]:
     with db() as conn:
         rows = rows_to_dicts(conn.execute(
             """
-            SELECT order_lines.*
+            SELECT *
             FROM order_lines
-            WHERE state='missing'
+            WHERE store_id=?
+              AND odoo_order_id=?
               AND COALESCE(amazon_order_id, '') = ''
-              AND COALESCE(replacement_asin, '') = ''
-              AND COALESCE(NULLIF(asin, ''), NULLIF(missing_asin, ''), '') != ''
+              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory', 'ignored')
+              AND COALESCE(order_engine, '') != 'third_party'
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM order_lines AS sibling
-                  WHERE sibling.store_id=order_lines.store_id
-                    AND sibling.odoo_order_id=order_lines.odoo_order_id
-                    AND COALESCE(sibling.replacement_asin, '') != ''
+              AND COALESCE(asin, '') != ''
+            ORDER BY id
+            """,
+            (store_id, odoo_order_id),
+        ).fetchall())
+        if not rows:
+            return 0, "No unresolved order lines remain eligible for Amazon ordering."
+        if any(clean_text(row.get("state")) == "submitted" for row in rows):
+            return 0, "This Odoo order is already queued for Chrome fulfilment."
+        waiting: list[str] = []
+        for row in rows:
+            if clean_text(row.get("state")) != "missing":
+                continue
+            asin = normalize_asin(row.get("replacement_asin") or row.get("missing_asin") or row.get("asin") or "")
+            availability = conn.execute(
+                """
+                SELECT status
+                FROM missing_asin_availability
+                WHERE order_line_id=? AND asin=?
+                """,
+                (row["id"], asin),
+            ).fetchone()
+            availability_status = clean_text(availability["status"] if availability else "")
+            if availability_status not in {"back_in_stock", "approved"}:
+                waiting.append(asin or str(row["id"]))
+        if waiting:
+            return 0, f"Waiting for the remaining missing ASIN(s): {', '.join(waiting)}."
+        line_ids = [int(row["id"]) for row in rows]
+
+    queued, _cleared, _blocked, _account, _details = queue_chrome_order_groups_fast(
+        store_id,
+        line_ids=line_ids,
+        include_missing_asins=True,
+    )
+    if not queued:
+        return 0, "All missing ASINs are ready, but an Odoo, duplicate, fulfilment, or safety guard blocked the queue."
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE missing_asin_availability
+            SET status='approved',
+                queued_at=COALESCE(queued_at, ?),
+                availability_message=?,
+                last_checked_at=?
+            WHERE store_id=?
+              AND odoo_order_id=?
+              AND status='back_in_stock'
+            """,
+            (now, "Automatically queued after every unresolved ASIN was confirmed ready.", now, store_id, odoo_order_id),
+        )
+    return queued, "Every unresolved ASIN is ready; the whole remaining Odoo order was queued for Chrome fulfilment."
+
+
+def auto_queue_all_ready_missing_orders(limit: int = 500) -> int:
+    with db() as conn:
+        candidates = rows_to_dicts(conn.execute(
+            """
+            SELECT DISTINCT order_lines.store_id, order_lines.odoo_order_id
+            FROM order_lines
+            LEFT JOIN missing_asin_availability AS availability
+              ON availability.order_line_id=order_lines.id
+            WHERE COALESCE(order_lines.amazon_order_id, '') = ''
+              AND COALESCE(order_lines.order_engine, '') != 'third_party'
+              AND COALESCE(order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+              AND (
+                (order_lines.state='missing' AND availability.status IN ('back_in_stock', 'approved'))
+                OR (
+                  order_lines.state='pulled'
+                  AND COALESCE(order_lines.replacement_asin, '') != ''
+                )
               )
-            ORDER BY COALESCE(updated_at, created_at) ASC, id ASC
+            ORDER BY order_lines.store_id, order_lines.odoo_order_id
             LIMIT ?
             """,
-            (limit,),
+            (max(1, min(int(limit or 500), 2000)),),
         ).fetchall())
-    candidates = []
-    for row in rows:
-        asin = normalize_asin(row.get("missing_asin") or row.get("asin") or "")
-        if not asin:
-            continue
-        candidates.append({
-            "line_id": row["id"],
-            "store_id": row["store_id"],
-            "odoo_order_id": row["odoo_order_id"],
-            "odoo_order_name": row["odoo_order_name"],
-            "asin": asin,
-            "product_name": row.get("product_name") or "",
-            "quantity": row.get("quantity") or 1,
-            "amazon_url": asin_product_url(asin),
-        })
-    return candidates
+    queued_total = 0
+    for candidate in candidates:
+        queued, _message = auto_queue_ready_missing_order(
+            int(candidate["store_id"]),
+            int(candidate["odoo_order_id"]),
+        )
+        queued_total += queued
+    return queued_total
 
 
 def back_in_stock_rows(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int]:
@@ -25420,8 +25546,6 @@ def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
         raise HTTPException(400, f"Only back-in-stock records can be approved. Current status is {record['status']}.")
     if clean_text(record["amazon_order_id"]):
         raise HTTPException(400, "This order line already has an Amazon order ID.")
-    if clean_text(record["replacement_asin"]):
-        raise HTTPException(400, "A replacement ASIN is assigned. It will not be queued from the back-in-stock page.")
     local_status = clean_text(record["odoo_status_label"]).lower()
     if local_status in {"cancelled", "refunded"}:
         with db() as conn:
@@ -25436,42 +25560,21 @@ def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
         mark_back_in_stock_cancelled(line_id, asin, odoo_status, message)
         fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders"})
         return {"ok": False, "message": f"{message} Nothing was queued.", "queued": 0}
-    queued, _cleared, _blocked, _account, _details = queue_chrome_order_groups_fast(
+    queued, readiness_message = auto_queue_ready_missing_order(
         int(record["store_id"]),
-        line_ids=[line_id],
-        include_missing_asins=True,
+        int(record["odoo_order_id"]),
     )
     if not queued:
+        next_status = "back_in_stock" if readiness_message.startswith("Waiting for the remaining missing ASIN") else "approval_failed"
         with db() as conn:
             conn.execute(
                 "UPDATE missing_asin_availability SET status=?, availability_message=?, last_checked_at=? WHERE id=?",
-                ("approval_failed", "Approval did not queue this line; it may already be queued, fulfilled, ignored, or blocked.", utc_now(), availability_id),
+                (next_status, readiness_message, utc_now(), availability_id),
             )
         fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders"})
-        return {"ok": False, "message": "Could not queue this line; it may already be queued, fulfilled, ignored, or blocked.", "queued": 0}
-    with db() as conn:
-        conn.execute(
-            """
-            UPDATE order_lines
-            SET amazon_status='back_in_stock',
-                fulfilment_note=CASE
-                  WHEN COALESCE(fulfilment_note, '') = '' THEN ?
-                  ELSE fulfilment_note || ' | ' || ?
-                END,
-                updated_at=?
-            WHERE id=?
-            """,
-            ("Back in stock approved; queued for Chrome fulfilment.", "Back in stock approved; queued for Chrome fulfilment.", utc_now(), line_id),
-        )
-        conn.execute(
-            "UPDATE missing_asin_availability SET status='approved', queued_at=?, availability_message=?, last_checked_at=? WHERE id=?",
-            (utc_now(), "Approved after Odoo cancellation check; queued for Chrome.", utc_now(), availability_id),
-        )
-        updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
-        if updated:
-            index_order_line(updated)
+        return {"ok": False, "message": readiness_message, "queued": 0}
     fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders"})
-    return {"ok": True, "message": "Approved and queued for Chrome fulfilment.", "queued": queued}
+    return {"ok": True, "message": readiness_message, "queued": queued}
 
 
 @app.delete("/api/back-in-stock/{availability_id}")
@@ -25507,15 +25610,7 @@ def api_chrome_missing_asin_report(payload: dict[str, Any]) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Order line not found.")
-        order_has_replacement = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM order_lines
-            WHERE store_id=? AND odoo_order_id=? AND COALESCE(replacement_asin, '') != ''
-            """,
-            (row["store_id"], row["odoo_order_id"]),
-        ).fetchone()["count"]
-        record_status = "replacement_assigned" if order_has_replacement else status
+        record_status = status
         conn.execute(
             """
             INSERT INTO missing_asin_availability (
@@ -25546,9 +25641,29 @@ def api_chrome_missing_asin_report(payload: dict[str, Any]) -> dict[str, Any]:
                 now,
             ),
         )
-    if in_stock and order_has_replacement:
-        skipped_reason = "Replacement ASIN is already assigned on this Odoo order."
-    return {"ok": True, "status": record_status if in_stock else status, "queued": 0, "requires_approval": in_stock and not order_has_replacement, "skipped_reason": skipped_reason}
+        availability = conn.execute(
+            "SELECT id FROM missing_asin_availability WHERE order_line_id=? AND asin=?",
+            (line_id, asin),
+        ).fetchone()
+        availability_id = int(availability["id"] or 0) if availability else 0
+        store_id = int(row["store_id"])
+        odoo_order_id = int(row["odoo_order_id"] or 0)
+    if in_stock and availability_id and odoo_order_id and auto_chrome_ordering_enabled():
+        queued, queue_message = auto_queue_ready_missing_order(store_id, odoo_order_id)
+        if not queued:
+            skipped_reason = queue_message
+        fast_page_cache_clear_matching({"back-in-stock", "chrome-jobs", "dashboard", "orders", "missing"})
+        return {
+            "ok": True,
+            "status": "approved" if queued else record_status,
+            "queued": queued,
+            "requires_approval": False,
+            "skipped_reason": skipped_reason,
+            "message": queue_message,
+        }
+    if in_stock and not auto_chrome_ordering_enabled():
+        skipped_reason = "Automatic Chrome ordering is paused; the ready ASIN will remain in Back In Stock until ordering is enabled."
+    return {"ok": True, "status": record_status, "queued": 0, "requires_approval": False, "skipped_reason": skipped_reason}
 
 
 @app.get("/api/partial-fulfilments")
@@ -25697,8 +25812,21 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
         pass
     if updated:
         index_order_line(updated)
+    queued = 0
+    queue_message = ""
+    if auto_chrome_ordering_enabled():
+        queued, queue_message = auto_queue_ready_missing_order(effective_store_id, int(updated["odoo_order_id"] or 0))
+        with db() as conn:
+            updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
-    return {"ok": True, "message": f"Replacement {replacement_asin} assigned and marked ready to queue.", "row": row_to_dict(updated)}
+    message = f"Replacement {replacement_asin} assigned."
+    if queued:
+        message += f" {queue_message}"
+    elif auto_chrome_ordering_enabled() and queue_message:
+        message += f" {queue_message}"
+    else:
+        message += " It is ready for the next manual queue action."
+    return {"ok": True, "message": message, "queued": queued, "row": row_to_dict(updated)}
 
 
 def original_product_name_for_line(store_id: int, row: Any) -> str:
@@ -29973,12 +30101,17 @@ def api_resume_chrome_auto_ordering(payload: dict[str, Any]) -> dict[str, Any]:
             "auto_chrome_fulfil_last_message",
             f"Automatic Chrome ordering enabled for eligible Odoo orders dated {start_date} or later; queue refresh pending.",
         )
+        ready_missing_queued = auto_queue_all_ready_missing_orders()
     fast_page_cache_clear_matching({"settings-services"})
     return {
         "ok": True,
         "enabled": True,
         "start_date": start_date,
-        "message": f"Automatic Chrome ordering enabled. Eligible orders dated {start_date} or later will be queued on the next scheduler pass.",
+        "ready_missing_queued": ready_missing_queued,
+        "message": (
+            f"Automatic Chrome ordering enabled. Eligible orders dated {start_date} or later will be queued on the next scheduler pass. "
+            f"Queued {ready_missing_queued} ready missing/replacement order(s)."
+        ),
     }
 
 

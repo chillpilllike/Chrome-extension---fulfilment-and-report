@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-manual-auto-order-session-v131";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-missing-asin-48-hour-v132";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {

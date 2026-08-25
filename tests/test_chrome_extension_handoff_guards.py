@@ -151,7 +151,38 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.140")
+        self.assertEqual(MANIFEST["version"], "0.1.141")
+
+    def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
+        self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
+        self.assertIn("MISSING_ASIN_RECHECK_HOURS = 48", APP)
+        candidate_start = APP.index("def missing_asin_check_candidates")
+        candidate_end = APP.index("def auto_queue_ready_missing_order", candidate_start)
+        candidates = APP[candidate_start:candidate_end]
+        self.assertIn("availability.last_checked_at <= ?", candidates)
+        self.assertIn("'checking'", candidates)
+        self.assertIn("_MISSING_ASIN_CHECK_CLAIM_LOCK", candidates)
+        self.assertIn('row.get("replacement_asin") or row.get("missing_asin")', candidates)
+
+    def test_ready_missing_lines_requeue_as_one_whole_odoo_order(self) -> None:
+        helper_start = APP.index("def auto_queue_ready_missing_order")
+        helper_end = APP.index("def auto_queue_all_ready_missing_orders", helper_start)
+        helper = APP[helper_start:helper_end]
+        self.assertIn("Waiting for the remaining missing ASIN", helper)
+        self.assertIn("line_ids = [int(row[\"id\"]) for row in rows]", helper)
+        self.assertIn("include_missing_asins=True", helper)
+        report_start = APP.index("def api_chrome_missing_asin_report")
+        report_end = APP.index("def api_partial_fulfilments", report_start)
+        report = APP[report_start:report_end]
+        self.assertIn("auto_queue_ready_missing_order(store_id, odoo_order_id)", report)
+        self.assertIn('"requires_approval": False', report)
+
+    def test_replacement_assignment_queues_when_auto_ordering_is_enabled(self) -> None:
+        assign_start = APP.index("def api_assign_replacement")
+        assign_end = APP.index("def original_product_name_for_line", assign_start)
+        assign = APP[assign_start:assign_end]
+        self.assertIn("if auto_chrome_ordering_enabled()", assign)
+        self.assertIn("auto_queue_ready_missing_order", assign)
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")

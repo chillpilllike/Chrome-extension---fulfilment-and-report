@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-manual-auto-order-session-v131";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-missing-asin-48-hour-v132";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -12,7 +12,7 @@ let startNextJobInFlight = null;
 const claimNextJobInFlight = new Map();
 const submitProtectionLocks = new Set();
 const MISSING_ASIN_ALARM = "nutricity-missing-asin-availability";
-const MISSING_ASIN_CHECK_PERIOD_MINUTES = 24 * 60;
+const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60;
 const FULFILMENT_WATCHDOG_ALARM = "nutricity-fulfilment-watchdog";
 const FULFILMENT_WATCHDOG_PERIOD_MINUTES = 1;
 const AUTO_ORDER_ALARM = "nutricity-auto-order-queue";
