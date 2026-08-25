@@ -6015,12 +6015,11 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   }
 
   const save = await waitUntil(() => {
-    if (!visibleDeliveryPreferencesDialog()) return null;
     return [...document.querySelectorAll("button, input[type='submit'], input[type='button']")]
       .find((element) => (
         visible(element)
         && !element.disabled
-        && normalizedText(element.value || element.textContent || "").toLowerCase() === "save instructions"
+        && normalizedText(element.value || element.getAttribute("aria-label") || element.textContent || "").toLowerCase() === "save instructions"
       )) || null;
   }, 10000, 150);
   if (!save) {
