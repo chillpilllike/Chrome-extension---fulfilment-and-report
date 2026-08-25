@@ -38,6 +38,14 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
             self.assertEqual(main.chrome_source_line_item_count(rows), 3)
             self.assertEqual(main.required_chrome_account_experience(rows), "consumer")
 
+    def test_claim_filters_account_type_before_candidate_limit(self) -> None:
+        source = inspect.getsource(main.claim_next_chrome_job)
+        account_filter = source.index("? = 'consumer'")
+        candidate_limit = source.index("LIMIT 250", account_filter)
+        self.assertLess(account_filter, candidate_limit)
+        self.assertIn("COUNT(*) = 1", source[account_filter:candidate_limit])
+        self.assertIn("source_line_count", source[account_filter:candidate_limit])
+
 
 if __name__ == "__main__":
     unittest.main()

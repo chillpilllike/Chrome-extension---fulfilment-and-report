@@ -12118,6 +12118,10 @@ def claim_next_chrome_job(
                     (group_key,),
                 ).fetchall())
                 return chrome_job_from_rows(rows)
+        candidate_experience = "any"
+        if chrome_account_type_routing_enabled():
+            detected_experience = clean_text(account_experience).lower()
+            candidate_experience = detected_experience if detected_experience in {"consumer", "business"} else "none"
         candidates = conn.execute(
             """
             SELECT amazon_group_key,
@@ -12133,10 +12137,25 @@ def claim_next_chrome_job(
               AND (? IS NULL OR store_id=?)
             GROUP BY amazon_group_key
             HAVING MAX(CASE WHEN COALESCE(chrome_claimed_by, '') != '' THEN 1 ELSE 0 END) = 0
+               AND (
+                    ? = 'any'
+                    OR (
+                        ? = 'consumer'
+                        AND (
+                            COUNT(*) > 1
+                            OR MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) > 1
+                        )
+                    )
+                    OR (
+                        ? = 'business'
+                        AND COUNT(*) = 1
+                        AND MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) <= 1
+                    )
+               )
             ORDER BY newest_order_date DESC, newest_order_id DESC, first_line_id ASC
             LIMIT 250
             """,
-            (store_id, store_id),
+            (store_id, store_id, candidate_experience, candidate_experience, candidate_experience),
         ).fetchall()
         for candidate in candidates:
             group_key = str(candidate["amazon_group_key"])
