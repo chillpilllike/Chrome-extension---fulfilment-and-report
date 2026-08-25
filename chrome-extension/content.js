@@ -6015,12 +6015,8 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   }
 
   const save = await waitUntil(() => {
-    return [...document.querySelectorAll("button, input[type='submit'], input[type='button']")]
-      .find((element) => (
-        visible(element)
-        && !element.disabled
-        && normalizedText(element.value || element.getAttribute("aria-label") || element.textContent || "").toLowerCase() === "save instructions"
-      )) || null;
+    const candidate = findButtonByText(["save instructions"]);
+    return candidate && !candidate.disabled ? candidate : null;
   }, 10000, 150);
   if (!save) {
     return pauseForDeliveryPreferences(activeJob, "Amazon consumer delivery instructions did not expose a usable Save instructions button.", dialog);
