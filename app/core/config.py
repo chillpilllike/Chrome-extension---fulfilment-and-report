@@ -38,6 +38,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "auto_chrome_fulfil_enabled": os.getenv("AUTO_CHROME_FULFIL_ENABLED", "true"),
     "auto_chrome_fulfil_interval_minutes": os.getenv("AUTO_CHROME_FULFIL_INTERVAL_MINUTES", "5"),
     "auto_chrome_fulfil_minimum_age_minutes": os.getenv("AUTO_CHROME_FULFIL_MINIMUM_AGE_MINUTES", "60"),
+    "auto_chrome_fulfil_start_date": os.getenv("AUTO_CHROME_FULFIL_START_DATE", ""),
     "auto_chrome_fulfil_days": os.getenv("AUTO_CHROME_FULFIL_DAYS", "2"),
     "auto_chrome_fulfil_limit": os.getenv("AUTO_CHROME_FULFIL_LIMIT", "100"),
     "chrome_route_orders_by_account_type": os.getenv("CHROME_ROUTE_ORDERS_BY_ACCOUNT_TYPE", "true"),

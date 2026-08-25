@@ -15164,6 +15164,45 @@ function SettingsPage({
       setSavingServices("")
     }
   }
+  async function pauseChromeAutoOrdering() {
+    setSavingServices("Chrome Auto Ordering")
+    try {
+      const result = await api<{ ok: boolean; message: string; enabled: boolean; cleared: number; protected: number; start_date: string }>("/api/chrome/auto-ordering/pause", {
+        method: "POST",
+        body: JSON.stringify({}),
+      })
+      setSettings((current) => ({
+        ...current,
+        auto_chrome_fulfil_enabled: "false",
+        auto_chrome_fulfil_start_date: result.start_date || current.auto_chrome_fulfil_start_date || "",
+      }))
+      onResult({ ok: result.ok, title: "Chrome Auto Ordering Paused", message: result.message })
+    } finally {
+      setSavingServices("")
+    }
+  }
+  async function resumeChromeAutoOrdering() {
+    const startDate = (settings.auto_chrome_fulfil_start_date || "").trim()
+    if (!startDate) {
+      onResult({ ok: false, title: "Start Date Required", message: "Choose the earliest Odoo order date that may be sent to the Chrome queue." })
+      return
+    }
+    setSavingServices("Chrome Auto Ordering")
+    try {
+      const result = await api<{ ok: boolean; message: string; enabled: boolean; start_date: string }>("/api/chrome/auto-ordering/resume", {
+        method: "POST",
+        body: JSON.stringify({ start_date: startDate }),
+      })
+      setSettings((current) => ({
+        ...current,
+        auto_chrome_fulfil_enabled: "true",
+        auto_chrome_fulfil_start_date: result.start_date,
+      }))
+      onResult({ ok: result.ok, title: "Chrome Auto Ordering Enabled", message: result.message })
+    } finally {
+      setSavingServices("")
+    }
+  }
   async function saveTrackingScriptConfig(sources: Record<string, any>[], destinations: Record<string, any>[]) {
     setSavingServices("Tracking Script Fields")
     try {
@@ -15689,10 +15728,36 @@ function SettingsPage({
               </SelectField>
               <TextField label="Auto Pull Limit" value={settings.pull_orders_limit || "0"} onChange={(value) => setSetting("pull_orders_limit", value)} />
               <p className="text-xs text-muted-foreground md:col-span-2">Use 0 for normal auto pull so every confirmed paid order in the selected window is ingested. A limit is only for short diagnostics.</p>
-              <SelectField label="Automatically Queue Chrome Orders" value={settings.auto_chrome_fulfil_enabled || "false"} onChange={(value) => setSetting("auto_chrome_fulfil_enabled", value)}>
-                <option value="false">Disabled</option>
-                <option value="true">Enabled</option>
-              </SelectField>
+              <div className="grid gap-2 rounded border bg-muted/10 p-3 md:col-span-2">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium">Automatic Chrome Ordering</div>
+                    <div className="text-xs text-muted-foreground">
+                      {settings.auto_chrome_fulfil_enabled === "true"
+                        ? `Enabled${settings.auto_chrome_fulfil_start_date ? ` for Odoo orders dated ${settings.auto_chrome_fulfil_start_date} or later` : ""}.`
+                        : "Paused. New claims are blocked and unsubmitted queue lines remain pulled."}
+                    </div>
+                  </div>
+                  {settings.auto_chrome_fulfil_enabled === "true" ? (
+                    <Button variant="destructive" onClick={pauseChromeAutoOrdering} disabled={savingServices === "Chrome Auto Ordering"}>
+                      {savingServices === "Chrome Auto Ordering" ? "Pausing..." : "Pause Auto Ordering & Reset Queue"}
+                    </Button>
+                  ) : null}
+                </div>
+                {settings.auto_chrome_fulfil_enabled !== "true" ? (
+                  <div className="grid gap-3 md:grid-cols-[minmax(220px,320px)_auto] md:items-end">
+                    <TextField
+                      label="Queue eligible Odoo orders since"
+                      type="date"
+                      value={settings.auto_chrome_fulfil_start_date || ""}
+                      onChange={(value) => setSetting("auto_chrome_fulfil_start_date", value)}
+                    />
+                    <Button onClick={resumeChromeAutoOrdering} disabled={savingServices === "Chrome Auto Ordering" || !settings.auto_chrome_fulfil_start_date}>
+                      {savingServices === "Chrome Auto Ordering" ? "Enabling..." : "Enable Auto Ordering"}
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
               <SelectField label="Auto Queue Check Interval" value={settings.auto_chrome_fulfil_interval_minutes || "5"} onChange={(value) => setSetting("auto_chrome_fulfil_interval_minutes", value)}>
                 {["5", "15", "30", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
               </SelectField>
@@ -15730,7 +15795,6 @@ function SettingsPage({
 	                  "autosync_interval_minutes",
                   "pull_orders_days",
                   "pull_orders_limit",
-                  "auto_chrome_fulfil_enabled",
                   "auto_chrome_fulfil_interval_minutes",
                   "auto_chrome_fulfil_minimum_age_minutes",
                   "auto_chrome_fulfil_days",

@@ -217,6 +217,7 @@ _PAYMENT_FAILURE_CLEANUP_ENQUEUED_AT = 0.0
 _PAYMENT_FAILURE_CLEANUP_LOCK = threading.Lock()
 _CHROME_RECOVER_SUBMITTED_NONE_CACHE: dict[tuple[Optional[int], str], float] = {}
 _CHROME_RECOVER_SUBMITTED_NONE_LOCK = threading.Lock()
+_AUTO_CHROME_QUEUE_CONTROL_LOCK = threading.RLock()
 FAST_PAGE_CACHE_MAX_ENTRIES = int(os.getenv("FAST_PAGE_CACHE_MAX_ENTRIES", "3000") or 3000)
 _DISPATCH_REBUILD_PROGRESS: dict[str, Any] = {
     "status": "idle",
@@ -11668,6 +11669,34 @@ def chrome_account_type_routing_enabled() -> bool:
     }
 
 
+def auto_chrome_ordering_enabled() -> bool:
+    return clean_text(get_service_settings().get("auto_chrome_fulfil_enabled")).lower() in {
+        "1", "true", "yes", "on", "enabled",
+    }
+
+
+def normalized_auto_chrome_start_date(value: Any) -> str:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return ""
+    try:
+        return datetime.strptime(cleaned, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return ""
+
+
+def chrome_order_is_on_or_after_start_date(group_rows: list[dict[str, Any]], start_date: str) -> bool:
+    normalized = normalized_auto_chrome_start_date(start_date)
+    if not normalized:
+        return True
+    cutoff_date = datetime.strptime(normalized, "%Y-%m-%d").date()
+    order_dates = [parse_any_datetime(row.get("odoo_order_date")) for row in group_rows]
+    return bool(order_dates) and all(
+        value is not None and odoo_display_date_for_guard(value) >= cutoff_date
+        for value in order_dates
+    )
+
+
 def chrome_source_line_item_count(group_rows: list[dict[str, Any]]) -> int:
     recorded_counts = [int(float(row.get("source_line_count") or 0)) for row in group_rows]
     return max([len(group_rows), *recorded_counts])
@@ -13157,6 +13186,7 @@ def place_orders(
     allow_missing_spaid: bool = False,
     include_missing_asins: bool = False,
     minimum_order_age_minutes: int = 0,
+    minimum_odoo_order_date: str = "",
 ) -> tuple[int, int]:
     store = get_store(store_id)
     amazon_account = get_amazon_account(amazon_account_id)
@@ -13249,6 +13279,16 @@ def place_orders(
                 if received_times and all(value is not None and value <= cutoff for value in received_times):
                     eligible_order_ids.add(order_id)
             lines = [line for line in lines if int(line["odoo_order_id"]) in eligible_order_ids]
+        if lines and normalized_auto_chrome_start_date(minimum_odoo_order_date):
+            by_order_date: dict[int, list[dict[str, Any]]] = {}
+            for line in lines:
+                by_order_date.setdefault(int(line["odoo_order_id"]), []).append(dict(line))
+            eligible_date_order_ids = {
+                order_id
+                for order_id, order_lines in by_order_date.items()
+                if chrome_order_is_on_or_after_start_date(order_lines, minimum_odoo_order_date)
+            }
+            lines = [line for line in lines if int(line["odoo_order_id"]) in eligible_date_order_ids]
     inventory_lines: list[dict[str, Any]] = []
     allocated_lines: list[dict[str, Any]] = []
     purchase_lines: list[dict[str, Any]] = []
@@ -24588,30 +24628,40 @@ def autosync_loop() -> None:
             chrome_interval = max(1, raw_chrome_interval or 5)
             chrome_elapsed = max(time.time() - last_chrome_run, setting_elapsed_seconds("auto_chrome_fulfil_last_run_at", chrome_interval * 60))
             if chrome_enabled and chrome_elapsed >= chrome_interval * 60:
-                days = max(1, min(30, int(float(settings.get("auto_chrome_fulfil_days") or 2))))
-                limit = max(1, min(500, int(float(settings.get("auto_chrome_fulfil_limit") or 100))))
-                minimum_age = max(1, min(1440, int(float(settings.get("auto_chrome_fulfil_minimum_age_minutes") or 60))))
-                queued_total = 0
-                skipped_total = 0
-                for store in list_stores():
-                    store_id = int(store["id"])
-                    pulled_count = fetch_odoo_lines_exclusive(get_store(store_id), days=days, limit=limit, wait=False)
-                    if pulled_count:
-                        start_typesense_reindex_job()
-                    if pulled_count is not None:
-                        queued, skipped = place_orders(
-                            store_id,
-                            ordering_engine="chrome",
-                            minimum_order_age_minutes=minimum_age,
+                with _AUTO_CHROME_QUEUE_CONTROL_LOCK:
+                    # Pause owns this same lock. Re-read after acquiring it so a
+                    # scheduler pass observed before Pause cannot refill the queue.
+                    if auto_chrome_ordering_enabled():
+                        current_settings = get_service_settings()
+                        days = max(1, min(30, int(float(current_settings.get("auto_chrome_fulfil_days") or 2))))
+                        limit = max(1, min(500, int(float(current_settings.get("auto_chrome_fulfil_limit") or 100))))
+                        minimum_age = max(1, min(1440, int(float(current_settings.get("auto_chrome_fulfil_minimum_age_minutes") or 60))))
+                        start_date = normalized_auto_chrome_start_date(current_settings.get("auto_chrome_fulfil_start_date"))
+                        queued_total = 0
+                        skipped_total = 0
+                        for store in list_stores():
+                            store_id = int(store["id"])
+                            pulled_count = fetch_odoo_lines_exclusive(get_store(store_id), days=days, limit=limit, wait=False)
+                            if pulled_count:
+                                start_typesense_reindex_job()
+                            if pulled_count is not None:
+                                queued, skipped = place_orders(
+                                    store_id,
+                                    ordering_engine="chrome",
+                                    minimum_order_age_minutes=minimum_age,
+                                    minimum_odoo_order_date=start_date,
+                                )
+                                queued_total += queued
+                                skipped_total += skipped
+                        set_setting("auto_chrome_fulfil_last_run_at", utc_now())
+                        set_setting(
+                            "auto_chrome_fulfil_last_message",
+                            (
+                                f"Queued {queued_total} whole order(s) dated {start_date or 'any date'} or later "
+                                f"and at least {minimum_age} minutes old; skipped {skipped_total}."
+                            ),
                         )
-                        queued_total += queued
-                        skipped_total += skipped
-                set_setting("auto_chrome_fulfil_last_run_at", utc_now())
-                set_setting(
-                    "auto_chrome_fulfil_last_message",
-                    f"Queued {queued_total} whole order(s) at least {minimum_age} minutes old; skipped {skipped_total}.",
-                )
-                last_chrome_run = time.time()
+                        last_chrome_run = time.time()
             cancelled_interval = int(float(settings.get("cancelled_orders_sync_interval_minutes") or 0))
             if cancelled_interval > 0 and time.time() - last_cancelled_run >= cancelled_interval * 60:
                 days = max(1, min(365, int(float(settings.get("cancelled_orders_sync_days") or 30))))
@@ -29087,6 +29137,13 @@ def api_chrome_jobs(
     account_experience: str = "",
 ) -> dict[str, Any]:
     if claim:
+        if not auto_chrome_ordering_enabled():
+            return {
+                "ok": True,
+                "jobs": [],
+                "auto_ordering_paused": True,
+                "message": "Automatic Chrome ordering is paused in app settings.",
+            }
         history_reconciled = reconcile_exact_submitted_chrome_jobs_from_history()
         chatter_repaired = repair_missing_chrome_order_chatter()
         # Older loaded extension workers used resume_existing=false, which can
@@ -29826,8 +29883,12 @@ def api_chrome_clear_failed_jobs(store_id: Optional[int] = None) -> dict[str, An
     return {"ok": True, "cleared": cursor.rowcount, "message": f"Cleared {cursor.rowcount} failed or stale queued Chrome job line(s)."}
 
 
-@app.post("/api/chrome/queue/force-clear")
-def api_chrome_force_clear_queue(store_id: Optional[int] = None) -> dict[str, Any]:
+def reset_unsubmitted_chrome_queue(
+    store_id: Optional[int] = None,
+    *,
+    attempt_status: str = "force_cleared",
+    attempt_error: str = "Chrome queue force cleared from extension popup.",
+) -> tuple[int, int]:
     now = utc_now()
     with db() as conn:
         protected = int(conn.execute(
@@ -29864,16 +29925,68 @@ def api_chrome_force_clear_queue(store_id: Optional[int] = None) -> dict[str, An
         conn.execute(
             """
             UPDATE amazon_attempts
-            SET status='force_cleared',
-                error='Chrome queue force cleared from extension popup.'
+            SET status=?,
+                error=?
             WHERE mode='chrome'
               AND status IN ('queued', 'error')
-            """
+            """,
+            (attempt_status, attempt_error),
         )
-    message = f"Force cleared {cursor.rowcount} unsubmitted Chrome queue line(s)."
+    return cursor.rowcount, protected
+
+
+@app.post("/api/chrome/auto-ordering/pause")
+def api_pause_chrome_auto_ordering() -> dict[str, Any]:
+    with _AUTO_CHROME_QUEUE_CONTROL_LOCK:
+        set_setting("auto_chrome_fulfil_enabled", "false")
+        set_setting("auto_chrome_fulfil_last_message", "Automatic Chrome ordering paused; unsubmitted queue reset to pulled.")
+        cleared, protected = reset_unsubmitted_chrome_queue(
+            attempt_status="auto_ordering_paused",
+            attempt_error="Automatic Chrome ordering paused from app settings.",
+        )
+    fast_page_cache_clear_matching({"settings-services"})
+    message = f"Automatic Chrome ordering paused. Returned {cleared} unsubmitted queue line(s) to pulled."
+    if protected:
+        message += f" Preserved {protected} line(s) already submitted to Amazon and awaiting reporting."
+    return {
+        "ok": True,
+        "enabled": False,
+        "cleared": cleared,
+        "protected": protected,
+        "start_date": normalized_auto_chrome_start_date(get_service_settings().get("auto_chrome_fulfil_start_date")),
+        "message": message,
+    }
+
+
+@app.post("/api/chrome/auto-ordering/resume")
+def api_resume_chrome_auto_ordering(payload: dict[str, Any]) -> dict[str, Any]:
+    start_date = normalized_auto_chrome_start_date(payload.get("start_date"))
+    if not start_date:
+        raise HTTPException(400, "Choose a valid auto-ordering start date before enabling.")
+    with _AUTO_CHROME_QUEUE_CONTROL_LOCK:
+        set_setting("auto_chrome_fulfil_start_date", start_date)
+        set_setting("auto_chrome_fulfil_enabled", "true")
+        set_setting("auto_chrome_fulfil_last_run_at", "")
+        set_setting(
+            "auto_chrome_fulfil_last_message",
+            f"Automatic Chrome ordering enabled for eligible Odoo orders dated {start_date} or later; queue refresh pending.",
+        )
+    fast_page_cache_clear_matching({"settings-services"})
+    return {
+        "ok": True,
+        "enabled": True,
+        "start_date": start_date,
+        "message": f"Automatic Chrome ordering enabled. Eligible orders dated {start_date} or later will be queued on the next scheduler pass.",
+    }
+
+
+@app.post("/api/chrome/queue/force-clear")
+def api_chrome_force_clear_queue(store_id: Optional[int] = None) -> dict[str, Any]:
+    cleared, protected = reset_unsubmitted_chrome_queue(store_id)
+    message = f"Force cleared {cleared} unsubmitted Chrome queue line(s)."
     if protected:
         message += f" Preserved {protected} submitted line(s) waiting for Amazon order-number reporting."
-    return {"ok": True, "cleared": cursor.rowcount, "protected": protected, "message": message}
+    return {"ok": True, "cleared": cleared, "protected": protected, "message": message}
 
 
 def amazon_asin_internal_note(current: Any, asin: str) -> str:

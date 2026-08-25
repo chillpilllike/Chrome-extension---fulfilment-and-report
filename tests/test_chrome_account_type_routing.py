@@ -1,8 +1,13 @@
 import unittest
 import inspect
+import pathlib
 from unittest.mock import patch
 
 from app import main
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+FRONTEND = (ROOT / "frontend" / "src" / "App.tsx").read_text()
 
 
 class ChromeAccountTypeRoutingTests(unittest.TestCase):
@@ -45,6 +50,42 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
         self.assertLess(account_filter, candidate_limit)
         self.assertIn("COUNT(*) = 1", source[account_filter:candidate_limit])
         self.assertIn("source_line_count", source[account_filter:candidate_limit])
+
+    def test_auto_order_start_date_is_inclusive_and_blocks_older_orders(self) -> None:
+        self.assertTrue(main.chrome_order_is_on_or_after_start_date(
+            [{"odoo_order_date": "2026-08-25T00:00:00+00:00"}],
+            "2026-08-25",
+        ))
+        self.assertTrue(main.chrome_order_is_on_or_after_start_date(
+            [{"odoo_order_date": "2026-08-24T20:00:00+00:00"}],
+            "2026-08-25",
+        ))
+        self.assertFalse(main.chrome_order_is_on_or_after_start_date(
+            [{"odoo_order_date": "2026-08-24T18:00:00+00:00"}],
+            "2026-08-25",
+        ))
+        self.assertFalse(main.chrome_order_is_on_or_after_start_date(
+            [{"odoo_order_date": ""}],
+            "2026-08-25",
+        ))
+
+    def test_pause_resets_only_unsubmitted_queue_and_blocks_claims(self) -> None:
+        pause_source = inspect.getsource(main.api_pause_chrome_auto_ordering)
+        reset_source = inspect.getsource(main.reset_unsubmitted_chrome_queue)
+        claim_source = inspect.getsource(main.api_chrome_jobs)
+        self.assertIn('set_setting("auto_chrome_fulfil_enabled", "false")', pause_source)
+        self.assertIn("reset_unsubmitted_chrome_queue", pause_source)
+        self.assertIn("NOT IN ('order_submitted', 'reporting_complete')", reset_source)
+        self.assertIn("if not auto_chrome_ordering_enabled()", claim_source)
+
+    def test_resume_requires_date_and_ui_prompts_for_it(self) -> None:
+        resume_source = inspect.getsource(main.api_resume_chrome_auto_ordering)
+        scheduler_source = inspect.getsource(main.autosync_loop)
+        self.assertIn("Choose a valid auto-ordering start date", resume_source)
+        self.assertIn('set_setting("auto_chrome_fulfil_last_run_at", "")', resume_source)
+        self.assertIn("minimum_odoo_order_date=start_date", scheduler_source)
+        self.assertIn("Pause Auto Ordering & Reset Queue", FRONTEND)
+        self.assertIn("Queue eligible Odoo orders since", FRONTEND)
 
 
 if __name__ == "__main__":
