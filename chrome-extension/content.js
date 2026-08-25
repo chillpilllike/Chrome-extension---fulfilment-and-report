@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-delivery-accordions-v117";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-delivery-settle-v118";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5601,6 +5601,7 @@ const WAREHOUSE_OBSERVED_HOLIDAYS = [
   "christmas day",
 ];
 const WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES = 2;
+const CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS = 1000;
 
 function visibleDeliveryPreferencesDialog() {
   const dialogs = [...document.querySelectorAll("[role='dialog'][aria-hidden='false'], .a-popover-modal[role='dialog']")]
@@ -5919,7 +5920,7 @@ function consumerBusinessDeliveryPreferencesMatch(dialog) {
 
 async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, retryAttempt = 0) {
   showPanel("Delivery preferences", "Verifying consumer Business hours, weekend closure, front-door instructions, and no observed holidays.", null, null);
-  await clickElement(trigger, "Add or edit consumer delivery instructions", { delayMs: 300 });
+  await clickElement(trigger, "Add or edit consumer delivery instructions", { delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
   let dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
   if (!dialog) {
     return pauseForDeliveryPreferences(activeJob, "Amazon did not open the consumer delivery-instructions dialog.");
@@ -5964,7 +5965,7 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   if (!save) {
     return pauseForDeliveryPreferences(activeJob, "Amazon consumer delivery instructions did not expose a usable Save instructions button.", dialog);
   }
-  await clickElement(save, "Save consumer delivery instructions", { preClickDelayMs: 100, delayMs: 800 });
+  await clickElement(save, "Save consumer delivery instructions", { preClickDelayMs: 100, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
   if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 10000, 200)) {
     return pauseForDeliveryPreferences(activeJob, "Amazon did not confirm saving the consumer delivery instructions.", visibleDeliveryPreferencesDialog());
   }
