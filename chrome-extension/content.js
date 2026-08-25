@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-delivery-preferences-v116";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-delivery-accordions-v117";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5849,6 +5849,41 @@ function consumerBusinessFlagControl(dialog, kind, day) {
   return dialog?.querySelector(`input[id^='business_hours_${kind}_${day}_'][id$='_BUSINESS']`) || null;
 }
 
+function consumerBusinessAccordion(dialog, labelPrefix) {
+  const wanted = normalizedText(labelPrefix).toLowerCase();
+  return [...(dialog?.querySelectorAll("button") || [])]
+    .find((button) => normalizedText(button.textContent || "").toLowerCase().startsWith(wanted)) || null;
+}
+
+async function expandConsumerBusinessAccordion(dialog, labelPrefix) {
+  const accordion = consumerBusinessAccordion(dialog, labelPrefix);
+  if (!accordion) return false;
+  if (accordion.getAttribute("aria-expanded") !== "true") {
+    await clickElement(accordion, labelPrefix, { preClickDelayMs: 0, delayMs: 200 });
+  }
+  return Boolean(await waitUntil(
+    () => consumerBusinessAccordion(visibleDeliveryPreferencesDialog(), labelPrefix)?.getAttribute("aria-expanded") === "true",
+    5000,
+    150,
+  ));
+}
+
+async function prepareConsumerBusinessDeliveryControls(dialog) {
+  const sections = [
+    "When is this address open for deliveries?",
+    "Where should we leave your packages at this address?",
+    "Do we need a security code, call box number or key to access this building?",
+    "Do we need additional instructions to deliver to this address?",
+  ];
+  for (const section of sections) {
+    if (!await expandConsumerBusinessAccordion(dialog, section)) return false;
+    dialog = visibleDeliveryPreferencesDialog();
+  }
+  // Leave business hours expanded so the active Business holiday control is
+  // visible and can be distinguished from Amazon's duplicate hidden controls.
+  return expandConsumerBusinessAccordion(dialog, sections[0]);
+}
+
 function consumerBusinessDeliveryControls(dialog) {
   return {
     business: dialog?.querySelector("#ma-business-type-button-input") || null,
@@ -5857,7 +5892,7 @@ function consumerBusinessDeliveryControls(dialog) {
     weekdayOpen24: consumerBusinessFlagControl(dialog, "open", "weekday"),
     weekendClosed: consumerBusinessFlagControl(dialog, "closed", "weekend"),
     weekendOpen24: consumerBusinessFlagControl(dialog, "open", "weekend"),
-    holidaysOpen: dialog?.querySelector("#exceptionDatesOpen-announce") || null,
+    holidaysOpen: [...(dialog?.querySelectorAll("#exceptionDatesOpen-announce") || [])].find(visible) || null,
     frontDoor: dialog?.querySelector("input[name='preferredDeliveryLocationBUSINESS'][value='FRONTDOOR']") || null,
     security: dialog?.querySelector("#securityCode-BUSINESS") || null,
     callBox: dialog?.querySelector("#callBox-BUSINESS") || null,
@@ -5897,12 +5932,13 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   if (controls.business.getAttribute("aria-selected") !== "true") {
     await clickElement(controls.business, "Business property type", { preClickDelayMs: 0, delayMs: 300 });
   }
-  dialog = await waitUntil(() => {
-    const candidate = visibleDeliveryPreferencesDialog();
-    return candidate && consumerBusinessTimeControl(candidate, "start", "weekday") ? candidate : null;
-  }, 8000, 200);
-  if (!dialog) {
-    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose Business delivery-hour controls.");
+  dialog = await waitUntil(visibleDeliveryPreferencesDialog, 8000, 200);
+  if (!dialog || !await prepareConsumerBusinessDeliveryControls(dialog)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose all Business delivery-instruction sections.", dialog);
+  }
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!consumerBusinessTimeControl(dialog, "start", "weekday")) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose Business delivery-hour controls.", dialog);
   }
 
   controls = consumerBusinessDeliveryControls(dialog);
@@ -5942,6 +5978,7 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   if (dialog && consumerBusinessDeliveryControls(dialog).business?.getAttribute("aria-selected") !== "true") {
     await clickElement(consumerBusinessDeliveryControls(dialog).business, "Verify Business property type", { preClickDelayMs: 0, delayMs: 300 });
   }
+  if (dialog) await prepareConsumerBusinessDeliveryControls(dialog);
   const verified = Boolean(await waitUntil(() => {
     const candidate = visibleDeliveryPreferencesDialog();
     return candidate && consumerBusinessDeliveryPreferencesMatch(candidate) ? candidate : null;
