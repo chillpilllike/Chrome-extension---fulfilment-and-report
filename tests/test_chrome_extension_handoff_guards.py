@@ -151,7 +151,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.141")
+        self.assertEqual(MANIFEST["version"], "0.1.142")
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
@@ -396,6 +396,33 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("const continueButton = nativePaymentContinueControl(payment?.continueButton);", CONTENT)
         self.assertNotIn("radio.checked = true", CONTENT)
 
+    def test_business_payment_rejects_rewards_instrument_and_requires_stable_native_card(self) -> None:
+        self.assertIn("function businessCardPaymentRadio(preferences = [])", CONTENT)
+        self.assertIn("cardDigitsForPaymentRadio(radio)", CONTENT)
+        self.assertIn("function businessCardIsNativePaymentInstrument(digits)", CONTENT)
+        self.assertIn("selectedNativePaymentInstrumentRadio()", CONTENT)
+        self.assertIn("async function waitForStableBusinessCardSelection", CONTENT)
+        self.assertIn("await selectStableBusinessPaymentCard(payment.radio)", CONTENT)
+        self.assertIn('accountExperience === "business"', CONTENT)
+
+    def test_business_payment_uses_primary_continue_and_consumer_keeps_generic_path(self) -> None:
+        business_start = CONTENT.index("function findBusinessPaymentSelection(preferences = [])")
+        business_end = CONTENT.index("function alternatePaymentContinueButtons", business_start)
+        business = CONTENT[business_start:business_end]
+        self.assertIn("primary-continue-payselect", business)
+        payment_start = CONTENT.index("async function handlePaymentSelection(activeJob)")
+        payment_end = CONTENT.index("async function openPaymentSelectionIfAvailable", payment_start)
+        payment = CONTENT[payment_start:payment_end]
+        self.assertIn('accountExperience === "business"', payment)
+        self.assertIn('accountExperience === "consumer"', payment)
+        self.assertIn("findBusinessPaymentSelection(cardPreferences)", payment)
+        self.assertIn("findPaymentSelection(cardPreferences)", payment)
+
+    def test_business_payment_does_not_accept_card_text_while_still_on_pay_page(self) -> None:
+        self.assertIn("function businessPaymentSelectionPageOpen()", CONTENT)
+        self.assertIn("async function waitForBusinessPaymentTransition", CONTENT)
+        self.assertIn("Boolean(progress?.transitioned)", CONTENT)
+
     def test_payment_selection_must_remain_checked_after_amazon_rerender(self) -> None:
         self.assertIn("const clicked = await clickPaymentRadio(payment.radio);", CONTENT)
         self.assertIn("const stableSelection = clicked && await waitUntil", CONTENT)
@@ -404,7 +431,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
 
     def test_payment_controls_get_a_slow_render_readiness_window(self) -> None:
         self.assertIn("Waiting for Amazon to finish loading the payment controls.", CONTENT)
-        self.assertIn("findPaymentSelection(cardPreferences), 12000, 200", CONTENT)
+        self.assertIn("waitUntil(findAccountPaymentSelection, 12000, 200)", CONTENT)
 
     def test_textless_native_payment_continue_is_not_discarded(self) -> None:
         selection_start = CONTENT.index("function findPaymentSelection(preferences = [])")

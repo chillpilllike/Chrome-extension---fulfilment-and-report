@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-missing-asin-48-hour-v132";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-business-payment-native-card-v133";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;

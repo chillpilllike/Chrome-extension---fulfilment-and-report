@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-missing-asin-48-hour-v132";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-business-payment-native-card-v133";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5125,6 +5125,77 @@ function paymentRadioForDigits(digits) {
     .find((radio) => !radio.disabled && cardDigitsForPaymentRadio(radio) === digits) || null;
 }
 
+function selectedNativePaymentInstrumentRadio() {
+  return [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
+    .find((radio) => !radio.disabled && radio.checked) || null;
+}
+
+function businessCardPaymentRadio(preferences = []) {
+  const cardRadios = [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
+    .filter((radio) => !radio.disabled && cardDigitsForPaymentRadio(radio));
+  if (!cardRadios.length) return null;
+  for (const preferred of preferences) {
+    const exact = cardRadios.find((radio) => cardDigitsForPaymentRadio(radio) === preferred);
+    if (exact) return exact;
+  }
+  return cardRadios.find((radio) => radio.checked) || cardRadios[0];
+}
+
+function businessCardIsNativePaymentInstrument(digits) {
+  if (!digits) return false;
+  const selected = selectedNativePaymentInstrumentRadio();
+  return Boolean(
+    selected
+    && cardDigitsForPaymentRadio(selected) === digits
+    && paymentRadioForDigits(digits)?.checked === true
+  );
+}
+
+async function waitForStableBusinessCardSelection(digits, timeout = 4500, stableMs = 1000) {
+  const deadline = Date.now() + timeout;
+  let selectedSince = 0;
+  while (Date.now() < deadline) {
+    if (businessCardIsNativePaymentInstrument(digits)) {
+      if (!selectedSince) selectedSince = Date.now();
+      if (Date.now() - selectedSince >= stableMs) return paymentRadioForDigits(digits);
+    } else {
+      selectedSince = 0;
+    }
+    await sleep(100);
+  }
+  return false;
+}
+
+async function selectStableBusinessPaymentCard(radio) {
+  const digits = cardDigitsForPaymentRadio(radio);
+  if (!digits) return false;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const current = paymentRadioForDigits(digits) || radio;
+    if (!businessCardIsNativePaymentInstrument(digits)) {
+      await clickPaymentRadio(current);
+    }
+    const stable = await waitForStableBusinessCardSelection(digits);
+    if (stable) return stable;
+  }
+  return false;
+}
+
+function businessPaymentSelectionPageOpen() {
+  return amazonAccountExperience() === "business"
+    && /\/checkout\/p\/[^/]+\/pay\/?$/i.test(String(location.pathname || ""));
+}
+
+async function waitForBusinessPaymentTransition(preferences = [], timeout = 4500) {
+  return waitUntil(() => {
+    const progress = checkoutPaymentProgress(preferences);
+    if (progress.hasPlaceOrderButton) return { ...progress, transitioned: true };
+    if (!businessPaymentSelectionPageOpen() || !progress.hasPaymentRadio) {
+      return { ...progress, transitioned: true };
+    }
+    return false;
+  }, timeout, 150);
+}
+
 async function clickPaymentRadio(radio) {
   const row = paymentRowForRadio(radio);
   const preferredDigits = cardDigitsForPaymentRadio(radio);
@@ -5212,6 +5283,21 @@ function findPaymentSelection(preferences = []) {
   const continueButton = visiblePaymentContinueButtons()[0];
   if (continueButton) return { radio, continueButton };
   return null;
+}
+
+function findBusinessPaymentSelection(preferences = []) {
+  const radio = businessCardPaymentRadio(preferences);
+  if (!radio) return null;
+  // Business checkout may preselect its Rewards/Points instrument even though
+  // the rewards checkbox is off. Only a native credit-card radio is eligible.
+  // Prefer the primary Business continue control, which owns the purchase id;
+  // the secondary header widget is merely an alternate surface.
+  const buttons = visiblePaymentContinueButtons();
+  const continueButton = buttons.find((element) => (
+    normalizedText(element.getAttribute?.("data-csa-c-slot-id") || "")
+      .includes("primary-continue-payselect")
+  )) || buttons[0];
+  return continueButton ? { radio, continueButton } : null;
 }
 
 function alternatePaymentContinueButtons(primary = null) {
@@ -6719,11 +6805,15 @@ async function handlePaymentSelection(activeJob) {
   try {
     const state = await getExtensionState();
     const cardPreferences = cardPreferenceList(state.cardLast4Preference);
-    let payment = findPaymentSelection(cardPreferences);
+    const accountExperience = amazonAccountExperience();
+    const findAccountPaymentSelection = accountExperience === "business"
+      ? () => findBusinessPaymentSelection(cardPreferences)
+      : () => findPaymentSelection(cardPreferences);
+    let payment = findAccountPaymentSelection();
     if (!payment) {
       if (!findPaymentRadio()) return false;
       showPanel("Nutricity checkout", "Waiting for Amazon to finish loading the payment controls.", null, null);
-      payment = await waitUntil(() => findPaymentSelection(cardPreferences), 12000, 200);
+      payment = await waitUntil(findAccountPaymentSelection, 12000, 200);
       if (!payment) {
         await pauseForManualCheckout(activeJob, "Amazon is asking for a payment method, but I could not find the payment Continue button.");
         return true;
@@ -6737,7 +6827,13 @@ async function handlePaymentSelection(activeJob) {
       radioAlreadySelected: paymentRadioIsSelected(payment.radio),
     }).catch(() => {});
     showPanel("Nutricity checkout", selectedDigits ? `Selecting card ending in ${selectedDigits}.` : "Selecting Amazon payment method.", null, null);
-    if (!paymentRadioIsSelected(payment.radio)) {
+    if (accountExperience === "business") {
+      const stableSelection = await selectStableBusinessPaymentCard(payment.radio);
+      if (!stableSelection) {
+        await pauseForManualCheckout(activeJob, `Could not keep Business card ending in ${selectedDigits || cardPreferences.join(" or ")} selected; Amazon restored another payment instrument.`);
+        return true;
+      }
+    } else if (accountExperience === "consumer" && !paymentRadioIsSelected(payment.radio)) {
       const clicked = await clickPaymentRadio(payment.radio);
       const stableSelection = clicked && await waitUntil(() => {
         const current = paymentRadioForDigits(selectedDigits);
@@ -6747,6 +6843,9 @@ async function handlePaymentSelection(activeJob) {
         await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${selectedDigits || cardPreferences.join(" or ")}.`);
         return true;
       }
+    } else if (accountExperience !== "consumer") {
+      await pauseForManualCheckout(activeJob, "Amazon account type could not be positively detected at payment selection.");
+      return true;
     }
     if (cardPreferences.length && selectedDigits && !cardPreferences.includes(selectedDigits)) {
       await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
@@ -6757,23 +6856,42 @@ async function handlePaymentSelection(activeJob) {
       await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
-    payment = findPaymentSelection(cardPreferences);
+    payment = findAccountPaymentSelection();
     const continueButton = nativePaymentContinueControl(payment?.continueButton);
     if (!payment || !continueButton) {
       await pauseForManualCheckout(activeJob, "Amazon changed the payment form before the selected card could be confirmed.");
       return true;
     }
+    if (accountExperience === "business" && !businessCardIsNativePaymentInstrument(selectedDigits)) {
+      await pauseForManualCheckout(activeJob, `Amazon Business replaced card ending in ${selectedDigits || cardPreferences.join(" or ")} with another payment instrument before Continue.`);
+      return true;
+    }
     await clickElement(continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
-    let progress = await waitForCheckoutPaymentProgress(cardPreferences, 4500, { stopOnTransition: true });
-    let advanced = Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
+    let progress = accountExperience === "business"
+      ? await waitForBusinessPaymentTransition(cardPreferences, 4500)
+      : await waitForCheckoutPaymentProgress(cardPreferences, 4500, { stopOnTransition: true });
+    let advanced = accountExperience === "business"
+      ? Boolean(progress?.transitioned)
+      : Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
     if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
       const alternate = alternatePaymentContinueButtons(continueButton)[0];
       if (alternate) {
+        if (accountExperience === "business") {
+          const reselection = await selectStableBusinessPaymentCard(payment.radio);
+          if (!reselection) {
+            await pauseForManualCheckout(activeJob, `Amazon Business restored another payment instrument after Continue instead of keeping card ending in ${selectedDigits}.`);
+            return true;
+          }
+        }
         showPanel("Nutricity checkout", "Retrying Amazon payment continue button.", null, null);
         await clickElement(alternate, "alternate Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
-        progress = await waitForCheckoutPaymentProgress(cardPreferences, 3500, { stopOnTransition: true });
-        advanced = Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
+        progress = accountExperience === "business"
+          ? await waitForBusinessPaymentTransition(cardPreferences, 3500)
+          : await waitForCheckoutPaymentProgress(cardPreferences, 3500, { stopOnTransition: true });
+        advanced = accountExperience === "business"
+          ? Boolean(progress?.transitioned)
+          : Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
       }
     }
     if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
