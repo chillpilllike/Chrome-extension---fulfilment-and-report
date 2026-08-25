@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-25-account-aware-subscriptions-v113";
+const CONTENT_SCRIPT_BUILD = "2026-08-25-account-aware-subscription-prices-v114";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -879,6 +879,15 @@ function subscribeAndSavePriceFromText(text) {
   return Number.isFinite(value) ? value : null;
 }
 
+function oneTimePurchasePriceFromText(text) {
+  const match = String(text || "")
+    .replace(/,/g, "")
+    .match(/one[\s-]*time\s+purchase\s*\$+\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
 function oneTimePurchaseRootSelector() {
   return [
     "#qualifiedBuybox",
@@ -929,7 +938,11 @@ function productPriceSnapshot() {
   const regularFallbackPrices = regularPrices.length ? [] : regularRoots
     .map((root) => firstPriceIn(root))
     .filter((value) => Number(value) > 0);
-  const regular = regularPrices.length ? Math.min(...regularPrices) : (regularFallbackPrices.length ? Math.min(...regularFallbackPrices) : null);
+  // Amazon places coupon copy such as "Saving $1.00" inside the broad buy box.
+  // Prefer the price explicitly labelled "One-time purchase" so a coupon value
+  // can never masquerade as the unit price in the Subscribe & Save comparison.
+  const labelledRegular = oneTimePurchasePriceFromText(document.body.innerText);
+  const regular = labelledRegular || (regularPrices.length ? Math.min(...regularPrices) : (regularFallbackPrices.length ? Math.min(...regularFallbackPrices) : null));
   const snsRoots = [...document.querySelectorAll(subscribeAndSaveRootSelector())].filter(visible);
   const snsPriceSelectors = [
     "#sns-tiered-price .a-price[data-a-size='b']",

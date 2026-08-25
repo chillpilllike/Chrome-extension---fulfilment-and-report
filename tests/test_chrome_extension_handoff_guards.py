@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.113")
+        self.assertEqual(MANIFEST["version"], "0.1.114")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -845,6 +845,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         snapshot_end = CONTENT.index("function snsQuantityControlVisible()", snapshot_start)
         snapshot = CONTENT[snapshot_start:snapshot_end]
         self.assertIn("Math.min(sns, regular)", snapshot)
+
+    def test_labelled_one_time_price_wins_over_coupon_savings(self) -> None:
+        parser_start = CONTENT.index("function oneTimePurchasePriceFromText(text)")
+        parser_end = CONTENT.index("function oneTimePurchaseRootSelector()", parser_start)
+        parser = CONTENT[parser_start:parser_end]
+        self.assertIn("one[\\s-]*time\\s+purchase", parser)
+        snapshot_start = CONTENT.index("function productPriceSnapshot()")
+        snapshot_end = CONTENT.index("function snsQuantityControlVisible()", snapshot_start)
+        snapshot = CONTENT[snapshot_start:snapshot_end]
+        self.assertIn("const labelledRegular = oneTimePurchasePriceFromText(document.body.innerText);", snapshot)
+        self.assertIn("const regular = labelledRegular ||", snapshot)
 
     def test_subscription_cart_button_is_detected_by_meaning_inside_sns_root(self) -> None:
         finder_start = CONTENT.index("function findSubscribeAddToCartTarget()")
