@@ -5852,8 +5852,8 @@ function consumerBusinessFlagControl(dialog, kind, day) {
 
 function consumerBusinessAccordion(dialog, labelPrefix) {
   const wanted = normalizedText(labelPrefix).toLowerCase();
-  return [...(dialog?.querySelectorAll("button") || [])]
-    .find((button) => visible(button) && normalizedText(button.textContent || "").toLowerCase().startsWith(wanted)) || null;
+  return [...(dialog?.querySelectorAll("a, button") || [])]
+    .find((control) => visible(control) && normalizedText(control.textContent || "").toLowerCase().startsWith(wanted)) || null;
 }
 
 async function expandConsumerBusinessAccordion(dialog, labelPrefix) {
