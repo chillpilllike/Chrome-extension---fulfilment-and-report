@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-preferences-hydration-v88";
+const CONTENT_SCRIPT_BUILD = "2026-08-25-warehouse-preferences-self-retry-v110";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5573,6 +5573,7 @@ const WAREHOUSE_DELIVERY_WEEKDAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY
 const WAREHOUSE_DELIVERY_WEEKENDS = ["SATURDAY", "SUNDAY"];
 const WAREHOUSE_DELIVERY_START = "10:00";
 const WAREHOUSE_DELIVERY_END = "17:00";
+const WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES = 2;
 
 function visibleDeliveryPreferencesDialog() {
   const dialogs = [...document.querySelectorAll("[role='dialog'][aria-hidden='false'], .a-popover-modal[role='dialog']")]
@@ -5653,7 +5654,7 @@ async function pauseForDeliveryPreferences(activeJob, message, dialog = visibleD
   return false;
 }
 
-async function ensureWarehouseDeliveryPreferences(activeJob) {
+async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
   const editPreferences = await waitUntil(
     () => [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
       .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "edit delivery preferences"),
@@ -5776,6 +5777,22 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
   dialog = visibleDeliveryPreferencesDialog();
   await closeDeliveryPreferencesDialog(dialog);
   if (!verified) {
+    if (retryAttempt < WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES) {
+      const nextAttempt = retryAttempt + 1;
+      showPanel(
+        "Delivery preferences",
+        `Amazon did not retain the warehouse delivery schedule. Retrying automatically (${nextAttempt}/${WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES}).`,
+        null,
+        null,
+      );
+      await sendDiagnostic("Retrying checkout delivery preferences automatically.", {
+        group_key: activeJob?.job?.group_key || "",
+        retry_attempt: nextAttempt,
+        max_automatic_retries: WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES,
+      });
+      await sleep(1500);
+      return ensureWarehouseDeliveryPreferences(activeJob, nextAttempt);
+    }
     return pauseForDeliveryPreferences(activeJob, "Amazon did not retain Monday-Friday 10:00 AM-5:00 PM with Saturday-Sunday closed.");
   }
   await sendDiagnostic("Saved and verified checkout delivery preferences.", {
