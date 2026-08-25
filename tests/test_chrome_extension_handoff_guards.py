@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.114")
+        self.assertEqual(MANIFEST["version"], "0.1.115")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -86,8 +86,8 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
     def test_checkout_enforces_warehouse_delivery_hours_before_delivery_selection(self) -> None:
         self.assertIn('"MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"', CONTENT)
         self.assertIn('const WAREHOUSE_DELIVERY_WEEKENDS = ["SATURDAY", "SUNDAY"]', CONTENT)
-        self.assertIn('const WAREHOUSE_DELIVERY_START = "10:00"', CONTENT)
-        self.assertIn('const WAREHOUSE_DELIVERY_END = "17:00"', CONTENT)
+        self.assertIn('const WAREHOUSE_DELIVERY_START = "08:00"', CONTENT)
+        self.assertIn('const WAREHOUSE_DELIVERY_END = "16:00"', CONTENT)
         preferences_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0)")
         preferences_end = CONTENT.index("async function ensurePreferredAmazonDayWeekdayDelivery", preferences_start)
         preferences = CONTENT[preferences_start:preferences_end]
@@ -97,16 +97,29 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("setWarehouseDeliveryClosed(closed, true)", preferences)
         self.assertIn("warehouseDeliveryControlsMatch(dialog)", preferences)
         self.assertIn("adpSubmitButton_", preferences)
-        self.assertIn("const existingSummaryVerified = await waitUntil(", preferences)
         self.assertIn("deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog())", preferences)
-        self.assertIn("let verified = Boolean(await waitUntil(", preferences)
+        self.assertIn("const verified = await verifyWarehouseDeliveryControlsFromSummary", preferences)
         self.assertIn("verifyWarehouseDeliveryControlsFromSummary", preferences)
+
+    def test_checkout_enforces_complete_delivery_instructions(self) -> None:
+        self.assertIn('const WAREHOUSE_DELIVERY_DROP_OFF = "front door";', CONTENT)
+        self.assertIn('BUSINESS NAME: OUTSIDE THE BOX SHIPPING\\nYou can drop the package at the front door and i\'ll be here to pick up.', CONTENT)
+        self.assertIn('"independence day"', CONTENT)
+        self.assertIn('"christmas day"', CONTENT)
+        preferences_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0)")
+        preferences_end = CONTENT.index("async function ensurePreferredAmazonDayWeekdayDelivery", preferences_start)
+        preferences = CONTENT[preferences_start:preferences_end]
+        self.assertIn("setWarehouseDeliveryInstructions(dialog)", preferences)
+        self.assertIn("clearWarehouseObservedHolidays(dialog)", preferences)
+        self.assertIn("warehouseCompleteDeliveryPreferencesMatch(dialog)", preferences)
+        self.assertLess(preferences.index("setWarehouseDeliveryInstructions(dialog)"), preferences.index("adpSubmitButton_"))
+        self.assertLess(preferences.index("clearWarehouseObservedHolidays(dialog)"), preferences.index("adpSubmitButton_"))
 
     def test_delivery_preferences_retry_themselves_before_manual_pause(self) -> None:
         preferences_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0)")
         preferences_end = CONTENT.index("async function ensurePreferredAmazonDayWeekdayDelivery", preferences_start)
         preferences = CONTENT[preferences_start:preferences_end]
-        failure = "Amazon did not retain Monday-Friday 10:00 AM-5:00 PM with Saturday-Sunday closed."
+        failure = "Amazon did not retain the complete warehouse delivery preferences"
 
         self.assertIn("const WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES = 2;", CONTENT)
         self.assertIn("if (retryAttempt < WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES)", preferences)
@@ -123,9 +136,11 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         helper = CONTENT[helper_start:helper_end]
         self.assertIn('querySelector("#deliveryTimesEditLink")', helper)
         self.assertIn('querySelector("#businessHoursExpandLink")', helper)
-        self.assertIn("warehouseDeliveryControlsMatch(candidate) ? candidate : null", helper)
+        self.assertIn("warehouseCompleteDeliveryPreferencesMatch(candidate) ? candidate : null", helper)
         self.assertIn("}, 10000, 200)", helper)
-        self.assertIn("warehouseDeliveryControlsMatch(currentDialog)", helper)
+        self.assertIn("warehouseCompleteDeliveryPreferencesMatch(currentDialog)", helper)
+        self.assertIn('expandDeliveryPreferenceSection(currentDialog, "Delivery Instructions"', helper)
+        self.assertIn('expandDeliveryPreferenceSection(currentDialog, "Observed Holidays"', helper)
 
         checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
         checkout_end = CONTENT.index("function extractOrderId()", checkout_start)

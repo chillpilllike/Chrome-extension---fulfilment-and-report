@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-25-account-aware-subscription-prices-v114";
+const CONTENT_SCRIPT_BUILD = "2026-08-25-complete-delivery-preferences-v115";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5583,8 +5583,23 @@ function preferredAmazonDayWeekdaySelected() {
 
 const WAREHOUSE_DELIVERY_WEEKDAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"];
 const WAREHOUSE_DELIVERY_WEEKENDS = ["SATURDAY", "SUNDAY"];
-const WAREHOUSE_DELIVERY_START = "10:00";
-const WAREHOUSE_DELIVERY_END = "17:00";
+const WAREHOUSE_DELIVERY_START = "08:00";
+const WAREHOUSE_DELIVERY_END = "16:00";
+const WAREHOUSE_DELIVERY_DROP_OFF = "front door";
+const WAREHOUSE_DELIVERY_ADDITIONAL_INFO = "BUSINESS NAME: OUTSIDE THE BOX SHIPPING\nYou can drop the package at the front door and i'll be here to pick up.";
+const WAREHOUSE_OBSERVED_HOLIDAYS = [
+  "new year's day",
+  "martin luther king jr. day",
+  "george washington's birthday",
+  "memorial day",
+  "juneteenth independence day",
+  "independence day",
+  "labor day",
+  "columbus day",
+  "veterans day",
+  "thanksgiving day",
+  "christmas day",
+];
 const WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES = 2;
 
 function visibleDeliveryPreferencesDialog() {
@@ -5600,9 +5615,150 @@ function deliveryPreferencesSummaryIsWarehouseSchedule(dialog = visibleDeliveryP
   const section = edit?.closest(".a-expander-inner, .a-expander-content") || edit?.parentElement;
   const text = normalizedText(section?.innerText || section?.textContent || "").toLowerCase();
   return /monday\s*-\s*friday/.test(text)
-    && /10:00\s*am\s*-\s*0?5:00\s*pm/.test(text)
+    && /0?8:00\s*am\s*-\s*0?4:00\s*pm/.test(text)
     && /saturday\s*-\s*sunday/.test(text)
     && /closed for deliveries/.test(text);
+}
+
+function deliveryPreferenceControlText(control) {
+  if (!control) return "";
+  const id = control.id ? CSS.escape(control.id) : "";
+  const label = id ? control.ownerDocument?.querySelector?.(`label[for='${id}']`) : null;
+  const wrapper = control.closest?.("label, .a-radio, .a-checkbox, li, tr, [role='radio'], [role='checkbox']");
+  return normalizedText([
+    control.getAttribute?.("aria-label"),
+    label?.innerText,
+    label?.textContent,
+    wrapper?.innerText,
+    wrapper?.textContent,
+  ].filter(Boolean).join(" ")).toLowerCase();
+}
+
+function deliveryPreferenceControlByLabel(dialog, selector, labelText) {
+  const wanted = normalizedText(labelText).toLowerCase();
+  return [...(dialog?.querySelectorAll?.(selector) || [])].find((control) => {
+    const text = deliveryPreferenceControlText(control);
+    return text === wanted || text.startsWith(`${wanted} `);
+  }) || null;
+}
+
+function deliveryPreferenceTextControl(dialog, labelText, selector) {
+  const wanted = normalizedText(labelText).toLowerCase();
+  const direct = [...(dialog?.querySelectorAll?.(selector) || [])].find((control) => {
+    const idName = `${control.id || ""} ${control.name || ""} ${control.getAttribute?.("aria-label") || ""}`.toLowerCase();
+    return idName.includes(wanted.replace(/\s+/g, "")) || normalizedText(control.getAttribute?.("aria-label") || "").toLowerCase() === wanted;
+  });
+  if (direct) return direct;
+  for (const label of dialog?.querySelectorAll?.("label, .a-form-label, .a-text-bold, span, div") || []) {
+    if (normalizedText(label.innerText || label.textContent || "").toLowerCase() !== wanted) continue;
+    const labelled = label.getAttribute?.("for") ? dialog.querySelector(`#${CSS.escape(label.getAttribute("for"))}`) : null;
+    const nearby = labelled || label.parentElement?.querySelector?.(selector) || label.nextElementSibling?.matches?.(selector) && label.nextElementSibling;
+    if (nearby?.matches?.(selector)) return nearby;
+  }
+  return null;
+}
+
+function warehouseDeliveryInstructionControls(dialog) {
+  const frontDoor = deliveryPreferenceControlByLabel(dialog, "input[type='radio']", WAREHOUSE_DELIVERY_DROP_OFF);
+  const security = deliveryPreferenceTextControl(dialog, "security code", "input[type='text'], input:not([type]), textarea");
+  const callBox = deliveryPreferenceTextControl(dialog, "call box name or number", "input[type='text'], input:not([type]), textarea");
+  const additionalInfo = deliveryPreferenceTextControl(dialog, "additional info", "textarea, input[type='text'], input:not([type])");
+  return { frontDoor, security, callBox, additionalInfo };
+}
+
+function warehouseObservedHolidayControls(dialog) {
+  return WAREHOUSE_OBSERVED_HOLIDAYS.map((holiday) => (
+    deliveryPreferenceControlByLabel(dialog, "input[type='checkbox']", holiday)
+  ));
+}
+
+function warehouseObservedHolidayControlsReady(dialog) {
+  const controls = warehouseObservedHolidayControls(dialog);
+  return controls.length === WAREHOUSE_OBSERVED_HOLIDAYS.length && controls.every(Boolean);
+}
+
+function normalizedDeliveryInstructionValue(value) {
+  return String(value || "").replace(/\r\n/g, "\n").trim();
+}
+
+function warehouseDeliveryInstructionsMatch(dialog) {
+  const { frontDoor, security, callBox, additionalInfo } = warehouseDeliveryInstructionControls(dialog);
+  return Boolean(
+    frontDoor?.checked === true
+    && normalizedDeliveryInstructionValue(security?.value) === ""
+    && normalizedDeliveryInstructionValue(callBox?.value) === ""
+    && normalizedDeliveryInstructionValue(additionalInfo?.value) === WAREHOUSE_DELIVERY_ADDITIONAL_INFO
+  );
+}
+
+function warehouseObservedHolidaysMatch(dialog) {
+  const controls = warehouseObservedHolidayControls(dialog);
+  return controls.length === WAREHOUSE_OBSERVED_HOLIDAYS.length
+    && controls.every((control) => control?.checked === false);
+}
+
+function warehouseCompleteDeliveryPreferencesMatch(dialog) {
+  return warehouseDeliveryControlsMatch(dialog)
+    && warehouseDeliveryInstructionsMatch(dialog)
+    && warehouseObservedHolidaysMatch(dialog);
+}
+
+function deliveryPreferenceSectionButton(dialog, sectionName) {
+  const wanted = normalizedText(sectionName).toLowerCase();
+  return [...(dialog?.querySelectorAll?.("button, [role='button'], a") || [])].find((control) => (
+    visible(control) && normalizedText(control.innerText || control.textContent || "").toLowerCase() === wanted
+  )) || null;
+}
+
+async function expandDeliveryPreferenceSection(dialog, sectionName, controlsReady) {
+  if (controlsReady()) return true;
+  const button = deliveryPreferenceSectionButton(dialog, sectionName);
+  if (!button) return false;
+  await clickElement(button, `Edit ${sectionName}`, { preClickDelayMs: 0, delayMs: 250 });
+  return Boolean(await waitUntil(controlsReady, 5000, 150));
+}
+
+function setDeliveryPreferenceText(control, value) {
+  if (!control) return false;
+  if (control.value === value) return true;
+  const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  if (setter) setter.call(control, value);
+  else control.value = value;
+  control.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  control.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  return control.value === value;
+}
+
+async function setWarehouseDeliveryInstructions(dialog) {
+  const expanded = await expandDeliveryPreferenceSection(dialog, "Delivery Instructions", () => {
+    const controls = warehouseDeliveryInstructionControls(visibleDeliveryPreferencesDialog());
+    return Boolean(controls.frontDoor && controls.security && controls.callBox && controls.additionalInfo);
+  });
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!expanded || !dialog) return false;
+  const { frontDoor, security, callBox, additionalInfo } = warehouseDeliveryInstructionControls(dialog);
+  if (!frontDoor.checked) frontDoor.click();
+  const securityAccepted = setDeliveryPreferenceText(security, "");
+  const callBoxAccepted = setDeliveryPreferenceText(callBox, "");
+  const infoAccepted = setDeliveryPreferenceText(additionalInfo, WAREHOUSE_DELIVERY_ADDITIONAL_INFO);
+  await sleep(150);
+  return securityAccepted && callBoxAccepted && infoAccepted && warehouseDeliveryInstructionsMatch(dialog);
+}
+
+async function clearWarehouseObservedHolidays(dialog) {
+  const expanded = await expandDeliveryPreferenceSection(dialog, "Observed Holidays", () => (
+    warehouseObservedHolidayControlsReady(visibleDeliveryPreferencesDialog())
+  ));
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!expanded || !dialog) return false;
+  const controls = warehouseObservedHolidayControls(dialog);
+  if (controls.length !== WAREHOUSE_OBSERVED_HOLIDAYS.length || controls.some((control) => !control)) return false;
+  for (const control of controls) {
+    if (control.checked) control.click();
+  }
+  await sleep(150);
+  return warehouseObservedHolidaysMatch(dialog);
 }
 
 function warehouseDeliveryDayControl(dialog, day, kind) {
@@ -5632,12 +5788,20 @@ async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDelive
   if (expandDays && visible(expandDays)) {
     await clickElement(expandDays, "Expand saved delivery days", { preClickDelayMs: 0, delayMs: 250 });
   }
+  await expandDeliveryPreferenceSection(currentDialog, "Delivery Instructions", () => {
+    const controls = warehouseDeliveryInstructionControls(visibleDeliveryPreferencesDialog());
+    return Boolean(controls.frontDoor && controls.security && controls.callBox && controls.additionalInfo);
+  });
+  currentDialog = visibleDeliveryPreferencesDialog();
+  await expandDeliveryPreferenceSection(currentDialog, "Observed Holidays", () => (
+    warehouseObservedHolidayControlsReady(visibleDeliveryPreferencesDialog())
+  ));
   const fullyHydratedDialog = await waitUntil(() => {
     const candidate = visibleDeliveryPreferencesDialog();
-    return candidate && warehouseDeliveryControlsMatch(candidate) ? candidate : null;
+    return candidate && warehouseCompleteDeliveryPreferencesMatch(candidate) ? candidate : null;
   }, 10000, 200);
   currentDialog = fullyHydratedDialog || visibleDeliveryPreferencesDialog();
-  return Boolean(currentDialog && warehouseDeliveryControlsMatch(currentDialog));
+  return Boolean(currentDialog && warehouseCompleteDeliveryPreferencesMatch(currentDialog));
 }
 
 function setWarehouseDeliverySelect(select, value) {
@@ -5680,7 +5844,7 @@ async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
     );
   }
 
-  showPanel("Delivery preferences", "Verifying Monday-Friday 10:00 AM-5:00 PM and closing Saturday-Sunday.", null, null);
+  showPanel("Delivery preferences", "Verifying Monday-Friday 8:00 AM-4:00 PM, weekend closure, front-door instructions, and no observed holidays.", null, null);
   await clickElement(editPreferences, "Edit delivery preferences", { delayMs: 300 });
   let dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
   const editDeliveryTimes = await waitUntil(
@@ -5692,22 +5856,6 @@ async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
   if (!dialog || !editDeliveryTimes) {
     return pauseForDeliveryPreferences(activeJob, "Amazon opened delivery preferences but did not expose the Delivery Times edit control.", dialog);
   }
-  const existingSummaryVerified = await waitUntil(
-    () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
-    3000,
-    150,
-  );
-  if (existingSummaryVerified) {
-    await closeDeliveryPreferencesDialog(dialog);
-    await sendDiagnostic("Verified checkout delivery preferences.", {
-      group_key: activeJob?.job?.group_key || "",
-      weekdays: "Monday-Friday 10:00-17:00",
-      weekends: "closed",
-      changed: false,
-    });
-    return true;
-  }
-
   await clickElement(editDeliveryTimes, "Edit delivery times", { delayMs: 250 });
   dialog = await waitUntil(visibleDeliveryPreferencesDialog, 5000, 150);
   const expandDays = await waitUntil(
@@ -5752,6 +5900,17 @@ async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
     return pauseForDeliveryPreferences(activeJob, "Amazon did not accept the required weekday hours and weekend closures.", dialog);
   }
 
+  const instructionsReady = await setWarehouseDeliveryInstructions(dialog);
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!instructionsReady) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not accept the required front-door delivery instructions.", dialog);
+  }
+  const holidaysReady = await clearWarehouseObservedHolidays(dialog);
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!holidaysReady || !warehouseCompleteDeliveryPreferencesMatch(dialog)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not accept the required observed-holiday preferences.", dialog);
+  }
+
   const save = dialog.querySelector("span[id^='adpSubmitButton_'] input[type='submit'], input[type='submit'][aria-labelledby^='adpSubmitButton_']");
   if (!save || !visible(save)) {
     return pauseForDeliveryPreferences(activeJob, "Amazon delivery preferences did not expose a usable Save button.", dialog);
@@ -5778,14 +5937,12 @@ async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
   // Amazon inserts the Edit link before it hydrates the compact Monday-Friday
   // summary. Give that summary time to settle instead of treating the
   // temporarily empty section as a failed save.
-  let verified = Boolean(await waitUntil(
+  await waitUntil(
     () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
     6000,
     200,
-  ));
-  if (!verified) {
-    verified = await verifyWarehouseDeliveryControlsFromSummary(visibleDeliveryPreferencesDialog());
-  }
+  );
+  const verified = await verifyWarehouseDeliveryControlsFromSummary(visibleDeliveryPreferencesDialog());
   dialog = visibleDeliveryPreferencesDialog();
   await closeDeliveryPreferencesDialog(dialog);
   if (!verified) {
@@ -5805,12 +5962,14 @@ async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
       await sleep(1500);
       return ensureWarehouseDeliveryPreferences(activeJob, nextAttempt);
     }
-    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain Monday-Friday 10:00 AM-5:00 PM with Saturday-Sunday closed.");
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain the complete warehouse delivery preferences: Monday-Friday 8:00 AM-4:00 PM, weekends closed, front-door instructions, and no observed holidays.");
   }
   await sendDiagnostic("Saved and verified checkout delivery preferences.", {
     group_key: activeJob?.job?.group_key || "",
-    weekdays: "Monday-Friday 10:00-17:00",
+    weekdays: "Monday-Friday 08:00-16:00",
     weekends: "closed",
+    drop_off: "Front Door",
+    observed_holidays: "none",
     changed,
   });
   return true;
