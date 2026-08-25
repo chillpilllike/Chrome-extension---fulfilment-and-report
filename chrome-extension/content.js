@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-delivery-settle-v118";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-add-more-instructions-v119";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5869,20 +5869,43 @@ async function expandConsumerBusinessAccordion(dialog, labelPrefix) {
   ));
 }
 
+async function revealConsumerBusinessInstructionSections(dialog) {
+  const securityLabel = "Do we need a security code, call box number or key to access this building?";
+  const additionalLabel = "Do we need additional instructions to deliver to this address?";
+  if (consumerBusinessAccordion(dialog, securityLabel) && consumerBusinessAccordion(dialog, additionalLabel)) return true;
+
+  const addMore = [...(dialog?.querySelectorAll("a, button") || [])]
+    .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "add more instructions");
+  if (!addMore) return false;
+  await clickElement(addMore, "Add more consumer Business instructions", { preClickDelayMs: 0, delayMs: 250 });
+  return Boolean(await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && consumerBusinessAccordion(candidate, securityLabel) && consumerBusinessAccordion(candidate, additionalLabel);
+  }, 5000, 150));
+}
+
 async function prepareConsumerBusinessDeliveryControls(dialog) {
-  const sections = [
+  const primarySections = [
     "When is this address open for deliveries?",
     "Where should we leave your packages at this address?",
+  ];
+  const additionalSections = [
     "Do we need a security code, call box number or key to access this building?",
     "Do we need additional instructions to deliver to this address?",
   ];
-  for (const section of sections) {
+  for (const section of primarySections) {
+    if (!await expandConsumerBusinessAccordion(dialog, section)) return false;
+    dialog = visibleDeliveryPreferencesDialog();
+  }
+  if (!await revealConsumerBusinessInstructionSections(dialog)) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  for (const section of additionalSections) {
     if (!await expandConsumerBusinessAccordion(dialog, section)) return false;
     dialog = visibleDeliveryPreferencesDialog();
   }
   // Leave business hours expanded so the active Business holiday control is
   // visible and can be distinguished from Amazon's duplicate hidden controls.
-  return expandConsumerBusinessAccordion(dialog, sections[0]);
+  return expandConsumerBusinessAccordion(dialog, primarySections[0]);
 }
 
 function consumerBusinessDeliveryControls(dialog) {
