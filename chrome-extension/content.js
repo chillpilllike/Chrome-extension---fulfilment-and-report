@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-recipient-and-controls-v120";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-business-render-v121";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5853,7 +5853,7 @@ function consumerBusinessFlagControl(dialog, kind, day) {
 function consumerBusinessAccordion(dialog, labelPrefix) {
   const wanted = normalizedText(labelPrefix).toLowerCase();
   return [...(dialog?.querySelectorAll("button") || [])]
-    .find((button) => normalizedText(button.textContent || "").toLowerCase().startsWith(wanted)) || null;
+    .find((button) => visible(button) && normalizedText(button.textContent || "").toLowerCase().startsWith(wanted)) || null;
 }
 
 async function expandConsumerBusinessAccordion(dialog, labelPrefix) {
@@ -5871,7 +5871,13 @@ async function expandConsumerBusinessAccordion(dialog, labelPrefix) {
 
 async function exposeConsumerBusinessControls(dialog, labelPrefix, controlsReady) {
   if (controlsReady(dialog)) return true;
-  const accordion = consumerBusinessAccordion(dialog, labelPrefix);
+  const accordion = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate) return null;
+    if (controlsReady(candidate)) return true;
+    return consumerBusinessAccordion(candidate, labelPrefix);
+  }, 5000, 150);
+  if (accordion === true) return true;
   if (!accordion) return false;
   if (accordion.getAttribute("aria-expanded") !== "true") {
     await clickElement(accordion, labelPrefix, { preClickDelayMs: 0, delayMs: 200 });
@@ -5887,8 +5893,14 @@ async function revealConsumerBusinessInstructionSections(dialog) {
   const additionalLabel = "Do we need additional instructions to deliver to this address?";
   if (consumerBusinessAccordion(dialog, securityLabel) && consumerBusinessAccordion(dialog, additionalLabel)) return true;
 
-  const addMore = [...(dialog?.querySelectorAll("a, button") || [])]
-    .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "add more instructions");
+  const addMore = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate) return null;
+    if (consumerBusinessAccordion(candidate, securityLabel) && consumerBusinessAccordion(candidate, additionalLabel)) return true;
+    return [...candidate.querySelectorAll("a, button")]
+      .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "add more instructions") || null;
+  }, 5000, 150);
+  if (addMore === true) return true;
   if (!addMore) return false;
   await clickElement(addMore, "Add more consumer Business instructions", { preClickDelayMs: 0, delayMs: 250 });
   return Boolean(await waitUntil(() => {
@@ -5973,7 +5985,7 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
     return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose the Business property type.", dialog);
   }
   if (controls.business.getAttribute("aria-selected") !== "true") {
-    await clickElement(controls.business, "Business property type", { preClickDelayMs: 0, delayMs: 300 });
+    await clickElement(controls.business, "Business property type", { preClickDelayMs: 0, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
   }
   dialog = await waitUntil(visibleDeliveryPreferencesDialog, 8000, 200);
   if (!dialog || !await prepareConsumerBusinessDeliveryControls(dialog)) {
@@ -6019,7 +6031,7 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   await clickElement(refreshedTrigger, "Recheck consumer delivery instructions", { delayMs: 300 });
   dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
   if (dialog && consumerBusinessDeliveryControls(dialog).business?.getAttribute("aria-selected") !== "true") {
-    await clickElement(consumerBusinessDeliveryControls(dialog).business, "Verify Business property type", { preClickDelayMs: 0, delayMs: 300 });
+    await clickElement(consumerBusinessDeliveryControls(dialog).business, "Verify Business property type", { preClickDelayMs: 0, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
   }
   if (dialog) await prepareConsumerBusinessDeliveryControls(dialog);
   const verified = Boolean(await waitUntil(() => {
