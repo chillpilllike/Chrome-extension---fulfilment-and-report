@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.110")
+        self.assertEqual(MANIFEST["version"], "0.1.111")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -621,21 +621,22 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('/\\bnext[ -]?day\\b/', next_day)
         self.assertIn('!isAmazonDayDeliveryContext(context)', next_day)
 
-    def test_available_amazon_day_weekday_beats_earlier_default(self) -> None:
-        helper_start = CONTENT.index("function preferredAmazonDayWeekdayOption()")
-        helper_end = CONTENT.index("async function ensureWarehouseOpenDayDelivery", helper_start)
-        helper = CONTENT[helper_start:helper_end]
-        self.assertIn("isAmazonDayDeliveryContext(context)", helper)
-        self.assertIn("!deliveryContextIsNotConsolidated(context)", helper)
-        self.assertIn("deliveryContextNamesWarehouseOpenDay(context)", helper)
+    def test_amazon_day_does_not_override_free_next_day_on_workdays(self) -> None:
         reward_start = CONTENT.index("async function ensureRewardedLaterDelivery")
         reward_end = CONTENT.index("function checkoutDeliveryPromiseText", reward_start)
         reward = CONTENT[reward_start:reward_end]
-        self.assertIn("ensurePreferredAmazonDayWeekdayDelivery(activeJob)", reward)
-        self.assertLess(
-            reward.index("ensurePreferredAmazonDayWeekdayDelivery(activeJob)"),
-            reward.index("ensureFreeNextDayDelivery(activeJob, brooklynDay)"),
-        )
+        self.assertNotIn("ensurePreferredAmazonDayWeekdayDelivery(activeJob)", reward)
+        self.assertIn("if (!shouldPreferReward) return ensureFreeNextDayDelivery(activeJob, brooklynDay);", reward)
+
+    def test_reward_option_requires_its_own_explicit_weekday_reward_label(self) -> None:
+        helper_start = CONTENT.index("function fridayRewardDeliveryOption()")
+        helper_end = CONTENT.index("function rewardedLaterDeliverySelected()", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        self.assertIn("isOnePercentDeliveryRewardText(context.text)", helper)
+        self.assertIn("!deliveryContextIsNotConsolidated(context)", helper)
+        self.assertIn("deliveryContextNamesWarehouseOpenDay(context)", helper)
+        self.assertNotIn("checkoutOffersOnePercentDeliveryReward()", helper)
+        self.assertNotIn("isAmazonDayDeliveryContext(context)", helper)
 
     def test_split_weekend_delivery_is_replaced_before_preferences_apply(self) -> None:
         helper_start = CONTENT.index("function selectedDeliveryRadioContext()")

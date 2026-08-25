@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-25-warehouse-preferences-self-retry-v110";
+const CONTENT_SCRIPT_BUILD = "2026-08-25-delivery-option-priority-v111";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5431,27 +5431,14 @@ function isAmazonDayDeliveryContext(context) {
 }
 
 function fridayRewardDeliveryOption() {
-  const radios = [...document.querySelectorAll("input[type='radio']")].filter((radio) => !radio.disabled);
-  for (const radio of radios) {
-    const context = deliveryRadioContext(radio);
-    if (isOnePercentDeliveryRewardText(context.text)) return context;
-  }
-
-  if (!checkoutOffersOnePercentDeliveryReward()) return null;
-  const knownRewardNodes = [
-    document.querySelector("#second-nominated-dayPromiseReferenceForRadioLabel"),
-    document.querySelector("#second-nominated-dayReferenceForRadioLabel"),
-    ...document.querySelectorAll("[id*='nominated-day' i], .delivery-promise-text, .delivery-option-text"),
-  ].filter(Boolean);
-  for (const node of knownRewardNodes) {
-    const radio = radioLinkedToDeliveryReference(node);
-    if (radio) return deliveryRadioContext(radio);
-  }
-  for (const radio of radios) {
-    const context = deliveryRadioContext(radio);
-    if (isAmazonDayDeliveryContext(context)) return context;
-  }
-  return null;
+  return [...document.querySelectorAll("input[type='radio']")]
+    .filter((radio) => !radio.disabled)
+    .map(deliveryRadioContext)
+    .find((context) => (
+      isOnePercentDeliveryRewardText(context.text)
+      && !deliveryContextIsNotConsolidated(context)
+      && deliveryContextNamesWarehouseOpenDay(context)
+    )) || null;
 }
 
 function rewardedLaterDeliverySelected() {
@@ -5459,7 +5446,8 @@ function rewardedLaterDeliverySelected() {
   if (!selectedRadio) return false;
   const context = deliveryRadioContext(selectedRadio);
   return isOnePercentDeliveryRewardText(context.text)
-    || checkoutOffersOnePercentDeliveryReward() && isAmazonDayDeliveryContext(context);
+    && !deliveryContextIsNotConsolidated(context)
+    && deliveryContextNamesWarehouseOpenDay(context);
 }
 
 function selectedDeliveryRadioContext() {
@@ -5947,19 +5935,18 @@ async function ensureRewardedLaterDelivery(activeJob) {
   const warehouseDaySelection = await ensureWarehouseOpenDayDelivery(activeJob);
   if (warehouseDaySelection !== null) return warehouseDaySelection;
 
-  // Dispatch benefits from one predictable weekday delivery. Whenever Amazon
-  // exposes an eligible Amazon Day option, prefer it over an earlier default
-  // even when that default is itself Monday-Friday.
-  if (!await ensurePreferredAmazonDayWeekdayDelivery(activeJob)) return false;
-  if (preferredAmazonDayWeekdaySelected()) return true;
-
   const state = await getExtensionState();
   const brooklynDay = brooklynWeekday();
   const shouldPreferReward = state.preferRewardedLaterDelivery === true
     && brooklynNextDayIsWarehouseHoliday();
+  // Sunday-Thursday: the next day is a warehouse working day, so the earliest
+  // verified free next-day option wins. Amazon Day/reward placement in the DOM
+  // must never override it merely because that option is last.
   if (!shouldPreferReward) return ensureFreeNextDayDelivery(activeJob, brooklynDay);
   if (rewardedLaterDeliverySelected()) return true;
 
+  // Friday/Saturday only: consider a reward option when that exact radio's own
+  // label explicitly advertises 1% and promises one consolidated weekday.
   const rewardOption = fridayRewardDeliveryOption();
   if (!rewardOption) return true;
   if (!rewardOption.control) {
