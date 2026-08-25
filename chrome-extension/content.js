@@ -5975,6 +5975,19 @@ function consumerBusinessDeliveryPreferencesMatch(dialog) {
   );
 }
 
+function consumerBusinessDeliverySavedSummaryMatches(dialog) {
+  const text = normalizedText(dialog?.innerText || dialog?.textContent || "");
+  return Boolean(
+    text.includes("delivery instructions saved")
+    && /property type:\s*business/.test(text)
+    && /monday\s*-\s*friday\s*8(?::00)?\s*am\s*-\s*4(?::00)?\s*pm/.test(text)
+    && /saturday\s*-\s*sunday\s*closed/.test(text)
+    && /holidays\s*open/.test(text)
+    && text.includes("front door")
+    && text.includes("business name: outside the box shipping")
+  );
+}
+
 async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, retryAttempt = 0) {
   showPanel("Delivery preferences", "Verifying consumer Business hours, weekend closure, front-door instructions, and no observed holidays.", null, null);
   await clickElement(trigger, "Add or edit consumer delivery instructions", { delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
@@ -6025,7 +6038,26 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
     return pauseForDeliveryPreferences(activeJob, "Amazon consumer delivery instructions did not expose a usable Save instructions button.", dialog);
   }
   await clickElement(save, "Save consumer delivery instructions", { preClickDelayMs: 100, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
-  if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 10000, 200)) {
+  const saveOutcome = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate) return "closed";
+    if (consumerBusinessDeliverySavedSummaryMatches(candidate)) return "verified_summary";
+    return null;
+  }, 10000, 200);
+  if (saveOutcome === "verified_summary") {
+    await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
+    await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200);
+    await sendDiagnostic("Saved and verified consumer checkout delivery preferences from Amazon's confirmation summary.", {
+      group_key: activeJob?.job?.group_key || "",
+      property_type: "Business",
+      weekdays: "Monday-Friday 08:00-16:00",
+      weekends: "closed",
+      drop_off: "Front Door",
+      observed_holidays: "none",
+    });
+    return true;
+  }
+  if (saveOutcome !== "closed") {
     await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
     if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200)) {
       return pauseForDeliveryPreferences(activeJob, "Amazon kept the consumer delivery-instructions dialog open after saving and it could not be closed for verification.", visibleDeliveryPreferencesDialog());

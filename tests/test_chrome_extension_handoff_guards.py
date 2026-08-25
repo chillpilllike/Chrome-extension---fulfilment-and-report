@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.127")
+        self.assertEqual(MANIFEST["version"], "0.1.128")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -159,6 +159,19 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());", save_confirmation)
         self.assertIn("if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200))", save_confirmation)
         self.assertIn("Amazon kept the consumer delivery-instructions dialog open after saving", save_confirmation)
+        self.assertIn("consumerBusinessDeliverySavedSummaryMatches(candidate)", save_confirmation)
+        self.assertIn('saveOutcome === "verified_summary"', save_confirmation)
+        self.assertIn("confirmation summary", save_confirmation)
+        summary_start = CONTENT.index("function consumerBusinessDeliverySavedSummaryMatches")
+        summary_end = CONTENT.index("async function ensureConsumerWarehouseDeliveryPreferences", summary_start)
+        summary = CONTENT[summary_start:summary_end]
+        self.assertIn('text.includes("delivery instructions saved")', summary)
+        self.assertIn("property type", summary)
+        self.assertIn("monday", summary)
+        self.assertIn("saturday", summary)
+        self.assertIn("holidays", summary)
+        self.assertIn('text.includes("front door")', summary)
+        self.assertIn('text.includes("business name: outside the box shipping")', summary)
         normalizer_start = CONTENT.index("function normalizedDeliveryInstructionValue")
         normalizer_end = CONTENT.index("function warehouseDeliveryInstructionsMatch", normalizer_start)
         self.assertIn("&#0*39;|&apos;", CONTENT[normalizer_start:normalizer_end])
