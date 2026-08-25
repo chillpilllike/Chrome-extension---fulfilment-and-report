@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.128")
+        self.assertEqual(MANIFEST["version"], "0.1.129")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -860,6 +860,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         cleanup_guard = CONTENT.index('activeJob?.stage === "cleanup_after_failure"', CONTENT.index("async function guardUnexpectedAmazonPage"))
         unexpected_guard = CONTENT.index('reason: "unexpected_order_history_page"', cleanup_guard)
         self.assertLess(cleanup_guard, unexpected_guard)
+
+    def test_submitted_order_history_reaches_safe_matcher_without_self_redirect(self) -> None:
+        guard_start = CONTENT.index("async function guardUnexpectedAmazonPage(activeJob)")
+        guard_end = CONTENT.index("function submittedStage(activeJob)", guard_start)
+        guard = CONTENT[guard_start:guard_end]
+        history_passthrough = guard.index("if (isOrderHistoryPage() && submittedEvidence) return false;")
+        generic_submitted_guard = guard.index("if (\n    isAmazonThankYouPage()", history_passthrough)
+        redirect = guard.index("forceOrderReportingFromSubmittedPage", generic_submitted_guard)
+        self.assertLess(history_passthrough, generic_submitted_guard)
+        self.assertLess(history_passthrough, redirect)
+        self.assertIn("const submittedEvidence = submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob);", guard)
 
     def test_address_list_is_recovered_before_final_recipient_verification(self) -> None:
         self.assertIn("function checkoutAddressSelectionPageOpen()", CONTENT)

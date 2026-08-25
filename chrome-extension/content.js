@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-business-render-v121";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-order-history-reporting-v122";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -7821,10 +7821,17 @@ async function forceOrderReportingFromSubmittedPage(activeJob, reason = "") {
 }
 
 async function guardUnexpectedAmazonPage(activeJob) {
+  const submittedEvidence = submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob);
+  // Order history is the authoritative recipient/ASIN verification surface.
+  // Do not let the generic submitted-page guard read the first order number
+  // from that page and redirect back to the same URL forever. The normal run
+  // path will call handleOrderHistory(), select the matching card, and report
+  // it idempotently to the app.
+  if (isOrderHistoryPage() && submittedEvidence) return false;
   if (
     isAmazonThankYouPage() ||
     confirmationSaysPlaced() ||
-    ((submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob)) && pageLooksAfterAmazonSubmit())
+    (submittedEvidence && pageLooksAfterAmazonSubmit())
   ) {
     await forceOrderReportingFromSubmittedPage(activeJob, "Amazon confirmation URL or placed-order text detected.");
     return true;
@@ -7839,7 +7846,7 @@ async function guardUnexpectedAmazonPage(activeJob) {
   ) {
     return false;
   }
-  if ((isOrderHistoryPage() || isOrderDetailsPage()) && !submittedOrPausedStage(activeJob) && !activeJobWasSubmittedToAmazon(activeJob)) {
+  if ((isOrderHistoryPage() || isOrderDetailsPage()) && !submittedEvidence) {
     activeJob.paused = true;
     activeJob.pausedStage = activeJob.stage || "product";
     activeJob.pageGuardPausedAt = Date.now();
@@ -7856,7 +7863,7 @@ async function guardUnexpectedAmazonPage(activeJob) {
     );
     return true;
   }
-  if ((submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob)) && /\/cart/i.test(location.pathname)) {
+  if (submittedEvidence && /\/cart/i.test(location.pathname)) {
     await sendDiagnostic("Submitted job landed on cart; redirecting to order history instead of clearing cart.", {
       group_key: activeJob?.job?.group_key || "",
       stage: activeJob.stage || "",
