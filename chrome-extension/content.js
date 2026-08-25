@@ -6015,15 +6015,14 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   }
 
   const save = await waitUntil(() => {
-    const candidate = visibleDeliveryPreferencesDialog();
-    if (!candidate) return null;
-    return [...candidate.querySelectorAll("button, input[type='submit'], input[type='button']")]
+    if (!visibleDeliveryPreferencesDialog()) return null;
+    return [...document.querySelectorAll("button, input[type='submit'], input[type='button']")]
       .find((element) => (
         visible(element)
         && !element.disabled
         && normalizedText(element.value || element.textContent || "").toLowerCase() === "save instructions"
       )) || null;
-  }, 5000, 150);
+  }, 10000, 150);
   if (!save) {
     return pauseForDeliveryPreferences(activeJob, "Amazon consumer delivery instructions did not expose a usable Save instructions button.", dialog);
   }
