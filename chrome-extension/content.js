@@ -6014,8 +6014,16 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
     return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not accept the complete Business delivery instructions.", dialog);
   }
 
-  const save = [...dialog.querySelectorAll("button, input[type='submit']")]
-    .find((element) => visible(element) && normalizedText(element.value || element.textContent || "").toLowerCase() === "save instructions");
+  const save = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate) return null;
+    return [...candidate.querySelectorAll("button, input[type='submit'], input[type='button']")]
+      .find((element) => (
+        visible(element)
+        && !element.disabled
+        && normalizedText(element.value || element.textContent || "").toLowerCase() === "save instructions"
+      )) || null;
+  }, 5000, 150);
   if (!save) {
     return pauseForDeliveryPreferences(activeJob, "Amazon consumer delivery instructions did not expose a usable Save instructions button.", dialog);
   }

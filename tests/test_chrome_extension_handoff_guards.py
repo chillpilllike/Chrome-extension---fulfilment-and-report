@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.122")
+        self.assertEqual(MANIFEST["version"], "0.1.123")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -149,6 +149,11 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('setWarehouseDeliverySelect(controls.weekdayStart, "8:00")', helper)
         self.assertIn("consumerBusinessDeliveryPreferencesMatch(dialog)", helper)
         self.assertIn('"save instructions"', helper)
+        self.assertIn("const save = await waitUntil(() =>", helper)
+        self.assertIn("const candidate = visibleDeliveryPreferencesDialog();", helper)
+        self.assertIn('candidate.querySelectorAll("button, input[type=\'submit\'], input[type=\'button\']")', helper)
+        self.assertIn("!element.disabled", helper)
+        self.assertIn("}, 5000, 150);", helper)
         self.assertIn("return ensureConsumerWarehouseDeliveryPreferences(activeJob, nextTrigger, nextAttempt);", helper)
 
     def test_delivery_preferences_retry_themselves_before_manual_pause(self) -> None:
