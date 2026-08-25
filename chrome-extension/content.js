@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-add-more-instructions-v119";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-recipient-and-controls-v120";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5869,6 +5869,19 @@ async function expandConsumerBusinessAccordion(dialog, labelPrefix) {
   ));
 }
 
+async function exposeConsumerBusinessControls(dialog, labelPrefix, controlsReady) {
+  if (controlsReady(dialog)) return true;
+  const accordion = consumerBusinessAccordion(dialog, labelPrefix);
+  if (!accordion) return false;
+  if (accordion.getAttribute("aria-expanded") !== "true") {
+    await clickElement(accordion, labelPrefix, { preClickDelayMs: 0, delayMs: 200 });
+  }
+  return Boolean(await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && controlsReady(candidate);
+  }, 5000, 150));
+}
+
 async function revealConsumerBusinessInstructionSections(dialog) {
   const securityLabel = "Do we need a security code, call box number or key to access this building?";
   const additionalLabel = "Do we need additional instructions to deliver to this address?";
@@ -5885,27 +5898,33 @@ async function revealConsumerBusinessInstructionSections(dialog) {
 }
 
 async function prepareConsumerBusinessDeliveryControls(dialog) {
-  const primarySections = [
-    "When is this address open for deliveries?",
-    "Where should we leave your packages at this address?",
-  ];
-  const additionalSections = [
-    "Do we need a security code, call box number or key to access this building?",
-    "Do we need additional instructions to deliver to this address?",
-  ];
-  for (const section of primarySections) {
-    if (!await expandConsumerBusinessAccordion(dialog, section)) return false;
-    dialog = visibleDeliveryPreferencesDialog();
-  }
+  const hoursLabel = "When is this address open for deliveries?";
+  const locationLabel = "Where should we leave your packages at this address?";
+  const securityLabel = "Do we need a security code, call box number or key to access this building?";
+  const additionalLabel = "Do we need additional instructions to deliver to this address?";
+  if (!await exposeConsumerBusinessControls(dialog, hoursLabel, (candidate) => Boolean(
+    consumerBusinessTimeControl(candidate, "start", "weekday")
+    && consumerBusinessTimeControl(candidate, "stop", "weekday")
+    && consumerBusinessFlagControl(candidate, "closed", "weekend")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!await exposeConsumerBusinessControls(dialog, locationLabel, (candidate) => Boolean(
+    candidate.querySelector("input[name='preferredDeliveryLocationBUSINESS'][value='FRONTDOOR']")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
   if (!await revealConsumerBusinessInstructionSections(dialog)) return false;
   dialog = visibleDeliveryPreferencesDialog();
-  for (const section of additionalSections) {
-    if (!await expandConsumerBusinessAccordion(dialog, section)) return false;
-    dialog = visibleDeliveryPreferencesDialog();
-  }
+  if (!await exposeConsumerBusinessControls(dialog, securityLabel, (candidate) => Boolean(
+    candidate.querySelector("#securityCode-BUSINESS") && candidate.querySelector("#callBox-BUSINESS")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!await exposeConsumerBusinessControls(dialog, additionalLabel, (candidate) => Boolean(
+    candidate.querySelector("#freeTextInstruction-BUSINESS")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
   // Leave business hours expanded so the active Business holiday control is
   // visible and can be distinguished from Amazon's duplicate hidden controls.
-  return expandConsumerBusinessAccordion(dialog, primarySections[0]);
+  return expandConsumerBusinessAccordion(dialog, hoursLabel);
 }
 
 function consumerBusinessDeliveryControls(dialog) {
@@ -7416,6 +7435,14 @@ async function handleCheckout(activeJob) {
   const addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
   if (addressAlreadyConfirmed) {
     await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Verified delivery address for ${checkoutRecipient}.`);
+  }
+  // Consumer checkout can land on the address list with an unrelated personal
+  // address selected even though this exact Nutricity recipient already exists.
+  // Select and deliver to the exact row before any generic warehouse-row edit;
+  // editing first can rename the wrong Nutricity row and create duplicates.
+  if (checkoutAddressSelectionPageOpen() && addressRowForRecipient(checkoutRecipient)) {
+    await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient);
+    return;
   }
   const addressEditIsFresh = addressAlreadyConfirmed || activeJob.addressEditedRecipient === checkoutRecipient && Date.now() - Number(activeJob.addressEditedAt || 0) < 30000;
   if (!addressEditIsFresh) {

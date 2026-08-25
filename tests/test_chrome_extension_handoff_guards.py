@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.119")
+        self.assertEqual(MANIFEST["version"], "0.1.120")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -132,7 +132,10 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("prepareConsumerBusinessDeliveryControls(dialog)", helper)
         self.assertIn("revealConsumerBusinessInstructionSections(dialog)", CONTENT)
         self.assertIn('=== "add more instructions"', CONTENT)
-        self.assertIn("expandConsumerBusinessAccordion(dialog, section)", CONTENT)
+        self.assertIn("exposeConsumerBusinessControls(dialog, hoursLabel", CONTENT)
+        self.assertIn("exposeConsumerBusinessControls(dialog, locationLabel", CONTENT)
+        self.assertIn("exposeConsumerBusinessControls(dialog, securityLabel", CONTENT)
+        self.assertIn("exposeConsumerBusinessControls(dialog, additionalLabel", CONTENT)
         self.assertIn("find(visible)", CONTENT)
         self.assertIn("const CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS = 1000;", CONTENT)
         self.assertIn('"Add or edit consumer delivery instructions", { delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS }', helper)
@@ -834,6 +837,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertLess(address_recovery, missing_recipient_pause)
         self.assertIn("const recipientRow = addressRowForRecipient(checkoutRecipient);", CONTENT[address_recovery:missing_recipient_pause])
         self.assertIn("const editor = await openAddressEditorIfAvailable(activeJob);", CONTENT[address_recovery:missing_recipient_pause])
+
+    def test_exact_consumer_recipient_row_is_selected_before_any_address_edit(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        exact_row = checkout.index("checkoutAddressSelectionPageOpen() && addressRowForRecipient(checkoutRecipient)")
+        edit_freshness = checkout.index("const addressEditIsFresh", exact_row)
+        open_editor = checkout.index("openAddressEditorIfAvailable(activeJob)", edit_freshness)
+        self.assertLess(exact_row, edit_freshness)
+        self.assertLess(exact_row, open_editor)
+        self.assertIn("await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient);", checkout[exact_row:edit_freshness])
 
     def test_recipient_parser_does_not_concatenate_duplicate_accessible_text(self) -> None:
         parser_start = CONTENT.index("function checkoutDeliveryRecipientText()")
