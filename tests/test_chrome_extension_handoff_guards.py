@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.129")
+        self.assertEqual(MANIFEST["version"], "0.1.130")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -871,6 +871,33 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertLess(history_passthrough, generic_submitted_guard)
         self.assertLess(history_passthrough, redirect)
         self.assertIn("const submittedEvidence = submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob);", guard)
+
+    def test_address_selection_and_editor_are_detected_without_serial_six_second_waits(self) -> None:
+        verify_start = CONTENT.index("async function verifyCheckoutDeliveryRecipient")
+        verify_end = CONTENT.index("async function handleCheckoutLimitPurchase", verify_start)
+        verify = CONTENT[verify_start:verify_end]
+        render_wait = verify.index("const confirmedAfterRender")
+        self.assertIn("&& !checkoutAddressSelectionPageOpen()", verify[:render_wait])
+        self.assertIn("&& !findAddressNameInput()", verify[:render_wait])
+
+        open_start = CONTENT.index("async function openAddressEditorIfAvailable")
+        open_end = CONTENT.index("async function openNewDeliveryAddressFormIfAvailable", open_start)
+        opener = CONTENT[open_start:open_end]
+        self.assertIn("let editAddress = findEditAddressTrigger();", opener)
+        self.assertIn("let changeAddress = editAddress ? null : findChangeDeliveryAddressButton();", opener)
+        self.assertIn("2500,\n      150,", opener)
+        self.assertNotIn("await waitUntil(findEditAddressTrigger, 6000", opener)
+        self.assertNotIn("await sleep(2000)", opener)
+
+    def test_existing_address_name_fill_avoids_fixed_animation_delays(self) -> None:
+        fill_start = CONTENT.index("async function fillFullName(name)")
+        fill_end = CONTENT.index("async function setInputValue", fill_start)
+        fill = CONTENT[fill_start:fill_end]
+        self.assertIn("findAddressNameInput() || await waitUntil", fill)
+        self.assertIn("6000, 150", fill)
+        self.assertIn('behavior: "auto"', fill)
+        self.assertNotIn("sleep(500)", fill)
+        self.assertNotIn("sleep(800)", fill)
 
     def test_address_list_is_recovered_before_final_recipient_verification(self) -> None:
         self.assertIn("function checkoutAddressSelectionPageOpen()", CONTENT)

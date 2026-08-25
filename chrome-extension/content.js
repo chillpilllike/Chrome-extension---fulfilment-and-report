@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-order-history-reporting-v122";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-fast-address-detection-v123";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -4232,21 +4232,20 @@ async function fillFullName(name) {
   if (window.__nutricityFillingFullName) return false;
   window.__nutricityFillingFullName = true;
   try {
-  const input = await waitUntil(() => (
+  const input = findAddressNameInput() || await waitUntil(() => (
     document.querySelector("input#address-ui-widgets-enterAddressFullName[name='address-ui-widgets-enterAddressFullName']")
     || findAddressNameInput()
-  ), 20000);
+  ), 6000, 150);
   if (!input) return false;
   const desired = String(name || "").replace(/\s+/g, " ").trim();
   if (!desired) return false;
-  input.scrollIntoView({ block: "center", behavior: "smooth" });
-  await sleep(500);
+  input.scrollIntoView({ block: "center", behavior: "auto" });
   await setInputValue(input, desired);
-  await sleep(800);
+  await sleep(120);
   let saved = input.value.replace(/\s+/g, " ").trim() === desired;
   if (!saved) {
     await setInputValue(input, desired);
-    await sleep(500);
+    await sleep(120);
     saved = input.value.replace(/\s+/g, " ").trim() === desired;
   }
   input.blur();
@@ -6894,18 +6893,35 @@ async function openAddressEditorIfAvailable(activeJob) {
   const directEditor = findAddressNameInput();
   if (directEditor) return directEditor;
 
-  let editAddress = await waitUntil(findEditAddressTrigger, 6000, 400);
+  // Detect the surface that Amazon already rendered instead of serially
+  // waiting for an Edit link on the final review page, where only Change
+  // delivery address can exist.
+  let editAddress = findEditAddressTrigger();
+  let changeAddress = editAddress ? null : findChangeDeliveryAddressButton();
+  if (!editAddress && !changeAddress) {
+    await waitUntil(
+      () => findAddressNameInput() || findEditAddressTrigger() || findChangeDeliveryAddressButton(),
+      2500,
+      150,
+    );
+    if (findAddressNameInput()) return findAddressNameInput();
+    editAddress = findEditAddressTrigger();
+    changeAddress = editAddress ? null : findChangeDeliveryAddressButton();
+  }
   if (!editAddress) {
-    const changeAddress = findChangeDeliveryAddressButton();
     if (changeAddress) {
       showPanel("Nutricity checkout", "Opening delivery address selection.", null, null);
       activeJob.stage = "editing_address";
       activeJob.editAddressClickedAt = Date.now();
       await setActiveJob(activeJob);
       await clickElement(changeAddress, "Change delivery address link");
-      await sleep(2000);
-      editAddress = await waitUntil(findEditAddressTrigger, 10000, 400);
-      if (!editAddress && findAddressNameInput()) return findAddressNameInput();
+      const addressSurface = await waitUntil(
+        () => findAddressNameInput() || findEditAddressTrigger(),
+        7000,
+        150,
+      );
+      if (findAddressNameInput()) return findAddressNameInput();
+      editAddress = addressSurface || findEditAddressTrigger();
     }
   }
 
@@ -6916,14 +6932,7 @@ async function openAddressEditorIfAvailable(activeJob) {
   activeJob.editAddressClickedAt = Date.now();
   await setActiveJob(activeJob);
   await clickElement(editAddress, "Edit address link");
-  await waitForElement([
-    "#address-ui-widgets-enterAddressFullName",
-    "input[name='address-ui-widgets-enterAddressFullName']",
-    "input[aria-label='Full name']",
-    "input[name*='FullName']",
-    "input[id*='FullName']",
-  ], 8000);
-  return findAddressNameInput();
+  return await waitUntil(findAddressNameInput, 6000, 150) || findAddressNameInput();
 }
 
 async function openNewDeliveryAddressFormIfAvailable(activeJob) {
@@ -7047,8 +7056,9 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   if (!filled) return false;
 
   showPanel("Nutricity checkout", "Saving Amazon address.", null, null);
-  await sleep(1000);
-  const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "continue"]);
+  const useAddress = findUseAddressButton()
+    || await waitUntil(findUseAddressButton, 4500, 150)
+    || findButtonByText(["use this address", "save address", "continue"]);
   if (!useAddress) {
     if (checkoutAdvancedAfterAddressSave()) {
       activeJob.stage = "checkout";
@@ -7074,8 +7084,6 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   if (findPlaceOrderButton() && checkoutShowsRecipient(checkoutRecipient)) {
     return markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Checkout address panel shows the edited recipient. Continuing checkout.");
   }
-  await sleep(1000);
-
   const recipientAddressControl = await waitUntil(() => !findAddressNameInput() && recipientAddressSelectionControl(checkoutRecipient), 10000, 300);
   if (recipientAddressControl) {
     showPanel("Nutricity checkout", "Selecting the recipient delivery address.", null, null);
@@ -7219,7 +7227,11 @@ async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
   // Closing Amazon's address editor often restores the checkout card in two
   // renders: the Place Order button appears first, then the delivery details.
   // Do not pause in the gap when the correct address has simply not painted yet.
-  if (!checkoutRecipientConfirmed(checkoutRecipient)) {
+  if (
+    !checkoutRecipientConfirmed(checkoutRecipient)
+    && !checkoutAddressSelectionPageOpen()
+    && !findAddressNameInput()
+  ) {
     const confirmedAfterRender = await waitUntil(
       () => checkoutRecipientConfirmed(checkoutRecipient),
       6000,
