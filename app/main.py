@@ -13247,6 +13247,16 @@ def place_orders(
         ).fetchall()
         if ordering_engine == "chrome":
             lines = [line for line in lines if clean_text(line["state"]) != "submitted"]
+        if lines and normalized_auto_chrome_start_date(minimum_odoo_order_date):
+            by_order_date: dict[int, list[dict[str, Any]]] = {}
+            for line in lines:
+                by_order_date.setdefault(int(line["odoo_order_id"]), []).append(dict(line))
+            eligible_date_order_ids = {
+                order_id
+                for order_id, order_lines in by_order_date.items()
+                if chrome_order_is_on_or_after_start_date(order_lines, minimum_odoo_order_date)
+            }
+            lines = [line for line in lines if int(line["odoo_order_id"]) in eligible_date_order_ids]
         if lines:
             allowed_ids, candidate_blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, [int(line["id"]) for line in lines])
             failed += candidate_blocked
@@ -13279,16 +13289,6 @@ def place_orders(
                 if received_times and all(value is not None and value <= cutoff for value in received_times):
                     eligible_order_ids.add(order_id)
             lines = [line for line in lines if int(line["odoo_order_id"]) in eligible_order_ids]
-        if lines and normalized_auto_chrome_start_date(minimum_odoo_order_date):
-            by_order_date: dict[int, list[dict[str, Any]]] = {}
-            for line in lines:
-                by_order_date.setdefault(int(line["odoo_order_id"]), []).append(dict(line))
-            eligible_date_order_ids = {
-                order_id
-                for order_id, order_lines in by_order_date.items()
-                if chrome_order_is_on_or_after_start_date(order_lines, minimum_odoo_order_date)
-            }
-            lines = [line for line in lines if int(line["odoo_order_id"]) in eligible_date_order_ids]
     inventory_lines: list[dict[str, Any]] = []
     allocated_lines: list[dict[str, Any]] = []
     purchase_lines: list[dict[str, Any]] = []
@@ -29937,8 +29937,10 @@ def reset_unsubmitted_chrome_queue(
 
 @app.post("/api/chrome/auto-ordering/pause")
 def api_pause_chrome_auto_ordering() -> dict[str, Any]:
+    # Block extension claims immediately. If a scheduler pass already owns the
+    # lock, wait for it and then reset everything it left unsubmitted.
+    set_setting("auto_chrome_fulfil_enabled", "false")
     with _AUTO_CHROME_QUEUE_CONTROL_LOCK:
-        set_setting("auto_chrome_fulfil_enabled", "false")
         set_setting("auto_chrome_fulfil_last_message", "Automatic Chrome ordering paused; unsubmitted queue reset to pulled.")
         cleared, protected = reset_unsubmitted_chrome_queue(
             attempt_status="auto_ordering_paused",

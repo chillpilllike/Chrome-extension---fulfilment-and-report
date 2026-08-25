@@ -74,6 +74,10 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
         reset_source = inspect.getsource(main.reset_unsubmitted_chrome_queue)
         claim_source = inspect.getsource(main.api_chrome_jobs)
         self.assertIn('set_setting("auto_chrome_fulfil_enabled", "false")', pause_source)
+        self.assertLess(
+            pause_source.index('set_setting("auto_chrome_fulfil_enabled", "false")'),
+            pause_source.index("with _AUTO_CHROME_QUEUE_CONTROL_LOCK"),
+        )
         self.assertIn("reset_unsubmitted_chrome_queue", pause_source)
         self.assertIn("NOT IN ('order_submitted', 'reporting_complete')", reset_source)
         self.assertIn("if not auto_chrome_ordering_enabled()", claim_source)
@@ -81,9 +85,14 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
     def test_resume_requires_date_and_ui_prompts_for_it(self) -> None:
         resume_source = inspect.getsource(main.api_resume_chrome_auto_ordering)
         scheduler_source = inspect.getsource(main.autosync_loop)
+        place_source = inspect.getsource(main.place_orders)
         self.assertIn("Choose a valid auto-ordering start date", resume_source)
         self.assertIn('set_setting("auto_chrome_fulfil_last_run_at", "")', resume_source)
         self.assertIn("minimum_odoo_order_date=start_date", scheduler_source)
+        self.assertLess(
+            place_source.index("eligible_date_order_ids"),
+            place_source.index("block_selected_orders_with_existing_amazon_orders", place_source.index("eligible_date_order_ids")),
+        )
         self.assertIn("Pause Auto Ordering & Reset Queue", FRONTEND)
         self.assertIn("Queue eligible Odoo orders since", FRONTEND)
 
