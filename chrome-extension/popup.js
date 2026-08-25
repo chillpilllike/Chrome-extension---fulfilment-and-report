@@ -5,6 +5,7 @@ const deliveryLimitDays = document.querySelector("#deliveryLimitDays");
 const editExistingAddress = document.querySelector("#editExistingAddress");
 const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAsin");
 const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
+const autoOrderQueue = document.querySelector("#autoOrderQueue");
 const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
 const pauseBeforePlaceOrder = document.querySelector("#pauseBeforePlaceOrder");
 const preferRewardedLaterDelivery = document.querySelector("#preferRewardedLaterDelivery");
@@ -60,7 +61,8 @@ function hydrateSettingsValues(settings = {}) {
   deliveryLimitDays.value = String(Math.min(30, Math.max(1, Math.floor(Number(settings.deliveryLimitDays) || 5))));
   editExistingAddress.checked = settings.editExistingAddress !== false;
   fulfilAvailableMixedAsin.checked = settings.fulfilAvailableMixedAsin === true;
-  splitMixedAsinOrders.checked = settings.splitMixedAsinOrders !== false;
+  splitMixedAsinOrders.checked = false;
+  autoOrderQueue.checked = settings.autoOrderQueue === true;
   browserlessOrderMode.checked = settings.browserlessOrderMode === true;
   pauseBeforePlaceOrder.checked = settings.pauseBeforePlaceOrder === true;
   preferRewardedLaterDelivery.checked = settings.preferRewardedLaterDelivery === true;
@@ -76,6 +78,7 @@ function hasSettingsPayload(state) {
     Object.hasOwn(state, "editExistingAddress") ||
     Object.hasOwn(state, "fulfilAvailableMixedAsin") ||
     Object.hasOwn(state, "splitMixedAsinOrders") ||
+    Object.hasOwn(state, "autoOrderQueue") ||
     Object.hasOwn(state, "browserlessOrderMode") ||
     Object.hasOwn(state, "pauseBeforePlaceOrder") ||
     Object.hasOwn(state, "preferRewardedLaterDelivery")
@@ -91,12 +94,13 @@ function loadSavedSettings() {
       deliveryLimitDays: 5,
       editExistingAddress: true,
       fulfilAvailableMixedAsin: false,
-      splitMixedAsinOrders: true,
+      splitMixedAsinOrders: false,
+      autoOrderQueue: true,
       browserlessOrderMode: false,
       pauseBeforePlaceOrder: false,
       preferRewardedLaterDelivery: false,
     }, (settings) => {
-      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) {
+      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, autoOrderQueue, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) {
         hydrateSettingsValues(settings);
         settingsHydrated = true;
       }
@@ -121,7 +125,7 @@ function registerControlWindow() {
   });
 }
 
-[apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].forEach((input) => {
+[apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, autoOrderQueue, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].forEach((input) => {
   input.addEventListener("input", () => {
     settingsDirty = true;
   });
@@ -144,7 +148,7 @@ function updateModeNotice() {
 browserlessOrderMode.addEventListener("change", updateModeNotice);
 
 function syncSettingsInputs(state) {
-  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, splitMixedAsinOrders, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) return;
+  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, autoOrderQueue, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) return;
   hydrateSettingsValues(state);
   settingsHydrated = true;
 }
@@ -157,7 +161,8 @@ function settingsPayload() {
     deliveryLimitDays: Math.min(30, Math.max(1, Math.floor(Number(deliveryLimitDays.value) || 5))),
     editExistingAddress: editExistingAddress.checked,
     fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked,
-    splitMixedAsinOrders: splitMixedAsinOrders.checked,
+    splitMixedAsinOrders: false,
+    autoOrderQueue: autoOrderQueue.checked,
     browserlessOrderMode: browserlessOrderMode.checked,
     pauseBeforePlaceOrder: pauseBeforePlaceOrder.checked,
     preferRewardedLaterDelivery: preferRewardedLaterDelivery.checked,

@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-preferences-hydration-v88";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-account-routed-auto-queue-v130";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -15,6 +15,8 @@ const MISSING_ASIN_ALARM = "nutricity-missing-asin-availability";
 const MISSING_ASIN_CHECK_PERIOD_MINUTES = 24 * 60;
 const FULFILMENT_WATCHDOG_ALARM = "nutricity-fulfilment-watchdog";
 const FULFILMENT_WATCHDOG_PERIOD_MINUTES = 1;
+const AUTO_ORDER_ALARM = "nutricity-auto-order-queue";
+const AUTO_ORDER_PERIOD_MINUTES = 1;
 const BROWSERLESS_SWITCH_POLL_MS = 2000;
 const BROWSERLESS_SWITCH_TIMEOUT_MS = 10 * 60 * 1000;
 const DIAGNOSTIC_SESSION_LIMIT = 4;
@@ -29,7 +31,8 @@ async function getSettings() {
     cardLast4Preference: "",
     editExistingAddress: true,
     fulfilAvailableMixedAsin: false,
-    splitMixedAsinOrders: true,
+    splitMixedAsinOrders: false,
+    autoOrderQueue: true,
     browserlessOrderMode: false,
     pauseBeforePlaceOrder: false,
     preferRewardedLaterDelivery: false,
@@ -1177,6 +1180,33 @@ async function amazonTabsInWindow(windowId) {
   }
 }
 
+// ACCOUNT-TYPE CLAIM INVARIANT: profile names are irrelevant. Every extension
+// must positively detect its live Amazon experience before claiming. The API
+// then atomically assigns only a compatible whole Odoo order to the first idle
+// consumer or Business worker that reaches the queue.
+async function detectAmazonAccountExperience(windowId = null, createIfMissing = false) {
+  let tabs = windowId ? await amazonTabsInWindow(windowId) : [];
+  if (!tabs.length && chrome.tabs?.query) {
+    tabs = await chrome.tabs.query({
+      url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"],
+    }).catch(() => []);
+  }
+  if (!tabs.length && createIfMissing) {
+    const created = await createAmazonWorkerWindow(false);
+    const tab = created?.tabs?.[0];
+    if (tab?.id) tabs = [tab];
+  }
+  for (const tab of tabs) {
+    if (!tab?.id) continue;
+    await injectContentScriptWhenReady(tab.id).catch(() => false);
+    const detected = await chrome.tabs.sendMessage(tab.id, { type: "GET_AMAZON_ACCOUNT_EXPERIENCE" }).catch(() => null);
+    if (["consumer", "business"].includes(detected?.experience)) {
+      return { experience: detected.experience, windowId: tab.windowId || windowId, tabId: tab.id };
+    }
+  }
+  return { experience: "unknown", windowId, tabId: null };
+}
+
 async function ensureContentScriptsInAmazonTabs(label = "extension recovery", options = {}) {
   if (!chrome.tabs?.query) return;
   const tabs = await chrome.tabs.query({
@@ -1205,10 +1235,15 @@ async function ensureStoredActiveJobContentScripts(label = "active job recovery"
 }
 
 async function startNextJob(sourceWindowId = null) {
+  const options = arguments[1] || {};
   if (startNextJobInFlight) return startNextJobInFlight;
   startNextJobInFlight = (async () => {
   sourceWindowId = await existingChromeWindowId(sourceWindowId);
-  await setForceStop(false);
+  if (options.automatic === true) {
+    if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active." };
+  } else {
+    await setForceStop(false);
+  }
   await releaseMissingWindowJobs({ force: true });
   const submittedRecovery = await recoverSubmittedJobInWindow(sourceWindowId);
   if (submittedRecovery?.activeJob) return submittedRecovery;
@@ -1230,7 +1265,7 @@ async function startNextJob(sourceWindowId = null) {
     }
   }
   const workerId = await getWorkerId();
-  const { splitMixedAsinOrders, fulfilAvailableMixedAsin, browserlessOrderMode } = await getSettings();
+  const { browserlessOrderMode } = await getSettings();
   if (browserlessOrderMode === true) {
     const browserless = await browserlessOrderStatus().catch(() => null);
     if (browserless?.progress?.running === true) {
@@ -1244,6 +1279,13 @@ async function startNextJob(sourceWindowId = null) {
       await log("Browserless ordering stopped; starting the next queued order in Chrome UI mode.", sourceWindowId);
     }
   }
+  const detectedAccount = await detectAmazonAccountExperience(sourceWindowId, true);
+  if (!["consumer", "business"].includes(detectedAccount.experience)) {
+    const message = "Amazon account type could not be positively detected, so no queued order was claimed.";
+    await log(message, sourceWindowId);
+    return { ok: false, message };
+  }
+  sourceWindowId = detectedAccount.windowId || sourceWindowId;
   let queueBefore = null;
   const { cachedQueueStatus } = await getSettings();
   if (
@@ -1272,18 +1314,14 @@ async function startNextJob(sourceWindowId = null) {
     });
     return { ok: false, message };
   }
-  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, sourceWindowId, queueBefore);
-  if (!preflight.ok) {
-    await updateOrderProgressTotal(0, preflight.message || "Split-order preflight failed.");
-    return { ok: false, message: preflight.message || "Split-order preflight failed." };
-  }
   if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; did not claim a queued order." };
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=${splitMixedAsinOrders === true ? "true" : "false"}`);
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}`);
   const job = payload.jobs?.[0];
   if (!job) {
     await updateOrderProgressTotal(0, "No queued Chrome jobs found.");
-    await log("No queued Chrome jobs found.");
-    return { ok: false, message: "No queued Chrome jobs found." };
+    const message = `No queued whole orders compatible with this ${detectedAccount.experience} Amazon account.`;
+    await log(message);
+    return { ok: false, message };
   }
   if (jobWasSubmittedToAmazon(job)) {
     await log(`Recovered submitted ${job.group_key}; looking up Amazon order ID instead of opening a new cart.`, sourceWindowId);
@@ -1352,13 +1390,12 @@ async function startBrowserlessOrderRun(sourceWindowId = null) {
   }
   const workerId = await getWorkerId();
   const browserlessWorkerId = workerId.startsWith("browserless-") ? workerId : `browserless-${workerId}`;
-  const { splitMixedAsinOrders } = await getSettings();
   const result = await api("/api/chrome/browserless/run", {
     method: "POST",
     body: JSON.stringify({
       worker_id: browserlessWorkerId,
       ordering_engine: "chrome_browserless",
-      split_mixed_asin: splitMixedAsinOrders === true,
+      split_mixed_asin: false,
     }),
     timeoutMs: 15000,
   });
@@ -1490,22 +1527,13 @@ async function claimNextJobInWindow(windowId) {
     }
   }
   const workerId = await getWorkerId();
-  const { splitMixedAsinOrders, fulfilAvailableMixedAsin } = await getSettings();
-  let queueBefore = null;
-  if (splitMixedAsinOrders === true) {
-    try {
-      queueBefore = await api("/api/chrome/jobs?claim=false&job_limit=12", { timeoutMs: 15000 });
-    } catch (error) {
-      await log(`Could not load queue before split preflight: ${error.message || error}`, windowId);
-    }
-  }
-  const preflight = await preflightSplitQueueHead(workerId, splitMixedAsinOrders, fulfilAvailableMixedAsin, windowId, queueBefore);
-  if (!preflight.ok) {
-    await log(preflight.message || "Split-order preflight failed.", windowId);
+  const detectedAccount = await detectAmazonAccountExperience(windowId, false);
+  if (!["consumer", "business"].includes(detectedAccount.experience)) {
+    await log("Amazon account type could not be positively detected; did not claim another order.", windowId);
     return null;
   }
   if (await forceStopActive()) return null;
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=${splitMixedAsinOrders === true ? "true" : "false"}`);
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}`);
   const job = payload.jobs?.[0];
   if (!job) {
     await setWindowJob(windowId, null);
@@ -2805,6 +2833,27 @@ async function setupFulfilmentWatchdogAlarm() {
   });
 }
 
+async function setupAutoOrderAlarm() {
+  if (!chrome.alarms?.create) return;
+  const { autoOrderQueue } = await getSettings();
+  if (autoOrderQueue !== true) {
+    await chrome.alarms.clear(AUTO_ORDER_ALARM).catch(() => false);
+    return;
+  }
+  await chrome.alarms.create(AUTO_ORDER_ALARM, {
+    delayInMinutes: 0.1,
+    periodInMinutes: AUTO_ORDER_PERIOD_MINUTES,
+  });
+}
+
+async function runAutoOrderQueue() {
+  const { autoOrderQueue } = await getSettings();
+  if (autoOrderQueue !== true || await forceStopActive() || await activeOrderingInProgress()) return;
+  const queue = await api("/api/chrome/jobs?claim=false&job_limit=1", { timeoutMs: 15000 }).catch(() => null);
+  if (!queue?.job_count) return;
+  await startNextJob(null, { automatic: true });
+}
+
 function waitForTabComplete(tabId, timeoutMs = 30000) {
   return new Promise((resolve) => {
     let settled = false;
@@ -3036,6 +3085,7 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  setupAutoOrderAlarm().catch((error) => log(`Could not schedule automatic ordering: ${error.message}`));
   forceStopActive().then((stopped) => {
     if (stopped) return;
     recoverAfterRuntimeRestart("Chrome startup", true)
@@ -3046,6 +3096,7 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
+  setupAutoOrderAlarm().catch((error) => log(`Could not schedule automatic ordering: ${error.message}`));
   forceStopActive().then((stopped) => {
     if (stopped) return;
     recoverAfterRuntimeRestart("extension reload").catch((error) => log(`Could not recover fulfilment after extension reload: ${error.message}`));
@@ -3055,6 +3106,10 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === AUTO_ORDER_ALARM) {
+    runAutoOrderQueue().catch((error) => log(`Automatic order queue failed: ${error.message}`));
+    return;
+  }
   if (alarm.name === FULFILMENT_WATCHDOG_ALARM) {
     runFulfilmentWatchdog("background watchdog").catch((error) => log(`Fulfilment watchdog failed: ${error.message}`));
     return;
@@ -3371,12 +3426,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         cardLast4Preference: message.cardLast4Preference || "",
         editExistingAddress: message.editExistingAddress !== false,
         fulfilAvailableMixedAsin: message.fulfilAvailableMixedAsin === true,
-        splitMixedAsinOrders: message.splitMixedAsinOrders === true,
+        splitMixedAsinOrders: false,
+        autoOrderQueue: message.autoOrderQueue === true,
         browserlessOrderMode: message.browserlessOrderMode === true,
         pauseBeforePlaceOrder: message.pauseBeforePlaceOrder === true,
         preferRewardedLaterDelivery: message.preferRewardedLaterDelivery === true,
         deliveryLimitDays: Math.min(30, Math.max(1, Math.floor(Number(message.deliveryLimitDays) || 5))),
       });
+      await setupAutoOrderAlarm();
       return { ok: true };
     }
     if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "", senderPageInfo(sender, message.page || {}), message.amazonRecipient || "", message.amazonAsins || [], String(message.groupKey || ""), String(message.workerId || ""));

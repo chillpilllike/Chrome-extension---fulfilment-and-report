@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-22-delivery-preferences-hydration-v88";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-account-routed-auto-queue-v130";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -556,6 +556,7 @@ function showPanel(title, message, actionText, action) {
     panel.querySelector(".nutricity-panel-close").addEventListener("click", closePanel);
     document.documentElement.append(panel);
   }
+  panel.dataset.nutricityBuild = CONTENT_SCRIPT_BUILD;
   panel.classList.toggle("is-stopped", /\bstopped\b|force stop/i.test(`${title} ${message}`));
   panel.classList.remove("is-minimized");
   panel.querySelector("strong").textContent = title;
@@ -879,6 +880,15 @@ function subscribeAndSavePriceFromText(text) {
   return Number.isFinite(value) ? value : null;
 }
 
+function oneTimePurchasePriceFromText(text) {
+  const match = String(text || "")
+    .replace(/,/g, "")
+    .match(/one[\s-]*time\s+purchase\s*\$+\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
 function oneTimePurchaseRootSelector() {
   return [
     "#qualifiedBuybox",
@@ -929,7 +939,11 @@ function productPriceSnapshot() {
   const regularFallbackPrices = regularPrices.length ? [] : regularRoots
     .map((root) => firstPriceIn(root))
     .filter((value) => Number(value) > 0);
-  const regular = regularPrices.length ? Math.min(...regularPrices) : (regularFallbackPrices.length ? Math.min(...regularFallbackPrices) : null);
+  // Amazon places coupon copy such as "Saving $1.00" inside the broad buy box.
+  // Prefer the price explicitly labelled "One-time purchase" so a coupon value
+  // can never masquerade as the unit price in the Subscribe & Save comparison.
+  const labelledRegular = oneTimePurchasePriceFromText(document.body.innerText);
+  const regular = labelledRegular || (regularPrices.length ? Math.min(...regularPrices) : (regularFallbackPrices.length ? Math.min(...regularFallbackPrices) : null));
   const snsRoots = [...document.querySelectorAll(subscribeAndSaveRootSelector())].filter(visible);
   const snsPriceSelectors = [
     "#sns-tiered-price .a-price[data-a-size='b']",
@@ -1483,6 +1497,12 @@ function cartVerificationMatches(activeJob) {
   ));
 }
 
+// ACCOUNT-TYPE INVARIANT (also documented in chrome-extension/AGENTS.md):
+// Consumer and Business fulfilment are separate flows. Consumer multi-ASIN
+// orders use "Add subscription to cart" whenever Subscribe & Save is cheaper;
+// a late/missing consumer control must pause, never fall back to One-time.
+// Business does not expose that control and stays in its normal-cart branch.
+// Never infer Business merely because a consumer-only control is not rendered.
 function amazonAccountExperience() {
   const url = new URL(location.href);
   const purchaseProgram = normalizedText(url.searchParams.get("purchasePrograms") || "");
@@ -1498,11 +1518,10 @@ function amazonAccountExperience() {
   const businessShell = [
     ...document.querySelectorAll(
       [
-        "header [aria-label*='Amazon Business' i]",
-        "#navbar [aria-label*='Amazon Business' i]",
-        "#nav-logo [aria-label*='Amazon Business' i]",
+        "#nav-logo a[aria-label*='Amazon Business' i]",
+        "a#nav-logo-sprites[aria-label*='Amazon Business' i]",
         "a[href*='ref_=ab_checkout_logo']",
-        "a[href*='businessprime'][data-csa-c-slot-id]",
+        "a[href*='business.amazon.com'][aria-label*='Amazon Business' i]",
       ].join(", "),
     ),
   ].find(visible);
@@ -1515,6 +1534,36 @@ function amazonAccountExperience() {
     document.querySelector("a[href*='ref_=nav_logo']"),
   ].find(visible);
   return consumerShell ? "consumer" : "unknown";
+}
+
+async function resolvedAmazonAccountExperience(activeJob) {
+  const persisted = ["consumer", "business"].includes(activeJob?.amazonAccountExperience)
+    ? activeJob.amazonAccountExperience
+    : "unknown";
+  let accountExperience = amazonAccountExperience();
+  if (accountExperience === "unknown" && persisted !== "unknown") {
+    accountExperience = persisted;
+  }
+  if (accountExperience === "unknown") {
+    accountExperience = await waitUntil(() => {
+      const detected = amazonAccountExperience();
+      return detected === "unknown" ? null : detected;
+    }, 15000, 250) || "unknown";
+  }
+  const requiredExperience = activeJob?.job?.required_account_experience || "any";
+  if (requiredExperience !== "any" && requiredExperience !== accountExperience) {
+    throw new Error(`Account-type safety stop: this whole order requires ${requiredExperience}, but this extension detected ${accountExperience}.`);
+  }
+  if (accountExperience === "unknown") {
+    const error = new Error("Amazon account type could not be positively detected. Fulfilment paused instead of treating this account as Business or selecting One-time purchase.");
+    error.failureCode = "";
+    throw error;
+  }
+  if (activeJob && activeJob.amazonAccountExperience !== accountExperience) {
+    activeJob.amazonAccountExperience = accountExperience;
+    await setActiveJob(activeJob, { reason: "record_product_account_experience" });
+  }
+  return accountExperience;
 }
 
 function isAmazonBusinessPage() {
@@ -2447,7 +2496,8 @@ async function applySubscribeAndSaveIfCheaper(quantity, activeJob = null, option
     throw error;
   }
   if (options.requireCartAdd) {
-    const subscriptionCartButton = findSubscribeAddToCartTarget();
+    const subscriptionCartButton = await waitUntil(findSubscribeAddToCartTarget, 15000, 250)
+      || findSubscribeAddToCartTarget();
     if (!subscriptionCartButton) {
       const error = new Error("Subscribe & Save is cheaper for this multi-item order, but Amazon did not show Add subscription to cart. Fulfilment paused instead of opening a single-item subscription checkout.");
       error.failureCode = "";
@@ -2585,17 +2635,10 @@ async function activateSubscribeAndSaveOption() {
     target.querySelector?.("h5"),
   ].filter(Boolean);
   for (const clickTarget of [...new Set(clickTargets)]) {
-    clickTarget.scrollIntoView({ block: "center", behavior: "smooth" });
-    await sleep(250);
-    clickTarget.focus?.();
-    dispatchAmazonClickSequence(clickTarget);
-    clickTarget.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
-    clickTarget.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
-    clickTarget.dispatchEvent(new KeyboardEvent("keydown", { key: " ", code: "Space", bubbles: true, cancelable: true }));
-    clickTarget.dispatchEvent(new KeyboardEvent("keyup", { key: " ", code: "Space", bubbles: true, cancelable: true }));
-    dispatchClickAtElementCenter(clickTarget);
-    await waitForStableDom(700, 5000);
-    if (subscribeAndSaveIsActive()) return true;
+    // One native click is deliberate. Dispatching click + Enter + Space + a
+    // second coordinate click can toggle Amazon's accordion back to One-time.
+    await clickElement(clickTarget, "Subscribe & Save accordion row", { delayMs: 500 });
+    if (await waitUntil(subscribeAndSaveIsActive, 4000, 200)) return true;
   }
   return await waitUntil(subscribeAndSaveIsActive, 3000, 250);
 }
@@ -2627,7 +2670,7 @@ async function activateOneTimePurchaseOption() {
   if (oneTimePurchaseIsActive()) return true;
   const target = findOneTimePurchaseAccordionTarget();
   if (!target) return false;
-  showPanel("Multi-item checkout", "Switching back to One-time purchase so all items can share one Amazon order.", null, null);
+  showPanel("One-time purchase", "Selecting One-time purchase for this fulfilment order.", null, null);
   target.scrollIntoView({ block: "center", behavior: "smooth" });
   await sleep(250);
   target.focus?.();
@@ -3132,7 +3175,7 @@ function quantityValueAccepted(context = "regular", qty = 1) {
     ? [...document.querySelectorAll(subscribeAndSaveRootSelector())]
     : [document];
   const controls = roots.flatMap((root) => [
-    ...root.querySelectorAll("select[id*='predefinedQuantitiesDropdown'], select#quantity, select[name='quantity'], input#rcxsubsQuan, input[id$='quantityTextInput'], input[id$='freeQuantityTextInput'], input#quantity"),
+    ...root.querySelectorAll("select[id*='predefinedQuantitiesDropdown'], select#rcxsubsQuan, select[name='rcxsubsQuan'], select#quantity, select[name='quantity'], input#rcxsubsQuan, input[id$='quantityTextInput'], input[id$='freeQuantityTextInput'], input#quantity"),
   ]).filter((control) => context === "sns" || !control.closest(subscribeAndSaveRootSelector()));
   const accepted = controls.some((control) => {
     const value = Number(String(control.value || "").replace(/[^\d.]/g, ""));
@@ -3140,7 +3183,7 @@ function quantityValueAccepted(context = "regular", qty = 1) {
   });
   if (!accepted) return false;
   if (context !== "sns") return true;
-  const subscribeButton = document.querySelector("#rcx-subscribe-submit-button-announce, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input, button[value='snsText']");
+  const subscribeButton = findSubscribeAddToCartTarget() || document.querySelector("#rcx-subscribe-submit-button-announce, #rcx-subscribe-submit-button button, #rcx-subscribe-submit-button input, button[value='snsText']");
   return Boolean(subscribeButton && visible(subscribeButton) && !subscribeButton.disabled);
 }
 
@@ -3151,7 +3194,7 @@ function syncSubscribeAndSaveQuantity(qty = 1) {
   ].filter((root, index, all) => root && all.indexOf(root) === index);
   const scopedRoots = roots.length ? roots : [document];
   const controls = scopedRoots.flatMap((root) => [
-    ...root.querySelectorAll("input#rcxsubsQuan, form input[name='quantity'], select[id*='sns'][id*='predefinedQuantitiesDropdown'], input[id*='sns'][id$='quantityTextInput'], input[id*='sns'][id$='freeQuantityTextInput']"),
+    ...root.querySelectorAll("select#rcxsubsQuan, select[name='rcxsubsQuan'], input#rcxsubsQuan, form input[name='quantity'], select[id*='sns'][id*='predefinedQuantitiesDropdown'], input[id*='sns'][id$='quantityTextInput'], input[id*='sns'][id$='freeQuantityTextInput']"),
   ]).filter((control, index, all) => all.indexOf(control) === index);
 
   for (const control of controls) {
@@ -3377,6 +3420,8 @@ async function setQuantity(quantity, context = "regular") {
         "#snsAccordionRowMiddle select[id*='sns'][id*='predefinedQuantitiesDropdown']",
         "#snsAccordionRow select[id*='sns'][id*='predefinedQuantitiesDropdown']",
         "#snsQuantity_feature_div select[id*='sns'][id*='predefinedQuantitiesDropdown']",
+        "#snsAccordionRowMiddle select#rcxsubsQuan",
+        "#snsAccordionRow select#rcxsubsQuan",
         "#snsAccordionRowMiddle input#rcxsubsQuan",
         "#snsAccordionRow input#rcxsubsQuan",
         "#rcx-subscribe-submit-button",
@@ -3690,51 +3735,68 @@ async function handleProduct(activeJob) {
     showPanel("Pack variant found", `${selectionNote} Proceeding with this option.`, null, null);
     await sleep(1800);
   }
+  const accountExperience = await resolvedAmazonAccountExperience(activeJob);
   const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
-  const mixedSnsFallbackAsins = Array.isArray(activeJob.mixedSnsOneTimeFallbackAsins)
-    ? activeJob.mixedSnsOneTimeFallbackAsins.map((value) => String(value || "").toUpperCase())
-    : [];
-  const mixedSnsFallbackRecorded = mixedAsinAfterVariant
-    && mixedSnsFallbackAsins.includes(String(purchaseItem.asin || "").toUpperCase());
-  let useSubscribeAndSave = Boolean(snsIsCheaper && !mixedSnsFallbackRecorded);
-  if (useSubscribeAndSave && mixedAsinAfterVariant) {
-    const snsActivated = await activateSubscribeAndSaveOption();
-    if (snsActivated) await waitUntil(snsQuantityControlVisible, 5000, 250);
-    if (!findSubscribeAddToCartTarget()) {
-      activeJob.mixedSnsOneTimeFallbackAsins = [...new Set([
-        ...mixedSnsFallbackAsins,
-        String(purchaseItem.asin || "").toUpperCase(),
-      ].filter(Boolean))];
-      await setActiveJob(activeJob, { reason: "persist_mixed_sns_one_time_fallback" });
-      const oneTimeActivated = await activateOneTimePurchaseOption();
-      if (!oneTimeActivated) {
-        const error = new Error("Amazon does not offer Add subscription to cart for this multi-item order, and the extension could not restore One-time purchase. Fulfilment paused before adding anything.");
-        error.failureCode = "";
-        throw error;
-      }
-      useSubscribeAndSave = false;
-      showPanel(
-        "Multi-item checkout",
-        "Subscribe & Save is cheaper, but Amazon only offers a separate Subscribe checkout. Using One-time purchase so every item stays in the same Amazon order.",
-        null,
-        null,
-      );
-    }
+  const consumerMixedSubscription = mixedAsinAfterVariant && accountExperience === "consumer";
+  const businessMixedOrder = mixedAsinAfterVariant && accountExperience === "business";
+  const useSubscribeAndSave = Boolean(snsIsCheaper && !businessMixedOrder);
+
+  await sendDiagnostic("Account-specific product purchase decision.", {
+    group_key: activeJob.job?.group_key || "",
+    asin: purchaseItem.asin || item.asin || "",
+    account_experience: accountExperience,
+    mixed_asin_order: mixedAsinAfterVariant,
+    regular_price: priceSnapshot.regular || null,
+    subscribe_and_save_price: priceSnapshot.sns || null,
+    subscribe_and_save_is_cheaper: Boolean(snsIsCheaper),
+    use_subscribe_and_save: Boolean(useSubscribeAndSave),
+    require_subscription_cart: Boolean(consumerMixedSubscription && useSubscribeAndSave),
+  });
+
+  if (snsIsCheaper && businessMixedOrder) {
+    showPanel(
+      "Business multi-item checkout",
+      "Using One-time purchase because Business multi-ASIN orders must stay in the normal Amazon cart.",
+      null,
+      null,
+    );
   }
-  if (mixedSnsFallbackRecorded && !oneTimePurchaseIsActive()) {
-    const oneTimeActivated = await activateOneTimePurchaseOption();
-    if (!oneTimeActivated) {
-      const error = new Error("Amazon rerendered the mixed-item product page without retaining One-time purchase. Fulfilment paused before clicking any Add button.");
+  if (useSubscribeAndSave && consumerMixedSubscription) {
+    showPanel(
+      "Consumer Subscribe & Save",
+      `Consumer account confirmed. Selecting Subscribe & Save (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}) and waiting for Add subscription to cart.`,
+      null,
+      null,
+    );
+    const snsActivated = await activateSubscribeAndSaveOption();
+    if (!snsActivated) {
+      const error = new Error("Consumer account has a cheaper Subscribe & Save offer, but Amazon did not activate it. Fulfilment paused without switching to One-time purchase.");
+      error.failureCode = "";
+      throw error;
+    }
+    await waitUntil(snsQuantityControlVisible, 10000, 250);
+    const subscriptionCartButton = await waitUntil(findSubscribeAddToCartTarget, 15000, 250);
+    if (!subscriptionCartButton) {
+      const error = new Error("Consumer account has a cheaper Subscribe & Save offer, but Amazon did not render Add subscription to cart. Fulfilment paused without switching to One-time purchase.");
       error.failureCode = "";
       throw error;
     }
   }
+  if (!useSubscribeAndSave && !oneTimePurchaseIsActive()) {
+    const oneTimeActivated = await activateOneTimePurchaseOption();
+    if (!oneTimeActivated && subscribeAndSaveIsActive()) {
+      const error = new Error("Amazon retained Subscribe & Save when this item requires One-time purchase. Fulfilment paused before adding anything.");
+      error.failureCode = "";
+      throw error;
+    }
+  }
+
   const priceForDecision = useSubscribeAndSave ? priceSnapshot.sns : (priceSnapshot.regular || priceSnapshot.best);
   await recordAmazonPrice(
     activeJob,
     item,
     priceForDecision,
-    useSubscribeAndSave ? (mixedAsinAfterVariant ? "subscribe-save-cart" : "subscribe-save") : "product",
+    useSubscribeAndSave ? (consumerMixedSubscription ? "subscribe-save-cart" : "subscribe-save") : "product",
     purchaseItem,
   );
   const quantity = Number(purchaseItem.quantity || 1);
@@ -3759,7 +3821,7 @@ async function handleProduct(activeJob) {
   }
 
   const subscribed = useSubscribeAndSave
-    ? await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob, { requireCartAdd: mixedAsinAfterVariant })
+    ? await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob, { requireCartAdd: consumerMixedSubscription })
     : false;
   if (!subscribed) {
     if (useSubscribeAndSave) {
@@ -4208,21 +4270,20 @@ async function fillFullName(name) {
   if (window.__nutricityFillingFullName) return false;
   window.__nutricityFillingFullName = true;
   try {
-  const input = await waitUntil(() => (
+  const input = findAddressNameInput() || await waitUntil(() => (
     document.querySelector("input#address-ui-widgets-enterAddressFullName[name='address-ui-widgets-enterAddressFullName']")
     || findAddressNameInput()
-  ), 20000);
+  ), 6000, 150);
   if (!input) return false;
   const desired = String(name || "").replace(/\s+/g, " ").trim();
   if (!desired) return false;
-  input.scrollIntoView({ block: "center", behavior: "smooth" });
-  await sleep(500);
+  input.scrollIntoView({ block: "center", behavior: "auto" });
   await setInputValue(input, desired);
-  await sleep(800);
+  await sleep(120);
   let saved = input.value.replace(/\s+/g, " ").trim() === desired;
   if (!saved) {
     await setInputValue(input, desired);
-    await sleep(500);
+    await sleep(120);
     saved = input.value.replace(/\s+/g, " ").trim() === desired;
   }
   input.blur();
@@ -5431,27 +5492,14 @@ function isAmazonDayDeliveryContext(context) {
 }
 
 function fridayRewardDeliveryOption() {
-  const radios = [...document.querySelectorAll("input[type='radio']")].filter((radio) => !radio.disabled);
-  for (const radio of radios) {
-    const context = deliveryRadioContext(radio);
-    if (isOnePercentDeliveryRewardText(context.text)) return context;
-  }
-
-  if (!checkoutOffersOnePercentDeliveryReward()) return null;
-  const knownRewardNodes = [
-    document.querySelector("#second-nominated-dayPromiseReferenceForRadioLabel"),
-    document.querySelector("#second-nominated-dayReferenceForRadioLabel"),
-    ...document.querySelectorAll("[id*='nominated-day' i], .delivery-promise-text, .delivery-option-text"),
-  ].filter(Boolean);
-  for (const node of knownRewardNodes) {
-    const radio = radioLinkedToDeliveryReference(node);
-    if (radio) return deliveryRadioContext(radio);
-  }
-  for (const radio of radios) {
-    const context = deliveryRadioContext(radio);
-    if (isAmazonDayDeliveryContext(context)) return context;
-  }
-  return null;
+  return [...document.querySelectorAll("input[type='radio']")]
+    .filter((radio) => !radio.disabled)
+    .map(deliveryRadioContext)
+    .find((context) => (
+      isOnePercentDeliveryRewardText(context.text)
+      && !deliveryContextIsNotConsolidated(context)
+      && deliveryContextNamesWarehouseOpenDay(context)
+    )) || null;
 }
 
 function rewardedLaterDeliverySelected() {
@@ -5459,7 +5507,8 @@ function rewardedLaterDeliverySelected() {
   if (!selectedRadio) return false;
   const context = deliveryRadioContext(selectedRadio);
   return isOnePercentDeliveryRewardText(context.text)
-    || checkoutOffersOnePercentDeliveryReward() && isAmazonDayDeliveryContext(context);
+    && !deliveryContextIsNotConsolidated(context)
+    && deliveryContextNamesWarehouseOpenDay(context);
 }
 
 function selectedDeliveryRadioContext() {
@@ -5571,8 +5620,25 @@ function preferredAmazonDayWeekdaySelected() {
 
 const WAREHOUSE_DELIVERY_WEEKDAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"];
 const WAREHOUSE_DELIVERY_WEEKENDS = ["SATURDAY", "SUNDAY"];
-const WAREHOUSE_DELIVERY_START = "10:00";
-const WAREHOUSE_DELIVERY_END = "17:00";
+const WAREHOUSE_DELIVERY_START = "08:00";
+const WAREHOUSE_DELIVERY_END = "16:00";
+const WAREHOUSE_DELIVERY_DROP_OFF = "front door";
+const WAREHOUSE_DELIVERY_ADDITIONAL_INFO = "BUSINESS NAME: OUTSIDE THE BOX SHIPPING\nYou can drop the package at the front door and i'll be here to pick up.";
+const WAREHOUSE_OBSERVED_HOLIDAYS = [
+  "new year's day",
+  "martin luther king jr. day",
+  "george washington's birthday",
+  "memorial day",
+  "juneteenth independence day",
+  "independence day",
+  "labor day",
+  "columbus day",
+  "veterans day",
+  "thanksgiving day",
+  "christmas day",
+];
+const WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES = 2;
+const CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS = 1000;
 
 function visibleDeliveryPreferencesDialog() {
   const dialogs = [...document.querySelectorAll("[role='dialog'][aria-hidden='false'], .a-popover-modal[role='dialog']")]
@@ -5587,9 +5653,153 @@ function deliveryPreferencesSummaryIsWarehouseSchedule(dialog = visibleDeliveryP
   const section = edit?.closest(".a-expander-inner, .a-expander-content") || edit?.parentElement;
   const text = normalizedText(section?.innerText || section?.textContent || "").toLowerCase();
   return /monday\s*-\s*friday/.test(text)
-    && /10:00\s*am\s*-\s*0?5:00\s*pm/.test(text)
+    && /0?8:00\s*am\s*-\s*0?4:00\s*pm/.test(text)
     && /saturday\s*-\s*sunday/.test(text)
     && /closed for deliveries/.test(text);
+}
+
+function deliveryPreferenceControlText(control) {
+  if (!control) return "";
+  const id = control.id ? CSS.escape(control.id) : "";
+  const label = id ? control.ownerDocument?.querySelector?.(`label[for='${id}']`) : null;
+  const wrapper = control.closest?.("label, .a-radio, .a-checkbox, li, tr, [role='radio'], [role='checkbox']");
+  return normalizedText([
+    control.getAttribute?.("aria-label"),
+    label?.innerText,
+    label?.textContent,
+    wrapper?.innerText,
+    wrapper?.textContent,
+  ].filter(Boolean).join(" ")).toLowerCase();
+}
+
+function deliveryPreferenceControlByLabel(dialog, selector, labelText) {
+  const wanted = normalizedText(labelText).toLowerCase();
+  return [...(dialog?.querySelectorAll?.(selector) || [])].find((control) => {
+    const text = deliveryPreferenceControlText(control);
+    return text === wanted || text.startsWith(`${wanted} `);
+  }) || null;
+}
+
+function deliveryPreferenceTextControl(dialog, labelText, selector) {
+  const wanted = normalizedText(labelText).toLowerCase();
+  const direct = [...(dialog?.querySelectorAll?.(selector) || [])].find((control) => {
+    const idName = `${control.id || ""} ${control.name || ""} ${control.getAttribute?.("aria-label") || ""}`.toLowerCase();
+    return idName.includes(wanted.replace(/\s+/g, "")) || normalizedText(control.getAttribute?.("aria-label") || "").toLowerCase() === wanted;
+  });
+  if (direct) return direct;
+  for (const label of dialog?.querySelectorAll?.("label, .a-form-label, .a-text-bold, span, div") || []) {
+    if (normalizedText(label.innerText || label.textContent || "").toLowerCase() !== wanted) continue;
+    const labelled = label.getAttribute?.("for") ? dialog.querySelector(`#${CSS.escape(label.getAttribute("for"))}`) : null;
+    const nearby = labelled || label.parentElement?.querySelector?.(selector) || label.nextElementSibling?.matches?.(selector) && label.nextElementSibling;
+    if (nearby?.matches?.(selector)) return nearby;
+  }
+  return null;
+}
+
+function warehouseDeliveryInstructionControls(dialog) {
+  const frontDoor = deliveryPreferenceControlByLabel(dialog, "input[type='radio']", WAREHOUSE_DELIVERY_DROP_OFF);
+  const security = deliveryPreferenceTextControl(dialog, "security code", "input[type='text'], input:not([type]), textarea");
+  const callBox = deliveryPreferenceTextControl(dialog, "call box name or number", "input[type='text'], input:not([type]), textarea");
+  const additionalInfo = deliveryPreferenceTextControl(dialog, "additional info", "textarea, input[type='text'], input:not([type])");
+  return { frontDoor, security, callBox, additionalInfo };
+}
+
+function warehouseObservedHolidayControls(dialog) {
+  return WAREHOUSE_OBSERVED_HOLIDAYS.map((holiday) => (
+    deliveryPreferenceControlByLabel(dialog, "input[type='checkbox']", holiday)
+  ));
+}
+
+function warehouseObservedHolidayControlsReady(dialog) {
+  const controls = warehouseObservedHolidayControls(dialog);
+  return controls.length === WAREHOUSE_OBSERVED_HOLIDAYS.length && controls.every(Boolean);
+}
+
+function normalizedDeliveryInstructionValue(value) {
+  return String(value || "")
+    .replace(/&#0*39;|&apos;/gi, "'")
+    .replace(/\r\n/g, "\n")
+    .trim();
+}
+
+function warehouseDeliveryInstructionsMatch(dialog) {
+  const { frontDoor, security, callBox, additionalInfo } = warehouseDeliveryInstructionControls(dialog);
+  return Boolean(
+    frontDoor?.checked === true
+    && normalizedDeliveryInstructionValue(security?.value) === ""
+    && normalizedDeliveryInstructionValue(callBox?.value) === ""
+    && normalizedDeliveryInstructionValue(additionalInfo?.value) === WAREHOUSE_DELIVERY_ADDITIONAL_INFO
+  );
+}
+
+function warehouseObservedHolidaysMatch(dialog) {
+  const controls = warehouseObservedHolidayControls(dialog);
+  return controls.length === WAREHOUSE_OBSERVED_HOLIDAYS.length
+    && controls.every((control) => control?.checked === false);
+}
+
+function warehouseCompleteDeliveryPreferencesMatch(dialog) {
+  return warehouseDeliveryControlsMatch(dialog)
+    && warehouseDeliveryInstructionsMatch(dialog)
+    && warehouseObservedHolidaysMatch(dialog);
+}
+
+function deliveryPreferenceSectionButton(dialog, sectionName) {
+  const wanted = normalizedText(sectionName).toLowerCase();
+  return [...(dialog?.querySelectorAll?.("button, [role='button'], a") || [])].find((control) => (
+    visible(control) && normalizedText(control.innerText || control.textContent || "").toLowerCase() === wanted
+  )) || null;
+}
+
+async function expandDeliveryPreferenceSection(dialog, sectionName, controlsReady) {
+  if (controlsReady()) return true;
+  const button = deliveryPreferenceSectionButton(dialog, sectionName);
+  if (!button) return false;
+  await clickElement(button, `Edit ${sectionName}`, { preClickDelayMs: 0, delayMs: 250 });
+  return Boolean(await waitUntil(controlsReady, 5000, 150));
+}
+
+function setDeliveryPreferenceText(control, value) {
+  if (!control) return false;
+  if (control.value === value) return true;
+  const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  if (setter) setter.call(control, value);
+  else control.value = value;
+  control.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  control.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  return control.value === value;
+}
+
+async function setWarehouseDeliveryInstructions(dialog) {
+  const expanded = await expandDeliveryPreferenceSection(dialog, "Delivery Instructions", () => {
+    const controls = warehouseDeliveryInstructionControls(visibleDeliveryPreferencesDialog());
+    return Boolean(controls.frontDoor && controls.security && controls.callBox && controls.additionalInfo);
+  });
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!expanded || !dialog) return false;
+  const { frontDoor, security, callBox, additionalInfo } = warehouseDeliveryInstructionControls(dialog);
+  if (!frontDoor.checked) frontDoor.click();
+  const securityAccepted = setDeliveryPreferenceText(security, "");
+  const callBoxAccepted = setDeliveryPreferenceText(callBox, "");
+  const infoAccepted = setDeliveryPreferenceText(additionalInfo, WAREHOUSE_DELIVERY_ADDITIONAL_INFO);
+  await sleep(150);
+  return securityAccepted && callBoxAccepted && infoAccepted && warehouseDeliveryInstructionsMatch(dialog);
+}
+
+async function clearWarehouseObservedHolidays(dialog) {
+  const expanded = await expandDeliveryPreferenceSection(dialog, "Observed Holidays", () => (
+    warehouseObservedHolidayControlsReady(visibleDeliveryPreferencesDialog())
+  ));
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!expanded || !dialog) return false;
+  const controls = warehouseObservedHolidayControls(dialog);
+  if (controls.length !== WAREHOUSE_OBSERVED_HOLIDAYS.length || controls.some((control) => !control)) return false;
+  for (const control of controls) {
+    if (control.checked) control.click();
+  }
+  await sleep(150);
+  return warehouseObservedHolidaysMatch(dialog);
 }
 
 function warehouseDeliveryDayControl(dialog, day, kind) {
@@ -5619,12 +5829,20 @@ async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDelive
   if (expandDays && visible(expandDays)) {
     await clickElement(expandDays, "Expand saved delivery days", { preClickDelayMs: 0, delayMs: 250 });
   }
+  await expandDeliveryPreferenceSection(currentDialog, "Delivery Instructions", () => {
+    const controls = warehouseDeliveryInstructionControls(visibleDeliveryPreferencesDialog());
+    return Boolean(controls.frontDoor && controls.security && controls.callBox && controls.additionalInfo);
+  });
+  currentDialog = visibleDeliveryPreferencesDialog();
+  await expandDeliveryPreferenceSection(currentDialog, "Observed Holidays", () => (
+    warehouseObservedHolidayControlsReady(visibleDeliveryPreferencesDialog())
+  ));
   const fullyHydratedDialog = await waitUntil(() => {
     const candidate = visibleDeliveryPreferencesDialog();
-    return candidate && warehouseDeliveryControlsMatch(candidate) ? candidate : null;
+    return candidate && warehouseCompleteDeliveryPreferencesMatch(candidate) ? candidate : null;
   }, 10000, 200);
   currentDialog = fullyHydratedDialog || visibleDeliveryPreferencesDialog();
-  return Boolean(currentDialog && warehouseDeliveryControlsMatch(currentDialog));
+  return Boolean(currentDialog && warehouseCompleteDeliveryPreferencesMatch(currentDialog));
 }
 
 function setWarehouseDeliverySelect(select, value) {
@@ -5653,13 +5871,276 @@ async function pauseForDeliveryPreferences(activeJob, message, dialog = visibleD
   return false;
 }
 
-async function ensureWarehouseDeliveryPreferences(activeJob) {
-  const editPreferences = await waitUntil(
-    () => [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
-      .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "edit delivery preferences"),
-    6000,
-    250,
+function checkoutDeliveryPreferencesTrigger() {
+  return [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
+    .find((element) => {
+      if (!visible(element)) return false;
+      const text = normalizedText(element.textContent || "").toLowerCase();
+      return text === "edit delivery preferences"
+        || text === "add delivery instructions"
+        || text === "edit delivery instructions";
+    }) || null;
+}
+
+function consumerBusinessTimeControl(dialog, kind, day) {
+  return dialog?.querySelector(`select[id^='business_hours_${kind}_${day}_'][id$='_BUSINESS']`) || null;
+}
+
+function consumerBusinessFlagControl(dialog, kind, day) {
+  return dialog?.querySelector(`input[id^='business_hours_${kind}_${day}_'][id$='_BUSINESS']`) || null;
+}
+
+function consumerBusinessAccordion(dialog, labelPrefix) {
+  const wanted = normalizedText(labelPrefix).toLowerCase();
+  return [...(dialog?.querySelectorAll("a, button") || [])]
+    .find((control) => visible(control) && normalizedText(control.textContent || "").toLowerCase().startsWith(wanted)) || null;
+}
+
+async function expandConsumerBusinessAccordion(dialog, labelPrefix) {
+  const accordion = consumerBusinessAccordion(dialog, labelPrefix);
+  if (!accordion) return false;
+  if (accordion.getAttribute("aria-expanded") !== "true") {
+    await clickElement(accordion, labelPrefix, { preClickDelayMs: 0, delayMs: 200 });
+  }
+  return Boolean(await waitUntil(
+    () => consumerBusinessAccordion(visibleDeliveryPreferencesDialog(), labelPrefix)?.getAttribute("aria-expanded") === "true",
+    5000,
+    150,
+  ));
+}
+
+async function exposeConsumerBusinessControls(dialog, labelPrefix, controlsReady) {
+  if (controlsReady(dialog)) return true;
+  const accordion = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate) return null;
+    if (controlsReady(candidate)) return true;
+    return consumerBusinessAccordion(candidate, labelPrefix);
+  }, 5000, 150);
+  if (accordion === true) return true;
+  if (!accordion) return false;
+  if (accordion.getAttribute("aria-expanded") !== "true") {
+    await clickElement(accordion, labelPrefix, { preClickDelayMs: 0, delayMs: 200 });
+  }
+  return Boolean(await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && controlsReady(candidate);
+  }, 5000, 150));
+}
+
+async function revealConsumerBusinessInstructionSections(dialog) {
+  const securityLabel = "Do we need a security code, call box number or key to access this building?";
+  const additionalLabel = "Do we need additional instructions to deliver to this address?";
+  if (consumerBusinessAccordion(dialog, securityLabel) && consumerBusinessAccordion(dialog, additionalLabel)) return true;
+
+  const addMore = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate) return null;
+    if (consumerBusinessAccordion(candidate, securityLabel) && consumerBusinessAccordion(candidate, additionalLabel)) return true;
+    return [...candidate.querySelectorAll("a, button")]
+      .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "add more instructions") || null;
+  }, 5000, 150);
+  if (addMore === true) return true;
+  if (!addMore) return false;
+  await clickElement(addMore, "Add more consumer Business instructions", { preClickDelayMs: 0, delayMs: 250 });
+  return Boolean(await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && consumerBusinessAccordion(candidate, securityLabel) && consumerBusinessAccordion(candidate, additionalLabel);
+  }, 5000, 150));
+}
+
+async function prepareConsumerBusinessDeliveryControls(dialog) {
+  const hoursLabel = "When is this address open for deliveries?";
+  const locationLabel = "Where should we leave your packages at this address?";
+  const securityLabel = "Do we need a security code, call box number or key to access this building?";
+  const additionalLabel = "Do we need additional instructions to deliver to this address?";
+  if (!await exposeConsumerBusinessControls(dialog, hoursLabel, (candidate) => Boolean(
+    consumerBusinessTimeControl(candidate, "start", "weekday")
+    && consumerBusinessTimeControl(candidate, "stop", "weekday")
+    && consumerBusinessFlagControl(candidate, "closed", "weekend")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!await exposeConsumerBusinessControls(dialog, locationLabel, (candidate) => Boolean(
+    candidate.querySelector("input[name='preferredDeliveryLocationBUSINESS'][value='FRONTDOOR']")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!await revealConsumerBusinessInstructionSections(dialog)) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!await exposeConsumerBusinessControls(dialog, securityLabel, (candidate) => Boolean(
+    candidate.querySelector("#securityCode-BUSINESS") && candidate.querySelector("#callBox-BUSINESS")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!await exposeConsumerBusinessControls(dialog, additionalLabel, (candidate) => Boolean(
+    candidate.querySelector("#freeTextInstruction-BUSINESS")
+  ))) return false;
+  dialog = visibleDeliveryPreferencesDialog();
+  // Leave business hours expanded so the active Business holiday control is
+  // visible and can be distinguished from Amazon's duplicate hidden controls.
+  return expandConsumerBusinessAccordion(dialog, hoursLabel);
+}
+
+function consumerBusinessDeliveryControls(dialog) {
+  return {
+    business: dialog?.querySelector("#ma-business-type-button-input") || null,
+    weekdayStart: consumerBusinessTimeControl(dialog, "start", "weekday"),
+    weekdayEnd: consumerBusinessTimeControl(dialog, "stop", "weekday"),
+    weekdayOpen24: consumerBusinessFlagControl(dialog, "open", "weekday"),
+    weekendClosed: consumerBusinessFlagControl(dialog, "closed", "weekend"),
+    weekendOpen24: consumerBusinessFlagControl(dialog, "open", "weekend"),
+    holidaysOpen: [...(dialog?.querySelectorAll("#exceptionDatesOpen-announce") || [])].find(visible) || null,
+    frontDoor: dialog?.querySelector("input[name='preferredDeliveryLocationBUSINESS'][value='FRONTDOOR']") || null,
+    security: dialog?.querySelector("#securityCode-BUSINESS") || null,
+    callBox: dialog?.querySelector("#callBox-BUSINESS") || null,
+    additionalInfo: dialog?.querySelector("#freeTextInstruction-BUSINESS") || null,
+  };
+}
+
+function consumerBusinessDeliveryPreferencesMatch(dialog) {
+  const controls = consumerBusinessDeliveryControls(dialog);
+  return Boolean(
+    controls.business?.getAttribute("aria-selected") === "true"
+    && controls.weekdayStart?.value === "8:00"
+    && controls.weekdayEnd?.value === WAREHOUSE_DELIVERY_END
+    && controls.weekdayOpen24?.checked === false
+    && controls.weekendClosed?.checked === true
+    && controls.weekendOpen24?.checked === false
+    && controls.holidaysOpen?.getAttribute("aria-pressed") === "true"
+    && controls.frontDoor?.checked === true
+    && normalizedDeliveryInstructionValue(controls.security?.value) === ""
+    && normalizedDeliveryInstructionValue(controls.callBox?.value) === ""
+    && normalizedDeliveryInstructionValue(controls.additionalInfo?.value) === WAREHOUSE_DELIVERY_ADDITIONAL_INFO
   );
+}
+
+function consumerBusinessDeliverySavedSummaryMatches(dialog) {
+  const text = normalizedText(dialog?.innerText || dialog?.textContent || "");
+  return Boolean(
+    text.includes("delivery instructions saved")
+    && /property type:\s*business/.test(text)
+    && /monday\s*-\s*friday\s*8(?::00)?\s*am\s*-\s*4(?::00)?\s*pm/.test(text)
+    && /saturday\s*-\s*sunday\s*closed/.test(text)
+    && /holidays\s*open/.test(text)
+    && text.includes("front door")
+    && text.includes("business name: outside the box shipping")
+  );
+}
+
+async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, retryAttempt = 0) {
+  showPanel("Delivery preferences", "Verifying consumer Business hours, weekend closure, front-door instructions, and no observed holidays.", null, null);
+  await clickElement(trigger, "Add or edit consumer delivery instructions", { delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
+  let dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
+  if (!dialog) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not open the consumer delivery-instructions dialog.");
+  }
+
+  let controls = consumerBusinessDeliveryControls(dialog);
+  if (!controls.business) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose the Business property type.", dialog);
+  }
+  if (controls.business.getAttribute("aria-selected") !== "true") {
+    await clickElement(controls.business, "Business property type", { preClickDelayMs: 0, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
+  }
+  dialog = await waitUntil(visibleDeliveryPreferencesDialog, 8000, 200);
+  if (!dialog || !await prepareConsumerBusinessDeliveryControls(dialog)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose all Business delivery-instruction sections.", dialog);
+  }
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!consumerBusinessTimeControl(dialog, "start", "weekday")) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose Business delivery-hour controls.", dialog);
+  }
+
+  controls = consumerBusinessDeliveryControls(dialog);
+  if (controls.weekdayOpen24?.checked) controls.weekdayOpen24.click();
+  if (controls.weekendOpen24?.checked) controls.weekendOpen24.click();
+  const weekdayStartAccepted = setWarehouseDeliverySelect(controls.weekdayStart, "8:00");
+  const weekdayEndAccepted = setWarehouseDeliverySelect(controls.weekdayEnd, WAREHOUSE_DELIVERY_END);
+  const weekendAccepted = setWarehouseDeliveryClosed(controls.weekendClosed, true);
+  if (controls.holidaysOpen?.getAttribute("aria-pressed") !== "true") controls.holidaysOpen?.click();
+  if (!controls.frontDoor?.checked) controls.frontDoor?.click();
+  const securityAccepted = setDeliveryPreferenceText(controls.security, "");
+  const callBoxAccepted = setDeliveryPreferenceText(controls.callBox, "");
+  const infoAccepted = setDeliveryPreferenceText(controls.additionalInfo, WAREHOUSE_DELIVERY_ADDITIONAL_INFO);
+  await sleep(250);
+
+  if (!weekdayStartAccepted || !weekdayEndAccepted || !weekendAccepted || !securityAccepted || !callBoxAccepted || !infoAccepted
+      || !consumerBusinessDeliveryPreferencesMatch(dialog)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not accept the complete Business delivery instructions.", dialog);
+  }
+
+  const save = await waitUntil(() => {
+    const candidate = findButtonByText(["save instructions"]);
+    return candidate && !candidate.disabled ? candidate : null;
+  }, 10000, 150);
+  if (!save) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer delivery instructions did not expose a usable Save instructions button.", dialog);
+  }
+  await clickElement(save, "Save consumer delivery instructions", { preClickDelayMs: 100, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
+  const saveOutcome = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate) return "closed";
+    if (consumerBusinessDeliverySavedSummaryMatches(candidate)) return "verified_summary";
+    return null;
+  }, 10000, 200);
+  if (saveOutcome === "verified_summary") {
+    await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
+    await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200);
+    await sendDiagnostic("Saved and verified consumer checkout delivery preferences from Amazon's confirmation summary.", {
+      group_key: activeJob?.job?.group_key || "",
+      property_type: "Business",
+      weekdays: "Monday-Friday 08:00-16:00",
+      weekends: "closed",
+      drop_off: "Front Door",
+      observed_holidays: "none",
+    });
+    return true;
+  }
+  if (saveOutcome !== "closed") {
+    await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
+    if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200)) {
+      return pauseForDeliveryPreferences(activeJob, "Amazon kept the consumer delivery-instructions dialog open after saving and it could not be closed for verification.", visibleDeliveryPreferencesDialog());
+    }
+  }
+
+  const refreshedTrigger = await waitUntil(checkoutDeliveryPreferencesTrigger, 10000, 250);
+  if (!refreshedTrigger) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon saved consumer delivery instructions but did not return to checkout for verification.");
+  }
+  await clickElement(refreshedTrigger, "Recheck consumer delivery instructions", { delayMs: 300 });
+  dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
+  if (dialog && consumerBusinessDeliveryControls(dialog).business?.getAttribute("aria-selected") !== "true") {
+    await clickElement(consumerBusinessDeliveryControls(dialog).business, "Verify Business property type", { preClickDelayMs: 0, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
+  }
+  if (dialog) await prepareConsumerBusinessDeliveryControls(dialog);
+  const verified = Boolean(await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && consumerBusinessDeliveryPreferencesMatch(candidate) ? candidate : null;
+  }, 10000, 200));
+  await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
+
+  if (!verified) {
+    if (retryAttempt < WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES) {
+      const nextAttempt = retryAttempt + 1;
+      showPanel("Delivery preferences", `Amazon did not retain the consumer Business delivery instructions. Retrying automatically (${nextAttempt}/${WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES}).`, null, null);
+      await sleep(1500);
+      const nextTrigger = await waitUntil(checkoutDeliveryPreferencesTrigger, 10000, 250);
+      if (nextTrigger) return ensureConsumerWarehouseDeliveryPreferences(activeJob, nextTrigger, nextAttempt);
+    }
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain the complete consumer Business delivery preferences: Monday-Friday 8:00 AM-4:00 PM, weekends closed, front door, and no observed holidays.");
+  }
+
+  await sendDiagnostic("Saved and verified consumer checkout delivery preferences.", {
+    group_key: activeJob?.job?.group_key || "",
+    property_type: "Business",
+    weekdays: "Monday-Friday 08:00-16:00",
+    weekends: "closed",
+    drop_off: "Front Door",
+    observed_holidays: "none",
+  });
+  return true;
+}
+
+async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
+  const editPreferences = await waitUntil(checkoutDeliveryPreferencesTrigger, 6000, 250);
   if (!editPreferences) {
     return pauseForDeliveryPreferences(
       activeJob,
@@ -5667,7 +6148,11 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
     );
   }
 
-  showPanel("Delivery preferences", "Verifying Monday-Friday 10:00 AM-5:00 PM and closing Saturday-Sunday.", null, null);
+  if (normalizedText(editPreferences.textContent || "").toLowerCase() !== "edit delivery preferences") {
+    return ensureConsumerWarehouseDeliveryPreferences(activeJob, editPreferences, retryAttempt);
+  }
+
+  showPanel("Delivery preferences", "Verifying Monday-Friday 8:00 AM-4:00 PM, weekend closure, front-door instructions, and no observed holidays.", null, null);
   await clickElement(editPreferences, "Edit delivery preferences", { delayMs: 300 });
   let dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
   const editDeliveryTimes = await waitUntil(
@@ -5679,22 +6164,6 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
   if (!dialog || !editDeliveryTimes) {
     return pauseForDeliveryPreferences(activeJob, "Amazon opened delivery preferences but did not expose the Delivery Times edit control.", dialog);
   }
-  const existingSummaryVerified = await waitUntil(
-    () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
-    3000,
-    150,
-  );
-  if (existingSummaryVerified) {
-    await closeDeliveryPreferencesDialog(dialog);
-    await sendDiagnostic("Verified checkout delivery preferences.", {
-      group_key: activeJob?.job?.group_key || "",
-      weekdays: "Monday-Friday 10:00-17:00",
-      weekends: "closed",
-      changed: false,
-    });
-    return true;
-  }
-
   await clickElement(editDeliveryTimes, "Edit delivery times", { delayMs: 250 });
   dialog = await waitUntil(visibleDeliveryPreferencesDialog, 5000, 150);
   const expandDays = await waitUntil(
@@ -5739,6 +6208,17 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
     return pauseForDeliveryPreferences(activeJob, "Amazon did not accept the required weekday hours and weekend closures.", dialog);
   }
 
+  const instructionsReady = await setWarehouseDeliveryInstructions(dialog);
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!instructionsReady) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not accept the required front-door delivery instructions.", dialog);
+  }
+  const holidaysReady = await clearWarehouseObservedHolidays(dialog);
+  dialog = visibleDeliveryPreferencesDialog();
+  if (!holidaysReady || !warehouseCompleteDeliveryPreferencesMatch(dialog)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not accept the required observed-holiday preferences.", dialog);
+  }
+
   const save = dialog.querySelector("span[id^='adpSubmitButton_'] input[type='submit'], input[type='submit'][aria-labelledby^='adpSubmitButton_']");
   if (!save || !visible(save)) {
     return pauseForDeliveryPreferences(activeJob, "Amazon delivery preferences did not expose a usable Save button.", dialog);
@@ -5765,23 +6245,39 @@ async function ensureWarehouseDeliveryPreferences(activeJob) {
   // Amazon inserts the Edit link before it hydrates the compact Monday-Friday
   // summary. Give that summary time to settle instead of treating the
   // temporarily empty section as a failed save.
-  let verified = Boolean(await waitUntil(
+  await waitUntil(
     () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
     6000,
     200,
-  ));
-  if (!verified) {
-    verified = await verifyWarehouseDeliveryControlsFromSummary(visibleDeliveryPreferencesDialog());
-  }
+  );
+  const verified = await verifyWarehouseDeliveryControlsFromSummary(visibleDeliveryPreferencesDialog());
   dialog = visibleDeliveryPreferencesDialog();
   await closeDeliveryPreferencesDialog(dialog);
   if (!verified) {
-    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain Monday-Friday 10:00 AM-5:00 PM with Saturday-Sunday closed.");
+    if (retryAttempt < WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES) {
+      const nextAttempt = retryAttempt + 1;
+      showPanel(
+        "Delivery preferences",
+        `Amazon did not retain the warehouse delivery schedule. Retrying automatically (${nextAttempt}/${WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES}).`,
+        null,
+        null,
+      );
+      await sendDiagnostic("Retrying checkout delivery preferences automatically.", {
+        group_key: activeJob?.job?.group_key || "",
+        retry_attempt: nextAttempt,
+        max_automatic_retries: WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES,
+      });
+      await sleep(1500);
+      return ensureWarehouseDeliveryPreferences(activeJob, nextAttempt);
+    }
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain the complete warehouse delivery preferences: Monday-Friday 8:00 AM-4:00 PM, weekends closed, front-door instructions, and no observed holidays.");
   }
   await sendDiagnostic("Saved and verified checkout delivery preferences.", {
     group_key: activeJob?.job?.group_key || "",
-    weekdays: "Monday-Friday 10:00-17:00",
+    weekdays: "Monday-Friday 08:00-16:00",
     weekends: "closed",
+    drop_off: "Front Door",
+    observed_holidays: "none",
     changed,
   });
   return true;
@@ -5930,19 +6426,18 @@ async function ensureRewardedLaterDelivery(activeJob) {
   const warehouseDaySelection = await ensureWarehouseOpenDayDelivery(activeJob);
   if (warehouseDaySelection !== null) return warehouseDaySelection;
 
-  // Dispatch benefits from one predictable weekday delivery. Whenever Amazon
-  // exposes an eligible Amazon Day option, prefer it over an earlier default
-  // even when that default is itself Monday-Friday.
-  if (!await ensurePreferredAmazonDayWeekdayDelivery(activeJob)) return false;
-  if (preferredAmazonDayWeekdaySelected()) return true;
-
   const state = await getExtensionState();
   const brooklynDay = brooklynWeekday();
   const shouldPreferReward = state.preferRewardedLaterDelivery === true
     && brooklynNextDayIsWarehouseHoliday();
+  // Sunday-Thursday: the next day is a warehouse working day, so the earliest
+  // verified free next-day option wins. Amazon Day/reward placement in the DOM
+  // must never override it merely because that option is last.
   if (!shouldPreferReward) return ensureFreeNextDayDelivery(activeJob, brooklynDay);
   if (rewardedLaterDeliverySelected()) return true;
 
+  // Friday/Saturday only: consider a reward option when that exact radio's own
+  // label explicitly advertises 1% and promises one consolidated weekday.
   const rewardOption = fridayRewardDeliveryOption();
   if (!rewardOption) return true;
   if (!rewardOption.control) {
@@ -6436,18 +6931,35 @@ async function openAddressEditorIfAvailable(activeJob) {
   const directEditor = findAddressNameInput();
   if (directEditor) return directEditor;
 
-  let editAddress = await waitUntil(findEditAddressTrigger, 6000, 400);
+  // Detect the surface that Amazon already rendered instead of serially
+  // waiting for an Edit link on the final review page, where only Change
+  // delivery address can exist.
+  let editAddress = findEditAddressTrigger();
+  let changeAddress = editAddress ? null : findChangeDeliveryAddressButton();
+  if (!editAddress && !changeAddress) {
+    await waitUntil(
+      () => findAddressNameInput() || findEditAddressTrigger() || findChangeDeliveryAddressButton(),
+      2500,
+      150,
+    );
+    if (findAddressNameInput()) return findAddressNameInput();
+    editAddress = findEditAddressTrigger();
+    changeAddress = editAddress ? null : findChangeDeliveryAddressButton();
+  }
   if (!editAddress) {
-    const changeAddress = findChangeDeliveryAddressButton();
     if (changeAddress) {
       showPanel("Nutricity checkout", "Opening delivery address selection.", null, null);
       activeJob.stage = "editing_address";
       activeJob.editAddressClickedAt = Date.now();
       await setActiveJob(activeJob);
       await clickElement(changeAddress, "Change delivery address link");
-      await sleep(2000);
-      editAddress = await waitUntil(findEditAddressTrigger, 10000, 400);
-      if (!editAddress && findAddressNameInput()) return findAddressNameInput();
+      const addressSurface = await waitUntil(
+        () => findAddressNameInput() || findEditAddressTrigger(),
+        7000,
+        150,
+      );
+      if (findAddressNameInput()) return findAddressNameInput();
+      editAddress = addressSurface || findEditAddressTrigger();
     }
   }
 
@@ -6458,14 +6970,7 @@ async function openAddressEditorIfAvailable(activeJob) {
   activeJob.editAddressClickedAt = Date.now();
   await setActiveJob(activeJob);
   await clickElement(editAddress, "Edit address link");
-  await waitForElement([
-    "#address-ui-widgets-enterAddressFullName",
-    "input[name='address-ui-widgets-enterAddressFullName']",
-    "input[aria-label='Full name']",
-    "input[name*='FullName']",
-    "input[id*='FullName']",
-  ], 8000);
-  return findAddressNameInput();
+  return await waitUntil(findAddressNameInput, 6000, 150) || findAddressNameInput();
 }
 
 async function openNewDeliveryAddressFormIfAvailable(activeJob) {
@@ -6589,8 +7094,9 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   if (!filled) return false;
 
   showPanel("Nutricity checkout", "Saving Amazon address.", null, null);
-  await sleep(1000);
-  const useAddress = await waitUntil(findUseAddressButton, 8000) || findButtonByText(["use this address", "save address", "continue"]);
+  const useAddress = findUseAddressButton()
+    || await waitUntil(findUseAddressButton, 4500, 150)
+    || findButtonByText(["use this address", "save address", "continue"]);
   if (!useAddress) {
     if (checkoutAdvancedAfterAddressSave()) {
       activeJob.stage = "checkout";
@@ -6616,8 +7122,6 @@ async function saveEditedAddress(activeJob, checkoutRecipient) {
   if (findPlaceOrderButton() && checkoutShowsRecipient(checkoutRecipient)) {
     return markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, "Checkout address panel shows the edited recipient. Continuing checkout.");
   }
-  await sleep(1000);
-
   const recipientAddressControl = await waitUntil(() => !findAddressNameInput() && recipientAddressSelectionControl(checkoutRecipient), 10000, 300);
   if (recipientAddressControl) {
     showPanel("Nutricity checkout", "Selecting the recipient delivery address.", null, null);
@@ -6761,7 +7265,11 @@ async function verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient) {
   // Closing Amazon's address editor often restores the checkout card in two
   // renders: the Place Order button appears first, then the delivery details.
   // Do not pause in the gap when the correct address has simply not painted yet.
-  if (!checkoutRecipientConfirmed(checkoutRecipient)) {
+  if (
+    !checkoutRecipientConfirmed(checkoutRecipient)
+    && !checkoutAddressSelectionPageOpen()
+    && !findAddressNameInput()
+  ) {
     const confirmedAfterRender = await waitUntil(
       () => checkoutRecipientConfirmed(checkoutRecipient),
       6000,
@@ -7026,9 +7534,38 @@ async function handleCheckout(activeJob) {
     if (activeJob.paused) return;
   }
 
-  const addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
+  let addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
+  if (
+    !addressAlreadyConfirmed
+    && !findAddressNameInput()
+    && !checkoutAddressSelectionPageOpen()
+  ) {
+    // Amazon paints the final checkout shell before its delivery card. Wait
+    // for all valid address surfaces in parallel; returning on whichever one
+    // appears first preserves the fast path without treating a slow render as
+    // a missing Change/Edit control.
+    await waitUntil(
+      () =>
+        checkoutRecipientConfirmed(checkoutRecipient)
+        || findAddressNameInput()
+        || checkoutAddressSelectionPageOpen()
+        || findChangeDeliveryAddressButton()
+        || findEditAddressTrigger(),
+      8000,
+      150,
+    );
+    addressAlreadyConfirmed = checkoutRecipientConfirmed(checkoutRecipient);
+  }
   if (addressAlreadyConfirmed) {
     await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Verified delivery address for ${checkoutRecipient}.`);
+  }
+  // Consumer checkout can land on the address list with an unrelated personal
+  // address selected even though this exact Nutricity recipient already exists.
+  // Select and deliver to the exact row before any generic warehouse-row edit;
+  // editing first can rename the wrong Nutricity row and create duplicates.
+  if (checkoutAddressSelectionPageOpen() && addressRowForRecipient(checkoutRecipient)) {
+    await verifyCheckoutDeliveryRecipient(activeJob, checkoutRecipient);
+    return;
   }
   const addressEditIsFresh = addressAlreadyConfirmed || activeJob.addressEditedRecipient === checkoutRecipient && Date.now() - Number(activeJob.addressEditedAt || 0) < 30000;
   if (!addressEditIsFresh) {
@@ -7046,12 +7583,25 @@ async function handleCheckout(activeJob) {
           return;
         }
       } else {
-        await sleep(750);
+        await waitUntil(
+          () =>
+            checkoutRecipientConfirmed(checkoutRecipient)
+            || findAddressNameInput()
+            || findChangeDeliveryAddressButton()
+            || findEditAddressTrigger(),
+          5000,
+          150,
+        );
         if (checkoutRecipientConfirmed(checkoutRecipient)) {
           await markCheckoutRecipientConfirmed(activeJob, checkoutRecipient, `Delivery address shows ${checkoutRecipient}. Continuing checkout.`);
         } else {
-        await pauseForManualCheckout(activeJob, "Could not find the Change delivery address or Edit address link for the Nutricity address.");
-        return;
+          const lateAddressEditor = await openAddressEditorIfAvailable(activeJob);
+          if (lateAddressEditor) {
+            if (!await saveEditedAddress(activeJob, checkoutRecipient)) return;
+          } else {
+            await pauseForManualCheckout(activeJob, "Could not find the Change delivery address or Edit address link for the Nutricity address.");
+            return;
+          }
         }
       }
     } else {
@@ -7355,10 +7905,17 @@ async function forceOrderReportingFromSubmittedPage(activeJob, reason = "") {
 }
 
 async function guardUnexpectedAmazonPage(activeJob) {
+  const submittedEvidence = submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob);
+  // Order history is the authoritative recipient/ASIN verification surface.
+  // Do not let the generic submitted-page guard read the first order number
+  // from that page and redirect back to the same URL forever. The normal run
+  // path will call handleOrderHistory(), select the matching card, and report
+  // it idempotently to the app.
+  if (isOrderHistoryPage() && submittedEvidence) return false;
   if (
     isAmazonThankYouPage() ||
     confirmationSaysPlaced() ||
-    ((submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob)) && pageLooksAfterAmazonSubmit())
+    (submittedEvidence && pageLooksAfterAmazonSubmit())
   ) {
     await forceOrderReportingFromSubmittedPage(activeJob, "Amazon confirmation URL or placed-order text detected.");
     return true;
@@ -7373,7 +7930,7 @@ async function guardUnexpectedAmazonPage(activeJob) {
   ) {
     return false;
   }
-  if ((isOrderHistoryPage() || isOrderDetailsPage()) && !submittedOrPausedStage(activeJob) && !activeJobWasSubmittedToAmazon(activeJob)) {
+  if ((isOrderHistoryPage() || isOrderDetailsPage()) && !submittedEvidence) {
     activeJob.paused = true;
     activeJob.pausedStage = activeJob.stage || "product";
     activeJob.pageGuardPausedAt = Date.now();
@@ -7390,7 +7947,7 @@ async function guardUnexpectedAmazonPage(activeJob) {
     );
     return true;
   }
-  if ((submittedOrPausedStage(activeJob) || activeJobWasSubmittedToAmazon(activeJob)) && /\/cart/i.test(location.pathname)) {
+  if (submittedEvidence && /\/cart/i.test(location.pathname)) {
     await sendDiagnostic("Submitted job landed on cart; redirecting to order history instead of clearing cart.", {
       group_key: activeJob?.job?.group_key || "",
       stage: activeJob.stage || "",
@@ -9541,6 +10098,7 @@ async function autoResumeResolvedCheckoutPause(activeJob) {
   if (!/\/checkout/i.test(location.pathname)) return false;
   const pausedStage = String(activeJob?.pausedStage || activeJob?.stage || "");
   if (!["checkout", "editing_address"].includes(pausedStage)) return false;
+  const checkoutRecipient = recipientName(activeJob);
   const placeOrder = findPlaceOrderButton();
   if (
     placeOrder &&
@@ -9943,6 +10501,10 @@ registerContentCleanup(() => document.removeEventListener("visibilitychange", on
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "NUTRICITY_CONTENT_PING") {
     sendResponse({ ok: true, build: CONTENT_SCRIPT_BUILD });
+    return true;
+  }
+  if (message.type === "GET_AMAZON_ACCOUNT_EXPERIENCE") {
+    sendResponse({ ok: true, experience: amazonAccountExperience(), build: CONTENT_SCRIPT_BUILD });
     return true;
   }
   if (message.type === "RUN_ACTIVE_JOB") {

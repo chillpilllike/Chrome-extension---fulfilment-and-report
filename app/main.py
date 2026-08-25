@@ -11657,6 +11657,30 @@ CHROME_ORDER_SUBMITTED_STATUS = "order_submitted"
 CHROME_PROTECTED_STATUSES = {CHROME_ORDER_SUBMITTED_STATUS, "reporting_complete"}
 
 
+def chrome_account_type_routing_enabled() -> bool:
+    return clean_text(get_service_settings().get("chrome_route_orders_by_account_type")).lower() in {
+        "1", "true", "yes", "on", "enabled",
+    }
+
+
+def chrome_source_line_item_count(group_rows: list[dict[str, Any]]) -> int:
+    recorded_counts = [int(float(row.get("source_line_count") or 0)) for row in group_rows]
+    return max([len(group_rows), *recorded_counts])
+
+
+def required_chrome_account_experience(group_rows: list[dict[str, Any]]) -> str:
+    """Route whole Odoo orders by source line count, never by Chrome profile identity."""
+    if not chrome_account_type_routing_enabled():
+        return "any"
+    return "consumer" if chrome_source_line_item_count(group_rows) > 1 else "business"
+
+
+def chrome_account_experience_matches(group_rows: list[dict[str, Any]], account_experience: str) -> bool:
+    required = required_chrome_account_experience(group_rows)
+    detected = clean_text(account_experience).lower()
+    return required == "any" or detected == required
+
+
 def chrome_job_lease_expiry() -> str:
     return (datetime.now(timezone.utc) + timedelta(minutes=CHROME_JOB_LEASE_MINUTES)).isoformat()
 
@@ -11740,6 +11764,8 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
         }),
         "claimed_by": group_rows[0].get("chrome_claimed_by") or "",
         "claim_expires_at": group_rows[0].get("chrome_claim_expires_at") or "",
+        "line_item_count": chrome_source_line_item_count(group_rows),
+        "required_account_experience": required_chrome_account_experience(group_rows),
         "items": [
             {
                 "asin": item["asin"],
@@ -11960,6 +11986,7 @@ def claim_next_chrome_job(
     worker_id: str,
     resume_existing: bool = True,
     split_mixed_asin: bool = False,
+    account_experience: str = "",
 ) -> Optional[dict[str, Any]]:
     worker_id = clean_text(worker_id)[:120] or f"worker-{uuid.uuid4().hex[:12]}"
     with db() as conn:
@@ -12047,6 +12074,21 @@ def claim_next_chrome_job(
                 (worker_id, store_id, store_id),
             ).fetchall()
             if existing:
+                existing_rows = rows_to_dicts(existing)
+                if not chrome_account_experience_matches(existing_rows, account_experience):
+                    group_key = str(existing_rows[0]["amazon_group_key"])
+                    conn.execute(
+                        """
+                        UPDATE order_lines
+                        SET chrome_claimed_by=NULL, chrome_claimed_at=NULL,
+                            chrome_claim_expires_at=NULL, updated_at=?
+                        WHERE amazon_group_key=? AND chrome_claimed_by=?
+                          AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                        """,
+                        (utc_now(), group_key, worker_id),
+                    )
+                    existing = []
+            if existing:
                 expiry = chrome_job_lease_expiry()
                 group_key = str(existing[0]["amazon_group_key"])
                 conn.execute(
@@ -12082,21 +12124,32 @@ def claim_next_chrome_job(
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
               AND COALESCE(amazon_group_key, '') != ''
-              AND COALESCE(chrome_claimed_by, '') = ''
               AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
               AND (? IS NULL OR store_id=?)
             GROUP BY amazon_group_key
+            HAVING MAX(CASE WHEN COALESCE(chrome_claimed_by, '') != '' THEN 1 ELSE 0 END) = 0
             ORDER BY newest_order_date DESC, newest_order_id DESC, first_line_id ASC
-            LIMIT 10
+            LIMIT 250
             """,
             (store_id, store_id),
         ).fetchall()
         for candidate in candidates:
             group_key = str(candidate["amazon_group_key"])
-            if split_mixed_asin:
-                group_key = split_chrome_group_by_asin_if_needed(conn, group_key)
-                if not group_key:
-                    continue
+            candidate_rows = rows_to_dicts(conn.execute(
+                """
+                SELECT * FROM order_lines
+                WHERE amazon_group_key=? AND order_engine='chrome' AND state='submitted'
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND COALESCE(chrome_claimed_by, '') = ''
+                  AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                ORDER BY id
+                """,
+                (group_key,),
+            ).fetchall())
+            if not candidate_rows or not chrome_account_experience_matches(candidate_rows, account_experience):
+                continue
+            # Whole-order invariant: the legacy split flag is intentionally
+            # ignored. One Odoo order must never be divided across workers.
             expiry = chrome_job_lease_expiry()
             cursor = conn.execute(
                 """
@@ -12607,6 +12660,7 @@ def queue_chrome_order_groups_fast(
               AND asin IS NOT NULL AND asin != ''
               AND COALESCE(amazon_order_id, '') = ''
               AND state NOT IN ('ordered', 'delivered', 'dispatched', 'costly', 'inventory', 'ignored')
+              AND state != 'submitted'
               AND (? = 1 OR state != 'missing')
               AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
               {where_line_ids}
@@ -13078,6 +13132,7 @@ def place_orders(
     ordering_engine: str = "rest",
     allow_missing_spaid: bool = False,
     include_missing_asins: bool = False,
+    minimum_order_age_minutes: int = 0,
 ) -> tuple[int, int]:
     store = get_store(store_id)
     amazon_account = get_amazon_account(amazon_account_id)
@@ -13136,6 +13191,8 @@ def place_orders(
             """,
             [store_id, 1 if include_missing_asins else 0, *params[1:]],
         ).fetchall()
+        if ordering_engine == "chrome":
+            lines = [line for line in lines if clean_text(line["state"]) != "submitted"]
         if lines:
             allowed_ids, candidate_blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, [int(line["id"]) for line in lines])
             failed += candidate_blocked
@@ -13154,6 +13211,20 @@ def place_orders(
         if lines:
             lines, odoo_blocked, _odoo_messages = filter_lines_by_live_odoo_status(conn, store_id, [dict(line) for line in lines])
             failed += odoo_blocked
+        if lines and minimum_order_age_minutes > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(minimum_order_age_minutes)))
+            by_order: dict[int, list[dict[str, Any]]] = {}
+            for line in lines:
+                by_order.setdefault(int(line["odoo_order_id"]), []).append(dict(line))
+            eligible_order_ids: set[int] = set()
+            for order_id, order_lines in by_order.items():
+                received_times = [
+                    parse_any_datetime(line.get("pulled_at") or line.get("created_at"))
+                    for line in order_lines
+                ]
+                if received_times and all(value is not None and value <= cutoff for value in received_times):
+                    eligible_order_ids.add(order_id)
+            lines = [line for line in lines if int(line["odoo_order_id"]) in eligible_order_ids]
     inventory_lines: list[dict[str, Any]] = []
     allocated_lines: list[dict[str, Any]] = []
     purchase_lines: list[dict[str, Any]] = []
@@ -24488,17 +24559,34 @@ def autosync_loop() -> None:
                 set_setting("autosync_last_message", result["message"])
                 set_setting("autosync_last_run_at", utc_now())
                 last_run = time.time()
-            chrome_interval = int(float(settings.get("auto_chrome_fulfil_interval_minutes") or 0))
-            if chrome_interval > 0 and time.time() - last_chrome_run >= chrome_interval * 60:
+            raw_chrome_interval = int(float(settings.get("auto_chrome_fulfil_interval_minutes") or 0))
+            chrome_enabled = clean_text(settings.get("auto_chrome_fulfil_enabled")).lower() in {"1", "true", "yes", "on", "enabled"}
+            chrome_interval = max(1, raw_chrome_interval or 5)
+            chrome_elapsed = max(time.time() - last_chrome_run, setting_elapsed_seconds("auto_chrome_fulfil_last_run_at", chrome_interval * 60))
+            if chrome_enabled and chrome_elapsed >= chrome_interval * 60:
                 days = max(1, min(30, int(float(settings.get("auto_chrome_fulfil_days") or 2))))
                 limit = max(1, min(500, int(float(settings.get("auto_chrome_fulfil_limit") or 100))))
+                minimum_age = max(1, min(1440, int(float(settings.get("auto_chrome_fulfil_minimum_age_minutes") or 60))))
+                queued_total = 0
+                skipped_total = 0
                 for store in list_stores():
                     store_id = int(store["id"])
                     pulled_count = fetch_odoo_lines_exclusive(get_store(store_id), days=days, limit=limit, wait=False)
                     if pulled_count:
                         start_typesense_reindex_job()
                     if pulled_count is not None:
-                        place_orders(store_id, ordering_engine="chrome")
+                        queued, skipped = place_orders(
+                            store_id,
+                            ordering_engine="chrome",
+                            minimum_order_age_minutes=minimum_age,
+                        )
+                        queued_total += queued
+                        skipped_total += skipped
+                set_setting("auto_chrome_fulfil_last_run_at", utc_now())
+                set_setting(
+                    "auto_chrome_fulfil_last_message",
+                    f"Queued {queued_total} whole order(s) at least {minimum_age} minutes old; skipped {skipped_total}.",
+                )
                 last_chrome_run = time.time()
             cancelled_interval = int(float(settings.get("cancelled_orders_sync_interval_minutes") or 0))
             if cancelled_interval > 0 and time.time() - last_cancelled_run >= cancelled_interval * 60:
@@ -28972,6 +29060,7 @@ def api_chrome_jobs(
     resume_existing: bool = True,
     job_limit: int = 50,
     split_mixed_asin: bool = False,
+    account_experience: str = "",
 ) -> dict[str, Any]:
     if claim:
         history_reconciled = reconcile_exact_submitted_chrome_jobs_from_history()
@@ -28987,6 +29076,7 @@ def api_chrome_jobs(
             worker_id,
             resume_existing=resume_existing,
             split_mixed_asin=split_mixed_asin,
+            account_experience=account_experience,
         )
         # Before handing a fresh claim to Chrome, consume any one exact,
         # non-cancelled Amazon-history match. This prevents a previously
@@ -29013,6 +29103,7 @@ def api_chrome_jobs(
                 worker_id,
                 resume_existing=True,
                 split_mixed_asin=split_mixed_asin,
+                account_experience=account_experience,
             )
         return {
             "ok": True,

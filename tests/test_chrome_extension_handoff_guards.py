@@ -14,6 +14,27 @@ APP = (ROOT / "app" / "main.py").read_text()
 
 
 class ChromeExtensionHandoffGuardTests(unittest.TestCase):
+    def test_workers_detect_account_type_before_whole_order_claim(self) -> None:
+        self.assertIn('type: "GET_AMAZON_ACCOUNT_EXPERIENCE"', BACKGROUND)
+        self.assertIn('if (message.type === "GET_AMAZON_ACCOUNT_EXPERIENCE")', CONTENT)
+        self.assertIn('account_experience=${encodeURIComponent(detectedAccount.experience)}', BACKGROUND)
+        self.assertIn('split_mixed_asin=false&account_experience=', BACKGROUND)
+        self.assertIn('required_account_experience', APP)
+        self.assertIn('chrome_account_experience_matches(candidate_rows, account_experience)', APP)
+
+    def test_continuous_queue_toggle_and_alarm_are_guarded(self) -> None:
+        self.assertIn('id="autoOrderQueue"', POPUP_HTML)
+        self.assertIn('autoOrderQueue: autoOrderQueue.checked', POPUP_JS)
+        self.assertIn('const AUTO_ORDER_ALARM = "nutricity-auto-order-queue"', BACKGROUND)
+        self.assertIn('await activeOrderingInProgress()', BACKGROUND)
+        self.assertIn('await startNextJob(null, { automatic: true })', BACKGROUND)
+        self.assertIn('autoOrderQueue: true', BACKGROUND)
+
+    def test_legacy_multi_asin_split_is_forced_off(self) -> None:
+        self.assertIn('splitMixedAsinOrders: false', BACKGROUND)
+        self.assertIn('splitMixedAsinOrders: false', POPUP_JS)
+        self.assertNotIn('split_mixed_asin=${splitMixedAsinOrders', BACKGROUND)
+
     def test_background_and_content_builds_match(self) -> None:
         background_build = re.search(r'EXPECTED_CONTENT_SCRIPT_BUILD = "([^"]+)"', BACKGROUND)
         content_build = re.search(r'CONTENT_SCRIPT_BUILD = "([^"]+)"', CONTENT)
@@ -46,7 +67,63 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.109")
+        self.assertEqual(MANIFEST["version"], "0.1.138")
+
+    def test_consumer_and_business_subscription_cart_flows_stay_separate(self) -> None:
+        detector_start = CONTENT.index("function amazonAccountExperience()")
+        detector_end = CONTENT.index("function isAmazonBusinessPage()", detector_start)
+        detector = CONTENT[detector_start:detector_end]
+        self.assertIn('return "business"', detector)
+        self.assertIn('return consumerShell ? "consumer" : "unknown"', detector)
+        self.assertNotIn("header [aria-label*='Amazon Business' i]", detector)
+        self.assertNotIn("#navbar [aria-label*='Amazon Business' i]", detector)
+        self.assertIn("#nav-logo a[aria-label*='Amazon Business' i]", detector)
+
+        product_start = CONTENT.index("async function handleProduct(activeJob)")
+        product_end = CONTENT.index("async function handleSubscribeCheckout", product_start)
+        product = CONTENT[product_start:product_end]
+        self.assertIn('accountExperience === "consumer"', product)
+        self.assertIn('accountExperience === "business"', product)
+        self.assertIn("await waitUntil(findSubscribeAddToCartTarget, 15000, 250)", product)
+        self.assertIn("Fulfilment paused without switching to One-time purchase", product)
+        self.assertIn("Business multi-ASIN orders must stay in the normal Amazon cart", product)
+        self.assertNotIn('accountExperience !== "consumer"', product)
+        self.assertNotIn("mixedSnsOneTimeFallbackAsins", product)
+        self.assertNotIn("persist_consumer_mixed_sns_one_time_fallback", product)
+
+        resolver_start = CONTENT.index("async function resolvedAmazonAccountExperience")
+        resolver_end = CONTENT.index("function isAmazonBusinessPage()", resolver_start)
+        resolver = CONTENT[resolver_start:resolver_end]
+        self.assertIn('accountExperience === "unknown"', resolver)
+        self.assertIn("await waitUntil(() =>", resolver)
+        self.assertIn("paused instead of treating this account as Business", resolver)
+
+    def test_subscribe_activation_uses_one_native_click_per_target(self) -> None:
+        start = CONTENT.index("async function activateSubscribeAndSaveOption()")
+        end = CONTENT.index("function findOneTimePurchaseAccordionTarget", start)
+        activation = CONTENT[start:end]
+        self.assertIn('clickElement(clickTarget, "Subscribe & Save accordion row"', activation)
+        self.assertNotIn("dispatchAmazonClickSequence(clickTarget)", activation)
+        self.assertNotIn("dispatchClickAtElementCenter(clickTarget)", activation)
+        self.assertNotIn("KeyboardEvent", activation)
+
+    def test_consumer_sns_quantity_supports_amazons_rcx_select(self) -> None:
+        accepted_start = CONTENT.index("function quantityValueAccepted(")
+        accepted_end = CONTENT.index("function syncSubscribeAndSaveQuantity(", accepted_start)
+        accepted = CONTENT[accepted_start:accepted_end]
+        self.assertIn("select#rcxsubsQuan", accepted)
+        self.assertIn("findSubscribeAddToCartTarget()", accepted)
+
+        sync_start = accepted_end
+        sync_end = CONTENT.index("async function clickQuantityUpdateButton", sync_start)
+        sync = CONTENT[sync_start:sync_end]
+        self.assertIn("select#rcxsubsQuan", sync)
+        self.assertIn("select[name='rcxsubsQuan']", sync)
+
+        setter_start = CONTENT.index("async function setQuantity(")
+        setter_end = CONTENT.index("async function navigateToNext", setter_start)
+        setter = CONTENT[setter_start:setter_end]
+        self.assertIn('"#snsAccordionRowMiddle select#rcxsubsQuan"', setter)
 
     def test_order_history_waits_without_reloading_incomplete_cards(self):
         start = CONTENT.index("async function handleOrderHistory(activeJob)")
@@ -380,9 +457,9 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         reward_start = CONTENT.index("async function ensureRewardedLaterDelivery")
         reward_end = CONTENT.index("function checkoutDeliveryPromiseText", reward_start)
         reward = CONTENT[reward_start:reward_end]
-        self.assertIn("ensurePreferredAmazonDayWeekdayDelivery(activeJob)", reward)
+        self.assertIn("ensureWarehouseOpenDayDelivery(activeJob)", reward)
         self.assertLess(
-            reward.index("ensurePreferredAmazonDayWeekdayDelivery(activeJob)"),
+            reward.index("ensureWarehouseOpenDayDelivery(activeJob)"),
             reward.index("ensureFreeNextDayDelivery(activeJob, brooklynDay)"),
         )
 

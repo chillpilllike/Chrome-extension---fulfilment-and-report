@@ -15676,8 +15676,19 @@ function SettingsPage({
               </SelectField>
               <TextField label="Auto Pull Limit" value={settings.pull_orders_limit || "0"} onChange={(value) => setSetting("pull_orders_limit", value)} />
               <p className="text-xs text-muted-foreground md:col-span-2">Use 0 for normal auto pull so every confirmed paid order in the selected window is ingested. A limit is only for short diagnostics.</p>
-              <SelectField label="Auto Pull + Queue Chrome" value={settings.auto_chrome_fulfil_interval_minutes || "0"} onChange={(value) => setSetting("auto_chrome_fulfil_interval_minutes", value)}>
-                {["0", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
+              <SelectField label="Automatically Queue Chrome Orders" value={settings.auto_chrome_fulfil_enabled || "false"} onChange={(value) => setSetting("auto_chrome_fulfil_enabled", value)}>
+                <option value="false">Disabled</option>
+                <option value="true">Enabled</option>
+              </SelectField>
+              <SelectField label="Auto Queue Check Interval" value={settings.auto_chrome_fulfil_interval_minutes || "5"} onChange={(value) => setSetting("auto_chrome_fulfil_interval_minutes", value)}>
+                {["5", "15", "30", "60", "180", "360", "720", "1440"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
+              </SelectField>
+              <SelectField label="Queue Orders After" value={settings.auto_chrome_fulfil_minimum_age_minutes || "60"} onChange={(value) => setSetting("auto_chrome_fulfil_minimum_age_minutes", value)}>
+                {["30", "60", "90", "120", "180", "360"].map((value) => <option key={value} value={value}>{value} minutes after app receipt</option>)}
+              </SelectField>
+              <SelectField label="Route Chrome Orders by Account Type" value={settings.chrome_route_orders_by_account_type || "false"} onChange={(value) => setSetting("chrome_route_orders_by_account_type", value)}>
+                <option value="false">Disabled — any detected account type</option>
+                <option value="true">Enabled — multi-line Consumer, single-line Business</option>
               </SelectField>
               <SelectField label="Auto Fulfil Pull Window" value={settings.auto_chrome_fulfil_days || "2"} onChange={(value) => setSetting("auto_chrome_fulfil_days", value)}>
                 {["1", "2", "3", "7", "14", "30"].map((value) => <option key={value} value={value}>Last {value} day{value === "1" ? "" : "s"}</option>)}
@@ -15706,9 +15717,12 @@ function SettingsPage({
 	                  "autosync_interval_minutes",
                   "pull_orders_days",
                   "pull_orders_limit",
+                  "auto_chrome_fulfil_enabled",
                   "auto_chrome_fulfil_interval_minutes",
+                  "auto_chrome_fulfil_minimum_age_minutes",
                   "auto_chrome_fulfil_days",
                   "auto_chrome_fulfil_limit",
+                  "chrome_route_orders_by_account_type",
                   "cancelled_orders_sync_interval_minutes",
                   "cancelled_orders_sync_days",
                   "pull_orders_batch_size",
