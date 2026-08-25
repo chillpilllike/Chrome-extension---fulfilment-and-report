@@ -592,6 +592,10 @@ async function api(path, options = {}) {
       headers: { "Content-Type": "application/json", ...(authTokens[index] ? { "X-Admin-Token": authTokens[index] } : {}), ...(fetchOptions.headers || {}) },
       signal: controller.signal,
       ...fetchOptions,
+      // Chrome fulfilment claims and heartbeats are stateful even though some
+      // legacy endpoints use GET. Never let the browser reuse an old empty
+      // claim response for a live worker.
+      cache: "no-store",
     }).finally(() => clearTimeout(timeout));
     if (response.ok || response.status !== 401 || index === authTokens.length - 1) break;
   }

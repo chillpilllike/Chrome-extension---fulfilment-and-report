@@ -22,6 +22,9 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('required_account_experience', APP)
         self.assertIn('chrome_account_experience_matches(candidate_rows, account_experience)', APP)
 
+    def test_stateful_extension_api_requests_never_reuse_cached_claims(self) -> None:
+        self.assertIn('cache: "no-store"', BACKGROUND)
+
     def test_continuous_queue_toggle_and_alarm_are_guarded(self) -> None:
         self.assertIn('id="autoOrderQueue"', POPUP_HTML)
         self.assertIn('autoOrderQueue: autoOrderQueue.checked', POPUP_JS)
@@ -139,7 +142,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.138")
+        self.assertEqual(MANIFEST["version"], "0.1.139")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
