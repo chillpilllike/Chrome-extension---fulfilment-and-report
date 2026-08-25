@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.111")
+        self.assertEqual(MANIFEST["version"], "0.1.112")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -429,26 +429,42 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("await injectActiveAmazonTabInWindow(windowId);", cleanup_branch)
         self.assertIn("return currentJob;", cleanup_branch)
 
-    def test_multi_item_subscription_without_cart_button_falls_back_to_one_time(self) -> None:
+    def test_every_fulfilment_requires_verified_one_time_purchase(self) -> None:
         product_start = CONTENT.index("async function handleProduct(activeJob)")
         product_end = CONTENT.index("async function handleAddClicked", product_start)
         product = CONTENT[product_start:product_end]
-        self.assertIn("if (useSubscribeAndSave && mixedAsinAfterVariant)", product)
-        self.assertIn("if (!findSubscribeAddToCartTarget())", product)
-        self.assertIn("await activateOneTimePurchaseOption()", product)
-        self.assertIn("useSubscribeAndSave = false;", product)
-        self.assertIn("Using One-time purchase so every item stays in the same Amazon order.", product)
+        self.assertIn("const oneTimeReady = await ensureOneTimePurchaseForFulfilment()", product)
+        self.assertIn("if (!oneTimeReady)", product)
+        self.assertIn("Fulfilment paused without selecting Subscribe & Save", product)
         self.assertIn("function findOneTimePurchaseAccordionTarget()", CONTENT)
         self.assertIn("async function activateOneTimePurchaseOption()", CONTENT)
+        self.assertIn("async function ensureOneTimePurchaseForFulfilment()", CONTENT)
 
-    def test_multi_item_subscription_fallback_survives_amazon_rerenders(self) -> None:
+    def test_product_flow_clears_any_stale_subscription_state(self) -> None:
         product_start = CONTENT.index("async function handleProduct(activeJob)")
         product_end = CONTENT.index("async function handleAddClicked", product_start)
         product = CONTENT[product_start:product_end]
-        self.assertIn("mixedSnsOneTimeFallbackAsins", product)
-        self.assertIn('reason: "persist_mixed_sns_one_time_fallback"', product)
-        self.assertIn("snsIsCheaper && !mixedSnsFallbackRecorded", product)
-        self.assertIn("mixedSnsFallbackRecorded && !oneTimePurchaseIsActive()", product)
+        self.assertIn("activeJob.subscribeAndSave = false", product)
+        self.assertIn("activeJob.subscriptionCartAsins = []", product)
+        self.assertIn('reason: "enforce_one_time_purchase_only"', product)
+        self.assertNotIn("mixedSnsOneTimeFallbackAsins", product)
+
+    def test_legacy_subscription_state_is_blocked_before_checkout_actions(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("async function forceOrderReportingFromSubmittedPage", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        guard = checkout.index("activeJob?.subscribeAndSave")
+        wait = checkout.index("await waitForElement")
+        self.assertLess(guard, wait)
+        self.assertIn('activeJob?.stage === "subscribe_checkout"', checkout[:wait])
+        self.assertIn("activeJob?.subscriptionCartAsins", checkout[:wait])
+        self.assertIn("Blocked Subscribe & Save before checkout actions", checkout[:wait])
+
+        legacy_start = CONTENT.index("async function handleSubscribeCheckout(activeJob)")
+        legacy_end = CONTENT.index("async function retryProvenMissingCartItemOnce", legacy_start)
+        legacy = CONTENT[legacy_start:legacy_end]
+        self.assertIn("Blocked a legacy Subscribe & Save checkout", legacy)
+        self.assertNotIn("await handleCheckout(activeJob)", legacy)
 
     def test_regular_cart_add_never_uses_subscription_cart_control(self) -> None:
         finder_start = CONTENT.index("function findRegularAddToCartTarget()")
@@ -828,14 +844,24 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("await clickElement(placeOrder", recovery)
         self.assertNotIn("protectBeforeAmazonSubmit", recovery.replace("// protectBeforeAmazonSubmit", "// protection"))
 
-    def test_mixed_asin_subscriptions_use_cart_instead_of_single_item_checkout(self) -> None:
+    def test_fulfilment_product_flow_never_selects_subscribe_and_save(self) -> None:
         product_start = CONTENT.index("async function handleProduct(activeJob)")
         product_end = CONTENT.index("async function handleAddClicked(activeJob)", product_start)
         product = CONTENT[product_start:product_end]
-        self.assertIn("let useSubscribeAndSave = Boolean(snsIsCheaper && !mixedSnsFallbackRecorded);", product)
-        self.assertIn("{ requireCartAdd: mixedAsinAfterVariant }", product)
-        self.assertIn('"subscribe-save-cart"', product)
-        self.assertNotIn("Subscribe & Save skipped", product)
+        self.assertIn("await ensureOneTimePurchaseForFulfilment()", product)
+        self.assertIn("activeJob.subscribeAndSave = false", product)
+        self.assertIn("const priceForDecision = priceSnapshot.regular", product)
+        self.assertIn('setQuantity(purchaseItem.quantity, "regular")', product)
+        self.assertNotIn("applySubscribeAndSaveIfCheaper", product)
+        self.assertNotIn("activateSubscribeAndSaveOption", product)
+        self.assertNotIn('"subscribe-save"', product)
+
+    def test_subscribe_price_is_diagnostic_only(self) -> None:
+        snapshot_start = CONTENT.index("function productPriceSnapshot()")
+        snapshot_end = CONTENT.index("function snsQuantityControlVisible()", snapshot_start)
+        snapshot = CONTENT[snapshot_start:snapshot_end]
+        self.assertIn("const best = regular || 0", snapshot)
+        self.assertNotIn("Math.min(sns, regular)", snapshot)
 
     def test_subscription_cart_button_is_detected_by_meaning_inside_sns_root(self) -> None:
         finder_start = CONTENT.index("function findSubscribeAddToCartTarget()")
