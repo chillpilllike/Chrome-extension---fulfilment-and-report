@@ -5679,7 +5679,10 @@ function warehouseObservedHolidayControlsReady(dialog) {
 }
 
 function normalizedDeliveryInstructionValue(value) {
-  return String(value || "").replace(/\r\n/g, "\n").trim();
+  return String(value || "")
+    .replace(/&#0*39;|&apos;/gi, "'")
+    .replace(/\r\n/g, "\n")
+    .trim();
 }
 
 function warehouseDeliveryInstructionsMatch(dialog) {
@@ -6023,7 +6026,10 @@ async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, re
   }
   await clickElement(save, "Save consumer delivery instructions", { preClickDelayMs: 100, delayMs: CONSUMER_DELIVERY_INSTRUCTION_SETTLE_MS });
   if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 10000, 200)) {
-    return pauseForDeliveryPreferences(activeJob, "Amazon did not confirm saving the consumer delivery instructions.", visibleDeliveryPreferencesDialog());
+    await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
+    if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200)) {
+      return pauseForDeliveryPreferences(activeJob, "Amazon kept the consumer delivery-instructions dialog open after saving and it could not be closed for verification.", visibleDeliveryPreferencesDialog());
+    }
   }
 
   const refreshedTrigger = await waitUntil(checkoutDeliveryPreferencesTrigger, 10000, 250);

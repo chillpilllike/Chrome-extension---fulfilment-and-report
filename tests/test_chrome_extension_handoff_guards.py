@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.126")
+        self.assertEqual(MANIFEST["version"], "0.1.127")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -153,6 +153,15 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('findButtonByText(["save instructions"])', helper)
         self.assertIn("candidate && !candidate.disabled", helper)
         self.assertIn("}, 10000, 150);", helper)
+        save_click = helper.index('clickElement(save, "Save consumer delivery instructions"')
+        reopen = helper.index("const refreshedTrigger = await waitUntil(checkoutDeliveryPreferencesTrigger", save_click)
+        save_confirmation = helper[save_click:reopen]
+        self.assertIn("await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());", save_confirmation)
+        self.assertIn("if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200))", save_confirmation)
+        self.assertIn("Amazon kept the consumer delivery-instructions dialog open after saving", save_confirmation)
+        normalizer_start = CONTENT.index("function normalizedDeliveryInstructionValue")
+        normalizer_end = CONTENT.index("function warehouseDeliveryInstructionsMatch", normalizer_start)
+        self.assertIn("&#0*39;|&apos;", CONTENT[normalizer_start:normalizer_end])
         self.assertIn("return ensureConsumerWarehouseDeliveryPreferences(activeJob, nextTrigger, nextAttempt);", helper)
 
     def test_delivery_preferences_retry_themselves_before_manual_pause(self) -> None:
