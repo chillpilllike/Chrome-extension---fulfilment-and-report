@@ -46,7 +46,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.115")
+        self.assertEqual(MANIFEST["version"], "0.1.116")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -114,6 +114,25 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("warehouseCompleteDeliveryPreferencesMatch(dialog)", preferences)
         self.assertLess(preferences.index("setWarehouseDeliveryInstructions(dialog)"), preferences.index("adpSubmitButton_"))
         self.assertLess(preferences.index("clearWarehouseObservedHolidays(dialog)"), preferences.index("adpSubmitButton_"))
+
+    def test_consumer_checkout_uses_its_business_delivery_instruction_modal(self) -> None:
+        helper_start = CONTENT.index("async function ensureConsumerWarehouseDeliveryPreferences")
+        helper_end = CONTENT.index("async function ensureWarehouseDeliveryPreferences", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+
+        self.assertIn('"add delivery instructions"', CONTENT)
+        self.assertIn('"edit delivery instructions"', CONTENT)
+        self.assertIn("#ma-business-type-button-input", CONTENT)
+        self.assertIn("business_hours_${kind}_${day}_", CONTENT)
+        self.assertIn('consumerBusinessTimeControl(dialog, "start", "weekday")', CONTENT)
+        self.assertIn('consumerBusinessFlagControl(dialog, "closed", "weekend")', CONTENT)
+        self.assertIn("#exceptionDatesOpen-announce", CONTENT)
+        self.assertIn("preferredDeliveryLocationBUSINESS", CONTENT)
+        self.assertIn("#freeTextInstruction-BUSINESS", CONTENT)
+        self.assertIn('setWarehouseDeliverySelect(controls.weekdayStart, "8:00")', helper)
+        self.assertIn("consumerBusinessDeliveryPreferencesMatch(dialog)", helper)
+        self.assertIn('"save instructions"', helper)
+        self.assertIn("return ensureConsumerWarehouseDeliveryPreferences(activeJob, nextTrigger, nextAttempt);", helper)
 
     def test_delivery_preferences_retry_themselves_before_manual_pause(self) -> None:
         preferences_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0)")

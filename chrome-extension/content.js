@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-25-complete-delivery-preferences-v115";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-consumer-delivery-preferences-v116";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5830,18 +5830,157 @@ async function pauseForDeliveryPreferences(activeJob, message, dialog = visibleD
   return false;
 }
 
-async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
-  const editPreferences = await waitUntil(
-    () => [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
-      .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "edit delivery preferences"),
-    6000,
-    250,
+function checkoutDeliveryPreferencesTrigger() {
+  return [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
+    .find((element) => {
+      if (!visible(element)) return false;
+      const text = normalizedText(element.textContent || "").toLowerCase();
+      return text === "edit delivery preferences"
+        || text === "add delivery instructions"
+        || text === "edit delivery instructions";
+    }) || null;
+}
+
+function consumerBusinessTimeControl(dialog, kind, day) {
+  return dialog?.querySelector(`select[id^='business_hours_${kind}_${day}_'][id$='_BUSINESS']`) || null;
+}
+
+function consumerBusinessFlagControl(dialog, kind, day) {
+  return dialog?.querySelector(`input[id^='business_hours_${kind}_${day}_'][id$='_BUSINESS']`) || null;
+}
+
+function consumerBusinessDeliveryControls(dialog) {
+  return {
+    business: dialog?.querySelector("#ma-business-type-button-input") || null,
+    weekdayStart: consumerBusinessTimeControl(dialog, "start", "weekday"),
+    weekdayEnd: consumerBusinessTimeControl(dialog, "stop", "weekday"),
+    weekdayOpen24: consumerBusinessFlagControl(dialog, "open", "weekday"),
+    weekendClosed: consumerBusinessFlagControl(dialog, "closed", "weekend"),
+    weekendOpen24: consumerBusinessFlagControl(dialog, "open", "weekend"),
+    holidaysOpen: dialog?.querySelector("#exceptionDatesOpen-announce") || null,
+    frontDoor: dialog?.querySelector("input[name='preferredDeliveryLocationBUSINESS'][value='FRONTDOOR']") || null,
+    security: dialog?.querySelector("#securityCode-BUSINESS") || null,
+    callBox: dialog?.querySelector("#callBox-BUSINESS") || null,
+    additionalInfo: dialog?.querySelector("#freeTextInstruction-BUSINESS") || null,
+  };
+}
+
+function consumerBusinessDeliveryPreferencesMatch(dialog) {
+  const controls = consumerBusinessDeliveryControls(dialog);
+  return Boolean(
+    controls.business?.getAttribute("aria-selected") === "true"
+    && controls.weekdayStart?.value === "8:00"
+    && controls.weekdayEnd?.value === WAREHOUSE_DELIVERY_END
+    && controls.weekdayOpen24?.checked === false
+    && controls.weekendClosed?.checked === true
+    && controls.weekendOpen24?.checked === false
+    && controls.holidaysOpen?.getAttribute("aria-pressed") === "true"
+    && controls.frontDoor?.checked === true
+    && normalizedDeliveryInstructionValue(controls.security?.value) === ""
+    && normalizedDeliveryInstructionValue(controls.callBox?.value) === ""
+    && normalizedDeliveryInstructionValue(controls.additionalInfo?.value) === WAREHOUSE_DELIVERY_ADDITIONAL_INFO
   );
+}
+
+async function ensureConsumerWarehouseDeliveryPreferences(activeJob, trigger, retryAttempt = 0) {
+  showPanel("Delivery preferences", "Verifying consumer Business hours, weekend closure, front-door instructions, and no observed holidays.", null, null);
+  await clickElement(trigger, "Add or edit consumer delivery instructions", { delayMs: 300 });
+  let dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
+  if (!dialog) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not open the consumer delivery-instructions dialog.");
+  }
+
+  let controls = consumerBusinessDeliveryControls(dialog);
+  if (!controls.business) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose the Business property type.", dialog);
+  }
+  if (controls.business.getAttribute("aria-selected") !== "true") {
+    await clickElement(controls.business, "Business property type", { preClickDelayMs: 0, delayMs: 300 });
+  }
+  dialog = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && consumerBusinessTimeControl(candidate, "start", "weekday") ? candidate : null;
+  }, 8000, 200);
+  if (!dialog) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not expose Business delivery-hour controls.");
+  }
+
+  controls = consumerBusinessDeliveryControls(dialog);
+  if (controls.weekdayOpen24?.checked) controls.weekdayOpen24.click();
+  if (controls.weekendOpen24?.checked) controls.weekendOpen24.click();
+  const weekdayStartAccepted = setWarehouseDeliverySelect(controls.weekdayStart, "8:00");
+  const weekdayEndAccepted = setWarehouseDeliverySelect(controls.weekdayEnd, WAREHOUSE_DELIVERY_END);
+  const weekendAccepted = setWarehouseDeliveryClosed(controls.weekendClosed, true);
+  if (controls.holidaysOpen?.getAttribute("aria-pressed") !== "true") controls.holidaysOpen?.click();
+  if (!controls.frontDoor?.checked) controls.frontDoor?.click();
+  const securityAccepted = setDeliveryPreferenceText(controls.security, "");
+  const callBoxAccepted = setDeliveryPreferenceText(controls.callBox, "");
+  const infoAccepted = setDeliveryPreferenceText(controls.additionalInfo, WAREHOUSE_DELIVERY_ADDITIONAL_INFO);
+  await sleep(250);
+
+  if (!weekdayStartAccepted || !weekdayEndAccepted || !weekendAccepted || !securityAccepted || !callBoxAccepted || !infoAccepted
+      || !consumerBusinessDeliveryPreferencesMatch(dialog)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer checkout did not accept the complete Business delivery instructions.", dialog);
+  }
+
+  const save = [...dialog.querySelectorAll("button, input[type='submit']")]
+    .find((element) => visible(element) && normalizedText(element.value || element.textContent || "").toLowerCase() === "save instructions");
+  if (!save) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon consumer delivery instructions did not expose a usable Save instructions button.", dialog);
+  }
+  await clickElement(save, "Save consumer delivery instructions", { preClickDelayMs: 100, delayMs: 800 });
+  if (!await waitUntil(() => !visibleDeliveryPreferencesDialog(), 10000, 200)) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not confirm saving the consumer delivery instructions.", visibleDeliveryPreferencesDialog());
+  }
+
+  const refreshedTrigger = await waitUntil(checkoutDeliveryPreferencesTrigger, 10000, 250);
+  if (!refreshedTrigger) {
+    return pauseForDeliveryPreferences(activeJob, "Amazon saved consumer delivery instructions but did not return to checkout for verification.");
+  }
+  await clickElement(refreshedTrigger, "Recheck consumer delivery instructions", { delayMs: 300 });
+  dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
+  if (dialog && consumerBusinessDeliveryControls(dialog).business?.getAttribute("aria-selected") !== "true") {
+    await clickElement(consumerBusinessDeliveryControls(dialog).business, "Verify Business property type", { preClickDelayMs: 0, delayMs: 300 });
+  }
+  const verified = Boolean(await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && consumerBusinessDeliveryPreferencesMatch(candidate) ? candidate : null;
+  }, 10000, 200));
+  await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
+
+  if (!verified) {
+    if (retryAttempt < WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES) {
+      const nextAttempt = retryAttempt + 1;
+      showPanel("Delivery preferences", `Amazon did not retain the consumer Business delivery instructions. Retrying automatically (${nextAttempt}/${WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES}).`, null, null);
+      await sleep(1500);
+      const nextTrigger = await waitUntil(checkoutDeliveryPreferencesTrigger, 10000, 250);
+      if (nextTrigger) return ensureConsumerWarehouseDeliveryPreferences(activeJob, nextTrigger, nextAttempt);
+    }
+    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain the complete consumer Business delivery preferences: Monday-Friday 8:00 AM-4:00 PM, weekends closed, front door, and no observed holidays.");
+  }
+
+  await sendDiagnostic("Saved and verified consumer checkout delivery preferences.", {
+    group_key: activeJob?.job?.group_key || "",
+    property_type: "Business",
+    weekdays: "Monday-Friday 08:00-16:00",
+    weekends: "closed",
+    drop_off: "Front Door",
+    observed_holidays: "none",
+  });
+  return true;
+}
+
+async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
+  const editPreferences = await waitUntil(checkoutDeliveryPreferencesTrigger, 6000, 250);
   if (!editPreferences) {
     return pauseForDeliveryPreferences(
       activeJob,
       "Amazon checkout did not expose Edit delivery preferences. Fulfilment is paused so warehouse delivery hours cannot be skipped.",
     );
+  }
+
+  if (normalizedText(editPreferences.textContent || "").toLowerCase() !== "edit delivery preferences") {
+    return ensureConsumerWarehouseDeliveryPreferences(activeJob, editPreferences, retryAttempt);
   }
 
   showPanel("Delivery preferences", "Verifying Monday-Friday 8:00 AM-4:00 PM, weekend closure, front-door instructions, and no observed holidays.", null, null);
