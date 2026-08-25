@@ -37,8 +37,8 @@
       </label>
       <input id="splitMixedAsinOrders" type="hidden">
       <label class="checkbox-row">
-        <input id="autoOrderQueue" type="checkbox">
-        <span>Continuously process compatible queued orders</span>
+        <input id="autoOrderingConfirmed" type="checkbox">
+        <span>I confirm this Amazon account is ready for auto ordering</span>
       </label>
       <label class="checkbox-row">
         <input id="browserlessOrderMode" type="checkbox">
@@ -58,11 +58,10 @@
         <button id="testConnection" class="secondary">Check connection</button>
         <button id="openHeadlessSession" class="secondary">Open headless session</button>
         <button id="reloadExtension" class="secondary">Reload extension</button>
-        <button id="start">Start next queued order</button>
+        <button id="autoOrderingToggle" disabled>Start Auto Ordering</button>
         <button id="pauseResume" class="secondary">Pause</button>
         <button id="skipJob" class="secondary">Skip</button>
         <button id="markMissing" class="warning">Missing</button>
-        <button id="stop" class="secondary">Stop</button>
         <button id="forceStop" class="danger">Force stop</button>
         <button id="forceClearQueue" class="danger">Force clear queue</button>
         <button id="clearFailed" class="danger">Clear stale queue</button>

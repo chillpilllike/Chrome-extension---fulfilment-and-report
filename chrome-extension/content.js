@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-account-routed-auto-queue-v130";
+const CONTENT_SCRIPT_BUILD = "2026-08-26-manual-auto-order-session-v131";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {

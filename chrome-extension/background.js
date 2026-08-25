@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-account-routed-auto-queue-v130";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-manual-auto-order-session-v131";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -32,7 +32,7 @@ async function getSettings() {
     editExistingAddress: true,
     fulfilAvailableMixedAsin: false,
     splitMixedAsinOrders: false,
-    autoOrderQueue: true,
+    autoOrderQueue: false,
     browserlessOrderMode: false,
     pauseBeforePlaceOrder: false,
     preferRewardedLaterDelivery: false,
@@ -52,7 +52,20 @@ async function getSettings() {
     logsByWindow: {},
     diagnosticSessions: { currentSessionId: "", sessions: [] },
   });
-  return data;
+  const session = await chrome.storage.session.get({ autoOrderingRunning: false });
+  return { ...data, autoOrderingRunning: session.autoOrderingRunning === true };
+}
+
+async function autoOrderingIsRunning() {
+  const session = await chrome.storage.session.get({ autoOrderingRunning: false });
+  return session.autoOrderingRunning === true;
+}
+
+async function setAutoOrderingRunning(running) {
+  await chrome.storage.session.set({ autoOrderingRunning: running === true });
+  if (running !== true && chrome.alarms?.clear) {
+    await chrome.alarms.clear(AUTO_ORDER_ALARM).catch(() => false);
+  }
 }
 
 async function getWorkerId() {
@@ -126,6 +139,9 @@ async function existingChromeWindowId(windowId) {
 
 async function setWindowJob(windowId, activeJob, options = {}) {
   if (activeJob && await forceStopActive()) return;
+  if (activeJob && !orderSubmitStarted(activeJob) && !await autoOrderingIsRunning()) {
+    return;
+  }
   const state = await getSettings();
   const { activeJobsByWindow } = state;
   const next = { ...(activeJobsByWindow || {}) };
@@ -1240,6 +1256,9 @@ async function ensureStoredActiveJobContentScripts(label = "active job recovery"
 
 async function startNextJob(sourceWindowId = null) {
   const options = arguments[1] || {};
+  if (!await autoOrderingIsRunning()) {
+    return { ok: false, auto_ordering_stopped: true, message: "Auto ordering is stopped. Tick the confirmation and click Start Auto Ordering." };
+  }
   if (startNextJobInFlight) return startNextJobInFlight;
   startNextJobInFlight = (async () => {
   sourceWindowId = await existingChromeWindowId(sourceWindowId);
@@ -1492,6 +1511,7 @@ async function stopBrowserlessOrderRun(sourceWindowId = null) {
 }
 
 async function claimNextJobInWindow(windowId) {
+  if (!await autoOrderingIsRunning()) return null;
   windowId = await existingChromeWindowId(windowId);
   const claimKey = String(windowId || "global");
   if (claimNextJobInFlight.has(claimKey)) return claimNextJobInFlight.get(claimKey);
@@ -2272,6 +2292,7 @@ async function releaseMissingWindowJobs(options = {}) {
 
 async function runFulfilmentWatchdog(label = "scheduled watchdog") {
   if (await forceStopActive()) return { ok: true, stopped: true };
+  if (!await autoOrderingIsRunning()) return { ok: true, stopped: true, auto_ordering_stopped: true };
 
   await releaseMissingWindowJobs({ force: true });
   await ensureStoredActiveJobContentScripts(label);
@@ -2839,8 +2860,7 @@ async function setupFulfilmentWatchdogAlarm() {
 
 async function setupAutoOrderAlarm() {
   if (!chrome.alarms?.create) return;
-  const { autoOrderQueue } = await getSettings();
-  if (autoOrderQueue !== true) {
+  if (!await autoOrderingIsRunning()) {
     await chrome.alarms.clear(AUTO_ORDER_ALARM).catch(() => false);
     return;
   }
@@ -2851,11 +2871,45 @@ async function setupAutoOrderAlarm() {
 }
 
 async function runAutoOrderQueue() {
-  const { autoOrderQueue } = await getSettings();
-  if (autoOrderQueue !== true || await forceStopActive() || await activeOrderingInProgress()) return;
+  if (!await autoOrderingIsRunning() || await forceStopActive() || await activeOrderingInProgress()) return;
   const queue = await api("/api/chrome/jobs?claim=false&job_limit=1", { timeoutMs: 15000 }).catch(() => null);
   if (!queue?.job_count) return;
   await startNextJob(null, { automatic: true });
+}
+
+async function startAutoOrdering(windowId, confirmed = false) {
+  if (confirmed !== true) {
+    return { ok: false, confirmation_required: true, message: "Tick the confirmation before starting auto ordering." };
+  }
+  await setForceStop(false);
+  await setAutoOrderingRunning(true);
+  await setupAutoOrderAlarm();
+  const { browserlessOrderMode } = await getSettings();
+  const result = browserlessOrderMode === true
+    ? await startBrowserlessOrderRun(windowId)
+    : await startNextJob(windowId, { automatic: true });
+  if (result?.ok === false && !result?.active_job_running) {
+    return {
+      ...result,
+      ok: true,
+      auto_ordering_running: true,
+      message: `${result.message || "No compatible order is ready."} Auto ordering is running and will keep checking.`,
+    };
+  }
+  return { ...result, ok: true, auto_ordering_running: true };
+}
+
+async function stopAutoOrdering(windowId) {
+  await setAutoOrderingRunning(false);
+  const result = await stopJob(windowId, { reason: "Auto ordering stopped manually from the popup." });
+  return {
+    ...result,
+    ok: true,
+    auto_ordering_running: false,
+    message: result?.message === "Stopped active job."
+      ? "Auto ordering stopped and the active pre-submit job was released safely."
+      : "Auto ordering stopped. No new orders will be claimed until you confirm and start it again.",
+  };
 }
 
 function waitForTabComplete(tabId, timeoutMs = 30000) {
@@ -3089,7 +3143,7 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  setupAutoOrderAlarm().catch((error) => log(`Could not schedule automatic ordering: ${error.message}`));
+  setAutoOrderingRunning(false).catch((error) => log(`Could not reset automatic ordering at Chrome startup: ${error.message}`));
   forceStopActive().then((stopped) => {
     if (stopped) return;
     recoverAfterRuntimeRestart("Chrome startup", true)
@@ -3100,7 +3154,7 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  setupAutoOrderAlarm().catch((error) => log(`Could not schedule automatic ordering: ${error.message}`));
+  setAutoOrderingRunning(false).catch((error) => log(`Could not reset automatic ordering after extension install: ${error.message}`));
   forceStopActive().then((stopped) => {
     if (stopped) return;
     recoverAfterRuntimeRestart("extension reload").catch((error) => log(`Could not recover fulfilment after extension reload: ${error.message}`));
@@ -3196,8 +3250,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await setForceStop(false);
       return { ok: true };
     }
-    if (message.type === "START_NEXT") return startNextJob(windowId);
-    if (message.type === "START_BROWSERLESS") return startBrowserlessOrderRun(windowId);
+    if (message.type === "START_AUTO_ORDERING") return startAutoOrdering(windowId, message.confirmed === true);
+    if (message.type === "STOP_AUTO_ORDERING") return stopAutoOrdering(windowId);
+    if (message.type === "START_NEXT" || message.type === "START_BROWSERLESS") {
+      return { ok: false, confirmation_required: true, message: "Use Start Auto Ordering with the confirmation ticked." };
+    }
     if (message.type === "GET_BROWSERLESS_STATUS") return browserlessOrderStatus();
     if (message.type === "OPEN_BROWSERLESS_SESSION") return openBrowserlessSession();
     if (message.type === "REGISTER_CONTROL_WINDOW") {
@@ -3277,6 +3334,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "GET_ACTIVE_JOB") {
       if (await forceStopActive()) return { ok: true, activeJob: null, forceStopped: true };
       let { activeJob } = await getWindowState(windowId);
+      if (!await autoOrderingIsRunning() && !orderSubmitStarted(activeJob)) {
+        const recovered = await recoverSubmittedJobInWindow(windowId);
+        return {
+          ok: true,
+          activeJob: recovered?.activeJob || null,
+          autoOrderingRunning: false,
+          autoOrderingStopped: true,
+        };
+      }
       if (activeJob?.job && senderIsAmazon && senderTabId && !activeJob.targetTabId) {
         activeJob.targetTabId = senderTabId;
         await setWindowJob(windowId, activeJob, { reason: "bind_worker_tab_from_active_job_request" });
@@ -3431,13 +3497,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         editExistingAddress: message.editExistingAddress !== false,
         fulfilAvailableMixedAsin: message.fulfilAvailableMixedAsin === true,
         splitMixedAsinOrders: false,
-        autoOrderQueue: message.autoOrderQueue === true,
+        autoOrderQueue: false,
         browserlessOrderMode: message.browserlessOrderMode === true,
         pauseBeforePlaceOrder: message.pauseBeforePlaceOrder === true,
         preferRewardedLaterDelivery: message.preferRewardedLaterDelivery === true,
         deliveryLimitDays: Math.min(30, Math.max(1, Math.floor(Number(message.deliveryLimitDays) || 5))),
       });
-      await setupAutoOrderAlarm();
       return { ok: true };
     }
     if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "", senderPageInfo(sender, message.page || {}), message.amazonRecipient || "", message.amazonAsins || [], String(message.groupKey || ""), String(message.workerId || ""));

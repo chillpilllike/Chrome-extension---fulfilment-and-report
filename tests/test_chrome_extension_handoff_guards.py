@@ -25,13 +25,22 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
     def test_stateful_extension_api_requests_never_reuse_cached_claims(self) -> None:
         self.assertIn('cache: "no-store"', BACKGROUND)
 
-    def test_continuous_queue_toggle_and_alarm_are_guarded(self) -> None:
-        self.assertIn('id="autoOrderQueue"', POPUP_HTML)
-        self.assertIn('autoOrderQueue: autoOrderQueue.checked', POPUP_JS)
+    def test_auto_ordering_requires_manual_session_confirmation(self) -> None:
+        self.assertIn('id="autoOrderingConfirmed"', POPUP_HTML)
+        self.assertIn('id="autoOrderingToggle" disabled', POPUP_HTML)
+        self.assertIn('"Start Auto Ordering"', POPUP_JS)
+        self.assertIn('"Stop Auto Ordering"', POPUP_JS)
+        self.assertIn('confirmed: !isRunning && autoOrderingConfirmed.checked', POPUP_JS)
         self.assertIn('const AUTO_ORDER_ALARM = "nutricity-auto-order-queue"', BACKGROUND)
+        self.assertIn('chrome.storage.session.get({ autoOrderingRunning: false })', BACKGROUND)
+        self.assertIn('setAutoOrderingRunning(false)', BACKGROUND)
+        self.assertIn('if (!await autoOrderingIsRunning())', BACKGROUND)
+        self.assertIn('if (activeJob && !orderSubmitStarted(activeJob) && !await autoOrderingIsRunning())', BACKGROUND)
+        self.assertIn('if (!await autoOrderingIsRunning() && !orderSubmitStarted(activeJob))', BACKGROUND)
         self.assertIn('await activeOrderingInProgress()', BACKGROUND)
         self.assertIn('await startNextJob(null, { automatic: true })', BACKGROUND)
-        self.assertIn('autoOrderQueue: true', BACKGROUND)
+        self.assertNotIn('autoOrderQueue: true', BACKGROUND)
+        self.assertNotIn('setupAutoOrderAlarm().catch((error) => log(`Could not schedule automatic ordering', BACKGROUND)
 
     def test_legacy_multi_asin_split_is_forced_off(self) -> None:
         self.assertIn('splitMixedAsinOrders: false', BACKGROUND)
@@ -142,7 +151,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.139")
+        self.assertEqual(MANIFEST["version"], "0.1.140")
 
     def test_delivery_options_click_the_native_radio_before_the_label(self) -> None:
         helper_start = CONTENT.index("async function clickDeliveryRadioContext(context, label)")
@@ -406,12 +415,13 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('id="extensionVersion"', POPUP_HTML)
         self.assertIn("chrome.runtime.getManifest().version", POPUP_JS)
 
-    def test_popup_start_gives_immediate_background_worker_feedback(self) -> None:
-        self.assertIn('const startNextButton = document.querySelector("#start");', POPUP_JS)
-        self.assertIn("startNextButton.disabled = true;", POPUP_JS)
-        self.assertIn("The Amazon worker is running in the background.", POPUP_JS)
+    def test_popup_start_button_turns_into_stop_and_greys_out_without_tick(self) -> None:
+        self.assertIn('const autoOrderingToggle = document.querySelector("#autoOrderingToggle");', POPUP_JS)
+        self.assertIn('autoOrderingToggle.disabled = !autoOrderingRunning && !autoOrderingConfirmed.checked;', POPUP_JS)
+        self.assertIn('autoOrderingToggle.textContent = autoOrderingRunning ? "Stop Auto Ordering" : "Start Auto Ordering";', POPUP_JS)
+        self.assertIn('type: isRunning ? "STOP_AUTO_ORDERING" : "START_AUTO_ORDERING"', POPUP_JS)
+        self.assertIn('autoOrderingConfirmed.checked = false', POPUP_JS)
         self.assertIn("await refresh();", POPUP_JS)
-        self.assertIn("startNextButton.disabled = false;", POPUP_JS)
 
     def test_reporting_evidence_cannot_regress_during_same_job_refresh(self) -> None:
         set_window_start = BACKGROUND.index("async function setWindowJob")

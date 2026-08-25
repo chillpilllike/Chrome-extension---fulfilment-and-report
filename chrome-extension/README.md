@@ -16,7 +16,9 @@
 2. Log in to the local fulfilment app in the same Chrome profile.
 3. In the app, set **Ordering engine** to **Chrome Extension**.
 4. Select the order lines and click **Place Selected** or **Club Place**. This queues Chrome jobs.
-5. Open the extension popup and click **Start next queued order**, or enable **Continuously process compatible queued orders**.
+5. Open the extension popup, tick **I confirm this Amazon account is ready for auto ordering**, then click **Start Auto Ordering**.
+
+Auto ordering never starts merely because Chrome opened or the extension reloaded. The confirmation is required for each browser session. While it is running, **Start Auto Ordering** becomes **Stop Auto Ordering**. Stopping clears the session permission, safely releases an active pre-submit job, and prevents any new claim until the confirmation is ticked and Start is clicked again.
 
 The extension opens each Amazon product page, pauses when coupon or promotion text is found, adds items to cart, proceeds through checkout, edits only the full name to `Nutricity <OdooOrderNumber>`, clicks **Place your order**, and reports the Amazon order ID back to the local app when it can detect it.
 

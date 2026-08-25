@@ -5,7 +5,8 @@ const deliveryLimitDays = document.querySelector("#deliveryLimitDays");
 const editExistingAddress = document.querySelector("#editExistingAddress");
 const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAsin");
 const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
-const autoOrderQueue = document.querySelector("#autoOrderQueue");
+const autoOrderingConfirmed = document.querySelector("#autoOrderingConfirmed");
+const autoOrderingToggle = document.querySelector("#autoOrderingToggle");
 const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
 const pauseBeforePlaceOrder = document.querySelector("#pauseBeforePlaceOrder");
 const preferRewardedLaterDelivery = document.querySelector("#preferRewardedLaterDelivery");
@@ -62,7 +63,6 @@ function hydrateSettingsValues(settings = {}) {
   editExistingAddress.checked = settings.editExistingAddress !== false;
   fulfilAvailableMixedAsin.checked = settings.fulfilAvailableMixedAsin === true;
   splitMixedAsinOrders.checked = false;
-  autoOrderQueue.checked = settings.autoOrderQueue === true;
   browserlessOrderMode.checked = settings.browserlessOrderMode === true;
   pauseBeforePlaceOrder.checked = settings.pauseBeforePlaceOrder === true;
   preferRewardedLaterDelivery.checked = settings.preferRewardedLaterDelivery === true;
@@ -78,7 +78,6 @@ function hasSettingsPayload(state) {
     Object.hasOwn(state, "editExistingAddress") ||
     Object.hasOwn(state, "fulfilAvailableMixedAsin") ||
     Object.hasOwn(state, "splitMixedAsinOrders") ||
-    Object.hasOwn(state, "autoOrderQueue") ||
     Object.hasOwn(state, "browserlessOrderMode") ||
     Object.hasOwn(state, "pauseBeforePlaceOrder") ||
     Object.hasOwn(state, "preferRewardedLaterDelivery")
@@ -95,12 +94,11 @@ function loadSavedSettings() {
       editExistingAddress: true,
       fulfilAvailableMixedAsin: false,
       splitMixedAsinOrders: false,
-      autoOrderQueue: true,
       browserlessOrderMode: false,
       pauseBeforePlaceOrder: false,
       preferRewardedLaterDelivery: false,
     }, (settings) => {
-      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, autoOrderQueue, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) {
+      if (!chrome.runtime.lastError && !settingsHydrated && !settingsDirty && ![apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) {
         hydrateSettingsValues(settings);
         settingsHydrated = true;
       }
@@ -125,7 +123,7 @@ function registerControlWindow() {
   });
 }
 
-[apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, autoOrderQueue, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].forEach((input) => {
+[apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].forEach((input) => {
   input.addEventListener("input", () => {
     settingsDirty = true;
   });
@@ -148,7 +146,7 @@ function updateModeNotice() {
 browserlessOrderMode.addEventListener("change", updateModeNotice);
 
 function syncSettingsInputs(state) {
-  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, autoOrderQueue, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) return;
+  if (!hasSettingsPayload(state) || settingsHydrated || settingsDirty || [apiBase, adminToken, cardLast4Preference, deliveryLimitDays, editExistingAddress, fulfilAvailableMixedAsin, browserlessOrderMode, pauseBeforePlaceOrder, preferRewardedLaterDelivery].includes(document.activeElement)) return;
   hydrateSettingsValues(state);
   settingsHydrated = true;
 }
@@ -162,7 +160,6 @@ function settingsPayload() {
     editExistingAddress: editExistingAddress.checked,
     fulfilAvailableMixedAsin: fulfilAvailableMixedAsin.checked,
     splitMixedAsinOrders: false,
-    autoOrderQueue: autoOrderQueue.checked,
     browserlessOrderMode: browserlessOrderMode.checked,
     pauseBeforePlaceOrder: pauseBeforePlaceOrder.checked,
     preferRewardedLaterDelivery: preferRewardedLaterDelivery.checked,
@@ -416,6 +413,12 @@ async function refresh() {
     }
     syncSettingsInputs(state);
     const job = state.activeJob?.job;
+    const autoOrderingRunning = state.autoOrderingRunning === true;
+    if (autoOrderingRunning) autoOrderingConfirmed.checked = true;
+    autoOrderingToggle.textContent = autoOrderingRunning ? "Stop Auto Ordering" : "Start Auto Ordering";
+    autoOrderingToggle.classList.toggle("danger", autoOrderingRunning);
+    autoOrderingToggle.disabled = !autoOrderingRunning && !autoOrderingConfirmed.checked;
+    autoOrderingConfirmed.disabled = autoOrderingRunning;
     pauseResume.textContent = state.activeJob?.paused ? "Resume" : "Pause";
     updateModeNotice();
     pauseResume.disabled = !job;
@@ -506,38 +509,42 @@ document.querySelector("#reloadExtension").addEventListener("click", async () =>
   setTimeout(() => chrome.runtime.reload(), 50);
 });
 
-const startNextButton = document.querySelector("#start");
+autoOrderingConfirmed.addEventListener("change", () => {
+  autoOrderingToggle.disabled = !autoOrderingConfirmed.checked;
+});
 
-startNextButton.addEventListener("click", async () => {
-  startNextButton.disabled = true;
-  setStatus(browserlessOrderMode.checked ? "Starting background order placement..." : "Starting next queued order...");
+autoOrderingToggle.addEventListener("click", async () => {
+  const state = await send({ type: "GET_STATE" }).catch(() => ({}));
+  const isRunning = state?.autoOrderingRunning === true;
+  autoOrderingToggle.disabled = true;
+  setStatus(isRunning ? "Stopping auto ordering..." : "Starting auto ordering...");
   try {
-    await send({ type: "SET_API_BASE", ...settingsPayload() });
-    settingsDirty = false;
-    await send({ type: "CLEAR_FORCE_STOP" });
-    const result = await send({ type: browserlessOrderMode.checked ? "START_BROWSERLESS" : "START_NEXT" });
+    if (!isRunning) {
+      if (!autoOrderingConfirmed.checked) {
+        setStatus("Tick the confirmation before starting auto ordering.");
+        return;
+      }
+      await send({ type: "SET_API_BASE", ...settingsPayload() });
+      settingsDirty = false;
+    }
+    const result = await send({
+      type: isRunning ? "STOP_AUTO_ORDERING" : "START_AUTO_ORDERING",
+      confirmed: !isRunning && autoOrderingConfirmed.checked,
+    });
     if (result.targetWindowId) {
       targetWindowId = result.targetWindowId;
       registerControlWindow();
     }
-    const groupKey = result?.activeJob?.job?.group_key || result?.next_group_key || "";
-    setStatus(
-      result.message
-      || (result.ok && groupKey
-        ? `Working on ${groupKey}. The Amazon worker is running in the background.`
-        : result.ok ? "Order worker started in the background." : "Could not start."),
-    );
+    if (isRunning || result.auto_ordering_running !== true) autoOrderingConfirmed.checked = false;
+    setStatus(result.message || (result.ok ? (isRunning ? "Auto ordering stopped." : "Auto ordering started.") : "Could not update auto ordering."));
     await refresh();
   } catch (error) {
-    setStatus(error.message || "Could not start queued order.");
+    setStatus(error.message || "Could not update auto ordering.");
   } finally {
-    startNextButton.disabled = false;
+    const latest = await send({ type: "GET_STATE" }).catch(() => ({}));
+    const running = latest?.autoOrderingRunning === true;
+    autoOrderingToggle.disabled = !running && !autoOrderingConfirmed.checked;
   }
-});
-
-document.querySelector("#stop").addEventListener("click", async () => {
-  const result = await send({ type: "STOP_JOB" });
-  setStatus(result.message);
 });
 
 forceStop.addEventListener("click", async () => {
@@ -652,16 +659,12 @@ async function runPopupRecoveryAction() {
       return;
     }
     await chrome.storage.local.set({ [lockKey]: { action, startedAt: Date.now() } });
-    setStatus("Stopping stale active job and starting the next queued order...");
+    setStatus("Stopping stale active job. Manual confirmation is required before auto ordering can restart...");
     try {
       await send({ type: "STOP_JOB" }).catch(() => null);
-      await send({ type: "CLEAR_FORCE_STOP" }).catch(() => null);
-      const result = await send({ type: browserlessOrderMode.checked ? "START_BROWSERLESS" : "START_NEXT" });
-      if (result?.targetWindowId) {
-        targetWindowId = result.targetWindowId;
-        registerControlWindow();
-      }
-      setStatus(result?.message || (result?.ok ? "Started." : "Could not start."));
+      autoOrderingConfirmed.checked = false;
+      autoOrderingToggle.disabled = true;
+      setStatus("Stopped. Tick the confirmation, then click Start Auto Ordering when you are ready.");
       await refresh();
     } finally {
       history.replaceState(null, "", location.pathname);
