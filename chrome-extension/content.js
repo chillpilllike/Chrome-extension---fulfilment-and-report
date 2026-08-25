@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-25-one-time-purchase-only-v112";
+const CONTENT_SCRIPT_BUILD = "2026-08-25-account-aware-subscriptions-v113";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -942,10 +942,7 @@ function productPriceSnapshot() {
     .flatMap((root) => priceCandidatesIn(root, snsPriceSelectors))
     .filter((value) => Number(value) > 0);
   const sns = snsPrices.length ? Math.min(...snsPrices) : subscribeAndSavePriceFromText(document.body.innerText);
-  // Fulfilment orders are always one-time purchases. Keep the Subscribe & Save
-  // price for diagnostics only; it must never become the price used for pack,
-  // profitability, quantity, cart, or checkout decisions.
-  const best = regular || 0;
+  const best = sns && regular ? Math.min(sns, regular) : sns || regular || 0;
   return { regular, sns, best };
 }
 
@@ -2640,16 +2637,6 @@ async function activateOneTimePurchaseOption() {
   return oneTimePurchaseIsActive() || await waitUntil(oneTimePurchaseIsActive, 3000, 250);
 }
 
-async function ensureOneTimePurchaseForFulfilment() {
-  const oneTimeAccordion = findOneTimePurchaseAccordionTarget();
-  if (oneTimeAccordion && !oneTimePurchaseIsActive()) {
-    const activated = await activateOneTimePurchaseOption();
-    if (!activated) return false;
-  }
-  if (subscribeAndSaveIsActive()) return false;
-  return Boolean(await waitUntil(findRegularAddToCartTarget, 8000, 250));
-}
-
 function dispatchAmazonClickSequence(element) {
   const pointerEvent = typeof PointerEvent === "function" ? PointerEvent : MouseEvent;
   element.dispatchEvent(new pointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerType: "mouse", view: window }));
@@ -3679,16 +3666,6 @@ async function handleProduct(activeJob) {
     return;
   }
 
-  const oneTimeReady = await ensureOneTimePurchaseForFulfilment();
-  if (!oneTimeReady) {
-    const error = new Error(`Amazon did not expose a verified One-time purchase option for ASIN ${expectedItem.asin}. Fulfilment paused without selecting Subscribe & Save.`);
-    error.failureCode = "";
-    throw error;
-  }
-  activeJob.subscribeAndSave = false;
-  activeJob.subscriptionCartAsins = [];
-  await setActiveJob(activeJob, { reason: "enforce_one_time_purchase_only" });
-
   const savingsApplied = await applyAdditionalSavings("regular");
   if (savingsApplied) {
     await waitForStableDom(900, 6000);
@@ -3702,21 +3679,73 @@ async function handleProduct(activeJob) {
   }
 
   const priceSnapshot = productPriceSnapshot();
-  const priceForVariantDecision = priceSnapshot.regular;
+  const mixedAsinOrder = isMixedAsinOrder(activeJob);
+  const priceForVariantDecision = mixedAsinOrder ? (priceSnapshot.regular || priceSnapshot.best) : priceSnapshot.best;
   const switchedVariant = await selectCheapestCountVariant(activeJob, item, priceForVariantDecision);
   if (switchedVariant) return;
   const purchaseItem = selectedVariantItem(activeJob, item);
+  const mixedAsinAfterVariant = isMixedAsinOrder(activeJob);
   const selectionNote = variantSelectionNote(item, purchaseItem);
   if (selectionNote) {
     showPanel("Pack variant found", `${selectionNote} Proceeding with this option.`, null, null);
     await sleep(1800);
   }
-  const priceForDecision = priceSnapshot.regular;
+  const accountExperience = amazonAccountExperience();
+  if (activeJob.amazonAccountExperience !== accountExperience) {
+    activeJob.amazonAccountExperience = accountExperience;
+    await setActiveJob(activeJob, { reason: "record_product_account_experience" });
+  }
+  const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular && priceSnapshot.sns < priceSnapshot.regular;
+  const consumerMixedSubscription = mixedAsinAfterVariant && accountExperience === "consumer";
+  const businessOrUnknownMixed = mixedAsinAfterVariant && accountExperience !== "consumer";
+  const mixedSnsFallbackAsins = Array.isArray(activeJob.mixedSnsOneTimeFallbackAsins)
+    ? activeJob.mixedSnsOneTimeFallbackAsins.map((value) => String(value || "").toUpperCase())
+    : [];
+  const mixedSnsFallbackRecorded = consumerMixedSubscription
+    && mixedSnsFallbackAsins.includes(String(purchaseItem.asin || "").toUpperCase());
+  let useSubscribeAndSave = Boolean(snsIsCheaper && !businessOrUnknownMixed && !mixedSnsFallbackRecorded);
+
+  if (snsIsCheaper && businessOrUnknownMixed) {
+    showPanel(
+      "Business multi-item checkout",
+      "Using One-time purchase because Business multi-ASIN orders must stay in the normal Amazon cart.",
+      null,
+      null,
+    );
+  }
+  if (useSubscribeAndSave && consumerMixedSubscription) {
+    const snsActivated = await activateSubscribeAndSaveOption();
+    if (snsActivated) await waitUntil(snsQuantityControlVisible, 5000, 250);
+    if (!findSubscribeAddToCartTarget()) {
+      activeJob.mixedSnsOneTimeFallbackAsins = [...new Set([
+        ...mixedSnsFallbackAsins,
+        String(purchaseItem.asin || "").toUpperCase(),
+      ].filter(Boolean))];
+      await setActiveJob(activeJob, { reason: "persist_consumer_mixed_sns_one_time_fallback" });
+      useSubscribeAndSave = false;
+      showPanel(
+        "Consumer multi-item checkout",
+        "Subscribe & Save is cheaper, but Amazon did not expose Add subscription to cart for this item. Using One-time purchase for this item without opening a separate checkout.",
+        null,
+        null,
+      );
+    }
+  }
+  if (!useSubscribeAndSave && !oneTimePurchaseIsActive()) {
+    const oneTimeActivated = await activateOneTimePurchaseOption();
+    if (!oneTimeActivated && subscribeAndSaveIsActive()) {
+      const error = new Error("Amazon retained Subscribe & Save when this item requires One-time purchase. Fulfilment paused before adding anything.");
+      error.failureCode = "";
+      throw error;
+    }
+  }
+
+  const priceForDecision = useSubscribeAndSave ? priceSnapshot.sns : (priceSnapshot.regular || priceSnapshot.best);
   await recordAmazonPrice(
     activeJob,
     item,
     priceForDecision,
-    "product",
+    useSubscribeAndSave ? (consumerMixedSubscription ? "subscribe-save-cart" : "subscribe-save") : "product",
     purchaseItem,
   );
   const quantity = Number(purchaseItem.quantity || 1);
@@ -3740,7 +3769,13 @@ async function handleProduct(activeJob) {
     }
   }
 
-  {
+  const subscribed = useSubscribeAndSave
+    ? await applySubscribeAndSaveIfCheaper(purchaseItem.quantity, activeJob, { requireCartAdd: consumerMixedSubscription })
+    : false;
+  if (!subscribed) {
+    if (useSubscribeAndSave) {
+      throw new Error(`Subscribe & Save is cheaper (${moneyText(priceSnapshot.sns)} vs ${moneyText(priceSnapshot.regular)}), but the extension did not complete the Subscribe & Save selection. Fulfilment paused before changing regular quantity.`);
+    }
     const quantitySet = await setQuantity(purchaseItem.quantity, "regular");
     if (!quantitySet) {
       const requestedQuantity = Math.max(1, Math.round(Number(purchaseItem.quantity || 1)));
@@ -3845,11 +3880,21 @@ async function handleAddClicked(activeJob) {
 }
 
 async function handleSubscribeCheckout(activeJob) {
-  await pauseForManualCheckout(
-    activeJob,
-    "Blocked a legacy Subscribe & Save checkout. Nutricity fulfilment permits One-time purchase only; reset this attempt before retrying.",
-    "product",
-  );
+  markCheckoutStarted(activeJob);
+  activeJob.subscribeAndSave = true;
+  if (/\/checkout/i.test(location.pathname) || document.querySelector("#placeOrder, input.place-your-order-button, [data-checkout-view-modal], #checkout-primary-continue-button-id, input[aria-label='Full name']")) {
+    activeJob.stage = "checkout";
+    await setActiveJob(activeJob);
+    await handleCheckout(activeJob);
+    return;
+  }
+  showPanel("Nutricity fulfilment", "Subscribe & Save clicked. Waiting for checkout.", null, null);
+  await sleep(2500);
+  const latest = await getActiveJob();
+  if (latest?.stage === "subscribe_checkout" && !/\/checkout/i.test(location.pathname)) {
+    latest.stage = "checkout";
+    await setActiveJob(latest);
+  }
 }
 
 async function retryProvenMissingCartItemOnce(activeJob, itemIndex, asin, expectedQuantity) {
@@ -3980,11 +4025,30 @@ async function handleCart(activeJob) {
     }
   }
   if (activeJob.subscribeAndSave || activeJob.stage === "subscribe_checkout") {
-    await pauseForManualCheckout(
-      activeJob,
-      "Blocked a legacy Subscribe & Save cart. Nutricity fulfilment permits One-time purchase only; reset this attempt before retrying.",
-      "product",
-    );
+    if (cartIsVisiblyEmpty()) {
+      const item = activeJob.job?.items?.[Number(activeJob.itemIndex || 0)] || activeJob.job?.items?.[0] || null;
+      const purchaseItem = item ? selectedVariantItem(activeJob, item) : item;
+      const asin = purchaseItem?.asin || item?.asin || "unknown";
+      const attempts = Number(activeJob.emptySubscribeCartRetryCount || 0);
+      if (attempts < 1 && asin !== "unknown") {
+        activeJob.emptySubscribeCartRetryCount = attempts + 1;
+        activeJob.stage = "product";
+        activeJob.subscribeAndSave = false;
+        await setActiveJob(activeJob, { allowStageRegression: true });
+        showPanel("Nutricity fulfilment", `Subscribe & Save returned to an empty cart for ASIN ${asin}. Retrying the product page once before reporting anything.`, null, null);
+        location.href = `https://www.amazon.com/dp/${asin}?th=1`;
+        return;
+      }
+      await pauseForManualCheckout(
+        activeJob,
+        `Subscribe & Save returned to an empty Amazon cart for ASIN ${asin}. The product page was reachable, so this was not marked Missing.`,
+        "product",
+      );
+      return;
+    }
+    activeJob.stage = "checkout";
+    await setActiveJob(activeJob);
+    showPanel("Nutricity fulfilment", "Subscribe & Save is already in checkout flow. Not clearing cart.", null, null);
     return;
   }
   if (activeJob.stage === "clear_cart") {
@@ -6887,18 +6951,6 @@ async function handleCheckoutLimitPurchase(activeJob) {
 }
 
 async function handleCheckout(activeJob) {
-  if (
-    activeJob?.subscribeAndSave ||
-    activeJob?.stage === "subscribe_checkout" ||
-    (activeJob?.subscriptionCartAsins || []).length
-  ) {
-    await pauseForManualCheckout(
-      activeJob,
-      "Blocked Subscribe & Save before checkout actions. Nutricity fulfilment permits One-time purchase only; reset this attempt before retrying.",
-      "product",
-    );
-    return;
-  }
   await waitForElement([
     "#placeOrder",
     "input.place-your-order-button",
