@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.main import (
     normalize_package_pickup_confirmation_status,
@@ -7,6 +8,7 @@ from app.main import (
     package_pickup_card_date,
     package_pickup_delivery_timestamp,
     package_pickup_scan_history,
+    package_pickup_order_readiness,
     package_tracker_delivery_date,
     package_tracker_delivery_kind,
     record_package_pickup_scan_event,
@@ -74,6 +76,9 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
                 self.calls.append((sql, tuple(params or ())))
                 return self
 
+            def fetchall(self):
+                return []
+
         connection = FakeConnection()
         record_package_pickup_scan_event(
             connection,
@@ -96,6 +101,27 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
         self.assertEqual(insert_params[7], "111-2222222-3333333")
         self.assertEqual(insert_params[8], "TBA333598452175")
         self.assertEqual(insert_params[9], "Nutricity NC22982")
+
+    @patch("app.main.dispatch_related_parts")
+    def test_order_readiness_requires_every_related_package(self, related_parts) -> None:
+        related_parts.return_value = [
+            {"received": True, "scan_code": "TBA-FIRST"},
+            {"received": False, "scan_code": "TBA-LATER", "delivery_label": "Arriving tomorrow"},
+        ]
+        readiness = package_pickup_order_readiness(object(), {"odoo_order_name": "NC23000"})
+        self.assertFalse(readiness["ready_to_ship"])
+        self.assertEqual(readiness["received_packages"], 1)
+        self.assertEqual(readiness["remaining_packages"], 1)
+        self.assertEqual(readiness["pending_packages"][0]["shipment_id"], "TBA-LATER")
+        self.assertIn("Arriving tomorrow", readiness["message"])
+
+    @patch("app.main.dispatch_related_parts")
+    def test_complete_order_is_ready_to_ship(self, related_parts) -> None:
+        related_parts.return_value = [{"received": True}, {"received": True}]
+        readiness = package_pickup_order_readiness(object(), {"odoo_order_name": "NC23000"})
+        self.assertTrue(readiness["ready_to_ship"])
+        self.assertEqual(readiness["received_packages"], 2)
+        self.assertIn("can be shipped", readiness["message"])
 
     def test_delivery_timestamp_uses_tracking_record_instead_of_confirmation_update(self) -> None:
         self.assertEqual(

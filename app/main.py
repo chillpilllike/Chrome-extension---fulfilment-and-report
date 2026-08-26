@@ -1274,6 +1274,12 @@ def init_db() -> None:
                 amazon_order_id TEXT,
                 shipment_id TEXT,
                 recipient_ref TEXT,
+                order_ready INTEGER NOT NULL DEFAULT 0,
+                order_total_packages INTEGER NOT NULL DEFAULT 0,
+                order_received_packages INTEGER NOT NULL DEFAULT 0,
+                order_remaining_packages INTEGER NOT NULL DEFAULT 0,
+                order_readiness_message TEXT,
+                remaining_packages_json TEXT NOT NULL DEFAULT '[]',
                 message TEXT,
                 scanned_at TEXT NOT NULL
             );
@@ -1765,6 +1771,17 @@ def init_db() -> None:
             "updated_at": "ALTER TABLE package_pickup_delivery_records ADD COLUMN updated_at TEXT",
         }.items():
             if column not in existing_pickup_delivery_cols:
+                conn.execute(ddl)
+        existing_pickup_scan_cols = {r["name"] for r in conn.execute("PRAGMA table_info(package_pickup_scan_events)").fetchall()}
+        for column, ddl in {
+            "order_ready": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_ready INTEGER NOT NULL DEFAULT 0",
+            "order_total_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_total_packages INTEGER NOT NULL DEFAULT 0",
+            "order_received_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_received_packages INTEGER NOT NULL DEFAULT 0",
+            "order_remaining_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_remaining_packages INTEGER NOT NULL DEFAULT 0",
+            "order_readiness_message": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_readiness_message TEXT",
+            "remaining_packages_json": "ALTER TABLE package_pickup_scan_events ADD COLUMN remaining_packages_json TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if column not in existing_pickup_scan_cols:
                 conn.execute(ddl)
         existing_dispatch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_dispatch_packages)").fetchall()}
         if "canonical_scan_code" not in existing_dispatch_cols:
@@ -6956,7 +6973,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
             """
             SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                    odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
-                   scan_status, tote_code, last_scanned_at, placed_at, updated_at, scan_count,
+                   scan_status, tote_code, received_at, last_scanned_at, placed_at, updated_at, scan_count,
                    asins_json, products_json,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
             FROM amazon_dispatch_packages
@@ -6983,7 +7000,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
             """
             SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
                    odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
-                   scan_status, tote_code, last_scanned_at, placed_at, updated_at, scan_count,
+                   scan_status, tote_code, received_at, last_scanned_at, placed_at, updated_at, scan_count,
                    asins_json, products_json,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
             FROM amazon_dispatch_packages
@@ -7005,7 +7022,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         part["rack_key"] = dispatch_rack_key_for_package(part)
         part["rack_label"] = dispatch_rack_label_for_package(part)
         part["delivery_label"] = dispatch_delivery_label(part)
-        part["received"] = clean_text(part.get("scan_status")) not in {"", "pending"}
+        part["received"] = clean_text(part.get("scan_status")) not in {"", "pending"} or bool(clean_text(part.get("received_at")))
         part["scan_label"] = "Received / scanned" if part["received"] else "Not scanned yet"
         try:
             covered_line_ids.update(int(value) for value in json.loads(part.get("order_line_ids_json") or "[]") if int(value or 0) > 0)
@@ -31861,17 +31878,71 @@ def ensure_package_pickup_scan_history_table(conn: Any) -> None:
             amazon_order_id TEXT,
             shipment_id TEXT,
             recipient_ref TEXT,
+            order_ready INTEGER NOT NULL DEFAULT 0,
+            order_total_packages INTEGER NOT NULL DEFAULT 0,
+            order_received_packages INTEGER NOT NULL DEFAULT 0,
+            order_remaining_packages INTEGER NOT NULL DEFAULT 0,
+            order_readiness_message TEXT,
+            remaining_packages_json TEXT NOT NULL DEFAULT '[]',
             message TEXT,
             scanned_at TEXT NOT NULL
         )
         """
     )
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(package_pickup_scan_events)").fetchall()}
+    for column, ddl in {
+        "order_ready": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_ready INTEGER NOT NULL DEFAULT 0",
+        "order_total_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_total_packages INTEGER NOT NULL DEFAULT 0",
+        "order_received_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_received_packages INTEGER NOT NULL DEFAULT 0",
+        "order_remaining_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_remaining_packages INTEGER NOT NULL DEFAULT 0",
+        "order_readiness_message": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_readiness_message TEXT",
+        "remaining_packages_json": "ALTER TABLE package_pickup_scan_events ADD COLUMN remaining_packages_json TEXT NOT NULL DEFAULT '[]'",
+    }.items():
+        if column not in existing_cols:
+            conn.execute(ddl)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_package_pickup_scan_events_scanned ON package_pickup_scan_events(scanned_at DESC)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_package_pickup_scan_events_store_scanned ON package_pickup_scan_events(store_id, scanned_at DESC)"
     )
+
+
+def package_pickup_order_readiness(conn: Any, package: dict[str, Any]) -> dict[str, Any]:
+    """Describe whether every physical package linked to this Odoo order is on hand."""
+    related_parts = dispatch_related_parts(conn, package)
+    if not related_parts:
+        related_parts = [{**package, "received": bool(clean_text(package.get("received_at")))}]
+    total = len(related_parts)
+    received = sum(1 for part in related_parts if part.get("received"))
+    pending = [part for part in related_parts if not part.get("received")]
+    pending_packages = [
+        {
+            "shipment_id": normalize_dispatch_scan_code(part.get("canonical_scan_code") or part.get("scan_code")),
+            "amazon_order_id": clean_text(part.get("amazon_order_id")),
+            "recipient_ref": clean_text(part.get("recipient_ref")),
+            "expected": clean_text(part.get("delivery_label") or part.get("package_status") or part.get("promise")) or "Delivery date not captured",
+        }
+        for part in pending
+    ]
+    ready = bool(total and received >= total)
+    if ready:
+        message = f"All {total} package{'s' if total != 1 else ''} received. Full Odoo order can be shipped."
+    else:
+        expected = "; ".join(dict.fromkeys(item["expected"] for item in pending_packages))
+        message = f"Hold order: {len(pending)} of {total} package{'s are' if total != 1 else ' is'} still pending"
+        if expected:
+            message += f" ({expected})"
+        message += "."
+    return {
+        "ready_to_ship": ready,
+        "status": "ready_to_ship" if ready else "hold",
+        "total_packages": total,
+        "received_packages": received,
+        "remaining_packages": len(pending),
+        "pending_packages": pending_packages,
+        "message": message,
+    }
 
 
 def record_package_pickup_scan_event(
@@ -31885,16 +31956,20 @@ def record_package_pickup_scan_event(
     package: Optional[dict[str, Any]] = None,
     duplicate: bool = False,
     store_id: Optional[int] = None,
+    order_readiness: Optional[dict[str, Any]] = None,
 ) -> None:
     ensure_package_pickup_scan_history_table(conn)
     package = package or {}
+    order_readiness = order_readiness or {}
     shipment_id = normalize_dispatch_scan_code(package.get("canonical_scan_code") or package.get("scan_code"))
     conn.execute(
         """
         INSERT INTO package_pickup_scan_events
             (store_id, package_id, scan_code, result_status, matched, duplicate,
-             odoo_order_name, amazon_order_id, shipment_id, recipient_ref, message, scanned_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             odoo_order_name, amazon_order_id, shipment_id, recipient_ref,
+             order_ready, order_total_packages, order_received_packages, order_remaining_packages,
+             order_readiness_message, remaining_packages_json, message, scanned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(package.get("store_id") or store_id or 0),
@@ -31907,6 +31982,12 @@ def record_package_pickup_scan_event(
             clean_text(package.get("amazon_order_id")),
             shipment_id,
             clean_text(package.get("recipient_ref")) or (f"Nutricity {clean_text(package.get('odoo_order_name'))}".strip() if package else ""),
+            1 if order_readiness.get("ready_to_ship") else 0,
+            int(order_readiness.get("total_packages") or 0),
+            int(order_readiness.get("received_packages") or 0),
+            int(order_readiness.get("remaining_packages") or 0),
+            clean_text(order_readiness.get("message")),
+            json.dumps(order_readiness.get("pending_packages") or []),
             clean_text(message),
             scanned_at,
         ),
@@ -31937,11 +32018,12 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
             f"""
             SELECT
                 COUNT(*) AS total_scans,
-                COUNT(*) FILTER (WHERE matched=1) AS matched,
+                COUNT(*) FILTER (WHERE matched=1 AND duplicate=0) AS matched,
                 COUNT(*) FILTER (WHERE matched=0) AS unsuccessful,
                 COUNT(*) FILTER (WHERE duplicate=1) AS duplicates,
-                COUNT(DISTINCT package_id) FILTER (WHERE matched=1 AND package_id IS NOT NULL) AS unique_packages,
-                COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1) AS odoo_orders_found
+                COUNT(DISTINCT package_id) FILTER (WHERE matched=1 AND duplicate=0 AND package_id IS NOT NULL) AS unique_packages,
+                COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0) AS odoo_orders_found,
+                COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0 AND order_ready=1) AS ready_to_ship_orders
             FROM package_pickup_scan_events
             WHERE scanned_at>=? AND scanned_at<? {store_sql}
             """,
@@ -31950,7 +32032,9 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
         events = rows_to_dicts(conn.execute(
             f"""
             SELECT id, store_id, package_id, scan_code, result_status, matched, duplicate,
-                   odoo_order_name, amazon_order_id, shipment_id, recipient_ref, message, scanned_at
+                   odoo_order_name, amazon_order_id, shipment_id, recipient_ref,
+                   order_ready, order_total_packages, order_received_packages, order_remaining_packages,
+                   order_readiness_message, remaining_packages_json, message, scanned_at
             FROM package_pickup_scan_events
             WHERE scanned_at>=? AND scanned_at<? {store_sql}
             ORDER BY scanned_at DESC, id DESC
@@ -31969,8 +32053,9 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
             "duplicates": int(summary_row.get("duplicates") or 0),
             "unique_packages": int(summary_row.get("unique_packages") or 0),
             "odoo_orders_found": int(summary_row.get("odoo_orders_found") or 0),
+            "ready_to_ship_orders": int(summary_row.get("ready_to_ship_orders") or 0),
         },
-        "events": events,
+        "events": [{**event, "pending_packages": parse_json_list_value(event.get("remaining_packages_json"))} for event in events],
     }
 
 
@@ -32096,6 +32181,8 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             """,
             (first_scanned_at, merged_codes, now, package_id),
         )
+        package = {**package, "received_at": first_scanned_at, "scanned_codes_json": merged_codes}
+        order_readiness = package_pickup_order_readiness(conn, package)
         scan_date = package_pickup_business_date(first_scanned_at)
         if not duplicate and scan_date:
             package_store_id = int(package.get("store_id") or 0)
@@ -32121,6 +32208,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             "delivered_at": delivered_at,
             "pickup_scanned_at": first_scanned_at,
             "pickup_scan_date": scan_date,
+            "order_readiness": order_readiness,
         }
         duplicate_text = " already scanned; original pickup time retained" if duplicate else " scanned successfully"
         success_message = f"{result['odoo_order_name'] or result['amazon_order_id']}{duplicate_text}."
@@ -32134,6 +32222,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             scanned_at=now,
             package=package,
             store_id=payload.store_id,
+            order_readiness=order_readiness,
         )
     fast_page_cache_clear_matching({"package-pickups"})
     return {

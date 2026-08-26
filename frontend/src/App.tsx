@@ -648,6 +648,17 @@ type PackagePickupScanPackage = {
   delivered_at: string
   pickup_scanned_at: string
   pickup_scan_date: string
+  order_readiness?: PackagePickupOrderReadiness
+}
+
+type PackagePickupOrderReadiness = {
+  ready_to_ship: boolean
+  status: "ready_to_ship" | "hold"
+  total_packages: number
+  received_packages: number
+  remaining_packages: number
+  pending_packages: Array<{ shipment_id?: string; amazon_order_id?: string; recipient_ref?: string; expected: string }>
+  message: string
 }
 
 type PackagePickupScanEntry = {
@@ -684,6 +695,12 @@ type PackagePickupScanHistoryEvent = {
   recipient_ref: string
   message: string
   scanned_at: string
+  order_ready: boolean | number
+  order_total_packages: number
+  order_received_packages: number
+  order_remaining_packages: number
+  order_readiness_message: string
+  pending_packages?: PackagePickupOrderReadiness["pending_packages"]
 }
 
 type PackagePickupScanHistory = {
@@ -697,6 +714,7 @@ type PackagePickupScanHistory = {
     duplicates: number
     unique_packages: number
     odoo_orders_found: number
+    ready_to_ship_orders: number
   }
   events: PackagePickupScanHistoryEvent[]
 }
@@ -6455,7 +6473,7 @@ function PackagePickupPage({
   const [pickupScannerMode, setPickupScannerMode] = useState<"camera" | "hardware">("camera")
   const [pickupScannerStatus, setPickupScannerStatus] = useState("")
   const [pickupScannerError, setPickupScannerError] = useState("")
-  const [pickupScannerFlash, setPickupScannerFlash] = useState<"success" | "error" | "">("")
+  const [pickupScannerFlash, setPickupScannerFlash] = useState<"success" | "duplicate" | "error" | "">("")
   const [pickupScanEntries, setPickupScanEntries] = useState<PackagePickupScanEntry[]>([])
   const [lastPickupScanEntries, setLastPickupScanEntries] = useState<PackagePickupScanEntry[]>(() => {
     try {
@@ -6545,7 +6563,7 @@ function PackagePickupPage({
     }
   }
 
-  function setPickupScanFeedback(kind: "success" | "error", message: string) {
+  function setPickupScanFeedback(kind: "success" | "duplicate" | "error", message: string) {
     setPickupScannerFlash(kind)
     setPickupScannerStatus(message)
     if (pickupFlashTimerRef.current) window.clearTimeout(pickupFlashTimerRef.current)
@@ -6610,8 +6628,11 @@ function PackagePickupPage({
         package: result.package,
       }
       addPickupScanEntry(entry)
-      if (entry.ok) {
-        setPickupScanFeedback("success", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} matched${result.duplicate ? " · already scanned" : ""}. Ready for the next package.`)
+      if (entry.ok && entry.duplicate) {
+        setPickupScanFeedback("duplicate", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} is a duplicate scan. Successful count was not increased.`)
+        schedulePickupRefresh()
+      } else if (entry.ok) {
+        setPickupScanFeedback("success", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} matched. ${result.package?.order_readiness?.message || "Ready for the next package."}`)
         schedulePickupRefresh()
       } else {
         setPickupScanFeedback("error", entry.message)
@@ -6970,10 +6991,13 @@ function PackagePickupPage({
   const pickupPageCount = Math.max(1, Math.ceil(visibleCards.length / pickupDaysPerPage))
   const safePickupPage = Math.min(pickupPage, pickupPageCount)
   const pagedPickupCards = visibleCards.slice((safePickupPage - 1) * pickupDaysPerPage, safePickupPage * pickupDaysPerPage)
-  const pickupScanSuccessCount = pickupScanEntries.filter((entry) => entry.ok).length
+  const pickupScanSuccessCount = pickupScanEntries.filter((entry) => entry.ok && !entry.duplicate).length
+  const pickupScanDuplicateCount = pickupScanEntries.filter((entry) => entry.duplicate).length
   const pickupScanFailureCount = pickupScanEntries.filter((entry) => !entry.ok).length
-  const pickupSummarySuccessCount = lastPickupScanEntries.filter((entry) => entry.ok).length
+  const pickupSummarySuccessCount = lastPickupScanEntries.filter((entry) => entry.ok && !entry.duplicate).length
+  const pickupSummaryDuplicateCount = lastPickupScanEntries.filter((entry) => entry.duplicate).length
   const pickupSummaryFailureCount = lastPickupScanEntries.filter((entry) => !entry.ok).length
+  const pickupSummaryReadyOrders = new Set(lastPickupScanEntries.filter((entry) => entry.ok && !entry.duplicate && entry.package?.order_readiness?.ready_to_ship && entry.package.odoo_order_name).map((entry) => entry.package!.odoo_order_name)).size
   const todayPickupScanSummary = pickupHistory?.summary || {
     total_scans: 0,
     matched: 0,
@@ -6981,6 +7005,7 @@ function PackagePickupPage({
     duplicates: 0,
     unique_packages: 0,
     odoo_orders_found: 0,
+    ready_to_ship_orders: 0,
   }
 
   useEffect(() => {
@@ -7036,6 +7061,7 @@ function PackagePickupPage({
             )}
             <div className="pickup-scanner-counts" aria-label="Current scanner session counts">
               <div className="is-success"><span>Successful</span><strong>{pickupScanSuccessCount}</strong></div>
+              <div className="is-duplicate"><span>Duplicates</span><strong>{pickupScanDuplicateCount}</strong></div>
               <div className="is-error"><span>Unsuccessful</span><strong>{pickupScanFailureCount}</strong></div>
             </div>
             <div className={cn("pickup-scanner-live-status", pickupScannerFlash && `is-${pickupScannerFlash}`)}>
@@ -7044,9 +7070,9 @@ function PackagePickupPage({
             {pickupScanEntries.length ? (
               <div className="pickup-scanner-recent">
                 {pickupScanEntries.slice(0, 4).map((entry, index) => (
-                  <div key={`${entry.scannedAt}-${entry.code}-${index}`} className={entry.ok ? "is-success" : "is-error"}>
-                    {entry.ok ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
-                    <span><strong>{entry.package?.odoo_order_name || entry.code}</strong><small>{entry.message}</small></span>
+                  <div key={`${entry.scannedAt}-${entry.code}-${index}`} className={entry.duplicate ? "is-duplicate" : entry.ok ? "is-success" : "is-error"}>
+                    {entry.duplicate ? <RefreshCw className="size-4" /> : entry.ok ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
+                    <span><strong>{entry.package?.odoo_order_name || entry.code}</strong><small>{entry.message}</small>{entry.package?.order_readiness ? <small className={entry.package.order_readiness.ready_to_ship ? "is-ready" : "is-hold"}>{entry.package.order_readiness.message}</small> : null}</span>
                   </div>
                 ))}
               </div>
@@ -7062,12 +7088,16 @@ function PackagePickupPage({
         <DialogContent className="pickup-scan-summary-dialog max-w-2xl">
           <DialogHeader>
             <DialogTitle>Last pickup scan summary</DialogTitle>
-            <DialogDescription>{pickupSummarySuccessCount} successful · {pickupSummaryFailureCount} unsuccessful</DialogDescription>
+            <DialogDescription>{pickupSummarySuccessCount} successful · {pickupSummaryDuplicateCount} duplicate · {pickupSummaryFailureCount} unsuccessful</DialogDescription>
           </DialogHeader>
+          <div className="pickup-order-ready-summary">
+            <PackageCheck className="size-5" />
+            <span><strong>{pickupSummaryReadyOrders} complete Odoo order{pickupSummaryReadyOrders === 1 ? "" : "s"} can be shipped</strong><small>Every expected package for these orders is received.</small></span>
+          </div>
           <div className="pickup-scan-summary-list">
             {lastPickupScanEntries.map((entry, index) => (
-              <div key={`${entry.scannedAt}-${entry.code}-${index}`} className={entry.ok ? "is-success" : "is-error"}>
-                {entry.ok ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
+              <div key={`${entry.scannedAt}-${entry.code}-${index}`} className={entry.duplicate ? "is-duplicate" : entry.ok ? "is-success" : "is-error"}>
+                {entry.duplicate ? <RefreshCw className="size-4" /> : entry.ok ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
                 <div>
                   {entry.package?.odoo_order_name ? <OdooOrderRef name={entry.package.odoo_order_name} linkClassName="font-semibold" /> : <strong>{entry.code}</strong>}
                   {entry.package?.amazon_order_id ? <small>Amazon order {entry.package.amazon_order_id}</small> : null}
@@ -7075,6 +7105,7 @@ function PackagePickupPage({
                   {entry.package?.shipment_id ? <small>Shipment ID {entry.package.shipment_id}</small> : null}
                   <small>Scanned {formatDateTime(entry.scannedAt, { timeZone: "America/New_York", showTimeZone: true })}</small>
                   <small>{entry.message}</small>
+                  {entry.package?.order_readiness ? <small className={entry.package.order_readiness.ready_to_ship ? "is-ready" : "is-hold"}><b>{entry.package.order_readiness.received_packages}/{entry.package.order_readiness.total_packages} packages received.</b> {entry.package.order_readiness.message}</small> : null}
                 </div>
               </div>
             ))}
@@ -7095,29 +7126,33 @@ function PackagePickupPage({
           <div className="pickup-history-summary-grid">
             <div><span>Total scans</span><strong>{todayPickupScanSummary.total_scans}</strong></div>
             <div className="is-success"><span>Matched</span><strong>{todayPickupScanSummary.matched}</strong></div>
+            <div className="is-duplicate"><span>Duplicates</span><strong>{todayPickupScanSummary.duplicates}</strong></div>
             <div className="is-error"><span>Unsuccessful</span><strong>{todayPickupScanSummary.unsuccessful}</strong></div>
-            <div><span>Odoo orders found</span><strong>{todayPickupScanSummary.odoo_orders_found}</strong></div>
+            <div className="is-ready"><span>Ready Odoo orders</span><strong>{todayPickupScanSummary.ready_to_ship_orders}</strong></div>
           </div>
           <div className="pickup-history-meta">
             <span><strong>{todayPickupScanSummary.unique_packages}</strong> unique matched packages</span>
             <span><strong>{todayPickupScanSummary.duplicates}</strong> duplicate rescans</span>
+            <span><strong>{todayPickupScanSummary.odoo_orders_found}</strong> Odoo orders found</span>
           </div>
           <div className="pickup-scan-history-list">
             {(pickupHistory?.events || []).map((entry) => {
               const matched = Boolean(entry.matched)
+              const duplicate = Boolean(entry.duplicate)
               return (
-                <div key={entry.id} className={matched ? "is-success" : "is-error"}>
-                  {matched ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
+                <div key={entry.id} className={duplicate ? "is-duplicate" : matched ? "is-success" : "is-error"}>
+                  {duplicate ? <RefreshCw className="size-4" /> : matched ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
                   <div className="pickup-history-order">
                     <div className="pickup-history-order-head">
                       {entry.odoo_order_name ? <OdooOrderRef name={entry.odoo_order_name} linkClassName="font-semibold" /> : <strong>No Odoo order matched</strong>}
-                      <span className={matched ? "is-success" : "is-error"}>{entry.result_status.replaceAll("_", " ")}</span>
+                      <span className={duplicate ? "is-duplicate" : matched ? "is-success" : "is-error"}>{entry.result_status.replaceAll("_", " ")}</span>
                     </div>
                     <small><b>Amazon tracking ID</b> {entry.shipment_id || entry.scan_code || "Not matched"}</small>
                     {entry.amazon_order_id ? <small><b>Amazon order</b> {entry.amazon_order_id}</small> : null}
                     {entry.recipient_ref ? <small><b>Recipient</b> {entry.recipient_ref}</small> : null}
                     <small><b>Scanned</b> {formatDateTime(entry.scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
                     <small>{entry.message}</small>
+                    {matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>{entry.order_received_packages}/{entry.order_total_packages} packages received.</b> {entry.order_readiness_message}</small> : null}
                   </div>
                 </div>
               )
@@ -7204,8 +7239,9 @@ function PackagePickupPage({
             aria-label="Open today's complete package scanner history"
           >
             <span className="pickup-today-scan-icon"><PackageCheck className="size-5" /></span>
-            <span className="pickup-today-scan-title"><small>Today&apos;s scanner history</small><strong>{todayPickupScanSummary.total_scans} scans</strong></span>
+            <span className="pickup-today-scan-title"><small>Today&apos;s scanner history</small><strong>{todayPickupScanSummary.total_scans} scans · {todayPickupScanSummary.ready_to_ship_orders} ready</strong></span>
             <span className="pickup-today-scan-metric is-success"><small>Matched</small><strong>{todayPickupScanSummary.matched}</strong></span>
+            <span className="pickup-today-scan-metric is-duplicate"><small>Duplicate</small><strong>{todayPickupScanSummary.duplicates}</strong></span>
             <span className="pickup-today-scan-metric is-error"><small>Unsuccessful</small><strong>{todayPickupScanSummary.unsuccessful}</strong></span>
             <ChevronRight className="size-4" />
           </button>
