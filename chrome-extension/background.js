@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-26-business-payment-native-card-v133";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-business-bundle-checkout-v134";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -44,6 +44,8 @@ async function getSettings() {
     missingAsinAvailabilityLastRunAt: 0,
     availabilityCheckInFlight: false,
     recentAmazonOrders: [],
+    detectedAmazonAccountExperience: "",
+    detectedAmazonAccountExperienceAt: 0,
     cachedQueueStatus: null,
     orderProgress: null,
     fulfilmentActivity: { last: null },
@@ -683,20 +685,30 @@ async function readAppTokenFromTab(tabId) {
   }
 }
 
-async function probeAppOrigin(origin, adminToken = "") {
+function queueStatusRequestPath(workerId = "", accountExperience = "") {
+  const params = new URLSearchParams({
+    claim: "false",
+    job_limit: "12",
+    ...(workerId ? { worker_id: workerId } : {}),
+    ...(["consumer", "business"].includes(accountExperience) ? { account_experience: accountExperience } : {}),
+  });
+  return `/api/chrome/jobs?${params.toString()}`;
+}
+
+async function probeAppOrigin(origin, adminToken = "", accountExperience = "") {
   await api("/api/settings/admin-access", {
     apiBase: origin,
     adminToken,
     timeoutMs: 8000,
   });
-  return api("/api/chrome/jobs?claim=false&job_limit=12", {
+  return api(queueStatusRequestPath("", accountExperience), {
     apiBase: origin,
     adminToken,
     timeoutMs: 12000,
   });
 }
 
-async function discoverAppQueue(currentSnapshot = null) {
+async function discoverAppQueue(currentSnapshot = null, accountExperience = "") {
   if (!chrome.tabs?.query) return null;
   const tabs = await chrome.tabs.query({});
   const seen = new Set();
@@ -712,7 +724,7 @@ async function discoverAppQueue(currentSnapshot = null) {
   for (const candidate of candidates) {
     const adminToken = await readAppTokenFromTab(candidate.tabId);
     try {
-      const payload = await probeAppOrigin(candidate.origin, adminToken);
+      const payload = await probeAppOrigin(candidate.origin, adminToken, accountExperience);
       const jobs = payload.jobs || [];
       const jobCount = Number(payload.job_count || jobs.length || 0);
       if (jobCount <= 0 && currentSnapshot?.job_count > 0) continue;
@@ -730,15 +742,15 @@ async function discoverAppQueue(currentSnapshot = null) {
   return null;
 }
 
-async function getQueueStatus() {
+async function getQueueStatus(accountExperience = "") {
   const workerId = await getWorkerId();
   if (queueStatusInFlight) return queueStatusInFlight;
   queueStatusInFlight = (async () => {
   try {
-    const payload = await api(`/api/chrome/jobs?claim=false&job_limit=12&worker_id=${encodeURIComponent(workerId)}`);
+    const payload = await api(queueStatusRequestPath(workerId, accountExperience));
     const empty = Number(payload.job_count || payload.jobs?.length || 0) <= 0;
     if (empty) {
-      const discovered = await discoverAppQueue(payload);
+      const discovered = await discoverAppQueue(payload, accountExperience);
       if (discovered?.payload) {
         const discoveredPayload = discovered.payload;
         const snapshot = {
@@ -747,6 +759,7 @@ async function getQueueStatus() {
           counts: discoveredPayload.counts || [],
           job_count: Number(discoveredPayload.job_count || 0),
           workerId,
+          accountExperience,
           cached_at: Date.now(),
           stale: false,
           message: `Connected to app at ${discovered.origin}.`,
@@ -761,13 +774,14 @@ async function getQueueStatus() {
       counts: payload.counts || [],
       job_count: Number(payload.job_count || 0),
       workerId,
+      accountExperience,
       cached_at: Date.now(),
       stale: false,
     };
     await chrome.storage.local.set({ cachedQueueStatus: snapshot });
     return snapshot;
   } catch (error) {
-    const discovered = await discoverAppQueue();
+    const discovered = await discoverAppQueue(null, accountExperience);
     if (discovered?.payload) {
       const payload = discovered.payload;
       const snapshot = {
@@ -776,6 +790,7 @@ async function getQueueStatus() {
         counts: payload.counts || [],
         job_count: Number(payload.job_count || 0),
         workerId,
+        accountExperience,
         cached_at: Date.now(),
         stale: false,
         message: `Connected to app at ${discovered.origin}.`,
@@ -784,7 +799,7 @@ async function getQueueStatus() {
       return snapshot;
     }
     const { cachedQueueStatus } = await getSettings();
-    if (cachedQueueStatus?.ok) {
+    if (cachedQueueStatus?.ok && (!accountExperience || cachedQueueStatus.accountExperience === accountExperience)) {
       return {
         ...cachedQueueStatus,
         workerId: cachedQueueStatus.workerId || workerId,
@@ -1221,10 +1236,25 @@ async function detectAmazonAccountExperience(windowId = null, createIfMissing = 
     await injectContentScriptWhenReady(tab.id).catch(() => false);
     const detected = await chrome.tabs.sendMessage(tab.id, { type: "GET_AMAZON_ACCOUNT_EXPERIENCE" }).catch(() => null);
     if (["consumer", "business"].includes(detected?.experience)) {
+      await chrome.storage.local.set({
+        detectedAmazonAccountExperience: detected.experience,
+        detectedAmazonAccountExperienceAt: Date.now(),
+      });
       return { experience: detected.experience, windowId: tab.windowId || windowId, tabId: tab.id };
     }
   }
   return { experience: "unknown", windowId, tabId: null };
+}
+
+async function popupAmazonAccountExperience(windowId = null) {
+  const state = await getSettings();
+  const activeExperience = state.activeJob?.amazonAccountExperience;
+  if (["consumer", "business"].includes(activeExperience)) return activeExperience;
+  const cachedExperience = state.detectedAmazonAccountExperience;
+  const cacheAge = Date.now() - Number(state.detectedAmazonAccountExperienceAt || 0);
+  if (["consumer", "business"].includes(cachedExperience) && cacheAge < 60000) return cachedExperience;
+  const detected = await detectAmazonAccountExperience(windowId, false).catch(() => null);
+  return ["consumer", "business"].includes(detected?.experience) ? detected.experience : "";
 }
 
 async function ensureContentScriptsInAmazonTabs(label = "extension recovery", options = {}) {
@@ -3287,7 +3317,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "GET_QUEUE_STATUS") {
       const forceStopped = await forceStopActive();
       if (!forceStopped) await releaseMissingWindowJobs();
-      const queue = await getQueueStatus();
+      const accountExperience = await popupAmazonAccountExperience(windowId);
+      const queue = await getQueueStatus(accountExperience);
       return {
         ...queue,
         forceStopped,

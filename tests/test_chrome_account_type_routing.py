@@ -51,6 +51,16 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
         self.assertIn("COUNT(*) = 1", source[account_filter:candidate_limit])
         self.assertIn("source_line_count", source[account_filter:candidate_limit])
 
+    def test_queue_snapshot_filters_jobs_and_count_by_account_type(self) -> None:
+        source = inspect.getsource(main.chrome_queue_snapshot)
+        self.assertIn("account_experience", source)
+        self.assertGreaterEqual(source.count("? = 'consumer'"), 2)
+        self.assertGreaterEqual(source.count("? = 'business'"), 2)
+        self.assertGreaterEqual(source.count("source_line_count"), 2)
+
+        endpoint_source = inspect.getsource(main.api_chrome_jobs)
+        self.assertIn("account_experience=account_experience", endpoint_source)
+
     def test_auto_order_start_date_is_inclusive_and_blocks_older_orders(self) -> None:
         self.assertTrue(main.chrome_order_is_on_or_after_start_date(
             [{"odoo_order_date": "2026-08-25T00:00:00+00:00"}],

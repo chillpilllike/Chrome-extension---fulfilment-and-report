@@ -151,7 +151,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.142")
+        self.assertEqual(MANIFEST["version"], "0.1.143")
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
@@ -522,6 +522,24 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("cartVerificationMatches(activeJob)", guard)
         self.assertIn('failureCode: verifiedSingleAsinShortage ? "partial_quantity" : "cart_quantity_mismatch"', guard)
         self.assertIn('missingAsin: verifiedSingleAsinShortage ? expectedAsinList[0] : ""', guard)
+
+    def test_verified_business_bundle_expansion_is_not_misread_as_cart_pollution(self) -> None:
+        guard_start = CONTENT.index("async function ensureCheckoutOnlyExpectedUnits")
+        guard_end = CONTENT.index("function checkoutLineItemLimitCandidate", guard_start)
+        guard = CONTENT[guard_start:guard_end]
+        self.assertIn("verifiedBusinessBundleExpansion", guard)
+        self.assertIn("actual > expected", guard)
+        self.assertIn("isAmazonBusinessPage()", guard)
+        self.assertIn("cartVerificationMatches(activeJob)", guard)
+        self.assertIn("Accepted verified Amazon Business bundle expansion", guard)
+
+    def test_popup_queue_is_filtered_by_detected_amazon_experience(self) -> None:
+        self.assertIn("async function popupAmazonAccountExperience", BACKGROUND)
+        self.assertIn("queueStatusRequestPath(workerId, accountExperience)", BACKGROUND)
+        self.assertIn("account_experience: accountExperience", BACKGROUND)
+        queue_handler = BACKGROUND[BACKGROUND.index('if (message.type === "GET_QUEUE_STATUS")'):]
+        self.assertIn("popupAmazonAccountExperience(windowId)", queue_handler)
+        self.assertIn("getQueueStatus(accountExperience)", queue_handler)
 
     def test_claim_reconciles_one_exact_history_order_before_chrome_checkout(self) -> None:
         self.assertIn("def exact_amazon_history_match_for_chrome_job(", APP)

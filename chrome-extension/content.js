@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-26-business-payment-native-card-v133";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-bundle-checkout-v134";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -1574,6 +1574,31 @@ async function ensureCheckoutOnlyExpectedUnits(activeJob) {
   const expected = expectedCheckoutUnitCount(activeJob);
   const actual = checkoutSummaryUnitCount();
   if (!expected || (Number.isFinite(actual) && actual === expected)) return true;
+  const verifiedBusinessBundleExpansion = (
+    Number.isFinite(actual)
+    && actual > expected
+    && isAmazonBusinessPage()
+    && cartVerificationMatches(activeJob)
+  );
+  if (verifiedBusinessBundleExpansion) {
+    // Amazon Business expands some single-ASIN virtual bundles into their
+    // physical component rows only after checkout starts. The full cart was
+    // verified by ASIN and quantity immediately before checkout, so a larger
+    // physical-row count here is bundle expansion rather than cart pollution.
+    showPanel(
+      "Nutricity checkout",
+      `Verified the complete Amazon cart before checkout. Amazon Business expanded ${expected} ordered bundle unit(s) into ${actual} physical item unit(s); continuing safely.`,
+      null,
+      null,
+    );
+    await sendDiagnostic("Accepted verified Amazon Business bundle expansion at checkout.", {
+      group_key: activeJob?.job?.group_key || "",
+      expected_bundle_units: expected,
+      checkout_physical_units: actual,
+      verified_cart_quantities: activeJob?.cartVerification?.quantities || {},
+    });
+    return true;
+  }
   if (
     !Number.isFinite(actual)
     && (

@@ -11925,8 +11925,13 @@ def chrome_queue_snapshot(
     clear_expired: bool = True,
     limit: int = 50,
     worker_id: str = "",
+    account_experience: str = "",
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit or 50), 250))
+    candidate_experience = "any"
+    if chrome_account_type_routing_enabled():
+        detected_experience = clean_text(account_experience).lower()
+        candidate_experience = detected_experience if detected_experience in {"consumer", "business"} else "any"
     with db() as conn:
         if clear_expired:
             clear_expired_chrome_claims(conn)
@@ -11960,12 +11965,27 @@ def chrome_queue_snapshot(
               AND COALESCE(amazon_group_key, '') != ''
               AND (? IS NULL OR store_id=?)
             GROUP BY amazon_group_key
+            HAVING (
+                ? = 'any'
+                OR (
+                    ? = 'consumer'
+                    AND (
+                        COUNT(*) > 1
+                        OR MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) > 1
+                    )
+                )
+                OR (
+                    ? = 'business'
+                    AND COUNT(*) = 1
+                    AND MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) <= 1
+                )
+            )
             -- A worker's own pre-submit claim is the job that Start will resume.
             -- Show it first so the popup never misleadingly calls a later job “Next”.
             ORDER BY claimed_by_current_worker DESC, locked ASC, newest_order_date DESC, newest_order_id DESC, first_line_id ASC
             LIMIT ?
             """,
-            (worker_id, store_id, store_id, limit),
+            (worker_id, store_id, store_id, candidate_experience, candidate_experience, candidate_experience, limit),
         ).fetchall()
         job_count = int(conn.execute(
             """
@@ -11980,9 +12000,24 @@ def chrome_queue_snapshot(
                   AND COALESCE(amazon_group_key, '') != ''
                   AND (? IS NULL OR store_id=?)
                 GROUP BY amazon_group_key
+                HAVING (
+                    ? = 'any'
+                    OR (
+                        ? = 'consumer'
+                        AND (
+                            COUNT(*) > 1
+                            OR MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) > 1
+                        )
+                    )
+                    OR (
+                        ? = 'business'
+                        AND COUNT(*) = 1
+                        AND MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) <= 1
+                    )
+                )
             ) queued_groups
             """,
-            (store_id, store_id),
+            (store_id, store_id, candidate_experience, candidate_experience, candidate_experience),
         ).fetchone()["count"] or 0)
         group_keys = [str(row["amazon_group_key"]) for row in candidate_rows]
         rows = []
@@ -29390,7 +29425,12 @@ def api_chrome_jobs(
             "history_reconciled": history_reconciled,
             "chatter_repaired": chatter_repaired,
         }
-    snapshot = chrome_queue_snapshot(store_id, limit=job_limit, worker_id=worker_id)
+    snapshot = chrome_queue_snapshot(
+        store_id,
+        limit=job_limit,
+        worker_id=worker_id,
+        account_experience=account_experience,
+    )
     return {"ok": True, **snapshot}
 
 
