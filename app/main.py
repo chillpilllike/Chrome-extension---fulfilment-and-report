@@ -83,6 +83,7 @@ from app.schemas import (
     PackagePickupManualAmazonPayload,
     PackagePickupReceivedPayload,
     PackagePickupScanPayload,
+    PackagePickupScanResetPayload,
     PackagePickupSettingsPayload,
     PlacePayload,
     PullPayload,
@@ -193,6 +194,7 @@ PUBLIC_POST_API_PATHS = {
     "/api/package-pickups/manual-amazon",
     "/api/package-pickups/received",
     "/api/package-pickups/scan",
+    "/api/package-pickups/scan-reset",
     "/api/package-pickups/settings",
 }
 PUBLIC_DISPATCH_POST_PREFIXES = (
@@ -1280,6 +1282,12 @@ def init_db() -> None:
                 order_remaining_packages INTEGER NOT NULL DEFAULT 0,
                 order_readiness_message TEXT,
                 remaining_packages_json TEXT NOT NULL DEFAULT '[]',
+                state_snapshot_available INTEGER NOT NULL DEFAULT 0,
+                previous_received_at TEXT,
+                previous_not_received_at TEXT,
+                previous_scanned_codes_json TEXT,
+                undone_at TEXT,
+                undone_reason TEXT,
                 message TEXT,
                 scanned_at TEXT NOT NULL
             );
@@ -1780,6 +1788,12 @@ def init_db() -> None:
             "order_remaining_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_remaining_packages INTEGER NOT NULL DEFAULT 0",
             "order_readiness_message": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_readiness_message TEXT",
             "remaining_packages_json": "ALTER TABLE package_pickup_scan_events ADD COLUMN remaining_packages_json TEXT NOT NULL DEFAULT '[]'",
+            "state_snapshot_available": "ALTER TABLE package_pickup_scan_events ADD COLUMN state_snapshot_available INTEGER NOT NULL DEFAULT 0",
+            "previous_received_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN previous_received_at TEXT",
+            "previous_not_received_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN previous_not_received_at TEXT",
+            "previous_scanned_codes_json": "ALTER TABLE package_pickup_scan_events ADD COLUMN previous_scanned_codes_json TEXT",
+            "undone_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN undone_at TEXT",
+            "undone_reason": "ALTER TABLE package_pickup_scan_events ADD COLUMN undone_reason TEXT",
         }.items():
             if column not in existing_pickup_scan_cols:
                 conn.execute(ddl)
@@ -31926,6 +31940,12 @@ def ensure_package_pickup_scan_history_table(conn: Any) -> None:
             order_remaining_packages INTEGER NOT NULL DEFAULT 0,
             order_readiness_message TEXT,
             remaining_packages_json TEXT NOT NULL DEFAULT '[]',
+            state_snapshot_available INTEGER NOT NULL DEFAULT 0,
+            previous_received_at TEXT,
+            previous_not_received_at TEXT,
+            previous_scanned_codes_json TEXT,
+            undone_at TEXT,
+            undone_reason TEXT,
             message TEXT,
             scanned_at TEXT NOT NULL
         )
@@ -31939,6 +31959,12 @@ def ensure_package_pickup_scan_history_table(conn: Any) -> None:
         "order_remaining_packages": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_remaining_packages INTEGER NOT NULL DEFAULT 0",
         "order_readiness_message": "ALTER TABLE package_pickup_scan_events ADD COLUMN order_readiness_message TEXT",
         "remaining_packages_json": "ALTER TABLE package_pickup_scan_events ADD COLUMN remaining_packages_json TEXT NOT NULL DEFAULT '[]'",
+        "state_snapshot_available": "ALTER TABLE package_pickup_scan_events ADD COLUMN state_snapshot_available INTEGER NOT NULL DEFAULT 0",
+        "previous_received_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN previous_received_at TEXT",
+        "previous_not_received_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN previous_not_received_at TEXT",
+        "previous_scanned_codes_json": "ALTER TABLE package_pickup_scan_events ADD COLUMN previous_scanned_codes_json TEXT",
+        "undone_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN undone_at TEXT",
+        "undone_reason": "ALTER TABLE package_pickup_scan_events ADD COLUMN undone_reason TEXT",
     }.items():
         if column not in existing_cols:
             conn.execute(ddl)
@@ -31999,19 +32025,24 @@ def record_package_pickup_scan_event(
     duplicate: bool = False,
     store_id: Optional[int] = None,
     order_readiness: Optional[dict[str, Any]] = None,
-) -> None:
+    previous_package_state: Optional[dict[str, Any]] = None,
+) -> int:
     ensure_package_pickup_scan_history_table(conn)
     package = package or {}
     order_readiness = order_readiness or {}
+    previous_package_state = previous_package_state or {}
     shipment_id = normalize_dispatch_scan_code(package.get("canonical_scan_code") or package.get("scan_code"))
-    conn.execute(
+    inserted = conn.execute(
         """
         INSERT INTO package_pickup_scan_events
             (store_id, package_id, scan_code, result_status, matched, duplicate,
              odoo_order_name, amazon_order_id, shipment_id, recipient_ref,
              order_ready, order_total_packages, order_received_packages, order_remaining_packages,
-             order_readiness_message, remaining_packages_json, message, scanned_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             order_readiness_message, remaining_packages_json,
+             state_snapshot_available, previous_received_at, previous_not_received_at, previous_scanned_codes_json,
+             message, scanned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id
         """,
         (
             int(package.get("store_id") or store_id or 0),
@@ -32030,10 +32061,16 @@ def record_package_pickup_scan_event(
             int(order_readiness.get("remaining_packages") or 0),
             clean_text(order_readiness.get("message")),
             json.dumps(order_readiness.get("pending_packages") or []),
+            1 if previous_package_state else 0,
+            clean_text(previous_package_state.get("received_at")),
+            clean_text(previous_package_state.get("not_received_at")),
+            clean_text(previous_package_state.get("scanned_codes_json")) or "[]",
             clean_text(message),
             scanned_at,
         ),
     )
+    inserted_row = row_to_dict(inserted.fetchone()) or {}
+    return int(inserted_row.get("id") or 0)
 
 
 def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
@@ -32067,7 +32104,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
                 COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0) AS odoo_orders_found,
                 COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0 AND order_ready=1) AS ready_to_ship_orders
             FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? {store_sql}
+            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL {store_sql}
             """,
             params,
         ).fetchone()) or {}
@@ -32078,7 +32115,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
                    order_ready, order_total_packages, order_received_packages, order_remaining_packages,
                    order_readiness_message, remaining_packages_json, message, scanned_at
             FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? {store_sql}
+            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL {store_sql}
             ORDER BY scanned_at DESC, id DESC
             LIMIT 1000
             """,
@@ -32109,6 +32146,148 @@ def api_package_pickup_scan_history(store_id: Optional[int] = None, scan_date: s
         raise HTTPException(400, str(exc)) from exc
 
 
+def reset_package_pickup_scan_event(conn: Any, event: dict[str, Any], reset_at: str, reason: str, scan_date: str) -> dict[str, int]:
+    result = {"events_reset": 0, "packages_restored": 0, "counts_reduced": 0, "skipped": 0}
+    event_id = int(event.get("id") or 0)
+    package_id = int(event.get("package_id") or 0)
+    if not event_id or clean_text(event.get("undone_at")):
+        result["skipped"] = 1
+        return result
+    if not event.get("matched") or not package_id:
+        conn.execute("UPDATE package_pickup_scan_events SET undone_at=?, undone_reason=? WHERE id=? AND undone_at IS NULL", (reset_at, reason, event_id))
+        result["events_reset"] = 1
+        return result
+    if event.get("duplicate"):
+        conn.execute(
+            """
+            UPDATE package_pickup_delivery_records
+            SET scan_count=CASE WHEN scan_count>0 THEN scan_count-1 ELSE 0 END,
+                last_scanned_at=COALESCE(scanned_at, last_scanned_at), updated_at=?
+            WHERE package_id=?
+            """,
+            (reset_at, package_id),
+        )
+        conn.execute("UPDATE package_pickup_scan_events SET undone_at=?, undone_reason=? WHERE id=? AND undone_at IS NULL", (reset_at, reason, event_id))
+        result["events_reset"] = 1
+        return result
+    delivery_record = row_to_dict(conn.execute(
+        "SELECT * FROM package_pickup_delivery_records WHERE package_id=?",
+        (package_id,),
+    ).fetchone()) or {}
+    first_scanned_at = clean_text(delivery_record.get("scanned_at"))
+    if not first_scanned_at or package_pickup_business_date(first_scanned_at) != scan_date:
+        result["skipped"] = 1
+        return result
+    if event.get("state_snapshot_available"):
+        conn.execute(
+            """
+            UPDATE amazon_dispatch_packages
+            SET received_at=NULLIF(?, ''), not_received_at=NULLIF(?, ''), scanned_codes_json=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                clean_text(event.get("previous_received_at")),
+                clean_text(event.get("previous_not_received_at")),
+                clean_text(event.get("previous_scanned_codes_json")) or "[]",
+                reset_at,
+                package_id,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE amazon_dispatch_packages
+            SET received_at=CASE WHEN COALESCE(received_at, '')=? THEN NULL ELSE received_at END,
+                updated_at=?
+            WHERE id=?
+            """,
+            (first_scanned_at, reset_at, package_id),
+        )
+    conn.execute(
+        """
+        UPDATE package_pickup_delivery_records
+        SET scanned_at=NULL, last_scanned_at=NULL, scanned_code=NULL, scan_count=0, updated_at=?
+        WHERE package_id=? AND scanned_at=?
+        """,
+        (reset_at, package_id, first_scanned_at),
+    )
+    store_id = int(event.get("store_id") or 0)
+    conn.execute(
+        """
+        UPDATE package_pickup_checks
+        SET amazon_picked_up=CASE WHEN amazon_picked_up>0 THEN amazon_picked_up-1 ELSE 0 END, updated_at=?
+        WHERE store_id=? AND pickup_date=?
+        """,
+        (reset_at, store_id, scan_date),
+    )
+    conn.execute(
+        "UPDATE package_pickup_scan_events SET undone_at=?, undone_reason=? WHERE package_id=? AND undone_at IS NULL AND scanned_at>=? AND scanned_at<?",
+        (reset_at, reason, package_id, event.get("day_start_utc"), event.get("day_end_utc")),
+    )
+    result["events_reset"] = 1
+    result["packages_restored"] = 1
+    result["counts_reduced"] = 1
+    return result
+
+
+@app.post("/api/package-pickups/scan-reset")
+def api_package_pickup_scan_reset(payload: PackagePickupScanResetPayload) -> dict[str, Any]:
+    today = datetime.now(PACKAGE_PICKUP_TIMEZONE).date()
+    requested_date = clean_text(payload.scan_date)
+    if requested_date and requested_date != today.isoformat():
+        raise HTTPException(400, "For safety, scanner rollback is limited to today's Brooklyn scan date.")
+    scan_date = today.isoformat()
+    local_start = datetime.combine(today, datetime.min.time(), tzinfo=PACKAGE_PICKUP_TIMEZONE)
+    local_end = local_start + timedelta(days=1)
+    start_utc = local_start.astimezone(timezone.utc).isoformat(timespec="seconds")
+    end_utc = local_end.astimezone(timezone.utc).isoformat(timespec="seconds")
+    mode = clean_text(payload.mode).lower()
+    if mode not in {"last", "today"}:
+        raise HTTPException(400, "Reset mode must be last or today.")
+    if mode == "last" and not payload.event_id:
+        raise HTTPException(400, "The exact scan event is required to undo the last scan.")
+    now = utc_now()
+    params: list[Any] = [start_utc, end_utc]
+    store_sql = ""
+    if payload.store_id is not None:
+        store_sql = " AND store_id=?"
+        params.append(int(payload.store_id))
+    with db() as conn:
+        ensure_package_pickup_scan_history_table(conn)
+        if mode == "last":
+            event = row_to_dict(conn.execute(
+                f"SELECT * FROM package_pickup_scan_events WHERE id=? AND scanned_at>=? AND scanned_at<? AND undone_at IS NULL {store_sql}",
+                [int(payload.event_id), *params],
+            ).fetchone())
+            if not event:
+                raise HTTPException(409, "That scan is no longer active or does not belong to today's selected store.")
+            events = [event]
+        else:
+            events = rows_to_dicts(conn.execute(
+                f"SELECT * FROM package_pickup_scan_events WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL {store_sql} ORDER BY id DESC",
+                params,
+            ).fetchall())
+        totals = {"events_reset": 0, "packages_restored": 0, "counts_reduced": 0, "skipped": 0}
+        for event in events:
+            event["day_start_utc"] = start_utc
+            event["day_end_utc"] = end_utc
+            outcome = reset_package_pickup_scan_event(conn, event, now, "undo_last" if mode == "last" else "reset_today", scan_date)
+            for key in totals:
+                totals[key] += int(outcome.get(key) or 0)
+    fast_page_cache_clear_matching({"package-pickups", "dispatch-related-parts"})
+    return {
+        "ok": True,
+        "mode": mode,
+        "scan_date": scan_date,
+        **totals,
+        "message": (
+            "Last scan was undone."
+            if mode == "last"
+            else f"Today's scanner session was reset. {totals['packages_restored']} package(s) returned to their Amazon delivery-date cards."
+        ),
+    }
+
+
 @app.post("/api/package-pickups/scan")
 def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]:
     query_text = clean_text(payload.scan_code)
@@ -32125,11 +32304,11 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
     with db() as conn:
         if payload.manual_entry and len(scan_code) < 5:
             message = "Enter at least the last 5 letters or numbers of the tracking ID."
-            record_package_pickup_scan_event(
+            event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="manual_too_short", matched=False,
                 message=message, scanned_at=now, store_id=payload.store_id,
             )
-            return {"ok": True, "matched": False, "manual_entry": True, "scan_code": scan_code, "message": message}
+            return {"ok": True, "matched": False, "manual_entry": True, "event_id": event_id, "scan_code": scan_code, "message": message}
         matches = package_pickup_manual_scan_matches(conn, scan_code, payload.store_id) if payload.manual_entry else package_pickup_strict_scan_matches(conn, scan_code, payload.store_id)
         if len(matches) > 1:
             requested_length = min(max(len(scan_code) + 2, 7), 16) if payload.manual_entry else 0
@@ -32137,7 +32316,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 message = f"The last {len(scan_code)} characters match {len(matches)} different packages. Enter at least the last {requested_length} characters to identify the exact package."
             else:
                 message = f"Barcode {query_text} matches more than one package. Nothing was changed."
-            record_package_pickup_scan_event(
+            event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="manual_multiple_matches" if payload.manual_entry else "ambiguous", matched=False,
                 message=message, scanned_at=now, store_id=payload.store_id,
             )
@@ -32149,12 +32328,13 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "multiple_matches": bool(payload.manual_entry),
                 "match_count": len(matches),
                 "requested_length": requested_length,
+                "event_id": event_id,
                 "scan_code": scan_code,
                 "message": message,
             }
         if not matches and barcode_kind == "amazon_internal_label":
             message = "Amazon square label read. Now scan the long barcode beside the printed TBA number."
-            record_package_pickup_scan_event(
+            event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="needs_tracking_scan", matched=False,
                 message=message, scanned_at=now, store_id=payload.store_id,
             )
@@ -32163,6 +32343,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "matched": False,
                 "requires_tracking_scan": True,
                 "barcode_kind": barcode_kind,
+                "event_id": event_id,
                 "scan_code": scan_code,
                 "message": message,
             }
@@ -32172,7 +32353,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 if payload.manual_entry
                 else f"Barcode {query_text} is not linked to an expected Amazon package."
             )
-            record_package_pickup_scan_event(
+            event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="manual_not_found" if payload.manual_entry else "not_found", matched=False,
                 message=message, scanned_at=now, store_id=payload.store_id,
             )
@@ -32180,13 +32361,14 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "ok": True,
                 "matched": False,
                 "manual_entry": bool(payload.manual_entry),
+                "event_id": event_id,
                 "scan_code": scan_code,
                 "message": message,
             }
         package = matches[0]
         if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
             message = f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but Amazon has not reported it delivered yet."
-            record_package_pickup_scan_event(
+            event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="not_delivered", matched=False,
                 message=message, scanned_at=now, package=package, store_id=payload.store_id,
             )
@@ -32194,6 +32376,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "ok": True,
                 "matched": False,
                 "not_delivered": True,
+                "event_id": event_id,
                 "scan_code": scan_code,
                 "amazon_order_id": clean_text(package.get("amazon_order_id")),
                 "odoo_order_name": clean_text(package.get("odoo_order_name")),
@@ -32274,7 +32457,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
         }
         duplicate_text = " already scanned; original pickup time retained" if duplicate else " scanned successfully"
         success_message = f"{result['odoo_order_name'] or result['amazon_order_id']}{duplicate_text}."
-        record_package_pickup_scan_event(
+        event_id = record_package_pickup_scan_event(
             conn,
             scan_code=scan_code,
             result_status="duplicate" if duplicate else "matched",
@@ -32285,6 +32468,11 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             package=package,
             store_id=payload.store_id,
             order_readiness=order_readiness,
+            previous_package_state={
+                "received_at": package.get("received_at") if duplicate else matches[0].get("received_at"),
+                "not_received_at": matches[0].get("not_received_at"),
+                "scanned_codes_json": matches[0].get("scanned_codes_json"),
+            } if not duplicate else None,
         )
     fast_page_cache_clear_matching({"package-pickups"})
     return {
@@ -32292,6 +32480,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
         "matched": True,
         "duplicate": duplicate,
         "barcode_kind": barcode_kind,
+        "event_id": event_id,
         "package": result,
         "message": success_message,
     }

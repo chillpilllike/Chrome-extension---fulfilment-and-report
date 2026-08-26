@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from app.main import (
+    api_package_pickup_scan_reset,
     normalize_package_pickup_confirmation_status,
     normalize_package_pickup_time,
     package_pickup_business_date,
@@ -13,6 +14,7 @@ from app.main import (
     package_tracker_delivery_kind,
     record_package_pickup_scan_event,
 )
+from app.schemas.payloads import PackagePickupScanResetPayload
 
 
 class PackagePickupDeliveryDateTests(unittest.TestCase):
@@ -67,6 +69,10 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
             package_pickup_scan_history(scan_date="08/27/2026")
 
+    def test_reset_endpoint_refuses_any_non_today_scan_date_before_querying_database(self) -> None:
+        with self.assertRaisesRegex(Exception, "limited to today's Brooklyn scan date"):
+            api_package_pickup_scan_reset(PackagePickupScanResetPayload(mode="today", scan_date="2000-01-01"))
+
     def test_scan_event_snapshots_exact_linked_order_and_tracking(self) -> None:
         class FakeConnection:
             def __init__(self) -> None:
@@ -78,6 +84,9 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
 
             def fetchall(self):
                 return []
+
+            def fetchone(self):
+                return {"id": 77}
 
         connection = FakeConnection()
         record_package_pickup_scan_event(
@@ -97,6 +106,7 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
             },
         )
         insert_params = connection.calls[-1][1]
+        self.assertEqual(connection.calls[-1][0].strip().splitlines()[-1].strip(), "RETURNING id")
         self.assertEqual(insert_params[6], "NC22982")
         self.assertEqual(insert_params[7], "111-2222222-3333333")
         self.assertEqual(insert_params[8], "TBA333598452175")

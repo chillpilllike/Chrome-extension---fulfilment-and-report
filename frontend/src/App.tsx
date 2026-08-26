@@ -662,6 +662,7 @@ type PackagePickupOrderReadiness = {
 }
 
 type PackagePickupScanEntry = {
+  eventId?: number
   code: string
   ok: boolean
   duplicate?: boolean
@@ -680,6 +681,7 @@ type PackagePickupScanResponse = {
   multiple_matches?: boolean
   match_count?: number
   requested_length?: number
+  event_id?: number
   barcode_kind?: string
   message: string
   package?: PackagePickupScanPackage
@@ -721,6 +723,17 @@ type PackagePickupScanHistory = {
     ready_to_ship_orders: number
   }
   events: PackagePickupScanHistoryEvent[]
+}
+
+type PackagePickupScanResetResponse = {
+  ok: boolean
+  mode: "last" | "today"
+  scan_date: string
+  events_reset: number
+  packages_restored: number
+  counts_reduced: number
+  skipped: number
+  message: string
 }
 
 type PickupBulkRow = {
@@ -6492,6 +6505,7 @@ function PackagePickupPage({
   const [pickupHistoryOpen, setPickupHistoryOpen] = useState(false)
   const [pickupHistoryLoading, setPickupHistoryLoading] = useState(false)
   const [pickupHistory, setPickupHistory] = useState<PackagePickupScanHistory | null>(null)
+  const [pickupResetting, setPickupResetting] = useState(false)
   const [hardwareScanInput, setHardwareScanInput] = useState("")
   const [pickupManualEntryOpen, setPickupManualEntryOpen] = useState(false)
   const [pickupManualTracking, setPickupManualTracking] = useState("")
@@ -6612,6 +6626,7 @@ function PackagePickupPage({
       if (result.requires_tracking_scan) {
         pickupPendingAliasRef.current = code
         addPickupScanEntry({
+          eventId: result.event_id,
           code,
           ok: false,
           message: result.message,
@@ -6624,6 +6639,7 @@ function PackagePickupPage({
       }
       pickupPendingAliasRef.current = ""
       const entry: PackagePickupScanEntry = {
+        eventId: result.event_id,
         code,
         ok: Boolean(result.matched && result.package),
         duplicate: result.duplicate,
@@ -6668,6 +6684,65 @@ function PackagePickupPage({
     if (now - prior < 1400) return
     pickupRecentScansRef.current.set(recentKey, now)
     pickupScanQueueRef.current = pickupScanQueueRef.current.then(() => processPickupScan(code, manualEntry))
+  }
+
+  function restorePickupScannerFeedback(entries: PackagePickupScanEntry[]) {
+    const latest = entries[0]
+    if (!latest) {
+      setPickupScannerFlash("")
+      setPickupScannerStatus(pickupScannerMode === "camera" ? "Rapid scanner ready. Keep scanning packages—the camera stays open." : "Hardware scanner ready. Scan a barcode or type it and press Enter.")
+      return
+    }
+    setPickupScannerFlash(latest.duplicate ? "duplicate" : latest.ok ? "success" : "error")
+    setPickupScannerStatus(latest.message)
+  }
+
+  async function undoLastPickupScan() {
+    const latest = pickupScanEntriesRef.current[0]
+    if (!latest?.eventId || pickupResetting) return
+    if (!window.confirm("Undo the last scan? Only that exact scan event and its package changes will be reversed.")) return
+    setPickupResetting(true)
+    try {
+      const result = await api<PackagePickupScanResetResponse>("/api/package-pickups/scan-reset", {
+        method: "POST",
+        body: JSON.stringify({ mode: "last", event_id: latest.eventId, scan_date: brooklynDateInput(), store_id: storeId ? Number(storeId) : null }),
+      })
+      const next = pickupScanEntriesRef.current.slice(1)
+      pickupScanEntriesRef.current = next
+      setPickupScanEntries(next)
+      savePickupSummary(next)
+      restorePickupScannerFeedback(next)
+      await Promise.all([load(), loadPickupScanHistory()])
+      onResult({ ok: true, title: "Last scan undone", message: result.message })
+    } catch (error) {
+      onResult({ ok: false, title: "Could not undo scan", message: String(error) })
+    } finally {
+      setPickupResetting(false)
+      window.setTimeout(() => pickupHardwareInputRef.current?.focus(), 50)
+    }
+  }
+
+  async function resetTodayPickupScans() {
+    if (pickupResetting) return
+    if (!window.confirm("Are you sure? This will reset ALL active package scans from today in Brooklyn time. Packages first scanned today will return to their original Amazon delivery-date cards. Scans from every other date will remain unchanged.")) return
+    setPickupResetting(true)
+    try {
+      const result = await api<PackagePickupScanResetResponse>("/api/package-pickups/scan-reset", {
+        method: "POST",
+        body: JSON.stringify({ mode: "today", scan_date: brooklynDateInput(), store_id: storeId ? Number(storeId) : null }),
+      })
+      pickupScanEntriesRef.current = []
+      setPickupScanEntries([])
+      setLastPickupScanEntries([])
+      setPickupScannerFlash("")
+      try { window.localStorage.removeItem("package-pickup-last-scan-summary") } catch { /* Ignore unavailable local storage. */ }
+      await Promise.all([load(), loadPickupScanHistory()])
+      onResult({ ok: true, title: "Today's scans reset", message: result.message })
+    } catch (error) {
+      onResult({ ok: false, title: "Could not reset today's scans", message: String(error) })
+    } finally {
+      setPickupResetting(false)
+    }
   }
 
   function openPickupScanner(mode: "camera" | "hardware" = "camera") {
@@ -7115,6 +7190,9 @@ function PackagePickupPage({
             ) : null}
           </div>
           <DialogFooter className="border-t px-4 py-3">
+            <Button type="button" variant="outline" disabled={pickupResetting || !pickupScanEntries[0]?.eventId} onClick={() => void undoLastPickupScan()}>
+              <RefreshCw className={cn("size-4", pickupResetting && "animate-spin")} /> Undo last scan
+            </Button>
             <Button variant="outline" onClick={() => closePickupScanner(true)}><X className="size-4" /> Close and view summary</Button>
           </DialogFooter>
         </DialogContent>
@@ -7147,7 +7225,12 @@ function PackagePickupPage({
             ))}
             {!lastPickupScanEntries.length ? <div className="pickup-empty">No saved scanner session yet.</div> : null}
           </div>
-          <DialogFooter><Button onClick={() => setPickupSummaryOpen(false)}>Done</Button></DialogFooter>
+          <DialogFooter>
+            <Button type="button" variant="destructive" disabled={pickupResetting || (!todayPickupScanSummary.total_scans && !lastPickupScanEntries.some((entry) => entry.eventId))} onClick={() => void resetTodayPickupScans()}>
+              <RefreshCw className={cn("size-4", pickupResetting && "animate-spin")} /> Reset all today&apos;s scans
+            </Button>
+            <Button onClick={() => setPickupSummaryOpen(false)}>Done</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -7197,6 +7280,9 @@ function PackagePickupPage({
             {pickupHistoryLoading ? <div className="pickup-empty">Loading today&apos;s scanner history…</div> : null}
           </div>
           <DialogFooter>
+            <Button type="button" variant="destructive" disabled={pickupResetting || !todayPickupScanSummary.total_scans} onClick={() => void resetTodayPickupScans()}>
+              <RefreshCw className={cn("size-4", pickupResetting && "animate-spin")} /> Reset all today&apos;s scans
+            </Button>
             <Button variant="outline" onClick={() => void loadPickupScanHistory(true)} disabled={pickupHistoryLoading}>
               <RefreshCw className={cn("size-4", pickupHistoryLoading && "animate-spin")} /> Refresh
             </Button>

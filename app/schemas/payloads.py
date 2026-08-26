@@ -233,6 +233,13 @@ class PackagePickupScanPayload(BaseModel):
     manual_entry: bool = False
 
 
+class PackagePickupScanResetPayload(BaseModel):
+    store_id: Optional[int] = None
+    event_id: Optional[int] = None
+    scan_date: str = ""
+    mode: str = "last"
+
+
 class PackagePickupDeletePayload(BaseModel):
     source_type: str
     source_id: int
