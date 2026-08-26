@@ -6522,6 +6522,39 @@ function PackagePickupPage({
   const pickupScanQueueRef = useRef<Promise<void>>(Promise.resolve())
   const pickupRefreshTimerRef = useRef<number | null>(null)
   const pickupRefreshAfterCloseRef = useRef(false)
+  const pickupAudioContextRef = useRef<AudioContext | null>(null)
+
+  function primePickupScanAudio() {
+    try {
+      const context = pickupAudioContextRef.current || new window.AudioContext()
+      pickupAudioContextRef.current = context
+      if (context.state === "suspended") void context.resume()
+    } catch {
+      // Visual feedback remains available when Web Audio is unsupported or blocked.
+    }
+  }
+
+  function playPickupSuccessBeep() {
+    try {
+      const context = pickupAudioContextRef.current || new window.AudioContext()
+      pickupAudioContextRef.current = context
+      if (context.state === "suspended") void context.resume()
+      const oscillator = context.createOscillator()
+      const gain = context.createGain()
+      const startsAt = context.currentTime
+      oscillator.type = "sine"
+      oscillator.frequency.setValueAtTime(880, startsAt)
+      gain.gain.setValueAtTime(0.0001, startsAt)
+      gain.gain.exponentialRampToValueAtTime(0.2, startsAt + 0.012)
+      gain.gain.exponentialRampToValueAtTime(0.0001, startsAt + 0.13)
+      oscillator.connect(gain)
+      gain.connect(context.destination)
+      oscillator.start(startsAt)
+      oscillator.stop(startsAt + 0.14)
+    } catch {
+      // A blocked sound must never interrupt rapid scanning.
+    }
+  }
 
   async function load() {
     setLoading(true)
@@ -6661,6 +6694,7 @@ function PackagePickupPage({
         setPickupManualEntryOpen(false)
         setPickupManualTracking("")
         setPickupManualWarning("")
+        playPickupSuccessBeep()
         setPickupScanFeedback("success", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} matched. ${result.package?.order_readiness?.message || "Ready for the next package."}`)
         schedulePickupRefresh()
       } else {
@@ -6749,6 +6783,7 @@ function PackagePickupPage({
   }
 
   function openPickupScanner(mode: "camera" | "hardware" = "camera") {
+    primePickupScanAudio()
     pickupScanEntriesRef.current = []
     setPickupScanEntries([])
     setPickupScannerMode(mode)
@@ -6838,6 +6873,8 @@ function PackagePickupPage({
   useEffect(() => () => {
     stopPickupScannerStream()
     if (pickupRefreshTimerRef.current) window.clearTimeout(pickupRefreshTimerRef.current)
+    void pickupAudioContextRef.current?.close()
+    pickupAudioContextRef.current = null
   }, [])
 
   function updateDraft(pickupDate: string, key: "amazon" | "nonAmazon" | "orderNumbers", value: string) {
