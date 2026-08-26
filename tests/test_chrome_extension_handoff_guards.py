@@ -162,7 +162,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.144")
+        self.assertEqual(MANIFEST["version"], "0.1.145")
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
@@ -343,6 +343,11 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         helper_start = CONTENT.index("async function verifyWarehouseDeliveryControlsFromSummary")
         helper_end = CONTENT.index("function setWarehouseDeliverySelect", helper_start)
         helper = CONTENT[helper_start:helper_end]
+        self.assertIn("const compactSummaryVerified", helper)
+        self.assertIn("deliveryPreferencesSummaryIsWarehouseSchedule(candidate)", helper)
+        self.assertIn("const instructionsVerified", helper)
+        self.assertIn("const holidaysVerified", helper)
+        self.assertIn("if (instructionsVerified && holidaysVerified) return true;", helper)
         self.assertIn('querySelector("#deliveryTimesEditLink")', helper)
         self.assertIn('querySelector("#businessHoursExpandLink")', helper)
         self.assertIn("warehouseCompleteDeliveryPreferencesMatch(candidate) ? candidate : null", helper)

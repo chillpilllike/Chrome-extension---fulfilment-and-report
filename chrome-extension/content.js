@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-bundle-report-v135";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-delivery-summary-v136";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5932,6 +5932,40 @@ function warehouseDeliveryControlsMatch(dialog) {
 }
 
 async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDeliveryPreferencesDialog()) {
+  // Amazon's compact Delivery Times summary is the durable saved state. When
+  // it proves the weekday hours and weekend closure, verify the other saved
+  // sections directly instead of reopening the seven-day editor. Reopening
+  // that editor can replace its DOM while hydrating and caused false failures.
+  const compactSummaryVerified = Boolean(await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    return candidate && deliveryPreferencesSummaryIsWarehouseSchedule(candidate) ? candidate : null;
+  }, 6000, 200));
+  if (compactSummaryVerified) {
+    let currentDialog = visibleDeliveryPreferencesDialog();
+    const instructionsExpanded = await expandDeliveryPreferenceSection(currentDialog, "Delivery Instructions", () => {
+      const candidate = visibleDeliveryPreferencesDialog();
+      const controls = warehouseDeliveryInstructionControls(candidate);
+      return Boolean(controls.frontDoor && controls.security && controls.callBox && controls.additionalInfo);
+    });
+    const instructionsVerified = Boolean(instructionsExpanded && await waitUntil(() => {
+      const candidate = visibleDeliveryPreferencesDialog();
+      return candidate && warehouseDeliveryInstructionsMatch(candidate) ? candidate : null;
+    }, 5000, 150));
+
+    currentDialog = visibleDeliveryPreferencesDialog();
+    const holidaysExpanded = await expandDeliveryPreferenceSection(currentDialog, "Observed Holidays", () => (
+      warehouseObservedHolidayControlsReady(visibleDeliveryPreferencesDialog())
+    ));
+    const holidaysVerified = Boolean(holidaysExpanded && await waitUntil(() => {
+      const candidate = visibleDeliveryPreferencesDialog();
+      return candidate && warehouseObservedHolidaysMatch(candidate) ? candidate : null;
+    }, 5000, 150));
+    if (instructionsVerified && holidaysVerified) return true;
+  }
+
+  // Fall back to the detailed editor if Amazon did not render a trustworthy
+  // compact summary or one of the separately saved sections was incomplete.
+  dialog = visibleDeliveryPreferencesDialog();
   const editDeliveryTimes = dialog?.querySelector("#deliveryTimesEditLink");
   if (!editDeliveryTimes) return false;
   await clickElement(editDeliveryTimes, "Verify saved delivery times", { delayMs: 250 });
