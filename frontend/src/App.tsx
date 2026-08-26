@@ -6499,7 +6499,6 @@ function PackagePickupPage({
   const pickupRecentScansRef = useRef<Map<string, number>>(new Map())
   const pickupScanQueueRef = useRef<Promise<void>>(Promise.resolve())
   const pickupRefreshTimerRef = useRef<number | null>(null)
-  const pickupFlashTimerRef = useRef<number | null>(null)
 
   async function load() {
     setLoading(true)
@@ -6566,8 +6565,6 @@ function PackagePickupPage({
   function setPickupScanFeedback(kind: "success" | "duplicate" | "error", message: string) {
     setPickupScannerFlash(kind)
     setPickupScannerStatus(message)
-    if (pickupFlashTimerRef.current) window.clearTimeout(pickupFlashTimerRef.current)
-    pickupFlashTimerRef.current = window.setTimeout(() => setPickupScannerFlash(""), 650)
   }
 
   function schedulePickupRefresh() {
@@ -6690,13 +6687,6 @@ function PackagePickupPage({
       return
     }
     let cancelled = false
-    let noReadTimer = 0
-    function armNoReadWarning() {
-      if (noReadTimer) window.clearTimeout(noReadTimer)
-      noReadTimer = window.setTimeout(() => {
-        if (!cancelled) setPickupScanFeedback("error", "No barcode detected yet. Hold the long TBA barcode straight inside the frame.")
-      }, 6000)
-    }
     async function startRapidScanner() {
       try {
         if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is not available in this browser.")
@@ -6719,11 +6709,9 @@ function PackagePickupPage({
         const reader = new BrowserMultiFormatReader()
         pickupScannerReaderRef.current = reader
         setPickupScannerStatus("Rapid scanner ready. Keep scanning packages—the camera stays open.")
-        armNoReadWarning()
         const controls = await reader.decodeFromVideoElement(video, (result, error) => {
           const text = result?.getText?.().trim()
           if (text) {
-            armNoReadWarning()
             queuePickupScan(text)
             return
           }
@@ -6744,7 +6732,6 @@ function PackagePickupPage({
     void startRapidScanner()
     return () => {
       cancelled = true
-      if (noReadTimer) window.clearTimeout(noReadTimer)
       stopPickupScannerStream()
     }
     // Scanner lifecycle intentionally follows the open state and selected input mode.
@@ -6754,7 +6741,6 @@ function PackagePickupPage({
   useEffect(() => () => {
     stopPickupScannerStream()
     if (pickupRefreshTimerRef.current) window.clearTimeout(pickupRefreshTimerRef.current)
-    if (pickupFlashTimerRef.current) window.clearTimeout(pickupFlashTimerRef.current)
   }, [])
 
   function updateDraft(pickupDate: string, key: "amazon" | "nonAmazon" | "orderNumbers", value: string) {
