@@ -6506,6 +6506,7 @@ function PackagePickupPage({
   const [pickupHistoryLoading, setPickupHistoryLoading] = useState(false)
   const [pickupHistory, setPickupHistory] = useState<PackagePickupScanHistory | null>(null)
   const [pickupResetting, setPickupResetting] = useState(false)
+  const [pickupUndoConfirm, setPickupUndoConfirm] = useState(false)
   const [hardwareScanInput, setHardwareScanInput] = useState("")
   const [pickupManualEntryOpen, setPickupManualEntryOpen] = useState(false)
   const [pickupManualTracking, setPickupManualTracking] = useState("")
@@ -6520,6 +6521,7 @@ function PackagePickupPage({
   const pickupRecentScansRef = useRef<Map<string, number>>(new Map())
   const pickupScanQueueRef = useRef<Promise<void>>(Promise.resolve())
   const pickupRefreshTimerRef = useRef<number | null>(null)
+  const pickupRefreshAfterCloseRef = useRef(false)
 
   async function load() {
     setLoading(true)
@@ -6607,6 +6609,7 @@ function PackagePickupPage({
   }
 
   function addPickupScanEntry(entry: PackagePickupScanEntry) {
+    setPickupUndoConfirm(false)
     const next = [entry, ...pickupScanEntriesRef.current].slice(0, 100)
     pickupScanEntriesRef.current = next
     setPickupScanEntries(next)
@@ -6700,10 +6703,9 @@ function PackagePickupPage({
   async function undoLastPickupScan() {
     const latest = pickupScanEntriesRef.current[0]
     if (!latest?.eventId || pickupResetting) return
-    if (!window.confirm("Undo the last scan? Only that exact scan event and its package changes will be reversed.")) return
     setPickupResetting(true)
     try {
-      const result = await api<PackagePickupScanResetResponse>("/api/package-pickups/scan-reset", {
+      await api<PackagePickupScanResetResponse>("/api/package-pickups/scan-reset", {
         method: "POST",
         body: JSON.stringify({ mode: "last", event_id: latest.eventId, scan_date: brooklynDateInput(), store_id: storeId ? Number(storeId) : null }),
       })
@@ -6712,10 +6714,11 @@ function PackagePickupPage({
       setPickupScanEntries(next)
       savePickupSummary(next)
       restorePickupScannerFeedback(next)
-      await Promise.all([load(), loadPickupScanHistory()])
-      onResult({ ok: true, title: "Last scan undone", message: result.message })
+      setPickupUndoConfirm(false)
+      pickupRefreshAfterCloseRef.current = true
+      await loadPickupScanHistory()
     } catch (error) {
-      onResult({ ok: false, title: "Could not undo scan", message: String(error) })
+      setPickupScanFeedback("error", `Could not undo scan: ${String(error)}`)
     } finally {
       setPickupResetting(false)
       window.setTimeout(() => pickupHardwareInputRef.current?.focus(), 50)
@@ -6757,6 +6760,7 @@ function PackagePickupPage({
     setPickupManualEntryOpen(false)
     setPickupManualTracking("")
     setPickupManualWarning("")
+    setPickupUndoConfirm(false)
     pickupPendingAliasRef.current = ""
     pickupRecentScansRef.current.clear()
     pickupScanQueueRef.current = Promise.resolve()
@@ -6766,6 +6770,10 @@ function PackagePickupPage({
     stopPickupScannerStream()
     setPickupScannerOpen(false)
     pickupPendingAliasRef.current = ""
+    if (pickupRefreshAfterCloseRef.current) {
+      pickupRefreshAfterCloseRef.current = false
+      void load()
+    }
     if (pickupScanEntriesRef.current.length) {
       savePickupSummary(pickupScanEntriesRef.current)
       if (showSummary) setPickupSummaryOpen(true)
@@ -6803,15 +6811,10 @@ function PackagePickupPage({
         const reader = new BrowserMultiFormatReader()
         pickupScannerReaderRef.current = reader
         setPickupScannerStatus("Rapid scanner ready. Keep scanning packages—the camera stays open.")
-        const controls = await reader.decodeFromVideoElement(video, (result, error) => {
+        const controls = await reader.decodeFromVideoElement(video, (result) => {
           const text = result?.getText?.().trim()
           if (text) {
             queuePickupScan(text)
-            return
-          }
-          const errorName = String((error as Error | undefined)?.name || "")
-          if (error && errorName && errorName !== "NotFoundException") {
-            setPickupScanFeedback("error", "Barcode could not be read. Straighten the label and try again.")
           }
         })
         if (cancelled) controls.stop()
@@ -7190,9 +7193,19 @@ function PackagePickupPage({
             ) : null}
           </div>
           <DialogFooter className="border-t px-4 py-3">
-            <Button type="button" variant="outline" disabled={pickupResetting || !pickupScanEntries[0]?.eventId} onClick={() => void undoLastPickupScan()}>
-              <RefreshCw className={cn("size-4", pickupResetting && "animate-spin")} /> Undo last scan
-            </Button>
+            {pickupUndoConfirm ? (
+              <div className="pickup-undo-confirm">
+                <span><AlertCircle className="size-4" /> Undo only the latest scan and restore its previous package state?</span>
+                <Button type="button" size="sm" variant="ghost" disabled={pickupResetting} onClick={() => setPickupUndoConfirm(false)}>Cancel</Button>
+                <Button type="button" size="sm" variant="destructive" disabled={pickupResetting} onClick={() => void undoLastPickupScan()}>
+                  <RefreshCw className={cn("size-4", pickupResetting && "animate-spin")} /> Confirm undo
+                </Button>
+              </div>
+            ) : (
+              <Button type="button" variant="outline" disabled={pickupResetting || !pickupScanEntries[0]?.eventId} onClick={() => setPickupUndoConfirm(true)}>
+                <RefreshCw className="size-4" /> Undo last scan
+              </Button>
+            )}
             <Button variant="outline" onClick={() => closePickupScanner(true)}><X className="size-4" /> Close and view summary</Button>
           </DialogFooter>
         </DialogContent>

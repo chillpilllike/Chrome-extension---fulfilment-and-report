@@ -2688,6 +2688,9 @@ body,
 .pickup-manual-tracking-form input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .pickup-manual-tracking-warning { display: flex; align-items: flex-start; gap: .4rem; color: #a33a00; font-size: .72rem; font-weight: 650; }
 .pickup-manual-tracking-warning svg { flex: 0 0 auto; margin-top: .05rem; }
+.pickup-undo-confirm { display: flex; flex: 1 1 24rem; flex-wrap: wrap; align-items: center; gap: .45rem; padding: .4rem .5rem; border: 1px solid #efc2c2; border-radius: .4rem; background: #fff5f5; }
+.pickup-undo-confirm > span { display: flex; min-width: 12rem; flex: 1 1 15rem; align-items: center; gap: .35rem; color: #9b2c2c; font-size: .7rem; font-weight: 650; }
+.pickup-undo-confirm > span svg { flex: 0 0 auto; }
 .pickup-scanner-recent, .pickup-scan-summary-list { display: grid; gap: .45rem; max-height: 17rem; overflow-y: auto; }
 .pickup-scanner-recent > div, .pickup-scan-summary-list > div { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .55rem; align-items: start; padding: .55rem .65rem; border: 1px solid #e1e6ec; border-radius: .4rem; background: #fff; }
 .pickup-scanner-recent > div.is-success, .pickup-scan-summary-list > div.is-success { border-left: 3px solid #2fb344; }
