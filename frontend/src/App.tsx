@@ -34,7 +34,7 @@ import Menu2 from "@tabler/icons-react/dist/esm/icons/IconMenu2.mjs"
 import Clock from "@tabler/icons-react/dist/esm/icons/IconClock.mjs"
 import TruckDelivery from "@tabler/icons-react/dist/esm/icons/IconTruckDelivery.mjs"
 import { Popover } from "@base-ui/react/popover"
-import { BrowserMultiFormatReader, type IScannerControls } from "@zxing/browser"
+import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerControls } from "@zxing/browser"
 
 import { APP_VERSION } from "@/appVersion"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -6514,7 +6514,7 @@ function PackagePickupPage({
   const pickupScannerVideoRef = useRef<HTMLVideoElement | null>(null)
   const pickupScannerStreamRef = useRef<MediaStream | null>(null)
   const pickupScannerControlsRef = useRef<IScannerControls | null>(null)
-  const pickupScannerReaderRef = useRef<BrowserMultiFormatReader | null>(null)
+  const pickupScannerReaderRef = useRef<BrowserMultiFormatOneDReader | null>(null)
   const pickupHardwareInputRef = useRef<HTMLInputElement | null>(null)
   const pickupPendingAliasRef = useRef("")
   const pickupScanEntriesRef = useRef<PackagePickupScanEntry[]>([])
@@ -6727,7 +6727,7 @@ function PackagePickupPage({
     const latest = entries[0]
     if (!latest) {
       setPickupScannerFlash("")
-      setPickupScannerStatus(pickupScannerMode === "camera" ? "Rapid scanner ready. Keep scanning packages—the camera stays open." : "Hardware scanner ready. Scan a barcode or type it and press Enter.")
+      setPickupScannerStatus(pickupScannerMode === "camera" ? "Rapid scanner ready. Scan only the long linear barcode; square codes are ignored." : "Hardware scanner ready. Scan the long linear barcode or type it and press Enter.")
       return
     }
     setPickupScannerFlash(latest.duplicate ? "duplicate" : latest.ok ? "success" : "error")
@@ -6790,7 +6790,7 @@ function PackagePickupPage({
     setPickupScannerOpen(true)
     setPickupScannerError("")
     setPickupScannerFlash("")
-    setPickupScannerStatus(mode === "camera" ? "Opening rapid camera scanner…" : "Hardware scanner ready. Scan a barcode or type it and press Enter.")
+    setPickupScannerStatus(mode === "camera" ? "Opening rapid camera scanner…" : "Hardware scanner ready. Scan the long linear barcode or type it and press Enter.")
     setHardwareScanInput("")
     setPickupManualEntryOpen(false)
     setPickupManualTracking("")
@@ -6843,9 +6843,9 @@ function PackagePickupPage({
         pickupScannerStreamRef.current = stream
         video.srcObject = stream
         await video.play()
-        const reader = new BrowserMultiFormatReader()
+        const reader = new BrowserMultiFormatOneDReader()
         pickupScannerReaderRef.current = reader
-        setPickupScannerStatus("Rapid scanner ready. Keep scanning packages—the camera stays open.")
+        setPickupScannerStatus("Rapid scanner ready. Scan only the long linear barcode; square codes are ignored.")
         const controls = await reader.decodeFromVideoElement(video, (result) => {
           const text = result?.getText?.().trim()
           if (text) {
@@ -7142,7 +7142,7 @@ function PackagePickupPage({
         <DialogContent className="pickup-scanner-dialog max-w-2xl p-0">
           <DialogHeader className="border-b px-4 py-3">
             <DialogTitle className="flex items-center gap-2"><Camera className="size-5" /> Rapid Package Pickup Scanner</DialogTitle>
-            <DialogDescription>The scanner remains open while packages are matched and recorded in the background.</DialogDescription>
+            <DialogDescription>Scan the long linear barcode. Square Data Matrix and QR codes are ignored.</DialogDescription>
           </DialogHeader>
           <div className={cn("pickup-scanner-body", pickupScannerFlash && `is-${pickupScannerFlash}`)}>
             <div className="pickup-scanner-mode-tabs">
@@ -7167,7 +7167,7 @@ function PackagePickupPage({
               >
                 <PackageCheck className="size-10" />
                 <strong>Hardware scanner ready</strong>
-                <span>Most USB and Bluetooth laser scanners work as keyboards. Scan now; Enter submits automatically.</span>
+                <span>Most USB and Bluetooth laser scanners work as keyboards. Use the long linear barcode; configure a 2D imager to ignore square codes.</span>
                 <Input
                   ref={pickupHardwareInputRef}
                   value={hardwareScanInput}
