@@ -6496,7 +6496,7 @@ function PackagePickupPage({
     try {
       if (typeof window === "undefined") return []
       const parsed = JSON.parse(window.localStorage.getItem("package-pickup-last-scan-summary") || "[]")
-      return Array.isArray(parsed) ? parsed.slice(0, 100) : []
+      return Array.isArray(parsed) ? parsed.filter((entry) => !entry?.duplicate).slice(0, 100) : []
     } catch {
       return []
     }
@@ -6632,7 +6632,7 @@ function PackagePickupPage({
   }
 
   function savePickupSummary(entries: PackagePickupScanEntry[]) {
-    const summary = entries.slice(0, 100)
+    const summary = entries.filter((entry) => !entry.duplicate).slice(0, 100)
     setLastPickupScanEntries(summary)
     try {
       window.localStorage.setItem("package-pickup-last-scan-summary", JSON.stringify(summary))
@@ -6683,14 +6683,13 @@ function PackagePickupPage({
         scannedAt: new Date().toISOString(),
         package: result.package,
       }
-      addPickupScanEntry(entry)
       if (entry.ok && entry.duplicate) {
         setPickupManualEntryOpen(false)
         setPickupManualTracking("")
         setPickupManualWarning("")
         setPickupScanFeedback("duplicate", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} is a duplicate scan. Successful count was not increased.`)
-        schedulePickupRefresh()
       } else if (entry.ok) {
+        addPickupScanEntry(entry)
         setPickupManualEntryOpen(false)
         setPickupManualTracking("")
         setPickupManualWarning("")
@@ -6698,6 +6697,7 @@ function PackagePickupPage({
         setPickupScanFeedback("success", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} matched. ${result.package?.order_readiness?.message || "Ready for the next package."}`)
         schedulePickupRefresh()
       } else {
+        addPickupScanEntry(entry)
         if (manualEntry) setPickupManualWarning(entry.message)
         setPickupScanFeedback("error", entry.message)
         void loadPickupScanHistory()
@@ -7112,10 +7112,8 @@ function PackagePickupPage({
   const safePickupPage = Math.min(pickupPage, pickupPageCount)
   const pagedPickupCards = visibleCards.slice((safePickupPage - 1) * pickupDaysPerPage, safePickupPage * pickupDaysPerPage)
   const pickupScanSuccessCount = pickupScanEntries.filter((entry) => entry.ok && !entry.duplicate).length
-  const pickupScanDuplicateCount = pickupScanEntries.filter((entry) => entry.duplicate).length
   const pickupScanFailureCount = pickupScanEntries.filter((entry) => !entry.ok).length
   const pickupSummarySuccessCount = lastPickupScanEntries.filter((entry) => entry.ok && !entry.duplicate).length
-  const pickupSummaryDuplicateCount = lastPickupScanEntries.filter((entry) => entry.duplicate).length
   const pickupSummaryFailureCount = lastPickupScanEntries.filter((entry) => !entry.ok).length
   const pickupSummaryReadyOrders = new Set(lastPickupScanEntries.filter((entry) => entry.ok && !entry.duplicate && entry.package?.order_readiness?.ready_to_ship && entry.package.odoo_order_name).map((entry) => entry.package!.odoo_order_name)).size
   const todayPickupScanSummary = pickupHistory?.summary || {
@@ -7181,7 +7179,6 @@ function PackagePickupPage({
             )}
             <div className="pickup-scanner-counts" aria-label="Current scanner session counts">
               <div className="is-success"><span>Successful</span><strong>{pickupScanSuccessCount}</strong></div>
-              <div className="is-duplicate"><span>Duplicates</span><strong>{pickupScanDuplicateCount}</strong></div>
               <div className="is-error"><span>Unsuccessful</span><strong>{pickupScanFailureCount}</strong></div>
             </div>
             <div className={cn("pickup-scanner-live-status", pickupScannerFlash && `is-${pickupScannerFlash}`)}>
@@ -7252,7 +7249,7 @@ function PackagePickupPage({
         <DialogContent className="pickup-scan-summary-dialog max-w-2xl">
           <DialogHeader>
             <DialogTitle>Last pickup scan summary</DialogTitle>
-            <DialogDescription>{pickupSummarySuccessCount} successful · {pickupSummaryDuplicateCount} duplicate · {pickupSummaryFailureCount} unsuccessful</DialogDescription>
+            <DialogDescription>{pickupSummarySuccessCount} successful · {pickupSummaryFailureCount} unsuccessful</DialogDescription>
           </DialogHeader>
           <div className="pickup-order-ready-summary">
             <PackageCheck className="size-5" />
@@ -7295,13 +7292,11 @@ function PackagePickupPage({
           <div className="pickup-history-summary-grid">
             <div><span>Total scans</span><strong>{todayPickupScanSummary.total_scans}</strong></div>
             <div className="is-success"><span>Matched</span><strong>{todayPickupScanSummary.matched}</strong></div>
-            <div className="is-duplicate"><span>Duplicates</span><strong>{todayPickupScanSummary.duplicates}</strong></div>
             <div className="is-error"><span>Unsuccessful</span><strong>{todayPickupScanSummary.unsuccessful}</strong></div>
             <div className="is-ready"><span>Ready Odoo orders</span><strong>{todayPickupScanSummary.ready_to_ship_orders}</strong></div>
           </div>
           <div className="pickup-history-meta">
             <span><strong>{todayPickupScanSummary.unique_packages}</strong> unique matched packages</span>
-            <span><strong>{todayPickupScanSummary.duplicates}</strong> duplicate rescans</span>
             <span><strong>{todayPickupScanSummary.odoo_orders_found}</strong> Odoo orders found</span>
           </div>
           <div className="pickup-scan-history-list">
@@ -7413,7 +7408,6 @@ function PackagePickupPage({
             <span className="pickup-today-scan-icon"><PackageCheck className="size-5" /></span>
             <span className="pickup-today-scan-title"><small>Today&apos;s scanner history</small><strong>{todayPickupScanSummary.total_scans} scans · {todayPickupScanSummary.ready_to_ship_orders} ready</strong></span>
             <span className="pickup-today-scan-metric is-success"><small>Matched</small><strong>{todayPickupScanSummary.matched}</strong></span>
-            <span className="pickup-today-scan-metric is-duplicate"><small>Duplicate</small><strong>{todayPickupScanSummary.duplicates}</strong></span>
             <span className="pickup-today-scan-metric is-error"><small>Unsuccessful</small><strong>{todayPickupScanSummary.unsuccessful}</strong></span>
             <ChevronRight className="size-4" />
           </button>

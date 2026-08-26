@@ -32104,7 +32104,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
                 COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0) AS odoo_orders_found,
                 COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0 AND order_ready=1) AS ready_to_ship_orders
             FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL {store_sql}
+            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 {store_sql}
             """,
             params,
         ).fetchone()) or {}
@@ -32115,7 +32115,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
                    order_ready, order_total_packages, order_received_packages, order_remaining_packages,
                    order_readiness_message, remaining_packages_json, message, scanned_at
             FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL {store_sql}
+            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 {store_sql}
             ORDER BY scanned_at DESC, id DESC
             LIMIT 1000
             """,
@@ -32395,38 +32395,39 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             package.get("promise"),
             package.get("updated_at"),
         ) or clean_text(package.get("updated_at")) or now
-        conn.execute(
-            """
-            INSERT INTO package_pickup_delivery_records
-                (package_id, delivered_at, scanned_at, last_scanned_at, scanned_code, scan_count, updated_at, created_at)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(package_id) DO UPDATE SET
-                delivered_at=COALESCE(NULLIF(package_pickup_delivery_records.delivered_at, ''), excluded.delivered_at),
-                scanned_at=COALESCE(package_pickup_delivery_records.scanned_at, excluded.scanned_at),
-                last_scanned_at=excluded.last_scanned_at,
-                scanned_code=excluded.scanned_code,
-                scan_count=package_pickup_delivery_records.scan_count+1,
-                updated_at=excluded.updated_at
-            """,
-            (package_id, delivered_at, first_scanned_at, now, scan_code, now, now),
-        )
         merged_codes = clean_text(package.get("scanned_codes_json")) or "[]"
-        alias_row = {**package, "scanned_codes_json": merged_codes}
-        for alias in alias_codes:
-            merged_codes = dispatch_merge_scanned_codes(alias_row, alias, alias)
-            alias_row["scanned_codes_json"] = merged_codes
-        conn.execute(
-            """
-            UPDATE amazon_dispatch_packages
-            SET received_at=COALESCE(received_at, ?),
-                not_received_at=NULL,
-                scanned_codes_json=?,
-                updated_at=?
-            WHERE id=?
-            """,
-            (first_scanned_at, merged_codes, now, package_id),
-        )
-        package = {**package, "received_at": first_scanned_at, "scanned_codes_json": merged_codes}
+        if not duplicate:
+            conn.execute(
+                """
+                INSERT INTO package_pickup_delivery_records
+                    (package_id, delivered_at, scanned_at, last_scanned_at, scanned_code, scan_count, updated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET
+                    delivered_at=COALESCE(NULLIF(package_pickup_delivery_records.delivered_at, ''), excluded.delivered_at),
+                    scanned_at=COALESCE(package_pickup_delivery_records.scanned_at, excluded.scanned_at),
+                    last_scanned_at=excluded.last_scanned_at,
+                    scanned_code=excluded.scanned_code,
+                    scan_count=package_pickup_delivery_records.scan_count+1,
+                    updated_at=excluded.updated_at
+                """,
+                (package_id, delivered_at, first_scanned_at, now, scan_code, now, now),
+            )
+            alias_row = {**package, "scanned_codes_json": merged_codes}
+            for alias in alias_codes:
+                merged_codes = dispatch_merge_scanned_codes(alias_row, alias, alias)
+                alias_row["scanned_codes_json"] = merged_codes
+            conn.execute(
+                """
+                UPDATE amazon_dispatch_packages
+                SET received_at=COALESCE(received_at, ?),
+                    not_received_at=NULL,
+                    scanned_codes_json=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (first_scanned_at, merged_codes, now, package_id),
+            )
+            package = {**package, "received_at": first_scanned_at, "scanned_codes_json": merged_codes}
         order_readiness = package_pickup_order_readiness(conn, package)
         scan_date = package_pickup_business_date(first_scanned_at)
         if not duplicate and scan_date:
@@ -32457,23 +32458,24 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
         }
         duplicate_text = " already scanned; original pickup time retained" if duplicate else " scanned successfully"
         success_message = f"{result['odoo_order_name'] or result['amazon_order_id']}{duplicate_text}."
-        event_id = record_package_pickup_scan_event(
-            conn,
-            scan_code=scan_code,
-            result_status="duplicate" if duplicate else "matched",
-            matched=True,
-            duplicate=duplicate,
-            message=success_message,
-            scanned_at=now,
-            package=package,
-            store_id=payload.store_id,
-            order_readiness=order_readiness,
-            previous_package_state={
-                "received_at": package.get("received_at") if duplicate else matches[0].get("received_at"),
-                "not_received_at": matches[0].get("not_received_at"),
-                "scanned_codes_json": matches[0].get("scanned_codes_json"),
-            } if not duplicate else None,
-        )
+        event_id = None
+        if not duplicate:
+            event_id = record_package_pickup_scan_event(
+                conn,
+                scan_code=scan_code,
+                result_status="matched",
+                matched=True,
+                message=success_message,
+                scanned_at=now,
+                package=package,
+                store_id=payload.store_id,
+                order_readiness=order_readiness,
+                previous_package_state={
+                    "received_at": matches[0].get("received_at"),
+                    "not_received_at": matches[0].get("not_received_at"),
+                    "scanned_codes_json": matches[0].get("scanned_codes_json"),
+                },
+            )
     fast_page_cache_clear_matching({"package-pickups"})
     return {
         "ok": True,
