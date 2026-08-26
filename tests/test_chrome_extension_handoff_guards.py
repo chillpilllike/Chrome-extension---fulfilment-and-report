@@ -162,7 +162,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.145")
+        self.assertEqual(MANIFEST["version"], "0.1.146")
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
@@ -238,15 +238,15 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         preferences_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0)")
         preferences_end = CONTENT.index("async function ensurePreferredAmazonDayWeekdayDelivery", preferences_start)
         preferences = CONTENT[preferences_start:preferences_end]
-        self.assertIn('"#edit-delivery-preferences-link, a"', preferences)
+        self.assertIn('"#edit-delivery-preferences-link, a"', CONTENT)
         self.assertIn('querySelector("#deliveryTimesEditLink")', preferences)
         self.assertIn('querySelector("#businessHoursExpandLink")', preferences)
         self.assertIn("setWarehouseDeliveryClosed(closed, true)", preferences)
         self.assertIn("warehouseDeliveryControlsMatch(dialog)", preferences)
         self.assertIn("adpSubmitButton_", preferences)
-        self.assertIn("deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog())", preferences)
-        self.assertIn("const verified = await verifyWarehouseDeliveryControlsFromSummary", preferences)
-        self.assertIn("verifyWarehouseDeliveryControlsFromSummary", preferences)
+        self.assertIn("verifyWarehouseCompactSavedPreferences(dialog)", preferences)
+        self.assertIn("candidate.querySelector(\"[aria-busy='true']\")", preferences)
+        self.assertIn("}, 30000, 250)", preferences)
 
     def test_checkout_enforces_complete_delivery_instructions(self) -> None:
         self.assertIn('const WAREHOUSE_DELIVERY_DROP_OFF = "front door";', CONTENT)
@@ -324,23 +324,20 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("&#0*39;|&apos;", CONTENT[normalizer_start:normalizer_end])
         self.assertIn("return ensureConsumerWarehouseDeliveryPreferences(activeJob, nextTrigger, nextAttempt);", helper)
 
-    def test_delivery_preferences_retry_themselves_before_manual_pause(self) -> None:
+    def test_business_delivery_preferences_use_one_loading_and_save_pass(self) -> None:
         preferences_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0)")
         preferences_end = CONTENT.index("async function ensurePreferredAmazonDayWeekdayDelivery", preferences_start)
         preferences = CONTENT[preferences_start:preferences_end]
-        failure = "Amazon did not retain the complete warehouse delivery preferences"
 
-        self.assertIn("const WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES = 2;", CONTENT)
-        self.assertIn("if (retryAttempt < WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES)", preferences)
-        self.assertIn("return ensureWarehouseDeliveryPreferences(activeJob, nextAttempt);", preferences)
-        self.assertIn("await sleep(1500);", preferences)
-        self.assertLess(
-            preferences.index("return ensureWarehouseDeliveryPreferences(activeJob, nextAttempt);"),
-            preferences.index(failure),
-        )
+        self.assertIn("remained busy and did not finish loading", preferences)
+        self.assertIn("Verified already-saved checkout delivery preferences without resaving them", preferences)
+        self.assertIn("Saved checkout delivery preferences in one pass", preferences)
+        self.assertNotIn("Recheck delivery preferences", preferences)
+        self.assertNotIn("Retrying checkout delivery preferences automatically", preferences)
+        self.assertNotIn("return ensureWarehouseDeliveryPreferences(activeJob, nextAttempt);", preferences)
 
     def test_delivery_preferences_fall_back_to_all_seven_saved_controls(self) -> None:
-        helper_start = CONTENT.index("async function verifyWarehouseDeliveryControlsFromSummary")
+        helper_start = CONTENT.index("async function verifyWarehouseCompactSavedPreferences")
         helper_end = CONTENT.index("function setWarehouseDeliverySelect", helper_start)
         helper = CONTENT[helper_start:helper_end]
         self.assertIn("const compactSummaryVerified", helper)

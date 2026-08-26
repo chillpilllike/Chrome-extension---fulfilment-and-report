@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-delivery-summary-v136";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-delivery-single-pass-v137";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5931,7 +5931,7 @@ function warehouseDeliveryControlsMatch(dialog) {
   ));
 }
 
-async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDeliveryPreferencesDialog()) {
+async function verifyWarehouseCompactSavedPreferences(dialog = visibleDeliveryPreferencesDialog()) {
   // Amazon's compact Delivery Times summary is the durable saved state. When
   // it proves the weekday hours and weekend closure, verify the other saved
   // sections directly instead of reopening the seven-day editor. Reopening
@@ -5962,7 +5962,11 @@ async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDelive
     }, 5000, 150));
     if (instructionsVerified && holidaysVerified) return true;
   }
+  return false;
+}
 
+async function verifyWarehouseDeliveryControlsFromSummary(dialog = visibleDeliveryPreferencesDialog()) {
+  if (await verifyWarehouseCompactSavedPreferences(dialog)) return true;
   // Fall back to the detailed editor if Amazon did not render a trustworthy
   // compact summary or one of the separately saved sections was incomplete.
   dialog = visibleDeliveryPreferencesDialog();
@@ -6303,15 +6307,27 @@ async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
 
   showPanel("Delivery preferences", "Verifying Monday-Friday 8:00 AM-4:00 PM, weekend closure, front-door instructions, and no observed holidays.", null, null);
   await clickElement(editPreferences, "Edit delivery preferences", { delayMs: 300 });
-  let dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
-  const editDeliveryTimes = await waitUntil(
-    () => visibleDeliveryPreferencesDialog()?.querySelector("#deliveryTimesEditLink") || null,
-    10000,
-    200,
-  );
-  dialog = visibleDeliveryPreferencesDialog();
+  let dialog = await waitUntil(() => {
+    const candidate = visibleDeliveryPreferencesDialog();
+    if (!candidate || candidate.querySelector("[aria-busy='true']")) return null;
+    return candidate.querySelector("#deliveryTimesEditLink") ? candidate : null;
+  }, 30000, 250);
+  const editDeliveryTimes = dialog?.querySelector("#deliveryTimesEditLink") || null;
   if (!dialog || !editDeliveryTimes) {
-    return pauseForDeliveryPreferences(activeJob, "Amazon opened delivery preferences but did not expose the Delivery Times edit control.", dialog);
+    return pauseForDeliveryPreferences(activeJob, "Amazon's delivery-preferences dialog remained busy and did not finish loading. The checkout is paused instead of repeatedly reopening it.", visibleDeliveryPreferencesDialog());
+  }
+
+  if (await verifyWarehouseCompactSavedPreferences(dialog)) {
+    await closeDeliveryPreferencesDialog(visibleDeliveryPreferencesDialog());
+    await waitUntil(() => !visibleDeliveryPreferencesDialog(), 5000, 200);
+    await sendDiagnostic("Verified already-saved checkout delivery preferences without resaving them.", {
+      group_key: activeJob?.job?.group_key || "",
+      weekdays: "Monday-Friday 08:00-16:00",
+      weekends: "closed",
+      drop_off: "Front Door",
+      observed_holidays: "none",
+    });
+    return true;
   }
   await clickElement(editDeliveryTimes, "Edit delivery times", { delayMs: 250 });
   dialog = await waitUntil(visibleDeliveryPreferencesDialog, 5000, 150);
@@ -6377,51 +6393,10 @@ async function ensureWarehouseDeliveryPreferences(activeJob, retryAttempt = 0) {
   if (!closed) {
     return pauseForDeliveryPreferences(activeJob, "Amazon did not confirm saving the delivery preferences.", visibleDeliveryPreferencesDialog());
   }
-
-  const refreshedLink = await waitUntil(
-    () => [...document.querySelectorAll("#edit-delivery-preferences-link, a")]
-      .find((element) => visible(element) && normalizedText(element.textContent || "").toLowerCase() === "edit delivery preferences"),
-    10000,
-    250,
-  );
-  if (!refreshedLink) {
-    return pauseForDeliveryPreferences(activeJob, "Amazon saved delivery preferences but the checkout did not return for verification.");
-  }
-  await clickElement(refreshedLink, "Recheck delivery preferences", { delayMs: 300 });
-  dialog = await waitUntil(visibleDeliveryPreferencesDialog, 10000, 200);
-  await waitUntil(() => visibleDeliveryPreferencesDialog()?.querySelector("#deliveryTimesEditLink") || null, 10000, 200);
-  dialog = visibleDeliveryPreferencesDialog();
-  // Amazon inserts the Edit link before it hydrates the compact Monday-Friday
-  // summary. Give that summary time to settle instead of treating the
-  // temporarily empty section as a failed save.
-  await waitUntil(
-    () => deliveryPreferencesSummaryIsWarehouseSchedule(visibleDeliveryPreferencesDialog()),
-    6000,
-    200,
-  );
-  const verified = await verifyWarehouseDeliveryControlsFromSummary(visibleDeliveryPreferencesDialog());
-  dialog = visibleDeliveryPreferencesDialog();
-  await closeDeliveryPreferencesDialog(dialog);
-  if (!verified) {
-    if (retryAttempt < WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES) {
-      const nextAttempt = retryAttempt + 1;
-      showPanel(
-        "Delivery preferences",
-        `Amazon did not retain the warehouse delivery schedule. Retrying automatically (${nextAttempt}/${WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES}).`,
-        null,
-        null,
-      );
-      await sendDiagnostic("Retrying checkout delivery preferences automatically.", {
-        group_key: activeJob?.job?.group_key || "",
-        retry_attempt: nextAttempt,
-        max_automatic_retries: WAREHOUSE_DELIVERY_AUTOMATIC_RETRIES,
-      });
-      await sleep(1500);
-      return ensureWarehouseDeliveryPreferences(activeJob, nextAttempt);
-    }
-    return pauseForDeliveryPreferences(activeJob, "Amazon did not retain the complete warehouse delivery preferences: Monday-Friday 8:00 AM-4:00 PM, weekends closed, front-door instructions, and no observed holidays.");
-  }
-  await sendDiagnostic("Saved and verified checkout delivery preferences.", {
+  // A closed modal is Amazon's save acknowledgement. Do not immediately open
+  // a new modal: Amazon often leaves that second shell aria-busy, and repeated
+  // close/reopen cycles prevent its request from ever finishing.
+  await sendDiagnostic("Saved checkout delivery preferences in one pass.", {
     group_key: activeJob?.job?.group_key || "",
     weekdays: "Monday-Friday 08:00-16:00",
     weekends: "closed",
