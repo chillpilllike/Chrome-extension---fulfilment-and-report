@@ -670,6 +670,37 @@ type PackagePickupScanResponse = {
   package?: PackagePickupScanPackage
 }
 
+type PackagePickupScanHistoryEvent = {
+  id: number
+  store_id: number
+  package_id?: number
+  scan_code: string
+  result_status: string
+  matched: boolean | number
+  duplicate: boolean | number
+  odoo_order_name: string
+  amazon_order_id: string
+  shipment_id: string
+  recipient_ref: string
+  message: string
+  scanned_at: string
+}
+
+type PackagePickupScanHistory = {
+  ok: boolean
+  scan_date: string
+  timezone: string
+  summary: {
+    total_scans: number
+    matched: number
+    unsuccessful: number
+    duplicates: number
+    unique_packages: number
+    odoo_orders_found: number
+  }
+  events: PackagePickupScanHistoryEvent[]
+}
+
 type PickupBulkRow = {
   key: string
   source_id?: number
@@ -6436,6 +6467,9 @@ function PackagePickupPage({
     }
   })
   const [pickupSummaryOpen, setPickupSummaryOpen] = useState(false)
+  const [pickupHistoryOpen, setPickupHistoryOpen] = useState(false)
+  const [pickupHistoryLoading, setPickupHistoryLoading] = useState(false)
+  const [pickupHistory, setPickupHistory] = useState<PackagePickupScanHistory | null>(null)
   const [hardwareScanInput, setHardwareScanInput] = useState("")
   const pickupScannerVideoRef = useRef<HTMLVideoElement | null>(null)
   const pickupScannerStreamRef = useRef<MediaStream | null>(null)
@@ -6471,11 +6505,31 @@ function PackagePickupPage({
     }
   }
 
+  async function loadPickupScanHistory(showLoading = false) {
+    if (showLoading) setPickupHistoryLoading(true)
+    try {
+      const query = new URLSearchParams({ scan_date: brooklynDateInput() })
+      if (storeId) query.set("store_id", storeId)
+      const result = await api<PackagePickupScanHistory>(`/api/package-pickups/scan-history?${query.toString()}`)
+      setPickupHistory(result)
+    } catch (error) {
+      if (showLoading) onResult({ ok: false, title: "Scanner history", message: String(error) })
+    } finally {
+      if (showLoading) setPickupHistoryLoading(false)
+    }
+  }
+
   useEffect(() => {
     void load()
     // Filters are the source of truth for this operational view.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storeId, dateFrom, dateTo])
+
+  useEffect(() => {
+    void loadPickupScanHistory()
+    // Today's scanner history follows the selected store, not the delivery-date filters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeId])
 
   function stopPickupScannerStream() {
     pickupScannerControlsRef.current?.stop()
@@ -6500,7 +6554,10 @@ function PackagePickupPage({
 
   function schedulePickupRefresh() {
     if (pickupRefreshTimerRef.current) window.clearTimeout(pickupRefreshTimerRef.current)
-    pickupRefreshTimerRef.current = window.setTimeout(() => void load(), 500)
+    pickupRefreshTimerRef.current = window.setTimeout(() => {
+      void load()
+      void loadPickupScanHistory()
+    }, 500)
   }
 
   function savePickupSummary(entries: PackagePickupScanEntry[]) {
@@ -6532,6 +6589,14 @@ function PackagePickupPage({
       })
       if (result.requires_tracking_scan) {
         pickupPendingAliasRef.current = code
+        addPickupScanEntry({
+          code,
+          ok: false,
+          message: result.message,
+          scannedAt: new Date().toISOString(),
+        })
+        void loadPickupScanHistory()
+        setPickupScanFeedback("error", result.message)
         setPickupScannerStatus(`${result.message} Keep the scanner open and scan the long TBA barcode.`)
         return
       }
@@ -6550,6 +6615,7 @@ function PackagePickupPage({
         schedulePickupRefresh()
       } else {
         setPickupScanFeedback("error", entry.message)
+        void loadPickupScanHistory()
       }
     } catch (error) {
       const message = `Scan failed: ${String(error)}`
@@ -6908,6 +6974,14 @@ function PackagePickupPage({
   const pickupScanFailureCount = pickupScanEntries.filter((entry) => !entry.ok).length
   const pickupSummarySuccessCount = lastPickupScanEntries.filter((entry) => entry.ok).length
   const pickupSummaryFailureCount = lastPickupScanEntries.filter((entry) => !entry.ok).length
+  const todayPickupScanSummary = pickupHistory?.summary || {
+    total_scans: 0,
+    matched: 0,
+    unsuccessful: 0,
+    duplicates: 0,
+    unique_packages: 0,
+    odoo_orders_found: 0,
+  }
 
   useEffect(() => {
     setPickupPage(1)
@@ -7010,6 +7084,56 @@ function PackagePickupPage({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={pickupHistoryOpen} onOpenChange={setPickupHistoryOpen}>
+        <DialogContent className="pickup-scan-history-dialog max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Today&apos;s package scanner history</DialogTitle>
+            <DialogDescription>
+              {pickupDateLabel(pickupHistory?.scan_date || brooklynDateInput())} · Brooklyn time · {todayPickupScanSummary.total_scans} total scans
+            </DialogDescription>
+          </DialogHeader>
+          <div className="pickup-history-summary-grid">
+            <div><span>Total scans</span><strong>{todayPickupScanSummary.total_scans}</strong></div>
+            <div className="is-success"><span>Matched</span><strong>{todayPickupScanSummary.matched}</strong></div>
+            <div className="is-error"><span>Unsuccessful</span><strong>{todayPickupScanSummary.unsuccessful}</strong></div>
+            <div><span>Odoo orders found</span><strong>{todayPickupScanSummary.odoo_orders_found}</strong></div>
+          </div>
+          <div className="pickup-history-meta">
+            <span><strong>{todayPickupScanSummary.unique_packages}</strong> unique matched packages</span>
+            <span><strong>{todayPickupScanSummary.duplicates}</strong> duplicate rescans</span>
+          </div>
+          <div className="pickup-scan-history-list">
+            {(pickupHistory?.events || []).map((entry) => {
+              const matched = Boolean(entry.matched)
+              return (
+                <div key={entry.id} className={matched ? "is-success" : "is-error"}>
+                  {matched ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
+                  <div className="pickup-history-order">
+                    <div className="pickup-history-order-head">
+                      {entry.odoo_order_name ? <OdooOrderRef name={entry.odoo_order_name} linkClassName="font-semibold" /> : <strong>No Odoo order matched</strong>}
+                      <span className={matched ? "is-success" : "is-error"}>{entry.result_status.replaceAll("_", " ")}</span>
+                    </div>
+                    <small><b>Amazon tracking ID</b> {entry.shipment_id || entry.scan_code || "Not matched"}</small>
+                    {entry.amazon_order_id ? <small><b>Amazon order</b> {entry.amazon_order_id}</small> : null}
+                    {entry.recipient_ref ? <small><b>Recipient</b> {entry.recipient_ref}</small> : null}
+                    <small><b>Scanned</b> {formatDateTime(entry.scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                    <small>{entry.message}</small>
+                  </div>
+                </div>
+              )
+            })}
+            {!pickupHistoryLoading && !(pickupHistory?.events || []).length ? <div className="pickup-empty">No packages have been scanned today.</div> : null}
+            {pickupHistoryLoading ? <div className="pickup-empty">Loading today&apos;s scanner history…</div> : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => void loadPickupScanHistory(true)} disabled={pickupHistoryLoading}>
+              <RefreshCw className={cn("size-4", pickupHistoryLoading && "animate-spin")} /> Refresh
+            </Button>
+            <Button onClick={() => setPickupHistoryOpen(false)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={pickupTimeOpen} onOpenChange={(open) => { if (!pickupTimeSaving) setPickupTimeOpen(open) }}>
         <DialogContent className="pickup-time-dialog">
           <DialogHeader>
@@ -7070,6 +7194,21 @@ function PackagePickupPage({
 
       <section className="pickup-toolbar">
         <div className="pickup-toolbar-body">
+          <button
+            type="button"
+            className="pickup-today-scan-card"
+            onClick={() => {
+              setPickupHistoryOpen(true)
+              void loadPickupScanHistory(true)
+            }}
+            aria-label="Open today's complete package scanner history"
+          >
+            <span className="pickup-today-scan-icon"><PackageCheck className="size-5" /></span>
+            <span className="pickup-today-scan-title"><small>Today&apos;s scanner history</small><strong>{todayPickupScanSummary.total_scans} scans</strong></span>
+            <span className="pickup-today-scan-metric is-success"><small>Matched</small><strong>{todayPickupScanSummary.matched}</strong></span>
+            <span className="pickup-today-scan-metric is-error"><small>Unsuccessful</small><strong>{todayPickupScanSummary.unsuccessful}</strong></span>
+            <ChevronRight className="size-4" />
+          </button>
           <div className="pickup-filter-grid">
             <SelectField label="Store" value={storeId} onChange={onStoreChange}>
               <option value="">All stores</option>
@@ -7089,7 +7228,7 @@ function PackagePickupPage({
             </Button>
             {lastPickupScanEntries.length ? (
               <Button variant="outline" size="sm" onClick={() => setPickupSummaryOpen(true)}>
-                <CheckCircle2 className="size-4" /> Last scan summary
+                <CheckCircle2 className="size-4" /> Last session
               </Button>
             ) : null}
             <Button variant="outline" size="sm" onClick={() => setShowPackageSearch((current) => !current)} aria-expanded={showPackageSearch}>

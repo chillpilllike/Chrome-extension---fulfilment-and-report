@@ -6,8 +6,10 @@ from app.main import (
     package_pickup_business_date,
     package_pickup_card_date,
     package_pickup_delivery_timestamp,
+    package_pickup_scan_history,
     package_tracker_delivery_date,
     package_tracker_delivery_kind,
+    record_package_pickup_scan_event,
 )
 
 
@@ -58,6 +60,42 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
             package_pickup_card_date("2026-08-20T15:00:00Z"),
             "2026-08-20",
         )
+
+    def test_scan_history_rejects_invalid_date_before_querying_database(self) -> None:
+        with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
+            package_pickup_scan_history(scan_date="08/27/2026")
+
+    def test_scan_event_snapshots_exact_linked_order_and_tracking(self) -> None:
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def execute(self, sql, params=None):
+                self.calls.append((sql, tuple(params or ())))
+                return self
+
+        connection = FakeConnection()
+        record_package_pickup_scan_event(
+            connection,
+            scan_code="TBA333598452175",
+            result_status="matched",
+            matched=True,
+            message="NC22982 scanned successfully.",
+            scanned_at="2026-08-27T01:02:03+00:00",
+            package={
+                "id": 41,
+                "store_id": 1,
+                "canonical_scan_code": "TBA333598452175",
+                "amazon_order_id": "111-2222222-3333333",
+                "odoo_order_name": "NC22982",
+                "recipient_ref": "Nutricity NC22982",
+            },
+        )
+        insert_params = connection.calls[-1][1]
+        self.assertEqual(insert_params[6], "NC22982")
+        self.assertEqual(insert_params[7], "111-2222222-3333333")
+        self.assertEqual(insert_params[8], "TBA333598452175")
+        self.assertEqual(insert_params[9], "Nutricity NC22982")
 
     def test_delivery_timestamp_uses_tracking_record_instead_of_confirmation_update(self) -> None:
         self.assertEqual(

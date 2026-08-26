@@ -180,6 +180,7 @@ PUBLIC_API_PATHS = {
     "/api/amazon-otp",
     "/api/epost/tracking",
     "/api/package-pickups",
+    "/api/package-pickups/scan-history",
 }
 PUBLIC_POST_API_PATHS = {
     "/api/shopify/orders/status/sync",
@@ -1260,6 +1261,26 @@ def init_db() -> None:
                 updated_at TEXT,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS package_pickup_scan_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL DEFAULT 0,
+                package_id INTEGER,
+                scan_code TEXT NOT NULL,
+                result_status TEXT NOT NULL,
+                matched INTEGER NOT NULL DEFAULT 0,
+                duplicate INTEGER NOT NULL DEFAULT 0,
+                odoo_order_name TEXT,
+                amazon_order_id TEXT,
+                shipment_id TEXT,
+                recipient_ref TEXT,
+                message TEXT,
+                scanned_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_pickup_scan_events_scanned
+                ON package_pickup_scan_events(scanned_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_package_pickup_scan_events_store_scanned
+                ON package_pickup_scan_events(store_id, scanned_at DESC);
 
             CREATE TABLE IF NOT EXISTS ui_copy (
                 key TEXT PRIMARY KEY,
@@ -31825,6 +31846,142 @@ def package_pickup_strict_scan_matches(conn: Any, scan_code: str, store_id: Opti
     return dedupe_dispatch_package_rows(rows)
 
 
+def ensure_package_pickup_scan_history_table(conn: Any) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS package_pickup_scan_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL DEFAULT 0,
+            package_id INTEGER,
+            scan_code TEXT NOT NULL,
+            result_status TEXT NOT NULL,
+            matched INTEGER NOT NULL DEFAULT 0,
+            duplicate INTEGER NOT NULL DEFAULT 0,
+            odoo_order_name TEXT,
+            amazon_order_id TEXT,
+            shipment_id TEXT,
+            recipient_ref TEXT,
+            message TEXT,
+            scanned_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_package_pickup_scan_events_scanned ON package_pickup_scan_events(scanned_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_package_pickup_scan_events_store_scanned ON package_pickup_scan_events(store_id, scanned_at DESC)"
+    )
+
+
+def record_package_pickup_scan_event(
+    conn: Any,
+    *,
+    scan_code: str,
+    result_status: str,
+    matched: bool,
+    message: str,
+    scanned_at: str,
+    package: Optional[dict[str, Any]] = None,
+    duplicate: bool = False,
+    store_id: Optional[int] = None,
+) -> None:
+    ensure_package_pickup_scan_history_table(conn)
+    package = package or {}
+    shipment_id = normalize_dispatch_scan_code(package.get("canonical_scan_code") or package.get("scan_code"))
+    conn.execute(
+        """
+        INSERT INTO package_pickup_scan_events
+            (store_id, package_id, scan_code, result_status, matched, duplicate,
+             odoo_order_name, amazon_order_id, shipment_id, recipient_ref, message, scanned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(package.get("store_id") or store_id or 0),
+            int(package.get("id") or 0) or None,
+            normalize_dispatch_scan_code(scan_code) or clean_text(scan_code),
+            clean_text(result_status),
+            1 if matched else 0,
+            1 if duplicate else 0,
+            clean_text(package.get("odoo_order_name")),
+            clean_text(package.get("amazon_order_id")),
+            shipment_id,
+            clean_text(package.get("recipient_ref")) or (f"Nutricity {clean_text(package.get('odoo_order_name'))}".strip() if package else ""),
+            clean_text(message),
+            scanned_at,
+        ),
+    )
+
+
+def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
+    raw_date = clean_text(scan_date)
+    if raw_date:
+        try:
+            selected_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("Scan date must use YYYY-MM-DD format.") from exc
+    else:
+        selected_date = datetime.now(PACKAGE_PICKUP_TIMEZONE).date()
+    local_start = datetime.combine(selected_date, datetime.min.time(), tzinfo=PACKAGE_PICKUP_TIMEZONE)
+    local_end = local_start + timedelta(days=1)
+    start_utc = local_start.astimezone(timezone.utc).isoformat(timespec="seconds")
+    end_utc = local_end.astimezone(timezone.utc).isoformat(timespec="seconds")
+    params: list[Any] = [start_utc, end_utc]
+    store_sql = ""
+    if store_id is not None:
+        store_sql = " AND store_id=?"
+        params.append(int(store_id))
+    with db() as conn:
+        ensure_package_pickup_scan_history_table(conn)
+        summary_row = row_to_dict(conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_scans,
+                COUNT(*) FILTER (WHERE matched=1) AS matched,
+                COUNT(*) FILTER (WHERE matched=0) AS unsuccessful,
+                COUNT(*) FILTER (WHERE duplicate=1) AS duplicates,
+                COUNT(DISTINCT package_id) FILTER (WHERE matched=1 AND package_id IS NOT NULL) AS unique_packages,
+                COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1) AS odoo_orders_found
+            FROM package_pickup_scan_events
+            WHERE scanned_at>=? AND scanned_at<? {store_sql}
+            """,
+            params,
+        ).fetchone()) or {}
+        events = rows_to_dicts(conn.execute(
+            f"""
+            SELECT id, store_id, package_id, scan_code, result_status, matched, duplicate,
+                   odoo_order_name, amazon_order_id, shipment_id, recipient_ref, message, scanned_at
+            FROM package_pickup_scan_events
+            WHERE scanned_at>=? AND scanned_at<? {store_sql}
+            ORDER BY scanned_at DESC, id DESC
+            LIMIT 1000
+            """,
+            params,
+        ).fetchall())
+    return {
+        "ok": True,
+        "scan_date": selected_date.isoformat(),
+        "timezone": "America/New_York",
+        "summary": {
+            "total_scans": int(summary_row.get("total_scans") or 0),
+            "matched": int(summary_row.get("matched") or 0),
+            "unsuccessful": int(summary_row.get("unsuccessful") or 0),
+            "duplicates": int(summary_row.get("duplicates") or 0),
+            "unique_packages": int(summary_row.get("unique_packages") or 0),
+            "odoo_orders_found": int(summary_row.get("odoo_orders_found") or 0),
+        },
+        "events": events,
+    }
+
+
+@app.get("/api/package-pickups/scan-history")
+def api_package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
+    try:
+        return package_pickup_scan_history(store_id, scan_date)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/package-pickups/scan")
 def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]:
     query_text = clean_text(payload.scan_code)
@@ -31841,31 +31998,51 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
     with db() as conn:
         matches = package_pickup_strict_scan_matches(conn, scan_code, payload.store_id)
         if len(matches) > 1:
+            message = f"Barcode {query_text} matches more than one package. Nothing was changed."
+            record_package_pickup_scan_event(
+                conn, scan_code=scan_code, result_status="ambiguous", matched=False,
+                message=message, scanned_at=now, store_id=payload.store_id,
+            )
             return {
                 "ok": True,
                 "matched": False,
                 "ambiguous": True,
                 "scan_code": scan_code,
-                "message": f"Barcode {query_text} matches more than one package. Nothing was changed.",
+                "message": message,
             }
         if not matches and barcode_kind == "amazon_internal_label":
+            message = "Amazon square label read. Now scan the long barcode beside the printed TBA number."
+            record_package_pickup_scan_event(
+                conn, scan_code=scan_code, result_status="needs_tracking_scan", matched=False,
+                message=message, scanned_at=now, store_id=payload.store_id,
+            )
             return {
                 "ok": True,
                 "matched": False,
                 "requires_tracking_scan": True,
                 "barcode_kind": barcode_kind,
                 "scan_code": scan_code,
-                "message": "Amazon square label read. Now scan the long barcode beside the printed TBA number.",
+                "message": message,
             }
         if not matches:
+            message = f"Barcode {query_text} is not linked to an expected Amazon package."
+            record_package_pickup_scan_event(
+                conn, scan_code=scan_code, result_status="not_found", matched=False,
+                message=message, scanned_at=now, store_id=payload.store_id,
+            )
             return {
                 "ok": True,
                 "matched": False,
                 "scan_code": scan_code,
-                "message": f"Barcode {query_text} is not linked to an expected Amazon package.",
+                "message": message,
             }
         package = matches[0]
         if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
+            message = f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but Amazon has not reported it delivered yet."
+            record_package_pickup_scan_event(
+                conn, scan_code=scan_code, result_status="not_delivered", matched=False,
+                message=message, scanned_at=now, package=package, store_id=payload.store_id,
+            )
             return {
                 "ok": True,
                 "matched": False,
@@ -31873,7 +32050,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "scan_code": scan_code,
                 "amazon_order_id": clean_text(package.get("amazon_order_id")),
                 "odoo_order_name": clean_text(package.get("odoo_order_name")),
-                "message": f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but Amazon has not reported it delivered yet.",
+                "message": message,
             }
         package_id = int(package.get("id") or 0)
         existing = conn.execute(
@@ -31945,15 +32122,27 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             "pickup_scanned_at": first_scanned_at,
             "pickup_scan_date": scan_date,
         }
+        duplicate_text = " already scanned; original pickup time retained" if duplicate else " scanned successfully"
+        success_message = f"{result['odoo_order_name'] or result['amazon_order_id']}{duplicate_text}."
+        record_package_pickup_scan_event(
+            conn,
+            scan_code=scan_code,
+            result_status="duplicate" if duplicate else "matched",
+            matched=True,
+            duplicate=duplicate,
+            message=success_message,
+            scanned_at=now,
+            package=package,
+            store_id=payload.store_id,
+        )
     fast_page_cache_clear_matching({"package-pickups"})
-    duplicate_text = " already scanned; original pickup time retained" if duplicate else " scanned successfully"
     return {
         "ok": True,
         "matched": True,
         "duplicate": duplicate,
         "barcode_kind": barcode_kind,
         "package": result,
-        "message": f"{result['odoo_order_name'] or result['amazon_order_id']}{duplicate_text}.",
+        "message": success_message,
     }
 
 
