@@ -27720,6 +27720,7 @@ def chrome_browserless_complete_from_message(active_job: dict[str, Any], message
             line_ids=[int(value) for value in job.get("line_ids") or [] if int(value or 0) > 0],
             order_mappings=message.get("orderMappings") or [],
             pricing_summary=list((active_job.get("pricing") or {}).values()),
+            business_bundle_expansion=message.get("businessBundleExpansion") or {},
             worker_id=clean_text(active_job.get("workerId")),
         ),
     )
@@ -30677,10 +30678,38 @@ def chrome_completion_history_evidence_error(
         if normalize_asin(str(pricing.get("purchased_asin") or ""))
     )
     if observed_asins and expected_asins and not observed_asins.intersection(expected_asins):
-        return (
-            f"Refused to report Amazon order {amazon_order_id}: Amazon history ASINs "
-            f"{', '.join(sorted(observed_asins))} do not match this job's ASINs {', '.join(sorted(expected_asins))}."
+        bundle_evidence = payload.business_bundle_expansion or {}
+
+        def positive_number(value: Any) -> float:
+            try:
+                return max(0.0, float(value or 0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        verified_quantities = {
+            normalize_asin(str(asin or "")): positive_number(quantity)
+            for asin, quantity in (bundle_evidence.get("verified_cart_quantities") or {}).items()
+            if normalize_asin(str(asin or "")) and positive_number(quantity) > 0
+        }
+        expected_bundle_units = positive_number(bundle_evidence.get("expected_bundle_units"))
+        checkout_physical_units = positive_number(bundle_evidence.get("checkout_physical_units"))
+        row_units = sum(positive_number(row.get("quantity")) for row in rows)
+        verified_business_bundle = bool(
+            required_chrome_account_experience(rows) == "business"
+            and clean_text(bundle_evidence.get("group_key")) == clean_text(group_key)
+            and clean_text(bundle_evidence.get("account_experience")).lower() == "business"
+            and len(rows) == 1
+            and set(verified_quantities) == expected_asins
+            and abs(sum(verified_quantities.values()) - expected_bundle_units) < 0.001
+            and abs(row_units - expected_bundle_units) < 0.001
+            and checkout_physical_units > expected_bundle_units > 0
+            and len(observed_asins) <= checkout_physical_units
         )
+        if not verified_business_bundle:
+            return (
+                f"Refused to report Amazon order {amazon_order_id}: Amazon history ASINs "
+                f"{', '.join(sorted(observed_asins))} do not match this job's ASINs {', '.join(sorted(expected_asins))}."
+            )
     return ""
 
 

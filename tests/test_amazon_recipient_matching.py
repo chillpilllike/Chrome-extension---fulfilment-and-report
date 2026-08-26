@@ -451,6 +451,51 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
 
         self.assertEqual(error, "")
 
+    def test_chrome_completion_accepts_verified_business_bundle_components(self):
+        payload = ChromeJobCompletePayload(
+            amazon_order_id="111-6371926-1094608",
+            amazon_recipient="Nutricity NC24348 5mg",
+            amazon_asins=["B0CV2TF1WT", "B0FMZMCGSL", "B0B336FCWC"],
+            business_bundle_expansion={
+                "group_key": "NC24348",
+                "account_experience": "business",
+                "expected_bundle_units": 1,
+                "checkout_physical_units": 3,
+                "verified_cart_quantities": {"B0G5BG4HB9": 1},
+            },
+        )
+        rows = [{
+            "odoo_order_name": "NC24348",
+            "asin": "B0G5BG4HB9",
+            "quantity": 1,
+            "source_line_count": 1,
+        }]
+
+        error = chrome_completion_history_evidence_error(
+            "NC24348", rows, payload, {}, payload.amazon_order_id
+        )
+
+        self.assertEqual(error, "")
+
+    def test_chrome_completion_rejects_business_bundle_components_without_evidence(self):
+        payload = ChromeJobCompletePayload(
+            amazon_order_id="111-6371926-1094608",
+            amazon_recipient="Nutricity NC24348 5mg",
+            amazon_asins=["B0CV2TF1WT", "B0FMZMCGSL", "B0B336FCWC"],
+        )
+        rows = [{
+            "odoo_order_name": "NC24348",
+            "asin": "B0G5BG4HB9",
+            "quantity": 1,
+            "source_line_count": 1,
+        }]
+
+        error = chrome_completion_history_evidence_error(
+            "NC24348", rows, payload, {}, payload.amazon_order_id
+        )
+
+        self.assertIn("do not match", error)
+
 
 if __name__ == "__main__":
     unittest.main()

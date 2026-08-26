@@ -88,6 +88,7 @@ class ChromeJobCompletePayload(BaseModel):
     line_ids: list[int] = []
     order_mappings: list[dict[str, Any]] = []
     pricing_summary: list[dict[str, Any]] = []
+    business_bundle_expansion: dict[str, Any] = {}
     worker_id: str = ""
 
 

@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-bundle-checkout-v134";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-bundle-report-v135";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -1591,12 +1591,16 @@ async function ensureCheckoutOnlyExpectedUnits(activeJob) {
       null,
       null,
     );
-    await sendDiagnostic("Accepted verified Amazon Business bundle expansion at checkout.", {
+    activeJob.verifiedBusinessBundleExpansion = {
       group_key: activeJob?.job?.group_key || "",
+      account_experience: "business",
       expected_bundle_units: expected,
       checkout_physical_units: actual,
       verified_cart_quantities: activeJob?.cartVerification?.quantities || {},
-    });
+      verified_at: Date.now(),
+    };
+    await setActiveJob(activeJob, { reason: "verified_business_bundle_expansion" });
+    await sendDiagnostic("Accepted verified Amazon Business bundle expansion at checkout.", activeJob.verifiedBusinessBundleExpansion);
     return true;
   }
   if (
@@ -10041,6 +10045,28 @@ function unmappedReportingLineIds(activeJob, orderMappings) {
   return [...expectedLineIds].filter(Boolean);
 }
 
+function businessBundleCompletionEvidence(activeJob, orders) {
+  const persisted = activeJob?.verifiedBusinessBundleExpansion;
+  if (persisted?.group_key === activeJob?.job?.group_key && persisted?.account_experience === "business") {
+    return persisted;
+  }
+  if (activeJob?.amazonAccountExperience !== "business" || !cartVerificationMatches(activeJob)) return null;
+  const expectedAsins = new Set(Object.keys(expectedCartQuantities(activeJob) || {}).map((asin) => String(asin).toUpperCase()));
+  const observedAsins = [...new Set((orders || []).flatMap((order) => order.asins || []).map((asin) => String(asin).toUpperCase()).filter(Boolean))];
+  if (expectedAsins.size !== 1 || !observedAsins.length || observedAsins.some((asin) => expectedAsins.has(asin))) return null;
+  const expectedBundleUnits = expectedCheckoutUnitCount(activeJob);
+  if (!expectedBundleUnits || observedAsins.length <= expectedBundleUnits) return null;
+  return {
+    group_key: activeJob?.job?.group_key || "",
+    account_experience: "business",
+    expected_bundle_units: expectedBundleUnits,
+    checkout_physical_units: observedAsins.length,
+    verified_cart_quantities: { ...(activeJob?.cartVerification?.quantities || {}) },
+    observed_component_asins: observedAsins,
+    verified_at: Number(activeJob?.cartVerification?.verified_at || Date.now()),
+  };
+}
+
 async function reportAmazonOrders(activeJob, orders) {
   const uniqueOrders = [];
   const seen = new Set();
@@ -10097,6 +10123,7 @@ async function reportAmazonOrders(activeJob, orders) {
   const orderId = uniqueOrders[0]?.amazon_order_id || "";
   const orderLabel = uniqueOrders.map((order) => order.amazon_order_id).join(", ");
   const orderMappings = buildOrderMappings(activeJob, uniqueOrders);
+  const bundleExpansionEvidence = businessBundleCompletionEvidence(activeJob, uniqueOrders);
   if (requiresAsinMappedReporting(activeJob, uniqueOrders)) {
     const unmappedLineIds = unmappedReportingLineIds(activeJob, orderMappings);
     if (unmappedLineIds.length) {
@@ -10153,6 +10180,7 @@ async function reportAmazonOrders(activeJob, orders) {
         amazonAccountName: amazonSignedInAccountName(),
         amazonRecipient: uniqueOrders[0]?.recipient || "",
         amazonAsins: uniqueOrders[0]?.asins || [],
+        businessBundleExpansion: bundleExpansionEvidence,
         page: diagnosticPageInfo(),
       }, 55000);
       if (result?.ok) break;
@@ -10215,6 +10243,19 @@ async function reportAmazonOrders(activeJob, orders) {
       delete window.__nutricityOrderReportLocks[reportKey];
     }
   }
+}
+
+function showReportingCompleteStatus(activeJob) {
+  if (activeJob?.paused && activeJob?.reportError) {
+    showPanel(
+      "Nutricity reporting needs attention",
+      `${activeJob.reportError} The next queued order will not start until reporting succeeds.`,
+      "Retry reporting",
+      () => continueAfterManualStep(activeJob, "reporting_complete"),
+    );
+    return;
+  }
+  showPanel("Nutricity fulfilment", "Amazon order was reported. Waiting for the extension to start the next queued order.", null, null);
 }
 
 async function autoResumeResolvedCheckoutPause(activeJob) {
@@ -10395,7 +10436,7 @@ async function run() {
     }
     if (submittedStage(activeJob)) {
       if (activeJob.stage === "reporting_complete") {
-        showPanel("Nutricity fulfilment", "Amazon order was reported. Waiting for the extension to start the next queued order.", null, null);
+        showReportingCompleteStatus(activeJob);
       } else if (activeJob.stage === "complete_pending") {
         await handleCompletion(activeJob);
       } else {
@@ -10407,7 +10448,7 @@ async function run() {
     else if (activeJob.stage === "cleanup_after_failure") {
       await handleFailureCleanup(activeJob);
     } else if (activeJob.stage === "reporting_complete") {
-      showPanel("Nutricity fulfilment", "Amazon order was reported. Waiting for the extension to start the next queued order.", null, null);
+      showReportingCompleteStatus(activeJob);
     } else if (activeJob.stage === "duplicate_order") {
       const duplicateCheck = await send({ type: "CHECK_EXISTING_AMAZON_ORDER" });
       if (duplicateCheck?.ok && !duplicateCheck.duplicate) {

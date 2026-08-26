@@ -135,6 +135,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('expectedGroupKey = "", expectedWorkerId = ""', BACKGROUND)
         self.assertIn('Ignored stale completion report', BACKGROUND)
 
+    def test_business_bundle_evidence_reaches_completion_api(self) -> None:
+        self.assertIn("function businessBundleCompletionEvidence(activeJob, orders)", CONTENT)
+        self.assertIn("businessBundleExpansion: bundleExpansionEvidence", CONTENT)
+        self.assertIn("message.businessBundleExpansion || null", BACKGROUND)
+        self.assertIn("business_bundle_expansion: businessBundleExpansion || {}", BACKGROUND)
+
+    def test_failed_completion_is_not_rendered_as_reported(self) -> None:
+        self.assertIn("function showReportingCompleteStatus(activeJob)", CONTENT)
+        self.assertIn("Nutricity reporting needs attention", CONTENT)
+        self.assertIn("activeJob?.paused && activeJob?.reportError", CONTENT)
+
     def test_hidden_worker_is_explicitly_woken_after_handoff(self) -> None:
         self.assertIn('chrome.tabs.sendMessage(tabId, { type: "RUN_ACTIVE_JOB" })', BACKGROUND)
         self.assertIn('if (message.type === "RUN_ACTIVE_JOB")', CONTENT)
@@ -151,7 +162,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.143")
+        self.assertEqual(MANIFEST["version"], "0.1.144")
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
@@ -532,6 +543,8 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("isAmazonBusinessPage()", guard)
         self.assertIn("cartVerificationMatches(activeJob)", guard)
         self.assertIn("Accepted verified Amazon Business bundle expansion", guard)
+        self.assertIn("activeJob.verifiedBusinessBundleExpansion", guard)
+        self.assertIn('reason: "verified_business_bundle_expansion"', guard)
 
     def test_popup_queue_is_filtered_by_detected_amazon_experience(self) -> None:
         self.assertIn("async function popupAmazonAccountExperience", BACKGROUND)

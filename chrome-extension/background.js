@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-business-bundle-checkout-v134";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-business-bundle-report-v135";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -2489,7 +2489,7 @@ async function togglePause(windowId) {
   return { ok: true, paused: activeJob.paused, stage: activeJob.stage || "", message: activeJob.paused ? "Paused fulfilment." : `Resumed ${activeJob.stage || "fulfilment"}.` };
 }
 
-async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = [], orderDate = "", page = null, amazonRecipient = "", amazonAsins = [], expectedGroupKey = "", expectedWorkerId = "") {
+async function completeJob(orderId, orderUrl, amazonAccountName, windowId, orderMappings = [], orderDate = "", page = null, amazonRecipient = "", amazonAsins = [], expectedGroupKey = "", expectedWorkerId = "", businessBundleExpansion = null) {
   if (await forceStopActive()) {
     return { ok: false, stopped: true, message: "Force stop is active; ignored late order completion report." };
   }
@@ -2559,6 +2559,7 @@ async function completeJob(orderId, orderUrl, amazonAccountName, windowId, order
       line_ids: activeJob.job.line_ids || [],
       order_mappings: orderMappings || [],
       pricing_summary: Object.values(activeJob.pricing || {}),
+      business_bundle_expansion: businessBundleExpansion || {},
       worker_id: activeJob.workerId || "",
     };
     try {
@@ -3536,7 +3537,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       return { ok: true };
     }
-    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "", senderPageInfo(sender, message.page || {}), message.amazonRecipient || "", message.amazonAsins || [], String(message.groupKey || ""), String(message.workerId || ""));
+    if (message.type === "COMPLETE_JOB") return completeJob(message.orderId, message.orderUrl, message.amazonAccountName || "", windowId, message.orderMappings || [], message.orderDate || "", senderPageInfo(sender, message.page || {}), message.amazonRecipient || "", message.amazonAsins || [], String(message.groupKey || ""), String(message.workerId || ""), message.businessBundleExpansion || null);
     if (message.type === "MARK_LINE_MISSING") return markLineMissing(message.message || "Chrome extension line is missing.", message, windowId);
     if (message.type === "POST_SUBMIT_UNPLACED") return postSubmitUnplaced(message.message || "Amazon did not place the order after submit.", message, windowId);
     if (message.type === "SUBMIT_UNCERTAIN") return submitUncertain(message.message || "Amazon Place Order was submitted, but no matching Amazon order ID was found.", message, windowId);
