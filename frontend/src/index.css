@@ -2681,6 +2681,13 @@ body,
 .pickup-scanner-live-status.is-success { border-color: #98d7a3; background: #eaf7ec; color: #238636; }
 .pickup-scanner-live-status.is-duplicate { border-color: #f0c36a; background: #fff8e6; color: #8a5100; }
 .pickup-scanner-live-status.is-error { border-color: #efb3b3; background: #fcecec; color: #b42318; }
+.pickup-manual-tracking-wrap { display: grid; justify-items: start; gap: .5rem; padding: .7rem; border: 1px solid #efc2c2; border-radius: .45rem; background: rgba(255,255,255,.86); }
+.pickup-manual-tracking-form { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) auto auto; gap: .55rem; align-items: end; }
+.pickup-manual-tracking-form label { display: grid; min-width: 0; gap: .3rem; }
+.pickup-manual-tracking-form label > span { color: #526273; font-size: .7rem; font-weight: 700; }
+.pickup-manual-tracking-form input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.pickup-manual-tracking-warning { display: flex; align-items: flex-start; gap: .4rem; color: #a33a00; font-size: .72rem; font-weight: 650; }
+.pickup-manual-tracking-warning svg { flex: 0 0 auto; margin-top: .05rem; }
 .pickup-scanner-recent, .pickup-scan-summary-list { display: grid; gap: .45rem; max-height: 17rem; overflow-y: auto; }
 .pickup-scanner-recent > div, .pickup-scan-summary-list > div { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .55rem; align-items: start; padding: .55rem .65rem; border: 1px solid #e1e6ec; border-radius: .4rem; background: #fff; }
 .pickup-scanner-recent > div.is-success, .pickup-scan-summary-list > div.is-success { border-left: 3px solid #2fb344; }
@@ -3194,6 +3201,7 @@ body,
     .pickup-scanner-video { min-height: 52vh; aspect-ratio: 3 / 4; }
     .pickup-scanner-mode-tabs { display: grid; grid-template-columns: 1fr 1fr; }
     .pickup-scanner-counts { grid-template-columns: 1fr; }
+    .pickup-manual-tracking-form { grid-template-columns: 1fr; }
     .pickup-today-scan-card { grid-template-columns: auto minmax(0, 1fr) auto; margin-left: 0; }
     .pickup-today-scan-metric { display: none; }
     .pickup-history-summary-grid { grid-template-columns: 1fr 1fr; }

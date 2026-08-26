@@ -31357,7 +31357,7 @@ def package_pickup_tracking_matches(entered_value: Any, package_value: Any) -> b
     package_tracking = normalize_dispatch_scan_code(package_value)
     if len(entered) < 5 or not package_tracking:
         return False
-    return package_tracking == entered if len(entered) > 5 else package_tracking.endswith(entered)
+    return package_tracking == entered if len(entered) >= len(package_tracking) else package_tracking.endswith(entered)
 
 
 def package_pickup_placeholder_rows(package_type: str, count: int) -> list[tuple[int, int, str]]:
@@ -31863,6 +31863,48 @@ def package_pickup_strict_scan_matches(conn: Any, scan_code: str, store_id: Opti
     return dedupe_dispatch_package_rows(rows)
 
 
+def package_pickup_manual_scan_matches(conn: Any, entered_value: str, store_id: Optional[int] = None) -> list[dict[str, Any]]:
+    """Match a manually entered trailing tracking fragment without guessing when it is ambiguous."""
+    entered = normalize_dispatch_scan_code(entered_value)
+    if len(entered) < 5:
+        return []
+    suffix_pattern = f"%{entered}"
+    rows = rows_to_dicts(conn.execute(
+        """
+        SELECT *
+        FROM amazon_dispatch_packages
+        WHERE (
+            REGEXP_REPLACE(UPPER(COALESCE(scan_code, '')), '[^A-Z0-9-]', '', 'g') LIKE ?
+            OR REGEXP_REPLACE(UPPER(COALESCE(canonical_scan_code, '')), '[^A-Z0-9-]', '', 'g') LIKE ?
+            OR REGEXP_REPLACE(UPPER(COALESCE(last_scanned_code, '')), '[^A-Z0-9-]', '', 'g') LIKE ?
+            OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE
+                        WHEN COALESCE(scanned_codes_json, '') ~ '^\\s*\\[' THEN scanned_codes_json::jsonb
+                        ELSE '[]'::jsonb
+                    END
+                ) AS scanned(value)
+                WHERE REGEXP_REPLACE(UPPER(scanned.value), '[^A-Z0-9-]', '', 'g') LIKE ?
+            )
+        )
+          AND (? IS NULL OR store_id=?)
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 25
+        """,
+        (suffix_pattern, suffix_pattern, suffix_pattern, suffix_pattern, store_id, store_id),
+    ).fetchall())
+    matches = []
+    for row in dedupe_dispatch_package_rows(rows):
+        tracking_values = [
+            row.get("canonical_scan_code"), row.get("scan_code"), row.get("last_scanned_code"),
+            *dispatch_scanned_codes(row),
+        ]
+        if any(package_tracking_id_is_physical(value) and package_pickup_tracking_matches(entered, value) for value in tracking_values):
+            matches.append(row)
+    return matches
+
+
 def ensure_package_pickup_scan_history_table(conn: Any) -> None:
     conn.execute(
         """
@@ -32081,17 +32123,32 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
     ]
     now = utc_now()
     with db() as conn:
-        matches = package_pickup_strict_scan_matches(conn, scan_code, payload.store_id)
-        if len(matches) > 1:
-            message = f"Barcode {query_text} matches more than one package. Nothing was changed."
+        if payload.manual_entry and len(scan_code) < 5:
+            message = "Enter at least the last 5 letters or numbers of the tracking ID."
             record_package_pickup_scan_event(
-                conn, scan_code=scan_code, result_status="ambiguous", matched=False,
+                conn, scan_code=scan_code, result_status="manual_too_short", matched=False,
+                message=message, scanned_at=now, store_id=payload.store_id,
+            )
+            return {"ok": True, "matched": False, "manual_entry": True, "scan_code": scan_code, "message": message}
+        matches = package_pickup_manual_scan_matches(conn, scan_code, payload.store_id) if payload.manual_entry else package_pickup_strict_scan_matches(conn, scan_code, payload.store_id)
+        if len(matches) > 1:
+            requested_length = min(max(len(scan_code) + 2, 7), 16) if payload.manual_entry else 0
+            if payload.manual_entry:
+                message = f"The last {len(scan_code)} characters match {len(matches)} different packages. Enter at least the last {requested_length} characters to identify the exact package."
+            else:
+                message = f"Barcode {query_text} matches more than one package. Nothing was changed."
+            record_package_pickup_scan_event(
+                conn, scan_code=scan_code, result_status="manual_multiple_matches" if payload.manual_entry else "ambiguous", matched=False,
                 message=message, scanned_at=now, store_id=payload.store_id,
             )
             return {
                 "ok": True,
                 "matched": False,
                 "ambiguous": True,
+                "manual_entry": bool(payload.manual_entry),
+                "multiple_matches": bool(payload.manual_entry),
+                "match_count": len(matches),
+                "requested_length": requested_length,
                 "scan_code": scan_code,
                 "message": message,
             }
@@ -32110,14 +32167,19 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "message": message,
             }
         if not matches:
-            message = f"Barcode {query_text} is not linked to an expected Amazon package."
+            message = (
+                f"No expected package has a tracking ID ending in {scan_code}. Enter more characters or check the printed tracking ID."
+                if payload.manual_entry
+                else f"Barcode {query_text} is not linked to an expected Amazon package."
+            )
             record_package_pickup_scan_event(
-                conn, scan_code=scan_code, result_status="not_found", matched=False,
+                conn, scan_code=scan_code, result_status="manual_not_found" if payload.manual_entry else "not_found", matched=False,
                 message=message, scanned_at=now, store_id=payload.store_id,
             )
             return {
                 "ok": True,
                 "matched": False,
+                "manual_entry": bool(payload.manual_entry),
                 "scan_code": scan_code,
                 "message": message,
             }

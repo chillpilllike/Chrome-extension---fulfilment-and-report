@@ -17,6 +17,10 @@ class PackagePickupTrackingMatchTests(unittest.TestCase):
     def test_last_five_characters_match(self) -> None:
         self.assertTrue(package_pickup_tracking_matches("3X9Q7", "TBA1234567893X9Q7"))
 
+    def test_more_trailing_characters_narrow_the_same_tracking_id(self) -> None:
+        self.assertTrue(package_pickup_tracking_matches("893X9Q7", "TBA1234567893X9Q7"))
+        self.assertFalse(package_pickup_tracking_matches("893X9Q8", "TBA1234567893X9Q7"))
+
     def test_last_four_characters_are_rejected(self) -> None:
         self.assertFalse(package_pickup_tracking_matches("X9Q7", "TBA1234567893X9Q7"))
 

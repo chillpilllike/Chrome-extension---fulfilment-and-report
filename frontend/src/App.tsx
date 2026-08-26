@@ -676,6 +676,10 @@ type PackagePickupScanResponse = {
   duplicate?: boolean
   ambiguous?: boolean
   requires_tracking_scan?: boolean
+  manual_entry?: boolean
+  multiple_matches?: boolean
+  match_count?: number
+  requested_length?: number
   barcode_kind?: string
   message: string
   package?: PackagePickupScanPackage
@@ -6489,6 +6493,9 @@ function PackagePickupPage({
   const [pickupHistoryLoading, setPickupHistoryLoading] = useState(false)
   const [pickupHistory, setPickupHistory] = useState<PackagePickupScanHistory | null>(null)
   const [hardwareScanInput, setHardwareScanInput] = useState("")
+  const [pickupManualEntryOpen, setPickupManualEntryOpen] = useState(false)
+  const [pickupManualTracking, setPickupManualTracking] = useState("")
+  const [pickupManualWarning, setPickupManualWarning] = useState("")
   const pickupScannerVideoRef = useRef<HTMLVideoElement | null>(null)
   const pickupScannerStreamRef = useRef<MediaStream | null>(null)
   const pickupScannerControlsRef = useRef<IScannerControls | null>(null)
@@ -6592,7 +6599,7 @@ function PackagePickupPage({
     savePickupSummary(next)
   }
 
-  async function processPickupScan(rawCode: string) {
+  async function processPickupScan(rawCode: string, manualEntry = false) {
     const code = rawCode.trim()
     if (!code) return
     const aliases = pickupPendingAliasRef.current ? [pickupPendingAliasRef.current] : []
@@ -6600,7 +6607,7 @@ function PackagePickupPage({
     try {
       const result = await api<PackagePickupScanResponse>("/api/package-pickups/scan", {
         method: "POST",
-        body: JSON.stringify({ scan_code: code, alias_codes: aliases, store_id: storeId ? Number(storeId) : null }),
+        body: JSON.stringify({ scan_code: code, alias_codes: aliases, store_id: storeId ? Number(storeId) : null, manual_entry: manualEntry }),
       })
       if (result.requires_tracking_scan) {
         pickupPendingAliasRef.current = code
@@ -6626,32 +6633,41 @@ function PackagePickupPage({
       }
       addPickupScanEntry(entry)
       if (entry.ok && entry.duplicate) {
+        setPickupManualEntryOpen(false)
+        setPickupManualTracking("")
+        setPickupManualWarning("")
         setPickupScanFeedback("duplicate", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} is a duplicate scan. Successful count was not increased.`)
         schedulePickupRefresh()
       } else if (entry.ok) {
+        setPickupManualEntryOpen(false)
+        setPickupManualTracking("")
+        setPickupManualWarning("")
         setPickupScanFeedback("success", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} matched. ${result.package?.order_readiness?.message || "Ready for the next package."}`)
         schedulePickupRefresh()
       } else {
+        if (manualEntry) setPickupManualWarning(entry.message)
         setPickupScanFeedback("error", entry.message)
         void loadPickupScanHistory()
       }
     } catch (error) {
       const message = `Scan failed: ${String(error)}`
       addPickupScanEntry({ code, ok: false, message, scannedAt: new Date().toISOString() })
+      if (manualEntry) setPickupManualWarning(message)
       setPickupScanFeedback("error", message)
     } finally {
       window.setTimeout(() => pickupHardwareInputRef.current?.focus(), 50)
     }
   }
 
-  function queuePickupScan(rawCode: string) {
+  function queuePickupScan(rawCode: string, manualEntry = false) {
     const code = rawCode.trim()
     if (!code) return
     const now = Date.now()
-    const prior = pickupRecentScansRef.current.get(code) || 0
+    const recentKey = `${manualEntry ? "manual" : "scanner"}:${code}`
+    const prior = pickupRecentScansRef.current.get(recentKey) || 0
     if (now - prior < 1400) return
-    pickupRecentScansRef.current.set(code, now)
-    pickupScanQueueRef.current = pickupScanQueueRef.current.then(() => processPickupScan(code))
+    pickupRecentScansRef.current.set(recentKey, now)
+    pickupScanQueueRef.current = pickupScanQueueRef.current.then(() => processPickupScan(code, manualEntry))
   }
 
   function openPickupScanner(mode: "camera" | "hardware" = "camera") {
@@ -6663,6 +6679,9 @@ function PackagePickupPage({
     setPickupScannerFlash("")
     setPickupScannerStatus(mode === "camera" ? "Opening rapid camera scanner…" : "Hardware scanner ready. Scan a barcode or type it and press Enter.")
     setHardwareScanInput("")
+    setPickupManualEntryOpen(false)
+    setPickupManualTracking("")
+    setPickupManualWarning("")
     pickupPendingAliasRef.current = ""
     pickupRecentScansRef.current.clear()
     pickupScanQueueRef.current = Promise.resolve()
@@ -7053,6 +7072,37 @@ function PackagePickupPage({
             <div className={cn("pickup-scanner-live-status", pickupScannerFlash && `is-${pickupScannerFlash}`)}>
               {pickupScannerError ? <><AlertCircle className="size-4" /> {pickupScannerError}</> : pickupScannerStatus || "Waiting for a package barcode…"}
             </div>
+            {pickupScannerFlash === "error" ? (
+              <div className="pickup-manual-tracking-wrap">
+                {!pickupManualEntryOpen ? (
+                  <Button type="button" variant="outline" onClick={() => { setPickupManualEntryOpen(true); setPickupManualWarning("") }}>
+                    <Edit className="size-4" /> Enter tracking manually
+                  </Button>
+                ) : (
+                  <form
+                    className="pickup-manual-tracking-form"
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      const tracking = pickupManualTracking.trim()
+                      if (tracking.replace(/[^a-z0-9]/gi, "").length < 5) {
+                        setPickupManualWarning("Enter at least the last 5 letters or numbers of the tracking ID.")
+                        return
+                      }
+                      setPickupManualWarning("")
+                      queuePickupScan(tracking, true)
+                    }}
+                  >
+                    <label>
+                      <span>Tracking ID — start with its last 5 characters</span>
+                      <Input value={pickupManualTracking} onChange={(event) => setPickupManualTracking(event.target.value)} autoComplete="off" autoCapitalize="characters" placeholder="Example: 02175" autoFocus />
+                    </label>
+                    <Button type="submit" disabled={!pickupManualTracking.trim()}><Search className="size-4" /> Match package</Button>
+                    <Button type="button" variant="ghost" onClick={() => { setPickupManualEntryOpen(false); setPickupManualWarning("") }}>Cancel</Button>
+                  </form>
+                )}
+                {pickupManualWarning ? <div className="pickup-manual-tracking-warning"><AlertCircle className="size-4" /><span>{pickupManualWarning}</span></div> : null}
+              </div>
+            ) : null}
             {pickupScanEntries.length ? (
               <div className="pickup-scanner-recent">
                 {pickupScanEntries.slice(0, 4).map((entry, index) => (

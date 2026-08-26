@@ -230,6 +230,7 @@ class PackagePickupScanPayload(BaseModel):
     scan_code: str
     alias_codes: list[str] = Field(default_factory=list)
     store_id: Optional[int] = None
+    manual_entry: bool = False
 
 
 class PackagePickupDeletePayload(BaseModel):
