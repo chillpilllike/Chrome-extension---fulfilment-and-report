@@ -226,6 +226,12 @@ class PackagePickupSettingsPayload(BaseModel):
     pickup_time: str
 
 
+class PackagePickupScanPayload(BaseModel):
+    scan_code: str
+    alias_codes: list[str] = Field(default_factory=list)
+    store_id: Optional[int] = None
+
+
 class PackagePickupDeletePayload(BaseModel):
     source_type: str
     source_id: int

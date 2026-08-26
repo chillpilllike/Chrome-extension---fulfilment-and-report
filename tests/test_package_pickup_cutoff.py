@@ -4,6 +4,7 @@ from app.main import (
     normalize_package_pickup_confirmation_status,
     normalize_package_pickup_time,
     package_pickup_business_date,
+    package_pickup_card_date,
     package_pickup_delivery_timestamp,
     package_tracker_delivery_date,
     package_tracker_delivery_kind,
@@ -42,6 +43,21 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
 
     def test_explicit_local_delivery_display_controls_the_date(self) -> None:
         self.assertEqual(package_pickup_business_date("2026-08-20T00:00:00Z", "Aug 19, 2026 04:47 PM"), "2026-08-19")
+
+    def test_first_pickup_scan_moves_package_to_scanned_brooklyn_date(self) -> None:
+        self.assertEqual(
+            package_pickup_card_date(
+                "2026-08-20T15:00:00Z",
+                "2026-08-22T01:15:00Z",
+            ),
+            "2026-08-21",
+        )
+
+    def test_unscanned_package_remains_on_amazon_delivery_date(self) -> None:
+        self.assertEqual(
+            package_pickup_card_date("2026-08-20T15:00:00Z"),
+            "2026-08-20",
+        )
 
     def test_delivery_timestamp_uses_tracking_record_instead_of_confirmation_update(self) -> None:
         self.assertEqual(

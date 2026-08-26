@@ -82,6 +82,7 @@ from app.schemas import (
     PackagePickupDeletePayload,
     PackagePickupManualAmazonPayload,
     PackagePickupReceivedPayload,
+    PackagePickupScanPayload,
     PackagePickupSettingsPayload,
     PlacePayload,
     PullPayload,
@@ -190,6 +191,7 @@ PUBLIC_POST_API_PATHS = {
     "/api/package-pickups/delete-row",
     "/api/package-pickups/manual-amazon",
     "/api/package-pickups/received",
+    "/api/package-pickups/scan",
     "/api/package-pickups/settings",
 }
 PUBLIC_DISPATCH_POST_PREFIXES = (
@@ -1251,6 +1253,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS package_pickup_delivery_records (
                 package_id INTEGER PRIMARY KEY,
                 delivered_at TEXT NOT NULL,
+                scanned_at TEXT,
+                last_scanned_at TEXT,
+                scanned_code TEXT,
+                scan_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -1728,6 +1735,16 @@ def init_db() -> None:
         existing_manual_pickup_cols = {r["name"] for r in conn.execute("PRAGMA table_info(package_pickup_manual_amazon)").fetchall()}
         if "not_received_at" not in existing_manual_pickup_cols:
             conn.execute("ALTER TABLE package_pickup_manual_amazon ADD COLUMN not_received_at TEXT")
+        existing_pickup_delivery_cols = {r["name"] for r in conn.execute("PRAGMA table_info(package_pickup_delivery_records)").fetchall()}
+        for column, ddl in {
+            "scanned_at": "ALTER TABLE package_pickup_delivery_records ADD COLUMN scanned_at TEXT",
+            "last_scanned_at": "ALTER TABLE package_pickup_delivery_records ADD COLUMN last_scanned_at TEXT",
+            "scanned_code": "ALTER TABLE package_pickup_delivery_records ADD COLUMN scanned_code TEXT",
+            "scan_count": "ALTER TABLE package_pickup_delivery_records ADD COLUMN scan_count INTEGER NOT NULL DEFAULT 0",
+            "updated_at": "ALTER TABLE package_pickup_delivery_records ADD COLUMN updated_at TEXT",
+        }.items():
+            if column not in existing_pickup_delivery_cols:
+                conn.execute(ddl)
         existing_dispatch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_dispatch_packages)").fetchall()}
         if "canonical_scan_code" not in existing_dispatch_cols:
             conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN canonical_scan_code TEXT")
@@ -31243,6 +31260,12 @@ def package_pickup_business_date(value: Any, local_display: Any = "") -> str:
     return delivered.date().isoformat()
 
 
+def package_pickup_card_date(delivered_at: Any, scanned_at: Any = "", manual_pickup_date: Any = "", delivered_display: Any = "") -> str:
+    """Group a received package by its first pickup scan date, otherwise by its expected delivery date."""
+    scanned_date = package_pickup_business_date(scanned_at) if clean_text(scanned_at) else ""
+    return scanned_date or clean_text(manual_pickup_date) or package_pickup_business_date(delivered_at, delivered_display)
+
+
 def package_pickup_delivery_timestamp(
     package: dict[str, Any],
     delivery_info: dict[str, Any],
@@ -31343,18 +31366,31 @@ def package_pickup_data(
             CREATE TABLE IF NOT EXISTS package_pickup_delivery_records (
                 package_id INTEGER PRIMARY KEY,
                 delivered_at TEXT NOT NULL,
+                scanned_at TEXT,
+                last_scanned_at TEXT,
+                scanned_code TEXT,
+                scan_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
         saved_delivery_records = {
-            int(row.get("package_id") or 0): clean_text(row.get("delivered_at"))
+            int(row.get("package_id") or 0): row
             for row in rows_to_dicts(conn.execute(
-                "SELECT package_id, delivered_at FROM package_pickup_delivery_records"
+                """
+                SELECT package_id, delivered_at, scanned_at, last_scanned_at, scanned_code, scan_count
+                FROM package_pickup_delivery_records
+                """
             ).fetchall())
         }
         for package in packages:
-            package["pickup_delivered_at"] = saved_delivery_records.get(int(package.get("id") or 0), "")
+            pickup_record = saved_delivery_records.get(int(package.get("id") or 0), {})
+            package["pickup_delivered_at"] = clean_text(pickup_record.get("delivered_at"))
+            package["pickup_scanned_at"] = clean_text(pickup_record.get("scanned_at"))
+            package["pickup_last_scanned_at"] = clean_text(pickup_record.get("last_scanned_at"))
+            package["pickup_scanned_code"] = clean_text(pickup_record.get("scanned_code"))
+            package["pickup_scan_count"] = int(pickup_record.get("scan_count") or 0)
         line_params: list[Any] = []
         line_store_sql = ""
         if store_id:
@@ -31567,13 +31603,20 @@ def package_pickup_data(
         package_id = int(package.get("id") or 0)
         if delivered_at and not clean_text(package.get("pickup_delivered_at")):
             pickup_delivery_snapshots.append((delivered_at, package_id))
-        pickup_date = package_pickup_business_date(delivered_at, delivered_display)
-        if not pickup_date or pickup_date < start_date.isoformat() or pickup_date > end_date.isoformat():
+        delivery_date = package_pickup_business_date(delivered_at, delivered_display)
+        scanned_at = clean_text(package.get("pickup_scanned_at"))
+        manual_pickup_date = manual_pickup_date_by_package_id.get(package_id, "")
+        pickup_date = package_pickup_card_date(delivered_at, scanned_at, manual_pickup_date, delivered_display)
+        delivery_in_range = bool(delivery_date and start_date.isoformat() <= delivery_date <= end_date.isoformat())
+        pickup_in_range = bool(pickup_date and start_date.isoformat() <= pickup_date <= end_date.isoformat())
+        # The date filters remain useful for the small Amazon delivery timestamp,
+        # while a received package is physically grouped under the day it was scanned.
+        if not pickup_date or not (delivery_in_range or pickup_in_range):
             continue
         order_name = clean_text(package.get("odoo_order_name") or primary_line.get("odoo_order_name"))
         status = shopify_statuses.get((int(package.get("store_id") or 0), order_name.upper()), {})
         fulfilled = package_pickup_is_shopify_fulfilled(status.get("fulfillment_status"), status.get("cancelled_at"))
-        received_at = clean_text(package.get("received_at"))
+        received_at = scanned_at or clean_text(package.get("received_at"))
         not_received_at = clean_text(package.get("not_received_at"))
         received = bool(received_at)
         carrier = clean_text(package.get("carrier") or matched_tracking_part.get("carrier") or matched_tracking_part.get("carrier_name"))
@@ -31592,6 +31635,12 @@ def package_pickup_data(
             "delivery_status": clean_text(package.get("package_status") or package.get("promise") or matched_tracking_part.get("status")) or "Delivered",
             "delivered_at": delivered_at,
             "delivered_display": delivered_display,
+            "delivery_date": delivery_date,
+            "pickup_scanned_at": scanned_at,
+            "pickup_last_scanned_at": clean_text(package.get("pickup_last_scanned_at")),
+            "pickup_scanned_code": clean_text(package.get("pickup_scanned_code")),
+            "pickup_scan_count": int(package.get("pickup_scan_count") or 0),
+            "pickup_card_date": pickup_date,
             "package_type": "Amazon",
             "shopify_status": clean_text(status.get("fulfillment_status")) or "Pending",
             "shopify_fulfilled": fulfilled,
@@ -31706,7 +31755,13 @@ def package_pickup_data(
     for card in card_rows:
         card["amazon_reported_delivered"] = len(card["amazon_packages"])
         card["reported_delivered"] = len(card["amazon_packages"])
-        card["missing_amazon"] = max(0, len(card["amazon_packages"]) - int(card["amazon_picked_up"]))
+        scanned_received = sum(1 for row in card["amazon_packages"] if clean_text(row.get("pickup_scanned_at")))
+        card["amazon_scanned"] = scanned_received
+        card["amazon_picked_up"] = max(int(card["amazon_picked_up"]), scanned_received)
+        card["missing_amazon"] = sum(
+            1 for row in card["amazon_packages"]
+            if not clean_text(row.get("pickup_scanned_at")) and not bool(row.get("received"))
+        )
         card["unreported_amazon"] = max(0, int(card["amazon_picked_up"]) - len(card["amazon_packages"]))
         card["physical_total"] = int(card["amazon_picked_up"]) + int(card["non_amazon_picked_up"])
         card["shopify_fulfilled"] = sum(1 for row in [*card["amazon_packages"], *card["manual_amazon_packages"], *card["non_amazon_packages"]] if row["shopify_fulfilled"])
@@ -31735,6 +31790,171 @@ def api_package_pickups(store_id: Optional[int] = None, date_from: str = "", dat
         return package_pickup_data(store_id, clean_text(date_from), clean_text(date_to))
     except ValueError as exc:
         raise HTTPException(400, "Dates must use YYYY-MM-DD format.") from exc
+
+
+def package_pickup_strict_scan_matches(conn: Any, scan_code: str, store_id: Optional[int] = None) -> list[dict[str, Any]]:
+    """Return exact barcode/linked-alias matches; never guess from a partial hardware scan."""
+    normalized = normalize_dispatch_scan_code(scan_code)
+    if not normalized:
+        return []
+    rows = rows_to_dicts(conn.execute(
+        """
+        SELECT *
+        FROM amazon_dispatch_packages
+        WHERE (
+            UPPER(COALESCE(scan_code, ''))=?
+            OR UPPER(COALESCE(canonical_scan_code, ''))=?
+            OR UPPER(COALESCE(last_scanned_code, ''))=?
+            OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE
+                        WHEN COALESCE(scanned_codes_json, '') ~ '^\\s*\\[' THEN scanned_codes_json::jsonb
+                        ELSE '[]'::jsonb
+                    END
+                ) AS scanned(value)
+                WHERE REGEXP_REPLACE(UPPER(scanned.value), '[^A-Z0-9-]', '', 'g')=?
+            )
+        )
+          AND (? IS NULL OR store_id=?)
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 4
+        """,
+        (normalized, normalized, normalized, normalized, store_id, store_id),
+    ).fetchall())
+    return dedupe_dispatch_package_rows(rows)
+
+
+@app.post("/api/package-pickups/scan")
+def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]:
+    query_text = clean_text(payload.scan_code)
+    scan_code = normalize_dispatch_scan_code(query_text)
+    if not scan_code:
+        raise HTTPException(400, "scan_code is required")
+    barcode_kind = dispatch_barcode_kind(query_text)
+    alias_codes = [
+        clean_text(value)
+        for value in payload.alias_codes
+        if clean_text(value) and dispatch_barcode_kind(value) == "amazon_internal_label"
+    ]
+    now = utc_now()
+    with db() as conn:
+        matches = package_pickup_strict_scan_matches(conn, scan_code, payload.store_id)
+        if len(matches) > 1:
+            return {
+                "ok": True,
+                "matched": False,
+                "ambiguous": True,
+                "scan_code": scan_code,
+                "message": f"Barcode {query_text} matches more than one package. Nothing was changed.",
+            }
+        if not matches and barcode_kind == "amazon_internal_label":
+            return {
+                "ok": True,
+                "matched": False,
+                "requires_tracking_scan": True,
+                "barcode_kind": barcode_kind,
+                "scan_code": scan_code,
+                "message": "Amazon square label read. Now scan the long barcode beside the printed TBA number.",
+            }
+        if not matches:
+            return {
+                "ok": True,
+                "matched": False,
+                "scan_code": scan_code,
+                "message": f"Barcode {query_text} is not linked to an expected Amazon package.",
+            }
+        package = matches[0]
+        if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
+            return {
+                "ok": True,
+                "matched": False,
+                "not_delivered": True,
+                "scan_code": scan_code,
+                "amazon_order_id": clean_text(package.get("amazon_order_id")),
+                "odoo_order_name": clean_text(package.get("odoo_order_name")),
+                "message": f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but Amazon has not reported it delivered yet.",
+            }
+        package_id = int(package.get("id") or 0)
+        existing = conn.execute(
+            "SELECT * FROM package_pickup_delivery_records WHERE package_id=?",
+            (package_id,),
+        ).fetchone()
+        existing_data = row_to_dict(existing) or {}
+        first_scanned_at = clean_text(existing_data.get("scanned_at")) or now
+        duplicate = bool(clean_text(existing_data.get("scanned_at")))
+        delivered_at = clean_text(existing_data.get("delivered_at")) or package_tracker_delivery_date(
+            package.get("package_status"),
+            package.get("promise"),
+            package.get("updated_at"),
+        ) or clean_text(package.get("updated_at")) or now
+        conn.execute(
+            """
+            INSERT INTO package_pickup_delivery_records
+                (package_id, delivered_at, scanned_at, last_scanned_at, scanned_code, scan_count, updated_at, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(package_id) DO UPDATE SET
+                delivered_at=COALESCE(NULLIF(package_pickup_delivery_records.delivered_at, ''), excluded.delivered_at),
+                scanned_at=COALESCE(package_pickup_delivery_records.scanned_at, excluded.scanned_at),
+                last_scanned_at=excluded.last_scanned_at,
+                scanned_code=excluded.scanned_code,
+                scan_count=package_pickup_delivery_records.scan_count+1,
+                updated_at=excluded.updated_at
+            """,
+            (package_id, delivered_at, first_scanned_at, now, scan_code, now, now),
+        )
+        merged_codes = clean_text(package.get("scanned_codes_json")) or "[]"
+        alias_row = {**package, "scanned_codes_json": merged_codes}
+        for alias in alias_codes:
+            merged_codes = dispatch_merge_scanned_codes(alias_row, alias, alias)
+            alias_row["scanned_codes_json"] = merged_codes
+        conn.execute(
+            """
+            UPDATE amazon_dispatch_packages
+            SET received_at=COALESCE(received_at, ?),
+                not_received_at=NULL,
+                scanned_codes_json=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (first_scanned_at, merged_codes, now, package_id),
+        )
+        scan_date = package_pickup_business_date(first_scanned_at)
+        if not duplicate and scan_date:
+            package_store_id = int(package.get("store_id") or 0)
+            conn.execute(
+                """
+                INSERT INTO package_pickup_checks
+                    (store_id, pickup_date, amazon_picked_up, non_amazon_picked_up, created_at, updated_at)
+                VALUES (?, ?, 1, 0, ?, ?)
+                ON CONFLICT(store_id, pickup_date) DO UPDATE SET
+                    amazon_picked_up=package_pickup_checks.amazon_picked_up+1,
+                    updated_at=excluded.updated_at
+                """,
+                (package_store_id, scan_date, now, now),
+            )
+        canonical = normalize_dispatch_scan_code(package.get("canonical_scan_code") or package.get("scan_code"))
+        result = {
+            "id": package_id,
+            "scan_code": canonical,
+            "shipment_id": canonical,
+            "amazon_order_id": clean_text(package.get("amazon_order_id")),
+            "odoo_order_name": clean_text(package.get("odoo_order_name")),
+            "recipient_ref": clean_text(package.get("recipient_ref")) or f"Nutricity {clean_text(package.get('odoo_order_name'))}".strip(),
+            "delivered_at": delivered_at,
+            "pickup_scanned_at": first_scanned_at,
+            "pickup_scan_date": scan_date,
+        }
+    fast_page_cache_clear_matching({"package-pickups"})
+    duplicate_text = " already scanned; original pickup time retained" if duplicate else " scanned successfully"
+    return {
+        "ok": True,
+        "matched": True,
+        "duplicate": duplicate,
+        "barcode_kind": barcode_kind,
+        "package": result,
+        "message": f"{result['odoo_order_name'] or result['amazon_order_id']}{duplicate_text}.",
+    }
 
 
 @app.post("/api/package-pickups/settings")

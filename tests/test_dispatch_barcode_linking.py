@@ -7,7 +7,7 @@ from app.main import (
     dispatch_scan_code_is_physical,
     normalize_dispatch_scan_code,
 )
-from app.schemas.payloads import DispatchScanPayload
+from app.schemas.payloads import DispatchScanPayload, PackagePickupScanPayload
 
 
 class DispatchBarcodeLinkingTests(unittest.TestCase):
@@ -37,6 +37,12 @@ class DispatchBarcodeLinkingTests(unittest.TestCase):
     def test_scan_payload_alias_lists_are_not_shared(self):
         first = DispatchScanPayload(scan_code="TBA333598452175")
         second = DispatchScanPayload(scan_code="TBA332841203092")
+        first.alias_codes.append("SPqxPzY36T_001_v")
+        self.assertEqual(second.alias_codes, [])
+
+    def test_pickup_scan_payload_alias_lists_are_not_shared(self):
+        first = PackagePickupScanPayload(scan_code="TBA333598452175")
+        second = PackagePickupScanPayload(scan_code="TBA332841203092")
         first.alias_codes.append("SPqxPzY36T_001_v")
         self.assertEqual(second.alias_codes, [])
 

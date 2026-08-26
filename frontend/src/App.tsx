@@ -630,6 +630,44 @@ type PackagePickupRow = {
   position?: number
   needs_details?: boolean
   tracking_input?: string
+  delivery_date?: string
+  pickup_card_date?: string
+  pickup_scanned_at?: string
+  pickup_last_scanned_at?: string
+  pickup_scanned_code?: string
+  pickup_scan_count?: number
+}
+
+type PackagePickupScanPackage = {
+  id: number
+  scan_code: string
+  shipment_id: string
+  amazon_order_id: string
+  odoo_order_name: string
+  recipient_ref: string
+  delivered_at: string
+  pickup_scanned_at: string
+  pickup_scan_date: string
+}
+
+type PackagePickupScanEntry = {
+  code: string
+  ok: boolean
+  duplicate?: boolean
+  message: string
+  scannedAt: string
+  package?: PackagePickupScanPackage
+}
+
+type PackagePickupScanResponse = {
+  ok: boolean
+  matched: boolean
+  duplicate?: boolean
+  ambiguous?: boolean
+  requires_tracking_scan?: boolean
+  barcode_kind?: string
+  message: string
+  package?: PackagePickupScanPackage
 }
 
 type PickupBulkRow = {
@@ -645,6 +683,7 @@ type PackagePickupCard = {
   amazon_picked_up: number
   non_amazon_picked_up: number
   amazon_reported_delivered: number
+  amazon_scanned?: number
   reported_delivered: number
   missing_amazon: number
   unreported_amazon: number
@@ -2641,7 +2680,7 @@ function OdooOrderRef({
       <button
         type="button"
         className={cn(
-          "inline-flex size-6 flex-none items-center justify-center rounded border bg-background transition-colors",
+          "inline-flex size-5 flex-none items-center justify-center rounded border bg-background transition-colors",
           copied ? "border-emerald-500 text-emerald-700" : "border-primary/25 text-primary hover:border-primary hover:bg-primary/10",
         )}
         title={`Copy ${text}`}
@@ -2654,7 +2693,7 @@ function OdooOrderRef({
           window.setTimeout(() => setCopied(false), 1200)
         }}
       >
-        <Copy className="size-3.5" />
+        <Copy className="size-3" />
       </button>
     </span>
   )
@@ -6381,6 +6420,34 @@ function PackagePickupPage({
   const pickupDaysPerPage = 15
   const [expandedDates, setExpandedDates] = useState<Set<string>>(new Set())
   const [drafts, setDrafts] = useState<Record<string, { amazon: string; nonAmazon: string; orderNumbers: string }>>({})
+  const [pickupScannerOpen, setPickupScannerOpen] = useState(false)
+  const [pickupScannerMode, setPickupScannerMode] = useState<"camera" | "hardware">("camera")
+  const [pickupScannerStatus, setPickupScannerStatus] = useState("")
+  const [pickupScannerError, setPickupScannerError] = useState("")
+  const [pickupScannerFlash, setPickupScannerFlash] = useState<"success" | "error" | "">("")
+  const [pickupScanEntries, setPickupScanEntries] = useState<PackagePickupScanEntry[]>([])
+  const [lastPickupScanEntries, setLastPickupScanEntries] = useState<PackagePickupScanEntry[]>(() => {
+    try {
+      if (typeof window === "undefined") return []
+      const parsed = JSON.parse(window.localStorage.getItem("package-pickup-last-scan-summary") || "[]")
+      return Array.isArray(parsed) ? parsed.slice(0, 100) : []
+    } catch {
+      return []
+    }
+  })
+  const [pickupSummaryOpen, setPickupSummaryOpen] = useState(false)
+  const [hardwareScanInput, setHardwareScanInput] = useState("")
+  const pickupScannerVideoRef = useRef<HTMLVideoElement | null>(null)
+  const pickupScannerStreamRef = useRef<MediaStream | null>(null)
+  const pickupScannerControlsRef = useRef<IScannerControls | null>(null)
+  const pickupScannerReaderRef = useRef<BrowserMultiFormatReader | null>(null)
+  const pickupHardwareInputRef = useRef<HTMLInputElement | null>(null)
+  const pickupPendingAliasRef = useRef("")
+  const pickupScanEntriesRef = useRef<PackagePickupScanEntry[]>([])
+  const pickupRecentScansRef = useRef<Map<string, number>>(new Map())
+  const pickupScanQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const pickupRefreshTimerRef = useRef<number | null>(null)
+  const pickupFlashTimerRef = useRef<number | null>(null)
 
   async function load() {
     setLoading(true)
@@ -6409,6 +6476,199 @@ function PackagePickupPage({
     // Filters are the source of truth for this operational view.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storeId, dateFrom, dateTo])
+
+  function stopPickupScannerStream() {
+    pickupScannerControlsRef.current?.stop()
+    pickupScannerControlsRef.current = null
+    pickupScannerReaderRef.current = null
+    pickupScannerStreamRef.current?.getTracks().forEach((track) => track.stop())
+    pickupScannerStreamRef.current = null
+    if (pickupScannerVideoRef.current) {
+      pickupScannerVideoRef.current.pause()
+      pickupScannerVideoRef.current.srcObject = null
+      pickupScannerVideoRef.current.removeAttribute("src")
+      pickupScannerVideoRef.current.load()
+    }
+  }
+
+  function setPickupScanFeedback(kind: "success" | "error", message: string) {
+    setPickupScannerFlash(kind)
+    setPickupScannerStatus(message)
+    if (pickupFlashTimerRef.current) window.clearTimeout(pickupFlashTimerRef.current)
+    pickupFlashTimerRef.current = window.setTimeout(() => setPickupScannerFlash(""), 650)
+  }
+
+  function schedulePickupRefresh() {
+    if (pickupRefreshTimerRef.current) window.clearTimeout(pickupRefreshTimerRef.current)
+    pickupRefreshTimerRef.current = window.setTimeout(() => void load(), 500)
+  }
+
+  function savePickupSummary(entries: PackagePickupScanEntry[]) {
+    const summary = entries.slice(0, 100)
+    setLastPickupScanEntries(summary)
+    try {
+      window.localStorage.setItem("package-pickup-last-scan-summary", JSON.stringify(summary))
+    } catch {
+      // Session summary remains available in memory when local storage is unavailable.
+    }
+  }
+
+  function addPickupScanEntry(entry: PackagePickupScanEntry) {
+    const next = [entry, ...pickupScanEntriesRef.current].slice(0, 100)
+    pickupScanEntriesRef.current = next
+    setPickupScanEntries(next)
+    savePickupSummary(next)
+  }
+
+  async function processPickupScan(rawCode: string) {
+    const code = rawCode.trim()
+    if (!code) return
+    const aliases = pickupPendingAliasRef.current ? [pickupPendingAliasRef.current] : []
+    setPickupScannerStatus(`Checking ${code}…`)
+    try {
+      const result = await api<PackagePickupScanResponse>("/api/package-pickups/scan", {
+        method: "POST",
+        body: JSON.stringify({ scan_code: code, alias_codes: aliases, store_id: storeId ? Number(storeId) : null }),
+      })
+      if (result.requires_tracking_scan) {
+        pickupPendingAliasRef.current = code
+        setPickupScannerStatus(`${result.message} Keep the scanner open and scan the long TBA barcode.`)
+        return
+      }
+      pickupPendingAliasRef.current = ""
+      const entry: PackagePickupScanEntry = {
+        code,
+        ok: Boolean(result.matched && result.package),
+        duplicate: result.duplicate,
+        message: result.message || (result.matched ? "Package matched." : "Package not matched."),
+        scannedAt: new Date().toISOString(),
+        package: result.package,
+      }
+      addPickupScanEntry(entry)
+      if (entry.ok) {
+        setPickupScanFeedback("success", `${result.package?.odoo_order_name || result.package?.amazon_order_id || code} matched${result.duplicate ? " · already scanned" : ""}. Ready for the next package.`)
+        schedulePickupRefresh()
+      } else {
+        setPickupScanFeedback("error", entry.message)
+      }
+    } catch (error) {
+      const message = `Scan failed: ${String(error)}`
+      addPickupScanEntry({ code, ok: false, message, scannedAt: new Date().toISOString() })
+      setPickupScanFeedback("error", message)
+    } finally {
+      window.setTimeout(() => pickupHardwareInputRef.current?.focus(), 50)
+    }
+  }
+
+  function queuePickupScan(rawCode: string) {
+    const code = rawCode.trim()
+    if (!code) return
+    const now = Date.now()
+    const prior = pickupRecentScansRef.current.get(code) || 0
+    if (now - prior < 1400) return
+    pickupRecentScansRef.current.set(code, now)
+    pickupScanQueueRef.current = pickupScanQueueRef.current.then(() => processPickupScan(code))
+  }
+
+  function openPickupScanner(mode: "camera" | "hardware" = "camera") {
+    pickupScanEntriesRef.current = []
+    setPickupScanEntries([])
+    setPickupScannerMode(mode)
+    setPickupScannerOpen(true)
+    setPickupScannerError("")
+    setPickupScannerFlash("")
+    setPickupScannerStatus(mode === "camera" ? "Opening rapid camera scanner…" : "Hardware scanner ready. Scan a barcode or type it and press Enter.")
+    setHardwareScanInput("")
+    pickupPendingAliasRef.current = ""
+    pickupRecentScansRef.current.clear()
+    pickupScanQueueRef.current = Promise.resolve()
+  }
+
+  function closePickupScanner(showSummary = true) {
+    stopPickupScannerStream()
+    setPickupScannerOpen(false)
+    pickupPendingAliasRef.current = ""
+    if (pickupScanEntriesRef.current.length) {
+      savePickupSummary(pickupScanEntriesRef.current)
+      if (showSummary) setPickupSummaryOpen(true)
+    }
+  }
+
+  useEffect(() => {
+    if (!pickupScannerOpen || pickupScannerMode !== "camera") {
+      stopPickupScannerStream()
+      if (pickupScannerOpen && pickupScannerMode === "hardware") {
+        window.setTimeout(() => pickupHardwareInputRef.current?.focus(), 80)
+      }
+      return
+    }
+    let cancelled = false
+    let noReadTimer = 0
+    function armNoReadWarning() {
+      if (noReadTimer) window.clearTimeout(noReadTimer)
+      noReadTimer = window.setTimeout(() => {
+        if (!cancelled) setPickupScanFeedback("error", "No barcode detected yet. Hold the long TBA barcode straight inside the frame.")
+      }, 6000)
+    }
+    async function startRapidScanner() {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is not available in this browser.")
+        for (let attempt = 0; attempt < 10 && !pickupScannerVideoRef.current; attempt += 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, 80))
+        }
+        const video = pickupScannerVideoRef.current
+        if (!video) throw new Error("Camera preview is not ready.")
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        })
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop())
+          return
+        }
+        pickupScannerStreamRef.current = stream
+        video.srcObject = stream
+        await video.play()
+        const reader = new BrowserMultiFormatReader()
+        pickupScannerReaderRef.current = reader
+        setPickupScannerStatus("Rapid scanner ready. Keep scanning packages—the camera stays open.")
+        armNoReadWarning()
+        const controls = await reader.decodeFromVideoElement(video, (result, error) => {
+          const text = result?.getText?.().trim()
+          if (text) {
+            armNoReadWarning()
+            queuePickupScan(text)
+            return
+          }
+          const errorName = String((error as Error | undefined)?.name || "")
+          if (error && errorName && errorName !== "NotFoundException") {
+            setPickupScanFeedback("error", "Barcode could not be read. Straighten the label and try again.")
+          }
+        })
+        if (cancelled) controls.stop()
+        else pickupScannerControlsRef.current = controls
+      } catch (error) {
+        if (!cancelled) {
+          setPickupScannerError(String(error instanceof Error ? error.message : error))
+          setPickupScanFeedback("error", "Camera could not start. You can switch to a USB/Bluetooth scanner.")
+        }
+      }
+    }
+    void startRapidScanner()
+    return () => {
+      cancelled = true
+      if (noReadTimer) window.clearTimeout(noReadTimer)
+      stopPickupScannerStream()
+    }
+    // Scanner lifecycle intentionally follows the open state and selected input mode.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickupScannerOpen, pickupScannerMode, storeId])
+
+  useEffect(() => () => {
+    stopPickupScannerStream()
+    if (pickupRefreshTimerRef.current) window.clearTimeout(pickupRefreshTimerRef.current)
+    if (pickupFlashTimerRef.current) window.clearTimeout(pickupFlashTimerRef.current)
+  }, [])
 
   function updateDraft(pickupDate: string, key: "amazon" | "nonAmazon" | "orderNumbers", value: string) {
     setDrafts((current) => ({
@@ -6644,6 +6904,10 @@ function PackagePickupPage({
   const pickupPageCount = Math.max(1, Math.ceil(visibleCards.length / pickupDaysPerPage))
   const safePickupPage = Math.min(pickupPage, pickupPageCount)
   const pagedPickupCards = visibleCards.slice((safePickupPage - 1) * pickupDaysPerPage, safePickupPage * pickupDaysPerPage)
+  const pickupScanSuccessCount = pickupScanEntries.filter((entry) => entry.ok).length
+  const pickupScanFailureCount = pickupScanEntries.filter((entry) => !entry.ok).length
+  const pickupSummarySuccessCount = lastPickupScanEntries.filter((entry) => entry.ok).length
+  const pickupSummaryFailureCount = lastPickupScanEntries.filter((entry) => !entry.ok).length
 
   useEffect(() => {
     setPickupPage(1)
@@ -6655,6 +6919,97 @@ function PackagePickupPage({
 
   return (
     <div className="pickup-page grid gap-4">
+      <Dialog open={pickupScannerOpen} onOpenChange={(open) => !open && closePickupScanner(true)}>
+        <DialogContent className="pickup-scanner-dialog max-w-2xl p-0">
+          <DialogHeader className="border-b px-4 py-3">
+            <DialogTitle className="flex items-center gap-2"><Camera className="size-5" /> Rapid Package Pickup Scanner</DialogTitle>
+            <DialogDescription>The scanner remains open while packages are matched and recorded in the background.</DialogDescription>
+          </DialogHeader>
+          <div className={cn("pickup-scanner-body", pickupScannerFlash && `is-${pickupScannerFlash}`)}>
+            <div className="pickup-scanner-mode-tabs">
+              <Button type="button" size="sm" variant={pickupScannerMode === "camera" ? "default" : "outline"} onClick={() => setPickupScannerMode("camera")}><Camera className="size-4" /> Camera</Button>
+              <Button type="button" size="sm" variant={pickupScannerMode === "hardware" ? "default" : "outline"} onClick={() => setPickupScannerMode("hardware")}><PackageCheck className="size-4" /> USB / Bluetooth scanner</Button>
+            </div>
+            {pickupScannerMode === "camera" ? (
+              <div className="pickup-scanner-video-wrap">
+                <video ref={pickupScannerVideoRef} className="pickup-scanner-video" muted playsInline autoPlay />
+                <div className="pickup-scanner-target" />
+              </div>
+            ) : (
+              <form
+                className="pickup-hardware-scanner"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  const code = hardwareScanInput.trim()
+                  if (!code) return
+                  setHardwareScanInput("")
+                  queuePickupScan(code)
+                }}
+              >
+                <PackageCheck className="size-10" />
+                <strong>Hardware scanner ready</strong>
+                <span>Most USB and Bluetooth laser scanners work as keyboards. Scan now; Enter submits automatically.</span>
+                <Input
+                  ref={pickupHardwareInputRef}
+                  value={hardwareScanInput}
+                  onChange={(event) => setHardwareScanInput(event.target.value)}
+                  autoComplete="off"
+                  autoCapitalize="characters"
+                  placeholder="Scanner input appears here"
+                />
+                <Button type="submit" disabled={!hardwareScanInput.trim()}>Submit code</Button>
+              </form>
+            )}
+            <div className="pickup-scanner-counts" aria-label="Current scanner session counts">
+              <div className="is-success"><span>Successful</span><strong>{pickupScanSuccessCount}</strong></div>
+              <div className="is-error"><span>Unsuccessful</span><strong>{pickupScanFailureCount}</strong></div>
+            </div>
+            <div className={cn("pickup-scanner-live-status", pickupScannerFlash && `is-${pickupScannerFlash}`)}>
+              {pickupScannerError ? <><AlertCircle className="size-4" /> {pickupScannerError}</> : pickupScannerStatus || "Waiting for a package barcode…"}
+            </div>
+            {pickupScanEntries.length ? (
+              <div className="pickup-scanner-recent">
+                {pickupScanEntries.slice(0, 4).map((entry, index) => (
+                  <div key={`${entry.scannedAt}-${entry.code}-${index}`} className={entry.ok ? "is-success" : "is-error"}>
+                    {entry.ok ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
+                    <span><strong>{entry.package?.odoo_order_name || entry.code}</strong><small>{entry.message}</small></span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter className="border-t px-4 py-3">
+            <Button variant="outline" onClick={() => closePickupScanner(true)}><X className="size-4" /> Close and view summary</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={pickupSummaryOpen} onOpenChange={setPickupSummaryOpen}>
+        <DialogContent className="pickup-scan-summary-dialog max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Last pickup scan summary</DialogTitle>
+            <DialogDescription>{pickupSummarySuccessCount} successful · {pickupSummaryFailureCount} unsuccessful</DialogDescription>
+          </DialogHeader>
+          <div className="pickup-scan-summary-list">
+            {lastPickupScanEntries.map((entry, index) => (
+              <div key={`${entry.scannedAt}-${entry.code}-${index}`} className={entry.ok ? "is-success" : "is-error"}>
+                {entry.ok ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
+                <div>
+                  {entry.package?.odoo_order_name ? <OdooOrderRef name={entry.package.odoo_order_name} linkClassName="font-semibold" /> : <strong>{entry.code}</strong>}
+                  {entry.package?.amazon_order_id ? <small>Amazon order {entry.package.amazon_order_id}</small> : null}
+                  {entry.package?.recipient_ref ? <small>Recipient {entry.package.recipient_ref}</small> : null}
+                  {entry.package?.shipment_id ? <small>Shipment ID {entry.package.shipment_id}</small> : null}
+                  <small>Scanned {formatDateTime(entry.scannedAt, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                  <small>{entry.message}</small>
+                </div>
+              </div>
+            ))}
+            {!lastPickupScanEntries.length ? <div className="pickup-empty">No saved scanner session yet.</div> : null}
+          </div>
+          <DialogFooter><Button onClick={() => setPickupSummaryOpen(false)}>Done</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={pickupTimeOpen} onOpenChange={(open) => { if (!pickupTimeSaving) setPickupTimeOpen(open) }}>
         <DialogContent className="pickup-time-dialog">
           <DialogHeader>
@@ -6720,8 +7075,8 @@ function PackagePickupPage({
               <option value="">All stores</option>
               {stores.map((store) => <option key={store.id} value={store.id}>{store.name}</option>)}
             </SelectField>
-            <TextField label="From delivery date" type="date" value={dateFrom} onChange={setDateFrom} />
-            <TextField label="To delivery date" type="date" value={dateTo} onChange={setDateTo} />
+            <TextField label="From Amazon delivery date" type="date" value={dateFrom} onChange={setDateFrom} />
+            <TextField label="To Amazon delivery date" type="date" value={dateTo} onChange={setDateTo} />
             <SelectField label="Package view" value={packageView} onChange={(value) => setPackageView(value as "all" | "amazon_unfulfilled")}>
               <option value="all">All packages</option>
               <option value="amazon_unfulfilled">Amazon delivered · Shopify unfulfilled</option>
@@ -6729,6 +7084,14 @@ function PackagePickupPage({
             <button type="button" className="pickup-cutoff-chip" onClick={openPickupTimeEditor} title="Edit team pickup time"><Clock className="size-4" /><span>Team pickup <strong>{pickupTimeLabel(data?.cutoff || "09:30")}</strong></span><Edit className="size-3.5" /></button>
           </div>
           <div className="pickup-toolbar-actions">
+            <Button className="pickup-scanner-launch" size="sm" onClick={() => openPickupScanner("camera")}>
+              <Camera className="size-4" /> Scan packages
+            </Button>
+            {lastPickupScanEntries.length ? (
+              <Button variant="outline" size="sm" onClick={() => setPickupSummaryOpen(true)}>
+                <CheckCircle2 className="size-4" /> Last scan summary
+              </Button>
+            ) : null}
             <Button variant="outline" size="sm" onClick={() => setShowPackageSearch((current) => !current)} aria-expanded={showPackageSearch}>
               <Search className="size-4" /> {showPackageSearch ? "Hide package search" : "Search packages"}
             </Button>
@@ -6762,7 +7125,7 @@ function PackagePickupPage({
 
       <div className="pickup-rule-note">
         <Clock className="size-4" />
-        <span><strong>Delivery-date rule:</strong> packages stay on Amazon's Brooklyn delivery date. At the {pickupTimeLabel(data?.cutoff || "09:30")} pickup, use the prior delivery-date card; today's card may be empty.</span>
+        <span><strong>Scan-date rule:</strong> an expected package stays on its Amazon delivery-date card until received, then moves to the Brooklyn date card on which it was first scanned. Its original Amazon delivery time remains visible in small text and is included by the date filters.</span>
       </div>
 
       <section className="pickup-summary-strip" aria-label="Selected date range totals">
@@ -6774,7 +7137,7 @@ function PackagePickupPage({
 
       {visibleCards.length > pickupDaysPerPage && (
         <div className="pickup-pagination-bar">
-          <span>Newest delivery dates first · 15 days per page</span>
+          <span>Newest pickup cards first · 15 days per page</span>
           <PaginationControls page={safePickupPage} total={visibleCards.length} perPage={pickupDaysPerPage} onPage={setPickupPage} disabled={loading} label="delivery dates" />
         </div>
       )}
@@ -6806,7 +7169,7 @@ function PackagePickupPage({
                   <small>{expanded ? "Hide" : "Show"} {hasActivePackageFilters ? rows.length : allCardRows.length} package detail{(hasActivePackageFilters ? rows.length : allCardRows.length) === 1 ? "" : "s"}</small>
                 </span>
               </button>
-              <div className="pickup-day-metric"><span>Amazon delivered</span><strong>{card.amazon_reported_delivered}</strong></div>
+              <div className="pickup-day-metric"><span>Expected packages</span><strong>{card.amazon_reported_delivered}</strong></div>
               <div className="pickup-count-field"><Label>Amazon picked up</Label><Input type="number" min="0" value={draft.amazon} onChange={(event) => updateDraft(card.pickup_date, "amazon", event.target.value)} /></div>
               <div className="pickup-count-field"><Label>Non-Amazon picked up</Label><Input type="number" min="0" value={draft.nonAmazon} onChange={(event) => updateDraft(card.pickup_date, "nonAmazon", event.target.value)} /></div>
               <div className={`pickup-difference ${isMatched ? "is-matched" : "is-missing"}`}>{isMatched ? "Matched" : card.missing_amazon ? `Missing ${card.missing_amazon}` : `Extra ${card.unreported_amazon}`}</div>
@@ -6824,7 +7187,7 @@ function PackagePickupPage({
                 {card.missing_amazon > 0 && <div className="pickup-missing-alert"><AlertCircle className="size-4" /> {card.missing_amazon} Amazon-delivered package{card.missing_amazon === 1 ? " is" : "s are"} not in the physical pickup count.</div>}
                 <div className="pickup-table" role="table" aria-label={`${pickupDateLabel(card.pickup_date)} packages`}>
                   <div className="pickup-table-row pickup-table-header" role="row">
-                    <span>Odoo Order</span><span>Amazon Order</span><span>Tracking ID</span><span>Delivered at</span><span>Type</span><span>Shopify</span><span>Confirmation</span><span>Actions</span>
+                    <span>Odoo Order</span><span>Amazon Order</span><span>Tracking ID</span><span>Delivery / scan times</span><span>Type</span><span>Shopify</span><span>Confirmation</span><span>Actions</span>
                   </div>
                   {rows.map((row) => {
                     const receiveKey = `${row.source_type}:${row.source_id}`
@@ -6832,7 +7195,7 @@ function PackagePickupPage({
                     const confirmationBusy = receivingId.startsWith(`${receiveKey}:`)
                     return (
                       <div key={receiveKey} className={`pickup-table-row ${row.shopify_fulfilled ? "is-fulfilled" : ""}`} role="row">
-                        <span data-label="Odoo Order"><strong>{row.odoo_order_name || "Not entered"}</strong></span>
+                        <span data-label="Odoo Order">{row.odoo_order_name ? <OdooOrderRef name={row.odoo_order_name} linkClassName="font-semibold" /> : <strong>Not entered</strong>}</span>
                         <span data-label="Amazon Order">{row.amazon_order_url ? <a href={row.amazon_order_url} target="_blank" rel="noreferrer">{row.amazon_order_id}</a> : "—"}</span>
                         <span data-label="Tracking ID">
                           {row.tracking_id ? (
@@ -6842,7 +7205,10 @@ function PackagePickupPage({
                             </span>
                           ) : row.source_type !== "non_amazon" ? <span className="text-muted-foreground">Not captured</span> : "—"}
                         </span>
-                        <span data-label="Delivered at">{row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true }) || "Not recorded"}</span>
+                        <span data-label="Delivery / scan times" className="pickup-package-times">
+                          <small>Amazon delivered · {row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true }) || "Not recorded"}</small>
+                          {row.pickup_scanned_at ? <small className="is-scanned">Pickup scanned · {formatDateTime(row.pickup_scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small> : <small className="is-pending">Pickup scan pending</small>}
+                        </span>
                         <span data-label="Type"><span className={`pickup-type ${row.source_type}`}>{row.package_type}</span></span>
                         <span data-label="Shopify"><span className={`pickup-status ${row.shopify_fulfilled ? "is-fulfilled" : "is-pending"}`}>{row.shopify_fulfilled ? "Fulfilled" : row.shopify_status || "Pending"}</span></span>
                         <span data-label="Confirmation">
