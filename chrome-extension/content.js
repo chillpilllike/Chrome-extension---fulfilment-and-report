@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-delivery-single-pass-v137";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-bounce-v138";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5225,6 +5225,61 @@ async function waitForBusinessPaymentTransition(preferences = [], timeout = 4500
   }, timeout, 150);
 }
 
+function businessPaymentSelectionErrorVisible() {
+  if (!businessPaymentSelectionPageOpen()) return false;
+  const alerts = [...document.querySelectorAll("[role='alert'], .a-alert-error, .a-box.a-alert")]
+    .filter(visible)
+    .map((element) => normalizedText(element.innerText || element.textContent || ""));
+  return alerts.some((text) => (
+    text.includes("there was a problem")
+    && text.includes("select or add a payment method to continue")
+  ));
+}
+
+async function waitForSettledBusinessPaymentOutcome(preferences = [], timeout = 12000) {
+  const deadline = Date.now() + timeout;
+  let leftPaymentAt = 0;
+  let confirmedAt = 0;
+  while (Date.now() < deadline) {
+    await waitIfPaused();
+    const onPaymentPage = businessPaymentSelectionPageOpen();
+    if (onPaymentPage) {
+      leftPaymentAt = 0;
+      confirmedAt = 0;
+      const selected = selectedNativePaymentInstrumentRadio();
+      if (businessPaymentSelectionErrorVisible() && !selected) {
+        return { advanced: false, bouncedBack: true, reason: "payment_method_required" };
+      }
+    } else {
+      if (!leftPaymentAt) leftPaymentAt = Date.now();
+      const progress = checkoutPaymentProgress(preferences);
+      const confirmedPreferred = preferences.length
+        ? Boolean(progress.selectedDigits && preferences.includes(progress.selectedDigits))
+        : Boolean(progress.confirmed);
+      if (progress.hasPlaceOrderButton || confirmedPreferred) {
+        if (!confirmedAt) confirmedAt = Date.now();
+        if (Date.now() - confirmedAt >= 1500) {
+          return { ...progress, advanced: true, bouncedBack: false };
+        }
+      } else {
+        confirmedAt = 0;
+      }
+      // Amazon Business briefly leaves /pay while it validates the instrument.
+      // Do not call that success until it remains away long enough to rule out
+      // the common bounce back to /pay with "Select or add a payment method".
+      if (Date.now() - leftPaymentAt >= 5000) {
+        return { ...progress, advanced: true, bouncedBack: false };
+      }
+    }
+    await sleep(150);
+  }
+  return {
+    ...checkoutPaymentProgress(preferences),
+    advanced: !businessPaymentSelectionPageOpen(),
+    bouncedBack: businessPaymentSelectionErrorVisible() && !selectedNativePaymentInstrumentRadio(),
+  };
+}
+
 async function clickPaymentRadio(radio) {
   const row = paymentRowForRadio(radio);
   const preferredDigits = cardDigitsForPaymentRadio(radio);
@@ -6907,13 +6962,24 @@ async function handlePaymentSelection(activeJob) {
     await clickElement(continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
     let progress = accountExperience === "business"
-      ? await waitForBusinessPaymentTransition(cardPreferences, 4500)
+      ? await waitForSettledBusinessPaymentOutcome(cardPreferences, 12000)
       : await waitForCheckoutPaymentProgress(cardPreferences, 4500, { stopOnTransition: true });
     let advanced = accountExperience === "business"
-      ? Boolean(progress?.transitioned)
+      ? Boolean(progress?.advanced)
       : Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
-    if (!advanced && findPaymentRadio() && !findPlaceOrderButton()) {
-      const alternate = alternatePaymentContinueButtons(continueButton)[0];
+    const businessPaymentBounce = accountExperience === "business" && Boolean(progress?.bouncedBack);
+    if (!advanced && (findPaymentRadio() || businessPaymentBounce) && !findPlaceOrderButton()) {
+      if (businessPaymentBounce) {
+        showPanel("Nutricity checkout", `Amazon returned to payment without retaining card ending in ${selectedDigits}. Reselecting it once.`, null, null);
+        const readyPayment = await waitUntil(findAccountPaymentSelection, 12000, 200);
+        if (!readyPayment) {
+          await pauseForManualCheckout(activeJob, `Amazon Business returned to payment, but its native card controls did not reload for card ending in ${selectedDigits}.`);
+          return true;
+        }
+        payment = readyPayment;
+      }
+      const alternate = alternatePaymentContinueButtons(continueButton)[0]
+        || nativePaymentContinueControl(payment?.continueButton);
       if (alternate) {
         if (accountExperience === "business") {
           const reselection = await selectStableBusinessPaymentCard(payment.radio);
@@ -6925,10 +6991,10 @@ async function handlePaymentSelection(activeJob) {
         showPanel("Nutricity checkout", "Retrying Amazon payment continue button.", null, null);
         await clickElement(alternate, "alternate Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
         progress = accountExperience === "business"
-          ? await waitForBusinessPaymentTransition(cardPreferences, 3500)
+          ? await waitForSettledBusinessPaymentOutcome(cardPreferences, 12000)
           : await waitForCheckoutPaymentProgress(cardPreferences, 3500, { stopOnTransition: true });
         advanced = accountExperience === "business"
-          ? Boolean(progress?.transitioned)
+          ? Boolean(progress?.advanced)
           : Boolean(progress && (progress.confirmed || progress.hasPlaceOrderButton || !progress.hasPaymentRadio));
       }
     }

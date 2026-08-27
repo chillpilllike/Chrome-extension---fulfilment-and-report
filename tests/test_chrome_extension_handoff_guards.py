@@ -162,7 +162,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.146")
+        self.assertEqual(MANIFEST["version"], "0.1.147")
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
@@ -434,7 +434,33 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
     def test_business_payment_does_not_accept_card_text_while_still_on_pay_page(self) -> None:
         self.assertIn("function businessPaymentSelectionPageOpen()", CONTENT)
         self.assertIn("async function waitForBusinessPaymentTransition", CONTENT)
-        self.assertIn("Boolean(progress?.transitioned)", CONTENT)
+        self.assertIn("async function waitForSettledBusinessPaymentOutcome", CONTENT)
+        self.assertIn("Boolean(progress?.advanced)", CONTENT)
+
+    def test_business_payment_recovers_from_amazon_payment_method_bounce(self) -> None:
+        recovery_start = CONTENT.index("function businessPaymentSelectionErrorVisible()")
+        recovery_end = CONTENT.index("async function clickPaymentRadio", recovery_start)
+        recovery = CONTENT[recovery_start:recovery_end]
+        self.assertIn("select or add a payment method to continue", recovery)
+        self.assertIn("selectedNativePaymentInstrumentRadio()", recovery)
+        self.assertIn("bouncedBack: true", recovery)
+
+        payment_start = CONTENT.index("async function handlePaymentSelection(activeJob)")
+        payment_end = CONTENT.index("async function openPaymentSelectionIfAvailable", payment_start)
+        payment = CONTENT[payment_start:payment_end]
+        self.assertIn('accountExperience === "business"', payment)
+        self.assertIn("businessPaymentBounce", payment)
+        self.assertIn("await selectStableBusinessPaymentCard(payment.radio)", payment)
+        self.assertIn("alternatePaymentContinueButtons(continueButton)", payment)
+        self.assertIn("waitForSettledBusinessPaymentOutcome(cardPreferences, 12000)", payment)
+
+    def test_business_payment_bounce_recovery_does_not_change_consumer_progress_path(self) -> None:
+        payment_start = CONTENT.index("async function handlePaymentSelection(activeJob)")
+        payment_end = CONTENT.index("async function openPaymentSelectionIfAvailable", payment_start)
+        payment = CONTENT[payment_start:payment_end]
+        self.assertIn('accountExperience === "consumer" && !paymentRadioIsSelected(payment.radio)', payment)
+        self.assertIn("await waitForCheckoutPaymentProgress(cardPreferences, 4500, { stopOnTransition: true })", payment)
+        self.assertIn("await waitForCheckoutPaymentProgress(cardPreferences, 3500, { stopOnTransition: true })", payment)
 
     def test_payment_selection_must_remain_checked_after_amazon_rerender(self) -> None:
         self.assertIn("const clicked = await clickPaymentRadio(payment.radio);", CONTENT)
