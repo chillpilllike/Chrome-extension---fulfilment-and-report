@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v142";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v143";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5219,11 +5219,45 @@ async function selectBusinessCardFinancialOffer(radio) {
   // option and keeps the actual pay-in-full/rewards offer underneath it. An
   // empty financialOfferId makes /pay/continue report that no method exists.
   if (eligible.length !== 1) return false;
-  select.value = eligible[0].value;
+  const offer = eligible[0];
+  const offerText = normalizedText(offer.textContent || "");
+  const dropdownContainer = select.closest?.(".a-dropdown-container") || select.parentElement;
+  const dropdownButton = dropdownContainer?.querySelector?.(".a-button-dropdown, [data-action='a-dropdown-button']");
+
+  // The Business checkout now keeps payment selection in an AUI-owned model.
+  // Assigning the hidden native select alone looks correct in the DOM but is
+  // discarded when Continue submits. Select through Amazon's visible dropdown
+  // first so its own handler records the financial offer.
+  if (dropdownButton && visible(dropdownButton)) {
+    await clickElement(dropdownButton, "Business card payment option", { preClickDelayMs: 80, delayMs: 120 });
+    const visibleOffer = await waitUntil(() => {
+      const surfaces = [...document.querySelectorAll("[role='listbox'], .a-popover")].filter(visible);
+      for (const surface of surfaces) {
+        const candidates = [...surface.querySelectorAll("[role='option'], .a-dropdown-link, li.a-dropdown-item, a")];
+        const exact = candidates.find((candidate) => (
+          visible(candidate)
+          && normalizedText(candidate.innerText || candidate.textContent || "") === offerText
+        ));
+        if (exact) return exact.matches("a, button, [role='option']")
+          ? exact
+          : (exact.querySelector("a, button, [role='option']") || exact);
+      }
+      return false;
+    }, 1800, 80);
+    if (visibleOffer) {
+      await clickElement(visibleOffer, "Business card payment option value", { preClickDelayMs: 60, delayMs: 350 });
+      const auiSelected = await waitUntil(() => select.value === offer.value, 1600, 80);
+      if (auiSelected) return true;
+    }
+  }
+
+  // Keep compatibility with the older Business widget, where native select
+  // input/change events are sufficient and no visible AUI menu is rendered.
+  select.value = offer.value;
   select.dispatchEvent(new Event("input", { bubbles: true }));
   select.dispatchEvent(new Event("change", { bubbles: true }));
   await sleep(500);
-  return select.value === eligible[0].value;
+  return select.value === offer.value;
 }
 
 function businessPaymentWidgetBusy() {
