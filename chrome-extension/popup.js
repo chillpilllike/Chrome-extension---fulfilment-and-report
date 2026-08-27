@@ -7,6 +7,7 @@ const fulfilAvailableMixedAsin = document.querySelector("#fulfilAvailableMixedAs
 const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
 const autoOrderingConfirmed = document.querySelector("#autoOrderingConfirmed");
 const autoOrderingToggle = document.querySelector("#autoOrderingToggle");
+const startNext = document.querySelector("#startNext");
 const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
 const pauseBeforePlaceOrder = document.querySelector("#pauseBeforePlaceOrder");
 const preferRewardedLaterDelivery = document.querySelector("#preferRewardedLaterDelivery");
@@ -420,6 +421,8 @@ async function refresh() {
     autoOrderingToggle.disabled = !autoOrderingRunning && !autoOrderingConfirmed.checked;
     autoOrderingConfirmed.disabled = autoOrderingRunning;
     pauseResume.textContent = state.activeJob?.paused ? "Resume" : "Pause";
+    startNext.textContent = state.manualQueueRunning === true ? "Processing queued orders" : "Process queued orders";
+    startNext.disabled = Boolean(job) || state.manualQueueRunning === true || autoOrderingRunning;
     updateModeNotice();
     pauseResume.disabled = !job;
     skipJob.disabled = !job;
@@ -544,6 +547,27 @@ autoOrderingToggle.addEventListener("click", async () => {
     const latest = await send({ type: "GET_STATE" }).catch(() => ({}));
     const running = latest?.autoOrderingRunning === true;
     autoOrderingToggle.disabled = !running && !autoOrderingConfirmed.checked;
+  }
+});
+
+startNext.addEventListener("click", async () => {
+  startNext.disabled = true;
+  setStatus("Starting the currently available compatible queue...");
+  try {
+    await send({ type: "SET_API_BASE", ...settingsPayload() });
+    settingsDirty = false;
+    const result = await send({ type: "START_NEXT" });
+    if (result.targetWindowId) {
+      targetWindowId = result.targetWindowId;
+      registerControlWindow();
+    }
+    setStatus(result.message || (result.ok ? "Processing queued orders." : "Could not start queued orders."));
+    await refresh();
+  } catch (error) {
+    setStatus(error.message || "Could not start queued orders.");
+  } finally {
+    const latest = await send({ type: "GET_STATE" }).catch(() => ({}));
+    startNext.disabled = Boolean(latest?.activeJob?.job) || latest?.manualQueueRunning === true || latest?.autoOrderingRunning === true;
   }
 });
 

@@ -35,8 +35,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('chrome.storage.session.get({ autoOrderingRunning: false })', BACKGROUND)
         self.assertIn('setAutoOrderingRunning(false)', BACKGROUND)
         self.assertIn('if (!await autoOrderingIsRunning())', BACKGROUND)
-        self.assertIn('if (activeJob && !orderSubmitStarted(activeJob) && !await autoOrderingIsRunning())', BACKGROUND)
-        self.assertIn('if (!await autoOrderingIsRunning() && !orderSubmitStarted(activeJob))', BACKGROUND)
+        self.assertIn('if (!await autoOrderingIsRunning() || await forceStopActive() || await activeOrderingInProgress()) return;', BACKGROUND)
         self.assertIn('await activeOrderingInProgress()', BACKGROUND)
         self.assertIn('await startNextJob(null, { automatic: true })', BACKGROUND)
         self.assertNotIn('autoOrderQueue: true', BACKGROUND)
@@ -162,7 +161,35 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.148")
+        self.assertEqual(MANIFEST["version"], "0.1.149")
+
+    def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
+        self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
+        self.assertIn("async function setManualQueueRunning(running)", BACKGROUND)
+        self.assertIn("async function visibleQueueRunIsEnabled()", BACKGROUND)
+        self.assertIn("async function startManualQueueRun(windowId)", BACKGROUND)
+        self.assertIn('if (message.type === "START_NEXT") return startManualQueueRun(windowId);', BACKGROUND)
+        self.assertIn('id="startNext"', POPUP_HTML)
+        self.assertIn('startNext.addEventListener("click"', POPUP_JS)
+
+    def test_resume_persists_and_reinjects_when_auto_ordering_is_off(self) -> None:
+        setter_start = BACKGROUND.index("async function setWindowJob(windowId, activeJob")
+        setter_end = BACKGROUND.index("async function clearStoredJobGroup", setter_start)
+        setter = BACKGROUND[setter_start:setter_end]
+        self.assertIn("continuingStoredJob", setter)
+        self.assertIn("!await visibleQueueRunIsEnabled()", setter)
+
+        resume_start = BACKGROUND.index("async function togglePause(windowId)")
+        resume_end = BACKGROUND.index("async function completeJob", resume_start)
+        resume = BACKGROUND[resume_start:resume_end]
+        self.assertIn("if (!nextPaused && !await autoOrderingIsRunning())", resume)
+        self.assertIn("await setManualQueueRunning(true);", resume)
+        self.assertIn("await injectActiveAmazonTabInWindow(windowId);", resume)
+
+        get_active_start = BACKGROUND.index('if (message.type === "GET_ACTIVE_JOB")')
+        get_active_end = BACKGROUND.index('if (message.type === "HEARTBEAT_JOB")', get_active_start)
+        get_active = BACKGROUND[get_active_start:get_active_end]
+        self.assertNotIn("autoOrderingStopped: true", get_active)
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)

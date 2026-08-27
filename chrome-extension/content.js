@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-widget-settle-v139";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-manual-queue-resume-v140";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
