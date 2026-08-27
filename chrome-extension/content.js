@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v150";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-runtime-recovery-v151";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {

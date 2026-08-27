@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.159")
+        self.assertEqual(MANIFEST["version"], "0.1.160")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -944,10 +944,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
 
     def test_active_job_heartbeat_reports_pauses_every_minute(self) -> None:
         self.assertIn("const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;", BACKGROUND)
+        self.assertIn("async function heartbeatStoredActiveJobs", BACKGROUND)
+        self.assertIn("await heartbeatStoredActiveJobs(label);", BACKGROUND)
         self.assertIn("paused: activeJob.paused === true", BACKGROUND)
         self.assertIn('paused_stage: activeJob.pausedStage || ""', BACKGROUND)
         self.assertIn('last_error: activeJob.lastError || activeJob.pauseReason || ""', BACKGROUND)
         self.assertIn("activeJob.lastError = String(error.message", CONTENT)
+
+    def test_extension_reload_refreshes_dead_control_windows(self) -> None:
+        self.assertIn("async function reloadStoredControlWindows", BACKGROUND)
+        self.assertIn('params.set("runtimeRecovery", recoveryToken)', BACKGROUND)
+        self.assertIn("await reloadStoredControlWindows(label);", BACKGROUND)
 
     def test_cart_parser_supports_current_amazon_markup(self) -> None:
         roots_start = CONTENT.index("function cartActiveRoots()")

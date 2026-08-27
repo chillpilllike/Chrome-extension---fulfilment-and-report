@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v150";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-business-runtime-recovery-v151";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -916,9 +916,13 @@ async function refreshActiveJobFromQueue(windowId, force = false) {
 
 async function openControlWindow(tab) {
   const targetWindowId = tab?.windowId || null;
-  const popupUrl = chrome.runtime.getURL(`popup.html${targetWindowId ? `?targetWindowId=${targetWindowId}` : ""}`);
+  const popupUrl = controlPopupUrl(targetWindowId);
   const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["popup", "normal"] });
-  const existingTab = windows.flatMap((item) => item.tabs || []).find((tab) => tab.url === popupUrl);
+  const existingTab = windows.flatMap((item) => item.tabs || []).find((candidate) => {
+    if (!candidate.url?.startsWith(chrome.runtime.getURL("popup.html"))) return false;
+    const candidateTarget = Number(new URL(candidate.url).searchParams.get("targetWindowId") || 0) || null;
+    return candidateTarget === targetWindowId;
+  });
   if (existingTab?.id && existingTab.windowId) {
     await setControlWindow(existingTab.windowId, targetWindowId);
     await chrome.windows.update(existingTab.windowId, { focused: true });
@@ -933,6 +937,30 @@ async function openControlWindow(tab) {
     focused: true,
   });
   await setControlWindow(controlWindow?.id, targetWindowId);
+}
+
+function controlPopupUrl(targetWindowId, recoveryToken = "") {
+  const params = new URLSearchParams();
+  if (targetWindowId) params.set("targetWindowId", String(targetWindowId));
+  if (recoveryToken) params.set("runtimeRecovery", recoveryToken);
+  const query = params.toString();
+  return chrome.runtime.getURL(`popup.html${query ? `?${query}` : ""}`);
+}
+
+async function reloadStoredControlWindows(label = "extension restart") {
+  const { controlWindowsById } = await getSettings();
+  let recovered = 0;
+  for (const [controlWindowId, targetWindowId] of Object.entries(controlWindowsById || {})) {
+    const windowInfo = await chrome.windows.get(Number(controlWindowId), { populate: true }).catch(() => null);
+    const popupTab = (windowInfo?.tabs || []).find((tab) => tab.url?.startsWith(chrome.runtime.getURL("popup.html")));
+    if (!popupTab?.id) continue;
+    await chrome.tabs.update(popupTab.id, {
+      url: controlPopupUrl(Number(targetWindowId || 0) || null, String(Date.now())),
+    }).catch(() => null);
+    recovered += 1;
+  }
+  if (recovered) await log(`Reloaded ${recovered} control window(s) after ${label}.`);
+  return recovered;
 }
 
 function activeJobFor(job, workerId, targetWindowId) {
@@ -2453,6 +2481,7 @@ async function runFulfilmentWatchdog(label = "scheduled watchdog") {
     return { ok: true, stopped: true, auto_ordering_stopped: true };
   }
 
+  await heartbeatStoredActiveJobs(label);
   await releaseMissingWindowJobs({ force: true });
   await ensureStoredActiveJobContentScripts(label);
 
@@ -2493,7 +2522,9 @@ async function recoverAfterRuntimeRestart(label = "extension restart", releasePr
   runtimeRecoveryInFlight = (async () => {
     if (await forceStopActive()) return { ok: true, stopped: true };
 
+    await reloadStoredControlWindows(label);
     await reattachStoredJobsToRestoredWindows(label);
+    await heartbeatStoredActiveJobs(label);
     if (releasePreviousSessionJobs) {
       // Chrome may restore the exact checkout under a new window/tab ID. The
       // reattachment above preserves that matched checkout; release only jobs
@@ -2592,6 +2623,23 @@ async function heartbeatJob(activeJob, windowId) {
   });
   activeJob.lastHeartbeatAt = Date.now();
   await setWindowJob(windowId, activeJob);
+}
+
+async function heartbeatStoredActiveJobs(label = "background watchdog") {
+  const state = await getSettings();
+  const activeJobs = [state.activeJob, ...Object.values(state.activeJobsByWindow || {})]
+    .filter((job, index, jobs) => job?.job?.group_key && jobs.findIndex((candidate) => (
+      candidate?.job?.group_key === job.job.group_key
+    )) === index);
+  for (const activeJob of activeJobs) {
+    const windowId = Number(activeJob.targetWindowId || 0) || null;
+    try {
+      await heartbeatJob(activeJob, windowId);
+    } catch (error) {
+      await log(`Could not preserve ${activeJob.job.group_key} lock during ${label}: ${error.message}`, windowId);
+    }
+  }
+  return activeJobs.length;
 }
 
 async function togglePause(windowId) {
