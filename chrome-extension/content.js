@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-runtime-recovery-v151";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-cart-count-v152";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -1979,11 +1979,52 @@ function smartWagonAddedCartState(activeJob, expected) {
   };
 }
 
+function businessCartCountEvidence(activeJob, expected) {
+  const isBusiness = (
+    activeJob?.amazonAccountExperience === "business"
+    || activeJob?.job?.required_account_experience === "business"
+    || amazonAccountExperience() === "business"
+  );
+  if (!isBusiness || activeJob?.cartCleared !== true || !itemWasAdded(activeJob)) return null;
+
+  const expectedEntries = Object.entries(expected || {});
+  if (expectedEntries.length !== 1 || !cartActiveRoots().length || cartIsVisiblyEmpty()) return null;
+
+  const expectedTotal = Number(expectedEntries[0][1] || 0);
+  const bodyText = (document.body?.innerText || document.body?.textContent || "").replace(/\s+/g, " ");
+  const checkoutButton = findButtonByText(["proceed to checkout", "check out amazon cart"]);
+  const buttonText = (
+    checkoutButton?.value
+    || checkoutButton?.title
+    || checkoutButton?.getAttribute?.("aria-label")
+    || checkoutButton?.innerText
+    || checkoutButton?.textContent
+    || ""
+  ).replace(/\s+/g, " ");
+  const countMatch =
+    buttonText.match(/\((\d+)\s+items?\)/i)
+    || bodyText.match(/cart\s+subtotal\s*:?\s*\$?[\d,.]+\s*\((\d+)\s+items?\)/i)
+    || bodyText.match(/subtotal\s*\((\d+)\s+items?\)/i)
+    || bodyText.match(/\((\d+)\s+items?\)\s*subtotal/i);
+  const cartCount = countMatch ? Number(countMatch[1]) : null;
+  if (!Number.isFinite(cartCount) || cartCount !== expectedTotal) return null;
+
+  return {
+    ok: true,
+    exact: false,
+    warning: `Amazon Business cart row markup is unreadable, but the freshly cleared cart subtotal verifies exactly ${cartCount} expected item(s). Proceeding with checkout quantity safeguards active.`,
+  };
+}
+
 function verifyCartQuantities(activeJob) {
   const activeCart = cartActiveRoots()[0] || null;
   const expected = expectedCartQuantities(activeJob);
   if (!Object.keys(expected).length) return { ok: true, exact: false };
   const items = cartActiveItems();
+  if (activeCart && !items.length) {
+    const businessCount = businessCartCountEvidence(activeJob, expected);
+    if (businessCount) return businessCount;
+  }
   if ((!activeCart || !visible(activeCart)) && !items.length) {
     const smartWagon = smartWagonAddedCartState(activeJob, expected);
     if (smartWagon) return smartWagon;

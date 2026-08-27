@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.160")
+        self.assertEqual(MANIFEST["version"], "0.1.161")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -968,6 +968,16 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('node.getAttribute("data-csa-c-asin")', parser)
         self.assertIn("gp\\/aw\\/d", parser)
         self.assertIn("product-reviews", parser)
+
+    def test_business_cart_count_fallback_is_narrow_and_safe(self) -> None:
+        start = CONTENT.index("function businessCartCountEvidence")
+        end = CONTENT.index("function verifyCartQuantities", start)
+        fallback = CONTENT[start:end]
+        self.assertIn('activeJob?.amazonAccountExperience === "business"', fallback)
+        self.assertIn("activeJob?.cartCleared !== true", fallback)
+        self.assertIn("!itemWasAdded(activeJob)", fallback)
+        self.assertIn("expectedEntries.length !== 1", fallback)
+        self.assertIn("cartCount !== expectedTotal", fallback)
 
     def test_cart_verification_error_carries_detected_rows(self) -> None:
         self.assertGreaterEqual(CONTENT.count("${cartDiagnosticSummary()}"), 3)
