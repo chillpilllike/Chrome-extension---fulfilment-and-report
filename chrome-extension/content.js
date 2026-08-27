@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v147";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v148";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5177,14 +5177,11 @@ function businessCardPaymentRadio(preferences = []) {
 function businessCardIsNativePaymentInstrument(digits) {
   if (!digits) return false;
   const selected = selectedNativePaymentInstrumentRadio();
-  const formValue = selected?.form
-    ? new FormData(selected.form).get("ppw-instrumentRowSelection")
-    : null;
   return Boolean(
     selected
     && cardDigitsForPaymentRadio(selected) === digits
     && paymentRadioForDigits(digits)?.checked === true
-    && formValue === selected.value
+    && new URLSearchParams(selected.value).get("paymentMethod") === "CC"
   );
 }
 
