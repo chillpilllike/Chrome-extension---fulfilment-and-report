@@ -8893,6 +8893,8 @@ def preserved_order_line_refresh_state(preserved: Optional[dict[str, Any]]) -> t
         return "missing", last_error
     if state == "error" or amazon_status == "chrome_error":
         return "error", last_error
+    if state == "costly" or amazon_status == "cost_review":
+        return "costly", last_error
     if amazon_group_key and amazon_status in {"chrome_queued", "back_in_stock", "order_submitted", "reporting_complete"}:
         return "submitted", last_error
     if amazon_group_key and state == "submitted":
