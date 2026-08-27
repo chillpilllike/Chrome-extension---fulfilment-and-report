@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v144";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v145";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -7051,7 +7051,7 @@ async function handlePaymentSelection(activeJob) {
       await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
-    const currentPreferredRadio = paymentRadioForDigits(selectedDigits);
+    let currentPreferredRadio = paymentRadioForDigits(selectedDigits);
     if (cardPreferences.length && (!currentPreferredRadio || !paymentRadioIsSelected(currentPreferredRadio))) {
       await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
@@ -7072,8 +7072,20 @@ async function handlePaymentSelection(activeJob) {
         await pauseForManualCheckout(activeJob, `Amazon Business had not finished retaining card ending in ${selectedDigits || cardPreferences.join(" or ")} before Continue.`);
         return true;
       }
+      // Amazon can replace the payment form after the stable-card wait. That
+      // replacement preserves the checked card visually but drops the AUI
+      // financial-offer submit event, causing Continue to reset to Points.
+      // Reapply and verify the offer on the final live form immediately before
+      // resolving/clicking its primary Continue control.
+      currentPreferredRadio = paymentRadioForDigits(selectedDigits);
+      if (!currentPreferredRadio || !await selectBusinessCardFinancialOffer(currentPreferredRadio)) {
+        await pauseForManualCheckout(activeJob, `Amazon Business did not retain the payment option for card ending in ${selectedDigits || cardPreferences.join(" or ")}.`);
+        return true;
+      }
+      payment = findAccountPaymentSelection();
     }
-    await clickElement(continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
+    const finalContinueButton = nativePaymentContinueControl(payment?.continueButton) || continueButton;
+    await clickElement(finalContinueButton, "Use this payment method button", { preClickDelayMs: 20, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
     let progress = accountExperience === "business"
       ? await waitForSettledBusinessPaymentOutcome(cardPreferences, 12000)

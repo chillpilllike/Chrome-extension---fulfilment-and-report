@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.153")
+        self.assertEqual(MANIFEST["version"], "0.1.154")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -559,6 +559,8 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         payment_end = CONTENT.index("async function openPaymentSelectionIfAvailable", payment_start)
         payment = CONTENT[payment_start:payment_end]
         self.assertIn('accountExperience === "business"', payment)
+        self.assertGreaterEqual(payment.count("await selectBusinessCardFinancialOffer(currentPreferredRadio)"), 1)
+        self.assertIn("const finalContinueButton = nativePaymentContinueControl(payment?.continueButton) || continueButton", payment)
         self.assertIn('accountExperience === "consumer" && !paymentRadioIsSelected(payment.radio)', payment)
         self.assertIn("await clickPaymentRadio(payment.radio)", payment)
 
