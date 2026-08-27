@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.150")
+        self.assertEqual(MANIFEST["version"], "0.1.151")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -537,6 +537,27 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("const continueButton = visiblePaymentContinueButtons()[0];", selection)
         self.assertIn("return { radio, continueButton }", selection)
         self.assertNotIn("textContinue", selection)
+
+    def test_business_payment_supports_portal_card_and_financial_offer_without_changing_consumer(self) -> None:
+        self.assertIn("async function clickBusinessPaymentCard(radio)", CONTENT)
+        self.assertIn('businessCardContainer(current)', CONTENT)
+        self.assertIn('new FormData(selected.form).get("ppw-instrumentRowSelection")', CONTENT)
+        self.assertIn("async function selectBusinessCardFinancialOffer(radio)", CONTENT)
+        self.assertIn("select[name$='_financialOfferId']", CONTENT)
+        self.assertIn('select.dispatchEvent(new Event("change", { bubbles: true }))', CONTENT)
+
+        stable_start = CONTENT.index("async function selectStableBusinessPaymentCard(radio)")
+        stable_end = CONTENT.index("function businessPaymentSelectionPageOpen", stable_start)
+        stable = CONTENT[stable_start:stable_end]
+        self.assertIn("await clickBusinessPaymentCard(current)", stable)
+        self.assertIn("await selectBusinessCardFinancialOffer(stable)", stable)
+
+        payment_start = CONTENT.index("async function handlePaymentSelection(activeJob)")
+        payment_end = CONTENT.index("async function openPaymentSelectionIfAvailable", payment_start)
+        payment = CONTENT[payment_start:payment_end]
+        self.assertIn('accountExperience === "business"', payment)
+        self.assertIn('accountExperience === "consumer" && !paymentRadioIsSelected(payment.radio)', payment)
+        self.assertIn("await clickPaymentRadio(payment.radio)", payment)
 
     def test_final_review_waits_for_preferred_card_summary_evidence(self) -> None:
         ensure_start = CONTENT.index("async function ensurePreferredCheckoutPayment(activeJob)")

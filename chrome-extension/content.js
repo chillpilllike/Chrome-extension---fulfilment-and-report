@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-orphan-checkout-recovery-v141";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v142";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5173,11 +5173,57 @@ function businessCardPaymentRadio(preferences = []) {
 function businessCardIsNativePaymentInstrument(digits) {
   if (!digits) return false;
   const selected = selectedNativePaymentInstrumentRadio();
+  const formValue = selected?.form
+    ? new FormData(selected.form).get("ppw-instrumentRowSelection")
+    : null;
   return Boolean(
     selected
     && cardDigitsForPaymentRadio(selected) === digits
     && paymentRadioForDigits(digits)?.checked === true
+    && formValue === selected.value
   );
+}
+
+function businessCardContainer(radio) {
+  return radio?.closest?.(".pmts-credit-card-row")?.querySelector?.(".pmts-instrument-box")
+    || radio?.closest?.(".pmts-instrument-box")
+    || null;
+}
+
+async function clickBusinessPaymentCard(radio) {
+  const digits = cardDigitsForPaymentRadio(radio);
+  if (!digits) return false;
+  // Preserve the proven native radio/label path first. Newer Business pay
+  // portals additionally bind state to the outer instrument card, so click
+  // that surface as a Business-only fallback before accepting the selection.
+  await clickPaymentRadio(radio);
+  let current = paymentRadioForDigits(digits) || radio;
+  const card = businessCardContainer(current);
+  if (card) {
+    await clickElement(card, "Business payment instrument card", { preClickDelayMs: 80, delayMs: 180 });
+    current = paymentRadioForDigits(digits) || current;
+  }
+  return waitUntil(() => businessCardIsNativePaymentInstrument(digits) ? (paymentRadioForDigits(digits) || current) : false, 2200, 100);
+}
+
+async function selectBusinessCardFinancialOffer(radio) {
+  const row = radio?.closest?.(".pmts-credit-card-row");
+  const select = row?.querySelector?.("select[name$='_financialOfferId']");
+  if (!select || select.disabled || select.value) return true;
+  const eligible = [...select.options].filter((option) => (
+    !option.disabled
+    && option.value
+    && !/(?:monthly|installment|pay over time|financing|payment plan)/i.test(option.textContent || "")
+  ));
+  // Amazon's new Business card widget exposes a placeholder as the selected
+  // option and keeps the actual pay-in-full/rewards offer underneath it. An
+  // empty financialOfferId makes /pay/continue report that no method exists.
+  if (eligible.length !== 1) return false;
+  select.value = eligible[0].value;
+  select.dispatchEvent(new Event("input", { bubbles: true }));
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  await sleep(500);
+  return select.value === eligible[0].value;
 }
 
 function businessPaymentWidgetBusy() {
@@ -5210,10 +5256,13 @@ async function selectStableBusinessPaymentCard(radio) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const current = paymentRadioForDigits(digits) || radio;
     if (!businessCardIsNativePaymentInstrument(digits)) {
-      await clickPaymentRadio(current);
+      await clickBusinessPaymentCard(current);
     }
     const stable = await waitForStableBusinessCardSelection(digits);
-    if (stable) return stable;
+    if (stable && await selectBusinessCardFinancialOffer(stable)) {
+      const retained = await waitForStableBusinessCardSelection(digits, 5000, 1200);
+      if (retained) return retained;
+    }
   }
   return false;
 }
