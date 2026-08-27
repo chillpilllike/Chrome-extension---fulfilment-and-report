@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.158")
+        self.assertEqual(MANIFEST["version"], "0.1.159")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -547,7 +547,9 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn("businessPaymentCardRows().slice", CONTENT)
         self.assertIn("delayMs: 1000", CONTENT)
         self.assertNotIn("function businessCardContainer(radio)", CONTENT)
-        self.assertIn('new URLSearchParams(selected.value).get("paymentMethod") === "CC"', CONTENT)
+        self.assertIn("function businessPaymentCardRowIsSelected(card)", CONTENT)
+        self.assertIn('card.row.classList.contains("pmts-selected")', CONTENT)
+        self.assertIn('new URLSearchParams(selected.radio.value).get("paymentMethod") === "CC"', CONTENT)
         self.assertNotIn('new FormData(selected.form).get("ppw-instrumentRowSelection")', CONTENT)
         self.assertIn("async function selectBusinessCardFinancialOffer(radio)", CONTENT)
         self.assertIn("select[name$='_financialOfferId']", CONTENT)

@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v149";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v150";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5176,6 +5176,14 @@ function businessPaymentCardRowForDigits(digits) {
   )) || null;
 }
 
+function businessPaymentCardRowIsSelected(card) {
+  if (!card?.row || !card?.radio) return false;
+  return card.radio.checked === true
+    || card.row.classList.contains("pmts-selected")
+    || card.row.getAttribute("aria-selected") === "true"
+    || Boolean(card.row.querySelector("[aria-checked='true'], .a-radio-selected, .a-button-selected"));
+}
+
 function businessCardPaymentRadio(preferences = []) {
   const cardRows = businessPaymentCardRows();
   const cardRadios = cardRows.map(({ radio }) => radio);
@@ -5189,14 +5197,11 @@ function businessCardPaymentRadio(preferences = []) {
 
 function businessCardIsNativePaymentInstrument(digits) {
   if (!digits) return false;
-  const selected = businessPaymentCardRows()
-    .map(({ radio }) => radio)
-    .find((radio) => radio.checked);
+  const selected = businessPaymentCardRowForDigits(digits);
   return Boolean(
     selected
-    && cardDigitsForPaymentRadio(selected) === digits
-    && businessPaymentCardRowForDigits(digits)?.radio.checked === true
-    && new URLSearchParams(selected.value).get("paymentMethod") === "CC"
+    && businessPaymentCardRowIsSelected(selected)
+    && new URLSearchParams(selected.radio.value).get("paymentMethod") === "CC"
   );
 }
 
@@ -5288,7 +5293,7 @@ async function waitForStableBusinessCardSelection(digits, timeout = 5000, stable
   while (Date.now() < deadline) {
     if (businessCardIsNativePaymentInstrument(digits) && !businessPaymentWidgetBusy()) {
       if (!selectedSince) selectedSince = Date.now();
-      if (Date.now() - selectedSince >= stableMs) return paymentRadioForDigits(digits);
+      if (Date.now() - selectedSince >= stableMs) return businessPaymentCardRowForDigits(digits)?.radio || false;
     } else {
       selectedSince = 0;
     }
@@ -7049,8 +7054,13 @@ async function handlePaymentSelection(activeJob) {
       await pauseForManualCheckout(activeJob, `Could not find preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
-    let currentPreferredRadio = paymentRadioForDigits(selectedDigits);
-    if (cardPreferences.length && (!currentPreferredRadio || !paymentRadioIsSelected(currentPreferredRadio))) {
+    let currentPreferredRadio = accountExperience === "business"
+      ? businessPaymentCardRowForDigits(selectedDigits)?.radio
+      : paymentRadioForDigits(selectedDigits);
+    const currentPreferredSelected = accountExperience === "business"
+      ? businessCardIsNativePaymentInstrument(selectedDigits)
+      : paymentRadioIsSelected(currentPreferredRadio);
+    if (cardPreferences.length && (!currentPreferredRadio || !currentPreferredSelected)) {
       await pauseForManualCheckout(activeJob, `Could not select preferred card ending in ${cardPreferences.join(" or ")}.`);
       return true;
     }
