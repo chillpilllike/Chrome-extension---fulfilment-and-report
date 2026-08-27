@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-bounce-v138";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-widget-settle-v139";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5180,11 +5180,20 @@ function businessCardIsNativePaymentInstrument(digits) {
   );
 }
 
-async function waitForStableBusinessCardSelection(digits, timeout = 4500, stableMs = 1000) {
+function businessPaymentWidgetBusy() {
+  const paymentForm = document.querySelector("form.pmts-select-payment-instrument-form");
+  if (!paymentForm) return false;
+  if (paymentForm.getAttribute("aria-busy") === "true") return true;
+  return [...paymentForm.querySelectorAll(
+    "[aria-busy='true'], .a-spinner, .a-loading, .a-spinner-wrapper, [data-loading='true']",
+  )].some(visible);
+}
+
+async function waitForStableBusinessCardSelection(digits, timeout = 9000, stableMs = 3500) {
   const deadline = Date.now() + timeout;
   let selectedSince = 0;
   while (Date.now() < deadline) {
-    if (businessCardIsNativePaymentInstrument(digits)) {
+    if (businessCardIsNativePaymentInstrument(digits) && !businessPaymentWidgetBusy()) {
       if (!selectedSince) selectedSince = Date.now();
       if (Date.now() - selectedSince >= stableMs) return paymentRadioForDigits(digits);
     } else {
@@ -6959,6 +6968,13 @@ async function handlePaymentSelection(activeJob) {
       await pauseForManualCheckout(activeJob, `Amazon Business replaced card ending in ${selectedDigits || cardPreferences.join(" or ")} with another payment instrument before Continue.`);
       return true;
     }
+    if (accountExperience === "business") {
+      await sleep(500);
+      if (businessPaymentWidgetBusy() || !businessCardIsNativePaymentInstrument(selectedDigits)) {
+        await pauseForManualCheckout(activeJob, `Amazon Business had not finished retaining card ending in ${selectedDigits || cardPreferences.join(" or ")} before Continue.`);
+        return true;
+      }
+    }
     await clickElement(continueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
     let progress = accountExperience === "business"
@@ -7750,8 +7766,8 @@ async function handleCheckout(activeJob) {
   let handledPayment = false;
   if (findPaymentRadio()) {
     handledPayment = await handlePaymentSelection(activeJob);
-    if (handledPayment) {
-      showPanel("Nutricity checkout", "Payment confirmed. Changing address after payment.", null, null);
+    if (handledPayment && !activeJob.paused && !businessPaymentSelectionPageOpen()) {
+      showPanel("Nutricity checkout", "Payment accepted. Continuing checkout.", null, null);
     }
     if (activeJob.paused) return;
   }

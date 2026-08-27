@@ -162,7 +162,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.147")
+        self.assertEqual(MANIFEST["version"], "0.1.148")
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
@@ -415,6 +415,9 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("function businessCardIsNativePaymentInstrument(digits)", CONTENT)
         self.assertIn("selectedNativePaymentInstrumentRadio()", CONTENT)
         self.assertIn("async function waitForStableBusinessCardSelection", CONTENT)
+        self.assertIn("function businessPaymentWidgetBusy()", CONTENT)
+        self.assertIn("stableMs = 3500", CONTENT)
+        self.assertIn("!businessPaymentWidgetBusy()", CONTENT)
         self.assertIn("await selectStableBusinessPaymentCard(payment.radio)", CONTENT)
         self.assertIn('accountExperience === "business"', CONTENT)
 
@@ -461,6 +464,23 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('accountExperience === "consumer" && !paymentRadioIsSelected(payment.radio)', payment)
         self.assertIn("await waitForCheckoutPaymentProgress(cardPreferences, 4500, { stopOnTransition: true })", payment)
         self.assertIn("await waitForCheckoutPaymentProgress(cardPreferences, 3500, { stopOnTransition: true })", payment)
+
+    def test_business_payment_is_revalidated_after_widget_settles_before_continue(self) -> None:
+        payment_start = CONTENT.index("async function handlePaymentSelection(activeJob)")
+        payment_end = CONTENT.index("async function openPaymentSelectionIfAvailable", payment_start)
+        payment = CONTENT[payment_start:payment_end]
+        self.assertIn('if (accountExperience === "business") {', payment)
+        self.assertIn("await sleep(500);", payment)
+        self.assertIn("businessPaymentWidgetBusy() || !businessCardIsNativePaymentInstrument(selectedDigits)", payment)
+        self.assertIn("had not finished retaining card ending in", payment)
+
+    def test_checkout_does_not_claim_business_payment_confirmed_after_a_bounce(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        self.assertIn("handledPayment && !activeJob.paused && !businessPaymentSelectionPageOpen()", checkout)
+        self.assertIn("Payment accepted. Continuing checkout.", checkout)
+        self.assertNotIn("Payment confirmed. Changing address after payment.", checkout)
 
     def test_payment_selection_must_remain_checked_after_amazon_rerender(self) -> None:
         self.assertIn("const clicked = await clickPaymentRadio(payment.radio);", CONTENT)
