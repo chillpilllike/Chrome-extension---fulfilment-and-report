@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v148";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v149";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5159,28 +5159,43 @@ function selectedNativePaymentInstrumentRadio() {
     .find((radio) => !radio.disabled && radio.checked) || null;
 }
 
+function businessPaymentCardRows() {
+  return [...document.querySelectorAll(".pmts-portal-component .pmts-credit-card-row")]
+    .map((row) => ({
+      row,
+      number: row.querySelector(".pmts-cc-number[data-number]"),
+      radio: row.querySelector("input[type='radio'][name='ppw-instrumentRowSelection']"),
+    }))
+    .filter(({ number, radio }) => number && radio && !radio.disabled);
+}
+
+function businessPaymentCardRowForDigits(digits) {
+  if (!digits) return null;
+  return businessPaymentCardRows().find(({ number }) => (
+    String(number.getAttribute("data-number") || "").replace(/\D/g, "").slice(-4) === digits
+  )) || null;
+}
+
 function businessCardPaymentRadio(preferences = []) {
-  const cardRadios = [...document.querySelectorAll("input[type='radio'][name='ppw-instrumentRowSelection']")]
-    .filter((radio) => !radio.disabled && cardDigitsForPaymentRadio(radio));
+  const cardRows = businessPaymentCardRows();
+  const cardRadios = cardRows.map(({ radio }) => radio);
   if (!cardRadios.length) return null;
   for (const preferred of preferences) {
-    const exactRow = [...document.querySelectorAll(".pmts-credit-card-row")].find((row) => (
-      row.querySelector(`.pmts-cc-number[data-number='${CSS.escape(preferred)}']`)
-    ));
-    const exact = exactRow?.querySelector("input[type='radio'][name='ppw-instrumentRowSelection']")
-      || cardRadios.find((radio) => cardDigitsForPaymentRadio(radio) === preferred);
-    if (exact) return exact;
+    const exact = businessPaymentCardRowForDigits(preferred);
+    if (exact) return exact.radio;
   }
   return cardRadios.find((radio) => radio.checked) || cardRadios[0];
 }
 
 function businessCardIsNativePaymentInstrument(digits) {
   if (!digits) return false;
-  const selected = selectedNativePaymentInstrumentRadio();
+  const selected = businessPaymentCardRows()
+    .map(({ radio }) => radio)
+    .find((radio) => radio.checked);
   return Boolean(
     selected
     && cardDigitsForPaymentRadio(selected) === digits
-    && paymentRadioForDigits(digits)?.checked === true
+    && businessPaymentCardRowForDigits(digits)?.radio.checked === true
     && new URLSearchParams(selected.value).get("paymentMethod") === "CC"
   );
 }
@@ -5188,10 +5203,8 @@ function businessCardIsNativePaymentInstrument(digits) {
 async function clickBusinessPaymentCard(radio) {
   const digits = cardDigitsForPaymentRadio(radio);
   if (!digits) return false;
-  const row = [...document.querySelectorAll(".pmts-credit-card-row")].find((candidate) => (
-    candidate.querySelector(`.pmts-cc-number[data-number='${CSS.escape(digits)}']`)
-  ));
-  const nativeRadio = row?.querySelector("input[type='radio'][name='ppw-instrumentRowSelection']")
+  const card = businessPaymentCardRowForDigits(digits);
+  const nativeRadio = card?.radio
     || paymentRadioForDigits(digits)
     || radio;
   // Amazon's Business widget owns the radio's state. Click the exact native

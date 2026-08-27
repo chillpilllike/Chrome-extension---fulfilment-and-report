@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.157")
+        self.assertEqual(MANIFEST["version"], "0.1.158")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -540,7 +540,11 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
 
     def test_business_payment_supports_portal_card_and_financial_offer_without_changing_consumer(self) -> None:
         self.assertIn("async function clickBusinessPaymentCard(radio)", CONTENT)
-        self.assertIn(".pmts-cc-number[data-number=", CONTENT)
+        self.assertIn("function businessPaymentCardRows()", CONTENT)
+        self.assertIn('document.querySelectorAll(".pmts-portal-component .pmts-credit-card-row")', CONTENT)
+        self.assertIn('row.querySelector(".pmts-cc-number[data-number]")', CONTENT)
+        self.assertIn("function businessPaymentCardRowForDigits(digits)", CONTENT)
+        self.assertNotIn("businessPaymentCardRows().slice", CONTENT)
         self.assertIn("delayMs: 1000", CONTENT)
         self.assertNotIn("function businessCardContainer(radio)", CONTENT)
         self.assertIn('new URLSearchParams(selected.value).get("paymentMethod") === "CC"', CONTENT)
