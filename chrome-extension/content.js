@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v143";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v144";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5209,7 +5209,22 @@ async function clickBusinessPaymentCard(radio) {
 async function selectBusinessCardFinancialOffer(radio) {
   const row = radio?.closest?.(".pmts-credit-card-row");
   const select = row?.querySelector?.("select[name$='_financialOfferId']");
-  if (!select || select.disabled || select.value) return true;
+  if (!select || select.disabled) return true;
+  const ensureSubmitEvent = () => {
+    const form = select.form || select.closest?.("form");
+    if (!form) return false;
+    const eventName = "ppw-widgetEvent:SetPaymentPlanSelectContinueEvent";
+    let marker = [...form.elements].find((element) => element.name === eventName);
+    if (!marker) {
+      marker = document.createElement("input");
+      marker.type = "hidden";
+      marker.name = eventName;
+      marker.value = "";
+      form.appendChild(marker);
+    }
+    return true;
+  };
+  if (select.value) return ensureSubmitEvent();
   const eligible = [...select.options].filter((option) => (
     !option.disabled
     && option.value
@@ -5247,7 +5262,7 @@ async function selectBusinessCardFinancialOffer(radio) {
     if (visibleOffer) {
       await clickElement(visibleOffer, "Business card payment option value", { preClickDelayMs: 60, delayMs: 350 });
       const auiSelected = await waitUntil(() => select.value === offer.value, 1600, 80);
-      if (auiSelected) return true;
+      if (auiSelected) return ensureSubmitEvent();
     }
   }
 
@@ -5257,7 +5272,7 @@ async function selectBusinessCardFinancialOffer(radio) {
   select.dispatchEvent(new Event("input", { bubbles: true }));
   select.dispatchEvent(new Event("change", { bubbles: true }));
   await sleep(500);
-  return select.value === offer.value;
+  return select.value === offer.value && ensureSubmitEvent();
 }
 
 function businessPaymentWidgetBusy() {

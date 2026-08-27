@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.152")
+        self.assertEqual(MANIFEST["version"], "0.1.153")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -546,6 +546,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("select[name$='_financialOfferId']", CONTENT)
         self.assertIn("Business card payment option value", CONTENT)
         self.assertIn("[role='listbox'], .a-popover", CONTENT)
+        self.assertIn("ppw-widgetEvent:SetPaymentPlanSelectContinueEvent", CONTENT)
         self.assertIn('select.dispatchEvent(new Event("change", { bubbles: true }))', CONTENT)
 
         stable_start = CONTENT.index("async function selectStableBusinessPaymentCard(radio)")
