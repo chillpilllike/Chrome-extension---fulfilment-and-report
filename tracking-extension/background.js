@@ -1923,8 +1923,9 @@ async function handleOrderPackages(message, windowId, sender = {}) {
   tracking.mismatchRecoveryKey = "";
   tracking.mismatchRecoveryCount = 0;
   if (message.orderCancelled) {
+    let cancellationResult = null;
     try {
-      await postGuardedTrackingUpdate(
+      cancellationResult = await postGuardedTrackingUpdate(
         order.amazon_order_id,
         {
           amazon_order_url: message.amazonOrderUrl || orderUrl(order),
@@ -1943,9 +1944,13 @@ async function handleOrderPackages(message, windowId, sender = {}) {
     } catch (error) {
       await log(`Could not save cancelled status for ${order.amazon_order_id}: ${error.message}; continuing.`, windowId);
     }
-    await log(`Amazon order ${order.amazon_order_id} is cancelled; reset lines for reorder.`, windowId);
+    if (Number(cancellationResult?.manual_review || 0) > 0) {
+      await log(`Amazon order ${order.amazon_order_id} is cancelled; completed downstream fulfilment was kept and flagged for manual review.`, windowId);
+    } else if (cancellationResult) {
+      await log(`Amazon order ${order.amazon_order_id} is cancelled; reset lines for reorder.`, windowId);
+    }
     await advanceCurrentOrder(tracking, windowId, "cancelled");
-    return { ok: true };
+    return { ok: true, cancellation: cancellationResult };
   }
   if (message.paymentRevisionNeeded) {
     try {

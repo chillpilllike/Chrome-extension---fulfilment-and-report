@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-cart-count-v152";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-consumer-reset-state-v153";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -1857,6 +1857,15 @@ function markItemAdded(activeJob) {
     sessionStorage.setItem(addedItemMarkerKey(activeJob), String(Date.now()));
   } catch {
     // Session storage can be blocked on unusual browser profiles; state storage still carries the marker.
+  }
+}
+
+function clearItemAdded(activeJob) {
+  activeJob.addClickedAt = null;
+  try {
+    sessionStorage.removeItem(addedItemMarkerKey(activeJob));
+  } catch {
+    // State storage still clears the marker when session storage is unavailable.
   }
 }
 
@@ -10572,6 +10581,20 @@ async function run() {
   }
   window.__nutricityHadActiveJob = true;
   lastNoActiveJobCheckAt = 0;
+  if (activeJob.clearResetSessionMarkers) {
+    clearCheckoutStarted(activeJob);
+    clearItemAdded(activeJob);
+    activeJob.clearResetSessionMarkers = false;
+    await setActiveJob(activeJob, {
+      allowUnpause: true,
+      allowStageRegression: true,
+      reason: "clear_reset_session_markers",
+    });
+    await sendDiagnostic("Cleared stale cart and checkout session markers after an unplaced-order reset.", {
+      group_key: activeJob.job.group_key,
+      reset_revision: Number(activeJob.resetRevision || 0),
+    });
+  }
   const runDiagnosticKey = `${activeJob.job.group_key}:${location.pathname}:${activeJob.stage || ""}`;
   if (window.__nutricityLastRunDiagnosticKey !== runDiagnosticKey) {
     window.__nutricityLastRunDiagnosticKey = runDiagnosticKey;

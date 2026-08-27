@@ -2835,6 +2835,18 @@ def sync_odoo_ordered_tags_for_pairs(pairs: set[tuple[int, int]]) -> None:
             set_odoo_order_tag(store_id, grouped["remove"], False)
 
 
+def sync_odoo_ordered_tags_after_commit(pairs: set[tuple[int, int]]) -> None:
+    """Give the surrounding DB transaction time to commit before recalculating tags."""
+    if not pairs:
+        return
+
+    def run() -> None:
+        time.sleep(0.1)
+        sync_odoo_ordered_tags_for_pairs(pairs)
+
+    threading.Thread(target=run, name="odoo-ordered-tag-sync", daemon=True).start()
+
+
 class AmazonBusinessClient:
     def __init__(self, account: Optional[dict[str, Any]] = None) -> None:
         self.account = account
@@ -26700,7 +26712,111 @@ def api_pull_defaults() -> dict[str, Any]:
 def api_place(payload: PlacePayload) -> dict[str, Any]:
     if payload.line_ids:
         with db() as conn:
-            payload.line_ids = validate_line_ids_for_store(conn, payload.store_id, payload.line_ids, "Place selected")
+            selected_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
+            if not selected_ids:
+                raise HTTPException(400, "Select at least one valid order line to place.")
+            placeholders = ",".join("?" for _ in selected_ids)
+            selected_rows = rows_to_dicts(conn.execute(
+                f"""
+                SELECT order_lines.id, order_lines.store_id, order_lines.odoo_order_name,
+                       COALESCE(stores.name, 'Store ' || order_lines.store_id) AS store_name
+                FROM order_lines
+                LEFT JOIN stores ON stores.id=order_lines.store_id
+                WHERE order_lines.id IN ({placeholders})
+                ORDER BY order_lines.store_id, order_lines.id
+                """,
+                selected_ids,
+            ).fetchall()) if selected_ids else []
+        found_ids = {int(row["id"]) for row in selected_rows}
+        missing_ids = [line_id for line_id in selected_ids if line_id not in found_ids]
+        if missing_ids:
+            raise HTTPException(404, f"Place selected includes {len(missing_ids)} order line(s) that no longer exist. Refresh and try again.")
+        line_ids_by_store: dict[int, list[int]] = {}
+        store_names: dict[int, str] = {}
+        for row in selected_rows:
+            selected_store_id = int(row["store_id"])
+            line_ids_by_store.setdefault(selected_store_id, []).append(int(row["id"]))
+            store_names[selected_store_id] = clean_text(row.get("store_name")) or f"Store {selected_store_id}"
+        if len(line_ids_by_store) > 1:
+            ordering_engine = normalize_ordering_engine(payload.ordering_engine or get_default_ordering_engine())
+            results: list[dict[str, Any]] = []
+            total_queued = 0
+            queued_line_ids: list[int] = []
+            failures = 0
+            for selected_store_id, store_line_ids in line_ids_by_store.items():
+                store_payload = PlacePayload(
+                    store_id=selected_store_id,
+                    address_id=payload.address_id,
+                    amazon_account_id=payload.amazon_account_id,
+                    line_ids=store_line_ids,
+                    club=payload.club,
+                    ordering_engine=payload.ordering_engine,
+                    allow_missing_spaid=payload.allow_missing_spaid,
+                    include_missing_asins=payload.include_missing_asins,
+                )
+                try:
+                    store_result = place_orders_for_store_payload(store_payload)
+                    store_queued = int(store_result.get("queued") or store_result.get("ordered") or 0)
+                    total_queued += store_queued
+                    store_ok = bool(store_result.get("ok", True))
+                    if not store_ok:
+                        failures += 1
+                    results.append({
+                        "store_id": selected_store_id,
+                        "store_name": store_names[selected_store_id],
+                        "ok": store_ok,
+                        "queued": store_queued,
+                        "message": clean_text(store_result.get("message")),
+                    })
+                except Exception as exc:
+                    failures += 1
+                    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                    results.append({
+                        "store_id": selected_store_id,
+                        "store_name": store_names[selected_store_id],
+                        "ok": False,
+                        "queued": 0,
+                        "message": clean_text(detail) or "Store fulfilment failed.",
+                    })
+            if ordering_engine == "chrome":
+                with db() as conn:
+                    queued_line_ids = [
+                        int(row["id"])
+                        for row in conn.execute(
+                            f"""
+                            SELECT id
+                            FROM order_lines
+                            WHERE id IN ({','.join('?' for _ in selected_ids)})
+                              AND state='submitted'
+                              AND order_engine='chrome'
+                            ORDER BY id
+                            """,
+                            selected_ids,
+                        ).fetchall()
+                    ]
+            summaries = [
+                f"{result['store_name']}: {result['message']}"
+                for result in results
+            ]
+            return {
+                "ok": failures == 0 and any(result["ok"] for result in results),
+                "message": (
+                    f"Processed {len(results)} stores together using {ordering_engine}; "
+                    f"queued/placed {total_queued} order group{'s' if total_queued != 1 else ''}. "
+                    + " | ".join(summaries)
+                ),
+                "defer_refresh": ordering_engine == "chrome",
+                "queued": total_queued,
+                "queued_line_ids": queued_line_ids,
+                "store_results": results,
+            }
+        if line_ids_by_store:
+            payload.store_id = next(iter(line_ids_by_store))
+            payload.line_ids = next(iter(line_ids_by_store.values()))
+    return place_orders_for_store_payload(payload)
+
+
+def place_orders_for_store_payload(payload: PlacePayload) -> dict[str, Any]:
     ordering_engine = normalize_ordering_engine(payload.ordering_engine or get_default_ordering_engine())
     if ordering_engine == "chrome":
         selected_count = len(payload.line_ids or [])
@@ -26787,6 +26903,8 @@ def api_place(payload: PlacePayload) -> dict[str, Any]:
         message += " Reason: " + " | ".join(details)
     data["message"] = message
     data["ok"] = skipped == 0 and ordered > 0
+    data["ordered"] = ordered
+    data["skipped"] = skipped
     if ordering_engine == "cxml" and skipped and not payload.allow_missing_spaid:
         line = first_missing_spaid_line(payload.store_id, payload.line_ids or None)
         if line:
@@ -33449,6 +33567,255 @@ def api_dispatch_sorting_place(package_id: int, payload: DispatchPlacePayload) -
 _TRACKING_UPDATE_LOCK = threading.RLock()
 
 
+def tracking_cancellation_downstream_reasons(
+    conn: Any,
+    rows: list[dict[str, Any]],
+) -> dict[tuple[int, int], list[str]]:
+    """Return completed downstream work that must not be reversed automatically."""
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for raw_row in rows:
+        row = dict(raw_row)
+        key = (int(row["store_id"]), int(row["odoo_order_id"]))
+        grouped.setdefault(key, []).append(row)
+
+    protected: dict[tuple[int, int], list[str]] = {}
+    for key, order_rows in grouped.items():
+        store_id, odoo_order_id = key
+        order_name = clean_text(order_rows[0].get("odoo_order_name"))
+        reasons: list[str] = []
+        completed_local_line = conn.execute(
+            """
+            SELECT 1
+            FROM order_lines
+            WHERE store_id=?
+              AND odoo_order_id=?
+              AND state IN ('delivered', 'inventory')
+            LIMIT 1
+            """,
+            (store_id, odoo_order_id),
+        ).fetchone()
+        if completed_local_line:
+            reasons.append("the app already marks the order delivered/inventory fulfilled")
+        if order_name:
+            cached_rows = conn.execute(
+                """
+                SELECT fulfillment_status, shopify_order_name, shopify_order_id
+                FROM shopify_order_status_cache
+                WHERE store_id=?
+                  AND UPPER(odoo_order_name)=UPPER(?)
+                  AND COALESCE(cancelled_at, '') = ''
+                """,
+                (store_id, order_name),
+            ).fetchall()
+            for cached in cached_rows:
+                if shopify_status_is_fulfilled(cached.get("fulfillment_status")):
+                    shopify_ref = clean_text(cached.get("shopify_order_name")) or clean_text(cached.get("shopify_order_id"))
+                    reasons.append(f"Shopify order {shopify_ref or order_name} is already fulfilled")
+                    break
+            completed_job = conn.execute(
+                """
+                SELECT 1
+                FROM shopify_fulfilment_jobs
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND (status='completed' OR COALESCE(completed_at, '') != '')
+                LIMIT 1
+                """,
+                (store_id, odoo_order_id),
+            ).fetchone()
+            if completed_job:
+                reasons.append("a Shopify fulfilment job has already completed")
+        if reasons:
+            protected[key] = list(dict.fromkeys(reasons))
+    return protected
+
+
+def clear_stale_downstream_fulfilment_for_order(
+    conn: Any,
+    store_id: int,
+    odoo_order_id: int,
+    odoo_order_name: str,
+) -> dict[str, int]:
+    """Clear downstream app records only when no active fulfilment remains."""
+    remaining = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM order_lines
+        WHERE store_id=?
+          AND odoo_order_id=?
+          AND (
+            COALESCE(amazon_order_id, '') != ''
+            OR state IN ('ordered', 'dispatched', 'delivered', 'inventory')
+          )
+        """,
+        (store_id, odoo_order_id),
+    ).fetchone()
+    if int((remaining or {}).get("count") or 0) > 0:
+        return {"jobs": 0, "status": 0, "maps": 0}
+    jobs = conn.execute(
+        "DELETE FROM shopify_fulfilment_jobs WHERE store_id=? AND odoo_order_id=?",
+        (store_id, odoo_order_id),
+    ).rowcount
+    status = conn.execute(
+        "DELETE FROM shopify_order_status_cache WHERE store_id=? AND UPPER(odoo_order_name)=UPPER(?)",
+        (store_id, odoo_order_name),
+    ).rowcount
+    store_row = conn.execute("SELECT odoo_db FROM stores WHERE id=?", (store_id,)).fetchone()
+    source_key = f"{clean_text(store_row.get('odoo_db'))}:{odoo_order_name}" if store_row else ""
+    maps = 0
+    if source_key.strip(":"):
+        maps = conn.execute(
+            "DELETE FROM shopify_export_order_map WHERE src_order_key=?",
+            (source_key,),
+        ).rowcount
+    return {"jobs": int(jobs or 0), "status": int(status or 0), "maps": int(maps or 0)}
+
+
+def reset_cancelled_amazon_fulfilment(
+    conn: Any,
+    amazon_order_id: str,
+    rows: list[dict[str, Any]],
+    cancellation_message: str,
+    now: str,
+) -> dict[str, Any]:
+    """Reset safe orders and retain completed downstream orders for manual review."""
+    row_dicts = [dict(row) for row in rows]
+    protected = tracking_cancellation_downstream_reasons(conn, row_dicts)
+    reset_rows: list[dict[str, Any]] = []
+    review_rows: list[dict[str, Any]] = []
+    reset_line_ids: list[int] = []
+    reset_orders: set[tuple[int, int, str]] = set()
+    cancellation_payload = json_payload_for_storage(
+        {"order_cancelled": True, "amazon_order_id": amazon_order_id, "message": cancellation_message}
+    )
+    cancellation_note = (
+        f"Earlier Amazon order {amazon_order_id} was cancelled. "
+        f"Reset to fresh pulled state for reorder. {cancellation_message}"
+    )
+    for row in row_dicts:
+        key = (int(row["store_id"]), int(row["odoo_order_id"]))
+        reasons = protected.get(key) or []
+        if reasons:
+            review_message = (
+                f"Amazon reports order {amazon_order_id} cancelled, but automatic reset was blocked because "
+                f"{'; '.join(reasons)}. Review Odoo/Shopify fulfilment manually."
+            )
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET amazon_status='cancelled_review',
+                    tracking_status='Amazon cancelled - manual review',
+                    tracking_payload=?,
+                    tracking_checked_at=?,
+                    amazon_cancelled_at=?,
+                    amazon_cancelled_order_id=?,
+                    fulfilment_note=CASE
+                      WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                      WHEN fulfilment_note LIKE ? THEN fulfilment_note
+                      ELSE fulfilment_note || ' | ' || ?
+                    END,
+                    last_error=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    cancellation_payload,
+                    now,
+                    now,
+                    amazon_order_id,
+                    review_message,
+                    f"%Amazon reports order {amazon_order_id} cancelled%",
+                    review_message,
+                    review_message,
+                    now,
+                    row["id"],
+                ),
+            )
+            updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+            if updated:
+                review_rows.append(dict(updated))
+            continue
+
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET amazon_order_id=NULL,
+                amazon_order_url=NULL,
+                amazon_account_id=NULL,
+                amazon_account_name=NULL,
+                amazon_status=NULL,
+                tracking_status=NULL,
+                tracking_payload=NULL,
+                tracking_checked_at=NULL,
+                state='pulled',
+                order_engine='chrome',
+                amazon_group_key=NULL,
+                chrome_claimed_by=NULL,
+                chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL,
+                amazon_cancelled_at=?,
+                amazon_cancelled_order_id=?,
+                amazon_unit_price=NULL,
+                amazon_total_price=NULL,
+                chrome_profit_total=NULL,
+                fulfilment_note=CASE
+                  WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                  WHEN fulfilment_note LIKE ? THEN fulfilment_note
+                  ELSE fulfilment_note || ' | ' || ?
+                END,
+                last_error=NULL,
+                ordered_at=NULL,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                now,
+                amazon_order_id,
+                cancellation_note,
+                f"%Earlier Amazon order {amazon_order_id} was cancelled%",
+                cancellation_note,
+                now,
+                row["id"],
+            ),
+        )
+        reset_line_ids.append(int(row["id"]))
+        reset_orders.add((key[0], key[1], clean_text(row.get("odoo_order_name"))))
+        updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
+        if updated:
+            reset_rows.append(dict(updated))
+
+    if reset_line_ids:
+        placeholders = ",".join("?" for _ in reset_line_ids)
+        conn.execute(
+            f"""
+            UPDATE amazon_attempts
+            SET status='reset', error=NULL
+            WHERE order_line_id IN ({placeholders})
+              AND mode IN ('chrome', 'rest', 'cxml')
+              AND status IN ('queued', 'submitted', 'ok', 'error', 'costly', 'missing', 'ignored')
+            """,
+            reset_line_ids,
+        )
+
+    cleanup = {"jobs": 0, "status": 0, "maps": 0, "dispatch_packages": 0}
+    for store_id, odoo_order_id, order_name in reset_orders:
+        result = clear_stale_downstream_fulfilment_for_order(
+            conn, store_id, odoo_order_id, order_name
+        )
+        for name, count in result.items():
+            cleanup[name] += count
+    if reset_rows and not review_rows:
+        cleanup["dispatch_packages"] = dispatch_clear_packages_for_amazon_order(conn, amazon_order_id)
+    payment_failure_resolved = bool(resolve_payment_failure_for_order(conn, amazon_order_id, now))
+    return {
+        "reset_rows": reset_rows,
+        "review_rows": review_rows,
+        "protected": protected,
+        "cleanup": cleanup,
+        "payment_failure_resolved": payment_failure_resolved,
+    }
+
+
 @app.post("/api/tracking/update")
 def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
     for attempt in range(3):
@@ -33697,7 +34064,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
         for attempt in range(2):
             try:
                 rows = conn.execute(
-                    "SELECT * FROM order_lines WHERE amazon_order_id=? AND state IN ('ordered', 'dispatched', 'delivered')",
+                    "SELECT * FROM order_lines WHERE amazon_order_id=? AND state IN ('ordered', 'dispatched', 'delivered', 'inventory')",
                     (amazon_order_id,),
                 ).fetchall()
                 break
@@ -33918,71 +34285,46 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             tag_pairs = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in rows}
             now = utc_now()
             cancellation_message = clean_text(payload.cancellation_message) or "This order has been cancelled."
-            note = f"Earlier Amazon order {amazon_order_id} was cancelled. Reset to fresh pulled state for reorder. {cancellation_message}"
-            updated_rows = []
-            for row in rows:
-                conn.execute(
-                    """
-                    UPDATE order_lines
-                    SET amazon_order_id=NULL,
-                        amazon_order_url=NULL,
-                        amazon_status='cancelled',
-                        tracking_status='Amazon cancelled',
-                        tracking_payload=?,
-                        tracking_checked_at=?,
-                        state='pulled',
-                        order_engine='chrome',
-                        amazon_group_key=NULL,
-                        chrome_claimed_by=NULL,
-                        chrome_claimed_at=NULL,
-                        chrome_claim_expires_at=NULL,
-                        amazon_cancelled_at=?,
-                        amazon_cancelled_order_id=?,
-                        fulfilment_note=CASE
-                          WHEN COALESCE(fulfilment_note, '') = '' THEN ?
-                          WHEN fulfilment_note LIKE ? THEN fulfilment_note
-                          ELSE fulfilment_note || ' | ' || ?
-                        END,
-                        last_error=NULL,
-                        ordered_at=NULL,
-                        updated_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        json_payload_for_storage({"order_cancelled": True, "amazon_order_id": amazon_order_id, "message": cancellation_message}),
-                        now,
-                        now,
-                        amazon_order_id,
-                        note,
-                        f"%Earlier Amazon order {amazon_order_id} was cancelled%",
-                        note,
-                        now,
-                        row["id"],
-                    ),
-                )
-                updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
-                if updated_row:
-                    updated_rows.append(updated_row)
+            cancellation_result = reset_cancelled_amazon_fulfilment(
+                conn,
+                amazon_order_id,
+                [dict(row) for row in rows],
+                cancellation_message,
+                now,
+            )
+            updated_rows = cancellation_result["reset_rows"] + cancellation_result["review_rows"]
             for updated_row in updated_rows:
                 index_order_line(updated_row)
-            payment_failure_resolved = bool(
-                resolve_payment_failure_and_clear_dispatch(conn, amazon_order_id, now)
-            )
             fast_page_cache_clear_matching({
                 "dispatch-sorting-summary",
                 "dispatch-sorting-summary-base",
                 "dispatch-status",
                 "dispatch-status-summary",
                 "tracking-orders",
+                "fulfilment-pending",
+                "dashboard",
+                "orders",
+                "search",
+                "chrome-jobs",
+                "shopify-fulfilment",
                 "payment-failures",
             })
-            threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
+            sync_odoo_ordered_tags_after_commit(tag_pairs)
+            reset_count = len(cancellation_result["reset_rows"])
+            review_count = len(cancellation_result["review_rows"])
+            message = f"Reset {reset_count} cancelled Amazon fulfilment line(s) for reorder."
+            if review_count:
+                message += f" Kept {review_count} completed downstream line(s) linked and flagged for manual review."
             return {
                 "ok": True,
                 "updated": len(updated_rows),
-                "tracking_status": "Amazon cancelled",
+                "reset": reset_count,
+                "manual_review": review_count,
+                "tracking_status": "Amazon cancelled - manual review" if review_count else "Amazon cancelled",
                 "order_cancelled": True,
-                "payment_failure_resolved": payment_failure_resolved,
+                "payment_failure_resolved": cancellation_result["payment_failure_resolved"],
+                "cleanup": cancellation_result["cleanup"],
+                "message": message,
             }
         if payload_has_payment_revision(payload):
             now = utc_now()
@@ -37019,36 +37361,15 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
         for amazon_order_id in dict.fromkeys(previous_amazon_order_ids):
             stale_dispatch_packages += dispatch_clear_packages_for_amazon_order(conn, amazon_order_id)
         for reset_store_id, reset_odoo_order_id, reset_order_name in selected_order_names:
-            remaining = conn.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM order_lines
-                WHERE store_id=?
-                  AND odoo_order_id=?
-                  AND (
-                    COALESCE(amazon_order_id, '') != ''
-                    OR state IN ('ordered', 'dispatched', 'delivered', 'inventory')
-                  )
-                """,
-                (reset_store_id, reset_odoo_order_id),
-            ).fetchone()
-            if int((remaining or {}).get("count") or 0) > 0:
-                continue
-            stale_shopify_jobs += conn.execute(
-                "DELETE FROM shopify_fulfilment_jobs WHERE store_id=? AND odoo_order_id=?",
-                (reset_store_id, reset_odoo_order_id),
-            ).rowcount
-            stale_shopify_status += conn.execute(
-                "DELETE FROM shopify_order_status_cache WHERE store_id=? AND UPPER(odoo_order_name)=UPPER(?)",
-                (reset_store_id, reset_order_name),
-            ).rowcount
-            store_row = conn.execute("SELECT odoo_db FROM stores WHERE id=?", (reset_store_id,)).fetchone()
-            source_key = f"{clean_text((store_row or {}).get('odoo_db'))}:{reset_order_name}" if store_row else ""
-            if source_key.strip(":"):
-                stale_shopify_maps += conn.execute(
-                    "DELETE FROM shopify_export_order_map WHERE src_order_key=?",
-                    (source_key,),
-                ).rowcount
+            cleanup = clear_stale_downstream_fulfilment_for_order(
+                conn,
+                reset_store_id,
+                reset_odoo_order_id,
+                reset_order_name,
+            )
+            stale_shopify_jobs += cleanup["jobs"]
+            stale_shopify_status += cleanup["status"]
+            stale_shopify_maps += cleanup["maps"]
         updated_rows = conn.execute(
             f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
             [payload.store_id, *selected_ids],

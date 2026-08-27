@@ -24,11 +24,15 @@ class PaymentFailureCancellationTests(unittest.TestCase):
         self.assertIn('"payment-failures"', source)
 
     def test_tracking_cancellation_resolves_the_payment_failure_immediately(self) -> None:
+        helper_start = APP.index("def reset_cancelled_amazon_fulfilment(")
         start = APP.index('@app.post("/api/tracking/update")')
         end = APP.index('@app.get("/api/tracking/payment-failures")', start)
+        helper_source = APP[helper_start:start]
         source = APP[start:end]
 
-        self.assertGreaterEqual(source.count("resolve_payment_failure_and_clear_dispatch"), 2)
+        self.assertIn("resolve_payment_failure_for_order", helper_source)
+        self.assertIn("dispatch_clear_packages_for_amazon_order", helper_source)
+        self.assertIn("reset_cancelled_amazon_fulfilment", source)
         self.assertGreaterEqual(source.count('"payment-failures"'), 2)
 
     def test_status_only_recheck_resolves_and_invalidates_payment_failure(self) -> None:

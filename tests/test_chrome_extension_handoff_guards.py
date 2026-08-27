@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.161")
+        self.assertEqual(MANIFEST["version"], "0.1.163")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -792,9 +792,14 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("/reset-fulfilment", reset)
         self.assertIn('amazon_status: ""', reset)
         self.assertIn("submitted_to_amazon: false", reset)
-        self.assertIn('activeJob.stage = "product";', reset)
+        self.assertIn('activeJob.stage = "clear_cart";', reset)
         self.assertIn("activeJob.itemIndex = 0;", reset)
         self.assertIn("activeJob.cartCleared = false;", reset)
+        self.assertIn("activeJob.clearResetSessionMarkers = true;", reset)
+        self.assertIn('"checkoutStartedAt"', reset)
+        self.assertIn('"cartAfterCheckoutRetryCount"', reset)
+        self.assertIn('"addClickedAt"', reset)
+        self.assertIn("activeJob.pricing = {};", reset)
         self.assertIn("await navigateWindowToCart(windowId)", reset)
         self.assertIn("allowSubmittedReset: true", reset)
         self.assertIn("activeJob.resetRevision = Date.now();", reset)
@@ -806,6 +811,27 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("Number(current?.resetRevision || 0) > Number(activeJob?.resetRevision || 0)", setter)
         self.assertIn("options.allowSubmittedReset !== true", setter)
         self.assertIn("Ignored stale pre-reset update", setter)
+
+        reset_handler_start = BACKGROUND.index('if (message.type === "SET_ACTIVE_JOB")')
+        reset_handler_end = BACKGROUND.index('if (message.type === "DIAG_LOG")', reset_handler_start)
+        reset_handler = BACKGROUND[reset_handler_start:reset_handler_end]
+        self.assertIn("resetRevisionsByGroup", reset_handler)
+        self.assertIn("RESET_STALE_UPDATE_GUARD_MS", reset_handler)
+        self.assertIn("ignored_stale_reset_update", reset_handler)
+        self.assertIn("Ignored stale history-page update after resetting", reset_handler)
+
+        reset_start = BACKGROUND.index("async function resetDuplicateFulfilment(windowId)")
+        reset_end = BACKGROUND.index("async function releaseStoredJob", reset_start)
+        reset = BACKGROUND[reset_start:reset_end]
+        self.assertIn("[activeJob.job.group_key]: activeJob.resetRevision", reset)
+
+        run_start = CONTENT.index("async function run()")
+        run_end = CONTENT.index("async function runSafely()", run_start)
+        run = CONTENT[run_start:run_end]
+        self.assertIn("if (activeJob.clearResetSessionMarkers)", run)
+        self.assertIn("clearCheckoutStarted(activeJob);", run)
+        self.assertIn("clearItemAdded(activeJob);", run)
+        self.assertIn('reason: "clear_reset_session_markers"', run)
 
     def test_next_claim_cannot_discard_required_cart_cleanup(self) -> None:
         blocker_start = BACKGROUND.index("function activeJobBlocksNext(activeJob)")

@@ -1,7 +1,8 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-business-cart-count-v152";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-consumer-reset-state-v153";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
+const RESET_STALE_UPDATE_GUARD_MS = 10 * 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
 let lastReleaseMissingWindowJobsAt = 0;
@@ -54,6 +55,7 @@ async function getSettings() {
     logs: [],
     logsByWindow: {},
     diagnosticSessions: { currentSessionId: "", sessions: [] },
+    resetRevisionsByGroup: {},
   });
   const session = await chrome.storage.session.get({ autoOrderingRunning: false });
   return { ...data, autoOrderingRunning: session.autoOrderingRunning === true };
@@ -2144,12 +2146,23 @@ async function resetDuplicateFulfilment(windowId) {
   };
   activeJob.duplicateOrder = null;
   activeJob.paused = false;
+  activeJob.pausedByUser = false;
   activeJob.pausedStage = null;
-  activeJob.stage = "product";
+  activeJob.stage = "clear_cart";
   activeJob.itemIndex = 0;
   activeJob.cartCleared = false;
+  activeJob.pricing = {};
+  activeJob.promoAcknowledged = {};
+  activeJob.clearResetSessionMarkers = true;
   activeJob.resetUnplacedSubmit = true;
   activeJob.resetRevision = Date.now();
+  const { resetRevisionsByGroup } = await getSettings();
+  await chrome.storage.local.set({
+    resetRevisionsByGroup: {
+      ...(resetRevisionsByGroup || {}),
+      [activeJob.job.group_key]: activeJob.resetRevision,
+    },
+  });
   for (const key of [
     "amazonSubmittedAt",
     "placeOrderClickStartedAt",
@@ -2158,6 +2171,25 @@ async function resetDuplicateFulfilment(windowId) {
     "reportedOrderId",
     "reportAttemptedAt",
     "lastError",
+    "checkoutStartedAt",
+    "cartAfterCheckoutRetryCount",
+    "addClickedAt",
+    "subscribeAndSave",
+    "cartMissingAddRetries",
+    "cartAddVerificationRetries",
+    "cartVerificationReloads",
+    "emptySubscribeCartRetryCount",
+    "addressEditedRecipient",
+    "addressEditedAt",
+    "addressVerifiedRecipient",
+    "addressVerifiedAt",
+    "addressVerifyAttempts",
+    "addressEditSaveRetries",
+    "addressMode",
+    "snsPaymentConfirmationAcceptedAt",
+    "snsBlockedSubmitRecoveredAt",
+    "amazonDuplicateOrderConfirmed",
+    "placeOrderControl",
   ]) delete activeJob[key];
   await setWindowJob(windowId, activeJob, { allowSubmittedReset: true, reason: "reset_unplaced_submit" });
   const targetTabId = await navigateWindowToCart(windowId);
@@ -3666,6 +3698,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; ignored active job update." };
       const incomingJob = message.activeJob || null;
       const { activeJob: currentJob } = await getWindowState(windowId);
+      const { resetRevisionsByGroup } = await getSettings();
+      const incomingGroupKey = incomingJob?.job?.group_key || "";
+      const resetBarrier = Number(resetRevisionsByGroup?.[incomingGroupKey] || 0);
+      if (
+        incomingGroupKey
+        && resetBarrier
+        && Date.now() - resetBarrier < RESET_STALE_UPDATE_GUARD_MS
+        && Number(incomingJob?.resetRevision || 0) < resetBarrier
+      ) {
+        await diagnosticLog(`Ignored stale history-page update after resetting ${incomingGroupKey}.`, {
+          windowId,
+          activeJob: currentJob || incomingJob,
+          level: "warn",
+          page: senderPageInfo(sender, message.page || {}),
+          details: {
+            reset_revision: resetBarrier,
+            incoming_reset_revision: Number(incomingJob?.resetRevision || 0),
+            incoming_stage: incomingJob?.stage || "",
+            reason: message.reason || "",
+          },
+        });
+        return { ok: true, ignored_stale_reset_update: true };
+      }
       if (isLateCompletedJobUpdate(currentJob, incomingJob)) {
         await log(`Ignored late completed-state update for ${incomingJob.job.group_key}.`, windowId);
         return { ok: true, ignored_late_completed_update: true };

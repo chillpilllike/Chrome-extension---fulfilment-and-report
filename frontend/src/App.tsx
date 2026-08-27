@@ -4262,12 +4262,14 @@ function App() {
     .filter((row): row is OrderLine => Boolean(row))
   const selectedStoreIds = Array.from(new Set(selectedRows.map((row) => Number(row.store_id || 0)).filter(Boolean)))
   const selectedActionStoreId = selected.length > 0 && selectedRows.length === selected.length && selectedStoreIds.length === 1 ? selectedStoreIds[0] : null
+  const canRunSelectedPlaceAction = Boolean(selected.length && selectedRows.length === selected.length && selectedStoreIds.length)
   const canRunSelectedStoreAction = Boolean(selected.length && selectedActionStoreId)
+  const selectedActionNoticeIsInfo = selectedRows.length === selected.length && selectedStoreIds.length > 1
   const selectedActionDisabledReason = selected.length
     ? selectedRows.length !== selected.length
       ? "Some selected rows are no longer loaded. Clear and select the order again."
       : selectedStoreIds.length > 1
-        ? "Selected rows are from multiple stores. Select one store's rows before placing."
+        ? `Orders from ${selectedStoreIds.length} stores selected. Place Selected will queue each store separately.`
         : ""
     : ""
   const selectedClubName = selectedRows.length
@@ -4295,19 +4297,6 @@ function App() {
     setSelected((current) => {
       const anchor = previousAnchor ?? current[current.length - 1] ?? null
       const shouldCheck = checked ?? !current.includes(row.id)
-      if (shouldCheck) {
-        const knownRows = current
-          .map((id) => currentRowsById.get(id) || selectedOrderRowsRef.current.get(id))
-          .filter((item): item is OrderLine => Boolean(item))
-        const knownStoreIds = Array.from(new Set(knownRows.map((item) => Number(item.store_id || 0)).filter(Boolean)))
-        const rowStoreId = Number(row.store_id || 0)
-        if (rowStoreId && knownStoreIds.length && !knownStoreIds.includes(rowStoreId)) {
-          selectedOrderRowsRef.current.clear()
-          selectedOrderRowsRef.current.set(row.id, row)
-          ordersSelectionAnchor.current = row.id
-          return [row.id]
-        }
-      }
       const next = shiftKey
         ? rangeSelection(visibleIds, current, row.id, shouldCheck, true, anchor)
         : shouldCheck
@@ -4352,13 +4341,15 @@ function App() {
   }
 
   function placeSelectedOrders() {
-    const actionStoreId = selectedStoreIdForAction("Place Selected")
-    if (!actionStoreId) return
+    if (!canRunSelectedPlaceAction) {
+      setModal({ ok: false, title: "Place Selected", message: "Select at least one currently loaded order line." })
+      return
+    }
     return runAction("Place Selected", () =>
       api<DashboardData>("/api/place", {
         method: "POST",
         body: JSON.stringify({
-          store_id: actionStoreId,
+          store_id: selectedStoreIds[0],
           address_id: Number(addressId),
           amazon_account_id: Number(amazonAccountId),
           line_ids: selected,
@@ -4371,13 +4362,15 @@ function App() {
   }
 
   function clubPlaceSelectedOrders() {
-    const actionStoreId = selectedStoreIdForAction("Club Place Selected")
-    if (!actionStoreId) return
+    if (!canRunSelectedPlaceAction) {
+      setModal({ ok: false, title: "Club Place Selected", message: "Select at least one currently loaded order line." })
+      return
+    }
     return runAction("Club Place Selected", () =>
       api<DashboardData>("/api/place", {
         method: "POST",
         body: JSON.stringify({
-          store_id: actionStoreId,
+          store_id: selectedStoreIds[0],
           address_id: Number(addressId),
           amazon_account_id: Number(amazonAccountId),
           line_ids: selected,
@@ -4481,7 +4474,7 @@ function App() {
     )
   }
 
-  async function runAction(title: string, fn: () => Promise<DashboardData | { message?: string; ok?: boolean; defer_refresh?: boolean }>) {
+  async function runAction(title: string, fn: () => Promise<DashboardData | { message?: string; ok?: boolean; defer_refresh?: boolean; queued?: number; queued_line_ids?: number[] }>) {
     try {
       setBusy(title)
       const result = await fn()
@@ -4492,7 +4485,7 @@ function App() {
         }
       } else if (result.defer_refresh) {
         if (selected.length && "queued" in result && Number(result.queued || 0) > 0) {
-          const queuedIds = new Set(selected)
+          const queuedIds = new Set(result.queued_line_ids?.length ? result.queued_line_ids : selected)
           const markQueued = (row: OrderLine) => queuedIds.has(row.id)
             ? {
                 ...row,
@@ -5365,7 +5358,7 @@ function App() {
                     </Button>
 	                    <Button
 	                      variant="outline"
-	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      disabled={!canRunSelectedPlaceAction || Boolean(busy)}
 	                      onClick={placeSelectedOrders}
 	                    >
                       <ShoppingCart className="size-4" />
@@ -5398,7 +5391,7 @@ function App() {
                       Replace ASIN
                     </Button>
 	                    <Button
-	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      disabled={!canRunSelectedPlaceAction || Boolean(busy)}
 	                      onClick={clubPlaceSelectedOrders}
 	                    >
                       Club Place
@@ -5447,7 +5440,7 @@ function App() {
                 )}
                 <PaginationControls page={ordersPage} total={ordersTotal} perPage={ORDERS_PAGE_SIZE} onPage={setOrdersPage} disabled={Boolean(busy)} label="rows" />
                 {selectedClubName && <p className="text-sm text-muted-foreground">Clubbed recipient: {selectedClubName}</p>}
-                {selectedActionDisabledReason && <p className="text-sm text-destructive">{selectedActionDisabledReason}</p>}
+                {selectedActionDisabledReason && <p className={`text-sm ${selectedActionNoticeIsInfo ? "text-muted-foreground" : "text-destructive"}`}>{selectedActionDisabledReason}</p>}
                 {orderingEngine === "cxml" && (
                   <label className="flex items-center gap-2 text-sm text-muted-foreground">
                     <Checkbox checked={allowMissingSpaid} onCheckedChange={(checked) => setAllowMissingSpaid(Boolean(checked))} />
@@ -5652,17 +5645,17 @@ function App() {
                     <div className="flex items-center gap-3">
                       <Badge variant="secondary" className="px-3 py-1 text-sm">{selected.length.toLocaleString()} selected</Badge>
                       {selectedClubName ? <span className="hidden max-w-xl truncate text-sm text-muted-foreground lg:block">{selectedClubName}</span> : null}
-                      {selectedActionDisabledReason ? <span className="hidden max-w-xl truncate text-sm text-destructive lg:block">{selectedActionDisabledReason}</span> : null}
+                      {selectedActionDisabledReason ? <span className={`hidden max-w-xl truncate text-sm lg:block ${selectedActionNoticeIsInfo ? "text-muted-foreground" : "text-destructive"}`}>{selectedActionDisabledReason}</span> : null}
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={placeSelectedOrders}>
+	                      <Button variant="outline" disabled={!canRunSelectedPlaceAction || Boolean(busy)} onClick={placeSelectedOrders}>
                         Place Selected
                       </Button>
 	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={() => setManualFulfilmentOpen(true)}>
                         <CheckCircle2 className="size-4" />
                         Manually Fulfilled
                       </Button>
-	                      <Button disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={clubPlaceSelectedOrders}>
+	                      <Button disabled={!canRunSelectedPlaceAction || Boolean(busy)} onClick={clubPlaceSelectedOrders}>
                         Club Place
                       </Button>
 	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={ignoreSelectedOrders}>
