@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-manual-queue-resume-v140";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-orphan-checkout-recovery-v141";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -10780,6 +10780,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message.type === "GET_AMAZON_ACCOUNT_EXPERIENCE") {
     sendResponse({ ok: true, experience: amazonAccountExperience(), build: CONTENT_SCRIPT_BUILD });
+    return true;
+  }
+  if (message.type === "GET_AMAZON_PAGE_CONTEXT") {
+    const pageText = String(document.body?.innerText || "");
+    const orderNames = [...new Set(
+      [...pageText.matchAll(/\bNC\d+\b/gi)].map((match) => String(match[0] || "").toUpperCase()),
+    )];
+    sendResponse({
+      ok: true,
+      build: CONTENT_SCRIPT_BUILD,
+      url: location.href,
+      experience: amazonAccountExperience(),
+      orderNames,
+      checkout: /\/checkout\//i.test(location.pathname),
+      cart: /\/cart\//i.test(location.pathname) || /\/gp\/cart\//i.test(location.pathname),
+    });
     return true;
   }
   if (message.type === "RUN_ACTIVE_JOB") {

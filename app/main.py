@@ -12126,6 +12126,7 @@ def claim_next_chrome_job(
     resume_existing: bool = True,
     split_mixed_asin: bool = False,
     account_experience: str = "",
+    preferred_group_key: str = "",
 ) -> Optional[dict[str, Any]]:
     worker_id = clean_text(worker_id)[:120] or f"worker-{uuid.uuid4().hex[:12]}"
     with db() as conn:
@@ -12291,6 +12292,13 @@ def claim_next_chrome_job(
             """,
             (store_id, store_id, candidate_experience, candidate_experience, candidate_experience),
         ).fetchall()
+        preferred_group_key = clean_text(preferred_group_key)
+        if preferred_group_key:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if clean_text(candidate["amazon_group_key"]) == preferred_group_key
+            ]
         for candidate in candidates:
             group_key = str(candidate["amazon_group_key"])
             candidate_rows = rows_to_dicts(conn.execute(
@@ -29368,6 +29376,7 @@ def api_chrome_jobs(
     job_limit: int = 50,
     split_mixed_asin: bool = False,
     account_experience: str = "",
+    preferred_group_key: str = "",
 ) -> dict[str, Any]:
     if claim:
         if not auto_chrome_ordering_enabled():
@@ -29391,6 +29400,7 @@ def api_chrome_jobs(
             resume_existing=resume_existing,
             split_mixed_asin=split_mixed_asin,
             account_experience=account_experience,
+            preferred_group_key=preferred_group_key,
         )
         # Before handing a fresh claim to Chrome, consume any one exact,
         # non-cancelled Amazon-history match. This prevents a previously
@@ -29418,6 +29428,7 @@ def api_chrome_jobs(
                 resume_existing=True,
                 split_mixed_asin=split_mixed_asin,
                 account_experience=account_experience,
+                preferred_group_key=preferred_group_key,
             )
         return {
             "ok": True,

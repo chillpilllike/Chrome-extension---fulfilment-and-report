@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-manual-queue-resume-v140";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-orphan-checkout-recovery-v141";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const completionLocks = new Set();
 let queueStatusInFlight = null;
@@ -1239,6 +1239,99 @@ async function amazonTabsInWindow(windowId) {
   }
 }
 
+async function amazonPageContext(tab) {
+  if (!tab?.id) return null;
+  await waitForTabComplete(tab.id, 5000).catch(() => undefined);
+  const loaded = await injectContentScript(tab.id).catch(() => false)
+    || await contentScriptLoaded(tab.id).catch(() => false);
+  if (!loaded) return null;
+  const context = await chrome.tabs.sendMessage(tab.id, { type: "GET_AMAZON_PAGE_CONTEXT" }).catch(() => null);
+  if (!context?.ok) return null;
+  return { ...context, tabId: tab.id, windowId: tab.windowId || null };
+}
+
+function activeJobOrderNames(activeJob) {
+  return (activeJob?.job?.order_names || [])
+    .map((name) => String(name || "").trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function pageContextMatchesActiveJob(context, activeJob) {
+  const pageOrderNames = new Set((context?.orderNames || []).map((name) => String(name || "").toUpperCase()));
+  return activeJobOrderNames(activeJob).some((name) => pageOrderNames.has(name));
+}
+
+async function reattachStoredJobsToRestoredWindows(label = "extension recovery") {
+  const state = await getSettings();
+  const storedJobs = [state.activeJob, ...Object.values(state.activeJobsByWindow || {})]
+    .filter((job, index, jobs) => job?.job?.group_key && jobs.findIndex((candidate) => (
+      candidate?.job?.group_key === job.job.group_key
+    )) === index);
+  if (!storedJobs.length || !chrome.tabs?.query) return 0;
+  const tabs = await chrome.tabs.query({
+    url: ["https://www.amazon.com/*", "https://amazon.com/*", "https://*.amazon.com/*"],
+  }).catch(() => []);
+  const contexts = [];
+  for (const tab of tabs) {
+    const context = await amazonPageContext(tab);
+    if (context) contexts.push(context);
+  }
+  let reattached = 0;
+  for (const storedJob of storedJobs) {
+    if (await existingChromeWindowId(storedJob.targetWindowId)) continue;
+    const matching = contexts.find((context) => pageContextMatchesActiveJob(context, storedJob));
+    if (!matching?.windowId || !matching?.tabId) continue;
+    if (!storedJob.paused && !await autoOrderingIsRunning()) await setManualQueueRunning(true);
+    const repaired = {
+      ...storedJob,
+      targetWindowId: matching.windowId,
+      targetTabId: matching.tabId,
+      amazonAccountExperience: matching.experience || storedJob.amazonAccountExperience || "",
+    };
+    await setWindowJob(matching.windowId, repaired, { reason: "reattach_restored_checkout" });
+    await log(`Reattached ${repaired.job.group_key} to its restored Amazon checkout after ${label}.`, matching.windowId);
+    reattached += 1;
+  }
+  return reattached;
+}
+
+async function recoverOrphanedCheckoutInWindow(windowId, accountExperience) {
+  const tabs = await amazonTabsInWindow(windowId);
+  for (const tab of tabs) {
+    const context = await amazonPageContext(tab);
+    if (!context?.checkout || !(context.orderNames || []).length) continue;
+    const snapshot = await api(`/api/chrome/jobs?claim=false&job_limit=80&account_experience=${encodeURIComponent(accountExperience)}`);
+    const matchingJob = (snapshot.jobs || []).find((job) => (
+      (job.order_names || []).some((name) => context.orderNames.includes(String(name || "").toUpperCase()))
+    ));
+    if (!matchingJob?.group_key) continue;
+    const workerId = await getWorkerId();
+    const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(accountExperience)}&preferred_group_key=${encodeURIComponent(matchingJob.group_key)}`);
+    const job = payload.jobs?.[0];
+    if (job?.group_key !== matchingJob.group_key) continue;
+    const activeJob = {
+      ...activeJobFor(job, workerId, windowId),
+      stage: "checkout",
+      cartCleared: true,
+      itemIndex: Array.isArray(job.items) ? job.items.length : 0,
+      targetTabId: tab.id,
+      amazonAccountExperience: accountExperience,
+      recoveredOrphanedCheckoutAt: Date.now(),
+    };
+    await setWindowJob(windowId, activeJob, { reason: "recover_orphaned_checkout" });
+    await injectActiveAmazonTabInWindow(windowId);
+    await log(`Recovered orphaned Amazon checkout for ${job.group_key}; continuing the existing cart instead of starting another order.`, windowId);
+    return {
+      ok: true,
+      activeJob,
+      targetWindowId: windowId,
+      recovered_orphaned_checkout: true,
+      message: `Recovered ${job.group_key} from the already-open Amazon checkout.`,
+    };
+  }
+  return null;
+}
+
 // ACCOUNT-TYPE CLAIM INVARIANT: profile names are irrelevant. Every extension
 // must positively detect its live Amazon experience before claiming. The API
 // then atomically assigns only a compatible whole Odoo order to the first idle
@@ -1364,6 +1457,12 @@ async function startNextJob(sourceWindowId = null) {
     return { ok: false, message };
   }
   sourceWindowId = detectedAccount.windowId || sourceWindowId;
+  const orphanedCheckout = await recoverOrphanedCheckoutInWindow(sourceWindowId, detectedAccount.experience)
+    .catch((error) => {
+      log(`Could not inspect an already-open checkout before claiming the next order: ${error.message}`, sourceWindowId);
+      return null;
+    });
+  if (orphanedCheckout?.activeJob) return orphanedCheckout;
   let queueBefore = null;
   const { cachedQueueStatus } = await getSettings();
   if (
@@ -2394,11 +2493,12 @@ async function recoverAfterRuntimeRestart(label = "extension restart", releasePr
   runtimeRecoveryInFlight = (async () => {
     if (await forceStopActive()) return { ok: true, stopped: true };
 
+    await reattachStoredJobsToRestoredWindows(label);
     if (releasePreviousSessionJobs) {
-      // A full Chrome restart cannot safely continue a pre-submit checkout in
-      // a closed window.  Release only those jobs; submitted jobs remain
-      // protected by releaseStoredJob and are recovered below.
-      await releaseAllStoredJobs("from the previous Chrome session");
+      // Chrome may restore the exact checkout under a new window/tab ID. The
+      // reattachment above preserves that matched checkout; release only jobs
+      // whose worker window really is still missing.
+      await releaseMissingWindowJobs({ force: true });
     }
 
     await ensureStoredActiveJobContentScripts(label);

@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.149")
+        self.assertEqual(MANIFEST["version"], "0.1.150")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -190,6 +190,17 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         get_active_end = BACKGROUND.index('if (message.type === "HEARTBEAT_JOB")', get_active_start)
         get_active = BACKGROUND[get_active_start:get_active_end]
         self.assertNotIn("autoOrderingStopped: true", get_active)
+
+    def test_restored_and_orphaned_checkouts_are_recovered_by_exact_order_name(self) -> None:
+        self.assertIn('if (message.type === "GET_AMAZON_PAGE_CONTEXT")', CONTENT)
+        self.assertIn("async function reattachStoredJobsToRestoredWindows", BACKGROUND)
+        self.assertIn("pageContextMatchesActiveJob(context, storedJob)", BACKGROUND)
+        self.assertIn("await reattachStoredJobsToRestoredWindows(label);", BACKGROUND)
+        self.assertIn("async function recoverOrphanedCheckoutInWindow", BACKGROUND)
+        self.assertIn("preferred_group_key=${encodeURIComponent(matchingJob.group_key)}", BACKGROUND)
+        self.assertIn('stage: "checkout"', BACKGROUND)
+        self.assertIn("preferred_group_key: str = \"\"", APP)
+        self.assertIn('clean_text(candidate["amazon_group_key"]) == preferred_group_key', APP)
 
     def test_missing_asins_are_reserved_for_one_check_every_48_hours(self) -> None:
         self.assertIn("const MISSING_ASIN_CHECK_PERIOD_MINUTES = 60", BACKGROUND)
