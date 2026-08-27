@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v145";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v146";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5316,6 +5316,22 @@ async function selectStableBusinessPaymentCard(radio) {
   return false;
 }
 
+async function submitBusinessPaymentForm(radio) {
+  const form = radio?.form || radio?.closest?.("form");
+  const action = String(form?.action || "");
+  if (!form || !/\/checkout\/p\/[^/]+\/pay\/continue/i.test(action)) return false;
+  await waitIfPaused();
+  if (typeof form.requestSubmit === "function") {
+    form.requestSubmit();
+  } else if (typeof form.submit === "function") {
+    form.submit();
+  } else {
+    return false;
+  }
+  await sleep(180);
+  return true;
+}
+
 function businessPaymentSelectionPageOpen() {
   return amazonAccountExperience() === "business"
     && /\/checkout\/p\/[^/]+\/pay\/?$/i.test(String(location.pathname || ""));
@@ -7085,7 +7101,12 @@ async function handlePaymentSelection(activeJob) {
       payment = findAccountPaymentSelection();
     }
     const finalContinueButton = nativePaymentContinueControl(payment?.continueButton) || continueButton;
-    await clickElement(finalContinueButton, "Use this payment method button", { preClickDelayMs: 20, delayMs: 180 });
+    const submittedBusinessForm = accountExperience === "business"
+      ? await submitBusinessPaymentForm(currentPreferredRadio)
+      : false;
+    if (!submittedBusinessForm) {
+      await clickElement(finalContinueButton, "Use this payment method button", { preClickDelayMs: 20, delayMs: 180 });
+    }
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
     let progress = accountExperience === "business"
       ? await waitForSettledBusinessPaymentOutcome(cardPreferences, 12000)
