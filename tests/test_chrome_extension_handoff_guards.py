@@ -161,7 +161,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.155")
+        self.assertEqual(MANIFEST["version"], "0.1.156")
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -454,7 +454,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("selectedNativePaymentInstrumentRadio()", CONTENT)
         self.assertIn("async function waitForStableBusinessCardSelection", CONTENT)
         self.assertIn("function businessPaymentWidgetBusy()", CONTENT)
-        self.assertIn("stableMs = 3500", CONTENT)
+        self.assertIn("stableMs = 1000", CONTENT)
         self.assertIn("!businessPaymentWidgetBusy()", CONTENT)
         self.assertIn("await selectStableBusinessPaymentCard(payment.radio)", CONTENT)
         self.assertIn('accountExperience === "business"', CONTENT)
@@ -540,13 +540,15 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
 
     def test_business_payment_supports_portal_card_and_financial_offer_without_changing_consumer(self) -> None:
         self.assertIn("async function clickBusinessPaymentCard(radio)", CONTENT)
-        self.assertIn('businessCardContainer(current)', CONTENT)
+        self.assertIn(".pmts-cc-number[data-number=", CONTENT)
+        self.assertIn("delayMs: 1000", CONTENT)
+        self.assertNotIn("function businessCardContainer(radio)", CONTENT)
         self.assertIn('new FormData(selected.form).get("ppw-instrumentRowSelection")', CONTENT)
         self.assertIn("async function selectBusinessCardFinancialOffer(radio)", CONTENT)
         self.assertIn("select[name$='_financialOfferId']", CONTENT)
+        self.assertIn("if (offerRow && !visible(offerRow)) return true", CONTENT)
         self.assertIn("Business card payment option value", CONTENT)
         self.assertIn("[role='listbox'], .a-popover", CONTENT)
-        self.assertIn("ppw-widgetEvent:SetPaymentPlanSelectContinueEvent", CONTENT)
         self.assertIn('select.dispatchEvent(new Event("change", { bubbles: true }))', CONTENT)
 
         stable_start = CONTENT.index("async function selectStableBusinessPaymentCard(radio)")
@@ -555,17 +557,11 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("await clickBusinessPaymentCard(current)", stable)
         self.assertIn("await selectBusinessCardFinancialOffer(stable)", stable)
 
-        self.assertIn("async function submitBusinessPaymentForm(radio)", CONTENT)
-        self.assertIn('form.requestSubmit()', CONTENT)
-        self.assertIn('form.submit()', CONTENT)
-
         payment_start = CONTENT.index("async function handlePaymentSelection(activeJob)")
         payment_end = CONTENT.index("async function openPaymentSelectionIfAvailable", payment_start)
         payment = CONTENT[payment_start:payment_end]
         self.assertIn('accountExperience === "business"', payment)
-        self.assertGreaterEqual(payment.count("await selectBusinessCardFinancialOffer(currentPreferredRadio)"), 1)
         self.assertIn("const finalContinueButton = nativePaymentContinueControl(payment?.continueButton) || continueButton", payment)
-        self.assertIn("await submitBusinessPaymentForm(currentPreferredRadio)", payment)
         self.assertIn('accountExperience === "consumer" && !paymentRadioIsSelected(payment.radio)', payment)
         self.assertIn("await clickPaymentRadio(payment.radio)", payment)
 

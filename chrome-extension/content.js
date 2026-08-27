@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-27-business-payment-offer-v146";
+const CONTENT_SCRIPT_BUILD = "2026-08-27-business-card-radio-v147";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -5164,7 +5164,11 @@ function businessCardPaymentRadio(preferences = []) {
     .filter((radio) => !radio.disabled && cardDigitsForPaymentRadio(radio));
   if (!cardRadios.length) return null;
   for (const preferred of preferences) {
-    const exact = cardRadios.find((radio) => cardDigitsForPaymentRadio(radio) === preferred);
+    const exactRow = [...document.querySelectorAll(".pmts-credit-card-row")].find((row) => (
+      row.querySelector(`.pmts-cc-number[data-number='${CSS.escape(preferred)}']`)
+    ));
+    const exact = exactRow?.querySelector("input[type='radio'][name='ppw-instrumentRowSelection']")
+      || cardRadios.find((radio) => cardDigitsForPaymentRadio(radio) === preferred);
     if (exact) return exact;
   }
   return cardRadios.find((radio) => radio.checked) || cardRadios[0];
@@ -5184,47 +5188,31 @@ function businessCardIsNativePaymentInstrument(digits) {
   );
 }
 
-function businessCardContainer(radio) {
-  return radio?.closest?.(".pmts-credit-card-row")?.querySelector?.(".pmts-instrument-box")
-    || radio?.closest?.(".pmts-instrument-box")
-    || null;
-}
-
 async function clickBusinessPaymentCard(radio) {
   const digits = cardDigitsForPaymentRadio(radio);
   if (!digits) return false;
-  // Preserve the proven native radio/label path first. Newer Business pay
-  // portals additionally bind state to the outer instrument card, so click
-  // that surface as a Business-only fallback before accepting the selection.
-  await clickPaymentRadio(radio);
-  let current = paymentRadioForDigits(digits) || radio;
-  const card = businessCardContainer(current);
-  if (card) {
-    await clickElement(card, "Business payment instrument card", { preClickDelayMs: 80, delayMs: 180 });
-    current = paymentRadioForDigits(digits) || current;
-  }
-  return waitUntil(() => businessCardIsNativePaymentInstrument(digits) ? (paymentRadioForDigits(digits) || current) : false, 2200, 100);
+  const row = [...document.querySelectorAll(".pmts-credit-card-row")].find((candidate) => (
+    candidate.querySelector(`.pmts-cc-number[data-number='${CSS.escape(digits)}']`)
+  ));
+  const nativeRadio = row?.querySelector("input[type='radio'][name='ppw-instrumentRowSelection']")
+    || paymentRadioForDigits(digits)
+    || radio;
+  // Amazon's Business widget owns the radio's state. Click the exact native
+  // radio once, then leave it alone for a full second while Amazon processes
+  // the selection. Clicking the label/outer card again can toggle its model
+  // back to the Points instrument.
+  await clickElement(nativeRadio, `Business card ending in ${digits}`, { preClickDelayMs: 80, delayMs: 1000 });
+  const current = paymentRadioForDigits(digits) || nativeRadio;
+  return businessCardIsNativePaymentInstrument(digits) ? current : false;
 }
 
 async function selectBusinessCardFinancialOffer(radio) {
   const row = radio?.closest?.(".pmts-credit-card-row");
   const select = row?.querySelector?.("select[name$='_financialOfferId']");
   if (!select || select.disabled) return true;
-  const ensureSubmitEvent = () => {
-    const form = select.form || select.closest?.("form");
-    if (!form) return false;
-    const eventName = "ppw-widgetEvent:SetPaymentPlanSelectContinueEvent";
-    let marker = [...form.elements].find((element) => element.name === eventName);
-    if (!marker) {
-      marker = document.createElement("input");
-      marker.type = "hidden";
-      marker.name = eventName;
-      marker.value = "";
-      form.appendChild(marker);
-    }
-    return true;
-  };
-  if (select.value) return ensureSubmitEvent();
+  const offerRow = select.closest?.(".a-row");
+  if (offerRow && !visible(offerRow)) return true;
+  if (select.value) return true;
   const eligible = [...select.options].filter((option) => (
     !option.disabled
     && option.value
@@ -5262,7 +5250,7 @@ async function selectBusinessCardFinancialOffer(radio) {
     if (visibleOffer) {
       await clickElement(visibleOffer, "Business card payment option value", { preClickDelayMs: 60, delayMs: 350 });
       const auiSelected = await waitUntil(() => select.value === offer.value, 1600, 80);
-      if (auiSelected) return ensureSubmitEvent();
+      if (auiSelected) return true;
     }
   }
 
@@ -5272,7 +5260,7 @@ async function selectBusinessCardFinancialOffer(radio) {
   select.dispatchEvent(new Event("input", { bubbles: true }));
   select.dispatchEvent(new Event("change", { bubbles: true }));
   await sleep(500);
-  return select.value === offer.value && ensureSubmitEvent();
+  return select.value === offer.value;
 }
 
 function businessPaymentWidgetBusy() {
@@ -5284,7 +5272,7 @@ function businessPaymentWidgetBusy() {
   )].some(visible);
 }
 
-async function waitForStableBusinessCardSelection(digits, timeout = 9000, stableMs = 3500) {
+async function waitForStableBusinessCardSelection(digits, timeout = 5000, stableMs = 1000) {
   const deadline = Date.now() + timeout;
   let selectedSince = 0;
   while (Date.now() < deadline) {
@@ -5314,22 +5302,6 @@ async function selectStableBusinessPaymentCard(radio) {
     }
   }
   return false;
-}
-
-async function submitBusinessPaymentForm(radio) {
-  const form = radio?.form || radio?.closest?.("form");
-  const action = String(form?.action || "");
-  if (!form || !/\/checkout\/p\/[^/]+\/pay\/continue/i.test(action)) return false;
-  await waitIfPaused();
-  if (typeof form.requestSubmit === "function") {
-    form.requestSubmit();
-  } else if (typeof form.submit === "function") {
-    form.submit();
-  } else {
-    return false;
-  }
-  await sleep(180);
-  return true;
 }
 
 function businessPaymentSelectionPageOpen() {
@@ -7088,25 +7060,10 @@ async function handlePaymentSelection(activeJob) {
         await pauseForManualCheckout(activeJob, `Amazon Business had not finished retaining card ending in ${selectedDigits || cardPreferences.join(" or ")} before Continue.`);
         return true;
       }
-      // Amazon can replace the payment form after the stable-card wait. That
-      // replacement preserves the checked card visually but drops the AUI
-      // financial-offer submit event, causing Continue to reset to Points.
-      // Reapply and verify the offer on the final live form immediately before
-      // resolving/clicking its primary Continue control.
-      currentPreferredRadio = paymentRadioForDigits(selectedDigits);
-      if (!currentPreferredRadio || !await selectBusinessCardFinancialOffer(currentPreferredRadio)) {
-        await pauseForManualCheckout(activeJob, `Amazon Business did not retain the payment option for card ending in ${selectedDigits || cardPreferences.join(" or ")}.`);
-        return true;
-      }
       payment = findAccountPaymentSelection();
     }
     const finalContinueButton = nativePaymentContinueControl(payment?.continueButton) || continueButton;
-    const submittedBusinessForm = accountExperience === "business"
-      ? await submitBusinessPaymentForm(currentPreferredRadio)
-      : false;
-    if (!submittedBusinessForm) {
-      await clickElement(finalContinueButton, "Use this payment method button", { preClickDelayMs: 20, delayMs: 180 });
-    }
+    await clickElement(finalContinueButton, "Use this payment method button", { preClickDelayMs: 80, delayMs: 180 });
     showPanel("Nutricity checkout", "Payment method selected. Waiting for checkout.", null, null);
     let progress = accountExperience === "business"
       ? await waitForSettledBusinessPaymentOutcome(cardPreferences, 12000)
