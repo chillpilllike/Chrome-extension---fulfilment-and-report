@@ -1,7 +1,9 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from app.main import (
+    api_package_pickup_scan,
     dispatch_barcode_kind,
     dispatch_merge_scanned_codes,
     dispatch_scan_code_is_physical,
@@ -45,6 +47,14 @@ class DispatchBarcodeLinkingTests(unittest.TestCase):
         second = PackagePickupScanPayload(scan_code="TBA332841203092")
         first.alias_codes.append("SPqxPzY36T_001_v")
         self.assertEqual(second.alias_codes, [])
+
+    @patch("app.main.db")
+    def test_pickup_internal_label_is_ignored_without_history_write(self, database):
+        result = api_package_pickup_scan(PackagePickupScanPayload(scan_code="SPqxPzY36T_001_v"))
+        self.assertTrue(result["ignored"])
+        self.assertFalse(result["matched"])
+        self.assertNotIn("event_id", result)
+        database.assert_not_called()
 
 
 if __name__ == "__main__":

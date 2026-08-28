@@ -32304,7 +32304,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
                 COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0) AS odoo_orders_found,
                 COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0 AND order_ready=1) AS ready_to_ship_orders
             FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 {store_sql}
+            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 AND result_status!='needs_tracking_scan' {store_sql}
             """,
             params,
         ).fetchone()) or {}
@@ -32315,7 +32315,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
                    order_ready, order_total_packages, order_received_packages, order_remaining_packages,
                    order_readiness_message, remaining_packages_json, message, scanned_at
             FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 {store_sql}
+            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 AND result_status!='needs_tracking_scan' {store_sql}
             ORDER BY scanned_at DESC, id DESC
             LIMIT 1000
             """,
@@ -32495,6 +32495,15 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
     if not scan_code:
         raise HTTPException(400, "scan_code is required")
     barcode_kind = dispatch_barcode_kind(query_text)
+    if not payload.manual_entry and not dispatch_scan_code_is_physical(query_text):
+        return {
+            "ok": True,
+            "matched": False,
+            "ignored": True,
+            "barcode_kind": barcode_kind,
+            "scan_code": scan_code,
+            "message": "Non-tracking label ignored. Scan the long barcode beside the printed TBA tracking number.",
+        }
     alias_codes = [
         clean_text(value)
         for value in payload.alias_codes
@@ -32528,21 +32537,6 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "multiple_matches": bool(payload.manual_entry),
                 "match_count": len(matches),
                 "requested_length": requested_length,
-                "event_id": event_id,
-                "scan_code": scan_code,
-                "message": message,
-            }
-        if not matches and barcode_kind == "amazon_internal_label":
-            message = "Amazon square label read. Now scan the long barcode beside the printed TBA number."
-            event_id = record_package_pickup_scan_event(
-                conn, scan_code=scan_code, result_status="needs_tracking_scan", matched=False,
-                message=message, scanned_at=now, store_id=payload.store_id,
-            )
-            return {
-                "ok": True,
-                "matched": False,
-                "requires_tracking_scan": True,
-                "barcode_kind": barcode_kind,
                 "event_id": event_id,
                 "scan_code": scan_code,
                 "message": message,

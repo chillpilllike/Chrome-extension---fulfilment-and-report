@@ -676,7 +676,7 @@ type PackagePickupScanResponse = {
   matched: boolean
   duplicate?: boolean
   ambiguous?: boolean
-  requires_tracking_scan?: boolean
+  ignored?: boolean
   manual_entry?: boolean
   multiple_matches?: boolean
   match_count?: number
@@ -6489,7 +6489,7 @@ function PackagePickupPage({
     try {
       if (typeof window === "undefined") return []
       const parsed = JSON.parse(window.localStorage.getItem("package-pickup-last-scan-summary") || "[]")
-      return Array.isArray(parsed) ? parsed.filter((entry) => !entry?.duplicate).slice(0, 100) : []
+      return Array.isArray(parsed) ? parsed.filter((entry) => !entry?.duplicate && !/Amazon square label read/i.test(String(entry?.message || ""))).slice(0, 100) : []
     } catch {
       return []
     }
@@ -6509,7 +6509,6 @@ function PackagePickupPage({
   const pickupScannerControlsRef = useRef<IScannerControls | null>(null)
   const pickupScannerReaderRef = useRef<BrowserMultiFormatOneDReader | null>(null)
   const pickupHardwareInputRef = useRef<HTMLInputElement | null>(null)
-  const pickupPendingAliasRef = useRef("")
   const pickupScanEntriesRef = useRef<PackagePickupScanEntry[]>([])
   const pickupRecentScansRef = useRef<Map<string, number>>(new Map())
   const pickupScanQueueRef = useRef<Promise<void>>(Promise.resolve())
@@ -6625,7 +6624,7 @@ function PackagePickupPage({
   }
 
   function savePickupSummary(entries: PackagePickupScanEntry[]) {
-    const summary = entries.filter((entry) => !entry.duplicate).slice(0, 100)
+    const summary = entries.filter((entry) => !entry.duplicate && !/Amazon square label read/i.test(entry.message)).slice(0, 100)
     setLastPickupScanEntries(summary)
     try {
       window.localStorage.setItem("package-pickup-last-scan-summary", JSON.stringify(summary))
@@ -6645,28 +6644,20 @@ function PackagePickupPage({
   async function processPickupScan(rawCode: string, manualEntry = false) {
     const code = rawCode.trim()
     if (!code) return
-    const aliases = pickupPendingAliasRef.current ? [pickupPendingAliasRef.current] : []
+    if (!manualEntry && !isPhysicalDispatchBarcode(code)) {
+      setPickupScanFeedback("error", "Non-tracking label ignored. Scan the long barcode beside the printed TBA tracking number.")
+      return
+    }
     setPickupScannerStatus(`Checking ${code}…`)
     try {
       const result = await api<PackagePickupScanResponse>("/api/package-pickups/scan", {
         method: "POST",
-        body: JSON.stringify({ scan_code: code, alias_codes: aliases, store_id: storeId ? Number(storeId) : null, manual_entry: manualEntry }),
+        body: JSON.stringify({ scan_code: code, alias_codes: [], store_id: storeId ? Number(storeId) : null, manual_entry: manualEntry }),
       })
-      if (result.requires_tracking_scan) {
-        pickupPendingAliasRef.current = code
-        addPickupScanEntry({
-          eventId: result.event_id,
-          code,
-          ok: false,
-          message: result.message,
-          scannedAt: new Date().toISOString(),
-        })
-        void loadPickupScanHistory()
+      if (result.ignored) {
         setPickupScanFeedback("error", result.message)
-        setPickupScannerStatus(`${result.message} Keep the scanner open and scan the long TBA barcode.`)
         return
       }
-      pickupPendingAliasRef.current = ""
       const entry: PackagePickupScanEntry = {
         eventId: result.event_id,
         code,
@@ -6789,7 +6780,6 @@ function PackagePickupPage({
     setPickupManualTracking("")
     setPickupManualWarning("")
     setPickupUndoConfirm(false)
-    pickupPendingAliasRef.current = ""
     pickupRecentScansRef.current.clear()
     pickupScanQueueRef.current = Promise.resolve()
   }
@@ -6797,7 +6787,6 @@ function PackagePickupPage({
   function closePickupScanner(showSummary = true) {
     stopPickupScannerStream()
     setPickupScannerOpen(false)
-    pickupPendingAliasRef.current = ""
     if (pickupRefreshAfterCloseRef.current) {
       pickupRefreshAfterCloseRef.current = false
       void load()
