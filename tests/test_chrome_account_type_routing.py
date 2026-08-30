@@ -51,6 +51,16 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
         self.assertIn("COUNT(*) = 1", source[account_filter:candidate_limit])
         self.assertIn("source_line_count", source[account_filter:candidate_limit])
 
+    def test_strict_preferred_claim_does_not_fall_back_to_general_queue(self) -> None:
+        source = inspect.getsource(main.claim_next_chrome_job)
+        preferred = source.index("preferred_candidates = [")
+        claim_loop = source.index("for candidate in candidates:", preferred)
+        strict = source[preferred:claim_loop]
+        self.assertIn("elif preferred_only:", strict)
+        self.assertIn("candidates = []", strict)
+        endpoint_source = inspect.getsource(main.api_chrome_jobs)
+        self.assertGreaterEqual(endpoint_source.count("preferred_only=preferred_only"), 2)
+
     def test_queue_snapshot_filters_jobs_and_count_by_account_type(self) -> None:
         source = inspect.getsource(main.chrome_queue_snapshot)
         self.assertIn("account_experience", source)
@@ -60,6 +70,33 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
 
         endpoint_source = inspect.getsource(main.api_chrome_jobs)
         self.assertIn("account_experience=account_experience", endpoint_source)
+
+    def test_bulk_odoo_queue_deduplicates_refs_and_reports_partial_success(self) -> None:
+        def queue_result(order_name: str) -> dict:
+            if order_name == "ES00260":
+                raise main.HTTPException(404, "ES00260 was not found.")
+            return {
+                "ok": True,
+                "queued": 1,
+                "order_name": order_name,
+                "group_key": f"group-{order_name}",
+                "preferred_group_key": f"group-{order_name}",
+            }
+
+        with patch.object(main, "queue_one_chrome_order_by_name", side_effect=queue_result) as queue_one:
+            result = main.api_chrome_queue_order({
+                "source_text": "ES00259, ES00260\nES00259 NC25089",
+            })
+
+        self.assertEqual(
+            [call.args[0] for call in queue_one.call_args_list],
+            ["ES00259", "ES00260", "NC25089"],
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["partial_success"])
+        self.assertEqual(result["queued"], 2)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["preferred_group_keys"], ["group-ES00259", "group-NC25089"])
 
     def test_auto_order_start_date_is_inclusive_and_blocks_older_orders(self) -> None:
         self.assertTrue(main.chrome_order_is_on_or_after_start_date(

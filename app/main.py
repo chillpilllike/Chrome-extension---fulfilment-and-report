@@ -249,6 +249,7 @@ _STORE_CACHE_LOCK = threading.Lock()
 _SHOPIFY_QUEUE_LOCK = threading.Lock()
 _SHOPIFY_WORKER_RUNNING_LOCK = threading.Lock()
 _SHOPIFY_RATE_LIMIT_LOCK = threading.Lock()
+_SHOPIFY_PUSH_RECONCILE_LOCK = threading.Lock()
 _SHOPIFY_RATE_LIMIT_BUCKETS: dict[str, dict[str, float]] = {}
 _SHOPIFY_OAUTH_LOCK = threading.Lock()
 _SHOPIFY_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
@@ -2845,6 +2846,104 @@ def sync_odoo_ordered_tags_after_commit(pairs: set[tuple[int, int]]) -> None:
         sync_odoo_ordered_tags_for_pairs(pairs)
 
     threading.Thread(target=run, name="odoo-ordered-tag-sync", daemon=True).start()
+
+
+def recent_app_ordered_odoo_orders(days: int = 120, limit: int = 10000) -> list[dict[str, Any]]:
+    """Return Odoo orders whose app lines prove that an Amazon order was placed."""
+    safe_days = max(1, min(730, int(days or 120)))
+    safe_limit = max(1, min(50000, int(limit or 10000)))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=safe_days)).isoformat(timespec="seconds")
+    with db() as conn:
+        return rows_to_dicts(conn.execute(
+            """
+            SELECT store_id,
+                   odoo_order_id,
+                   MAX(odoo_order_name) AS odoo_order_name,
+                   MAX(ordered_at) AS last_ordered_at
+            FROM order_lines
+            WHERE COALESCE(amazon_order_id, '') != ''
+              AND state IN ('ordered', 'dispatched', 'delivered')
+              AND COALESCE(ordered_at, '') != ''
+              AND NULLIF(ordered_at, '')::timestamptz >= ?::timestamptz
+            GROUP BY store_id, odoo_order_id
+            ORDER BY MAX(NULLIF(ordered_at, '')::timestamptz) DESC
+            LIMIT ?
+            """,
+            (cutoff, safe_limit),
+        ).fetchall())
+
+
+def reconcile_missing_odoo_ordered_tags(days: int = 120, limit: int = 10000) -> dict[str, Any]:
+    """Restore missing ``ordered`` tags from durable app order evidence.
+
+    Odoo is read in store-sized batches and only orders actually missing the
+    tag are written. A later scheduled pass retries any transient failure.
+    """
+    candidates = recent_app_ordered_odoo_orders(days=days, limit=limit)
+    by_store: dict[int, list[dict[str, Any]]] = {}
+    for row in candidates:
+        by_store.setdefault(int(row["store_id"]), []).append(row)
+    summary: dict[str, Any] = {
+        "checked": 0,
+        "repaired": 0,
+        "missing_orders": [],
+        "not_found": [],
+        "errors": [],
+    }
+    for store_id, rows in sorted(by_store.items()):
+        try:
+            odoo = OdooClient(get_store(store_id))
+            tag_id = ensure_odoo_order_tag(odoo, ODOO_ORDERED_TAG_NAME)
+            if not tag_id:
+                raise RuntimeError("Odoo sale orders do not expose a tag model.")
+            order_ids = sorted({int(row["odoo_order_id"]) for row in rows})
+            remote_by_id: dict[int, dict[str, Any]] = {}
+            for offset in range(0, len(order_ids), 200):
+                batch = order_ids[offset:offset + 200]
+                found = odoo.search_read(
+                    "sale.order",
+                    [("id", "in", batch)],
+                    ["id", "name", "tag_ids"],
+                    limit=len(batch),
+                )
+                remote_by_id.update({int(order["id"]): order for order in found})
+            missing_ids: list[int] = []
+            names_by_id = {int(row["odoo_order_id"]): clean_text(row.get("odoo_order_name")) for row in rows}
+            for order_id in order_ids:
+                remote = remote_by_id.get(order_id)
+                if not remote:
+                    summary["not_found"].append(names_by_id.get(order_id) or str(order_id))
+                    continue
+                summary["checked"] += 1
+                if int(tag_id) not in {int(value) for value in (remote.get("tag_ids") or [])}:
+                    missing_ids.append(order_id)
+                    summary["missing_orders"].append(clean_text(remote.get("name")) or names_by_id.get(order_id) or str(order_id))
+            # Keep writes small because Odoo automations can make a large
+            # many-order tag update exceed the XML-RPC response timeout.
+            for offset in range(0, len(missing_ids), 20):
+                batch = missing_ids[offset:offset + 20]
+                odoo.write("sale.order", batch, {"tag_ids": [(4, int(tag_id))]})
+                summary["repaired"] += len(batch)
+        except Exception as exc:
+            summary["errors"].append({"store_id": store_id, "error": clean_error_message(exc)})
+            print(f"Odoo ordered tag reconciliation failed for store {store_id}: {exc}", flush=True)
+    return summary
+
+
+def odoo_ordered_tag_reconciliation_loop() -> None:
+    interval = max(60, int(os.getenv("ODOO_ORDERED_TAG_RECONCILE_SECONDS", "300") or 300))
+    while True:
+        try:
+            summary = reconcile_missing_odoo_ordered_tags()
+            if summary["repaired"] or summary["errors"]:
+                print(
+                    f"Odoo ordered tag reconciliation checked={summary['checked']} "
+                    f"repaired={summary['repaired']} errors={len(summary['errors'])}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"Odoo ordered tag reconciliation scheduler failed: {exc}", flush=True)
+        time.sleep(interval)
 
 
 class AmazonBusinessClient:
@@ -12141,6 +12240,7 @@ def claim_next_chrome_job(
     split_mixed_asin: bool = False,
     account_experience: str = "",
     preferred_group_key: str = "",
+    preferred_only: bool = False,
 ) -> Optional[dict[str, Any]]:
     worker_id = clean_text(worker_id)[:120] or f"worker-{uuid.uuid4().hex[:12]}"
     with db() as conn:
@@ -12308,11 +12408,18 @@ def claim_next_chrome_job(
         ).fetchall()
         preferred_group_key = clean_text(preferred_group_key)
         if preferred_group_key:
-            candidates = [
+            preferred_candidates = [
                 candidate
                 for candidate in candidates
                 if clean_text(candidate["amazon_group_key"]) == preferred_group_key
             ]
+            # A popup may remember a preferred job that another worker has
+            # already claimed or completed. Prefer it when available, but do
+            # not let a stale preference stall every other queued order.
+            if preferred_candidates:
+                candidates = preferred_candidates
+            elif preferred_only:
+                candidates = []
         for candidate in candidates:
             group_key = str(candidate["amazon_group_key"])
             candidate_rows = rows_to_dicts(conn.execute(
@@ -20275,14 +20382,183 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
                 UPDATE order_lines
                 SET fulfilment_note=CASE
                       WHEN COALESCE(fulfilment_note, '') = '' THEN ?
+                      WHEN fulfilment_note LIKE ? THEN fulfilment_note
                       ELSE fulfilment_note || ' | ' || ?
                     END,
                     updated_at=?
                 WHERE id IN ({})
                 """.format(",".join("?" for _ in line_ids)),
-                [f"Shopify {route.upper()} queued ({country or 'unknown country'})", f"Shopify {route.upper()} queued ({country or 'unknown country'})", utc_now(), *line_ids],
+                [
+                    f"Shopify {route.upper()} queued ({country or 'unknown country'})",
+                    f"%Shopify {route.upper()} queued ({country or 'unknown country'})%",
+                    f"Shopify {route.upper()} queued ({country or 'unknown country'})",
+                    utc_now(),
+                    *line_ids,
+                ],
             )
     return inserted
+
+
+SHOPIFY_PUSH_RECONCILE_INTERVAL_SECONDS = 5 * 60
+SHOPIFY_PUSH_RUNNING_STALE_SECONDS = 30 * 60
+
+
+def missing_shopify_push_candidates(limit: int = 1000) -> list[dict[str, Any]]:
+    """Return Amazon-placed orders that still have no durable Shopify order map."""
+    limit = max(1, min(5000, int(limit or 1000)))
+    with db() as conn:
+        return rows_to_dicts(conn.execute(
+            """
+            WITH eligible AS (
+                SELECT order_lines.store_id,
+                       order_lines.odoo_order_id,
+                       UPPER(order_lines.odoo_order_name) AS odoo_order_name,
+                       stores.odoo_db,
+                       MIN(COALESCE(order_lines.ordered_at, order_lines.updated_at, order_lines.created_at)) AS eligible_at
+                FROM order_lines
+                JOIN stores ON stores.id=order_lines.store_id
+                WHERE COALESCE(order_lines.amazon_order_id, '') != ''
+                  AND order_lines.order_engine IN ('chrome', 'rest', 'cxml', 'manual_amazon', 'third_party')
+                  AND order_lines.state IN ('ordered', 'dispatched', 'delivered')
+                  AND COALESCE(order_lines.odoo_order_name, '') != ''
+                GROUP BY order_lines.store_id,
+                         order_lines.odoo_order_id,
+                         UPPER(order_lines.odoo_order_name),
+                         stores.odoo_db
+            ), latest_job AS (
+                SELECT DISTINCT ON (store_id, UPPER(odoo_order_name))
+                       id AS job_id,
+                       store_id,
+                       UPPER(odoo_order_name) AS odoo_order_name,
+                       route,
+                       status AS job_status,
+                       locked_at AS job_locked_at,
+                       created_at
+                FROM shopify_fulfilment_jobs
+                ORDER BY store_id, UPPER(odoo_order_name), created_at DESC
+            )
+            SELECT eligible.*,
+                   latest_job.job_id,
+                   latest_job.route,
+                   latest_job.job_status
+            FROM eligible
+            LEFT JOIN latest_job
+              ON latest_job.store_id=eligible.store_id
+             AND latest_job.odoo_order_name=eligible.odoo_order_name
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM shopify_export_order_map
+                WHERE shopify_export_order_map.src_order_key=(eligible.odoo_db || ':' || eligible.odoo_order_name)
+                  AND COALESCE(shopify_export_order_map.dest_order_id, '') != ''
+            )
+            ORDER BY eligible.eligible_at ASC, eligible.odoo_order_name ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall())
+
+
+def reconcile_missing_shopify_pushes(limit: int = 1000, start_worker: bool = True) -> dict[str, Any]:
+    """Durably recover eligible orders whose transient enqueue follow-up was lost."""
+    if not _SHOPIFY_PUSH_RECONCILE_LOCK.acquire(blocking=False):
+        return {"candidates": 0, "queued": 0, "recovered_jobs": 0, "running": True}
+    try:
+        candidates = missing_shopify_push_candidates(limit)
+        stale_cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=SHOPIFY_PUSH_RUNNING_STALE_SECONDS)
+        stale_cutoff = stale_cutoff_dt.isoformat()
+        recoverable = []
+        for row in candidates:
+            if clean_text(row.get("job_status")) != "running":
+                recoverable.append(row)
+                continue
+            locked_at = parse_iso_date(clean_text(row.get("job_locked_at")))
+            if locked_at and locked_at <= stale_cutoff_dt:
+                recoverable.append(row)
+        if not recoverable:
+            return {"candidates": len(candidates), "queued": 0, "recovered_jobs": 0, "running": False}
+
+        job_ids = [clean_text(row.get("job_id")) for row in recoverable if clean_text(row.get("job_id"))]
+        order_keys = sorted({
+            (int(row["store_id"]), int(row["odoo_order_id"]), clean_text(row["odoo_order_name"]))
+            for row in recoverable
+        })
+        recovered_jobs = 0
+        eligible_rows: list[dict[str, Any]] = []
+        with db() as conn:
+            if job_ids:
+                cursor = conn.execute(
+                    f"""
+                    UPDATE shopify_fulfilment_jobs
+                    SET status='amazon_placed',
+                        attempts=0,
+                        last_error='',
+                        next_run_at=?,
+                        locked_at=NULL,
+                        completed_at=NULL,
+                        updated_at=?
+                    WHERE id IN ({','.join('?' for _ in job_ids)})
+                      AND (
+                           status!='running'
+                           OR (status='running' AND COALESCE(locked_at, updated_at, created_at) <= ?)
+                      )
+                    """,
+                    [utc_now(), utc_now(), stale_cutoff, *job_ids],
+                )
+                recovered_jobs = int(cursor.rowcount or 0)
+            for store_id, odoo_order_id, order_name in order_keys:
+                eligible_rows.extend(rows_to_dicts(conn.execute(
+                    """
+                    SELECT *
+                    FROM order_lines
+                    WHERE store_id=?
+                      AND odoo_order_id=?
+                      AND UPPER(odoo_order_name)=UPPER(?)
+                      AND COALESCE(amazon_order_id, '') != ''
+                      AND order_engine IN ('chrome', 'rest', 'cxml', 'manual_amazon', 'third_party')
+                      AND state IN ('ordered', 'dispatched', 'delivered')
+                    ORDER BY id
+                    """,
+                    (store_id, odoo_order_id, order_name),
+                ).fetchall()))
+
+        queued = enqueue_shopify_fulfilment_for_rows(eligible_rows) if eligible_rows else 0
+        if start_worker and (queued or recovered_jobs):
+            start_shopify_fulfilment_worker()
+        if queued or recovered_jobs:
+            fast_page_cache_clear_matching({"shopify-fulfilment", "fulfilment-pending", "dashboard", "orders"})
+        return {
+            "candidates": len(candidates),
+            "queued": int(queued or 0),
+            "recovered_jobs": recovered_jobs,
+            "running": False,
+            "orders": [row["odoo_order_name"] for row in recoverable],
+        }
+    finally:
+        _SHOPIFY_PUSH_RECONCILE_LOCK.release()
+
+
+def shopify_push_reconciliation_loop() -> None:
+    # Allow schema/bootstrap work to settle before the first recovery sweep.
+    time.sleep(60)
+    while True:
+        try:
+            result = reconcile_missing_shopify_pushes()
+            set_setting("shopify_push_reconcile_last_run_at", utc_now())
+            set_setting(
+                "shopify_push_reconcile_last_message",
+                (
+                    f"Checked {result['candidates']} missing Shopify push candidate(s); "
+                    f"queued {result['queued']} and recovered {result['recovered_jobs']} existing job(s)."
+                ),
+            )
+        except Exception as exc:
+            message = f"Shopify push reconciliation failed: {clean_error_message(exc)}"
+            try:
+                set_setting("shopify_push_reconcile_last_message", message)
+            except Exception:
+                pass
+            print(message, flush=True)
+        time.sleep(SHOPIFY_PUSH_RECONCILE_INTERVAL_SECONDS)
 
 
 def claim_shopify_fulfilment_job() -> Optional[dict[str, Any]]:
@@ -24222,6 +24498,7 @@ def startup() -> None:
                 should_reindex_typesense = typesense_enabled() and get_setting("typesense_schema_version", "") != TYPESENSE_SCHEMA_VERSION
                 threading.Thread(target=shopify_tracking_schedule_loop, daemon=True).start()
                 threading.Thread(target=package_tracker_shopify_status_schedule_loop, daemon=True).start()
+                threading.Thread(target=shopify_push_reconciliation_loop, daemon=True).start()
                 threading.Thread(target=init_db, daemon=True).start()
                 resume_interrupted_shopify_tracking_jobs()
                 threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
@@ -24229,6 +24506,7 @@ def startup() -> None:
                 threading.Thread(target=backup_loop, daemon=True).start()
                 threading.Thread(target=amazon_otp_loop, daemon=True).start()
                 threading.Thread(target=odoo_chatter_outbox_schedule_loop, daemon=True).start()
+                threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
                 if should_reindex_typesense:
                     threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
                 threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
@@ -29497,6 +29775,7 @@ def api_chrome_jobs(
     split_mixed_asin: bool = False,
     account_experience: str = "",
     preferred_group_key: str = "",
+    preferred_only: bool = False,
 ) -> dict[str, Any]:
     if claim:
         if not auto_chrome_ordering_enabled():
@@ -29521,6 +29800,7 @@ def api_chrome_jobs(
             split_mixed_asin=split_mixed_asin,
             account_experience=account_experience,
             preferred_group_key=preferred_group_key,
+            preferred_only=preferred_only,
         )
         # Before handing a fresh claim to Chrome, consume any one exact,
         # non-cancelled Amazon-history match. This prevents a previously
@@ -29549,6 +29829,7 @@ def api_chrome_jobs(
                 split_mixed_asin=split_mixed_asin,
                 account_experience=account_experience,
                 preferred_group_key=preferred_group_key,
+                preferred_only=preferred_only,
             )
         return {
             "ok": True,
@@ -29564,6 +29845,242 @@ def api_chrome_jobs(
         account_experience=account_experience,
     )
     return {"ok": True, **snapshot}
+
+
+def queued_chrome_order_by_name(order_name: str) -> Optional[dict[str, Any]]:
+    """Return the live whole-order Chrome queue entry for an exact Odoo order."""
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE UPPER(odoo_order_name)=?
+              AND order_engine='chrome'
+              AND state='submitted'
+              AND COALESCE(amazon_order_id, '')=''
+              AND COALESCE(amazon_group_key, '')!=''
+            ORDER BY updated_at DESC, id ASC
+            """,
+            (order_name,),
+        ).fetchall())
+    if not rows:
+        return None
+    group_key = clean_text(rows[0].get("amazon_group_key"))
+    group_rows = [row for row in rows if clean_text(row.get("amazon_group_key")) == group_key]
+    return chrome_job_from_rows(group_rows) if group_rows else None
+
+
+def queue_one_chrome_order_by_name(order_name: str) -> dict[str, Any]:
+    """Pull one Odoo order and enqueue all of its eligible ASIN lines atomically."""
+    order_name = clean_text(order_name).upper()
+    if not ORDER_REF_RE.fullmatch(order_name):
+        raise HTTPException(400, "Enter one valid Odoo order number, for example ES00259.")
+
+    # Never refresh a live queue entry from Odoo. The regular Odoo upsert may
+    # update line state, so pulling here could otherwise disturb an active or
+    # waiting whole-order job.
+    existing_job = queued_chrome_order_by_name(order_name)
+    if existing_job:
+        return {
+            "ok": True,
+            "already_queued": True,
+            "queued": 0,
+            "order_name": order_name,
+            "group_key": existing_job["group_key"],
+            "preferred_group_key": existing_job["group_key"],
+            "job": existing_job,
+            "message": f"{order_name} is already in the queue and will be processed first when you click Process queued orders.",
+        }
+
+    with db() as conn:
+        known_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT store_id, odoo_order_id, amazon_order_id
+            FROM order_lines
+            WHERE UPPER(odoo_order_name)=?
+            ORDER BY updated_at DESC, id ASC
+            """,
+            (order_name,),
+        ).fetchall())
+    existing_amazon_ids = sorted({
+        clean_text(row.get("amazon_order_id"))
+        for row in known_rows
+        if clean_text(row.get("amazon_order_id"))
+    })
+    if existing_amazon_ids:
+        raise HTTPException(
+            409,
+            f"{order_name} already has Amazon order {', '.join(existing_amazon_ids)} and was not queued again.",
+        )
+
+    known_store_ids = sorted({int(row["store_id"]) for row in known_rows if int(row.get("store_id") or 0) > 0})
+    candidate_store_ids = known_store_ids or [int(store["id"]) for store in list_stores()]
+    if not candidate_store_ids:
+        raise HTTPException(400, "Add an Odoo store before queueing an order.")
+
+    pulled = 0
+    fetched = 0
+    eligible = 0
+    busy_stores: list[str] = []
+    warnings: list[str] = []
+    for store_id in candidate_store_ids:
+        store = get_store(store_id)
+        result = fetch_odoo_orders_by_names_exclusive(store, [order_name], wait=False, return_details=True)
+        if result is None:
+            busy_stores.append(store.name)
+            continue
+        if isinstance(result, dict):
+            pulled += int(result.get("inserted") or 0)
+            fetched += int(result.get("fetched") or 0)
+            eligible += int(result.get("eligible") or 0)
+            warnings.extend(clean_text(value) for value in (result.get("warnings") or []) if clean_text(value))
+        else:
+            pulled += int(result or 0)
+
+    if busy_stores:
+        raise HTTPException(409, f"Another Odoo pull is running for {', '.join(busy_stores)}. Try again when it finishes.")
+    if eligible <= 0:
+        warning_text = f" {'; '.join(warnings[:4])}" if warnings else ""
+        if fetched:
+            raise HTTPException(409, f"{order_name} was found in Odoo but is not eligible for fulfilment.{warning_text}")
+        raise HTTPException(404, f"{order_name} was not found in the configured Odoo stores.{warning_text}")
+
+    with db() as conn:
+        order_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE UPPER(odoo_order_name)=?
+            ORDER BY store_id, odoo_order_id, id
+            """,
+            (order_name,),
+        ).fetchall())
+    if not order_rows:
+        warning_text = f" {'; '.join(warnings[:4])}" if warnings else ""
+        raise HTTPException(404, f"{order_name} was not found in the configured Odoo stores.{warning_text}")
+
+    identities = {(int(row["store_id"]), int(row["odoo_order_id"])) for row in order_rows}
+    if len(identities) != 1:
+        raise HTTPException(409, f"{order_name} matched more than one configured Odoo order. Select it from the app instead.")
+    store_id, _odoo_order_id = next(iter(identities))
+    amazon_ids = sorted({clean_text(row.get("amazon_order_id")) for row in order_rows if clean_text(row.get("amazon_order_id"))})
+    if amazon_ids:
+        raise HTTPException(409, f"{order_name} already has Amazon order {', '.join(amazon_ids)} and was not queued again.")
+
+    queued, _cleared, blocked, account, details = queue_chrome_order_groups_fast(
+        store_id,
+        line_ids=[int(row["id"]) for row in order_rows],
+    )
+    job = queued_chrome_order_by_name(order_name)
+    if not queued or not job:
+        reason = " | ".join(details[:4]) if details else "No eligible unfulfilled ASIN lines were available."
+        if warnings:
+            reason += f" {'; '.join(warnings[:4])}"
+        return {
+            "ok": False,
+            "queued": 0,
+            "blocked": blocked,
+            "order_name": order_name,
+            "message": f"{order_name} was imported but not queued. {reason}",
+        }
+
+    asin_count = len(job.get("items") or [])
+    return {
+        "ok": True,
+        "already_queued": False,
+        "queued": queued,
+        "pulled": pulled,
+        "blocked": blocked,
+        "order_name": order_name,
+        "group_key": job["group_key"],
+        "preferred_group_key": job["group_key"],
+        "amazon_account_name": clean_text(account["name"]),
+        "job": job,
+        "message": f"Imported {order_name} and queued all {asin_count} ASIN{'s' if asin_count != 1 else ''}. It will be processed first when you click Process queued orders.",
+    }
+
+
+@app.post("/api/chrome/queue/order")
+def api_chrome_queue_order(payload: dict[str, Any]) -> dict[str, Any]:
+    """Import and queue one or more exact Odoo order references."""
+    raw_values = (
+        payload.get("order_names")
+        or payload.get("orders")
+        or payload.get("order_name")
+        or payload.get("odoo_order_name")
+        or payload.get("source_text")
+        or ""
+    )
+    values = raw_values if isinstance(raw_values, list) else [raw_values]
+    order_names = list(dict.fromkeys(
+        match.group(0).upper()
+        for value in values
+        for match in ORDER_REF_RE.finditer(str(value or ""))
+    ))[:100]
+    if not order_names:
+        raise HTTPException(400, "Enter at least one valid Odoo order number, for example ES00259.")
+
+    results: list[dict[str, Any]] = []
+    for order_name in order_names:
+        try:
+            results.append(queue_one_chrome_order_by_name(order_name))
+        except HTTPException as exc:
+            results.append({
+                "ok": False,
+                "queued": 0,
+                "order_name": order_name,
+                "status_code": int(exc.status_code),
+                "message": clean_text(exc.detail) or f"{order_name} could not be queued.",
+            })
+        except Exception as exc:
+            results.append({
+                "ok": False,
+                "queued": 0,
+                "order_name": order_name,
+                "status_code": 500,
+                "message": str(exc) or f"{order_name} could not be queued.",
+            })
+
+    successful = [result for result in results if result.get("ok")]
+    failed = [result for result in results if not result.get("ok")]
+    newly_queued = sum(int(result.get("queued") or 0) for result in successful)
+    already_queued = sum(1 for result in successful if result.get("already_queued"))
+    preferred_group_keys = list(dict.fromkeys(
+        clean_text(result.get("preferred_group_key") or result.get("group_key"))
+        for result in successful
+        if clean_text(result.get("preferred_group_key") or result.get("group_key"))
+    ))
+    if len(order_names) == 1:
+        result = results[0]
+        return {
+            **result,
+            "results": results,
+            "preferred_group_keys": preferred_group_keys,
+        }
+
+    summary = (
+        f"Processed {len(order_names)} Odoo order numbers: "
+        f"{newly_queued} newly queued, {already_queued} already queued, {len(failed)} failed."
+    )
+    if failed:
+        summary += " " + " | ".join(
+            f"{result['order_name']}: {clean_text(result.get('message'))}"
+            for result in failed[:6]
+        )
+        if len(failed) > 6:
+            summary += f" | plus {len(failed) - 6} more failure(s)."
+    return {
+        "ok": bool(successful) and not failed,
+        "partial_success": bool(successful) and bool(failed),
+        "order_names": order_names,
+        "queued": newly_queued,
+        "already_queued": already_queued,
+        "failed": len(failed),
+        "preferred_group_key": preferred_group_keys[0] if preferred_group_keys else "",
+        "preferred_group_keys": preferred_group_keys,
+        "results": results,
+        "message": summary,
+    }
 
 
 @app.get("/api/chrome/jobs/recover-submitted")

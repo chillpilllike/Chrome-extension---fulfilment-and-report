@@ -168,14 +168,39 @@
 .nutricity-order-history-annotation {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  flex-wrap: wrap;
   gap: 8px;
-  margin-top: 8px;
-  padding: 6px 0 0;
-  border-top: 1px solid rgba(15, 23, 42, 0.12);
+  margin: 0;
+  padding: 0;
+  border: 0;
   color: #172033;
   font: 12px/1.35 Arial, sans-serif;
-  text-align: right;
+  text-align: left;
+}
+
+.nutricity-order-history-card-verification {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(22, 101, 52, 0.24);
+  border-radius: 7px;
+  background: #f0fdf4;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
+.nutricity-order-history-card-verification-title {
+  color: #14532d;
+  font: 700 12px/1.3 Arial, sans-serif;
+}
+
+.nutricity-order-history-card-verification .nutricity-order-history-annotation + .nutricity-order-history-annotation {
+  padding-top: 8px;
+  border-top: 1px solid rgba(15, 23, 42, 0.12);
 }
 
 .nutricity-order-details-anchor {
@@ -223,6 +248,19 @@
   font-size: 11px;
   font-weight: 700;
   padding: 3px 7px;
+}
+
+.nutricity-order-history-amazon-id {
+  display: inline-block;
+  flex: 0 0 auto;
+  border: 1px solid rgba(30, 64, 175, 0.22);
+  border-radius: 999px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 7px;
+  white-space: nowrap;
 }
 
 .nutricity-order-history-annotation.is-miss .nutricity-order-history-label {
@@ -306,11 +344,12 @@
 .nutricity-order-history-copy {
   position: relative;
   display: inline-flex;
-  width: 16px;
-  height: 16px;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
   margin: 0 0 0 4px;
   padding: 0;
-  vertical-align: -3px;
+  vertical-align: middle;
   border: 1px solid rgba(37, 99, 235, 0.3);
   border-radius: 4px;
   background: #fff;
@@ -329,13 +368,13 @@
 }
 
 .nutricity-order-history-copy::before {
-  left: 4px;
+  left: 3px;
   top: 3px;
 }
 
 .nutricity-order-history-copy::after {
-  left: 7px;
-  top: 5px;
+  left: 6px;
+  top: 6px;
 }
 
 .nutricity-order-history-copy:hover {

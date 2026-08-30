@@ -7,6 +7,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BACKGROUND = (ROOT / "chrome-extension" / "background.js").read_text()
 CONTENT = (ROOT / "chrome-extension" / "content.js").read_text()
+CONTENT_CSS = (ROOT / "chrome-extension" / "content.css").read_text()
 MANIFEST = json.loads((ROOT / "chrome-extension" / "manifest.json").read_text())
 POPUP_HTML = (ROOT / "chrome-extension" / "popup.html").read_text()
 POPUP_JS = (ROOT / "chrome-extension" / "popup.js").read_text()
@@ -63,7 +64,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('accountExperience === "business"', product)
         self.assertIn("await waitUntil(findSubscribeAddToCartTarget, 15000, 250)", product)
         self.assertIn("Fulfilment paused without switching to One-time purchase", product)
-        self.assertIn("Business multi-ASIN orders must stay in the normal Amazon cart", product)
+        self.assertIn("Amazon Business orders must stay in the normal cart", product)
         self.assertNotIn('accountExperience !== "consumer"', product)
         self.assertNotIn("mixedSnsOneTimeFallbackAsins", product)
         self.assertNotIn("persist_consumer_mixed_sns_one_time_fallback", product)
@@ -161,7 +162,149 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.163")
+        self.assertEqual(MANIFEST["version"], "0.1.188")
+
+    def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
+        self.assertIn('id="odooOrderNumber"', POPUP_HTML)
+        self.assertIn('id="queueOdooOrder"', POPUP_HTML)
+        self.assertIn('type: "QUEUE_ODOO_ORDERS", orderNames', POPUP_JS)
+        self.assertIn('if (message.type === "QUEUE_ODOO_ORDER")', BACKGROUND)
+        self.assertIn('if (message.type === "QUEUE_ODOO_ORDERS")', BACKGROUND)
+        self.assertIn('/api/chrome/queue/order', BACKGROUND)
+        self.assertIn('preferred_group_key=', BACKGROUND)
+        self.assertIn('@app.post("/api/chrome/queue/order")', APP)
+        self.assertIn('results.append(queue_one_chrome_order_by_name(order_name))', APP)
+
+    def test_imported_odoo_orders_auto_start_and_never_fall_through_to_general_queue(self) -> None:
+        queue_start = BACKGROUND.index("async function queueOdooOrders")
+        queue_end = BACKGROUND.index("async function nextPreferredQueueGroupKey", queue_start)
+        queue = BACKGROUND[queue_start:queue_end]
+        self.assertIn("storedPreferences.preferredQueueGroupKeys", queue)
+        self.assertIn("mergedPreferredGroupKeys", queue)
+        self.assertIn("preferredQueueOrderNames", queue)
+        self.assertIn("startManualQueueRun(windowId)", queue)
+        self.assertIn("processing", queue)
+        self.assertIn("function preferredQueueJobIsClaimable", BACKGROUND)
+        self.assertGreaterEqual(BACKGROUND.count("preferredQueueJobIsClaimable(preferredGroupKey"), 2)
+        self.assertIn("claim=false&job_limit=250", BACKGROUND)
+        self.assertIn("&preferred_only=true", BACKGROUND)
+        self.assertIn("The general queue was not claimed", BACKGROUND)
+        self.assertIn("did not fall through to the general queue", BACKGROUND)
+        self.assertIn("preferred_only: bool = False", APP)
+        self.assertIn("elif preferred_only:", APP)
+        self.assertIn("candidates = []", APP)
+
+    def test_manual_queue_start_clears_processing_latch_after_startup_exception(self) -> None:
+        start = BACKGROUND.index("async function startManualQueueRun(windowId)")
+        end = BACKGROUND.index("async function stopAutoOrdering", start)
+        helper = BACKGROUND[start:end]
+        self.assertIn("try {", helper)
+        self.assertIn("} catch (error) {", helper)
+        self.assertIn("await setManualQueueRunning(false)", helper)
+        self.assertIn("manual_queue_running: false", helper)
+        self.assertIn("Could not start manual queued orders", helper)
+
+    def test_manual_queue_latch_is_session_only_and_removes_legacy_local_value(self) -> None:
+        start = BACKGROUND.index("async function manualQueueIsRunning()")
+        end = BACKGROUND.index("async function visibleQueueRunIsEnabled()", start)
+        helper = BACKGROUND[start:end]
+        self.assertIn("chrome.storage.session.get", helper)
+        self.assertIn("chrome.storage.session.set", helper)
+        self.assertIn('chrome.storage.local.remove("manualQueueRunning")', helper)
+        self.assertNotIn("chrome.storage.local.get({ manualQueueRunning", helper)
+
+    def test_delivery_preferences_are_remembered_per_order_recipient(self) -> None:
+        helper_start = CONTENT.index("async function rememberWarehouseDeliveryPreferencesVerified")
+        helper_end = CONTENT.index("function checkoutDeliveryPreferencesTrigger", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        self.assertIn("deliveryPreferencesVerifiedRecipient = recipientName(activeJob)", helper)
+        self.assertIn("deliveryPreferencesVerifiedAt = Date.now()", helper)
+        ensure_start = CONTENT.index("async function ensureWarehouseDeliveryPreferences")
+        ensure_end = CONTENT.index("async function ensurePreferredAmazonDayWeekdayDelivery", ensure_start)
+        ensure = CONTENT[ensure_start:ensure_end]
+        self.assertIn("activeJob.deliveryPreferencesVerifiedRecipient === expectedRecipient", ensure)
+        self.assertIn("await rememberWarehouseDeliveryPreferencesVerified(activeJob);", ensure)
+
+    def test_checkout_does_not_claim_submission_before_safety_checks(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        self.assertIn("Checkout is ready. Running final safety checks.", checkout)
+        self.assertNotIn("Checkout is ready. Placing the order.", checkout)
+
+    def test_checkout_poll_cannot_release_financial_confirmation_pause(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        ready_start = checkout.index("const readyPlaceOrder = findPlaceOrderButton();")
+        ready_end = checkout.index('if (activeJob.stage === "editing_address")', ready_start)
+        ready = checkout[ready_start:ready_end]
+        self.assertIn("if (activeJob.paused) return;", ready)
+        self.assertNotIn("activeJob.paused = false", ready)
+        self.assertNotIn("allowUnpause: true", ready)
+
+    def test_regular_free_form_quantity_requires_enabled_purchase_control(self) -> None:
+        accepted_start = CONTENT.index('function quantityValueAccepted(context = "regular", qty = 1)')
+        accepted_end = CONTENT.index("function syncSubscribeAndSaveQuantity", accepted_start)
+        accepted = CONTENT[accepted_start:accepted_end]
+        self.assertIn('if (context !== "sns") return Boolean(findRegularAddToCartTarget());', accepted)
+
+    def test_business_checkout_allows_valid_subscription_savings(self) -> None:
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        self.assertNotIn("checkoutShowsSubscriptionSavings()", checkout)
+        self.assertNotIn("Amazon Business checkout contains Subscribe & Save", checkout)
+
+    def test_final_purchase_pause_respects_popup_setting(self) -> None:
+        guard_start = CONTENT.index("async function pauseBeforeAmazonSubmitIfRequired")
+        guard_end = CONTENT.index("async function saveEditedAddress", guard_start)
+        guard = CONTENT[guard_start:guard_end]
+        self.assertIn("if (state.pauseBeforePlaceOrder !== true) return false;", guard)
+        self.assertIn("if (activeJob?.[approvalKey]) return false;", guard)
+
+    def test_business_single_asin_can_use_subscription_but_mixed_order_cannot(self) -> None:
+        decision_start = CONTENT.index("const snsIsCheaper =")
+        decision_end = CONTENT.index("await sendDiagnostic(\"Account-specific product purchase decision.\"", decision_start)
+        decision = CONTENT[decision_start:decision_end]
+        self.assertIn("snsIsCheaper && !businessMixedOrder", decision)
+        product_start = CONTENT.index("async function handleProduct")
+        product_end = CONTENT.index("async function handleAddClicked", product_start)
+        product = CONTENT[product_start:product_end]
+        self.assertIn("if (snsIsCheaper && businessMixedOrder)", product)
+        self.assertIn("mixed Amazon Business orders must stay in the normal cart", product)
+
+    def test_duplicate_check_retries_common_local_api_outages(self) -> None:
+        self.assertIn("function transientApiError", BACKGROUND)
+        matcher_start = BACKGROUND.index("function transientApiError")
+        matcher_end = BACKGROUND.index("async function getSettings", matcher_start)
+        matcher = BACKGROUND[matcher_start:matcher_end]
+        for marker in ("failed to fetch", "fetch failed", "connection refused", "econnrefused", "load failed"):
+            self.assertIn(marker, matcher.lower())
+        duplicate_start = BACKGROUND.index("async function checkExistingAmazonOrder")
+        duplicate_end = BACKGROUND.index("async function resetDuplicateFulfilment", duplicate_start)
+        duplicate = BACKGROUND[duplicate_start:duplicate_end]
+        self.assertIn("transientApiError(message)", duplicate)
+
+    def test_saved_hosted_api_is_not_replaced_by_tab_discovery(self) -> None:
+        self.assertIn('const DEFAULT_API_BASE = "https://fulfilment.gofinch.com";', BACKGROUND)
+        self.assertIn('const DEFAULT_API_BASE = "https://fulfilment.gofinch.com";', CONTENT)
+        self.assertIn('settings.apiBase || "https://fulfilment.gofinch.com"', POPUP_JS)
+        self.assertIn("function isLocalApiBase", BACKGROUND)
+        queue_start = BACKGROUND.index("async function getQueueStatus")
+        queue_end = BACKGROUND.index("async function getQueueJobsForActiveRefresh", queue_start)
+        queue = BACKGROUND[queue_start:queue_end]
+        self.assertIn("const allowAppTabDiscovery = isLocalApiBase(configuredApiBase);", queue)
+        self.assertIn("if (empty && allowAppTabDiscovery)", queue)
+        self.assertIn("const discovered = allowAppTabDiscovery", queue)
+        self.assertIn("? await discoverAppQueue(null, accountExperience)", queue)
+
+    def test_connection_error_names_the_configured_host_type(self) -> None:
+        error_start = BACKGROUND.index("function connectionErrorMessage")
+        error_end = BACKGROUND.index("async function testConnection", error_start)
+        error_block = BACKGROUND[error_start:error_end]
+        self.assertIn("isLocalApiBase(configuredBase)", error_block)
+        self.assertIn("Could not reach the hosted app", error_block)
 
     def test_manual_queue_mode_is_independent_from_auto_ordering(self) -> None:
         self.assertIn("async function manualQueueIsRunning()", BACKGROUND)
@@ -857,7 +1000,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("snsIsCheaper && !businessMixedOrder", product)
         self.assertIn("{ requireCartAdd: consumerMixedSubscription }", product)
         self.assertIn('consumerMixedSubscription ? "subscribe-save-cart" : "subscribe-save"', product)
-        self.assertIn("Business multi-ASIN orders must stay in the normal Amazon cart", product)
+        self.assertIn("mixed Amazon Business orders must stay in the normal cart", product)
         self.assertIn("await waitUntil(findSubscribeAddToCartTarget, 15000, 250)", product)
         self.assertIn("Fulfilment paused without switching to One-time purchase", product)
 
@@ -866,7 +1009,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         product_end = CONTENT.index("async function handleAddClicked", product_start)
         product = CONTENT[product_start:product_end]
         self.assertIn("const snsIsCheaper = priceSnapshot.sns && priceSnapshot.regular", product)
-        self.assertIn("const useSubscribeAndSave = Boolean(snsIsCheaper", product)
+        self.assertIn("const useSubscribeAndSave = Boolean(snsIsCheaper && !businessMixedOrder)", product)
         self.assertIn("applySubscribeAndSaveIfCheaper", product)
         self.assertIn("requireCartAdd: consumerMixedSubscription", product)
         self.assertIn("activateOneTimePurchaseOption()", product)
@@ -948,6 +1091,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         resume_start = CONTENT.index("async function autoResumeResolvedCheckoutPause")
         resume_end = CONTENT.index("async function run()", resume_start)
         resume = CONTENT[resume_start:resume_end]
+        self.assertIn('if (pausedStage !== "editing_address") return false;', resume)
         self.assertIn("placeOrder &&", resume)
         self.assertIn("!findAddressNameInput()", resume)
         self.assertNotIn("checkoutRecipientConfirmed(checkoutRecipient) &&", resume)
@@ -956,6 +1100,19 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
         checkout = CONTENT[checkout_start:checkout_end]
         self.assertLess(checkout.index("ensureCheckoutOnlyExpectedUnits"), checkout.index("protectBeforeAmazonSubmit"))
+
+    def test_final_checkout_pause_is_never_auto_resumed(self) -> None:
+        resume_start = CONTENT.index("async function autoResumeResolvedCheckoutPause(activeJob)")
+        resume_end = CONTENT.index("async function run()", resume_start)
+        resume = CONTENT[resume_start:resume_end]
+        self.assertIn('if (pausedStage !== "editing_address") return false;', resume)
+        self.assertNotIn('["checkout", "editing_address"].includes(pausedStage)', resume)
+
+    def test_selected_delivery_ignores_hidden_preload_modal_radios(self) -> None:
+        selected_start = CONTENT.index("function selectedDeliveryRadioContext()")
+        selected_end = CONTENT.index("function deliveryTextCalendarDates", selected_start)
+        selected = CONTENT[selected_start:selected_end]
+        self.assertIn("!radio.disabled && visible(radio)", selected)
 
     def test_free_next_day_confirmation_requeries_checked_radio(self) -> None:
         selection_start = CONTENT.index("function freeNextDayDeliverySelected()")
@@ -1044,6 +1201,11 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
     def test_warehouse_holiday_delivery_uses_brooklyn_timezone(self) -> None:
         self.assertIn('timeZone: "America/New_York"', CONTENT)
         self.assertIn('return ["Fri", "Sat"].includes(brooklynWeekday(now));', CONTENT)
+        weekday_start = CONTENT.index("function brooklynWeekday(now = new Date())")
+        weekday_end = CONTENT.index("function brooklynNextDayIsWarehouseHoliday", weekday_start)
+        weekday = CONTENT[weekday_start:weekday_end]
+        self.assertIn('now.toLocaleDateString("en-US"', weekday)
+        self.assertNotIn("new Intl.DateTimeFormat", weekday)
         reward_start = CONTENT.index("async function ensureRewardedLaterDelivery")
         reward_end = CONTENT.index("function checkoutDeliveryPromiseText", reward_start)
         reward = CONTENT[reward_start:reward_end]
@@ -1092,6 +1254,16 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
             reward.index("state.preferRewardedLaterDelivery === true"),
         )
 
+    def test_one_weekday_date_range_is_not_mistaken_for_split_delivery(self) -> None:
+        helper_start = CONTENT.index("function deliveryContextHasSplitPromise(context)")
+        helper_end = CONTENT.index("function deliveryContextIsNotConsolidated(context)", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        self.assertNotIn("namedDays.size > 1", helper)
+        self.assertNotIn("datedPromises.size > 1", helper)
+        self.assertIn("arrive|be delivered", helper)
+        self.assertIn("separately|on different", helper)
+        self.assertIn("Wednesday, Sep 2 - Thursday, Sep 3", helper)
+
     def test_checkout_fails_closed_if_weekend_delivery_remains_selected(self) -> None:
         guard_start = CONTENT.index("async function checkoutDeliveryWindowIsAllowed")
         guard_end = CONTENT.index("function checkoutQuantityFromPage", guard_start)
@@ -1110,6 +1282,18 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("date.getDay()", helpers)
         self.assertIn("[0, 6].includes", helpers)
         self.assertIn("date.getDay() >= 1 && date.getDay() <= 5", helpers)
+
+    def test_relative_delivery_days_use_brooklyn_warehouse_weekday(self) -> None:
+        helper_start = CONTENT.index('function deliveryTextIncludesWarehouseClosedDay(value = "", now = new Date())')
+        helper_end = CONTENT.index("function deliveryContextIncludesWarehouseClosedDay", helper_start)
+        helpers = CONTENT[helper_start:helper_end]
+        self.assertIn("const brooklynDay = brooklynWeekday(now)", helpers)
+        self.assertIn('["Fri", "Sat"].includes(brooklynDay)', helpers)
+        self.assertIn('["Sat", "Sun"].includes(brooklynDay)', helpers)
+        self.assertIn('/\\btomorrow\\b/i.test(text)', helpers)
+        self.assertIn('/\\btoday\\b/i.test(text)', helpers)
+        self.assertIn('!["Fri", "Sat"].includes(brooklynDay)', helpers)
+        self.assertIn('!["Sat", "Sun"].includes(brooklynDay)', helpers)
 
     def test_checkout_promise_ignores_unselected_delivery_rows(self) -> None:
         promise_start = CONTENT.index("function checkoutDeliveryPromiseText()")
@@ -1190,6 +1374,145 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('activeJob.cartMissingAddRetries = { ...retries, [retryKey]: 1 }', helper)
         self.assertIn('reason: "retry_proven_missing_cart_item_once"', helper)
         self.assertIn("actualQuantity === 0 && await retryProvenMissingCartItemOnce", cart)
+
+    def test_consumer_product_without_quantity_control_defers_quantity_to_cart(self) -> None:
+        helper_start = CONTENT.index("function canDeferConsumerQuantityToCart")
+        helper_end = CONTENT.index("function rememberConsumerCartQuantityFallback", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        product_start = CONTENT.index("const quantitySet = await setQuantity", CONTENT.index("async function handleProduct"))
+        product_end = CONTENT.index("const addButton = await waitUntil(findRegularAddToCartTarget", product_start)
+        product = CONTENT[product_start:product_end]
+        self.assertIn('accountExperience !== "consumer"', helper)
+        self.assertIn('activeJob?.job?.required_account_experience === "business"', helper)
+        self.assertIn("requestedQuantity <= 1", helper)
+        self.assertIn("quantityIssue?.message", helper)
+        self.assertIn("!findRegularAddToCartTarget()", helper)
+        self.assertIn("productQuantityControls.length === 0", helper)
+        self.assertIn("rememberConsumerCartQuantityFallback(activeJob, purchaseItem.asin, requestedQuantity)", product)
+        self.assertIn('reason: "consumer_product_quantity_deferred_to_cart"', product)
+        self.assertIn("!quantitySet && !deferConsumerQuantityToCart", product)
+        self.assertIn("requestedQuantity > 1 && !deferConsumerQuantityToCart", product)
+
+    def test_consumer_cart_fallback_increments_one_exact_asin_row_and_rechecks_each_click(self) -> None:
+        helper_start = CONTENT.index("async function reconcileConsumerCartQuantityFallback")
+        helper_end = CONTENT.index("function shouldRetryVerifiedCartAfterCheckout", helper_start)
+        helper = CONTENT[helper_start:helper_end]
+        self.assertIn("requiredClicks > 25", helper)
+        self.assertIn("matchingRows.length !== 1", helper)
+        self.assertIn("cartIncrementButtonForItem(matchingRows[0])", helper)
+        self.assertIn("cartQuantityForAsin(normalizedAsin) > before", helper)
+        self.assertIn("actualQuantity !== before + 1", helper)
+        self.assertIn("actualQuantity !== requestedQuantity", helper)
+        self.assertIn('reason: "consumer_cart_quantity_reconciled"', helper)
+        self.assertIn("clearConsumerCartQuantityFallback(activeJob, normalizedAsin)", helper)
+
+    def test_consumer_quantity_fallback_isolated_from_business_and_fails_as_chrome_error(self) -> None:
+        request_start = CONTENT.index("function consumerCartQuantityFallbackRequest")
+        request_end = CONTENT.index("function canDeferConsumerQuantityToCart", request_start)
+        request = CONTENT[request_start:request_end]
+        cart_start = CONTENT.index("async function handleCart(activeJob)")
+        cart_end = CONTENT.index("async function fillFullName", cart_start)
+        cart = CONTENT[cart_start:cart_end]
+        self.assertIn('activeJob?.amazonAccountExperience !== "consumer"', request)
+        self.assertIn('activeJob?.job?.required_account_experience === "business"', request)
+        self.assertIn("Object.entries(activeJob.consumerCartQuantityFallbacks || {})", cart)
+        self.assertIn("failCurrentJobAsChromeError(", cart)
+        self.assertIn('"consumer_cart_quantity_adjustment_failed"', cart)
+        self.assertNotIn("failCurrentItemAsMissing", cart[cart.index("consumerCartQuantityFallbacks"):cart.index("const cartCheck")])
+
+    def test_cart_identity_uses_only_app_authorized_asins_and_blocks_unexpected_rows(self) -> None:
+        expected_start = CONTENT.index("function expectedCartQuantities(activeJob)")
+        expected_end = CONTENT.index("function unauthorizedPurchaseAsinEvidence", expected_start)
+        expected = CONTENT[expected_start:expected_end]
+        verify_start = CONTENT.index("function verifyCartQuantities(activeJob)")
+        verify_end = CONTENT.index("function cartQuantityForAsin", verify_start)
+        verify = CONTENT[verify_start:verify_end]
+        self.assertIn('const asin = String(item.asin || "").trim().toUpperCase()', expected)
+        self.assertNotIn("purchased_asin", expected)
+        self.assertIn("unexpectedItems.push(asin)", verify)
+        self.assertIn("unknownItems.length || unexpectedItems.length", verify)
+        self.assertIn("identity_mismatch: true", verify)
+        self.assertIn("missing_asins: missingAsins", verify)
+        self.assertNotIn("return { ok: true, exact: false, warning: `Could not read ASIN", verify)
+
+    def test_product_identity_waits_for_amazon_canonical_child_asin(self) -> None:
+        evidence_start = CONTENT.index("function asinFromAmazonUrl")
+        evidence_end = CONTENT.index("function itemPrimaryLineId", evidence_start)
+        evidence = CONTENT[evidence_start:evidence_end]
+        product_start = CONTENT.index("async function handleProduct(activeJob)")
+        product_end = CONTENT.index("async function handleAddClicked", product_start)
+        product = CONTENT[product_start:product_end]
+        self.assertIn("(?:dp|gp\\/product|clp)", evidence)
+        self.assertIn('link[rel="canonical"]', evidence)
+        self.assertIn("#averageCustomerReviews[data-asin]", evidence)
+        self.assertIn("currentProductAsinEvidence().strong", product)
+        self.assertIn("await sleep(700)", product)
+        self.assertIn("treated as out of stock", product)
+
+    def test_proven_cart_asin_substitution_marks_requested_line_missing(self) -> None:
+        cart_start = CONTENT.index("async function handleCart(activeJob)")
+        cart_end = CONTENT.index("async function fillFullName", cart_start)
+        cart = CONTENT[cart_start:cart_end]
+        identity_start = cart.index("if (cartCheck.identity_mismatch)")
+        identity_end = cart.index("const mismatch =", identity_start)
+        identity = cart[identity_start:identity_end]
+        self.assertIn("cartCheck.missing_asins", identity)
+        self.assertIn("cartCheck.unexpected_asins", identity)
+        self.assertIn("failCurrentItemAsMissing(", identity)
+        self.assertIn('"asin_identity_mismatch"', identity)
+        self.assertIn("treated as out of stock", identity)
+
+    def test_legacy_cross_asin_variant_state_is_never_replayed_or_resumed(self) -> None:
+        selected_start = CONTENT.index("function selectedVariantItem(activeJob, item)")
+        selected_end = CONTENT.index("function purchaseAsinForJobItem", selected_start)
+        selected = CONTENT[selected_start:selected_end]
+        final_start = CONTENT.index("async function ensureFinalAuthorizedAsinIdentity")
+        final_end = CONTENT.index("// ACCOUNT-TYPE INVARIANT", final_start)
+        final_guard = CONTENT[final_start:final_end]
+        run_start = CONTENT.index("async function run()")
+        run_end = CONTENT.index("async function runSafely()", run_start)
+        run = CONTENT[run_start:run_end]
+        self.assertIn("return item", selected)
+        self.assertNotIn("selection.asin", selected)
+        self.assertIn("unauthorizedPurchaseAsinEvidence(activeJob)", final_guard)
+        self.assertIn("Reset this job and rebuild the Amazon cart", final_guard)
+        self.assertIn("Wrong Amazon product blocked", final_guard)
+        self.assertIn("if (unauthorizedPurchaseAsinEvidence(activeJob).length)", run)
+
+    def test_place_order_requires_fresh_exact_asin_evidence_for_both_account_types(self) -> None:
+        guard_start = CONTENT.index("async function ensureFinalAuthorizedAsinIdentity")
+        guard_end = CONTENT.index("// ACCOUNT-TYPE INVARIANT", guard_start)
+        guard = CONTENT[guard_start:guard_end]
+        checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
+        checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
+        checkout = CONTENT[checkout_start:checkout_end]
+        self.assertIn("if (cartVerificationMatches(activeJob)) return true", guard)
+        self.assertIn("directSingleSubscription && productIdentityVerificationsMatch(activeJob)", guard)
+        self.assertIn("No fresh exact-ASIN product or cart verification exists", guard)
+        self.assertNotIn('amazonAccountExperience === "consumer"', guard)
+        self.assertNotIn('amazonAccountExperience === "business"', guard)
+        identity_guard = checkout.index("ensureFinalAuthorizedAsinIdentity(activeJob)")
+        place_click = checkout.index('clickElement(placeOrder, "Place your order button")')
+        self.assertLess(identity_guard, place_click)
+
+    def test_order_history_requires_exact_authorized_asin_set_before_reporting(self) -> None:
+        active_start = CONTENT.index("function activeJobAsins(activeJob)")
+        active_end = CONTENT.index("function recentOrderMatchesActiveJob", active_start)
+        active = CONTENT[active_start:active_end]
+        history_start = CONTENT.index("function orderHistoryAsinIdentityCheck")
+        history_end = CONTENT.index("async function reportAmazonOrders", history_start)
+        history = CONTENT[history_start:history_end]
+        report_start = CONTENT.index("async function reportAmazonOrders")
+        report_end = CONTENT.index("function showReportingCompleteStatus", report_start)
+        report = CONTENT[report_start:report_end]
+        self.assertNotIn("purchased_asin", active)
+        self.assertIn("unexpected = [...observed].filter", history)
+        self.assertIn("missing = [...expected].filter", history)
+        self.assertIn("!unexpected.length && !missing.length", history)
+        self.assertNotIn("businessBundleCompletionEvidence", history)
+        self.assertIn("orderHistoryAsinIdentityCheck(activeJob, uniqueOrders)", report)
+        self.assertIn("Expected and observed ASIN sets must match exactly", report)
+        self.assertIn("The order was not marked placed in the app", report)
 
     def test_place_order_lookup_returns_a_native_control_not_amazon_wrapper(self) -> None:
         finder_start = CONTENT.index("function findPlaceOrderButton()")
@@ -1481,6 +1804,67 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
             recipient_parser.index('".shipToTriggerTextTruncate .a-truncate-cut"'),
             recipient_parser.index('".shipToTriggerTextTruncate .a-truncate-full"'),
         )
+
+    def test_consumer_order_history_reads_product_image_quantity_badge(self) -> None:
+        items_start = CONTENT.index("function orderCardItems(card)")
+        items_end = CONTENT.index("function quantityFromText", items_start)
+        items = CONTENT[items_start:items_end]
+        container_start = CONTENT.index("function itemContainerForQuantity")
+        container_end = CONTENT.index("function quantityFromItemElement", container_start)
+        container = CONTENT[container_start:container_end]
+        quantity_start = container_end
+        quantity_end = CONTENT.index("function orderDetailsPageOrderId", quantity_start)
+        quantity = CONTENT[quantity_start:quantity_end]
+        self.assertIn(".item-box", items)
+        self.assertIn(".yo-enhanced-items", items)
+        self.assertIn(".product-image__qty", container)
+        self.assertIn(".product-image__qty", quantity)
+
+    def test_split_order_annotations_name_their_exact_amazon_card(self) -> None:
+        identity_start = CONTENT.index("function appendAmazonOrderCardIdentity")
+        identity_end = CONTENT.index("function renderOrderHistoryPendingAnnotation", identity_start)
+        identity = CONTENT[identity_start:identity_end]
+        render_start = CONTENT.index("function renderOrderHistoryAnnotation")
+        render_end = CONTENT.index("function orderHistoryResultAsinSet", render_start)
+        render = CONTENT[render_start:render_end]
+        direct_start = CONTENT.index("function appendDirectOdooHistoryRows")
+        direct_end = CONTENT.index("function directOdooRowsForOrder", direct_start)
+        direct = CONTENT[direct_start:direct_end]
+        self.assertIn("marker.dataset.amazonOrderId = orderId", identity)
+        self.assertIn("This verification belongs only to Amazon card", identity)
+        self.assertIn("orderHistoryResultAsinSet(historyResult)", identity)
+        self.assertIn("appendAmazonOrderCardIdentity(marker, displayResult)", render)
+        self.assertIn("appendAmazonOrderCardIdentity(marker, historyResult)", direct)
+        self.assertIn(".nutricity-order-history-amazon-id", CONTENT_CSS)
+
+    def test_order_history_verification_uses_a_visible_card_panel(self) -> None:
+        container_start = CONTENT.index("function orderHistoryAnnotationContainer")
+        container_end = CONTENT.index("function appendAmazonOrderCardIdentity", container_start)
+        container = CONTENT[container_start:container_end]
+        self.assertIn("nutricity-order-history-card-verification", container)
+        self.assertIn("Amazon ↔ Odoo cross-verification", container)
+        self.assertIn("card.insertBefore(host, card.firstChild)", container)
+        self.assertIn(".nutricity-order-history-card-verification {", CONTENT_CSS)
+        self.assertIn("justify-content: flex-start", CONTENT_CSS)
+        self.assertIn("flex-wrap: wrap", CONTENT_CSS)
+
+    def test_order_history_copy_icon_is_centered_in_its_button(self) -> None:
+        copy_start = CONTENT_CSS.index(".nutricity-order-history-copy {")
+        copy_end = CONTENT_CSS.index(".nutricity-order-history-copy::before", copy_start)
+        copy_css = CONTENT_CSS[copy_start:copy_end]
+        self.assertIn("flex: 0 0 18px", copy_css)
+        self.assertIn("width: 18px", copy_css)
+        self.assertIn("height: 18px", copy_css)
+        self.assertIn("vertical-align: middle", copy_css)
+        self.assertNotIn("vertical-align: -3px", copy_css)
+
+    def test_synced_and_live_odoo_verifications_are_both_displayed(self) -> None:
+        direct_start = CONTENT.index("function appendDirectOdooHistoryRows")
+        direct_end = CONTENT.index("function directOdooRowsForOrder", direct_start)
+        direct = CONTENT[direct_start:direct_end]
+        self.assertIn("const rows = (directOdoo || []).filter(Boolean)", direct)
+        self.assertIn('label.textContent = "Odoo direct"', direct)
+        self.assertNotIn("directOdooRowDuplicatesSyncedResult", CONTENT)
 
 
 if __name__ == "__main__":

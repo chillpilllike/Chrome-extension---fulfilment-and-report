@@ -8,6 +8,8 @@ const splitMixedAsinOrders = document.querySelector("#splitMixedAsinOrders");
 const autoOrderingConfirmed = document.querySelector("#autoOrderingConfirmed");
 const autoOrderingToggle = document.querySelector("#autoOrderingToggle");
 const startNext = document.querySelector("#startNext");
+const odooOrderNumber = document.querySelector("#odooOrderNumber");
+const queueOdooOrder = document.querySelector("#queueOdooOrder");
 const browserlessOrderMode = document.querySelector("#browserlessOrderMode");
 const pauseBeforePlaceOrder = document.querySelector("#pauseBeforePlaceOrder");
 const preferRewardedLaterDelivery = document.querySelector("#preferRewardedLaterDelivery");
@@ -57,7 +59,7 @@ let settingsHydrated = false;
 let settingsHydratePromise = null;
 
 function hydrateSettingsValues(settings = {}) {
-  apiBase.value = settings.apiBase || "http://127.0.0.1:8000";
+  apiBase.value = settings.apiBase || "https://fulfilment.gofinch.com";
   adminToken.value = settings.adminToken || "";
   cardLast4Preference.value = settings.cardLast4Preference || "";
   deliveryLimitDays.value = String(Math.min(30, Math.max(1, Math.floor(Number(settings.deliveryLimitDays) || 5))));
@@ -88,7 +90,7 @@ function hasSettingsPayload(state) {
 function loadSavedSettings() {
   settingsHydratePromise = new Promise((resolve) => {
     chrome.storage.local.get({
-      apiBase: "http://127.0.0.1:8000",
+      apiBase: "https://fulfilment.gofinch.com",
       adminToken: "",
       cardLast4Preference: "",
       deliveryLimitDays: 5,
@@ -569,6 +571,44 @@ startNext.addEventListener("click", async () => {
     const latest = await send({ type: "GET_STATE" }).catch(() => ({}));
     startNext.disabled = Boolean(latest?.activeJob?.job) || latest?.manualQueueRunning === true || latest?.autoOrderingRunning === true;
   }
+});
+
+async function queueEnteredOdooOrder() {
+  const orderNames = [...new Set((String(odooOrderNumber.value || "").match(/\b[A-Z]{1,8}\d{2,}\b/gi) || [])
+    .map((value) => value.toUpperCase()))].slice(0, 100);
+  if (!orderNames.length) {
+    setStatus("Enter at least one valid Odoo order number.");
+    odooOrderNumber.focus();
+    return;
+  }
+  queueOdooOrder.disabled = true;
+  setStatus(`Importing ${orderNames.length} Odoo order${orderNames.length === 1 ? "" : "s"} and queueing all ASINs...`);
+  try {
+    await send({ type: "SET_API_BASE", ...settingsPayload() });
+    settingsDirty = false;
+    const result = await send({ type: "QUEUE_ODOO_ORDERS", orderNames });
+    setStatus(result.message || (result.ok ? `${orderNames.length} order(s) queued.` : "The Odoo orders could not all be queued."));
+    if (result.ok) {
+      odooOrderNumber.value = "";
+    } else if (result.partial_success && Array.isArray(result.results)) {
+      odooOrderNumber.value = result.results
+        .filter((item) => !item?.ok && item?.order_name)
+        .map((item) => item.order_name)
+        .join("\n");
+    }
+    await refresh();
+  } catch (error) {
+    setStatus(error.message || "Could not import and queue the Odoo orders.");
+  } finally {
+    queueOdooOrder.disabled = false;
+  }
+}
+
+queueOdooOrder.addEventListener("click", queueEnteredOdooOrder);
+odooOrderNumber.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
+  event.preventDefault();
+  queueEnteredOdooOrder();
 });
 
 forceStop.addEventListener("click", async () => {

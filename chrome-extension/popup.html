@@ -53,6 +53,14 @@
         <span>Warehouse closed Sat/Sun: prefer later 1% delivery when Brooklyn next day is a weekend</span>
       </label>
       <section id="modeNotice" class="mode-notice" hidden></section>
+      <section class="target-order">
+        <label for="odooOrderNumber">Odoo order numbers</label>
+        <div class="target-order-actions">
+          <textarea id="odooOrderNumber" spellcheck="false" autocomplete="off" rows="4" placeholder="ES00259&#10;NC25089&#10;VG00067"></textarea>
+          <button id="queueOdooOrder">Queue &amp; import orders</button>
+        </div>
+        <span>Paste up to 100 order numbers separated by spaces, commas, or new lines. Each Odoo order stays one fulfilment job.</span>
+      </section>
       <div class="actions">
         <button id="save">Save</button>
         <button id="testConnection" class="secondary">Check connection</button>

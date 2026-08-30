@@ -1,6 +1,6 @@
-const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const DEFAULT_API_BASE = "https://fulfilment.gofinch.com";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-27-consumer-reset-state-v153";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-08-30-strict-manual-order-priority-v174";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const RESET_STALE_UPDATE_GUARD_MS = 10 * 60 * 1000;
 const completionLocks = new Set();
@@ -24,6 +24,12 @@ const DIAGNOSTIC_SESSION_LIMIT = 4;
 const DIAGNOSTIC_ENTRY_LIMIT = 120;
 const DIAGNOSTIC_DUPLICATE_SUPPRESS_MS = 3000;
 const recentDiagnosticWrites = new Map();
+
+function transientApiError(message = "") {
+  return /abort|signal|timeout|network|failed to fetch|fetch failed|connection refused|econnrefused|load failed/i.test(
+    String(message || ""),
+  );
+}
 
 async function getSettings() {
   const data = await chrome.storage.local.get({
@@ -57,8 +63,12 @@ async function getSettings() {
     diagnosticSessions: { currentSessionId: "", sessions: [] },
     resetRevisionsByGroup: {},
   });
-  const session = await chrome.storage.session.get({ autoOrderingRunning: false });
-  return { ...data, autoOrderingRunning: session.autoOrderingRunning === true };
+  const session = await chrome.storage.session.get({ autoOrderingRunning: false, manualQueueRunning: false });
+  return {
+    ...data,
+    autoOrderingRunning: session.autoOrderingRunning === true,
+    manualQueueRunning: session.manualQueueRunning === true,
+  };
 }
 
 async function autoOrderingIsRunning() {
@@ -74,12 +84,15 @@ async function setAutoOrderingRunning(running) {
 }
 
 async function manualQueueIsRunning() {
-  const { manualQueueRunning } = await chrome.storage.local.get({ manualQueueRunning: false });
+  const { manualQueueRunning } = await chrome.storage.session.get({ manualQueueRunning: false });
   return manualQueueRunning === true;
 }
 
 async function setManualQueueRunning(running) {
-  await chrome.storage.local.set({ manualQueueRunning: running === true });
+  await chrome.storage.session.set({ manualQueueRunning: running === true });
+  // Before v0.1.179 this latch lived in persistent local storage. Remove the
+  // legacy value so an extension reload can never resurrect a stale run.
+  await chrome.storage.local.remove("manualQueueRunning");
 }
 
 async function visibleQueueRunIsEnabled() {
@@ -96,6 +109,10 @@ async function getWorkerId() {
 
 function normalizeApiBase(value) {
   return String(value || DEFAULT_API_BASE).trim().replace(/\/+$/, "") || DEFAULT_API_BASE;
+}
+
+function isLocalApiBase(value = "") {
+  return /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(normalizeApiBase(value));
 }
 
 function messageWindowId(message = {}, sender = {}) {
@@ -623,7 +640,7 @@ async function api(path, options = {}) {
   const adminToken = options.adminToken ?? settings.adminToken;
   const requestPath = String(path || "").startsWith("/") ? path : `/${path}`;
   const { timeoutMs = 45000, apiBase: _apiBase, adminToken: _adminToken, ...fetchOptions } = options;
-  const isLocalApi = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(base);
+  const isLocalApi = isLocalApiBase(base);
   const authTokens = [
     adminToken,
     isLocalApi && adminToken !== LOCAL_ADMIN_TOKEN_FALLBACK ? LOCAL_ADMIN_TOKEN_FALLBACK : "",
@@ -644,7 +661,15 @@ async function api(path, options = {}) {
     if (response.ok || response.status !== 401 || index === authTokens.length - 1) break;
   }
   if (!response.ok) {
-    throw new Error((await response.text()) || response.statusText);
+    const errorText = await response.text();
+    let errorMessage = errorText;
+    try {
+      const errorPayload = JSON.parse(errorText);
+      errorMessage = errorPayload.detail || errorPayload.message || errorText;
+    } catch (_) {
+      // Preserve non-JSON API errors verbatim.
+    }
+    throw new Error(errorMessage || response.statusText);
   }
   return response.json();
 }
@@ -652,7 +677,10 @@ async function api(path, options = {}) {
 function connectionErrorMessage(error, base = "") {
   const raw = String(error?.message || error || "Failed to fetch");
   if (/failed to fetch|networkerror|load failed|abort/i.test(raw)) {
-    return `Could not reach the local app at ${base || DEFAULT_API_BASE}. Make sure the app is running on port 8000, then click Save and Check connection again.`;
+    const configuredBase = normalizeApiBase(base);
+    return isLocalApiBase(configuredBase)
+      ? `Could not reach the local app at ${configuredBase}. Make sure the app is running on port 8000, then click Save and Check connection again.`
+      : `Could not reach the hosted app at ${configuredBase}. Check the hosted service, then click Save and Check connection again.`;
   }
   return raw;
 }
@@ -675,6 +703,90 @@ async function testConnection() {
   } catch (error) {
     throw new Error(connectionErrorMessage(error, base));
   }
+}
+
+async function queueOdooOrders(orderNames, windowId = null) {
+  const normalized = [...new Set((Array.isArray(orderNames) ? orderNames : [orderNames])
+    .map((value) => String(value || "").trim().toUpperCase())
+    .filter(Boolean))];
+  if (!normalized.length) return { ok: false, message: "Enter at least one Odoo order number." };
+  const result = await api("/api/chrome/queue/order", {
+    method: "POST",
+    body: JSON.stringify({ order_names: normalized }),
+    timeoutMs: 600000,
+  });
+  const preferredGroupKeys = [...new Set([
+    ...(Array.isArray(result.preferred_group_keys) ? result.preferred_group_keys : []),
+    result.preferred_group_key,
+    result.group_key,
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+  const orderNameByGroup = Object.fromEntries((result.results || [result])
+    .map((item) => [
+      String(item?.preferred_group_key || item?.group_key || "").trim(),
+      String(item?.order_name || "").trim().toUpperCase(),
+    ])
+    .filter(([groupKey, orderName]) => groupKey && orderName));
+  const storedPreferences = await chrome.storage.local.get({
+    preferredQueueGroupKeys: [],
+    preferredQueueOrderNames: {},
+  });
+  const mergedPreferredGroupKeys = [...new Set([
+    ...(storedPreferences.preferredQueueGroupKeys || []),
+    ...preferredGroupKeys,
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+  await chrome.storage.local.set({
+    cachedQueueStatus: null,
+    preferredQueueGroupKeys: mergedPreferredGroupKeys,
+    preferredQueueGroupKey: mergedPreferredGroupKeys[0] || "",
+    preferredQueueOrderNames: {
+      ...(storedPreferences.preferredQueueOrderNames || {}),
+      ...orderNameByGroup,
+    },
+  });
+  if (!preferredGroupKeys.length) return result;
+  const processing = await startManualQueueRun(windowId);
+  return {
+    ...result,
+    processing,
+    manual_queue_running: processing?.manual_queue_running === true,
+    message: `${result.message || "Odoo order queued."} ${processing?.message || "The inserted order is first in the manual queue."}`.trim(),
+  };
+}
+
+async function nextPreferredQueueGroupKey() {
+  const stored = await chrome.storage.local.get({ preferredQueueGroupKeys: [], preferredQueueGroupKey: "" });
+  return String(stored.preferredQueueGroupKeys?.[0] || stored.preferredQueueGroupKey || "").trim();
+}
+
+async function preferredQueueOrderName(groupKey) {
+  const normalized = String(groupKey || "").trim();
+  if (!normalized) return "";
+  const stored = await chrome.storage.local.get({ preferredQueueOrderNames: {} });
+  return String(stored.preferredQueueOrderNames?.[normalized] || "").trim().toUpperCase();
+}
+
+async function consumePreferredQueueGroupKey(groupKey) {
+  const normalized = String(groupKey || "").trim();
+  if (!normalized) return;
+  const stored = await chrome.storage.local.get({ preferredQueueGroupKeys: [], preferredQueueGroupKey: "", preferredQueueOrderNames: {} });
+  const remaining = (stored.preferredQueueGroupKeys || []).filter((value) => String(value || "").trim() !== normalized);
+  const remainingOrderNames = { ...(stored.preferredQueueOrderNames || {}) };
+  delete remainingOrderNames[normalized];
+  await chrome.storage.local.set({
+    preferredQueueGroupKeys: remaining,
+    preferredQueueGroupKey: remaining[0] || "",
+    preferredQueueOrderNames: remainingOrderNames,
+  });
+}
+
+async function preferredQueueJobIsClaimable(groupKey, accountExperience, workerId) {
+  const normalized = String(groupKey || "").trim();
+  if (!normalized) return true;
+  const snapshot = await api(`/api/chrome/jobs?claim=false&job_limit=250&worker_id=${encodeURIComponent(workerId || "")}&account_experience=${encodeURIComponent(accountExperience || "")}`);
+  return (snapshot.jobs || []).some((job) => (
+    String(job?.group_key || "").trim() === normalized
+    && (!job?.claimed_by || String(job.claimed_by) === String(workerId || ""))
+  ));
 }
 
 function tabOrigin(url = "") {
@@ -772,10 +884,15 @@ async function getQueueStatus(accountExperience = "") {
   const workerId = await getWorkerId();
   if (queueStatusInFlight) return queueStatusInFlight;
   queueStatusInFlight = (async () => {
+  const { apiBase: configuredApiBase } = await getSettings();
+  // A user-saved hosted API is authoritative. Auto-discovery exists only to
+  // help a default localhost setup find its local app; it must never replace
+  // a hosted production URL because another app-looking tab happens to open.
+  const allowAppTabDiscovery = isLocalApiBase(configuredApiBase);
   try {
     const payload = await api(queueStatusRequestPath(workerId, accountExperience));
     const empty = Number(payload.job_count || payload.jobs?.length || 0) <= 0;
-    if (empty) {
+    if (empty && allowAppTabDiscovery) {
       const discovered = await discoverAppQueue(payload, accountExperience);
       if (discovered?.payload) {
         const discoveredPayload = discovered.payload;
@@ -807,7 +924,9 @@ async function getQueueStatus(accountExperience = "") {
     await chrome.storage.local.set({ cachedQueueStatus: snapshot });
     return snapshot;
   } catch (error) {
-    const discovered = await discoverAppQueue(null, accountExperience);
+    const discovered = allowAppTabDiscovery
+      ? await discoverAppQueue(null, accountExperience)
+      : null;
     if (discovered?.payload) {
       const payload = discovered.payload;
       const snapshot = {
@@ -1522,14 +1641,32 @@ async function startNextJob(sourceWindowId = null) {
     return { ok: false, message };
   }
   if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; did not claim a queued order." };
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}`);
+  const preferredGroupKey = String(options.preferredGroupKey || await nextPreferredQueueGroupKey() || "").trim();
+  if (preferredGroupKey && !await preferredQueueJobIsClaimable(preferredGroupKey, detectedAccount.experience, workerId)) {
+    if (options.manual === true || await manualQueueIsRunning()) await setManualQueueRunning(false);
+    const preferredOrderName = await preferredQueueOrderName(preferredGroupKey);
+    const message = `${preferredOrderName || "The manually inserted order"} is not currently claimable in this ${detectedAccount.experience} Amazon profile. The general queue was not claimed.`;
+    await updateOrderProgressTotal(0, message);
+    await log(message, sourceWindowId);
+    return { ok: false, preferred_unavailable: true, message };
+  }
+  const preferredQuery = preferredGroupKey
+    ? `&preferred_group_key=${encodeURIComponent(preferredGroupKey)}&preferred_only=true`
+    : "";
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}${preferredQuery}`);
   const job = payload.jobs?.[0];
   if (!job) {
     if (options.manual === true || await manualQueueIsRunning()) await setManualQueueRunning(false);
-    await updateOrderProgressTotal(0, "No queued Chrome jobs found.");
-    const message = `No queued whole orders compatible with this ${detectedAccount.experience} Amazon account.`;
+    const preferredOrderName = await preferredQueueOrderName(preferredGroupKey);
+    const message = preferredGroupKey
+      ? `${preferredOrderName || "The manually inserted order"} is not currently claimable in this ${detectedAccount.experience} Amazon profile. The general queue was not claimed.`
+      : `No queued whole orders compatible with this ${detectedAccount.experience} Amazon account.`;
+    await updateOrderProgressTotal(0, message);
     await log(message);
     return { ok: false, message };
+  }
+  if (preferredGroupKey && job.group_key === preferredGroupKey) {
+    await consumePreferredQueueGroupKey(preferredGroupKey);
   }
   if (jobWasSubmittedToAmazon(job)) {
     await log(`Recovered submitted ${job.group_key}; looking up Amazon order ID instead of opening a new cart.`, sourceWindowId);
@@ -1742,13 +1879,33 @@ async function claimNextJobInWindow(windowId) {
     return null;
   }
   if (await forceStopActive()) return null;
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}`);
+  const preferredGroupKey = await nextPreferredQueueGroupKey();
+  if (preferredGroupKey && !await preferredQueueJobIsClaimable(preferredGroupKey, detectedAccount.experience, workerId)) {
+    if (await manualQueueIsRunning()) await setManualQueueRunning(false);
+    const preferredOrderName = await preferredQueueOrderName(preferredGroupKey);
+    await setWindowJob(windowId, null);
+    await log(`${preferredOrderName || "The manually inserted order"} is not claimable in this ${detectedAccount.experience} Amazon profile; did not fall through to the general queue.`, windowId);
+    return null;
+  }
+  const preferredQuery = preferredGroupKey
+    ? `&preferred_group_key=${encodeURIComponent(preferredGroupKey)}&preferred_only=true`
+    : "";
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}${preferredQuery}`);
   const job = payload.jobs?.[0];
   if (!job) {
     if (await manualQueueIsRunning()) await setManualQueueRunning(false);
     await setWindowJob(windowId, null);
-    await log("No more queued Chrome jobs found.", windowId);
+    const preferredOrderName = await preferredQueueOrderName(preferredGroupKey);
+    await log(
+      preferredGroupKey
+        ? `${preferredOrderName || "The manually inserted order"} is not claimable in this ${detectedAccount.experience} Amazon profile; did not fall through to the general queue.`
+        : "No more queued Chrome jobs found.",
+      windowId,
+    );
     return null;
+  }
+  if (preferredGroupKey && job.group_key === preferredGroupKey) {
+    await consumePreferredQueueGroupKey(preferredGroupKey);
   }
   if (jobWasSubmittedToAmazon(job)) {
     const recovered = await recoverSubmittedJobInWindow(windowId);
@@ -2104,8 +2261,7 @@ async function checkExistingAmazonOrder(windowId) {
     } catch (error) {
       lastError = error;
       const message = String(error?.message || error || "");
-      const transientAbort = /abort|signal|timeout|network/i.test(message);
-      if (!transientAbort || attempt === 3) break;
+      if (!transientApiError(message) || attempt === 3) break;
       await log(`Duplicate check retry ${attempt + 1} for ${activeJob.job.group_key} after transient error: ${message}`, windowId);
       await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
     }
@@ -3147,15 +3303,26 @@ async function startAutoOrdering(windowId, confirmed = false) {
 async function startManualQueueRun(windowId) {
   await setForceStop(false);
   await setManualQueueRunning(true);
-  const result = await startNextJob(windowId, { manual: true });
-  if (result?.ok === false && !result?.active_job_running) {
+  try {
+    const result = await startNextJob(windowId, { manual: true });
+    if (result?.ok === false && !result?.active_job_running) {
+      await setManualQueueRunning(false);
+    }
+    return {
+      ...result,
+      manual_queue_running: await manualQueueIsRunning(),
+      message: result?.message || "Processing the currently available compatible queue.",
+    };
+  } catch (error) {
     await setManualQueueRunning(false);
+    const message = error?.message || String(error || "Could not start queued orders.");
+    await log(`Could not start manual queued orders: ${message}`, windowId);
+    return {
+      ok: false,
+      manual_queue_running: false,
+      message,
+    };
   }
-  return {
-    ...result,
-    manual_queue_running: await manualQueueIsRunning(),
-    message: result?.message || "Processing the currently available compatible queue.",
-  };
 }
 
 async function stopAutoOrdering(windowId) {
@@ -3513,6 +3680,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "START_AUTO_ORDERING") return startAutoOrdering(windowId, message.confirmed === true);
     if (message.type === "STOP_AUTO_ORDERING") return stopAutoOrdering(windowId);
     if (message.type === "START_NEXT") return startManualQueueRun(windowId);
+    if (message.type === "QUEUE_ODOO_ORDERS") return queueOdooOrders(message.orderNames || [], windowId);
+    if (message.type === "QUEUE_ODOO_ORDER") return queueOdooOrders([message.orderName || ""], windowId);
     if (message.type === "START_BROWSERLESS") {
       return { ok: false, confirmation_required: true, message: "Use Start Auto Ordering with the confirmation ticked." };
     }
