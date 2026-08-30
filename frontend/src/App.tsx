@@ -3417,6 +3417,7 @@ function App() {
   const [editingReplacement, setEditingReplacement] = useState<OrderLine | null>(null)
   const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
   const [resetFulfilmentConfirmOpen, setResetFulfilmentConfirmOpen] = useState(false)
+  const [cancelOdooShopifyConfirmOpen, setCancelOdooShopifyConfirmOpen] = useState(false)
   const [placeRecentConfirmOpen, setPlaceRecentConfirmOpen] = useState(false)
   const [placeRecentDays, setPlaceRecentDays] = useState(() => savedPullSetting(PULL_DAYS_STORAGE_KEY, "5"))
   const [allowMissingSpaid, setAllowMissingSpaid] = useState(false)
@@ -4440,6 +4441,24 @@ function App() {
     setResetFulfilmentConfirmOpen(true)
   }
 
+  function cancelSelectedOdooShopifyOrders() {
+    if (!selected.length || busy) return
+    if (!selectedStoreIdForAction("Cancel Odoo + Shopify")) return
+    setCancelOdooShopifyConfirmOpen(true)
+  }
+
+  function confirmCancelSelectedOdooShopifyOrders() {
+    const actionStoreId = selectedStoreIdForAction("Cancel Odoo + Shopify")
+    if (!actionStoreId) return
+    setCancelOdooShopifyConfirmOpen(false)
+    return runAction("Cancel Odoo + Shopify", () =>
+      api<DashboardData>("/api/lines/cancel-odoo-shopify", {
+        method: "POST",
+        body: JSON.stringify({ store_id: actionStoreId, line_ids: selected }),
+      }),
+    )
+  }
+
   function confirmResetSelectedOrders() {
     const actionStoreId = selectedStoreIdForAction("Reset Selected")
     if (!actionStoreId) return
@@ -4940,6 +4959,30 @@ function App() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <Dialog open={cancelOdooShopifyConfirmOpen} onOpenChange={(open) => !open && setCancelOdooShopifyConfirmOpen(false)}>
+        <DialogContent className="border-destructive/50 sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertCircle className="size-5" />
+              Cancel selected orders in Odoo and Shopify?
+            </DialogTitle>
+            <DialogDescription>
+              This cancels each selected Odoo order, removes any unplaced fulfilment job, and then cancels every exact active order match in both Shopify DTC and DTB.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+            This cannot be undone here. Already-fulfilled Shopify orders will be left unchanged and reported for manual review.
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={Boolean(busy)} onClick={() => setCancelOdooShopifyConfirmOpen(false)}>
+              No, keep orders
+            </Button>
+            <Button variant="destructive" disabled={Boolean(busy) || !selected.length} onClick={confirmCancelSelectedOdooShopifyOrders}>
+              Yes, cancel Odoo + Shopify
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <AdminAccessDialog open={adminAccessOpen} onSubmit={handleAdminTokenSave} onClose={() => setAdminAccessOpen(false)} error={adminAuthError} busy={adminAuthBusy} />
       {mobileNavOpen && <button type="button" className="app-sidebar-backdrop d-print-none" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
       <aside className={`app-sidebar d-print-none ${mobileNavOpen ? "is-open" : ""}`} ref={navTabsRef}>
@@ -5403,6 +5446,14 @@ function App() {
 	                    >
                       <AlertCircle className="size-4" />
                       Do Not Process
+                    </Button>
+	                    <Button
+	                      variant="destructive"
+	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
+	                      onClick={cancelSelectedOdooShopifyOrders}
+	                    >
+                      <AlertCircle className="size-4" />
+                      Cancel Odoo + Shopify
                     </Button>
 	                    <Button
 	                      variant="outline"
@@ -16461,8 +16512,8 @@ function SettingsPage({
                 {["1", "2", "3", "7", "14", "30"].map((value) => <option key={value} value={value}>Last {value} day{value === "1" ? "" : "s"}</option>)}
               </SelectField>
               <TextField label="Auto Fulfil Pull Limit" value={settings.auto_chrome_fulfil_limit || "100"} onChange={(value) => setSetting("auto_chrome_fulfil_limit", value)} />
-              <SelectField label="Cancelled Order Sync" value={settings.cancelled_orders_sync_interval_minutes || "0"} onChange={(value) => setSetting("cancelled_orders_sync_interval_minutes", value)}>
-                {["0", "60", "1440", "2880", "4320", "10080"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
+              <SelectField label="Odoo → Shopify Cancellation Check" value={settings.cancelled_orders_sync_interval_minutes === "0" ? "15" : (settings.cancelled_orders_sync_interval_minutes || "15")} onChange={(value) => setSetting("cancelled_orders_sync_interval_minutes", value)}>
+                {["15", "30", "60", "1440", "2880", "4320", "10080"].map((value) => <option key={value} value={value}>{intervalLabel(value)}</option>)}
               </SelectField>
               <SelectField label="Cancelled Pull Window" value={settings.cancelled_orders_sync_days || "30"} onChange={(value) => setSetting("cancelled_orders_sync_days", value)}>
                 {["7", "14", "30", "60", "90", "180"].map((value) => <option key={value} value={value}>Last {value} days</option>)}

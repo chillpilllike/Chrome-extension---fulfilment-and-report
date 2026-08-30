@@ -1615,6 +1615,24 @@ def init_db() -> None:
                 PRIMARY KEY (store_id, odoo_order_name, route, dest_name)
             );
 
+            CREATE TABLE IF NOT EXISTS odoo_shopify_cancellation_sync (
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                odoo_order_id BIGINT NOT NULL,
+                odoo_order_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                matched_count INTEGER NOT NULL DEFAULT 0,
+                cancelled_count INTEGER NOT NULL DEFAULT 0,
+                already_cancelled_count INTEGER NOT NULL DEFAULT 0,
+                protected_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                details_json TEXT NOT NULL DEFAULT '[]',
+                last_error TEXT,
+                last_attempt_at TEXT,
+                completed_at TEXT,
+                PRIMARY KEY (store_id, odoo_order_id)
+            );
+
             CREATE TABLE IF NOT EXISTS shopify_export_sku_map (
                 state_scope TEXT NOT NULL,
                 dest_name TEXT NOT NULL,
@@ -19299,6 +19317,108 @@ def sync_inventory_for_store(store_id: int) -> None:
         ensure_inventory_for_line(row)
 
 
+def mark_cancelled_odoo_order_locally(store_id: int, order: dict[str, Any]) -> list[dict[str, Any]]:
+    order_id = int(order.get("id") or 0)
+    order_name = clean_text(order.get("name")).upper()
+    if not order_id or not order_name:
+        return []
+    status_label = derive_odoo_status(order, [])
+    if status_label not in {"cancelled", "refunded"}:
+        return []
+    now = utc_now()
+    message = f"Odoo order {order_name} is {status_label}; fulfilment was stopped."
+    with db() as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM order_lines
+            WHERE store_id=?
+              AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
+            LIMIT 1
+            """,
+            (store_id, order_id, order_name),
+        ).fetchone()
+        if not existing:
+            return []
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET odoo_order_state=?,
+                odoo_invoice_status=?,
+                odoo_status_label=?,
+                state=CASE
+                  WHEN COALESCE(amazon_order_id, '') = ''
+                   AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  THEN 'pulled'
+                  ELSE state
+                END,
+                amazon_status=CASE
+                  WHEN COALESCE(amazon_order_id, '') = ''
+                   AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  THEN NULL
+                  ELSE amazon_status
+                END,
+                amazon_group_key=CASE
+                  WHEN COALESCE(amazon_order_id, '') = ''
+                   AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  THEN NULL
+                  ELSE amazon_group_key
+                END,
+                chrome_claimed_by=CASE
+                  WHEN COALESCE(amazon_order_id, '') = ''
+                   AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  THEN NULL
+                  ELSE chrome_claimed_by
+                END,
+                chrome_claimed_at=CASE
+                  WHEN COALESCE(amazon_order_id, '') = ''
+                   AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  THEN NULL
+                  ELSE chrome_claimed_at
+                END,
+                chrome_claim_expires_at=CASE
+                  WHEN COALESCE(amazon_order_id, '') = ''
+                   AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  THEN NULL
+                  ELSE chrome_claim_expires_at
+                END,
+                last_error=CASE
+                  WHEN COALESCE(amazon_order_id, '') = ''
+                   AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                  THEN ?
+                  ELSE last_error
+                END,
+                updated_at=?
+            WHERE store_id=?
+              AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
+            """,
+            (
+                clean_text(order.get("state")),
+                clean_text(order.get("invoice_status")),
+                status_label,
+                message,
+                now,
+                store_id,
+                order_id,
+                order_name,
+            ),
+        )
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE store_id=?
+              AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
+            ORDER BY id
+            """,
+            (store_id, order_id, order_name),
+        ).fetchall())
+    for row in rows:
+        index_order_line(row)
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "cancelled-orders"})
+    return rows
+
+
 def sync_cancelled_orders_for_store(store_id: int, days: int = 30, limit: int = 500) -> dict[str, Any]:
     store = get_store(store_id)
     odoo = OdooClient(store)
@@ -19313,67 +19433,65 @@ def sync_cancelled_orders_for_store(store_id: int, days: int = 30, limit: int = 
         order=f"{date_field} desc",
     )
     touched_rows: list[dict[str, Any]] = []
-    now = utc_now()
-    with db() as conn:
-        for order in orders:
-            status_label = derive_odoo_status(order, [])
-            if status_label not in {"cancelled", "refunded"}:
-                continue
-            order_id = int(order.get("id") or 0)
-            order_name = clean_text(order.get("name"))
-            rows = conn.execute(
-                """
-                SELECT * FROM order_lines
-                WHERE store_id=?
-                  AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
-                  AND COALESCE(amazon_order_id, '') != ''
-                """,
-                (store_id, order_id, order_name),
-            ).fetchall()
-            if not rows:
-                continue
-            conn.execute(
-                """
-                UPDATE order_lines
-                SET odoo_order_state=?,
-                    odoo_invoice_status=?,
-                    odoo_status_label=?,
-                    updated_at=?
-                WHERE store_id=?
-                  AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
-                  AND COALESCE(amazon_order_id, '') != ''
-                """,
-                (
-                    clean_text(order.get("state")),
-                    clean_text(order.get("invoice_status")),
-                    status_label,
-                    now,
-                    store_id,
-                    order_id,
-                    order_name,
-                ),
-            )
-            touched_rows.extend(
-                rows_to_dicts(conn.execute(
-                    """
-                    SELECT * FROM order_lines
-                    WHERE store_id=?
-                      AND (odoo_order_id=? OR UPPER(odoo_order_name)=UPPER(?))
-                      AND COALESCE(amazon_order_id, '') != ''
-                    """,
-                    (store_id, order_id, order_name),
-                ).fetchall())
-            )
+    cancellation_candidates: list[tuple[int, str]] = []
+    for order in orders:
+        status_label = derive_odoo_status(order, [])
+        if status_label not in {"cancelled", "refunded"}:
+            continue
+        order_id = int(order.get("id") or 0)
+        order_name = clean_text(order.get("name")).upper()
+        updated_rows = mark_cancelled_odoo_order_locally(store_id, order)
+        if not updated_rows:
+            continue
+        touched_rows.extend(updated_rows)
+        cancellation_candidates.append((order_id, order_name))
     for row in touched_rows:
-        ensure_inventory_for_line(row)
-        index_order_line(row)
+        if clean_text(row.get("amazon_order_id")):
+            ensure_inventory_for_line(row)
+    clients_by_route: dict[str, list[Any]] = {}
+    shopify_matched = 0
+    shopify_cancelled = 0
+    shopify_already_cancelled = 0
+    shopify_protected = 0
+    shopify_failed = 0
+    shopify_errors: list[str] = []
+    for order_id, order_name in dict.fromkeys(cancellation_candidates):
+        if not odoo_shopify_cancellation_needs_sync(store_id, order_id):
+            continue
+        try:
+            cancellation = cancel_shopify_orders_for_odoo_order(
+                store_id,
+                order_id,
+                order_name,
+                clients_by_route=clients_by_route,
+            )
+            shopify_matched += int(cancellation.get("matched") or 0)
+            shopify_cancelled += int(cancellation.get("cancelled") or 0)
+            shopify_already_cancelled += int(cancellation.get("already_cancelled") or 0)
+            shopify_protected += int(cancellation.get("protected") or 0)
+            shopify_failed += int(cancellation.get("failed") or 0)
+            if cancellation.get("error"):
+                shopify_errors.append(f"{order_name}: {cancellation['error']}")
+        except Exception as exc:
+            shopify_failed += 1
+            shopify_errors.append(f"{order_name}: {exc}")
     sync_inventory_for_store(store_id)
     return {
         "ok": True,
         "store_id": store_id,
         "checked": len(orders),
         "updated": len(touched_rows),
-        "message": f"Checked {len(orders)} cancelled Odoo order(s), updated {len(touched_rows)} ordered line(s).",
+        "shopify_matched": shopify_matched,
+        "shopify_cancelled": shopify_cancelled,
+        "shopify_already_cancelled": shopify_already_cancelled,
+        "shopify_protected": shopify_protected,
+        "shopify_failed": shopify_failed,
+        "shopify_errors": shopify_errors[:20],
+        "message": (
+            f"Checked {len(orders)} cancelled Odoo order(s), updated {len(touched_rows)} app line(s); "
+            f"cancelled {shopify_cancelled} Shopify order(s), already cancelled {shopify_already_cancelled}, "
+            f"manual review {shopify_protected}, failed {shopify_failed}."
+        ),
     }
 
 
@@ -20263,6 +20381,183 @@ def active_shopify_orders_for_odoo_order(store_id: int, order_name: str) -> list
                     "shop": client.shop,
                 })
     return matches
+
+
+def record_odoo_shopify_cancellation_result(
+    store_id: int,
+    odoo_order_id: int,
+    order_name: str,
+    result: dict[str, Any],
+) -> None:
+    now = utc_now()
+    status = clean_text(result.get("status")) or "failed"
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO odoo_shopify_cancellation_sync
+            (store_id, odoo_order_id, odoo_order_name, status, attempts, matched_count, cancelled_count,
+             already_cancelled_count, protected_count, failed_count, details_json, last_error,
+             last_attempt_at, completed_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(store_id, odoo_order_id) DO UPDATE SET
+              odoo_order_name=excluded.odoo_order_name,
+              status=excluded.status,
+              attempts=odoo_shopify_cancellation_sync.attempts + 1,
+              matched_count=excluded.matched_count,
+              cancelled_count=excluded.cancelled_count,
+              already_cancelled_count=excluded.already_cancelled_count,
+              protected_count=excluded.protected_count,
+              failed_count=excluded.failed_count,
+              details_json=excluded.details_json,
+              last_error=excluded.last_error,
+              last_attempt_at=excluded.last_attempt_at,
+              completed_at=excluded.completed_at
+            """,
+            (
+                int(store_id),
+                int(odoo_order_id),
+                clean_text(order_name).upper(),
+                status,
+                int(result.get("matched") or 0),
+                int(result.get("cancelled") or 0),
+                int(result.get("already_cancelled") or 0),
+                int(result.get("protected") or 0),
+                int(result.get("failed") or 0),
+                json.dumps(result.get("details") or [], default=str),
+                clean_text(result.get("error"))[:2000] or None,
+                now,
+                now if status in {"completed", "manual_review"} else None,
+            ),
+        )
+
+
+def odoo_shopify_cancellation_needs_sync(store_id: int, odoo_order_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT status
+            FROM odoo_shopify_cancellation_sync
+            WHERE store_id=? AND odoo_order_id=?
+            """,
+            (int(store_id), int(odoo_order_id)),
+        ).fetchone()
+    return not row or clean_text(row.get("status")) in {"pending", "failed", "partial"}
+
+
+def cancel_shopify_orders_for_odoo_order(
+    store_id: int,
+    odoo_order_id: int,
+    order_name: str,
+    clients_by_route: Optional[dict[str, list[Any]]] = None,
+) -> dict[str, Any]:
+    clean_order_name = clean_text(order_name).upper()
+    if not clean_order_name:
+        raise ValueError("Odoo order name is required for Shopify cancellation.")
+    store = get_store(store_id)
+    source_key = f"{store.odoo_db}:{clean_order_name}"
+    with db() as conn:
+        mapped_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT state_scope, dest_name, dest_order_id
+            FROM shopify_export_order_map
+            WHERE src_order_key=?
+              AND state_scope IN ('dtc', 'dtb')
+              AND COALESCE(dest_order_id, '') != ''
+            """,
+            (source_key,),
+        ).fetchall())
+    mapped_by_destination = {
+        (clean_text(row.get("state_scope")).lower(), clean_text(row.get("dest_name"))): clean_text(row.get("dest_order_id"))
+        for row in mapped_rows
+    }
+    result: dict[str, Any] = {
+        "ok": True,
+        "status": "completed",
+        "matched": 0,
+        "cancelled": 0,
+        "already_cancelled": 0,
+        "protected": 0,
+        "failed": 0,
+        "details": [],
+        "error": "",
+    }
+    cache = clients_by_route if clients_by_route is not None else {}
+    seen: set[tuple[str, str, str]] = set()
+    for route in ("dtc", "dtb"):
+        try:
+            clients = cache.get(route)
+            if clients is None:
+                clients = shopify_clients_for_route(route)
+                cache[route] = clients
+        except Exception as exc:
+            result["failed"] += 1
+            result["details"].append({"route": route, "status": "route_error", "error": str(exc)[:1000]})
+            continue
+        for client in clients:
+            try:
+                candidates: list[dict[str, Any]] = []
+                mapped_order_id = mapped_by_destination.get((route, clean_text(client.name)))
+                if mapped_order_id:
+                    mapped_order = shopify_order_by_id(client, mapped_order_id)
+                    if mapped_order:
+                        candidates.append(mapped_order)
+                for order in shopify_orders_by_name(client, clean_order_name, limit=10):
+                    candidates.append(order)
+                for order in candidates:
+                    order_id = clean_text(order.get("id"))
+                    order_reference = clean_text(order.get("name")).lstrip("#").upper()
+                    identity = (route, clean_text(client.name), order_id)
+                    if not order_id or identity in seen or order_reference != clean_order_name.lstrip("#"):
+                        continue
+                    seen.add(identity)
+                    result["matched"] += 1
+                    detail = {
+                        "route": route,
+                        "destination": clean_text(client.name),
+                        "shop": clean_text(client.shop),
+                        "shopify_order_id": order_id,
+                        "shopify_order_name": clean_text(order.get("name")),
+                    }
+                    if clean_text(order.get("cancelled_at")):
+                        result["already_cancelled"] += 1
+                        detail["status"] = "already_cancelled"
+                        result["details"].append(detail)
+                        upsert_shopify_order_status(store_id, route, client.name, client.shop, clean_order_name, order)
+                        continue
+                    if shopify_order_is_fulfilled(order):
+                        result["protected"] += 1
+                        detail["status"] = "manual_review_fulfilled"
+                        detail["error"] = "Shopify order is already fulfilled and was not automatically cancelled."
+                        result["details"].append(detail)
+                        upsert_shopify_order_status(store_id, route, client.name, client.shop, clean_order_name, order)
+                        continue
+                    client.cancel_order(int(order_id), restock=False, refund=False, reason="other")
+                    verified = shopify_order_by_id(client, order_id)
+                    if not verified or not clean_text(verified.get("cancelled_at")):
+                        raise RuntimeError(f"Shopify did not confirm cancellation for order {order_id}.")
+                    result["cancelled"] += 1
+                    detail["status"] = "cancelled"
+                    detail["cancelled_at"] = clean_text(verified.get("cancelled_at"))
+                    result["details"].append(detail)
+                    upsert_shopify_order_status(store_id, route, client.name, client.shop, clean_order_name, verified)
+            except Exception as exc:
+                result["failed"] += 1
+                result["details"].append({
+                    "route": route,
+                    "destination": clean_text(getattr(client, "name", "")),
+                    "status": "failed",
+                    "error": str(exc)[:1000],
+                })
+    errors = [clean_text(item.get("error")) for item in result["details"] if clean_text(item.get("error"))]
+    if result["failed"]:
+        result["status"] = "partial" if result["cancelled"] or result["already_cancelled"] else "failed"
+    elif result["protected"]:
+        result["status"] = "manual_review"
+    result["ok"] = result["status"] == "completed"
+    result["error"] = " | ".join(dict.fromkeys(errors))[:2000]
+    record_odoo_shopify_cancellation_result(store_id, odoo_order_id, clean_order_name, result)
+    fast_page_cache_clear_matching({"orders", "cancelled-orders", "shopify-fulfilment", "fulfilment-pending"})
+    return result
 
 
 def force_enqueue_shopify_fulfilment_for_line_ids(store_id: int, line_ids: list[int]) -> dict[str, Any]:
@@ -25166,8 +25461,8 @@ def autosync_loop() -> None:
                             ),
                         )
                         last_chrome_run = time.time()
-            cancelled_interval = int(float(settings.get("cancelled_orders_sync_interval_minutes") or 0))
-            if cancelled_interval > 0 and time.time() - last_cancelled_run >= cancelled_interval * 60:
+            cancelled_interval = max(15, int(float(settings.get("cancelled_orders_sync_interval_minutes") or 15)))
+            if time.time() - last_cancelled_run >= cancelled_interval * 60:
                 days = max(1, min(365, int(float(settings.get("cancelled_orders_sync_days") or 30))))
                 for store in list_stores():
                     sync_cancelled_orders_for_store(int(store["id"]), days=days)
@@ -25323,18 +25618,28 @@ def api_cancelled_orders_sync(payload: Optional[dict[str, Any]] = None) -> dict[
     stores = [get_store(store_id)] if store_id else list_stores()
     results = []
     total_updated = 0
+    total_shopify_cancelled = 0
+    total_shopify_failed = 0
+    total_shopify_protected = 0
     for store in stores:
         result = sync_cancelled_orders_for_store(int(store["id"]), days=days)
         results.append(result)
         total_updated += int(result.get("updated") or 0)
+        total_shopify_cancelled += int(result.get("shopify_cancelled") or 0)
+        total_shopify_failed += int(result.get("shopify_failed") or 0)
+        total_shopify_protected += int(result.get("shopify_protected") or 0)
     rows, total = list_cancelled_order_lines(store_id, 1, 100)
     stores_payload = rows_to_dicts(list_stores())
     for store in stores_payload:
         if store.get("odoo_password"):
             store["odoo_password"] = "********"
     return {
-        "ok": True,
-        "message": f"Cancelled order sync complete. Updated {total_updated} ordered line(s).",
+        "ok": total_shopify_failed == 0 and total_shopify_protected == 0,
+        "message": (
+            f"Cancelled order sync complete. Updated {total_updated} app line(s), cancelled "
+            f"{total_shopify_cancelled} Shopify order(s), failed {total_shopify_failed}, "
+            f"manual review {total_shopify_protected}."
+        ),
         "results": results,
         "rows": cancelled_order_rows_payload(rows, stores_payload),
         "page": 1,
@@ -37899,6 +38204,91 @@ def api_delivery_check(payload: StoreActionPayload) -> dict[str, Any]:
     delivered, errors = check_deliveries(payload.store_id)
     data = dashboard_data(payload.store_id)
     data["message"] = f"Delivery check complete. Delivered: {delivered}; errors: {errors}."
+    return data
+
+
+@app.post("/api/lines/cancel-odoo-shopify")
+def api_cancel_odoo_and_shopify_orders(payload: DeleteLinesPayload) -> dict[str, Any]:
+    if not payload.line_ids:
+        raise HTTPException(400, "Select at least one Odoo order to cancel.")
+    with db() as conn:
+        selected_ids = validate_line_ids_for_store(conn, payload.store_id, payload.line_ids, "Cancel Odoo + Shopify")
+        rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT DISTINCT odoo_order_id, odoo_order_name
+            FROM order_lines
+            WHERE store_id=?
+              AND id IN ({','.join('?' for _ in selected_ids)})
+              AND COALESCE(odoo_order_id, 0) > 0
+              AND COALESCE(odoo_order_name, '') != ''
+            ORDER BY odoo_order_id
+            """,
+            [payload.store_id, *selected_ids],
+        ).fetchall())
+    if not rows:
+        raise HTTPException(400, "The selected lines do not contain an Odoo order reference.")
+
+    store = get_store(payload.store_id)
+    odoo = OdooClient(store)
+    fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status", "write_date"])
+    clients_by_route: dict[str, list[Any]] = {}
+    cancelled_odoo = 0
+    already_cancelled_odoo = 0
+    shopify_matched = 0
+    shopify_cancelled = 0
+    shopify_already_cancelled = 0
+    shopify_protected = 0
+    failures: list[str] = []
+    for selected in rows:
+        order_id = int(selected["odoo_order_id"])
+        order_name = clean_text(selected.get("odoo_order_name")).upper()
+        try:
+            live_rows = odoo.read("sale.order", [order_id], fields)
+            if not live_rows:
+                raise RuntimeError("Odoo order was not found.")
+            live_order = live_rows[0]
+            if clean_text(live_order.get("state")).lower() == "cancel":
+                already_cancelled_odoo += 1
+            else:
+                odoo.execute("sale.order", "action_cancel", [[order_id]])
+                verified_rows = odoo.read("sale.order", [order_id], fields)
+                live_order = verified_rows[0] if verified_rows else {}
+                if clean_text(live_order.get("state")).lower() != "cancel":
+                    raise RuntimeError("Odoo did not confirm the cancellation.")
+                cancelled_odoo += 1
+            mark_cancelled_odoo_order_locally(payload.store_id, live_order)
+            cancellation = cancel_shopify_orders_for_odoo_order(
+                payload.store_id,
+                order_id,
+                order_name or clean_text(live_order.get("name")),
+                clients_by_route=clients_by_route,
+            )
+            shopify_matched += int(cancellation.get("matched") or 0)
+            shopify_cancelled += int(cancellation.get("cancelled") or 0)
+            shopify_already_cancelled += int(cancellation.get("already_cancelled") or 0)
+            shopify_protected += int(cancellation.get("protected") or 0)
+            if cancellation.get("error"):
+                failures.append(f"{order_name}: {cancellation['error']}")
+        except Exception as exc:
+            failures.append(f"{order_name or order_id}: {exc}")
+
+    data = dashboard_data(payload.store_id)
+    data["ok"] = not failures and not shopify_protected
+    data["cancelled_odoo"] = cancelled_odoo
+    data["already_cancelled_odoo"] = already_cancelled_odoo
+    data["shopify_matched"] = shopify_matched
+    data["shopify_cancelled"] = shopify_cancelled
+    data["shopify_already_cancelled"] = shopify_already_cancelled
+    data["shopify_protected"] = shopify_protected
+    data["errors"] = failures[:20]
+    message = (
+        f"Odoo: cancelled {cancelled_odoo}, already cancelled {already_cancelled_odoo}. "
+        f"Shopify: matched {shopify_matched}, cancelled {shopify_cancelled}, "
+        f"already cancelled {shopify_already_cancelled}, manual review {shopify_protected}."
+    )
+    if failures:
+        message += " Errors: " + " | ".join(failures[:5])
+    data["message"] = message
     return data
 
 

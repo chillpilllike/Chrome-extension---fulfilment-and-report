@@ -42,7 +42,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "auto_chrome_fulfil_days": os.getenv("AUTO_CHROME_FULFIL_DAYS", "2"),
     "auto_chrome_fulfil_limit": os.getenv("AUTO_CHROME_FULFIL_LIMIT", "100"),
     "chrome_route_orders_by_account_type": os.getenv("CHROME_ROUTE_ORDERS_BY_ACCOUNT_TYPE", "true"),
-    "cancelled_orders_sync_interval_minutes": os.getenv("CANCELLED_ORDERS_SYNC_INTERVAL_MINUTES", "0"),
+    "cancelled_orders_sync_interval_minutes": os.getenv("CANCELLED_ORDERS_SYNC_INTERVAL_MINUTES", "15"),
     "cancelled_orders_sync_days": os.getenv("CANCELLED_ORDERS_SYNC_DAYS", "30"),
     "openexchange_api_key": os.getenv("OPENEXCHANGE_API_KEY", ""),
     "openexchange_sync_interval_minutes": os.getenv("OPENEXCHANGE_SYNC_INTERVAL_MINUTES", "2880"),
