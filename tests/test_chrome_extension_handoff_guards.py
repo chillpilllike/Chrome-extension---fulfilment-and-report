@@ -177,7 +177,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.191")
+        self.assertEqual(MANIFEST["version"], "0.1.192")
 
     def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
         self.assertIn('id="odooOrderNumber"', POPUP_HTML)
@@ -1505,6 +1505,8 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         checkout_start = CONTENT.index("async function handleCheckout(activeJob)")
         checkout_end = CONTENT.index("function extractOrderId()", checkout_start)
         checkout = CONTENT[checkout_start:checkout_end]
+        self.assertIn("finalCheckoutAsinQuantityEvidence()", guard)
+        self.assertIn("exactAsinQuantitiesMatch(expected, checkoutEvidence.quantities)", guard)
         self.assertIn("if (cartVerificationMatches(activeJob)) return true", guard)
         self.assertIn("directSingleSubscription && productIdentityVerificationsMatch(activeJob)", guard)
         self.assertIn("No fresh exact-ASIN product or cart verification exists", guard)
@@ -1513,6 +1515,18 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         identity_guard = checkout.index("ensureFinalAuthorizedAsinIdentity(activeJob)")
         place_click = checkout.index('clickElement(placeOrder, "Place your order button")')
         self.assertLess(identity_guard, place_click)
+
+    def test_business_final_checkout_reads_hidden_asin_and_native_stepper_quantity(self) -> None:
+        evidence_start = CONTENT.index("function finalCheckoutAsinQuantityEvidence")
+        evidence_end = CONTENT.index("function exactAsinQuantitiesMatch", evidence_start)
+        evidence = CONTENT[evidence_start:evidence_end]
+        quantity_start = CONTENT.index("function checkoutLineItemQuantity")
+        quantity_end = CONTENT.index("function finalCheckoutAsinQuantityEvidence", quantity_start)
+        quantity = CONTENT[quantity_start:quantity_end]
+        self.assertIn("[data-testid^='Item_asin_']", evidence)
+        self.assertIn("[id^='checkout-item-block-']", evidence)
+        self.assertIn("checkoutLineItemQuantity(row)", evidence)
+        self.assertIn("[name='checkout-quantity-stepper']", quantity)
 
     def test_order_history_requires_exact_authorized_asin_set_before_reporting(self) -> None:
         active_start = CONTENT.index("function activeJobAsins(activeJob)")

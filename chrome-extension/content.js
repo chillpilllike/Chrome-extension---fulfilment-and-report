@@ -1441,7 +1441,7 @@ function checkoutLineItemTitle(groupView) {
 }
 
 function checkoutLineItemQuantity(groupView) {
-  const stepper = groupView?.querySelector?.("[name='stma-checkout-quantity-stepper'], [data-a-component='stepper'], input[name='quantity'], input[data-testid='ItemSelectLineItemQuantityTextField'], input.quantity-input, [role='spinbutton']");
+  const stepper = groupView?.querySelector?.("[name='checkout-quantity-stepper'], [name='stma-checkout-quantity-stepper'], [data-a-component='stepper'], input[name='quantity'], input[data-testid='ItemSelectLineItemQuantityTextField'], input.quantity-input, [role='spinbutton']");
   const rawValue = stepper?.getAttribute?.("data-steppervalue")
     ?? stepper?.getAttribute?.("data-displaystring")
     ?? stepper?.getAttribute?.("aria-valuenow")
@@ -1451,6 +1451,48 @@ function checkoutLineItemQuantity(groupView) {
     ?? "";
   const value = Number(String(rawValue).trim());
   return Number.isFinite(value) ? value : null;
+}
+
+function finalCheckoutAsinQuantityEvidence() {
+  const asinNodes = [...document.querySelectorAll("[data-testid^='Item_asin_']")];
+  if (!asinNodes.length) return { present: false, readable: false, quantities: {}, observed_asins: [] };
+  const quantities = {};
+  const observedAsins = [];
+  const seenRows = new Set();
+  let readable = true;
+  asinNodes.forEach((node, index) => {
+    const asin = String(node.textContent || "").trim().toUpperCase();
+    const row = node.closest("[id^='checkout-item-block-'], [data-item-index]") || node.parentElement;
+    const rowKey = `${row?.id || row?.getAttribute?.("data-item-index") || index}:${asin}`;
+    if (seenRows.has(rowKey)) return;
+    seenRows.add(rowKey);
+    if (!/^[A-Z0-9]{10}$/.test(asin)) {
+      readable = false;
+      return;
+    }
+    observedAsins.push(asin);
+    const quantity = checkoutLineItemQuantity(row);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      readable = false;
+      return;
+    }
+    quantities[asin] = (quantities[asin] || 0) + Number(quantity);
+  });
+  if (observedAsins.length !== seenRows.size) readable = false;
+  return {
+    present: true,
+    readable,
+    quantities,
+    observed_asins: [...new Set(observedAsins)],
+  };
+}
+
+function exactAsinQuantitiesMatch(expected = {}, actual = {}) {
+  const expectedKeys = Object.keys(expected).sort();
+  const actualKeys = Object.keys(actual).sort();
+  return expectedKeys.length === actualKeys.length && expectedKeys.every((asin, index) => (
+    asin === actualKeys[index] && Number(expected[asin]) === Number(actual[asin])
+  ));
 }
 
 function checkoutVisibleQuantityValues() {
@@ -1542,6 +1584,35 @@ async function ensureFinalAuthorizedAsinIdentity(activeJob) {
       evidence: legacyEvidence,
     }, "error");
     showPanel("Wrong Amazon product blocked", message, null, null);
+    return false;
+  }
+  const checkoutEvidence = finalCheckoutAsinQuantityEvidence();
+  if (checkoutEvidence.present) {
+    const expected = expectedCartQuantities(activeJob);
+    if (checkoutEvidence.readable && exactAsinQuantitiesMatch(expected, checkoutEvidence.quantities)) {
+      activeJob.finalCheckoutAsinVerification = {
+        group_key: activeJob?.job?.group_key || "",
+        quantities: checkoutEvidence.quantities,
+        verified_at: Date.now(),
+      };
+      activeJob.asinIdentityError = "";
+      await setActiveJob(activeJob, { reason: "verified_final_checkout_asins" });
+      return true;
+    }
+    const quantityDetails = Object.entries(checkoutEvidence.quantities)
+      .map(([asin, quantity]) => `${asin} x${quantity}`)
+      .join(", ");
+    const message = `${strictAsinIdentityMessage(activeJob, checkoutEvidence.observed_asins, "Final checkout")} ${checkoutEvidence.readable ? `Amazon checkout quantities are ${quantityDetails || "unreadable"}; they must exactly match the queued order.` : "Amazon exposed an item ASIN but its exact quantity could not be read."}`;
+    activeJob.paused = true;
+    activeJob.pausedStage = "checkout";
+    activeJob.asinIdentityError = message;
+    await setActiveJob(activeJob);
+    await sendDiagnostic("Blocked Place Order because final checkout ASIN/quantity evidence did not exactly match.", {
+      group_key: activeJob?.job?.group_key || "",
+      expected_quantities: expected,
+      checkout_evidence: checkoutEvidence,
+    }, "error");
+    showPanel("Wrong Amazon checkout blocked", message, null, null);
     return false;
   }
   if (cartVerificationMatches(activeJob)) return true;
