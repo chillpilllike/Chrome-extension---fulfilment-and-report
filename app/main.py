@@ -2776,12 +2776,52 @@ def odoo_chatter_outbox_schedule_loop() -> None:
 
 
 ODOO_ORDERED_TAG_NAME = "ordered"
+ODOO_HOLD_TAG_NAME = "hold"
 
 
 def odoo_order_tag_model(odoo: OdooClient) -> str:
     fields = odoo.fields_get("sale.order")
     tag_field = fields.get("tag_ids") or {}
     return clean_text(tag_field.get("relation")) if isinstance(tag_field, dict) else ""
+
+
+def odoo_order_ids_with_tag(
+    odoo: OdooClient,
+    orders: list[dict[str, Any]],
+    tag_name: str,
+) -> set[int]:
+    wanted = clean_text(tag_name).casefold()
+    if not wanted:
+        return set()
+    tag_ids = sorted({
+        int(tag_id)
+        for order in orders
+        for tag_id in (order.get("tag_ids") or [])
+        if str(tag_id or "").isdigit() and int(tag_id) > 0
+    })
+    if not tag_ids:
+        return set()
+    model = odoo_order_tag_model(odoo)
+    if not model:
+        raise RuntimeError("Odoo sale.order tag model could not be resolved for the hold-tag safety check.")
+    tags = odoo.read(model, tag_ids, ["id", "name"])
+    matching_tag_ids = {
+        int(tag["id"])
+        for tag in tags
+        if int(tag.get("id") or 0) > 0 and clean_text(tag.get("name")).casefold() == wanted
+    }
+    if not matching_tag_ids:
+        return set()
+    return {
+        int(order.get("id") or 0)
+        for order in orders
+        if int(order.get("id") or 0) > 0
+        and matching_tag_ids.intersection({
+            int(tag_id)
+            for tag_id in (order.get("tag_ids") or [])
+            if str(tag_id or "").isdigit()
+        })
+    }
 
 
 def ensure_odoo_order_tag(odoo: OdooClient, tag_name: str = ODOO_ORDERED_TAG_NAME) -> Optional[int]:
@@ -12374,6 +12414,13 @@ def claim_next_chrome_job(
                 (worker_id, store_id, store_id),
             ).fetchall()
             if existing:
+                existing_rows, _blocked, _messages = filter_lines_by_live_odoo_status(
+                    conn,
+                    int(existing[0]["store_id"]),
+                    rows_to_dicts(existing),
+                )
+                existing = existing_rows
+            if existing:
                 existing_rows = rows_to_dicts(existing)
                 if not chrome_account_experience_matches(existing_rows, account_experience):
                     group_key = str(existing_rows[0]["amazon_group_key"])
@@ -12479,6 +12526,12 @@ def claim_next_chrome_job(
                 """,
                 (group_key,),
             ).fetchall())
+            if candidate_rows:
+                candidate_rows, _blocked, _messages = filter_lines_by_live_odoo_status(
+                    conn,
+                    int(candidate_rows[0]["store_id"]),
+                    candidate_rows,
+                )
             if not candidate_rows or not chrome_account_experience_matches(candidate_rows, account_experience):
                 continue
             # Whole-order invariant: the legacy split flag is intentionally
@@ -25854,8 +25907,11 @@ def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any])
     try:
         store = get_store(store_id)
         odoo = OdooClient(store)
-        fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status"])
-        live_orders = odoo.read("sale.order", order_ids, fields or ["id", "name", "state", "invoice_status"])
+        fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status", "tag_ids"])
+        if "tag_ids" not in fields:
+            raise RuntimeError("Odoo sale.order.tag_ids is unavailable; fulfilment was blocked because hold tags cannot be verified.")
+        live_orders = odoo.read("sale.order", order_ids, fields)
+        held_order_ids = odoo_order_ids_with_tag(odoo, live_orders, ODOO_HOLD_TAG_NAME)
     except Exception as exc:
         raise HTTPException(502, f"Could not verify Odoo order status before placing order: {exc}") from exc
 
@@ -25869,7 +25925,9 @@ def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any])
         order_name = clean_text(order.get("name")) or str(order_id)
         state = clean_text(order.get("state")).lower()
         invoice_status = clean_text(order.get("invoice_status")).lower()
-        if state == "cancel":
+        if order_id in held_order_ids:
+            blocked[order_id] = ("hold", f"Odoo order {order_name} has the hold tag. It was removed from the fulfilment queue.")
+        elif state == "cancel":
             blocked[order_id] = ("cancelled", f"Odoo order {order_name} is cancelled.")
         elif invoice_status == "refunded":
             blocked[order_id] = ("refunded", f"Odoo order {order_name} is refunded.")
@@ -25880,7 +25938,44 @@ def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any])
     now = utc_now()
     messages = list(dict.fromkeys(message for _status, message in blocked.values()))
     for order_id, (status, message) in blocked.items():
-        if status in {"cancelled", "refunded"}:
+        if status == "hold":
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET state=CASE
+                      WHEN state='submitted'
+                       AND COALESCE(amazon_order_id, '') = ''
+                       AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                      THEN 'pulled'
+                      ELSE state
+                    END,
+                    amazon_status=CASE
+                      WHEN state='submitted'
+                       AND COALESCE(amazon_order_id, '') = ''
+                       AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                      THEN NULL
+                      ELSE amazon_status
+                    END,
+                    amazon_group_key=CASE
+                      WHEN state='submitted'
+                       AND COALESCE(amazon_order_id, '') = ''
+                       AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                      THEN NULL
+                      ELSE amazon_group_key
+                    END,
+                    chrome_claimed_by=NULL,
+                    chrome_claimed_at=NULL,
+                    chrome_claim_expires_at=NULL,
+                    last_error=?,
+                    updated_at=?
+                WHERE store_id=?
+                  AND odoo_order_id=?
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+                """,
+                (message, now, store_id, order_id),
+            )
+        elif status in {"cancelled", "refunded"}:
             conn.execute(
                 """
                 UPDATE order_lines
@@ -30272,26 +30367,67 @@ def api_chrome_job_submitted(group_key: str, payload: ChromeJobHeartbeatPayload)
         raise HTTPException(400, "worker_id is required")
     expiry = chrome_job_lease_expiry()
     now = utc_now()
+    blocked_message = ""
+    submitted_count = 0
     with db() as conn:
         ensure_chrome_job_owner(conn, group_key, worker_id)
-        cursor = conn.execute(
+        pending_rows = rows_to_dicts(conn.execute(
             """
-            UPDATE order_lines
-            SET amazon_status=?,
-                chrome_claimed_by=?,
-                chrome_claimed_at=COALESCE(chrome_claimed_at, ?),
-                chrome_claim_expires_at=?,
-                updated_at=?
+            SELECT *
+            FROM order_lines
             WHERE amazon_group_key=?
               AND order_engine='chrome'
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+            ORDER BY id
             """,
-            (CHROME_ORDER_SUBMITTED_STATUS, worker_id, now, expiry, now, group_key),
-        )
-    if not cursor.rowcount:
+            (group_key,),
+        ).fetchall())
+        if not pending_rows:
+            protected_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM order_lines
+                WHERE amazon_group_key=?
+                  AND order_engine='chrome'
+                  AND state='submitted'
+                  AND COALESCE(amazon_order_id, '') = ''
+                  AND amazon_status IN ('order_submitted', 'reporting_complete')
+                """,
+                (group_key,),
+            ).fetchone()
+            submitted_count = int(protected_row["count"] or 0) if protected_row else 0
+        else:
+            _eligible, blocked_count, messages = filter_lines_by_live_odoo_status(
+                conn,
+                int(pending_rows[0]["store_id"]),
+                pending_rows,
+            )
+            if blocked_count:
+                blocked_message = messages[0] if messages else "Odoo order is not eligible for fulfilment."
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_status=?,
+                        chrome_claimed_by=?,
+                        chrome_claimed_at=COALESCE(chrome_claimed_at, ?),
+                        chrome_claim_expires_at=?,
+                        updated_at=?
+                    WHERE amazon_group_key=?
+                      AND order_engine='chrome'
+                      AND state='submitted'
+                      AND COALESCE(amazon_order_id, '') = ''
+                    """,
+                    (CHROME_ORDER_SUBMITTED_STATUS, worker_id, now, expiry, now, group_key),
+                )
+                submitted_count = cursor.rowcount
+    if blocked_message:
+        raise HTTPException(409, f"{blocked_message} Amazon Place Order was stopped.")
+    if not submitted_count:
         raise HTTPException(404, "Chrome job not found")
-    return {"ok": True, "submitted": cursor.rowcount, "claim_expires_at": expiry}
+    return {"ok": True, "submitted": submitted_count, "claim_expires_at": expiry}
 
 
 @app.get("/api/chrome/jobs/{group_key}/completion-status")
