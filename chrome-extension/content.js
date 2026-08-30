@@ -6344,8 +6344,31 @@ function deliveryContextHasSplitPromise(context) {
     || /\b(?:items?|packages?|shipments?)\s+(?:may|will|can)\s+(?:arrive|be delivered)\s+(?:separately|on different (?:days|dates))\b/i.test(text);
 }
 
+function deliveryTextStartMinutes(value = "") {
+  const text = normalizedText(value || "");
+  const match = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:-|–|—|to)\s*(?:\d{1,2})(?::\d{2})?\s*(?:am|pm)\b/i);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || 0);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour < 1 || hour > 12 || minute < 0 || minute > 59) return null;
+  if (hour === 12) hour = 0;
+  if (String(match[3]).toLowerCase() === "pm") hour += 12;
+  return hour * 60 + minute;
+}
+
+function deliveryTextStartsBeforeWarehouseOpen(value = "") {
+  const startMinutes = deliveryTextStartMinutes(value);
+  return Number.isFinite(startMinutes) && startMinutes < 8 * 60;
+}
+
+function deliveryContextStartsBeforeWarehouseOpen(context) {
+  return deliveryTextStartsBeforeWarehouseOpen(context?.text || "");
+}
+
 function deliveryContextIsNotConsolidated(context) {
-  return deliveryContextIncludesWarehouseClosedDay(context) || deliveryContextHasSplitPromise(context);
+  return deliveryContextIncludesWarehouseClosedDay(context)
+    || deliveryContextHasSplitPromise(context)
+    || deliveryContextStartsBeforeWarehouseOpen(context);
 }
 
 function deliveryContextNamesWarehouseOpenDay(context) {
@@ -7126,7 +7149,7 @@ async function ensureWarehouseOpenDayDelivery(activeJob) {
   if (!weekdayOption?.control) {
     await pauseForManualCheckout(
       activeJob,
-      `Amazon selected a split delivery or a delivery that includes Saturday or Sunday, but no Monday-Friday consolidated option could be selected safely. Selected option: ${selected.text}`,
+      `Amazon selected a split delivery, a Saturday/Sunday delivery, or a window beginning before 8:00 AM, but no safe Monday-Friday option could be selected. Selected option: ${selected.text}`,
       "checkout",
     );
     return false;
@@ -7134,11 +7157,11 @@ async function ensureWarehouseOpenDayDelivery(activeJob) {
 
   showPanel(
     "Weekday delivery required",
-    `The warehouse is closed Saturday and Sunday. Selecting the consolidated weekday option: ${weekdayOption.text}`,
+    `The warehouse accepts deliveries only from 8:00 AM on weekdays. Selecting the safe weekday option: ${weekdayOption.text}`,
     null,
     null,
   );
-  await sendDiagnostic("Replacing a split or weekend delivery with a consolidated weekday delivery.", {
+  await sendDiagnostic("Replacing a split, weekend, or before-8-AM delivery with a safe weekday delivery.", {
     selected_option_text: selected.text,
     replacement_option_text: weekdayOption.text,
     replacement_is_amazon_day: isAmazonDayDeliveryContext(weekdayOption),
@@ -7309,6 +7332,7 @@ async function ensureFinalConsolidatedDelivery(activeJob) {
       && !deliveryContextIsNotConsolidated(afterSettle)
       && deliveryContextNamesWarehouseOpenDay(afterSettle)
       && !deliveryTextIncludesWarehouseClosedDay(finalPromiseText)
+      && !deliveryTextStartsBeforeWarehouseOpen(finalPromiseText)
       && normalizedText(afterSettle.text || "") === normalizedText(stableText || afterSettle.text || "")
     ) {
       await sendDiagnostic("Final consolidated delivery selection remained stable before Place Order.", {
@@ -7324,7 +7348,7 @@ async function ensureFinalConsolidatedDelivery(activeJob) {
   const selected = selectedDeliveryRadioContext();
   await pauseForManualCheckout(
     activeJob,
-    `Amazon kept changing the final delivery selection. A single Monday-Friday consolidated option must remain selected before Place Order. Current option: ${selected?.text || "not visible"}`,
+    `Amazon kept changing the final delivery selection. A single Monday-Friday option beginning no earlier than 8:00 AM must remain selected before Place Order. Current option: ${selected?.text || "not visible"}`,
     "checkout",
   );
   return false;

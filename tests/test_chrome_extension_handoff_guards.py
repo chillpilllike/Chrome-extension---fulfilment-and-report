@@ -177,7 +177,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.192")
+        self.assertEqual(MANIFEST["version"], "0.1.193")
 
     def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
         self.assertIn('id="odooOrderNumber"', POPUP_HTML)
@@ -1527,6 +1527,19 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("[id^='checkout-item-block-']", evidence)
         self.assertIn("checkoutLineItemQuantity(row)", evidence)
         self.assertIn("[name='checkout-quantity-stepper']", quantity)
+
+    def test_delivery_selection_rejects_every_window_starting_before_8_am(self) -> None:
+        parser_start = CONTENT.index("function deliveryTextStartMinutes")
+        parser_end = CONTENT.index("function deliveryContextNamesWarehouseOpenDay", parser_start)
+        parser = CONTENT[parser_start:parser_end]
+        final_start = CONTENT.index("async function ensureFinalConsolidatedDelivery")
+        final_end = CONTENT.index("function checkoutDeliveryPromiseText", final_start)
+        final_guard = CONTENT[final_start:final_end]
+        self.assertIn("deliveryTextStartsBeforeWarehouseOpen", parser)
+        self.assertIn("startMinutes < 8 * 60", parser)
+        self.assertIn("deliveryContextStartsBeforeWarehouseOpen(context)", parser)
+        self.assertIn("!deliveryTextStartsBeforeWarehouseOpen(finalPromiseText)", final_guard)
+        self.assertIn("beginning no earlier than 8:00 AM", final_guard)
 
     def test_order_history_requires_exact_authorized_asin_set_before_reporting(self) -> None:
         active_start = CONTENT.index("function activeJobAsins(activeJob)")
