@@ -34,6 +34,13 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
             BACKGROUND.index("...retainedPreferredGroupKeys,"),
         )
 
+    def test_process_queue_remaps_stale_group_without_falling_to_wrong_profile(self) -> None:
+        self.assertIn("async function resolvePreferredQueueGroup(accountExperience, workerId)", BACKGROUND)
+        self.assertIn("const replacementCompatible = oldOrderName", BACKGROUND)
+        self.assertIn("const replacementAny = oldOrderName", BACKGROUND)
+        self.assertIn("claimable: Boolean(replacementCompatible)", BACKGROUND)
+        self.assertIn("await consumePreferredQueueGroupKey(oldGroupKey)", BACKGROUND)
+
     def test_auto_ordering_requires_manual_session_confirmation(self) -> None:
         self.assertIn('id="autoOrderingConfirmed"', POPUP_HTML)
         self.assertIn('id="autoOrderingToggle" disabled', POPUP_HTML)
@@ -170,7 +177,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.189")
+        self.assertEqual(MANIFEST["version"], "0.1.190")
 
     def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
         self.assertIn('id="odooOrderNumber"', POPUP_HTML)
@@ -193,7 +200,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn("startManualQueueRun(windowId)", queue)
         self.assertIn("processing", queue)
         self.assertIn("function preferredQueueJobIsClaimable", BACKGROUND)
-        self.assertGreaterEqual(BACKGROUND.count("preferredQueueJobIsClaimable(preferredGroupKey"), 2)
+        self.assertGreaterEqual(BACKGROUND.count("resolvePreferredQueueGroup(detectedAccount.experience, workerId)"), 2)
         self.assertIn("claim=false&job_limit=250", BACKGROUND)
         self.assertIn("&preferred_only=true", BACKGROUND)
         self.assertIn("The general queue was not claimed", BACKGROUND)

@@ -803,6 +803,66 @@ async function preferredQueueJobIsClaimable(groupKey, accountExperience, workerI
   ));
 }
 
+async function resolvePreferredQueueGroup(accountExperience, workerId) {
+  const stored = await chrome.storage.local.get({
+    preferredQueueGroupKeys: [],
+    preferredQueueGroupKey: "",
+    preferredQueueOrderNames: {},
+  });
+  const pendingKeys = [...new Set([
+    ...(stored.preferredQueueGroupKeys || []),
+    stored.preferredQueueGroupKey,
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!pendingKeys.length) return { groupKey: "", orderName: "", claimable: true };
+
+  const workerQuery = `&worker_id=${encodeURIComponent(workerId || "")}`;
+  const [compatibleSnapshot, allSnapshot] = await Promise.all([
+    api(`/api/chrome/jobs?claim=false&job_limit=250${workerQuery}&account_experience=${encodeURIComponent(accountExperience || "")}`),
+    api(`/api/chrome/jobs?claim=false&job_limit=250${workerQuery}`),
+  ]);
+  const compatibleJobs = compatibleSnapshot.jobs || [];
+  const allJobs = allSnapshot.jobs || [];
+  const availableToWorker = (job) => !job?.claimed_by || String(job.claimed_by) === String(workerId || "");
+  const orderNames = stored.preferredQueueOrderNames || {};
+
+  for (const oldGroupKey of pendingKeys) {
+    const oldOrderName = String(orderNames[oldGroupKey] || "").trim().toUpperCase();
+    const exactCompatible = compatibleJobs.find((job) => String(job?.group_key || "").trim() === oldGroupKey && availableToWorker(job));
+    if (exactCompatible) return { groupKey: oldGroupKey, orderName: oldOrderName, claimable: true };
+
+    const exactAny = allJobs.find((job) => String(job?.group_key || "").trim() === oldGroupKey && availableToWorker(job));
+    if (exactAny) return { groupKey: oldGroupKey, orderName: oldOrderName, claimable: false };
+
+    const replacementCompatible = oldOrderName
+      ? compatibleJobs.find((job) => (job?.order_names || []).some((name) => String(name || "").trim().toUpperCase() === oldOrderName) && availableToWorker(job))
+      : null;
+    const replacementAny = oldOrderName
+      ? allJobs.find((job) => (job?.order_names || []).some((name) => String(name || "").trim().toUpperCase() === oldOrderName) && availableToWorker(job))
+      : null;
+    const replacement = replacementCompatible || replacementAny;
+    if (replacement?.group_key) {
+      const replacementGroupKey = String(replacement.group_key).trim();
+      const remaining = pendingKeys.filter((value) => value !== oldGroupKey && value !== replacementGroupKey);
+      const nextOrderNames = { ...orderNames };
+      delete nextOrderNames[oldGroupKey];
+      nextOrderNames[replacementGroupKey] = oldOrderName;
+      await chrome.storage.local.set({
+        preferredQueueGroupKeys: [replacementGroupKey, ...remaining],
+        preferredQueueGroupKey: replacementGroupKey,
+        preferredQueueOrderNames: nextOrderNames,
+      });
+      return {
+        groupKey: replacementGroupKey,
+        orderName: oldOrderName,
+        claimable: Boolean(replacementCompatible),
+      };
+    }
+
+    await consumePreferredQueueGroupKey(oldGroupKey);
+  }
+  return { groupKey: "", orderName: "", claimable: true };
+}
+
 function tabOrigin(url = "") {
   try {
     const parsed = new URL(url);
@@ -1655,10 +1715,17 @@ async function startNextJob(sourceWindowId = null) {
     return { ok: false, message };
   }
   if (await forceStopActive()) return { ok: false, stopped: true, message: "Force stop is active; did not claim a queued order." };
-  const preferredGroupKey = String(options.preferredGroupKey || await nextPreferredQueueGroupKey() || "").trim();
-  if (preferredGroupKey && !await preferredQueueJobIsClaimable(preferredGroupKey, detectedAccount.experience, workerId)) {
+  const resolvedPreferred = options.preferredGroupKey
+    ? {
+        groupKey: String(options.preferredGroupKey || "").trim(),
+        orderName: await preferredQueueOrderName(options.preferredGroupKey),
+        claimable: await preferredQueueJobIsClaimable(options.preferredGroupKey, detectedAccount.experience, workerId),
+      }
+    : await resolvePreferredQueueGroup(detectedAccount.experience, workerId);
+  const preferredGroupKey = resolvedPreferred.groupKey;
+  if (preferredGroupKey && !resolvedPreferred.claimable) {
     if (options.manual === true || await manualQueueIsRunning()) await setManualQueueRunning(false);
-    const preferredOrderName = await preferredQueueOrderName(preferredGroupKey);
+    const preferredOrderName = resolvedPreferred.orderName || await preferredQueueOrderName(preferredGroupKey);
     const message = `${preferredOrderName || "The manually inserted order"} is not currently claimable in this ${detectedAccount.experience} Amazon profile. The general queue was not claimed.`;
     await updateOrderProgressTotal(0, message);
     await log(message, sourceWindowId);
@@ -1893,10 +1960,11 @@ async function claimNextJobInWindow(windowId) {
     return null;
   }
   if (await forceStopActive()) return null;
-  const preferredGroupKey = await nextPreferredQueueGroupKey();
-  if (preferredGroupKey && !await preferredQueueJobIsClaimable(preferredGroupKey, detectedAccount.experience, workerId)) {
+  const resolvedPreferred = await resolvePreferredQueueGroup(detectedAccount.experience, workerId);
+  const preferredGroupKey = resolvedPreferred.groupKey;
+  if (preferredGroupKey && !resolvedPreferred.claimable) {
     if (await manualQueueIsRunning()) await setManualQueueRunning(false);
-    const preferredOrderName = await preferredQueueOrderName(preferredGroupKey);
+    const preferredOrderName = resolvedPreferred.orderName || await preferredQueueOrderName(preferredGroupKey);
     await setWindowJob(windowId, null);
     await log(`${preferredOrderName || "The manually inserted order"} is not claimable in this ${detectedAccount.experience} Amazon profile; did not fall through to the general queue.`, windowId);
     return null;
