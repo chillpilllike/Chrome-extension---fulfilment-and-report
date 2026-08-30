@@ -730,16 +730,30 @@ async function queueOdooOrders(orderNames, windowId = null) {
     preferredQueueGroupKeys: [],
     preferredQueueOrderNames: {},
   });
+  // Re-importing an order can produce a new group key after a reset/requeue.
+  // Remove every older preference for the same Odoo order before putting the
+  // live group at the front; otherwise Process queued orders keeps testing the
+  // dead group and never claims the replacement job.
+  const requeuedOrderNames = new Set(normalized);
+  const staleSameOrderGroupKeys = new Set(Object.entries(storedPreferences.preferredQueueOrderNames || {})
+    .filter(([, orderName]) => requeuedOrderNames.has(String(orderName || "").trim().toUpperCase()))
+    .map(([groupKey]) => String(groupKey || "").trim())
+    .filter(Boolean));
+  const retainedPreferredGroupKeys = (storedPreferences.preferredQueueGroupKeys || [])
+    .map((value) => String(value || "").trim())
+    .filter((value) => value && !staleSameOrderGroupKeys.has(value));
   const mergedPreferredGroupKeys = [...new Set([
-    ...(storedPreferences.preferredQueueGroupKeys || []),
     ...preferredGroupKeys,
+    ...retainedPreferredGroupKeys,
   ].map((value) => String(value || "").trim()).filter(Boolean))];
+  const retainedPreferredOrderNames = { ...(storedPreferences.preferredQueueOrderNames || {}) };
+  for (const groupKey of staleSameOrderGroupKeys) delete retainedPreferredOrderNames[groupKey];
   await chrome.storage.local.set({
     cachedQueueStatus: null,
     preferredQueueGroupKeys: mergedPreferredGroupKeys,
     preferredQueueGroupKey: mergedPreferredGroupKeys[0] || "",
     preferredQueueOrderNames: {
-      ...(storedPreferences.preferredQueueOrderNames || {}),
+      ...retainedPreferredOrderNames,
       ...orderNameByGroup,
     },
   });

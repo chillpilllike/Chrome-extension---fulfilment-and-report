@@ -26,6 +26,14 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
     def test_stateful_extension_api_requests_never_reuse_cached_claims(self) -> None:
         self.assertIn('cache: "no-store"', BACKGROUND)
 
+    def test_reimport_replaces_stale_preferred_group_for_same_odoo_order(self) -> None:
+        self.assertIn("const staleSameOrderGroupKeys", BACKGROUND)
+        self.assertIn("!staleSameOrderGroupKeys.has(value)", BACKGROUND)
+        self.assertLess(
+            BACKGROUND.index("...preferredGroupKeys,"),
+            BACKGROUND.index("...retainedPreferredGroupKeys,"),
+        )
+
     def test_auto_ordering_requires_manual_session_confirmation(self) -> None:
         self.assertIn('id="autoOrderingConfirmed"', POPUP_HTML)
         self.assertIn('id="autoOrderingToggle" disabled', POPUP_HTML)
@@ -162,7 +170,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.188")
+        self.assertEqual(MANIFEST["version"], "0.1.189")
 
     def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
         self.assertIn('id="odooOrderNumber"', POPUP_HTML)
