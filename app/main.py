@@ -8869,14 +8869,51 @@ def order_has_paid_customer_invoice(order: dict[str, Any], invoice_rows: list[di
     return False
 
 
-def manual_pull_order_ineligible_reason(order: dict[str, Any], invoice_rows: list[dict[str, Any]]) -> str:
+def order_has_authorized_customer_transaction(
+    order: dict[str, Any],
+    transaction_rows: list[dict[str, Any]],
+) -> bool:
+    """Accept a full Odoo payment authorization before its invoice is created."""
+    try:
+        order_total = float(order.get("amount_total") or 0.0)
+    except Exception:
+        return False
+    if order_total == 0.0:
+        return True
+
+    order_currency_id = many2one_id(order.get("currency_id"))
+    authorized_total = 0.0
+    for transaction in transaction_rows:
+        if clean_text(transaction.get("state")).lower() not in {"authorized", "done"}:
+            continue
+        transaction_currency_id = many2one_id(transaction.get("currency_id"))
+        if order_currency_id and transaction_currency_id and transaction_currency_id != order_currency_id:
+            continue
+        try:
+            authorized_total += max(0.0, float(transaction.get("amount") or 0.0))
+        except Exception:
+            continue
+    return authorized_total + 0.01 >= order_total
+
+
+def manual_pull_order_ineligible_reason(
+    order: dict[str, Any],
+    invoice_rows: list[dict[str, Any]],
+    transaction_rows: Optional[list[dict[str, Any]]] = None,
+) -> str:
     order_name = clean_text(order.get("name")) or str(order.get("id") or "Odoo order")
     state = clean_text(order.get("state")).lower()
     if state not in {"sale", "done"}:
         return f"{order_name} skipped: Odoo order is not confirmed yet (state: {state or 'unknown'})."
-    if not order_has_paid_customer_invoice(order, invoice_rows):
+    if not order_has_paid_customer_invoice(order, invoice_rows) and not order_has_authorized_customer_transaction(
+        order,
+        transaction_rows or [],
+    ):
         invoice_status = clean_text(order.get("invoice_status")).lower()
-        return f"{order_name} skipped: Odoo order is not paid yet (invoice status: {invoice_status or 'unknown'})."
+        return (
+            f"{order_name} skipped: Odoo has no paid invoice or full authorized payment "
+            f"(invoice status: {invoice_status or 'unknown'})."
+        )
     return ""
 
 
@@ -9938,11 +9975,12 @@ def fetch_odoo_orders_by_names(store: Store, order_names: list[str], *, return_d
     domain: list[Any] = [("name", "in", normalized_names)]
     if store.website_id:
         domain.append(("website_id", "=", store.website_id))
-    order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "currency_id", "date_order", "amount_total", "partner_shipping_id", "partner_invoice_id", "partner_id"])
+    order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "transaction_ids", "currency_id", "date_order", "amount_total", "partner_shipping_id", "partner_invoice_id", "partner_id"])
     line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
     product_fields = odoo.existing_fields("product.product", ["id", "product_tmpl_id", "default_code", "detailed_type", "type"])
     tmpl_fields = odoo.existing_fields("product.template", ["id", "description", "default_code", "detailed_type", "type"])
     invoice_fields = odoo.existing_fields("account.move", ["id", "move_type", "state", "payment_state", "amount_total_signed", "amount_residual"])
+    transaction_fields = odoo.existing_fields("payment.transaction", ["id", "state", "amount", "currency_id"])
     orders = odoo.search_read("sale.order", domain, order_fields, limit=len(normalized_names), order="date_order desc, id desc")
     found_names = {clean_text(order.get("name")).upper() for order in orders}
     missing_names = [name for name in normalized_names if name not in found_names]
@@ -9954,6 +9992,9 @@ def fetch_odoo_orders_by_names(store: Store, order_names: list[str], *, return_d
     invoice_ids = sorted({int(invoice_id) for order in orders for invoice_id in (order.get("invoice_ids") or [])})
     invoice_rows = odoo.read("account.move", invoice_ids, invoice_fields) if invoice_ids else []
     invoices_by_id = {int(invoice["id"]): invoice for invoice in invoice_rows}
+    transaction_ids = sorted({int(transaction_id) for order in orders for transaction_id in (order.get("transaction_ids") or [])})
+    transaction_rows = odoo.read("payment.transaction", transaction_ids, transaction_fields) if transaction_ids else []
+    transactions_by_id = {int(transaction["id"]): transaction for transaction in transaction_rows}
     eligible_orders: list[dict[str, Any]] = []
     warnings: list[str] = [f"{name} not found in {store.name}." for name in missing_names]
     for order in orders:
@@ -9962,7 +10003,12 @@ def fetch_odoo_orders_by_names(store: Store, order_names: list[str], *, return_d
             for invoice_id in (order.get("invoice_ids") or [])
             if int(invoice_id) in invoices_by_id
         ]
-        warning = manual_pull_order_ineligible_reason(order, order_invoice_rows)
+        order_transaction_rows = [
+            transactions_by_id[int(transaction_id)]
+            for transaction_id in (order.get("transaction_ids") or [])
+            if int(transaction_id) in transactions_by_id
+        ]
+        warning = manual_pull_order_ineligible_reason(order, order_invoice_rows, order_transaction_rows)
         if warning:
             warnings.append(warning)
             print(f"[pull-by-order] store={store.id} {warning}", flush=True)
