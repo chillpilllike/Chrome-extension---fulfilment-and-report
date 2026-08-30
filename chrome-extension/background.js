@@ -1518,7 +1518,7 @@ async function reattachStoredJobsToRestoredWindows(label = "extension recovery")
   return reattached;
 }
 
-async function recoverOrphanedCheckoutInWindow(windowId, accountExperience) {
+async function recoverOrphanedCheckoutInWindow(windowId, accountExperience, manualClaim = false) {
   const tabs = await amazonTabsInWindow(windowId);
   for (const tab of tabs) {
     const context = await amazonPageContext(tab);
@@ -1529,7 +1529,7 @@ async function recoverOrphanedCheckoutInWindow(windowId, accountExperience) {
     ));
     if (!matchingJob?.group_key) continue;
     const workerId = await getWorkerId();
-    const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(accountExperience)}&preferred_group_key=${encodeURIComponent(matchingJob.group_key)}`);
+    const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(accountExperience)}&manual_claim=${manualClaim === true ? "true" : "false"}&preferred_group_key=${encodeURIComponent(matchingJob.group_key)}`);
     const job = payload.jobs?.[0];
     if (job?.group_key !== matchingJob.group_key) continue;
     const activeJob = {
@@ -1680,7 +1680,7 @@ async function startNextJob(sourceWindowId = null) {
     return { ok: false, message };
   }
   sourceWindowId = detectedAccount.windowId || sourceWindowId;
-  const orphanedCheckout = await recoverOrphanedCheckoutInWindow(sourceWindowId, detectedAccount.experience)
+  const orphanedCheckout = await recoverOrphanedCheckoutInWindow(sourceWindowId, detectedAccount.experience, options.manual === true || await manualQueueIsRunning())
     .catch((error) => {
       log(`Could not inspect an already-open checkout before claiming the next order: ${error.message}`, sourceWindowId);
       return null;
@@ -1734,7 +1734,7 @@ async function startNextJob(sourceWindowId = null) {
   const preferredQuery = preferredGroupKey
     ? `&preferred_group_key=${encodeURIComponent(preferredGroupKey)}&preferred_only=true`
     : "";
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}${preferredQuery}`);
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}&manual_claim=${options.manual === true || await manualQueueIsRunning() ? "true" : "false"}${preferredQuery}`);
   const job = payload.jobs?.[0];
   if (!job) {
     if (options.manual === true || await manualQueueIsRunning()) await setManualQueueRunning(false);
@@ -1972,7 +1972,7 @@ async function claimNextJobInWindow(windowId) {
   const preferredQuery = preferredGroupKey
     ? `&preferred_group_key=${encodeURIComponent(preferredGroupKey)}&preferred_only=true`
     : "";
-  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}${preferredQuery}`);
+  const payload = await api(`/api/chrome/jobs?worker_id=${encodeURIComponent(workerId)}&claim=true&resume_existing=true&split_mixed_asin=false&account_experience=${encodeURIComponent(detectedAccount.experience)}&manual_claim=${await manualQueueIsRunning() ? "true" : "false"}${preferredQuery}`);
   const job = payload.jobs?.[0];
   if (!job) {
     if (await manualQueueIsRunning()) await setManualQueueRunning(false);

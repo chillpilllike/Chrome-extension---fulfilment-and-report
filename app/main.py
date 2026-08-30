@@ -29822,9 +29822,10 @@ def api_chrome_jobs(
     account_experience: str = "",
     preferred_group_key: str = "",
     preferred_only: bool = False,
+    manual_claim: bool = False,
 ) -> dict[str, Any]:
     if claim:
-        if not auto_chrome_ordering_enabled():
+        if not manual_claim and not auto_chrome_ordering_enabled():
             return {
                 "ok": True,
                 "jobs": [],

@@ -177,7 +177,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.190")
+        self.assertEqual(MANIFEST["version"], "0.1.191")
 
     def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
         self.assertIn('id="odooOrderNumber"', POPUP_HTML)
@@ -329,6 +329,10 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertIn('if (message.type === "START_NEXT") return startManualQueueRun(windowId);', BACKGROUND)
         self.assertIn('id="startNext"', POPUP_HTML)
         self.assertIn('startNext.addEventListener("click"', POPUP_JS)
+        self.assertIn('manual_claim=${options.manual === true || await manualQueueIsRunning() ? "true" : "false"}', BACKGROUND)
+        self.assertIn('manual_claim=${await manualQueueIsRunning() ? "true" : "false"}', BACKGROUND)
+        self.assertIn("manual_claim: bool = False", APP)
+        self.assertIn("if not manual_claim and not auto_chrome_ordering_enabled()", APP)
 
     def test_resume_persists_and_reinjects_when_auto_ordering_is_off(self) -> None:
         setter_start = BACKGROUND.index("async function setWindowJob(windowId, activeJob")

@@ -127,7 +127,7 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
         )
         self.assertIn("reset_unsubmitted_chrome_queue", pause_source)
         self.assertIn("NOT IN ('order_submitted', 'reporting_complete')", reset_source)
-        self.assertIn("if not auto_chrome_ordering_enabled()", claim_source)
+        self.assertIn("if not manual_claim and not auto_chrome_ordering_enabled()", claim_source)
 
     def test_resume_requires_date_and_ui_prompts_for_it(self) -> None:
         resume_source = inspect.getsource(main.api_resume_chrome_auto_ordering)
