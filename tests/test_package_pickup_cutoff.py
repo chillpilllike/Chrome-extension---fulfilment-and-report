@@ -10,6 +10,7 @@ from app.main import (
     package_pickup_delivery_timestamp,
     package_pickup_scan_history,
     package_pickup_scan_history_summary,
+    package_pickup_historical_readiness,
     package_pickup_order_readiness,
     package_tracker_delivery_date,
     package_tracker_delivery_kind,
@@ -85,6 +86,28 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
         self.assertEqual(summary["active_scans"], 3)
         self.assertEqual(summary["unique_packages"], 2)
         self.assertEqual(summary["ready_to_ship_orders"], 1)
+
+    def test_historical_readiness_uses_canonical_physical_packages(self) -> None:
+        readiness = package_pickup_historical_readiness(
+            [
+                {"id": 11, "scan_code": "TBA-FIRST"},
+                {"id": 12, "scan_code": "TBA-SECOND", "delivery_label": "Delayed in transit"},
+            ],
+            {11},
+        )
+        self.assertFalse(readiness["ready_to_ship"])
+        self.assertEqual(readiness["total_packages"], 2)
+        self.assertEqual(readiness["received_packages"], 1)
+        self.assertEqual(readiness["pending_packages"][0]["shipment_id"], "TBA-SECOND")
+
+    def test_historical_readiness_repairs_single_package_alias_inflation(self) -> None:
+        readiness = package_pickup_historical_readiness(
+            [{"id": 21, "scan_code": "TBA-ONLY"}],
+            {21, 999},
+        )
+        self.assertTrue(readiness["ready_to_ship"])
+        self.assertEqual(readiness["total_packages"], 1)
+        self.assertEqual(readiness["received_packages"], 1)
 
     def test_reset_endpoint_refuses_any_non_today_scan_date_before_querying_database(self) -> None:
         with self.assertRaisesRegex(Exception, "limited to today's Brooklyn scan date"):

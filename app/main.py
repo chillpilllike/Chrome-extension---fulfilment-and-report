@@ -33453,6 +33453,113 @@ def package_pickup_scan_history_summary(events: list[dict[str, Any]]) -> dict[st
     }
 
 
+def package_pickup_historical_readiness(
+    parts: list[dict[str, Any]],
+    received_package_ids: set[int],
+) -> dict[str, Any]:
+    """Rebuild a scan-time readiness snapshot from canonical physical packages."""
+    total = len(parts)
+    received = sum(1 for part in parts if int(part.get("id") or 0) in received_package_ids)
+    received = min(received, total)
+    pending = [part for part in parts if int(part.get("id") or 0) not in received_package_ids]
+    pending_packages = [
+        {
+            "shipment_id": normalize_dispatch_scan_code(part.get("canonical_scan_code") or part.get("scan_code")),
+            "amazon_order_id": clean_text(part.get("amazon_order_id")),
+            "recipient_ref": clean_text(part.get("recipient_ref")),
+            "expected": clean_text(part.get("delivery_label") or part.get("package_status") or part.get("promise")) or "Delivery date not captured",
+        }
+        for part in pending
+    ]
+    ready = bool(total and received >= total)
+    if ready:
+        message = f"All {total} package{'s' if total != 1 else ''} received. Full Odoo order can be shipped."
+    else:
+        message = f"Hold order: {len(pending)} of {total} package{'s are' if total != 1 else ' is'} still pending."
+    return {
+        "ready_to_ship": ready,
+        "total_packages": total,
+        "received_packages": received,
+        "remaining_packages": len(pending),
+        "pending_packages": pending_packages,
+        "message": message,
+    }
+
+
+def repair_package_pickup_scan_history(conn: Any) -> dict[str, Any]:
+    """Remove stale shipment aliases and repair only provably inflated history snapshots."""
+    ensure_package_pickup_scan_history_table(conn)
+    amazon_order_ids = [
+        clean_text(row.get("amazon_order_id"))
+        for row in rows_to_dicts(conn.execute(
+            "SELECT DISTINCT amazon_order_id FROM amazon_dispatch_packages WHERE COALESCE(amazon_order_id, '') != ''"
+        ).fetchall())
+    ]
+    aliases_removed = sum(collapse_dispatch_shipment_alias_rows(conn, order_id) for order_id in amazon_order_ids)
+    events = rows_to_dicts(conn.execute(
+        """
+        SELECT * FROM package_pickup_scan_events
+        WHERE matched=1 AND duplicate=0 AND package_id IS NOT NULL AND order_total_packages>0
+        ORDER BY scanned_at, id
+        """
+    ).fetchall())
+    repaired_event_ids: list[int] = []
+    repaired_orders: set[str] = set()
+    for event in events:
+        package = row_to_dict(conn.execute(
+            "SELECT * FROM amazon_dispatch_packages WHERE id=?",
+            (int(event.get("package_id") or 0),),
+        ).fetchone())
+        if not package:
+            continue
+        parts = dispatch_related_parts(conn, package)
+        current_total = len(parts)
+        if not current_total or int(event.get("order_total_packages") or 0) <= current_total:
+            continue
+        received_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT DISTINCT package_id
+            FROM package_pickup_scan_events
+            WHERE store_id=? AND UPPER(COALESCE(odoo_order_name, ''))=UPPER(?)
+              AND matched=1 AND duplicate=0 AND package_id IS NOT NULL
+              AND scanned_at<=?
+            """,
+            (
+                int(event.get("store_id") or 0),
+                clean_text(event.get("odoo_order_name")),
+                clean_text(event.get("scanned_at")),
+            ),
+        ).fetchall())
+        received_ids = {int(row.get("package_id") or 0) for row in received_rows if int(row.get("package_id") or 0)}
+        readiness = package_pickup_historical_readiness(parts, received_ids)
+        conn.execute(
+            """
+            UPDATE package_pickup_scan_events
+            SET order_ready=?, order_total_packages=?, order_received_packages=?,
+                order_remaining_packages=?, order_readiness_message=?, remaining_packages_json=?
+            WHERE id=?
+            """,
+            (
+                1 if readiness["ready_to_ship"] else 0,
+                readiness["total_packages"],
+                readiness["received_packages"],
+                readiness["remaining_packages"],
+                readiness["message"],
+                json.dumps(readiness["pending_packages"]),
+                int(event.get("id") or 0),
+            ),
+        )
+        repaired_event_ids.append(int(event.get("id") or 0))
+        repaired_orders.add(clean_text(event.get("odoo_order_name")) or clean_text(event.get("amazon_order_id")))
+    return {
+        "ok": True,
+        "aliases_removed": aliases_removed,
+        "events_repaired": len(repaired_event_ids),
+        "event_ids": repaired_event_ids,
+        "orders": sorted(order for order in repaired_orders if order),
+    }
+
+
 def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
     raw_date = clean_text(scan_date)
     if raw_date:
@@ -33529,6 +33636,14 @@ def api_package_pickup_scan_history(store_id: Optional[int] = None, scan_date: s
         return package_pickup_scan_history(store_id, scan_date)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/package-pickups/repair-history")
+def api_repair_package_pickup_scan_history() -> dict[str, Any]:
+    with db() as conn:
+        result = repair_package_pickup_scan_history(conn)
+    fast_page_cache_clear_matching({"package-pickups", "dispatch-related-parts"})
+    return result
 
 
 def reset_package_pickup_scan_event(conn: Any, event: dict[str, Any], reset_at: str, reason: str, scan_date: str) -> dict[str, int]:

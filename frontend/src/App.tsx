@@ -730,6 +730,65 @@ type PackagePickupScanHistory = {
   events: PackagePickupScanHistoryEvent[]
 }
 
+type PackagePickupScanHistoryGroup = {
+  key: string
+  events: PackagePickupScanHistoryEvent[]
+  latest: PackagePickupScanHistoryEvent
+}
+
+function groupPackagePickupScanHistoryEvents(events: PackagePickupScanHistoryEvent[]): PackagePickupScanHistoryGroup[] {
+  const groups = new Map<string, PackagePickupScanHistoryEvent[]>()
+  events.forEach((entry) => {
+    const orderKey = entry.amazon_order_id
+      ? `amazon:${entry.store_id}:${entry.amazon_order_id}`
+      : entry.odoo_order_name
+        ? `odoo:${entry.store_id}:${entry.odoo_order_name.toUpperCase()}`
+        : `scan:${entry.id}`
+    groups.set(orderKey, [...(groups.get(orderKey) || []), entry])
+  })
+  return Array.from(groups, ([key, groupedEvents]) => ({ key, events: groupedEvents, latest: groupedEvents[0] }))
+}
+
+function PackagePickupScanHistoryGroupCard({ group }: { group: PackagePickupScanHistoryGroup }) {
+  const entry = group.latest
+  const activeEvents = group.events.filter((item) => !item.undone_at)
+  const matched = activeEvents.some((item) => Boolean(item.matched))
+  const duplicate = activeEvents.length > 0 && activeEvents.every((item) => Boolean(item.duplicate))
+  const undone = activeEvents.length === 0
+  return (
+    <div className={cn("pickup-history-group", duplicate ? "is-duplicate" : matched ? "is-success" : "is-error", undone && "is-undone")}>
+      {duplicate ? <RefreshCw className="size-4" /> : matched ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
+      <div className="pickup-history-order">
+        <div className="pickup-history-order-head">
+          {entry.odoo_order_name ? <OdooOrderRef name={entry.odoo_order_name} linkClassName="font-semibold" /> : <strong>No Odoo order matched</strong>}
+          <span className={undone ? "is-undone" : duplicate ? "is-duplicate" : matched ? "is-success" : "is-error"}>{group.events.length} scan{group.events.length === 1 ? "" : "s"}</span>
+        </div>
+        {entry.amazon_order_id ? <small><b>Amazon order</b> {entry.amazon_order_id}</small> : null}
+        {entry.recipient_ref ? <small><b>Recipient</b> {entry.recipient_ref}</small> : null}
+        {matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>{entry.order_received_packages}/{entry.order_total_packages} packages received.</b> {entry.order_readiness_message}</small> : null}
+        <div className="pickup-history-scans">
+          {group.events.map((scan) => {
+            const scanMatched = Boolean(scan.matched)
+            const scanDuplicate = Boolean(scan.duplicate)
+            const scanUndone = Boolean(scan.undone_at)
+            return (
+              <div key={scan.id} className={cn(scanDuplicate ? "is-duplicate" : scanMatched ? "is-success" : "is-error", scanUndone && "is-undone")}>
+                <div>
+                  <b>{scan.shipment_id || scan.scan_code || "Not matched"}</b>
+                  <span className={scanUndone ? "is-undone" : scanDuplicate ? "is-duplicate" : scanMatched ? "is-success" : "is-error"}>{scanUndone ? "undone later" : scan.result_status.replaceAll("_", " ")}</span>
+                </div>
+                <small><b>Scanned</b> {formatDateTime(scan.scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                {scanUndone ? <small className="is-undone"><b>Undone</b> {formatDateTime(scan.undone_at!, { timeZone: "America/New_York", showTimeZone: true })}{scan.undone_reason ? ` · ${scan.undone_reason.replaceAll("_", " ")}` : ""}</small> : null}
+                <small>{scan.message}</small>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 type PackagePickupScanResetResponse = {
   ok: boolean
   mode: "last" | "today"
@@ -7167,6 +7226,10 @@ function PackagePickupPage({
     odoo_orders_found: 0,
     ready_to_ship_orders: 0,
   }
+  const pickupHistoryGroups = useMemo(
+    () => groupPackagePickupScanHistoryEvents(pickupHistory?.events || []),
+    [pickupHistory?.events],
+  )
 
   useEffect(() => {
     setPickupPage(1)
@@ -7369,30 +7432,8 @@ function PackagePickupPage({
             <span><strong>{todayPickupScanSummary.odoo_orders_found}</strong> Odoo orders found</span>
           </div>
           <div className="pickup-scan-history-list">
-            {(pickupHistory?.events || []).map((entry) => {
-              const matched = Boolean(entry.matched)
-              const duplicate = Boolean(entry.duplicate)
-              const undone = Boolean(entry.undone_at)
-              return (
-                <div key={entry.id} className={cn(duplicate ? "is-duplicate" : matched ? "is-success" : "is-error", undone && "is-undone")}>
-                  {duplicate ? <RefreshCw className="size-4" /> : matched ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
-                  <div className="pickup-history-order">
-                    <div className="pickup-history-order-head">
-                      {entry.odoo_order_name ? <OdooOrderRef name={entry.odoo_order_name} linkClassName="font-semibold" /> : <strong>No Odoo order matched</strong>}
-                      <span className={undone ? "is-undone" : duplicate ? "is-duplicate" : matched ? "is-success" : "is-error"}>{undone ? "undone later" : entry.result_status.replaceAll("_", " ")}</span>
-                    </div>
-                    <small><b>Amazon tracking ID</b> {entry.shipment_id || entry.scan_code || "Not matched"}</small>
-                    {entry.amazon_order_id ? <small><b>Amazon order</b> {entry.amazon_order_id}</small> : null}
-                    {entry.recipient_ref ? <small><b>Recipient</b> {entry.recipient_ref}</small> : null}
-                    <small><b>Scanned</b> {formatDateTime(entry.scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
-                    {undone ? <small className="is-undone"><b>Undone</b> {formatDateTime(entry.undone_at!, { timeZone: "America/New_York", showTimeZone: true })}{entry.undone_reason ? ` · ${entry.undone_reason.replaceAll("_", " ")}` : ""}</small> : null}
-                    <small>{entry.message}</small>
-                    {matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>{entry.order_received_packages}/{entry.order_total_packages} packages received.</b> {entry.order_readiness_message}</small> : null}
-                  </div>
-                </div>
-              )
-            })}
-            {!pickupHistoryLoading && !(pickupHistory?.events || []).length ? <div className="pickup-empty">No scan events were recorded on this date.</div> : null}
+            {pickupHistoryGroups.map((group) => <PackagePickupScanHistoryGroupCard key={group.key} group={group} />)}
+            {!pickupHistoryLoading && !pickupHistoryGroups.length ? <div className="pickup-empty">No scan events were recorded on this date.</div> : null}
             {pickupHistoryLoading ? <div className="pickup-empty">Loading scanner history…</div> : null}
           </div>
           <DialogFooter>
