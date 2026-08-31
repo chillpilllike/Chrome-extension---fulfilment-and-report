@@ -35664,6 +35664,18 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
         sync_dispatch_packages_for_order_async(amazon_order_id)
         for related_order_id in related_tracking_order_ids_from_packages(amazon_order_id, downstream_packages):
             sync_dispatch_packages_for_order_async(related_order_id)
+        # Package identities can be promoted from an AMZPKG shipment alias to a
+        # physical TBA/UPS code during this update. Related-parts responses cache
+        # the old row ids separately from the dispatch summary, so invalidate both
+        # or a corrected split order continues to look duplicated until expiry.
+        fast_page_cache_clear_matching({
+            "dispatch-related-parts",
+            "dispatch-sorting-summary",
+            "dispatch-sorting-summary-base",
+            "dispatch-status",
+            "dispatch-status-summary",
+            "package-pickups",
+        })
     if delivered_flag:
         try:
             store = get_store(int(rows[0]["store_id"]))
