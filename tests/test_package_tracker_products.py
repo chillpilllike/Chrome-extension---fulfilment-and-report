@@ -13,6 +13,7 @@ from app.main import (
     package_tracker_single_package_history_products,
     package_tracker_tracking_parts_from_lines,
     tracking_packages_by_line_with_one_to_one_fallback,
+    tracking_package_shipment_key,
     tracking_unambiguous_replacement_product,
 )
 
@@ -108,6 +109,32 @@ class PackageTrackerProductTests(unittest.TestCase):
         self.assertEqual(len(packages), 1)
         self.assertIn("shipmentId=REAL", packages[0]["tracking_url"])
         self.assertEqual([row["scan_code"] for row in rows], ["AMZPKG-ABC"])
+
+    def test_physical_tracking_snapshot_replaces_temporary_alias_for_same_shipment(self):
+        packages = canonical_tracking_packages([
+            {
+                "tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=112-2304855-2001835&shipmentId=NkKj7J16V&packageIndex=0",
+                "asins": ["B09PVPNXPL", "B0G2MGBQJP"],
+                "products": [{"asin": "B09PVPNXPL", "title": "First"}],
+            },
+            {
+                "tracking_id": "TBA334090270674",
+                "tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=112-2304855-2001835&shipmentId=NkKj7J16V&packageIndex=0",
+                "status": "Delivered August 28",
+            },
+        ])
+
+        self.assertEqual(len(packages), 1)
+        self.assertEqual(packages[0]["tracking_id"], "TBA334090270674")
+        self.assertEqual(packages[0]["asins"], ["B09PVPNXPL", "B0G2MGBQJP"])
+        self.assertEqual(packages[0]["products"][0]["asin"], "B09PVPNXPL")
+
+    def test_package_index_zero_does_not_collapse_distinct_split_shipments(self):
+        first = {"tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=NkKj7J16V&packageIndex=0"}
+        second = {"tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=Nx2G7M1NV&packageIndex=0"}
+
+        self.assertNotEqual(tracking_package_shipment_key(first), tracking_package_shipment_key(second))
+        self.assertEqual(len(canonical_tracking_packages([first, second])), 2)
 
     def test_verified_quantity_survives_storage_compaction(self):
         products = compact_tracking_products([

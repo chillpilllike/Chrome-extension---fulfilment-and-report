@@ -852,6 +852,25 @@ function shipmentRootForTrackingLink(link) {
   return link.closest(".a-box, [data-component='orderCard']") || document.body;
 }
 
+function amazonShipmentIdentity(value = "") {
+  try {
+    const url = new URL(String(value || ""), location.origin);
+    const shipmentId = clean(url.searchParams.get("shipmentId") || url.searchParams.get("shipmentID") || "");
+    const packageId = clean(url.searchParams.get("packageId") || url.searchParams.get("packageID") || "");
+    const itemId = clean(url.searchParams.get("itemId") || url.searchParams.get("itemID") || "");
+    const packageIndex = clean(url.searchParams.get("packageIndex") || "");
+    return {
+      shipment_id: shipmentId,
+      package_id: packageId,
+      item_id: itemId,
+      package_index: packageIndex,
+      shipment_key: shipmentId ? `shipment:${shipmentId}` : packageId ? `package:${packageId}` : itemId ? `item:${itemId}` : "",
+    };
+  } catch (_) {
+    return { shipment_id: "", package_id: "", item_id: "", package_index: "", shipment_key: "" };
+  }
+}
+
 async function parseOrderDetails() {
   const amazonOrderId = currentOrderId();
   const paymentRevision = parsePaymentRevision();
@@ -874,9 +893,11 @@ async function parseOrderDetails() {
     const status = clean(box.querySelector(".od-status-message, [data-component='shipmentStatus'] h4")?.textContent);
     const products = productItemsFrom(box, 20);
     const asins = products.map((item) => item.asin);
+    const shipmentIdentity = amazonShipmentIdentity(href);
     packages.push(withPromiseDetails({
       amazon_order_id: amazonOrderId,
       tracking_url: href,
+      ...shipmentIdentity,
       order_status: status,
       promise: status,
       asins,
@@ -1027,6 +1048,7 @@ async function parseTrackingPage() {
   const hasTrackingIdentity = Boolean(clean(carrierInfo.carrier) || clean(carrierInfo.tracking_id));
   const statusOnly = !hasTrackingIdentity && !events.length && !products.length;
   const productAsins = products.map((item) => item.asin).filter(Boolean);
+  const shipmentIdentity = amazonShipmentIdentity(location.href);
   const pkg = {
     amazon_order_id: amazonOrderId,
     ...carrierInfo,
@@ -1035,6 +1057,7 @@ async function parseTrackingPage() {
     latest_event: events[0] || null,
     events: events.slice(0, 20),
     tracking_url: location.href,
+    ...shipmentIdentity,
     asins: statusOnly ? [] : productAsins,
     products: statusOnly ? [] : products,
     status_only: statusOnly,

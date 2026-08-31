@@ -5073,12 +5073,88 @@ def tracking_package_has_shipment_identity(package: dict[str, Any]) -> bool:
     ))
 
 
+def tracking_package_shipment_key(package: dict[str, Any]) -> str:
+    """Return Amazon's stable split-shipment identity without trusting packageIndex alone."""
+    if not isinstance(package, dict):
+        return ""
+    direct_values = (
+        ("shipment", package.get("shipment_id") or package.get("shipmentId")),
+        ("package", package.get("package_id") or package.get("packageId")),
+        ("item", package.get("item_id") or package.get("itemId")),
+    )
+    for prefix, value in direct_values:
+        cleaned = clean_text(value)
+        if cleaned:
+            return f"{prefix}:{cleaned}"
+    url = clean_text(package.get("tracking_url") or package.get("trackingUrl"))
+    try:
+        query = parse_qs(urlparse(url).query)
+    except Exception:
+        query = {}
+    for prefix, keys in (
+        ("shipment", ("shipmentId", "shipmentid")),
+        ("package", ("packageId", "packageid")),
+        ("item", ("itemId", "itemid")),
+    ):
+        for key in keys:
+            value = clean_text((query.get(key) or [""])[0])
+            if value:
+                return f"{prefix}:{value}"
+    return ""
+
+
+def tracking_package_physical_id(package: dict[str, Any]) -> str:
+    if not isinstance(package, dict):
+        return ""
+    for key in ("tracking_id", "trackingId", "tracking_number", "trackingNumber", "tracking_code", "trackingCode"):
+        value = clean_text(package.get(key))
+        if package_tracking_id_is_physical(value):
+            return normalize_dispatch_scan_code(value)
+    return ""
+
+
+def merge_tracking_shipment_snapshots(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Merge one shipment's pre-tracking and carrier snapshots, preferring physical proof."""
+    existing_physical = bool(tracking_package_physical_id(existing))
+    incoming_physical = bool(tracking_package_physical_id(incoming))
+    primary, secondary = (existing, incoming) if existing_physical and not incoming_physical else (incoming, existing)
+    merged = dict(secondary)
+    for key, value in primary.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    merged_products = merge_amazon_product_snapshots(existing.get("products") or [], incoming.get("products") or [])
+    if merged_products:
+        merged["products"] = merged_products
+    merged_asins = unique_normalized_asins([
+        *(existing.get("asins") or []),
+        *(incoming.get("asins") or []),
+        *(product.get("asin") for product in merged_products),
+    ])
+    if merged_asins:
+        merged["asins"] = merged_asins
+    return merged
+
+
 def canonical_tracking_packages(packages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop order-level status shadows once package-specific shipments are known."""
     values = [dict(package) for package in packages if isinstance(package, dict)]
     if not any(tracking_package_has_shipment_identity(package) for package in values):
         return values
-    return [package for package in values if tracking_package_has_shipment_identity(package)]
+    shipment_values = [package for package in values if tracking_package_has_shipment_identity(package)]
+    canonical: list[dict[str, Any]] = []
+    position_by_key: dict[str, int] = {}
+    for package in shipment_values:
+        shipment_key = tracking_package_shipment_key(package)
+        if not shipment_key:
+            canonical.append(package)
+            continue
+        position = position_by_key.get(shipment_key)
+        if position is None:
+            position_by_key[shipment_key] = len(canonical)
+            canonical.append(package)
+            continue
+        canonical[position] = merge_tracking_shipment_snapshots(canonical[position], package)
+    return canonical
 
 
 def dispatch_physical_package_key(row: dict[str, Any]) -> str:
@@ -5626,7 +5702,6 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
         return 0, []
     now = utc_now()
     by_code: dict[str, dict[str, Any]] = {}
-    fallback = package_payloads[0]
     for package in package_payloads:
         for code, _display in dispatch_codes_from_package(package, order_id):
             by_code[code] = package
@@ -5673,7 +5748,27 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
             normalize_dispatch_scan_code(row.get("display_code")),
             normalize_dispatch_scan_code(row.get("tracking_url")),
         ]
-        package = next((by_code[code] for code in codes if code and code in by_code), fallback)
+        package = next((by_code[code] for code in codes if code and code in by_code), None)
+        if package is None:
+            row_shipment_key = tracking_package_shipment_key(row)
+            shipment_matches = [
+                candidate for candidate in package_payloads
+                if row_shipment_key and tracking_package_shipment_key(candidate) == row_shipment_key
+            ]
+            if len(shipment_matches) == 1:
+                package = shipment_matches[0]
+        if package is None:
+            row_asins = set(unique_normalized_asins(parse_json_list_value(row.get("asins_json"))))
+            asin_matches = [
+                candidate for candidate in package_payloads
+                if row_asins.intersection(set(unique_normalized_asins(candidate.get("asins") or [])))
+            ]
+            if len(asin_matches) == 1:
+                package = asin_matches[0]
+        if package is None and len(existing_rows) == 1 and len(package_payloads) == 1:
+            package = package_payloads[0]
+        if package is None:
+            continue
         incoming_status = tracking_package_status_text(package)
         incoming_promise = tracking_package_promise_text(package)
         row_line_ids = package_line_ids(row.get("order_line_ids_json"))

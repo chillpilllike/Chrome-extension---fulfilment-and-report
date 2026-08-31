@@ -721,6 +721,32 @@ function sanitizePackageTrackingIdentity(packageData = {}) {
   return packageData;
 }
 
+function amazonShipmentKey(packageData = {}) {
+  const directShipment = String(packageData.shipment_id || packageData.shipmentId || "").trim();
+  const directPackage = String(packageData.package_id || packageData.packageId || "").trim();
+  const directItem = String(packageData.item_id || packageData.itemId || "").trim();
+  if (directShipment) return `shipment:${directShipment}`;
+  if (directPackage) return `package:${directPackage}`;
+  if (directItem) return `item:${directItem}`;
+  const rawUrl = String(packageData.tracking_url || packageData.trackingUrl || "").trim();
+  if (!rawUrl) return "";
+  try {
+    const url = new URL(rawUrl, "https://www.amazon.com");
+    const shipmentId = url.searchParams.get("shipmentId") || url.searchParams.get("shipmentID") || "";
+    const packageId = url.searchParams.get("packageId") || url.searchParams.get("packageID") || "";
+    const itemId = url.searchParams.get("itemId") || url.searchParams.get("itemID") || "";
+    return shipmentId ? `shipment:${shipmentId}` : packageId ? `package:${packageId}` : itemId ? `item:${itemId}` : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function splitShipmentMismatch(queuedPackage = {}, pagePackage = {}) {
+  const expected = amazonShipmentKey(queuedPackage);
+  const actual = amazonShipmentKey(pagePackage);
+  return expected && actual && expected !== actual ? { expected, actual } : null;
+}
+
 function usefulAmazonProductTitle(value) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (text.length < 6) return false;
@@ -1680,6 +1706,23 @@ async function handleHistoryPackageTracking(message, windowId) {
   }
   const queuedPackage = order.packages?.[Number(order.packageIndex || 0)] || {};
   const pagePackage = message.package || {};
+  const shipmentMismatch = splitShipmentMismatch(queuedPackage, pagePackage);
+  if (shipmentMismatch) {
+    const retryCount = Number(order.shipmentMismatchRetries || 0) + 1;
+    order.shipmentMismatchRetries = retryCount;
+    tracking.currentOrder = order;
+    tracking.lastActivityAt = Date.now();
+    tracking.lastMessage = `Blocked split-shipment mismatch for ${order.amazon_order_id}: expected ${shipmentMismatch.expected}, loaded ${shipmentMismatch.actual}.`;
+    await saveTracking(tracking, windowId);
+    await log(tracking.lastMessage, windowId);
+    if (retryCount >= 2) {
+      await advanceHistoryOrder(tracking, windowId, "failed");
+      return { ok: false, blocked: true, message: `${tracking.lastMessage} Order skipped after two safe retries.` };
+    }
+    await openHistoryCurrentOrder(windowId);
+    return { ok: true, blocked: true, recovering: true, message: `${tracking.lastMessage} Reopening the expected shipment.` };
+  }
+  order.shipmentMismatchRetries = 0;
   const packageData = { ...queuedPackage, ...pagePackage };
   sanitizePackageTrackingIdentity(packageData);
   if (Array.isArray(queuedPackage.asins) && queuedPackage.asins.length) packageData.asins = queuedPackage.asins;
@@ -2071,6 +2114,25 @@ async function handlePackageTracking(message, windowId, sender = {}) {
   }
   const queuedPackage = tracking.packages[tracking.packageIndex] || {};
   const pagePackage = message.package || {};
+  const shipmentMismatch = splitShipmentMismatch(queuedPackage, pagePackage);
+  if (shipmentMismatch) {
+    const retryCount = Number(tracking.shipmentMismatchRetries || 0) + 1;
+    tracking.shipmentMismatchRetries = retryCount;
+    tracking.lastActivityAt = Date.now();
+    tracking.lastMessage = `Blocked split-shipment mismatch for ${order.amazon_order_id}: expected ${shipmentMismatch.expected}, loaded ${shipmentMismatch.actual}.`;
+    await saveTracking(tracking, windowId);
+    await log(tracking.lastMessage, windowId);
+    if (retryCount >= 2) {
+      await advanceCurrentOrder(tracking, windowId, "failed");
+      return { ok: false, blocked: true, message: `${tracking.lastMessage} Order skipped after two safe retries.` };
+    }
+    const expectedUrl = queuedPackage.tracking_url;
+    setTimeout(() => {
+      openTrackingRunUrl(tracking, windowId, expectedUrl).catch((error) => log(`Could not reopen expected shipment for ${order.amazon_order_id}: ${error.message}`, windowId));
+    }, 0);
+    return { ok: true, blocked: true, recovering: true, message: `${tracking.lastMessage} Reopening the expected shipment.` };
+  }
+  tracking.shipmentMismatchRetries = 0;
   const packageData = { ...queuedPackage, ...pagePackage };
   sanitizePackageTrackingIdentity(packageData);
   if (Array.isArray(queuedPackage.asins) && queuedPackage.asins.length) {
