@@ -28,6 +28,13 @@ class PackageTrackerProductTests(unittest.TestCase):
 
         self.assertIn('"dispatch-related-parts"', source[update_start:update_end])
 
+    def test_pickup_scan_invalidates_related_parts_cache(self):
+        source = (pathlib.Path(__file__).resolve().parents[1] / "app" / "main.py").read_text()
+        scan_start = source.index("def api_package_pickup_scan(")
+        scan_end = source.index('@app.post("/api/package-pickups/settings")', scan_start)
+
+        self.assertIn('"dispatch-related-parts"', source[scan_start:scan_end])
+
     def test_unambiguous_fallback_exposes_replacement_metadata(self):
         product = tracking_unambiguous_replacement_product(
             [{"asins": ["B000000099"], "products": [{"asin": "B000000099", "title": "Replacement"}]}],

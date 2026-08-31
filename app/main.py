@@ -33855,7 +33855,12 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                     "scanned_codes_json": matches[0].get("scanned_codes_json"),
                 },
             )
-    fast_page_cache_clear_matching({"package-pickups"})
+    fast_page_cache_clear_matching({
+        "package-pickups",
+        "dispatch-related-parts",
+        "dispatch-sorting-summary",
+        "dispatch-sorting-summary-base",
+    })
     return {
         "ok": True,
         "matched": True,
