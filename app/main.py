@@ -6249,6 +6249,7 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
             ),
         )
         updated += 1
+    collapse_dispatch_shipment_alias_rows(conn, order_id)
     return updated
 
 
@@ -7220,7 +7221,12 @@ def dispatch_part_quality(row: dict[str, Any]) -> tuple[int, int, str]:
 def collapse_dispatch_related_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for part in parts:
-        key = dispatch_physical_package_key(part)
+        shipment_key = tracking_package_shipment_key(part)
+        key = (
+            f"{clean_text(part.get('amazon_order_id')).upper()}|{shipment_key}"
+            if shipment_key
+            else dispatch_physical_package_key(part)
+        )
         if not key:
             key = f"{clean_text(part.get('recipient_ref')).upper()}|{clean_text(part.get('amazon_order_id')).upper()}|{clean_text(part.get('order_line_ids_json'))}"
         if not key:
@@ -7229,6 +7235,51 @@ def collapse_dispatch_related_parts(parts: list[dict[str, Any]]) -> list[dict[st
         if existing is None or dispatch_part_quality(part) > dispatch_part_quality(existing):
             grouped[key] = part
     return sorted(grouped.values(), key=dispatch_part_sort_key)
+
+
+def dispatch_shipment_alias_pairs(rows: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    """Return temporary shipment row ids that are superseded by a physical row."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        shipment_key = tracking_package_shipment_key(row)
+        order_id = clean_text(row.get("amazon_order_id"))
+        if not shipment_key or not order_id:
+            continue
+        groups.setdefault(f"{order_id}|{shipment_key}", []).append(row)
+    pairs: list[tuple[int, int]] = []
+    for values in groups.values():
+        physical = next((
+            row for row in values
+            if package_tracking_id_is_physical(row.get("canonical_scan_code") or row.get("scan_code"))
+        ), None)
+        if not physical:
+            continue
+        target_id = int(physical.get("id") or 0)
+        if not target_id:
+            continue
+        for row in values:
+            alias_id = int(row.get("id") or 0)
+            if alias_id and alias_id != target_id and not package_tracking_id_is_physical(row.get("canonical_scan_code") or row.get("scan_code")):
+                pairs.append((alias_id, target_id))
+    return pairs
+
+
+def collapse_dispatch_shipment_alias_rows(conn: Any, amazon_order_id: str) -> int:
+    rows = rows_to_dicts(conn.execute(
+        "SELECT * FROM amazon_dispatch_packages WHERE amazon_order_id=? ORDER BY id",
+        (clean_text(amazon_order_id),),
+    ).fetchall())
+    removed = 0
+    for alias_id, target_id in dispatch_shipment_alias_pairs(rows):
+        alias = next((row for row in rows if int(row.get("id") or 0) == alias_id), {})
+        if clean_text(alias.get("received_at")) or clean_text(alias.get("placed_at")) or int(alias.get("scan_count") or 0) > 0:
+            continue
+        conn.execute("UPDATE package_pickup_scan_events SET package_id=? WHERE package_id=?", (target_id, alias_id))
+        conn.execute("UPDATE package_pickup_manual_amazon SET matched_dispatch_package_id=? WHERE matched_dispatch_package_id=?", (target_id, alias_id))
+        conn.execute("DELETE FROM package_pickup_delivery_records WHERE package_id=?", (alias_id,))
+        conn.execute("DELETE FROM amazon_dispatch_packages WHERE id=?", (alias_id,))
+        removed += 1
+    return removed
 
 
 def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) -> list[dict[str, Any]]:

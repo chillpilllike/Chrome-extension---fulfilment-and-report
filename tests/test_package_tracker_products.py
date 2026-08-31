@@ -6,6 +6,7 @@ from app.main import (
     canonical_tracking_packages,
     compact_tracking_products,
     dispatch_codes_from_package,
+    dispatch_shipment_alias_pairs,
     package_tracker_canonical_dispatch_rows,
     package_tracker_enforce_product_guard,
     package_tracker_fallback_asins_by_package,
@@ -143,6 +144,15 @@ class PackageTrackerProductTests(unittest.TestCase):
 
         self.assertNotEqual(tracking_package_shipment_key(first), tracking_package_shipment_key(second))
         self.assertEqual(len(canonical_tracking_packages([first, second])), 2)
+
+    def test_physical_package_supersedes_temporary_row_for_same_shipment(self):
+        rows = [
+            {"id": 10, "amazon_order_id": "112-2304855-2001835", "scan_code": "AMZPKG-TEMP", "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=NkKj7J16V&packageIndex=0"},
+            {"id": 11, "amazon_order_id": "112-2304855-2001835", "scan_code": "TBA334090270674", "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=NkKj7J16V&packageIndex=0"},
+            {"id": 12, "amazon_order_id": "112-2304855-2001835", "scan_code": "AMZPKG-OTHER", "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=Nx2G7M1NV&packageIndex=0"},
+        ]
+
+        self.assertEqual(dispatch_shipment_alias_pairs(rows), [(10, 11)])
 
     def test_verified_quantity_survives_storage_compaction(self):
         products = compact_tracking_products([
