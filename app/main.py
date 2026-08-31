@@ -11985,12 +11985,22 @@ def chrome_order_is_on_or_after_start_date(group_rows: list[dict[str, Any]], sta
 
 
 def chrome_source_line_item_count(group_rows: list[dict[str, Any]]) -> int:
-    recorded_counts = [int(float(row.get("source_line_count") or 0)) for row in group_rows]
-    return max([len(group_rows), *recorded_counts])
+    """Return the number of distinct purchasable ASINs in a whole Chrome job.
+
+    Multiple Odoo source lines can legitimately consolidate into one Amazon
+    ASIN. Account routing must follow the checkout shape the extension will
+    actually process, not the historical Odoo source-line count.
+    """
+    effective_asins = {
+        normalize_asin(row.get("replacement_asin") or row.get("asin"))
+        for row in group_rows
+        if normalize_asin(row.get("replacement_asin") or row.get("asin"))
+    }
+    return len(effective_asins) if effective_asins else len(group_rows)
 
 
 def required_chrome_account_experience(group_rows: list[dict[str, Any]]) -> str:
-    """Route whole Odoo orders by source line count, never by Chrome profile identity."""
+    """Route whole orders by distinct purchasable ASIN count, never profile identity."""
     if not chrome_account_type_routing_enabled():
         return "any"
     return "consumer" if chrome_source_line_item_count(group_rows) > 1 else "business"
@@ -12186,15 +12196,11 @@ def chrome_queue_snapshot(
                 ? = 'any'
                 OR (
                     ? = 'consumer'
-                    AND (
-                        COUNT(*) > 1
-                        OR MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) > 1
-                    )
+                    AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) > 1
                 )
                 OR (
                     ? = 'business'
-                    AND COUNT(*) = 1
-                    AND MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) <= 1
+                    AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) = 1
                 )
             )
             -- A worker's own pre-submit claim is the job that Start will resume.
@@ -12221,15 +12227,11 @@ def chrome_queue_snapshot(
                     ? = 'any'
                     OR (
                         ? = 'consumer'
-                        AND (
-                            COUNT(*) > 1
-                            OR MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) > 1
-                        )
+                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) > 1
                     )
                     OR (
                         ? = 'business'
-                        AND COUNT(*) = 1
-                        AND MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) <= 1
+                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) = 1
                     )
                 )
             ) queued_groups
@@ -12501,15 +12503,11 @@ def claim_next_chrome_job(
                     ? = 'any'
                     OR (
                         ? = 'consumer'
-                        AND (
-                            COUNT(*) > 1
-                            OR MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) > 1
-                        )
+                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) > 1
                     )
                     OR (
                         ? = 'business'
-                        AND COUNT(*) = 1
-                        AND MAX(CAST(COALESCE(source_line_count, 0) AS INTEGER)) <= 1
+                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) = 1
                     )
                )
             ORDER BY newest_order_date DESC, newest_order_id DESC, first_line_id ASC

@@ -563,8 +563,10 @@ startNext.addEventListener("click", async () => {
       targetWindowId = result.targetWindowId;
       registerControlWindow();
     }
-    setStatus(result.message || (result.ok ? "Processing queued orders." : "Could not start queued orders."));
     await refresh();
+    // refresh() renders the latest state and normally says "No active job".
+    // Preserve the actionable claim result when no compatible job was started.
+    setStatus(result.message || (result.ok ? "Processing queued orders." : "Could not start queued orders."));
   } catch (error) {
     setStatus(error.message || "Could not start queued orders.");
   } finally {

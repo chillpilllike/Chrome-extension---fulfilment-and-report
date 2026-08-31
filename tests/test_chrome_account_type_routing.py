@@ -23,33 +23,42 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
             self.assertTrue(main.chrome_account_experience_matches(rows, "consumer"))
             self.assertTrue(main.chrome_account_experience_matches(rows, "business"))
 
-    def test_enabled_routing_maps_multiple_lines_to_consumer(self) -> None:
-        rows = [{"id": 1}, {"id": 2}]
+    def test_enabled_routing_maps_multiple_asins_to_consumer(self) -> None:
+        rows = [{"id": 1, "asin": "B000000001"}, {"id": 2, "asin": "B000000002"}]
         with patch.object(main, "get_service_settings", return_value={"chrome_route_orders_by_account_type": "true"}):
             self.assertEqual(main.required_chrome_account_experience(rows), "consumer")
             self.assertTrue(main.chrome_account_experience_matches(rows, "consumer"))
             self.assertFalse(main.chrome_account_experience_matches(rows, "business"))
 
-    def test_enabled_routing_maps_single_line_to_business_even_for_quantity(self) -> None:
-        rows = [{"id": 1, "quantity": 8}]
+    def test_enabled_routing_maps_single_asin_to_business_even_for_quantity(self) -> None:
+        rows = [{"id": 1, "asin": "B000000001", "quantity": 8}]
         with patch.object(main, "get_service_settings", return_value={"chrome_route_orders_by_account_type": "true"}):
             self.assertEqual(main.required_chrome_account_experience(rows), "business")
             self.assertTrue(main.chrome_account_experience_matches(rows, "business"))
             self.assertFalse(main.chrome_account_experience_matches(rows, "consumer"))
 
-    def test_original_multi_line_order_stays_consumer_after_inventory_reduces_amazon_rows(self) -> None:
-        rows = [{"id": 1, "quantity": 2, "source_line_count": 3}]
+    def test_original_multi_line_order_routes_by_one_consolidated_asin(self) -> None:
+        rows = [{"id": 1, "asin": "B0866674VB", "quantity": 2, "source_line_count": 3}]
         with patch.object(main, "get_service_settings", return_value={"chrome_route_orders_by_account_type": "true"}):
-            self.assertEqual(main.chrome_source_line_item_count(rows), 3)
-            self.assertEqual(main.required_chrome_account_experience(rows), "consumer")
+            self.assertEqual(main.chrome_source_line_item_count(rows), 1)
+            self.assertEqual(main.required_chrome_account_experience(rows), "business")
+
+    def test_duplicate_rows_for_same_effective_asin_stay_business(self) -> None:
+        rows = [
+            {"id": 1, "asin": "B000000001", "quantity": 1},
+            {"id": 2, "asin": "B000000001", "quantity": 1},
+        ]
+        with patch.object(main, "get_service_settings", return_value={"chrome_route_orders_by_account_type": "true"}):
+            self.assertEqual(main.chrome_source_line_item_count(rows), 1)
+            self.assertEqual(main.required_chrome_account_experience(rows), "business")
 
     def test_claim_filters_account_type_before_candidate_limit(self) -> None:
         source = inspect.getsource(main.claim_next_chrome_job)
         account_filter = source.index("? = 'consumer'")
         candidate_limit = source.index("LIMIT 250", account_filter)
         self.assertLess(account_filter, candidate_limit)
-        self.assertIn("COUNT(*) = 1", source[account_filter:candidate_limit])
-        self.assertIn("source_line_count", source[account_filter:candidate_limit])
+        self.assertIn("COUNT(DISTINCT", source[account_filter:candidate_limit])
+        self.assertIn("replacement_asin", source[account_filter:candidate_limit])
 
     def test_strict_preferred_claim_does_not_fall_back_to_general_queue(self) -> None:
         source = inspect.getsource(main.claim_next_chrome_job)
@@ -66,7 +75,7 @@ class ChromeAccountTypeRoutingTests(unittest.TestCase):
         self.assertIn("account_experience", source)
         self.assertGreaterEqual(source.count("? = 'consumer'"), 2)
         self.assertGreaterEqual(source.count("? = 'business'"), 2)
-        self.assertGreaterEqual(source.count("source_line_count"), 2)
+        self.assertGreaterEqual(source.count("COUNT(DISTINCT"), 4)
 
         endpoint_source = inspect.getsource(main.api_chrome_jobs)
         self.assertIn("account_experience=account_experience", endpoint_source)

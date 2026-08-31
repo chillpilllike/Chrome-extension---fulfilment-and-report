@@ -16506,7 +16506,7 @@ function SettingsPage({
               </SelectField>
               <SelectField label="Route Chrome Orders by Account Type" value={settings.chrome_route_orders_by_account_type || "false"} onChange={(value) => setSetting("chrome_route_orders_by_account_type", value)}>
                 <option value="false">Disabled — any detected account type</option>
-                <option value="true">Enabled — multi-line Consumer, single-line Business</option>
+                <option value="true">Enabled — multi-ASIN Consumer, single-ASIN Business</option>
               </SelectField>
               <SelectField label="Auto Fulfil Pull Window" value={settings.auto_chrome_fulfil_days || "2"} onChange={(value) => setSetting("auto_chrome_fulfil_days", value)}>
                 {["1", "2", "3", "7", "14", "30"].map((value) => <option key={value} value={value}>Last {value} day{value === "1" ? "" : "s"}</option>)}

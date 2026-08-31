@@ -29,6 +29,6 @@ The extension opens each Amazon product page, pauses when coupon or promotion te
 - **Consumer account (any Chrome profile):** if Subscribe & Save is cheaper, the extension selects it. For a multi-item order it must wait for and click **Add subscription to cart**. If that consumer-only control does not render, the order pauses; it must not silently use One-time purchase.
 - **Amazon Business account (any Chrome profile):** Amazon does not provide **Add subscription to cart** and uses its separate normal-cart path.
 
-Each extension positively detects its current account type before claiming. When app routing is enabled, the first idle compatible consumer extension may claim a whole multi-line order, while the first idle compatible Business extension may claim a whole single-line order. Profile names are never used, and one Odoo order is never split among workers.
+Each extension positively detects its current account type before claiming. When app routing is enabled, the first idle compatible consumer extension may claim a whole multi-ASIN order, while the first idle compatible Business extension may claim a whole single-ASIN order. Multiple Odoo lines consolidated to the same purchasable ASIN still count as one ASIN. Profile names are never used, and one Odoo order is never split among workers.
 
 The mandatory implementation rules for future changes are in `AGENTS.md` in this directory.
