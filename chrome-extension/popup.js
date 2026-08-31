@@ -345,7 +345,7 @@ function renderQueueStatus(queue, state) {
   renderQueuedJobs(queue.jobs || [], queue.workerId || state.workerId || "");
   const jobCount = Number(queue.job_count);
   const waiting = Number.isFinite(jobCount) ? jobCount : submittedQueueCount(queue.counts || [], (queue.jobs || []).length);
-  queueCount.textContent = `${waiting} job${waiting === 1 ? "" : "s"} waiting`;
+  queueCount.textContent = `${waiting} compatible job${waiting === 1 ? "" : "s"} waiting`;
   queueCount.textContent += queueCountDetails(queue.counts || []);
   if (queue.stale) {
     queueCount.textContent += " · last loaded";
@@ -589,7 +589,7 @@ async function queueEnteredOdooOrder() {
     await send({ type: "SET_API_BASE", ...settingsPayload() });
     settingsDirty = false;
     const result = await send({ type: "QUEUE_ODOO_ORDERS", orderNames });
-    setStatus(result.message || (result.ok ? `${orderNames.length} order(s) queued.` : "The Odoo orders could not all be queued."));
+    const resultMessage = result.message || (result.ok ? `${orderNames.length} order(s) queued.` : "The Odoo orders could not all be queued.");
     if (result.ok) {
       odooOrderNumber.value = "";
     } else if (result.partial_success && Array.isArray(result.results)) {
@@ -599,6 +599,10 @@ async function queueEnteredOdooOrder() {
         .join("\n");
     }
     await refresh();
+    // refresh() updates the compatible live count but normally replaces the
+    // import result with "No active job". Keep the result visible so a user
+    // can distinguish newly queued, already queued, incompatible, and failed.
+    setStatus(resultMessage);
   } catch (error) {
     setStatus(error.message || "Could not import and queue the Odoo orders.");
   } finally {
