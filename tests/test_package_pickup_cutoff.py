@@ -9,6 +9,7 @@ from app.main import (
     package_pickup_card_date,
     package_pickup_delivery_timestamp,
     package_pickup_scan_history,
+    package_pickup_scan_history_summary,
     package_pickup_order_readiness,
     package_tracker_delivery_date,
     package_tracker_delivery_kind,
@@ -68,6 +69,22 @@ class PackagePickupDeliveryDateTests(unittest.TestCase):
     def test_scan_history_rejects_invalid_date_before_querying_database(self) -> None:
         with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
             package_pickup_scan_history(scan_date="08/27/2026")
+
+    def test_scan_history_summary_keeps_duplicate_and_undone_attempts(self) -> None:
+        summary = package_pickup_scan_history_summary([
+            {"package_id": 1, "matched": 1, "duplicate": 0, "odoo_order_name": "NC1", "order_ready": 0},
+            {"package_id": 1, "matched": 1, "duplicate": 1, "odoo_order_name": "NC1", "order_ready": 0},
+            {"package_id": 2, "matched": 1, "duplicate": 0, "odoo_order_name": "NC2", "order_ready": 1, "undone_at": "2026-08-30T12:00:00Z"},
+            {"matched": 0, "duplicate": 0, "result_status": "not_found"},
+        ])
+        self.assertEqual(summary["total_scans"], 4)
+        self.assertEqual(summary["matched"], 2)
+        self.assertEqual(summary["duplicates"], 1)
+        self.assertEqual(summary["unsuccessful"], 1)
+        self.assertEqual(summary["undone"], 1)
+        self.assertEqual(summary["active_scans"], 3)
+        self.assertEqual(summary["unique_packages"], 2)
+        self.assertEqual(summary["ready_to_ship_orders"], 1)
 
     def test_reset_endpoint_refuses_any_non_today_scan_date_before_querying_database(self) -> None:
         with self.assertRaisesRegex(Exception, "limited to today's Brooklyn scan date"):

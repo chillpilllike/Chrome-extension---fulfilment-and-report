@@ -706,6 +706,8 @@ type PackagePickupScanHistoryEvent = {
   order_received_packages: number
   order_remaining_packages: number
   order_readiness_message: string
+  undone_at?: string
+  undone_reason?: string
   pending_packages?: PackagePickupOrderReadiness["pending_packages"]
 }
 
@@ -718,10 +720,13 @@ type PackagePickupScanHistory = {
     matched: number
     unsuccessful: number
     duplicates: number
+    undone: number
+    active_scans: number
     unique_packages: number
     odoo_orders_found: number
     ready_to_ship_orders: number
   }
+  available_dates: Array<{ scan_date: string; total_scans: number }>
   events: PackagePickupScanHistoryEvent[]
 }
 
@@ -6549,6 +6554,7 @@ function PackagePickupPage({
   const [pickupHistoryOpen, setPickupHistoryOpen] = useState(false)
   const [pickupHistoryLoading, setPickupHistoryLoading] = useState(false)
   const [pickupHistory, setPickupHistory] = useState<PackagePickupScanHistory | null>(null)
+  const [pickupHistoryDate, setPickupHistoryDate] = useState(() => brooklynDateInput())
   const [pickupResetting, setPickupResetting] = useState(false)
   const [pickupUndoConfirm, setPickupUndoConfirm] = useState(false)
   const [hardwareScanInput, setHardwareScanInput] = useState("")
@@ -6621,13 +6627,14 @@ function PackagePickupPage({
     }
   }
 
-  async function loadPickupScanHistory(showLoading = false) {
+  async function loadPickupScanHistory(showLoading = false, scanDate = brooklynDateInput()) {
     if (showLoading) setPickupHistoryLoading(true)
     try {
-      const query = new URLSearchParams({ scan_date: brooklynDateInput() })
+      const query = new URLSearchParams({ scan_date: scanDate })
       if (storeId) query.set("store_id", storeId)
       const result = await api<PackagePickupScanHistory>(`/api/package-pickups/scan-history?${query.toString()}`)
       setPickupHistory(result)
+      setPickupHistoryDate(result.scan_date || scanDate)
     } catch (error) {
       if (showLoading) onResult({ ok: false, title: "Scanner history", message: String(error) })
     } finally {
@@ -7154,6 +7161,8 @@ function PackagePickupPage({
     matched: 0,
     unsuccessful: 0,
     duplicates: 0,
+    undone: 0,
+    active_scans: 0,
     unique_packages: 0,
     odoo_orders_found: 0,
     ready_to_ship_orders: 0,
@@ -7314,18 +7323,45 @@ function PackagePickupPage({
         </DialogContent>
       </Dialog>
 
-      <Dialog open={pickupHistoryOpen} onOpenChange={setPickupHistoryOpen}>
+      <Dialog open={pickupHistoryOpen} onOpenChange={(open) => {
+        setPickupHistoryOpen(open)
+        if (!open && pickupHistoryDate !== brooklynDateInput()) void loadPickupScanHistory(false, brooklynDateInput())
+      }}>
         <DialogContent className="pickup-scan-history-dialog max-w-3xl">
           <DialogHeader>
-            <DialogTitle>Today&apos;s package scanner history</DialogTitle>
+            <DialogTitle>Package scanner history</DialogTitle>
             <DialogDescription>
               {pickupDateLabel(pickupHistory?.scan_date || brooklynDateInput())} · Brooklyn time · {todayPickupScanSummary.total_scans} total scans
             </DialogDescription>
           </DialogHeader>
+          <div className="pickup-history-date-nav">
+            <Button type="button" size="sm" variant="outline" aria-label="Previous scan date" onClick={() => {
+              const previous = pickupHistory?.available_dates?.find((item) => item.scan_date < pickupHistoryDate)?.scan_date
+              const target = previous || (() => { const value = new Date(`${pickupHistoryDate}T12:00:00Z`); value.setUTCDate(value.getUTCDate() - 1); return value.toISOString().slice(0, 10) })()
+              void loadPickupScanHistory(true, target)
+            }}><ChevronLeft className="size-4" /></Button>
+            <label>
+              <span>Actual scan date</span>
+              <Input type="date" max={brooklynDateInput()} value={pickupHistoryDate} onChange={(event) => void loadPickupScanHistory(true, event.target.value)} />
+            </label>
+            <select className="form-select" value={pickupHistoryDate} onChange={(event) => void loadPickupScanHistory(true, event.target.value)} aria-label="Dates with saved scans">
+              {!(pickupHistory?.available_dates || []).some((item) => item.scan_date === pickupHistoryDate) ? <option value={pickupHistoryDate}>{pickupDateLabel(pickupHistoryDate)} · 0 scans</option> : null}
+              {(pickupHistory?.available_dates || []).map((item) => <option key={item.scan_date} value={item.scan_date}>{pickupDateLabel(item.scan_date)} · {item.total_scans} scan{item.total_scans === 1 ? "" : "s"}</option>)}
+            </select>
+            <Button type="button" size="sm" variant="outline" disabled={pickupHistoryDate >= brooklynDateInput()} aria-label="Next scan date" onClick={() => {
+              const nextDates = (pickupHistory?.available_dates || []).filter((item) => item.scan_date > pickupHistoryDate)
+              const next = nextDates.at(-1)?.scan_date
+              const target = next || (() => { const value = new Date(`${pickupHistoryDate}T12:00:00Z`); value.setUTCDate(value.getUTCDate() + 1); return value.toISOString().slice(0, 10) })()
+              void loadPickupScanHistory(true, target > brooklynDateInput() ? brooklynDateInput() : target)
+            }}><ChevronRight className="size-4" /></Button>
+            {pickupHistoryDate !== brooklynDateInput() ? <Button className="pickup-history-today" type="button" size="sm" variant="outline" onClick={() => void loadPickupScanHistory(true, brooklynDateInput())}>Today</Button> : null}
+          </div>
           <div className="pickup-history-summary-grid">
-            <div><span>Total scans</span><strong>{todayPickupScanSummary.total_scans}</strong></div>
+            <div><span>Actual scans</span><strong>{todayPickupScanSummary.total_scans}</strong></div>
             <div className="is-success"><span>Matched</span><strong>{todayPickupScanSummary.matched}</strong></div>
             <div className="is-error"><span>Unsuccessful</span><strong>{todayPickupScanSummary.unsuccessful}</strong></div>
+            <div className="is-duplicate"><span>Duplicates</span><strong>{todayPickupScanSummary.duplicates}</strong></div>
+            <div><span>Undone later</span><strong>{todayPickupScanSummary.undone}</strong></div>
             <div className="is-ready"><span>Ready Odoo orders</span><strong>{todayPickupScanSummary.ready_to_ship_orders}</strong></div>
           </div>
           <div className="pickup-history-meta">
@@ -7336,32 +7372,34 @@ function PackagePickupPage({
             {(pickupHistory?.events || []).map((entry) => {
               const matched = Boolean(entry.matched)
               const duplicate = Boolean(entry.duplicate)
+              const undone = Boolean(entry.undone_at)
               return (
-                <div key={entry.id} className={duplicate ? "is-duplicate" : matched ? "is-success" : "is-error"}>
+                <div key={entry.id} className={cn(duplicate ? "is-duplicate" : matched ? "is-success" : "is-error", undone && "is-undone")}>
                   {duplicate ? <RefreshCw className="size-4" /> : matched ? <CheckCircle2 className="size-4" /> : <AlertCircle className="size-4" />}
                   <div className="pickup-history-order">
                     <div className="pickup-history-order-head">
                       {entry.odoo_order_name ? <OdooOrderRef name={entry.odoo_order_name} linkClassName="font-semibold" /> : <strong>No Odoo order matched</strong>}
-                      <span className={duplicate ? "is-duplicate" : matched ? "is-success" : "is-error"}>{entry.result_status.replaceAll("_", " ")}</span>
+                      <span className={undone ? "is-undone" : duplicate ? "is-duplicate" : matched ? "is-success" : "is-error"}>{undone ? "undone later" : entry.result_status.replaceAll("_", " ")}</span>
                     </div>
                     <small><b>Amazon tracking ID</b> {entry.shipment_id || entry.scan_code || "Not matched"}</small>
                     {entry.amazon_order_id ? <small><b>Amazon order</b> {entry.amazon_order_id}</small> : null}
                     {entry.recipient_ref ? <small><b>Recipient</b> {entry.recipient_ref}</small> : null}
                     <small><b>Scanned</b> {formatDateTime(entry.scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
+                    {undone ? <small className="is-undone"><b>Undone</b> {formatDateTime(entry.undone_at!, { timeZone: "America/New_York", showTimeZone: true })}{entry.undone_reason ? ` · ${entry.undone_reason.replaceAll("_", " ")}` : ""}</small> : null}
                     <small>{entry.message}</small>
                     {matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>{entry.order_received_packages}/{entry.order_total_packages} packages received.</b> {entry.order_readiness_message}</small> : null}
                   </div>
                 </div>
               )
             })}
-            {!pickupHistoryLoading && !(pickupHistory?.events || []).length ? <div className="pickup-empty">No packages have been scanned today.</div> : null}
-            {pickupHistoryLoading ? <div className="pickup-empty">Loading today&apos;s scanner history…</div> : null}
+            {!pickupHistoryLoading && !(pickupHistory?.events || []).length ? <div className="pickup-empty">No scan events were recorded on this date.</div> : null}
+            {pickupHistoryLoading ? <div className="pickup-empty">Loading scanner history…</div> : null}
           </div>
           <DialogFooter>
-            <Button type="button" variant="destructive" disabled={pickupResetting || !todayPickupScanSummary.total_scans} onClick={() => void resetTodayPickupScans()}>
+            {pickupHistoryDate === brooklynDateInput() ? <Button type="button" variant="destructive" disabled={pickupResetting || !todayPickupScanSummary.active_scans} onClick={() => void resetTodayPickupScans()}>
               <RefreshCw className={cn("size-4", pickupResetting && "animate-spin")} /> Reset all today&apos;s scans
-            </Button>
-            <Button variant="outline" onClick={() => void loadPickupScanHistory(true)} disabled={pickupHistoryLoading}>
+            </Button> : null}
+            <Button variant="outline" onClick={() => void loadPickupScanHistory(true, pickupHistoryDate)} disabled={pickupHistoryLoading}>
               <RefreshCw className={cn("size-4", pickupHistoryLoading && "animate-spin")} /> Refresh
             </Button>
             <Button onClick={() => setPickupHistoryOpen(false)}>Done</Button>

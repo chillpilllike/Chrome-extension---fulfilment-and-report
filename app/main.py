@@ -33276,6 +33276,37 @@ def record_package_pickup_scan_event(
     return int(inserted_row.get("id") or 0)
 
 
+def package_pickup_scan_history_summary(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Summarize immutable physical scan attempts without hiding later rollbacks."""
+    matched_events = [event for event in events if bool(event.get("matched")) and not bool(event.get("duplicate"))]
+    unsuccessful_events = [event for event in events if not bool(event.get("matched"))]
+    duplicate_events = [event for event in events if bool(event.get("duplicate"))]
+    active_events = [event for event in events if not clean_text(event.get("undone_at"))]
+    return {
+        "total_scans": len(events),
+        "matched": len(matched_events),
+        "unsuccessful": len(unsuccessful_events),
+        "duplicates": len(duplicate_events),
+        "undone": sum(1 for event in events if clean_text(event.get("undone_at"))),
+        "active_scans": len(active_events),
+        "unique_packages": len({
+            int(event.get("package_id") or 0)
+            for event in matched_events
+            if int(event.get("package_id") or 0) > 0
+        }),
+        "odoo_orders_found": len({
+            clean_text(event.get("odoo_order_name"))
+            for event in matched_events
+            if clean_text(event.get("odoo_order_name"))
+        }),
+        "ready_to_ship_orders": len({
+            clean_text(event.get("odoo_order_name"))
+            for event in matched_events
+            if bool(event.get("order_ready")) and clean_text(event.get("odoo_order_name"))
+        }),
+    }
+
+
 def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
     raw_date = clean_text(scan_date)
     if raw_date:
@@ -33296,47 +33327,52 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
         params.append(int(store_id))
     with db() as conn:
         ensure_package_pickup_scan_history_table(conn)
-        summary_row = row_to_dict(conn.execute(
-            f"""
-            SELECT
-                COUNT(*) AS total_scans,
-                COUNT(*) FILTER (WHERE matched=1 AND duplicate=0) AS matched,
-                COUNT(*) FILTER (WHERE matched=0) AS unsuccessful,
-                COUNT(*) FILTER (WHERE duplicate=1) AS duplicates,
-                COUNT(DISTINCT package_id) FILTER (WHERE matched=1 AND duplicate=0 AND package_id IS NOT NULL) AS unique_packages,
-                COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0) AS odoo_orders_found,
-                COUNT(DISTINCT NULLIF(odoo_order_name, '')) FILTER (WHERE matched=1 AND duplicate=0 AND order_ready=1) AS ready_to_ship_orders
-            FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 AND result_status!='needs_tracking_scan' {store_sql}
-            """,
-            params,
-        ).fetchone()) or {}
         events = rows_to_dicts(conn.execute(
             f"""
             SELECT id, store_id, package_id, scan_code, result_status, matched, duplicate,
                    odoo_order_name, amazon_order_id, shipment_id, recipient_ref,
                    order_ready, order_total_packages, order_received_packages, order_remaining_packages,
-                   order_readiness_message, remaining_packages_json, message, scanned_at
+                   order_readiness_message, remaining_packages_json, message, scanned_at,
+                   undone_at, undone_reason
             FROM package_pickup_scan_events
-            WHERE scanned_at>=? AND scanned_at<? AND undone_at IS NULL AND duplicate=0 AND result_status!='needs_tracking_scan' {store_sql}
+            WHERE scanned_at>=? AND scanned_at<? {store_sql}
             ORDER BY scanned_at DESC, id DESC
-            LIMIT 1000
+            LIMIT 2000
             """,
             params,
         ).fetchall())
+        date_params: list[Any] = []
+        date_store_sql = ""
+        if store_id is not None:
+            date_store_sql = " WHERE store_id=?"
+            date_params.append(int(store_id))
+        date_rows = rows_to_dicts(conn.execute(
+            f"""
+            SELECT scanned_at
+            FROM package_pickup_scan_events
+            {date_store_sql}
+            ORDER BY scanned_at DESC, id DESC
+            LIMIT 10000
+            """,
+            date_params,
+        ).fetchall())
+    available_date_counts: dict[str, int] = {}
+    for row in date_rows:
+        scanned = parse_any_datetime(row.get("scanned_at"))
+        if not scanned:
+            continue
+        local_date = scanned.astimezone(PACKAGE_PICKUP_TIMEZONE).date().isoformat()
+        available_date_counts[local_date] = available_date_counts.get(local_date, 0) + 1
+    summary = package_pickup_scan_history_summary(events)
     return {
         "ok": True,
         "scan_date": selected_date.isoformat(),
         "timezone": "America/New_York",
-        "summary": {
-            "total_scans": int(summary_row.get("total_scans") or 0),
-            "matched": int(summary_row.get("matched") or 0),
-            "unsuccessful": int(summary_row.get("unsuccessful") or 0),
-            "duplicates": int(summary_row.get("duplicates") or 0),
-            "unique_packages": int(summary_row.get("unique_packages") or 0),
-            "odoo_orders_found": int(summary_row.get("odoo_orders_found") or 0),
-            "ready_to_ship_orders": int(summary_row.get("ready_to_ship_orders") or 0),
-        },
+        "summary": summary,
+        "available_dates": [
+            {"scan_date": value, "total_scans": count}
+            for value, count in sorted(available_date_counts.items(), reverse=True)[:180]
+        ],
         "events": [{**event, "pending_packages": parse_json_list_value(event.get("remaining_packages_json"))} for event in events],
     }
 

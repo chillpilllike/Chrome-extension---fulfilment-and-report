@@ -2704,7 +2704,10 @@ body,
 .pickup-order-ready-summary span { display: grid; gap: .1rem; }
 .pickup-order-ready-summary small { color: #55735d; font-size: .68rem; }
 .pickup-scan-history-dialog.pickup-scan-history-dialog { width: min(54rem, calc(100vw - 1rem)) !important; max-width: 54rem !important; }
-.pickup-history-summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); overflow: hidden; border: 1px solid #dfe6ee; border-radius: .55rem; background: #fff; }
+.pickup-history-date-nav { display: grid; grid-template-columns: auto minmax(10rem, 1fr) minmax(13rem, 1.35fr) auto auto; gap: .5rem; align-items: end; }
+.pickup-history-date-nav label { display: grid; gap: .28rem; }
+.pickup-history-date-nav label > span { color: #667382; font-size: .68rem; font-weight: 700; }
+.pickup-history-summary-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); overflow: hidden; border: 1px solid #dfe6ee; border-radius: .55rem; background: #fff; }
 .pickup-history-summary-grid > div { display: grid; gap: .12rem; padding: .72rem .8rem; border-right: 1px solid #e7ecf2; }
 .pickup-history-summary-grid > div:last-child { border-right: 0; }
 .pickup-history-summary-grid span { color: #718096; font-size: .65rem; font-weight: 650; }
@@ -2720,14 +2723,17 @@ body,
 .pickup-scan-history-list > div.is-success { border-left: 3px solid #2fb344; }
 .pickup-scan-history-list > div.is-duplicate { border-left: 3px solid #f59f00; background: #fffaf0; }
 .pickup-scan-history-list > div.is-error { border-left: 3px solid #d63939; }
+.pickup-scan-history-list > div.is-undone { opacity: .72; background: #f4f5f7; border-left-color: #7c8794; }
 .pickup-history-order { display: grid; min-width: 0; gap: .16rem; }
 .pickup-history-order-head { display: flex; align-items: center; justify-content: space-between; gap: .65rem; }
 .pickup-history-order-head > span { padding: .12rem .4rem; border-radius: 999px; background: #eef2f6; color: #526273; font-size: .6rem; font-weight: 750; text-transform: capitalize; }
 .pickup-history-order-head > span.is-success { background: #eaf7ec; color: #238636; }
 .pickup-history-order-head > span.is-duplicate { background: #fff3cd; color: #8a5100; }
 .pickup-history-order-head > span.is-error { background: #fcecec; color: #b42318; }
+.pickup-history-order-head > span.is-undone { background: #e9ecef; color: #495057; }
 .pickup-history-order small { color: #667382; font-size: .68rem; overflow-wrap: anywhere; }
 .pickup-history-order small b { color: #3f4d5c; font-weight: 700; }
+.pickup-history-order small.is-undone { color: #59636e; }
 .pickup-package-times { display: grid !important; gap: .18rem; }
 .pickup-package-times small { color: #667382; font-size: .63rem; font-weight: 600; line-height: 1.3; }
 .pickup-package-times small.is-scanned { color: #238636; }
@@ -3207,6 +3213,10 @@ body,
     .pickup-manual-tracking-form { grid-template-columns: 1fr; }
     .pickup-today-scan-card { grid-template-columns: auto minmax(0, 1fr) auto; margin-left: 0; }
     .pickup-today-scan-metric { display: none; }
+    .pickup-history-date-nav { grid-template-columns: auto minmax(0, 1fr) auto; }
+    .pickup-history-date-nav label { grid-column: 2; grid-row: 1; }
+    .pickup-history-date-nav > select { grid-column: 1 / -1; grid-row: 2; }
+    .pickup-history-date-nav > .pickup-history-today { grid-column: 1 / -1; grid-row: 3; }
     .pickup-history-summary-grid { grid-template-columns: 1fr 1fr; }
     .pickup-history-summary-grid > div:nth-child(even) { border-right: 0; }
     .pickup-history-summary-grid > div:not(:last-child) { border-bottom: 1px solid #e7ecf2; }
