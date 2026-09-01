@@ -4850,16 +4850,16 @@ function App() {
       {
         const inventory = inventoryAvailability(row)
         if (inventory.fullyAllocated) {
-          return <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">Fulfilled from inventory: {inventory.allocated}/{inventory.requested}</Badge>
+          return <Badge className="inventory-availability-badge inventory-availability-badge-ready">Fulfilled from inventory: {inventory.allocated}/{inventory.requested}</Badge>
         }
         if (inventory.allocated > 0) {
-          return <Badge className="bg-amber-500 text-amber-950 hover:bg-amber-500">Allocated {inventory.allocated}/{inventory.requested} · {inventory.available} available</Badge>
+          return <Badge className="inventory-availability-badge inventory-availability-badge-partial">Allocated {inventory.allocated}/{inventory.requested} · {inventory.available} available</Badge>
         }
         if (inventory.available >= inventory.remaining && inventory.remaining > 0) {
-          return <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">Inventory ready: {inventory.available} available</Badge>
+          return <Badge className="inventory-availability-badge inventory-availability-badge-ready">Inventory ready: {inventory.available} available</Badge>
         }
         if (inventory.available > 0) {
-          return <Badge className="bg-amber-500 text-amber-950 hover:bg-amber-500">Partial inventory: {inventory.available}/{inventory.remaining}</Badge>
+          return <Badge className="inventory-availability-badge inventory-availability-badge-partial">Partial inventory: {inventory.available}/{inventory.remaining}</Badge>
         }
         return ""
       }

@@ -1202,6 +1202,18 @@ body,
     background: #ffffff;
 }
 
+.tabler-admin-shell .inventory-availability-badge-ready {
+    border-color: #047857 !important;
+    background: #047857 !important;
+    color: #ffffff !important;
+}
+
+.tabler-admin-shell .inventory-availability-badge-partial {
+    border-color: #b45309 !important;
+    background: #f59e0b !important;
+    color: #451a03 !important;
+}
+
 .tabler-admin-shell .bg-primary { background: var(--tblr-primary); }
 .tabler-admin-shell .text-primary { color: var(--tblr-primary); }
 .tabler-admin-shell .text-primary-fg { color: #ffffff; }

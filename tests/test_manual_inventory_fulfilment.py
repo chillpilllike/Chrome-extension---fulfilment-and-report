@@ -8,6 +8,9 @@ from app import main
 FRONTEND = (
     Path(__file__).resolve().parents[1] / "frontend" / "src" / "App.tsx"
 ).read_text(encoding="utf-8")
+FRONTEND_CSS = (
+    Path(__file__).resolve().parents[1] / "frontend" / "src" / "index.css"
+).read_text(encoding="utf-8")
 EXTENSION = (
     Path(__file__).resolve().parents[1] / "chrome-extension" / "content.js"
 ).read_text(encoding="utf-8")
@@ -68,6 +71,9 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("Partial inventory:", FRONTEND)
         self.assertIn("Fulfilled from inventory:", FRONTEND)
         self.assertIn("border-l-emerald-500", FRONTEND)
+        self.assertIn("inventory-availability-badge-ready", FRONTEND)
+        self.assertIn("background: #047857 !important", FRONTEND_CSS)
+        self.assertIn("color: #ffffff !important", FRONTEND_CSS)
         self.assertIn("were already allocated from inventory", EXTENSION)
 
 
