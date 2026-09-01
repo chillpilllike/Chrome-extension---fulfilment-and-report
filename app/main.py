@@ -25796,7 +25796,12 @@ def api_cancelled_orders_sync(payload: Optional[dict[str, Any]] = None) -> dict[
 def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     store_id = int(payload.get("store_id") or 0)
     if not store_id:
-        raise HTTPException(400, "Store is required.")
+        configured_stores = list_stores()
+        if not configured_stores:
+            raise HTTPException(400, "Configure at least one store before adding inventory.")
+        # Inventory is shared across stores. Keep an internal owner only because
+        # the existing schema requires store_id; it is not an allocation guard.
+        store_id = int(configured_stores[0]["id"])
     asin = normalize_asin(str(payload.get("asin") or ""))
     odoo_order_name = clean_text(payload.get("odoo_order_name"))
     amazon_order_id = clean_text(payload.get("amazon_order_id"))
@@ -25908,15 +25913,18 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             raise HTTPException(400, "This inventory item is not available for fulfilment yet.")
         inventory_asin = normalize_asin(item["asin"])
         candidate_clauses = [
-            "store_id=?",
             "state NOT IN ('ordered', 'dispatched', 'delivered', 'inventory', 'ignored')",
             "COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')",
         ]
-        candidate_params: list[Any] = [item["store_id"]]
+        candidate_params: list[Any] = []
         if line_id:
             candidate_clauses.append("id=?")
             candidate_params.append(line_id)
         else:
+            # The legacy order-name prompt remains scoped for disambiguation.
+            # The Orders-page line_id flow intentionally allows cross-store use.
+            candidate_clauses.append("store_id=?")
+            candidate_params.append(item["store_id"])
             candidate_clauses.append("UPPER(odoo_order_name)=UPPER(?)")
             candidate_params.append(order_ref)
         if inventory_asin:
@@ -26024,7 +26032,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
         try:
             allocation_key = hashlib.sha256(note.encode("utf-8")).hexdigest()[:20]
             post_order_note_once(
-                get_store(int(item["store_id"])),
+                get_store(int(line["store_id"])),
                 int(line["odoo_order_id"]),
                 "inventory_allocated",
                 f"manual-inventory-{allocation_key}",

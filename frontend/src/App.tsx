@@ -4421,7 +4421,7 @@ function App() {
     setInventoryExpiryConfirmed(false)
     setSelectedInventoryId(null)
     try {
-      const result = await api<{ items: InventoryItem[] }>(`/api/inventory?store_id=${line.store_id}&page=1&per_page=100`)
+      const result = await api<{ items: InventoryItem[] }>("/api/inventory?page=1&per_page=100")
       const requiredQuantity = Math.max(0, Number(line.quantity || 0) - Number(line.inventory_allocated_quantity || 0))
       const lineAsin = String(line.asin || "").trim().toUpperCase()
       const available = (result.items || []).filter((item) => {
@@ -6069,7 +6069,6 @@ function App() {
           <InventoryPage
             rows={inventory}
             storeId={storeId}
-            stores={stores}
             page={inventoryPage}
             total={inventoryTotal}
             onPage={setInventoryPage}
@@ -12297,7 +12296,6 @@ function DuplicateTrackingPage({
 function InventoryPage({
   rows,
   storeId,
-  stores,
   page,
   total,
   onPage,
@@ -12306,7 +12304,6 @@ function InventoryPage({
 }: {
   rows: InventoryItem[]
   storeId: string
-  stores: Store[]
   page: number
   total: number
   onPage: (page: number) => void
@@ -12314,18 +12311,13 @@ function InventoryPage({
   onResult: (modal: ModalState) => void
 }) {
   const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
-  const [manualStoreId, setManualStoreId] = useState(storeId || "")
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string; asin?: string } | null>(null)
-  useEffect(() => {
-    if (storeId) setManualStoreId(storeId)
-    else if (!manualStoreId && stores.length === 1) setManualStoreId(String(stores[0].id))
-  }, [storeId, stores, manualStoreId])
 
   async function addManualInventory() {
     try {
       const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>("/api/inventory", {
         method: "POST",
-        body: JSON.stringify({ ...form, store_id: Number(manualStoreId), quantity: Number(form.quantity || 0) }),
+        body: JSON.stringify({ ...form, store_id: Number(storeId || 0) || null, quantity: Number(form.quantity || 0) }),
       })
       setForm({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
       onPage(1)
@@ -12376,11 +12368,7 @@ function InventoryPage({
           <CardTitle>Inventory</CardTitle>
           <CardDescription>Reusable stock is released only after Amazon delivery, warehouse receipt, Shopify cancellation, and Odoo cancellation/refund are all confirmed. For manual stock, enter a title and quantity; ASIN is optional.</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1fr_1.5fr_120px_1fr_1.2fr_auto]">
-          <SelectField label="Store" value={manualStoreId} onChange={setManualStoreId}>
-            <option value="">Select store</option>
-            {stores.map((store) => <option key={store.id} value={store.id}>{store.name}</option>)}
-          </SelectField>
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.5fr_120px_1fr_1.2fr_auto]">
           <div className="grid gap-1.5">
             <Label>Title <span className="text-destructive">*</span></Label>
             <Input value={form.product_name} onChange={(event) => setForm({ ...form, product_name: event.target.value })} placeholder="Product name" />
@@ -12398,7 +12386,7 @@ function InventoryPage({
             <Input value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} />
           </div>
           <div className="flex items-end">
-            <Button disabled={!manualStoreId || !form.product_name.trim() || Number(form.quantity || 0) <= 0} onClick={addManualInventory}>
+            <Button disabled={!form.product_name.trim() || Number(form.quantity || 0) <= 0} onClick={addManualInventory}>
               <Plus className="size-4" />
               Add
             </Button>
@@ -12410,7 +12398,7 @@ function InventoryPage({
         <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <CardTitle>Inventory Items</CardTitle>
-            <CardDescription>Showing max 100 rows per page. Available rows can fulfil a selected order when quantity is sufficient; rows with an ASIN must match the order ASIN.</CardDescription>
+            <CardDescription>Inventory is shared across all stores. Available rows can fulfil any selected order when quantity is sufficient; rows with an ASIN must match the order ASIN exactly.</CardDescription>
           </div>
           <PaginationControls page={page} total={total} onPage={onPage} />
         </CardHeader>
