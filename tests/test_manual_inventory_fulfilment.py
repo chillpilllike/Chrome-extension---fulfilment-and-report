@@ -8,6 +8,9 @@ from app import main
 FRONTEND = (
     Path(__file__).resolve().parents[1] / "frontend" / "src" / "App.tsx"
 ).read_text(encoding="utf-8")
+EXTENSION = (
+    Path(__file__).resolve().parents[1] / "chrome-extension" / "content.js"
+).read_text(encoding="utf-8")
 
 
 class ManualInventoryFulfilmentTests(unittest.TestCase):
@@ -44,6 +47,25 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         line_id_branch = source[source.index("if line_id:"):source.index("if inventory_asin:")]
         self.assertNotIn('candidate_clauses.append("store_id=?")', line_id_branch.split("else:", 1)[0])
         self.assertIn('get_store(int(line["store_id"]))', source)
+
+    def test_inventory_matching_is_global_and_uses_effective_replacement_asin(self) -> None:
+        reserve_source = inspect.getsource(main.reserve_inventory_for_line)
+        attach_source = inspect.getsource(main.api_attach_inventory_item)
+        create_source = inspect.getsource(main.api_create_inventory)
+
+        self.assertIn("asin = effective_inventory_asin(line)", reserve_source)
+        self.assertIn("WHERE asin=? AND status='available'", reserve_source)
+        self.assertNotIn("WHERE store_id=? AND asin=?", reserve_source)
+        self.assertIn("COALESCE(NULLIF(replacement_asin, ''), asin)=?", attach_source)
+        self.assertIn('{"inventory-v2", "orders", "dashboard"}', create_source)
+        self.assertIn("line.replacement_asin || line.asin", FRONTEND)
+
+    def test_orders_and_chrome_show_inventory_allocation_status(self) -> None:
+        self.assertIn("Inventory ready:", FRONTEND)
+        self.assertIn("Partial inventory:", FRONTEND)
+        self.assertIn("Fulfilled from inventory:", FRONTEND)
+        self.assertIn("border-l-emerald-500", FRONTEND)
+        self.assertIn("were already allocated from inventory", EXTENSION)
 
 
 if __name__ == "__main__":

@@ -7864,7 +7864,15 @@ def cancelled_order_rows_payload(rows: list[Any], stores: Optional[list[dict[str
     return data
 
 
+def effective_inventory_asin(line: Any) -> str:
+    """Return the exact ASIN inventory should match for an order line."""
+    replacement_asin = normalize_asin(line.get("replacement_asin") or "")
+    return replacement_asin or normalize_asin(line.get("asin") or "")
+
+
 def available_inventory_quantity(store_id: int, asin: str) -> float:
+    # store_id remains in the signature for existing callers, but inventory is
+    # intentionally shared across every configured storefront.
     asin = normalize_asin(asin)
     if not asin:
         return 0
@@ -7873,9 +7881,9 @@ def available_inventory_quantity(store_id: int, asin: str) -> float:
             """
             SELECT COALESCE(SUM(quantity), 0) AS quantity
             FROM inventory_items
-            WHERE store_id=? AND asin=? AND status='available'
+            WHERE asin=? AND status='available'
             """,
-            (store_id, asin),
+            (asin,),
         ).fetchone()
     return float(row["quantity"] or 0)
 
@@ -7887,7 +7895,7 @@ def inventory_purchase_quantity(line: dict[str, Any]) -> float:
 
 
 def reserve_inventory_for_line(line: dict[str, Any]) -> float:
-    asin = normalize_asin(line["asin"])
+    asin = effective_inventory_asin(line)
     quantity_needed = float(line["quantity"] or 1)
     if not asin or quantity_needed <= 0:
         return 0.0
@@ -7908,11 +7916,11 @@ def reserve_inventory_for_line(line: dict[str, Any]) -> float:
         rows = conn.execute(
             """
             SELECT * FROM inventory_items
-            WHERE store_id=? AND asin=? AND status='available'
+            WHERE asin=? AND status='available'
             ORDER BY updated_at ASC, id ASC
             FOR UPDATE
             """,
-            (line["store_id"], asin),
+            (asin,),
         ).fetchall()
         allocation_needed = quantity_needed - already_allocated
         remaining = allocation_needed
@@ -10460,7 +10468,7 @@ def backfill_cxml_order_references() -> int:
 def aggregate_items_by_asin(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for line in lines:
-        asin = normalize_asin(line["asin"] if "asin" in line.keys() else "")
+        asin = effective_inventory_asin(line)
         if not asin:
             continue
         replacement_asin = normalize_asin(line["replacement_asin"] if "replacement_asin" in line.keys() else "")
@@ -10476,6 +10484,8 @@ def aggregate_items_by_asin(lines: list[dict[str, Any]]) -> list[dict[str, Any]]
             {
                 "asin": asin,
                 "quantity": 0.0,
+                "requested_quantity": 0.0,
+                "inventory_quantity": 0.0,
                 "store_total_price": 0.0,
                 "store_unit_price": 0.0,
                 "product_names": [],
@@ -10495,6 +10505,8 @@ def aggregate_items_by_asin(lines: list[dict[str, Any]]) -> list[dict[str, Any]]
             if original_asin and original_asin not in entry["original_asins"]:
                 entry["original_asins"].append(original_asin)
         entry["quantity"] += quantity
+        entry["requested_quantity"] += original_quantity
+        entry["inventory_quantity"] += max(0.0, float(line.get("inventory_allocated_quantity") or 0))
         entry["store_total_price"] += store_total
         entry["store_unit_price"] = entry["store_total_price"] / entry["quantity"] if entry["quantity"] else 0.0
         product_name = str(line["product_name"] or "").strip()
@@ -12247,6 +12259,8 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
             {
                 "asin": item["asin"],
                 "quantity": item["quantity"],
+                "requested_quantity": item.get("requested_quantity") or item["quantity"],
+                "inventory_quantity": item.get("inventory_quantity") or 0,
                 "store_unit_price": round(float(item.get("store_unit_price") or 0), 2),
                 "store_total_price": round(float(item.get("store_total_price") or 0), 2),
                 "product_name": (item.get("product_names") or [""])[0],
@@ -24298,9 +24312,15 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                  AND page_orders.odoo_order_id=order_lines.odoo_order_id
             ),
             page_asins AS (
-                SELECT DISTINCT store_id, asin
+                SELECT DISTINCT store_id, asin,
+                       COALESCE(NULLIF(replacement_asin, ''), asin) AS effective_asin
                 FROM page_rows
                 WHERE COALESCE(asin, '') != ''
+            ),
+            page_inventory_asins AS (
+                SELECT DISTINCT effective_asin AS asin
+                FROM page_asins
+                WHERE COALESCE(effective_asin, '') != ''
             ),
             duplicate_counts AS (
                 SELECT duplicate_lines.store_id,
@@ -24315,15 +24335,13 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                 GROUP BY duplicate_lines.store_id, duplicate_lines.asin
             ),
             inventory_counts AS (
-                SELECT inventory_items.store_id,
-                       inventory_items.asin,
+                SELECT inventory_items.asin,
                        SUM(inventory_items.quantity) AS inventory_quantity
                 FROM inventory_items
-                JOIN page_asins
-                  ON page_asins.store_id = inventory_items.store_id
-                 AND page_asins.asin = inventory_items.asin
+                JOIN page_inventory_asins
+                  ON page_inventory_asins.asin = inventory_items.asin
                 WHERE inventory_items.status = 'available'
-                GROUP BY inventory_items.store_id, inventory_items.asin
+                GROUP BY inventory_items.asin
             ),
             order_asin_counts AS (
                 SELECT same_order_lines.store_id,
@@ -24348,8 +24366,7 @@ def dashboard_data(store_id: Optional[int] = None, page: int = 1, per_page: int 
                   ON duplicate_counts.store_id = page_rows.store_id
                  AND duplicate_counts.asin = page_rows.asin
                 LEFT JOIN inventory_counts
-                  ON inventory_counts.store_id = page_rows.store_id
-                 AND inventory_counts.asin = page_rows.asin
+                  ON inventory_counts.asin = COALESCE(NULLIF(page_rows.replacement_asin, ''), page_rows.asin)
                 LEFT JOIN order_asin_counts
                   ON order_asin_counts.store_id = page_rows.store_id
                  AND order_asin_counts.odoo_order_id = page_rows.odoo_order_id
@@ -24526,13 +24543,13 @@ def enrich_order_line_page_metrics(conn: Any, rows: list[dict[str, Any]]) -> Non
         row.setdefault("odoo_order_distinct_asin_count", 0)
 
     page_asins = sorted({
-        (int(row.get("store_id") or 0), clean_text(row.get("asin")))
+        (int(row.get("store_id") or 0), clean_text(row.get("asin")), effective_inventory_asin(row))
         for row in rows
         if int(row.get("store_id") or 0) > 0 and clean_text(row.get("asin"))
     })
     if page_asins:
-        asin_store_ids = [store_id for store_id, _asin in page_asins]
-        asin_values = [asin for _store_id, asin in page_asins]
+        asin_store_ids = [store_id for store_id, _asin, _effective_asin in page_asins]
+        asin_values = [asin for _store_id, asin, _effective_asin in page_asins]
         duplicate_rows = rows_to_dicts(conn.execute(
             """
             SELECT duplicate_lines.store_id,
@@ -24554,26 +24571,24 @@ def enrich_order_line_page_metrics(conn: Any, rows: list[dict[str, Any]]) -> Non
         }
         inventory_rows = rows_to_dicts(conn.execute(
             """
-            SELECT inventory_items.store_id,
-                   inventory_items.asin,
+            SELECT inventory_items.asin,
                    SUM(inventory_items.quantity) AS inventory_quantity
             FROM inventory_items
-            JOIN UNNEST(?::int[], ?::text[]) AS page_asins(store_id, asin)
-              ON page_asins.store_id=inventory_items.store_id
-             AND page_asins.asin=inventory_items.asin
+            JOIN UNNEST(?::text[]) AS page_asins(asin)
+              ON page_asins.asin=inventory_items.asin
             WHERE inventory_items.status='available'
-            GROUP BY inventory_items.store_id, inventory_items.asin
+            GROUP BY inventory_items.asin
             """,
-            (asin_store_ids, asin_values),
+            (sorted({effective_asin for _store_id, _asin, effective_asin in page_asins if effective_asin}),),
         ).fetchall())
         inventory_by_key = {
-            (int(row["store_id"]), clean_text(row["asin"])): float(row["inventory_quantity"] or 0)
+            clean_text(row["asin"]): float(row["inventory_quantity"] or 0)
             for row in inventory_rows
         }
         for row in rows:
             key = (int(row.get("store_id") or 0), clean_text(row.get("asin")))
             row["duplicate_asin_count"] = duplicate_by_key.get(key, 0)
-            row["inventory_quantity"] = inventory_by_key.get(key, 0)
+            row["inventory_quantity"] = inventory_by_key.get(effective_inventory_asin(row), 0)
 
     order_keys = sorted({
         (int(row.get("store_id") or 0), int(row.get("odoo_order_id") or 0))
@@ -24616,12 +24631,13 @@ def hydrate_order_line_rows(
     include_shopify: bool = True,
 ) -> list[dict[str, Any]]:
     row_dicts = rows_to_dicts(rows)
-    for row in row_dicts:
-        row.setdefault("duplicate_asin_count", 0)
-        row.setdefault("inventory_quantity", 0)
-        row.setdefault("odoo_order_distinct_asin_count", 0)
     if conn is not None and include_metrics:
         enrich_order_line_page_metrics(conn, row_dicts)
+    else:
+        for row in row_dicts:
+            row.setdefault("duplicate_asin_count", 0)
+            row.setdefault("inventory_quantity", 0)
+            row.setdefault("odoo_order_distinct_asin_count", 0)
     if stores is None and conn is not None:
         try:
             stores = rows_to_dicts(conn.execute("SELECT * FROM stores ORDER BY name").fetchall())
@@ -24669,8 +24685,7 @@ def order_line_search_select_sql(where_sql: str) -> str:
                COALESCE((
                    SELECT SUM(quantity)
                    FROM inventory_items
-                   WHERE inventory_items.store_id = order_lines.store_id
-                     AND inventory_items.asin = order_lines.asin
+                   WHERE inventory_items.asin = COALESCE(NULLIF(order_lines.replacement_asin, ''), order_lines.asin)
                      AND inventory_items.status = 'available'
                ), 0) AS inventory_quantity,
                COALESCE((
@@ -25887,7 +25902,7 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             row = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inserted["id"],)).fetchone()
     if row:
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(row) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
-    fast_page_cache_clear_matching({"inventory-v2"})
+    fast_page_cache_clear_matching({"inventory-v2", "orders", "dashboard"})
     item_label = f"ASIN {asin}" if asin else product_name
     return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {item_label}.", **refresh_inventory_response(store_id, 1, 100)}
 
@@ -25928,7 +25943,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             candidate_clauses.append("UPPER(odoo_order_name)=UPPER(?)")
             candidate_params.append(order_ref)
         if inventory_asin:
-            candidate_clauses.append("asin=?")
+            candidate_clauses.append("COALESCE(NULLIF(replacement_asin, ''), asin)=?")
             candidate_params.append(inventory_asin)
         candidates = conn.execute(
             f"""
@@ -25945,7 +25960,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             asin_detail = f" with ASIN {inventory_asin}" if inventory_asin else ""
             raise HTTPException(404, f"No open order line{asin_detail} found for {target}.")
         line = candidates[0]
-        asin = normalize_asin(line["asin"])
+        asin = effective_inventory_asin(line)
         quantity_needed = float(line["quantity"] or 1)
         quantity_available = float(item["quantity"] or 0)
         already_allocated = max(0.0, float(line.get("inventory_allocated_quantity") or 0))
@@ -26140,6 +26155,7 @@ def api_confirm_inventory_sent(inventory_id: int, payload: Optional[dict[str, An
             queued = enqueue_shopify_fulfilment_for_rows([dict(updated_line)])
             if queued:
                 start_shopify_fulfilment_worker()
+    fast_page_cache_clear_matching({"inventory-v2", "orders", "dashboard"})
     return {"ok": True, "message": f"Marked inventory sent for {line['odoo_order_name']}.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
 
 

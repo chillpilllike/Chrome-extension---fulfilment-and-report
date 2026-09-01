@@ -4085,7 +4085,11 @@ async function handleProduct(activeJob) {
   await sleep(700);
   const productIdentity = currentProductAsinEvidence();
   const asin = productIdentity.asin;
-  showPanel("Nutricity fulfilment", `Adding ${expectedItem.asin} for ${recipientName(activeJob)}.`, null, null);
+  const inventoryQuantity = Math.max(0, Number(item.inventory_quantity || 0));
+  const inventoryMessage = inventoryQuantity > 0
+    ? ` ${inventoryQuantity} unit(s) were already allocated from inventory; Amazon is only ordering the remaining ${Number(item.quantity || 0)}.`
+    : "";
+  showPanel("Nutricity fulfilment", `Adding ${expectedItem.asin} for ${recipientName(activeJob)}.${inventoryMessage}`, null, null);
   if (!asin) {
     await failCurrentJobAsChromeError(
       activeJob,

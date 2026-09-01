@@ -23,7 +23,28 @@ class InventoryAllocationLogicTests(unittest.TestCase):
         items = aggregate_items_by_asin([line])
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["quantity"], 1)
+        self.assertEqual(items[0]["requested_quantity"], 3)
+        self.assertEqual(items[0]["inventory_quantity"], 2)
         self.assertEqual(items[0]["store_total_price"], 10)
+
+    def test_replacement_asin_is_the_inventory_and_amazon_purchase_key(self) -> None:
+        line = {
+            "id": 93,
+            "asin": "B000000001",
+            "replacement_asin": "B000000002",
+            "original_asin": "B000000001",
+            "quantity": 2,
+            "inventory_allocated_quantity": 1,
+            "store_total_price": 20,
+            "store_unit_price": 10,
+            "supplier_part_auxiliary_id": "",
+            "product_name": "Replacement example",
+            "odoo_order_name": "NC25165",
+        }
+
+        items = aggregate_items_by_asin([line])
+        self.assertEqual(items[0]["asin"], "B000000002")
+        self.assertTrue(items[0]["uses_replacement_asin"])
 
     def test_full_inventory_removes_item_from_amazon_payload(self) -> None:
         line = {

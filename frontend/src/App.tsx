@@ -2871,6 +2871,14 @@ function isCostlyOrderLine(row: OrderLine) {
   return String(row.state || "").toLowerCase() === "costly" || String(row.amazon_status || "").toLowerCase() === "cost_review"
 }
 
+function inventoryAvailability(row: OrderLine) {
+  const requested = Math.max(0, Number(row.quantity || 0))
+  const allocated = Math.min(requested, Math.max(0, Number(row.inventory_allocated_quantity || 0)))
+  const available = Math.max(0, Number(row.inventory_quantity || 0))
+  const remaining = Math.max(0, requested - allocated)
+  return { requested, allocated, available, remaining, fullyAllocated: requested > 0 && allocated >= requested }
+}
+
 function ErrorTooltip({ value, className = "" }: { value?: string; className?: string }) {
   const text = String(value || "").trim()
   if (!text) return null
@@ -4423,7 +4431,7 @@ function App() {
     try {
       const result = await api<{ items: InventoryItem[] }>("/api/inventory?page=1&per_page=100")
       const requiredQuantity = Math.max(0, Number(line.quantity || 0) - Number(line.inventory_allocated_quantity || 0))
-      const lineAsin = String(line.asin || "").trim().toUpperCase()
+      const lineAsin = String(line.replacement_asin || line.asin || "").trim().toUpperCase()
       const available = (result.items || []).filter((item) => {
         const itemAsin = String(item.asin || "").trim().toUpperCase()
         return item.status === "available"
@@ -4839,7 +4847,22 @@ function App() {
       case "odoo_status":
         return <StatusBadge value={row.odoo_status_label} />
       case "inventory":
-        return Number(row.inventory_quantity || 0) > 0 ? <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">use inventory: {row.inventory_quantity}</Badge> : ""
+      {
+        const inventory = inventoryAvailability(row)
+        if (inventory.fullyAllocated) {
+          return <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">Fulfilled from inventory: {inventory.allocated}/{inventory.requested}</Badge>
+        }
+        if (inventory.allocated > 0) {
+          return <Badge className="bg-amber-500 text-amber-950 hover:bg-amber-500">Allocated {inventory.allocated}/{inventory.requested} · {inventory.available} available</Badge>
+        }
+        if (inventory.available >= inventory.remaining && inventory.remaining > 0) {
+          return <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">Inventory ready: {inventory.available} available</Badge>
+        }
+        if (inventory.available > 0) {
+          return <Badge className="bg-amber-500 text-amber-950 hover:bg-amber-500">Partial inventory: {inventory.available}/{inventory.remaining}</Badge>
+        }
+        return ""
+      }
       case "state":
         return <StatusBadge value={row.state} />
       case "engine":
@@ -5816,9 +5839,16 @@ function App() {
                             ? "order-row-missing"
                             : rowHasVisibleOrderGroup(row) || Number(row.odoo_order_distinct_asin_count || 0) > 1
                               ? "bg-parrot-green-lt"
-                              : isAmazonDeliveredLine(row)
+                            : isAmazonDeliveredLine(row)
                               ? ""
                               : "",
+                            (() => {
+                              const inventory = inventoryAvailability(row)
+                              if (inventory.fullyAllocated) return "border-l-4 border-l-emerald-600 bg-emerald-50/70"
+                              if (inventory.available >= inventory.remaining && inventory.remaining > 0) return "border-l-4 border-l-emerald-500 bg-emerald-50/70"
+                              if (inventory.available > 0 || inventory.allocated > 0) return "border-l-4 border-l-amber-500 bg-amber-50/70"
+                              return ""
+                            })(),
                           ].filter(Boolean).join(" ")
                         }
                       >
