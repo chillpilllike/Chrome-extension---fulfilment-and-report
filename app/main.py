@@ -25830,15 +25830,15 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 matched_line = candidates[0]
             else:
                 raise HTTPException(400, "Enter ASIN too because the Odoo/Amazon reference has multiple items.")
-    if not asin:
-        raise HTTPException(400, "ASIN is required.")
     quantity = float(payload.get("quantity") or 0)
     if not quantity and matched_line:
         quantity = float(matched_line.get("quantity") or 0)
     if quantity <= 0:
         raise HTTPException(400, "Quantity must be greater than zero.")
-    page_image_url = amazon_product_page_image_url(asin)
     product_name = clean_text(payload.get("product_name")) or (clean_text(matched_line.get("product_name")) if matched_line else "")
+    if not product_name:
+        raise HTTPException(400, "Title is required.")
+    page_image_url = amazon_product_page_image_url(asin) if asin else ""
     notes = clean_text(payload.get("notes"))
     amazon_order_url = clean_text(payload.get("amazon_order_url")) or (clean_text(matched_line.get("amazon_order_url")) if matched_line else "") or (order_line_amazon_url(amazon_order_id) if amazon_order_id else "")
     amazon_account_name = clean_text(payload.get("amazon_account_name")) or (clean_text(matched_line.get("amazon_account_name")) if matched_line else "")
@@ -25882,52 +25882,79 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             row = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inserted["id"],)).fetchone()
     if row:
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(row) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
-    return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {asin}.", **refresh_inventory_response(store_id, 1, 100)}
+    fast_page_cache_clear_matching({"inventory-v2"})
+    item_label = f"ASIN {asin}" if asin else product_name
+    return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {item_label}.", **refresh_inventory_response(store_id, 1, 100)}
 
 
 @app.post("/api/inventory/{inventory_id}/attach")
 def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     order_ref = clean_text(payload.get("order_ref") or payload.get("odoo_order_name"))
-    if not order_ref:
-        raise HTTPException(400, "Enter the new Odoo order name to attach this inventory item.")
+    line_id = int(payload.get("line_id") or 0)
+    if not order_ref and not line_id:
+        raise HTTPException(400, "Select an order line or enter the Odoo order name for this inventory item.")
+    if payload.get("expiry_confirmed") is not True:
+        raise HTTPException(400, "Check the expiry date and confirm the inventory item is not expired.")
     with db() as conn:
         item = conn.execute("SELECT * FROM inventory_items WHERE id=? FOR UPDATE", (inventory_id,)).fetchone()
         if not item:
             raise HTTPException(404, "Inventory item not found.")
-        if clean_text(item["status"]) == "used":
+        item_status = clean_text(item["status"])
+        if item_status == "used":
             raise HTTPException(400, "This inventory item has already been used.")
-        if clean_text(item["status"]) == "reserved":
+        if item_status == "reserved":
             raise HTTPException(400, "This inventory item is already attached to an order.")
-        asin = normalize_asin(item["asin"])
+        if item_status != "available":
+            raise HTTPException(400, "This inventory item is not available for fulfilment yet.")
+        inventory_asin = normalize_asin(item["asin"])
+        candidate_clauses = [
+            "store_id=?",
+            "state NOT IN ('ordered', 'dispatched', 'delivered', 'inventory', 'ignored')",
+            "COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')",
+        ]
+        candidate_params: list[Any] = [item["store_id"]]
+        if line_id:
+            candidate_clauses.append("id=?")
+            candidate_params.append(line_id)
+        else:
+            candidate_clauses.append("UPPER(odoo_order_name)=UPPER(?)")
+            candidate_params.append(order_ref)
+        if inventory_asin:
+            candidate_clauses.append("asin=?")
+            candidate_params.append(inventory_asin)
         candidates = conn.execute(
-            """
+            f"""
             SELECT *
             FROM order_lines
-            WHERE store_id=?
-              AND UPPER(odoo_order_name)=UPPER(?)
-              AND asin=?
-              AND state NOT IN ('ordered', 'dispatched', 'delivered', 'inventory', 'ignored')
-              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            WHERE {' AND '.join(candidate_clauses)}
             ORDER BY id ASC
             FOR UPDATE
             """,
-            (item["store_id"], order_ref, asin),
+            candidate_params,
         ).fetchall()
         if not candidates:
-            raise HTTPException(404, f"No open order line with ASIN {asin} found for {order_ref}.")
+            target = f"line {line_id}" if line_id else order_ref
+            asin_detail = f" with ASIN {inventory_asin}" if inventory_asin else ""
+            raise HTTPException(404, f"No open order line{asin_detail} found for {target}.")
         line = candidates[0]
+        asin = normalize_asin(line["asin"])
         quantity_needed = float(line["quantity"] or 1)
         quantity_available = float(item["quantity"] or 0)
         already_allocated = max(0.0, float(line.get("inventory_allocated_quantity") or 0))
         quantity_remaining = max(0.0, quantity_needed - already_allocated)
         reserved_quantity = min(quantity_available, quantity_remaining)
         if reserved_quantity <= 0:
-            raise HTTPException(400, f"{order_ref} already has its required inventory quantity allocated.")
+            raise HTTPException(400, f"{line['odoo_order_name']} already has its required inventory quantity allocated.")
+        if line_id and reserved_quantity < quantity_remaining:
+            raise HTTPException(
+                400,
+                f"This inventory row has only {quantity_available:g} available; {quantity_remaining:g} is required to fulfil the selected line.",
+            )
         allocated_quantity = already_allocated + reserved_quantity
         amazon_quantity = max(0.0, quantity_needed - allocated_quantity)
         inventory_only = amazon_quantity <= 0
         note = (
-            f"Attached inventory item #{inventory_id} to {line['odoo_order_name']}: "
+            f"Fulfilled from inventory item #{inventory_id}: expiry date checked and item confirmed not expired; "
             f"qty {reserved_quantity:g} allocated; total local qty {allocated_quantity:g} of {quantity_needed:g}; "
             f"Amazon remaining qty {amazon_quantity:g}. Manually verify dispatch, then confirm sent from Inventory."
         )
@@ -25944,7 +25971,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
              source_tracking_id, source_delivered_at, source_received_at, source_shopify_cancelled_at,
              source_odoo_status, source_inventory_item_id, status, source_type, notes, reserved_order_line_id,
              reserved_quantity, reserved_at, manual_reference, created_at, updated_at)
-            SELECT store_id, NULL, asin, ?, product_name, source_odoo_order_id, source_odoo_order_name,
+            SELECT store_id, NULL, ?, ?, product_name, source_odoo_order_id, source_odoo_order_name,
                    amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source,
                    source_tracking_id, source_delivered_at, source_received_at, source_shopify_cancelled_at,
                    source_odoo_status, id, 'reserved', source_type, ?, ?, ?, ?, ?, ?, ?
@@ -25952,6 +25979,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             RETURNING id
             """,
             (
+                asin,
                 reserved_quantity,
                 append_note(item["notes"], note),
                 line["id"],
@@ -26008,6 +26036,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             queued = enqueue_shopify_fulfilment_for_rows([dict(updated_line)])
             if queued:
                 start_shopify_fulfilment_worker()
+    fast_page_cache_clear_matching({"inventory-v2", "orders", "dashboard"})
     return {
         "ok": True,
         "message": (

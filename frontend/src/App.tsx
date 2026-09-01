@@ -3480,6 +3480,11 @@ function App() {
   const [editingSpaid, setEditingSpaid] = useState<OrderLine | null>(null)
   const [editingReplacement, setEditingReplacement] = useState<OrderLine | null>(null)
   const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
+  const [inventoryFulfilmentOpen, setInventoryFulfilmentOpen] = useState(false)
+  const [inventoryFulfilmentItems, setInventoryFulfilmentItems] = useState<InventoryItem[]>([])
+  const [selectedInventoryId, setSelectedInventoryId] = useState<number | null>(null)
+  const [inventoryExpiryConfirmed, setInventoryExpiryConfirmed] = useState(false)
+  const [inventoryFulfilmentLoading, setInventoryFulfilmentLoading] = useState(false)
   const [resetFulfilmentConfirmOpen, setResetFulfilmentConfirmOpen] = useState(false)
   const [cancelOdooShopifyConfirmOpen, setCancelOdooShopifyConfirmOpen] = useState(false)
   const [placeRecentConfirmOpen, setPlaceRecentConfirmOpen] = useState(false)
@@ -4405,6 +4410,48 @@ function App() {
     return null
   }
 
+  async function openInventoryFulfilment() {
+    if (selectedRows.length !== 1) {
+      setModal({ ok: false, title: "Fulfill from Inventory", message: "Select exactly one order line." })
+      return
+    }
+    const line = selectedRows[0]
+    setInventoryFulfilmentOpen(true)
+    setInventoryFulfilmentLoading(true)
+    setInventoryExpiryConfirmed(false)
+    setSelectedInventoryId(null)
+    try {
+      const result = await api<{ items: InventoryItem[] }>(`/api/inventory?store_id=${line.store_id}&page=1&per_page=100`)
+      const requiredQuantity = Math.max(0, Number(line.quantity || 0) - Number(line.inventory_allocated_quantity || 0))
+      const lineAsin = String(line.asin || "").trim().toUpperCase()
+      const available = (result.items || []).filter((item) => {
+        const itemAsin = String(item.asin || "").trim().toUpperCase()
+        return item.status === "available"
+          && Number(item.quantity || 0) >= requiredQuantity
+          && (!itemAsin || itemAsin === lineAsin)
+      })
+      setInventoryFulfilmentItems(available)
+      if (available.length === 1) setSelectedInventoryId(available[0].id)
+    } catch (error) {
+      setInventoryFulfilmentOpen(false)
+      setModal({ ok: false, title: "Inventory Load Failed", message: String(error) })
+    } finally {
+      setInventoryFulfilmentLoading(false)
+    }
+  }
+
+  async function confirmInventoryFulfilment() {
+    const line = selectedRows.length === 1 ? selectedRows[0] : null
+    if (!line || !selectedInventoryId || !inventoryExpiryConfirmed) return
+    setInventoryFulfilmentOpen(false)
+    await runAction("Fulfill from Inventory", () =>
+      api<{ ok: boolean; message: string }>(`/api/inventory/${selectedInventoryId}/attach`, {
+        method: "POST",
+        body: JSON.stringify({ line_id: line.id, expiry_confirmed: true }),
+      }),
+    )
+  }
+
   function placeSelectedOrders() {
     if (!canRunSelectedPlaceAction) {
       setModal({ ok: false, title: "Place Selected", message: "Select at least one currently loaded order line." })
@@ -4961,6 +5008,65 @@ function App() {
           setSelected([])
         }}
       />
+      <Dialog open={inventoryFulfilmentOpen} onOpenChange={(open) => !open && setInventoryFulfilmentOpen(false)}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <PackageCheck className="size-5" />
+              Fulfill from Inventory
+            </DialogTitle>
+            <DialogDescription>
+              {selectedRows.length === 1
+                ? `${selectedRows[0].odoo_order_name} · ${selectedRows[0].product_name} · required qty ${Math.max(0, Number(selectedRows[0].quantity || 0) - Number(selectedRows[0].inventory_allocated_quantity || 0))}`
+                : "Choose an available inventory item for the selected order line."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid max-h-[45vh] gap-2 overflow-y-auto">
+            {inventoryFulfilmentLoading ? <p className="text-sm text-muted-foreground">Loading available inventory…</p> : null}
+            {!inventoryFulfilmentLoading && inventoryFulfilmentItems.map((item) => (
+              <label key={item.id} className={cn("flex cursor-pointer items-center gap-3 rounded-md border p-3", selectedInventoryId === item.id && "border-primary bg-primary/5")}>
+                <input
+                  type="radio"
+                  name="inventory-item"
+                  checked={selectedInventoryId === item.id}
+                  onChange={() => setSelectedInventoryId(item.id)}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium">{item.product_name || "Untitled inventory item"}</div>
+                  <div className="text-xs text-muted-foreground">
+                    Qty {Number(item.quantity).toLocaleString()} · {item.asin ? `ASIN ${item.asin}` : "No ASIN (will use the order ASIN)"} · Inventory #{item.id}
+                  </div>
+                </div>
+              </label>
+            ))}
+            {!inventoryFulfilmentLoading && !inventoryFulfilmentItems.length ? (
+              <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                No compatible inventory row has enough available quantity. Add stock on the Inventory page, then try again.
+              </div>
+            ) : null}
+          </div>
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 size-5 shrink-0" />
+              <div>
+                <div className="font-semibold">Expiry warning</div>
+                <p>Physically check the item’s expiry date. Do not fulfil the order if the item is expired.</p>
+              </div>
+            </div>
+            <label className="mt-3 flex cursor-pointer items-center gap-2 font-medium">
+              <Checkbox checked={inventoryExpiryConfirmed} onCheckedChange={(checked) => setInventoryExpiryConfirmed(Boolean(checked))} />
+              <span className="ml-2">I checked the expiry date and confirm this item is not expired.</span>
+            </label>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setInventoryFulfilmentOpen(false)}>Cancel</Button>
+            <Button disabled={!selectedInventoryId || !inventoryExpiryConfirmed || inventoryFulfilmentLoading || Boolean(busy)} onClick={confirmInventoryFulfilment}>
+              <CheckCircle2 className="size-4" />
+              Confirm Inventory Fulfilment
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={placeRecentConfirmOpen} onOpenChange={(open) => !open && setPlaceRecentConfirmOpen(false)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
@@ -5473,6 +5579,14 @@ function App() {
                     </Button>
                     <Button
                       variant="outline"
+                      disabled={!canRunSelectedStoreAction || selected.length !== 1 || Boolean(busy)}
+                      onClick={openInventoryFulfilment}
+                    >
+                      <PackageCheck className="size-4" />
+                      Fulfill from Inventory
+                    </Button>
+                    <Button
+                      variant="outline"
                       disabled={!canRunSelectedStoreAction || Boolean(busy)}
                       onClick={pushSelectedToShopify}
                     >
@@ -5955,6 +6069,7 @@ function App() {
           <InventoryPage
             rows={inventory}
             storeId={storeId}
+            stores={stores}
             page={inventoryPage}
             total={inventoryTotal}
             onPage={setInventoryPage}
@@ -12182,6 +12297,7 @@ function DuplicateTrackingPage({
 function InventoryPage({
   rows,
   storeId,
+  stores,
   page,
   total,
   onPage,
@@ -12190,6 +12306,7 @@ function InventoryPage({
 }: {
   rows: InventoryItem[]
   storeId: string
+  stores: Store[]
   page: number
   total: number
   onPage: (page: number) => void
@@ -12197,12 +12314,18 @@ function InventoryPage({
   onResult: (modal: ModalState) => void
 }) {
   const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
+  const [manualStoreId, setManualStoreId] = useState(storeId || "")
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string; asin?: string } | null>(null)
+  useEffect(() => {
+    if (storeId) setManualStoreId(storeId)
+    else if (!manualStoreId && stores.length === 1) setManualStoreId(String(stores[0].id))
+  }, [storeId, stores, manualStoreId])
+
   async function addManualInventory() {
     try {
       const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>("/api/inventory", {
         method: "POST",
-        body: JSON.stringify({ ...form, store_id: Number(storeId), quantity: Number(form.quantity || 1) }),
+        body: JSON.stringify({ ...form, store_id: Number(manualStoreId), quantity: Number(form.quantity || 0) }),
       })
       setForm({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
       onPage(1)
@@ -12214,12 +12337,13 @@ function InventoryPage({
   }
 
   async function attachInventory(item: InventoryItem) {
-    const orderRef = window.prompt(`Attach ${item.asin} inventory to which new Odoo order? Enter order name, e.g. NC12345.`)
+    const orderRef = window.prompt(`Attach ${item.product_name || item.asin || `inventory #${item.id}`} to which new Odoo order? Enter order name, e.g. NC12345.`)
     if (!orderRef?.trim()) return
+    if (!window.confirm("Expiry warning: physically check the item. Confirm its expiry date has been checked and the item is not expired.")) return
     try {
       const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${item.id}/attach`, {
         method: "POST",
-        body: JSON.stringify({ order_ref: orderRef.trim() }),
+        body: JSON.stringify({ order_ref: orderRef.trim(), expiry_confirmed: true }),
       })
       onPage(1)
       onRows(result.items || [], result.total || 0)
@@ -12250,35 +12374,31 @@ function InventoryPage({
       <Card>
         <CardHeader>
           <CardTitle>Inventory</CardTitle>
-          <CardDescription>Reusable stock is released only after Amazon delivery, warehouse receipt, Shopify cancellation, and Odoo cancellation/refund are all confirmed. Manual stock uses the same ASIN and quantity allocation rules.</CardDescription>
+          <CardDescription>Reusable stock is released only after Amazon delivery, warehouse receipt, Shopify cancellation, and Odoo cancellation/refund are all confirmed. For manual stock, enter a title and quantity; ASIN is optional.</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1fr_120px_1.2fr_1fr_1fr_1.2fr_auto]">
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1fr_1.5fr_120px_1fr_1.2fr_auto]">
+          <SelectField label="Store" value={manualStoreId} onChange={setManualStoreId}>
+            <option value="">Select store</option>
+            {stores.map((store) => <option key={store.id} value={store.id}>{store.name}</option>)}
+          </SelectField>
           <div className="grid gap-1.5">
-            <Label>ASIN</Label>
-            <Input value={form.asin} onChange={(event) => setForm({ ...form, asin: event.target.value.toUpperCase() })} />
+            <Label>Title <span className="text-destructive">*</span></Label>
+            <Input value={form.product_name} onChange={(event) => setForm({ ...form, product_name: event.target.value })} placeholder="Product name" />
           </div>
           <div className="grid gap-1.5">
-            <Label>Qty</Label>
+            <Label>Quantity <span className="text-destructive">*</span></Label>
             <Input type="number" min={1} value={form.quantity} onChange={(event) => setForm({ ...form, quantity: event.target.value })} />
           </div>
           <div className="grid gap-1.5">
-            <Label>Product</Label>
-            <Input value={form.product_name} onChange={(event) => setForm({ ...form, product_name: event.target.value })} />
-          </div>
-          <div className="grid gap-1.5">
-            <Label>Odoo Ref</Label>
-            <Input value={form.odoo_order_name} onChange={(event) => setForm({ ...form, odoo_order_name: event.target.value })} />
-          </div>
-          <div className="grid gap-1.5">
-            <Label>Amazon Order</Label>
-            <Input value={form.amazon_order_id} onChange={(event) => setForm({ ...form, amazon_order_id: event.target.value })} />
+            <Label>ASIN <span className="text-xs text-muted-foreground">(optional)</span></Label>
+            <Input value={form.asin} onChange={(event) => setForm({ ...form, asin: event.target.value.toUpperCase() })} placeholder="B0…" />
           </div>
           <div className="grid gap-1.5">
             <Label>Notes</Label>
             <Input value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} />
           </div>
           <div className="flex items-end">
-            <Button disabled={!storeId || (!form.asin.trim() && !form.odoo_order_name.trim() && !form.amazon_order_id.trim())} onClick={addManualInventory}>
+            <Button disabled={!manualStoreId || !form.product_name.trim() || Number(form.quantity || 0) <= 0} onClick={addManualInventory}>
               <Plus className="size-4" />
               Add
             </Button>
@@ -12290,7 +12410,7 @@ function InventoryPage({
         <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <CardTitle>Inventory Items</CardTitle>
-            <CardDescription>Showing max 100 rows per page. Available rows can be reserved against future Odoo orders with matching ASIN and quantity.</CardDescription>
+            <CardDescription>Showing max 100 rows per page. Available rows can fulfil a selected order when quantity is sufficient; rows with an ASIN must match the order ASIN.</CardDescription>
           </div>
           <PaginationControls page={page} total={total} onPage={onPage} />
         </CardHeader>
@@ -12335,7 +12455,9 @@ function InventoryPage({
                     )}
                   </TableCell>
                   <TableCell>
-                    <a className="font-mono text-primary underline-offset-4 hover:underline" href={item.asin_url || `https://www.amazon.com/dp/${item.asin}`} target="_blank">{item.asin}</a>
+                    {item.asin ? (
+                      <a className="font-mono text-primary underline-offset-4 hover:underline" href={item.asin_url || `https://www.amazon.com/dp/${item.asin}`} target="_blank">{item.asin}</a>
+                    ) : <span className="text-muted-foreground">Not set</span>}
                     {item.image_source ? <div className="text-[11px] text-muted-foreground">{item.image_source === "amazon_page" ? "Amazon page image" : "Captured thumbnail"}</div> : null}
                   </TableCell>
                   <TableCell>{item.quantity}</TableCell>
