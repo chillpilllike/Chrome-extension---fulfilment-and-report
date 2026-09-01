@@ -30747,11 +30747,106 @@ def queued_chrome_order_by_name(order_name: str) -> Optional[dict[str, Any]]:
     return chrome_job_from_rows(group_rows) if group_rows else None
 
 
+def active_replacement_rows_by_order_name(order_name: str) -> list[dict[str, Any]]:
+    """Return every line in the newest active replacement run for an order."""
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """
+            SELECT *
+            FROM order_lines
+            WHERE UPPER(odoo_order_name)=?
+              AND COALESCE(replacement_run_id, '')!=''
+              AND COALESCE(amazon_order_id, '')=''
+              AND state NOT IN ('ordered', 'delivered', 'dispatched', 'inventory', 'ignored')
+            ORDER BY replacement_sequence DESC, updated_at DESC, id ASC
+            """,
+            (order_name,),
+        ).fetchall())
+    if not rows:
+        return []
+    newest_run_id = clean_text(rows[0].get("replacement_run_id"))
+    return [row for row in rows if clean_text(row.get("replacement_run_id")) == newest_run_id]
+
+
+def queue_active_replacement_by_order_name(order_name: str, replacement_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Queue a linked replacement without re-importing its fulfilled original."""
+    identities = {
+        (int(row.get("store_id") or 0), int(row.get("odoo_order_id") or 0))
+        for row in replacement_rows
+    }
+    if len(identities) != 1:
+        raise HTTPException(409, f"{order_name} has an ambiguous active replacement. Select its R1/R2 lines from the app instead.")
+    store_id, _odoo_order_id = next(iter(identities))
+    replacement_run_id = clean_text(replacement_rows[0].get("replacement_run_id"))
+    replacement_sequence = int(replacement_rows[0].get("replacement_sequence") or 1)
+
+    existing_job = queued_chrome_order_by_name(order_name)
+    if existing_job and clean_text(existing_job.get("replacement_run_id")) == replacement_run_id:
+        return {
+            "ok": True,
+            "already_queued": True,
+            "queued": 0,
+            "order_name": order_name,
+            "group_key": existing_job["group_key"],
+            "preferred_group_key": existing_job["group_key"],
+            "replacement_run_id": replacement_run_id,
+            "replacement_sequence": replacement_sequence,
+            "job": existing_job,
+            "message": f"Replacement R{replacement_sequence} for {order_name} is already queued and will be processed first.",
+        }
+
+    account_id = parse_optional_int(replacement_rows[0].get("amazon_account_id"))
+    queued, _cleared, blocked, account, details = queue_chrome_order_groups_fast(
+        store_id,
+        amazon_account_id=account_id,
+        line_ids=[int(row["id"]) for row in replacement_rows],
+    )
+    job = queued_chrome_order_by_name(order_name)
+    if not queued or not job or clean_text(job.get("replacement_run_id")) != replacement_run_id:
+        reason = " | ".join(details[:4]) if details else "The replacement failed its live Odoo or Chrome readiness check."
+        return {
+            "ok": False,
+            "queued": 0,
+            "blocked": blocked,
+            "order_name": order_name,
+            "replacement_run_id": replacement_run_id,
+            "replacement_sequence": replacement_sequence,
+            "message": f"Replacement R{replacement_sequence} for {order_name} was found but not queued. {reason}",
+        }
+
+    asin_count = len(job.get("items") or [])
+    return {
+        "ok": True,
+        "already_queued": False,
+        "queued": queued,
+        "pulled": 0,
+        "blocked": blocked,
+        "order_name": order_name,
+        "group_key": job["group_key"],
+        "preferred_group_key": job["group_key"],
+        "replacement_run_id": replacement_run_id,
+        "replacement_sequence": replacement_sequence,
+        "amazon_account_name": clean_text(account.get("name")),
+        "job": job,
+        "message": (
+            f"Replacement R{replacement_sequence} for {order_name} was queued with {asin_count} "
+            f"ASIN{'s' if asin_count != 1 else ''}. The fulfilled original was not re-imported."
+        ),
+    }
+
+
 def queue_one_chrome_order_by_name(order_name: str) -> dict[str, Any]:
     """Pull one Odoo order and enqueue all of its eligible ASIN lines atomically."""
     order_name = clean_text(order_name).upper()
     if not ORDER_REF_RE.fullmatch(order_name):
         raise HTTPException(400, "Enter one valid Odoo order number, for example ES00259.")
+
+    # A replacement is a separate fulfilment attempt linked to the original
+    # Odoo order. It must be treated like a normal Chrome job, but queue only
+    # the newest active R1/R2 run and never refresh the fulfilled original.
+    replacement_rows = active_replacement_rows_by_order_name(order_name)
+    if replacement_rows:
+        return queue_active_replacement_by_order_name(order_name, replacement_rows)
 
     # Never refresh a live queue entry from Odoo. The regular Odoo upsert may
     # update line state, so pulling here could otherwise disturb an active or

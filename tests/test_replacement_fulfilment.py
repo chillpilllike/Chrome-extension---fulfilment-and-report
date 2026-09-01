@@ -136,6 +136,63 @@ class ReplacementFulfilmentTests(unittest.TestCase):
         self.assertEqual(job["original_order_name"], "ES00378")
         self.assertEqual(job["recipient_name"], "Nutricity ES00378 R1")
 
+    def test_exact_order_insert_prioritizes_active_replacement_without_odoo_import(self) -> None:
+        replacement = {
+            "id": 3479666,
+            "store_id": 3,
+            "odoo_order_id": 1255,
+            "odoo_order_name": "ES00378",
+            "replacement_run_id": "replacement-3-1255-r1-token",
+            "replacement_sequence": 1,
+            "amazon_account_id": 1,
+        }
+        job = {
+            "group_key": "chrome-3-replacement-3-1255-r1-token-job",
+            "replacement_run_id": replacement["replacement_run_id"],
+            "items": [{"asin": "B098PTNRYX", "quantity": 2}],
+        }
+
+        with (
+            patch.object(main, "active_replacement_rows_by_order_name", return_value=[replacement]),
+            patch.object(main, "queue_chrome_order_groups_fast", return_value=(1, 0, 0, {"name": "Default Amazon Business"}, [])) as queue,
+            patch.object(main, "queued_chrome_order_by_name", side_effect=[None, job]),
+            patch.object(main, "fetch_odoo_orders_by_names_exclusive") as odoo_import,
+        ):
+            result = main.queue_one_chrome_order_by_name("ES00378")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["replacement_sequence"], 1)
+        self.assertEqual(result["preferred_group_key"], job["group_key"])
+        self.assertIn("fulfilled original was not re-imported", result["message"])
+        self.assertEqual(queue.call_args.kwargs["line_ids"], [3479666])
+        self.assertEqual(queue.call_args.kwargs["amazon_account_id"], 1)
+        odoo_import.assert_not_called()
+
+    def test_exact_order_insert_returns_already_queued_replacement(self) -> None:
+        replacement = {
+            "id": 3479666,
+            "store_id": 3,
+            "odoo_order_id": 1255,
+            "replacement_run_id": "replacement-3-1255-r1-token",
+            "replacement_sequence": 1,
+        }
+        job = {
+            "group_key": "chrome-3-replacement-3-1255-r1-token-job",
+            "replacement_run_id": replacement["replacement_run_id"],
+            "items": [{"asin": "B098PTNRYX", "quantity": 2}],
+        }
+
+        with (
+            patch.object(main, "active_replacement_rows_by_order_name", return_value=[replacement]),
+            patch.object(main, "queued_chrome_order_by_name", return_value=job),
+            patch.object(main, "queue_chrome_order_groups_fast") as queue,
+        ):
+            result = main.queue_one_chrome_order_by_name("ES00378")
+
+        self.assertTrue(result["already_queued"])
+        self.assertEqual(result["preferred_group_key"], job["group_key"])
+        queue.assert_not_called()
+
     def test_replacement_bypasses_only_scoped_guards(self) -> None:
         date_guard = inspect.getsource(main.block_lines_before_min_odoo_order_date)
         shopify_guard = inspect.getsource(main.block_lines_with_fulfilled_shopify_orders)
