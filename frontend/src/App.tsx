@@ -2716,8 +2716,11 @@ function StatusBadge({ value }: { value?: string }) {
   if (["ordered", "dispatched", "delivered"].includes(status)) {
     return <Badge variant="secondary">{status}</Badge>
   }
-  if (["available", "reserved", "inventory"].includes(status)) {
-    return <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">{status}</Badge>
+  if (["available", "inventory"].includes(status)) {
+    return <Badge className="inventory-availability-badge inventory-availability-badge-ready">{status}</Badge>
+  }
+  if (status === "reserved") {
+    return <Badge className="inventory-availability-badge inventory-availability-badge-partial">reserved</Badge>
   }
   if (status === "submitted") {
     return <Badge variant="outline">submitted</Badge>
@@ -2731,13 +2734,13 @@ function StatusBadge({ value }: { value?: string }) {
 function InventoryStatusBadge({ value }: { value?: string }) {
   const status = String(value || "available").trim().toLowerCase()
   if (status === "available") {
-    return <Badge className="border border-emerald-700 bg-emerald-600 text-white shadow-sm hover:bg-emerald-600">available</Badge>
+    return <Badge className="inventory-availability-badge inventory-availability-badge-ready shadow-sm">available</Badge>
   }
   if (status === "reserved") {
-    return <Badge className="border border-amber-700 bg-amber-500 text-amber-950 shadow-sm hover:bg-amber-500">reserved</Badge>
+    return <Badge className="inventory-availability-badge inventory-availability-badge-partial shadow-sm">reserved</Badge>
   }
   if (status === "used") {
-    return <Badge className="border border-slate-500 bg-slate-200 text-slate-900 shadow-sm hover:bg-slate-200">used</Badge>
+    return <Badge className="inventory-availability-badge inventory-availability-badge-used shadow-sm">used</Badge>
   }
   return <Badge variant="outline" className="border-slate-500 bg-white text-slate-900">{status}</Badge>
 }
@@ -4850,7 +4853,7 @@ function App() {
       {
         const inventory = inventoryAvailability(row)
         if (inventory.fullyAllocated) {
-          return <Badge className="inventory-availability-badge inventory-availability-badge-ready">Fulfilled from inventory: {inventory.allocated}/{inventory.requested}</Badge>
+          return <Badge className="inventory-availability-badge inventory-availability-badge-ready" title={`Fulfilled from inventory: ${inventory.allocated}/${inventory.requested}`}>Fulfilled {inventory.allocated}/{inventory.requested}</Badge>
         }
         if (inventory.allocated > 0) {
           return <Badge className="inventory-availability-badge inventory-availability-badge-partial">Allocated {inventory.allocated}/{inventory.requested} · {inventory.available} available</Badge>

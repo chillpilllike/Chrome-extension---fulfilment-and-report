@@ -1214,6 +1214,12 @@ body,
     color: #451a03 !important;
 }
 
+.tabler-admin-shell .inventory-availability-badge-used {
+    border-color: #64748b !important;
+    background: #e2e8f0 !important;
+    color: #0f172a !important;
+}
+
 .tabler-admin-shell .bg-primary { background: var(--tblr-primary); }
 .tabler-admin-shell .text-primary { color: var(--tblr-primary); }
 .tabler-admin-shell .text-primary-fg { color: #ffffff; }
