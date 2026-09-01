@@ -509,7 +509,10 @@ function activeJobOrderLabel(activeJob) {
   const names = Array.isArray(activeJob?.job?.order_names)
     ? activeJob.job.order_names.map((name) => String(name || "").trim()).filter(Boolean)
     : [];
-  if (names.length) return names.join(", ");
+  if (names.length) {
+    const replacementLabel = activeJob?.job?.is_replacement ? String(activeJob.job.replacement_label || "Replacement").trim() : "";
+    return [names.join(", "), replacementLabel].filter(Boolean).join(" · ");
+  }
   const recipient = String(activeJob?.job?.recipient_name || "").replace(/\s+/g, " ").trim();
   if (recipient) return recipient;
   return String(activeJob?.job?.group_key || "").replace(/\s+/g, " ").trim();
@@ -4089,7 +4092,10 @@ async function handleProduct(activeJob) {
   const inventoryMessage = inventoryQuantity > 0
     ? ` ${inventoryQuantity} unit(s) were already allocated from inventory; Amazon is only ordering the remaining ${Number(item.quantity || 0)}.`
     : "";
-  showPanel("Nutricity fulfilment", `Adding ${expectedItem.asin} for ${recipientName(activeJob)}.${inventoryMessage}`, null, null);
+  const replacementMessage = activeJob.job?.is_replacement
+    ? ` Processing ${activeJob.job.replacement_label || "replacement"} for ${activeJob.job.original_order_name || "the original Odoo order"}; reason: ${activeJob.job.replacement_reason || "replacement requested"}.`
+    : "";
+  showPanel(activeJob.job?.is_replacement ? "Nutricity replacement fulfilment" : "Nutricity fulfilment", `Adding ${expectedItem.asin} for ${recipientName(activeJob)}.${replacementMessage}${inventoryMessage}`, null, null);
   if (!asin) {
     await failCurrentJobAsChromeError(
       activeJob,

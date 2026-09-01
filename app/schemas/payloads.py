@@ -338,6 +338,16 @@ class ReplacementPayload(BaseModel):
     note: str = ""
 
 
+class ProcessReplacementPayload(BaseModel):
+    store_id: int
+    line_ids: list[int] = []
+    quantities: dict[int, float] = {}
+    reason: str = "lost"
+    note: str = ""
+    address_id: Optional[int] = None
+    amazon_account_id: Optional[int] = None
+
+
 class BulkPlacePayload(BaseModel):
     store_id: int
     line_ids: list[int]

@@ -204,6 +204,11 @@ type OrderLine = {
   replacement_product_name?: string
   replacement_note?: string
   replacement_assigned_at?: string
+  replacement_run_id?: string
+  replacement_sequence?: number
+  replacement_reason?: string
+  replacement_original_line_id?: number
+  replacement_original_amazon_order_id?: string
   cost_review_loss?: number
   cost_approved_at?: string
   asin_url?: string
@@ -3496,6 +3501,10 @@ function App() {
   const [selectedInventoryId, setSelectedInventoryId] = useState<number | null>(null)
   const [inventoryExpiryConfirmed, setInventoryExpiryConfirmed] = useState(false)
   const [inventoryFulfilmentLoading, setInventoryFulfilmentLoading] = useState(false)
+  const [processReplacementOpen, setProcessReplacementOpen] = useState(false)
+  const [processReplacementReason, setProcessReplacementReason] = useState("lost")
+  const [processReplacementNote, setProcessReplacementNote] = useState("")
+  const [processReplacementQuantities, setProcessReplacementQuantities] = useState<Record<number, number>>({})
   const [resetFulfilmentConfirmOpen, setResetFulfilmentConfirmOpen] = useState(false)
   const [cancelOdooShopifyConfirmOpen, setCancelOdooShopifyConfirmOpen] = useState(false)
   const [placeRecentConfirmOpen, setPlaceRecentConfirmOpen] = useState(false)
@@ -4463,6 +4472,52 @@ function App() {
     )
   }
 
+  function openProcessReplacement() {
+    const actionStoreId = selectedStoreIdForAction("Process Replacement")
+    if (!actionStoreId || !selectedRows.length) return
+    if (selectedRows.some((row) => Boolean(row.replacement_run_id))) {
+      setModal({ ok: false, title: "Process Replacement", message: "Select the original Odoo line, not an existing R1/R2 replacement line." })
+      return
+    }
+    const orderKeys = new Set(selectedRows.map((row) => `${row.store_id}:${row.odoo_order_id || row.odoo_order_name}`))
+    if (orderKeys.size !== 1) {
+      setModal({ ok: false, title: "Process Replacement", message: "Select lines from one Odoo order at a time." })
+      return
+    }
+    setProcessReplacementReason("lost")
+    setProcessReplacementNote("")
+    setProcessReplacementQuantities(Object.fromEntries(selectedRows.map((row) => [row.id, Number(row.quantity || 1)])))
+    setProcessReplacementOpen(true)
+  }
+
+  async function confirmProcessReplacement() {
+    const actionStoreId = selectedStoreIdForAction("Process Replacement")
+    if (!actionStoreId) return
+    const invalid = selectedRows.find((row) => {
+      const quantity = Number(processReplacementQuantities[row.id] || 0)
+      return quantity <= 0 || quantity > Number(row.quantity || 0)
+    })
+    if (invalid) {
+      setModal({ ok: false, title: "Process Replacement", message: `Enter a replacement quantity between 1 and ${Number(invalid.quantity || 0)} for ${invalid.product_name}.` })
+      return
+    }
+    setProcessReplacementOpen(false)
+    await runAction("Process Replacement", () =>
+      api<DashboardData>("/api/lines/process-replacement", {
+        method: "POST",
+        body: JSON.stringify({
+          store_id: actionStoreId,
+          line_ids: selectedRows.map((row) => row.id),
+          quantities: processReplacementQuantities,
+          reason: processReplacementReason,
+          note: processReplacementNote,
+          address_id: Number(addressId || 0) || null,
+          amazon_account_id: Number(amazonAccountId || 0) || null,
+        }),
+      }),
+    )
+  }
+
   function placeSelectedOrders() {
     if (!canRunSelectedPlaceAction) {
       setModal({ ok: false, title: "Place Selected", message: "Select at least one currently loaded order line." })
@@ -4774,7 +4829,16 @@ function App() {
       case "store":
         return row.store_name ? <Badge variant="outline">{row.store_name}</Badge> : <span className="text-muted-foreground">-</span>
       case "odoo_order":
-        return <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName={row.state === "missing" ? "text-destructive" : ""} />
+        return (
+          <div className="grid justify-items-start gap-1">
+            <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName={row.state === "missing" ? "text-destructive" : ""} />
+            {row.replacement_run_id ? (
+              <Badge className="inventory-availability-badge inventory-availability-badge-partial">
+                Replacement R{Number(row.replacement_sequence || 1)} · {row.replacement_reason || "replacement"}
+              </Badge>
+            ) : null}
+          </div>
+        )
       case "product":
         return (
           <Tooltip>
@@ -5089,6 +5153,60 @@ function App() {
             <Button disabled={!selectedInventoryId || !inventoryExpiryConfirmed || inventoryFulfilmentLoading || Boolean(busy)} onClick={confirmInventoryFulfilment}>
               <CheckCircle2 className="size-4" />
               Confirm Inventory Fulfilment
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={processReplacementOpen} onOpenChange={(open) => !open && setProcessReplacementOpen(false)}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <RefreshCw className="size-5" />
+              Process Replacement
+            </DialogTitle>
+            <DialogDescription>
+              Create a new Chrome replacement job linked to {selectedRows[0]?.odoo_order_name || "the original Odoo order"}. The original fulfilment history will remain unchanged.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid max-h-[48vh] gap-3 overflow-y-auto">
+            {selectedRows.map((row) => (
+              <div key={row.id} className="grid gap-2 rounded-md border p-3 sm:grid-cols-[minmax(0,1fr)_130px] sm:items-end">
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{row.product_name}</div>
+                  <div className="text-xs text-muted-foreground">ASIN {row.replacement_asin || row.asin} · original qty {Number(row.quantity).toLocaleString()}</div>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label>Replacement qty</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    max={Number(row.quantity || 1)}
+                    step="1"
+                    value={processReplacementQuantities[row.id] ?? Number(row.quantity || 1)}
+                    onChange={(event) => setProcessReplacementQuantities((current) => ({ ...current, [row.id]: Number(event.target.value) }))}
+                  />
+                </div>
+              </div>
+            ))}
+            <SelectField label="Reason" value={processReplacementReason} onChange={setProcessReplacementReason}>
+              <option value="lost">Lost shipment/item</option>
+              <option value="damaged">Damaged item</option>
+              <option value="wrong item">Wrong item received</option>
+              <option value="other">Other</option>
+            </SelectField>
+            <div className="grid gap-1.5">
+              <Label>Internal note (optional)</Label>
+              <Input value={processReplacementNote} onChange={(event) => setProcessReplacementNote(event.target.value)} placeholder="Reason details or approval reference" />
+            </div>
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
+              This creates a unique replacement job (R1, R2, …) and bypasses the already-fulfilled guard only for that job. It will not fulfil Shopify again.
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={Boolean(busy)} onClick={() => setProcessReplacementOpen(false)}>Cancel</Button>
+            <Button disabled={Boolean(busy) || !addressId || !amazonAccountId} onClick={confirmProcessReplacement}>
+              <ShoppingCart className="size-4" />
+              Create and Queue Replacement
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -5614,6 +5732,14 @@ function App() {
                     <Button
                       variant="outline"
                       disabled={!canRunSelectedStoreAction || Boolean(busy)}
+                      onClick={openProcessReplacement}
+                    >
+                      <RefreshCw className="size-4" />
+                      Process Replacement
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
                       onClick={pushSelectedToShopify}
                     >
                       <PackageCheck className="size-4" />
@@ -5916,6 +6042,10 @@ function App() {
 	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={() => setManualFulfilmentOpen(true)}>
                         <CheckCircle2 className="size-4" />
                         Manually Fulfilled
+                      </Button>
+	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={openProcessReplacement}>
+                        <RefreshCw className="size-4" />
+                        Process Replacement
                       </Button>
 	                      <Button disabled={!canRunSelectedPlaceAction || Boolean(busy)} onClick={clubPlaceSelectedOrders}>
                         Club Place

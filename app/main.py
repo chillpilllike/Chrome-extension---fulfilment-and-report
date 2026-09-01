@@ -88,6 +88,7 @@ from app.schemas import (
     PlacePayload,
     PullPayload,
     PunchoutReturnUrlPayload,
+    ProcessReplacementPayload,
     ReplacementPayload,
     ServiceSettingsPayload,
     ShopifyFulfilmentPushPayload,
@@ -665,6 +666,8 @@ def ensure_performance_indexes(conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_recover_submitted ON order_lines(chrome_claimed_by, amazon_status, store_id, odoo_order_date DESC, pulled_at DESC, created_at DESC, odoo_order_id DESC, id) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(amazon_group_key, '') != ''",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_group ON order_lines(amazon_group_key, id) WHERE order_engine='chrome'",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_chrome_expiry ON order_lines(chrome_claim_expires_at) WHERE order_engine='chrome' AND state='submitted' AND COALESCE(amazon_order_id, '') = '' AND COALESCE(chrome_claim_expires_at, '') != ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_replacement_run ON order_lines(replacement_run_id, replacement_sequence, id) WHERE COALESCE(replacement_run_id, '') != ''",
+        "CREATE INDEX IF NOT EXISTS idx_order_lines_replacement_original ON order_lines(replacement_original_line_id, replacement_sequence) WHERE replacement_original_line_id IS NOT NULL",
         # Reporting, accounting, and date windows.
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_date ON order_lines(store_id, odoo_order_date DESC, odoo_order_id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_bulk_duplicate_window ON order_lines(store_id, state, odoo_order_date DESC, asin, odoo_order_name) WHERE COALESCE(asin, '') != '' AND COALESCE(amazon_order_id, '') = ''",
@@ -1068,6 +1071,11 @@ def init_db() -> None:
                 replacement_product_name TEXT,
                 replacement_note TEXT,
                 replacement_assigned_at TEXT,
+                replacement_run_id TEXT,
+                replacement_sequence INTEGER,
+                replacement_reason TEXT,
+                replacement_original_line_id INTEGER,
+                replacement_original_amazon_order_id TEXT,
                 cost_approved_at TEXT,
                 cost_review_loss REAL,
                 raw_json TEXT,
@@ -1959,6 +1967,11 @@ def init_db() -> None:
             "replacement_product_name": "ALTER TABLE order_lines ADD COLUMN replacement_product_name TEXT",
             "replacement_note": "ALTER TABLE order_lines ADD COLUMN replacement_note TEXT",
             "replacement_assigned_at": "ALTER TABLE order_lines ADD COLUMN replacement_assigned_at TEXT",
+            "replacement_run_id": "ALTER TABLE order_lines ADD COLUMN replacement_run_id TEXT",
+            "replacement_sequence": "ALTER TABLE order_lines ADD COLUMN replacement_sequence INTEGER",
+            "replacement_reason": "ALTER TABLE order_lines ADD COLUMN replacement_reason TEXT",
+            "replacement_original_line_id": "ALTER TABLE order_lines ADD COLUMN replacement_original_line_id INTEGER",
+            "replacement_original_amazon_order_id": "ALTER TABLE order_lines ADD COLUMN replacement_original_amazon_order_id TEXT",
             "cost_approved_at": "ALTER TABLE order_lines ADD COLUMN cost_approved_at TEXT",
             "cost_review_loss": "ALTER TABLE order_lines ADD COLUMN cost_review_loss REAL",
         }.items():
@@ -8109,6 +8122,8 @@ ORDER_LINE_PAGE_SELECT = """
     amazon_cancelled_order_id, chrome_claimed_by, chrome_claimed_at, chrome_claim_expires_at,
     last_error, missing_asin, original_asin, replacement_asin, replacement_product_name,
     replacement_note, replacement_assigned_at, original_product_name, cost_approved_at, cost_review_loss,
+    replacement_run_id, replacement_sequence, replacement_reason, replacement_original_line_id,
+    replacement_original_amazon_order_id,
     source_line_count, pulled_at, ordered_at, created_at, updated_at,
     CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_code' ELSE '' END AS destination_country_code,
     CASE WHEN COALESCE(raw_json, '') ~ '^\\s*\\{' THEN raw_json::jsonb -> 'order' ->> 'destination_country_name' ELSE '' END AS destination_country_name
@@ -8129,6 +8144,8 @@ ORDER_LINE_PAGE_COLUMNS = (
     "amazon_cancelled_order_id", "chrome_claimed_by", "chrome_claimed_at", "chrome_claim_expires_at",
     "last_error", "missing_asin", "original_asin", "replacement_asin", "replacement_product_name",
     "replacement_note", "replacement_assigned_at", "original_product_name", "cost_approved_at", "cost_review_loss",
+    "replacement_run_id", "replacement_sequence", "replacement_reason", "replacement_original_line_id",
+    "replacement_original_amazon_order_id",
     "source_line_count", "pulled_at", "ordered_at", "created_at", "updated_at",
 )
 
@@ -12226,6 +12243,10 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
     has_replacement_asin = any(bool(item.get("uses_replacement_asin")) for item in items)
     group_key = str(group_rows[0]["amazon_group_key"])
     part_suffix = chrome_part_suffix(group_key)
+    replacement_sequence = int(group_rows[0].get("replacement_sequence") or 0)
+    is_replacement = bool(clean_text(group_rows[0].get("replacement_run_id") or ""))
+    replacement_label = f"R{replacement_sequence}" if is_replacement and replacement_sequence else ""
+    recipient_suffix = "-".join(value for value in (replacement_label, part_suffix) if value)
     amazon_statuses = [clean_text(row.get("amazon_status")) for row in group_rows if clean_text(row.get("amazon_status"))]
     amazon_status = (
         "order_submitted" if "order_submitted" in amazon_statuses else
@@ -12241,8 +12262,14 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
         "amazon_status": amazon_status,
         "submitted_to_amazon": amazon_status in {"order_submitted", "reporting_complete"},
         "order_names": order_names,
-        "recipient_name": chrome_recipient_name(order_names, part_suffix),
-        "recipient_suffix": part_suffix,
+        "recipient_name": chrome_recipient_name(order_names, recipient_suffix),
+        "recipient_suffix": recipient_suffix,
+        "is_replacement": is_replacement,
+        "replacement_run_id": clean_text(group_rows[0].get("replacement_run_id") or ""),
+        "replacement_sequence": replacement_sequence,
+        "replacement_label": replacement_label,
+        "replacement_reason": clean_text(group_rows[0].get("replacement_reason") or ""),
+        "original_order_name": order_names[0] if order_names else "",
         "has_replacement_asin": has_replacement_asin,
         "back_in_stock": "back_in_stock" in amazon_statuses,
         "line_ids": [row["id"] for row in group_rows],
@@ -12795,6 +12822,17 @@ def block_selected_orders_with_existing_amazon_orders(conn: Any, store_id: int, 
     if not selected_ids:
         return [], 0
     placeholders = ",".join("?" for _ in selected_ids)
+    replacement_ids = {
+        int(row["id"])
+        for row in conn.execute(
+            f"SELECT id FROM order_lines WHERE store_id=? AND id IN ({placeholders}) AND COALESCE(replacement_run_id, '') != ''",
+            [store_id, *selected_ids],
+        ).fetchall()
+    }
+    if replacement_ids:
+        normal_ids = [line_id for line_id in selected_ids if line_id not in replacement_ids]
+        normal_allowed, blocked = block_selected_orders_with_existing_amazon_orders(conn, store_id, normal_ids) if normal_ids else ([], 0)
+        return sorted([*replacement_ids, *(normal_allowed or [])]), blocked
     selected_orders = conn.execute(
         f"""
         SELECT DISTINCT odoo_order_id
@@ -13066,7 +13104,8 @@ def queue_chrome_order_groups(
         grouped[f"club-{uuid.uuid4().hex[:10]}"] = lines
     else:
         for line in lines:
-            grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
+            group_seed = clean_text(line.get("replacement_run_id") or "") or str(line["odoo_order_id"])
+            grouped.setdefault(group_seed, []).append(line)
     with db() as conn:
         queued, _ = persist_chrome_order_groups(conn, grouped, amazon_account, int(fulfilment_address["id"]))
     return queued
@@ -13168,7 +13207,8 @@ def queue_chrome_order_groups_fast(
                 grouped[f"club-{uuid.uuid4().hex[:10]}"] = lines
             else:
                 for line in lines:
-                    grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
+                    group_seed = clean_text(line.get("replacement_run_id") or "") or str(line["odoo_order_id"])
+                    grouped.setdefault(group_seed, []).append(line)
             queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
             if queued:
                 fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "missing", "back-in-stock"})
@@ -13256,7 +13296,8 @@ def queue_chrome_order_groups_fast(
             grouped[f"club-{uuid.uuid4().hex[:10]}"] = lines
         else:
             for line in lines:
-                grouped.setdefault(str(line["odoo_order_id"]), []).append(line)
+                group_seed = clean_text(line.get("replacement_run_id") or "") or str(line["odoo_order_id"])
+                grouped.setdefault(group_seed, []).append(line)
 
         queued, details = persist_chrome_order_groups(conn, grouped, account, int(address["id"]))
         if queued:
@@ -20873,6 +20914,10 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
         return 0
     grouped: dict[tuple[int, int, str], list[int]] = {}
     for row in rows:
+        # A replacement shipment is linked to an already-fulfilled Shopify
+        # order. Never create a second Shopify fulfilment for it.
+        if is_replacement_fulfilment_line(row):
+            continue
         engine = clean_text(row.get("order_engine"))
         state = clean_text(row.get("state"))
         is_inventory_fulfilment = engine == "inventory" and state in {"inventory", "delivered"}
@@ -21509,6 +21554,10 @@ def shopify_fulfilled_order_guard_enabled() -> bool:
     return str(get_service_settings().get("shopify_fulfilled_order_guard_enabled", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def is_replacement_fulfilment_line(row: Any) -> bool:
+    return bool(clean_text(row.get("replacement_run_id") or ""))
+
+
 def block_lines_before_min_odoo_order_date(conn: Any, lines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, list[str]]:
     if not lines:
         return lines, 0, []
@@ -21518,6 +21567,9 @@ def block_lines_before_min_odoo_order_date(conn: Any, lines: list[dict[str, Any]
     blocked_ids: list[int] = []
     messages: list[str] = []
     for line in lines:
+        if is_replacement_fulfilment_line(line):
+            allowed.append(line)
+            continue
         order_date = odoo_order_date_for_guard(line)
         display_date = odoo_display_date_for_guard(order_date) if order_date else None
         if not display_date or display_date >= MIN_PLACEABLE_ODOO_ORDER_DATE.date():
@@ -21824,7 +21876,11 @@ def block_lines_with_fulfilled_shopify_orders(conn: Any, store_id: int, lines: l
         return lines, 0, []
     if not shopify_fulfilled_order_guard_enabled():
         return lines, 0, []
-    order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in lines if clean_text(row.get("odoo_order_name"))})
+    replacement_lines = [line for line in lines if is_replacement_fulfilment_line(line)]
+    guarded_lines = [line for line in lines if not is_replacement_fulfilment_line(line)]
+    if not guarded_lines:
+        return lines, 0, []
+    order_names = sorted({clean_text(row.get("odoo_order_name")).upper() for row in guarded_lines if clean_text(row.get("odoo_order_name"))})
     ensure_shopify_order_status_cache_table()
     if live_sync:
         sync_shopify_status_for_order_names(store_id, order_names, force=True)
@@ -21844,10 +21900,10 @@ def block_lines_with_fulfilled_shopify_orders(conn: Any, store_id: int, lines: l
             fulfilled_by_order[clean_text(cached.get("odoo_order_name")).upper()] = dict(cached)
     if not fulfilled_by_order:
         return lines, 0, []
-    allowed: list[dict[str, Any]] = []
+    allowed: list[dict[str, Any]] = list(replacement_lines)
     blocked_ids: list[int] = []
     messages: list[str] = []
-    for line in lines:
+    for line in guarded_lines:
         order_name = clean_text(line.get("odoo_order_name")).upper()
         blocked = fulfilled_by_order.get(order_name)
         if not blocked:
@@ -26801,6 +26857,175 @@ def api_duplicate_asins(store_id: Optional[int] = None, page: int = 1, per_page:
         "days": days,
         "search_engine": search_engine,
     }, 90)
+
+
+@app.post("/api/lines/process-replacement")
+def api_process_replacement(payload: ProcessReplacementPayload) -> dict[str, Any]:
+    selected_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
+    if not selected_ids:
+        raise HTTPException(400, "Select at least one original order line for replacement.")
+    reason = clean_text(payload.reason).lower().replace("_", " ")
+    allowed_reasons = {"lost", "damaged", "wrong item", "other"}
+    if reason not in allowed_reasons:
+        raise HTTPException(400, "Choose lost, damaged, wrong item, or other as the replacement reason.")
+    now = utc_now()
+    replacement_run_id = ""
+    replacement_sequence = 0
+    replacement_line_ids: list[int] = []
+    original_rows: list[dict[str, Any]] = []
+    with db() as conn:
+        placeholders = ",".join("?" for _ in selected_ids)
+        original_rows = rows_to_dicts(conn.execute(
+            f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders}) ORDER BY id FOR UPDATE",
+            [payload.store_id, *selected_ids],
+        ).fetchall())
+        if len(original_rows) != len(selected_ids):
+            raise HTTPException(404, "One or more selected order lines no longer exist in this store.")
+        if any(is_replacement_fulfilment_line(row) for row in original_rows):
+            raise HTTPException(400, "Select the original Odoo line, not an existing replacement line.")
+        order_ids = {int(row.get("odoo_order_id") or 0) for row in original_rows}
+        order_names = {clean_text(row.get("odoo_order_name")) for row in original_rows}
+        if len(order_ids) != 1 or len(order_names) != 1:
+            raise HTTPException(400, "Process one Odoo order at a time when creating a replacement.")
+        if any(not effective_inventory_asin(row) for row in original_rows):
+            raise HTTPException(400, "Every replacement line must have a valid ASIN.")
+        active = conn.execute(
+            f"""
+            SELECT replacement_sequence, state, amazon_order_id
+            FROM order_lines
+            WHERE replacement_original_line_id IN ({placeholders})
+              AND COALESCE(replacement_run_id, '') != ''
+              AND LOWER(COALESCE(tracking_status, '')) != 'lost'
+              AND state NOT IN ('delivered', 'ignored')
+            ORDER BY replacement_sequence DESC, id DESC
+            LIMIT 1
+            """,
+            selected_ids,
+        ).fetchone()
+        if active:
+            raise HTTPException(
+                409,
+                f"Replacement R{int(active.get('replacement_sequence') or 1)} is still active for this selection. Complete, mark lost, or ignore it before creating another replacement.",
+            )
+        order_id = next(iter(order_ids))
+        order_name = next(iter(order_names))
+        sequence_row = conn.execute(
+            "SELECT COALESCE(MAX(replacement_sequence), 0) AS sequence FROM order_lines WHERE store_id=? AND odoo_order_id=?",
+            (payload.store_id, order_id),
+        ).fetchone()
+        replacement_sequence = int((sequence_row or {}).get("sequence") or 0) + 1
+        replacement_run_id = f"replacement-{payload.store_id}-{order_id}-r{replacement_sequence}-{uuid.uuid4().hex[:10]}"
+        reason_note = f"Replacement R{replacement_sequence} created for {order_name}: {reason}."
+        if clean_text(payload.note):
+            reason_note += f" {clean_text(payload.note)}"
+        for row in original_rows:
+            original_quantity = max(0.0, float(row.get("quantity") or 0))
+            requested_quantity = float(payload.quantities.get(int(row["id"]), original_quantity) or 0)
+            if requested_quantity <= 0 or requested_quantity > original_quantity:
+                raise HTTPException(
+                    400,
+                    f"Replacement quantity for {row.get('product_name') or row.get('asin')} must be greater than zero and no more than {original_quantity:g}.",
+                )
+            synthetic_odoo_line_id = 0
+            while not synthetic_odoo_line_id:
+                candidate = -int((uuid.uuid4().int % 1_900_000_000) + 1)
+                exists = conn.execute(
+                    "SELECT 1 FROM order_lines WHERE store_id=? AND odoo_line_id=?",
+                    (payload.store_id, candidate),
+                ).fetchone()
+                if not exists:
+                    synthetic_odoo_line_id = candidate
+            ratio = requested_quantity / original_quantity if original_quantity else 1.0
+            original_amazon_order_id = clean_text(row.get("amazon_order_id") or row.get("amazon_cancelled_order_id") or "")
+            inserted = conn.execute(
+                """
+                INSERT INTO order_lines
+                (store_id, odoo_order_id, odoo_order_name, odoo_order_date, odoo_line_id,
+                 product_id, product_tmpl_id, product_name, default_code, internal_note,
+                 asin_from_reference, asin_from_note, asin, supplier_part_auxiliary_id, quantity,
+                 store_unit_price, store_total_price, store_currency, store_currency_rate_to_usd,
+                 store_subtotal_native, store_delivery_native, store_discount_native,
+                 store_adjustment_native, store_total_native, fulfilment_note,
+                 odoo_order_state, odoo_invoice_status, odoo_status_label, state, order_engine,
+                 source_odoo_line_ids, source_line_count, raw_json, pulled_at,
+                 original_asin, original_product_name, replacement_asin, replacement_product_name,
+                 replacement_note, replacement_assigned_at, replacement_run_id, replacement_sequence,
+                 replacement_reason, replacement_original_line_id, replacement_original_amazon_order_id,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, 'pulled', 'chrome', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """,
+                (
+                    payload.store_id, row["odoo_order_id"], row["odoo_order_name"], row.get("odoo_order_date"), synthetic_odoo_line_id,
+                    row.get("product_id"), row.get("product_tmpl_id"), row.get("product_name"), row.get("default_code"), row.get("internal_note"),
+                    row.get("asin_from_reference"), row.get("asin_from_note"), effective_inventory_asin(row), row.get("supplier_part_auxiliary_id"), requested_quantity,
+                    row.get("store_unit_price"), float(row.get("store_total_price") or 0) * ratio, row.get("store_currency"), row.get("store_currency_rate_to_usd"),
+                    float(row.get("store_subtotal_native") or 0) * ratio, float(row.get("store_delivery_native") or 0) * ratio,
+                    float(row.get("store_discount_native") or 0) * ratio, float(row.get("store_adjustment_native") or 0) * ratio,
+                    float(row.get("store_total_native") or 0) * ratio, reason_note,
+                    row.get("odoo_order_state"), row.get("odoo_invoice_status"), row.get("odoo_status_label"),
+                    row.get("source_odoo_line_ids") or str(row.get("odoo_line_id") or ""), row.get("source_line_count") or 1,
+                    row.get("raw_json"), now, row.get("original_asin") or row.get("asin"), row.get("original_product_name") or row.get("product_name"),
+                    row.get("replacement_asin"), row.get("replacement_product_name"), row.get("replacement_note"), row.get("replacement_assigned_at"),
+                    replacement_run_id, replacement_sequence, reason, row["id"], original_amazon_order_id, now, now,
+                ),
+            ).fetchone()
+            replacement_line_ids.append(int(inserted["id"]))
+            conn.execute(
+                "UPDATE order_lines SET fulfilment_note=?, updated_at=? WHERE id=?",
+                (append_note(row.get("fulfilment_note"), reason_note), now, row["id"]),
+            )
+        updated_rows = conn.execute(
+            f"SELECT * FROM order_lines WHERE id IN ({','.join('?' for _ in [*selected_ids, *replacement_line_ids])})",
+            [*selected_ids, *replacement_line_ids],
+        ).fetchall()
+    for updated in updated_rows:
+        index_order_line(updated)
+    try:
+        item_summary = ", ".join(
+            f"{effective_inventory_asin(row)} × {float(payload.quantities.get(int(row['id']), row.get('quantity') or 0)):g}"
+            for row in original_rows
+        )
+        note_html = (
+            f"<p><strong>Replacement R{replacement_sequence} requested</strong></p>"
+            f"<p><strong>Reason:</strong> {html.escape(reason)}</p>"
+            f"<p><strong>Items:</strong> {html.escape(item_summary)}</p>"
+        )
+        if clean_text(payload.note):
+            note_html += f"<p><strong>Note:</strong> {html.escape(clean_text(payload.note))}</p>"
+        post_order_note_once(
+            get_store(payload.store_id),
+            int(original_rows[0]["odoo_order_id"]),
+            "replacement_requested",
+            replacement_run_id,
+            note_html,
+        )
+    except Exception as exc:
+        print(f"Replacement request Odoo note failed: {exc}", flush=True)
+    queued, _cleared, blocked, account, details = queue_chrome_order_groups_fast(
+        payload.store_id,
+        payload.amazon_account_id,
+        payload.address_id,
+        replacement_line_ids,
+        False,
+        False,
+    )
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "fulfilment-pending"})
+    data = dashboard_data(payload.store_id)
+    data.update({
+        "ok": queued > 0,
+        "queued": queued,
+        "queued_line_ids": replacement_line_ids if queued else [],
+        "replacement_run_id": replacement_run_id,
+        "replacement_sequence": replacement_sequence,
+        "message": (
+            f"Created replacement R{replacement_sequence} for {original_rows[0]['odoo_order_name']} and queued it for Chrome using {account.get('name') or 'the selected Amazon account'}."
+            if queued
+            else f"Created replacement R{replacement_sequence}, but Chrome queueing was blocked. {' | '.join(details) or f'Blocked checks: {blocked}.'}"
+        ),
+    })
+    return data
 
 
 @app.post("/api/lines/{line_id}/replacement")
@@ -31887,9 +32112,21 @@ def chrome_complete_followups(
         chatter_queued = True
         for order_id in sorted({int(row["odoo_order_id"]) for row in rows}):
             order_rows = [row for row in rows if int(row["odoo_order_id"]) == order_id]
+            replacement_row = next((row for row in order_rows if is_replacement_fulfilment_line(row)), None)
+            replacement_sequence = int((replacement_row or {}).get("replacement_sequence") or 0)
+            replacement_reason = clean_text((replacement_row or {}).get("replacement_reason") or "")
+            heading = (
+                f"Amazon replacement R{replacement_sequence} placed: {html.escape(amazon_order_id)}"
+                if replacement_row
+                else f"Amazon Chrome order placed: {html.escape(amazon_order_id)}"
+            )
             order_note_parts = [
-                f"<p><strong>Amazon Chrome order placed: {html.escape(amazon_order_id)}</strong></p>",
+                f"<p><strong>{heading}</strong></p>",
             ]
+            if replacement_row:
+                order_note_parts.append(
+                    f"<p><strong>Replacement reason:</strong> {html.escape(replacement_reason or 'replacement requested')}</p>"
+                )
             if clean_text(amazon_recipient):
                 order_note_parts.append(
                     f"<p><strong>Recipient:</strong> {html.escape(clean_text(amazon_recipient))}</p>"
