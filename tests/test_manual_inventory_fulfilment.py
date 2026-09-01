@@ -59,6 +59,9 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("COALESCE(NULLIF(replacement_asin, ''), asin)=?", attach_source)
         self.assertIn('{"inventory-v2", "orders", "dashboard"}', create_source)
         self.assertIn("line.replacement_asin || line.asin", FRONTEND)
+        exact_search_source = inspect.getsource(main.fast_exact_order_reference_search)
+        self.assertIn("NULLIF(filtered_order_lines.replacement_asin, '')", exact_search_source)
+        self.assertNotIn("0 AS inventory_quantity", exact_search_source)
 
     def test_orders_and_chrome_show_inventory_allocation_status(self) -> None:
         self.assertIn("Inventory ready:", FRONTEND)

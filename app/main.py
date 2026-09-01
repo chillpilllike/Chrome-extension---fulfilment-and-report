@@ -24762,7 +24762,15 @@ def fast_exact_order_reference_search(
             SELECT filtered_order_lines.*,
                    total_match.count AS _total_count,
                    0 AS duplicate_asin_count,
-                   0 AS inventory_quantity,
+                   COALESCE((
+                       SELECT SUM(inventory_items.quantity)
+                       FROM inventory_items
+                       WHERE inventory_items.asin = COALESCE(
+                           NULLIF(filtered_order_lines.replacement_asin, ''),
+                           filtered_order_lines.asin
+                       )
+                         AND inventory_items.status = 'available'
+                   ), 0) AS inventory_quantity,
                    COALESCE((
                        SELECT COUNT(DISTINCT same_order_lines.asin)
                        FROM order_lines AS same_order_lines
