@@ -1,12 +1,15 @@
 import json
 import pathlib
+import re
 import unittest
+from unittest.mock import patch
 
 from app.main import (
     canonical_tracking_packages,
     collapse_dispatch_related_parts,
     compact_tracking_products,
     dispatch_codes_from_package,
+    dispatch_related_parts,
     dispatch_shipment_alias_pairs,
     package_tracker_canonical_dispatch_rows,
     package_tracker_enforce_product_guard,
@@ -22,6 +25,45 @@ from app.main import (
 
 
 class PackageTrackerProductTests(unittest.TestCase):
+    def test_related_parts_query_preserves_shipment_identity_for_readiness(self):
+        for odoo_id in (123, None):
+            with self.subTest(odoo_id=odoo_id):
+                common = {
+                    "store_id": 1, "odoo_order_id": odoo_id, "odoo_order_name": "NC24335",
+                    "amazon_order_id": "111-4064278-0332216", "order_line_ids_json": "[]",
+                    "package_status": "Delivered September 1", "scan_status": "pending",
+                    "tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=111-4064278-0332216&shipmentId=Nkj1LmQQz&packageIndex=0",
+                }
+                rows = [
+                    {**common, "id": 1, "scan_code": "TBA334200206835", "canonical_scan_code": "TBA334200206835", "received_at": "2026-09-02T15:05:51+00:00"},
+                    {**common, "id": 2, "scan_code": "AMZPKG-STALE", "canonical_scan_code": "AMZPKG-STALE"},
+                ]
+
+                class Connection:
+                    def execute(self, query, params):
+                        if "FROM order_lines" in query:
+                            self.rows = []
+                        else:
+                            # Respect the real SQL projection so omitting tracking_url
+                            # reproduces a phantom pending package, as in production.
+                            columns = re.search(r"SELECT (.*?) FROM", " ".join(query.split())).group(1).split(",")
+                            self.rows = [{c.strip(): row.get(c.strip()) for c in columns} for row in rows]
+                        return self
+
+                    def fetchall(self):
+                        return self.rows
+
+                with patch("app.main.dispatch_recipient_ref_for_package", return_value="NC24335"):
+                    parts = dispatch_related_parts(Connection(), rows[0])
+                    self.assertEqual(len(parts), 1)
+                    self.assertTrue(parts[0]["received"])
+                    self.assertTrue(parts[0]["order_ready"])
+                    # A genuinely different shipment must still hold the order.
+                    rows.append({**common, "id": 3, "scan_code": "TBA334200206836", "canonical_scan_code": "TBA334200206836", "tracking_url": common["tracking_url"].replace("Nkj1LmQQz", "different")})
+                    parts = dispatch_related_parts(Connection(), rows[0])
+                    self.assertEqual(len(parts), 2)
+                    self.assertFalse(any(part["order_ready"] for part in parts))
+
     def test_tracking_updates_invalidate_related_parts_cache(self):
         source = (pathlib.Path(__file__).resolve().parents[1] / "app" / "main.py").read_text()
         update_start = source.index("def api_tracking_update_impl")

@@ -19,3 +19,13 @@
 5. Click **Start tracking**.
 
 The extension opens each tracked Amazon order, finds every **Track package** link, visits each package tracking page, captures carrier, tracking ID, current status, latest event date/time/message, and reports the package updates back to the local app.
+
+You can also open an individual Amazon tracking page without starting a queue.
+Version 0.1.72 fixes these manual updates being blocked with “No active tracking
+run to recover.” Active queue order and split-shipment guards still apply.
+
+After updating this folder, reload the extension in Chrome and refresh existing
+Amazon tabs. Website deployments do not update already installed extensions.
+Refreshing Amazon tracking updates delivery information; it does not retroactively
+turn an unsuccessful warehouse scan into a received package. Once a stale delivery
+status is corrected, rescan the physical parcel in Package Pickup Check.

@@ -1108,7 +1108,9 @@ async function run() {
       showPanel("Nutricity tracking", state.message || "Nutricity Tracking background did not respond. Reload the extension and start tracking again.");
       return;
     }
-    if (!currentPageMatchesActiveTracking(state)) {
+    // A manually opened package page can sync without a queue. Only recover
+    // mismatched pages when there is an active run to recover.
+    if (state?.tracking?.running && !currentPageMatchesActiveTracking(state)) {
       await recoverActiveTrackingPage(state, "tracking page did not match the active run");
       return;
     }

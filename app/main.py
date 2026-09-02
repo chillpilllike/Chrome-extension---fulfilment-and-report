@@ -7369,7 +7369,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         rows = rows_to_dicts(conn.execute(
             """
             SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
-                   odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
+                   odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise, tracking_url,
                    scan_status, tote_code, received_at, last_scanned_at, placed_at, updated_at, scan_count,
                    asins_json, products_json,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
@@ -7396,7 +7396,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         rows = rows_to_dicts(conn.execute(
             """
             SELECT id, scan_code, canonical_scan_code, display_code, last_scanned_code, scanned_codes_json, amazon_order_id, store_id, odoo_order_id,
-                   odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise,
+                   odoo_order_name, recipient_ref, order_line_ids_json, package_index, package_status, promise, tracking_url,
                    scan_status, tote_code, received_at, last_scanned_at, placed_at, updated_at, scan_count,
                    asins_json, products_json,
                    dispatch_date, destination_zone, service, priority, fulfilment_type
@@ -34314,7 +34314,10 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             }
         package = matches[0]
         if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
-            message = f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but Amazon has not reported it delivered yet."
+            message = (
+                f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but the saved Amazon status is not delivered. "
+                "Refresh its Amazon tracking page, then scan the parcel again. No receipt was recorded."
+            )
             event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="not_delivered", matched=False,
                 message=message, scanned_at=now, package=package, store_id=payload.store_id,
