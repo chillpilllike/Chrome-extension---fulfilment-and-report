@@ -8,7 +8,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-RUN git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" .
+RUN git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" . || node --input-type=module -e '\
+    import { createWriteStream } from "node:fs"; \
+    import { pipeline } from "node:stream/promises"; \
+    import { Readable } from "node:stream"; \
+    import { execFileSync } from "node:child_process"; \
+    const repo = new URL(process.env.REPO_URL); \
+    if (repo.hostname !== "github.com" || repo.username || repo.password) throw new Error("Public archive fallback requires an anonymous GitHub URL"); \
+    const path = repo.pathname.replace(/\.git$/, ""); \
+    const response = await fetch("https://codeload.github.com" + path + "/tar.gz/refs/heads/" + encodeURIComponent(process.env.GIT_BRANCH), { signal: AbortSignal.timeout(120000) }); \
+    if (!response.ok) throw new Error("GitHub source archive HTTP " + response.status); \
+    await pipeline(Readable.fromWeb(response.body), createWriteStream("/tmp/public-source.tar.gz")); \
+    execFileSync("tar", ["-xzf", "/tmp/public-source.tar.gz", "--strip-components=1", "-C", "/src"]); \
+    console.log("Fetched public GitHub source archive successfully");'
 
 
 FROM source AS frontend-build
