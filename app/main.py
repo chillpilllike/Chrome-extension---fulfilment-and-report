@@ -6263,6 +6263,7 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
         )
         updated += 1
     collapse_dispatch_shipment_alias_rows(conn, order_id)
+    reconcile_package_pickup_scans(conn)
     return updated
 
 
@@ -33767,6 +33768,9 @@ def ensure_package_pickup_scan_history_table(conn: Any) -> None:
         "previous_scanned_codes_json": "ALTER TABLE package_pickup_scan_events ADD COLUMN previous_scanned_codes_json TEXT",
         "undone_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN undone_at TEXT",
         "undone_reason": "ALTER TABLE package_pickup_scan_events ADD COLUMN undone_reason TEXT",
+        "reconciled_at": "ALTER TABLE package_pickup_scan_events ADD COLUMN IF NOT EXISTS reconciled_at TEXT",
+        "original_result_status": "ALTER TABLE package_pickup_scan_events ADD COLUMN IF NOT EXISTS original_result_status TEXT",
+        "original_message": "ALTER TABLE package_pickup_scan_events ADD COLUMN IF NOT EXISTS original_message TEXT",
     }.items():
         if column not in existing_cols:
             conn.execute(ddl)
@@ -34013,6 +34017,104 @@ def repair_package_pickup_scan_history(conn: Any) -> dict[str, Any]:
     }
 
 
+def reconcile_package_pickup_scans(conn: Any) -> int:
+    """Resolve saved physical scans once exact delivered package data arrives.
+
+    Retain the physical timestamp and original failure. Lock both the event and
+    package so concurrent refreshes/scanners cannot count a parcel twice.
+    """
+    ensure_package_pickup_scan_history_table(conn)
+    events = rows_to_dicts(conn.execute("""
+        SELECT * FROM package_pickup_scan_events
+        WHERE matched=0 AND undone_at IS NULL
+          AND result_status IN ('not_found', 'not_delivered')
+        ORDER BY scanned_at, id LIMIT 500
+        FOR UPDATE SKIP LOCKED
+    """).fetchall())
+    resolved = 0
+    now = utc_now()
+    for event in events:
+        code = normalize_dispatch_scan_code(event.get("scan_code"))
+        if not dispatch_scan_code_is_physical(code):
+            continue
+        matches = package_pickup_strict_scan_matches(conn, code, int(event.get("store_id") or 0) or None)
+        if len(matches) != 1:
+            continue
+        candidate = matches[0]
+        if event.get("package_id") and int(event["package_id"]) != int(candidate["id"]):
+            continue
+        package = row_to_dict(conn.execute(
+            "SELECT * FROM amazon_dispatch_packages WHERE id=? FOR UPDATE", (candidate["id"],)
+        ).fetchone()) or {}
+        if not package or not clean_text(package.get("odoo_order_name")):
+            continue
+        if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
+            continue
+        if amazon_order_has_open_payment_failure(conn, package.get("amazon_order_id")):
+            continue
+        scanned_at = clean_text(event.get("scanned_at"))
+        not_received_at = parse_any_datetime(package.get("not_received_at"))
+        scanned_time = parse_any_datetime(scanned_at)
+        if not scanned_time or (not_received_at and not_received_at > scanned_time):
+            continue
+        scan_date = package_pickup_business_date(scanned_at)
+        delivered_at = package_tracker_delivery_date(package.get("package_status"), package.get("promise"), package.get("updated_at"))
+        # Do not attach an old scan to a parcel Amazon reports delivered on a
+        # later calendar day. Unknown delivery dates also need more evidence.
+        delivery_date = clean_text(delivered_at)[:10]
+        if not scan_date or not delivery_date or delivery_date > scan_date:
+            continue
+        existing = row_to_dict(conn.execute(
+            "SELECT * FROM package_pickup_delivery_records WHERE package_id=?", (package["id"],)
+        ).fetchone()) or {}
+        duplicate = bool(clean_text(existing.get("scanned_at")))
+        previous = dict(package)
+        if not duplicate:
+            conn.execute("""
+                INSERT INTO package_pickup_delivery_records
+                    (package_id, delivered_at, scanned_at, last_scanned_at, scanned_code, scan_count, updated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET
+                    delivered_at=excluded.delivered_at, scanned_at=excluded.scanned_at,
+                    last_scanned_at=excluded.last_scanned_at, scanned_code=excluded.scanned_code,
+                    scan_count=1, updated_at=excluded.updated_at
+            """, (package["id"], delivered_at, scanned_at, scanned_at, code, now, now))
+            conn.execute("""
+                UPDATE amazon_dispatch_packages SET received_at=COALESCE(NULLIF(received_at, ''), ?),
+                    not_received_at=NULL, updated_at=? WHERE id=?
+            """, (scanned_at, now, package["id"]))
+            package["received_at"] = package.get("received_at") or scanned_at
+            conn.execute("""
+                INSERT INTO package_pickup_checks
+                    (store_id, pickup_date, amazon_picked_up, non_amazon_picked_up, created_at, updated_at)
+                VALUES (?, ?, 1, 0, ?, ?)
+                ON CONFLICT(store_id, pickup_date) DO UPDATE SET
+                    amazon_picked_up=package_pickup_checks.amazon_picked_up+1, updated_at=excluded.updated_at
+            """, (package["store_id"], scan_date, now, now))
+        readiness = package_pickup_order_readiness(conn, package)
+        message = f"{package['odoo_order_name']} matched after tracking refresh. Original physical scan time retained."
+        if duplicate:
+            message += " Package already counted; pickup total unchanged."
+        conn.execute("""
+            UPDATE package_pickup_scan_events
+            SET original_result_status=result_status, original_message=message,
+                reconciled_at=?, result_status='matched_after_tracking_refresh', matched=1, duplicate=?,
+                package_id=?, store_id=?, odoo_order_name=?, amazon_order_id=?, shipment_id=?, recipient_ref=?,
+                order_ready=?, order_total_packages=?, order_received_packages=?, order_remaining_packages=?,
+                order_readiness_message=?, remaining_packages_json=?, message=?,
+                state_snapshot_available=1, previous_received_at=?, previous_not_received_at=?, previous_scanned_codes_json=?
+            WHERE id=? AND matched=0 AND undone_at IS NULL
+        """, (now, int(duplicate), package["id"], package["store_id"], package["odoo_order_name"],
+              package.get("amazon_order_id"), package.get("canonical_scan_code") or code, package.get("recipient_ref"),
+              int(readiness["ready_to_ship"]), readiness["total_packages"], readiness["received_packages"],
+              readiness["remaining_packages"], readiness["message"], json.dumps(readiness["pending_packages"]), message,
+              previous.get("received_at"), previous.get("not_received_at"), previous.get("scanned_codes_json") or "[]", event["id"]))
+        resolved += 1
+    if resolved:
+        fast_page_cache_clear_matching({"package-pickups", "dispatch-related-parts", "dispatch-sorting-summary", "dispatch-sorting-summary-base", "dispatch-status", "dispatch-status-summary"})
+    return resolved
+
+
 def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
     raw_date = clean_text(scan_date)
     if raw_date:
@@ -34033,13 +34135,14 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
         params.append(int(store_id))
     with db() as conn:
         ensure_package_pickup_scan_history_table(conn)
+        reconcile_package_pickup_scans(conn)
         events = rows_to_dicts(conn.execute(
             f"""
             SELECT id, store_id, package_id, scan_code, result_status, matched, duplicate,
                    odoo_order_name, amazon_order_id, shipment_id, recipient_ref,
                    order_ready, order_total_packages, order_received_packages, order_remaining_packages,
                    order_readiness_message, remaining_packages_json, message, scanned_at,
-                   undone_at, undone_reason
+                   undone_at, undone_reason, reconciled_at, original_result_status, original_message
             FROM package_pickup_scan_events
             WHERE scanned_at>=? AND scanned_at<? {store_sql}
             ORDER BY scanned_at DESC, id DESC
@@ -34111,6 +34214,10 @@ def reset_package_pickup_scan_event(conn: Any, event: dict[str, Any], reset_at: 
         result["events_reset"] = 1
         return result
     if event.get("duplicate"):
+        if event.get("reconciled_at"):
+            conn.execute("UPDATE package_pickup_scan_events SET undone_at=?, undone_reason=? WHERE id=? AND undone_at IS NULL", (reset_at, reason, event_id))
+            result["events_reset"] = 1
+            return result
         conn.execute(
             """
             UPDATE package_pickup_delivery_records
@@ -34312,11 +34419,13 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
                 "scan_code": scan_code,
                 "message": message,
             }
-        package = matches[0]
+        package = row_to_dict(conn.execute(
+            "SELECT * FROM amazon_dispatch_packages WHERE id=? FOR UPDATE", (matches[0]["id"],)
+        ).fetchone()) or matches[0]
         if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
             message = (
                 f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but the saved Amazon status is not delivered. "
-                "Refresh its Amazon tracking page, then scan the parcel again. No receipt was recorded."
+                "Refresh its Amazon tracking page; this saved scan will be matched automatically once delivery is confirmed."
             )
             event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="not_delivered", matched=False,
@@ -35577,6 +35686,9 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
         try:
             with _TRACKING_UPDATE_LOCK:
                 result = api_tracking_update_impl(payload)
+            if result.get("ok"):
+                with db() as conn:
+                    result["pickup_scans_reconciled"] = reconcile_package_pickup_scans(conn)
             return result
         except (db_session.psycopg2.errors.DeadlockDetected, db_session.psycopg2.OperationalError):
             if attempt >= 2:

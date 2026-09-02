@@ -693,6 +693,9 @@ type PackagePickupScanResponse = {
 }
 
 type PackagePickupScanHistoryEvent = {
+  reconciled_at?: string
+  original_result_status?: string
+  original_message?: string
   id: number
   store_id: number
   package_id?: number
@@ -785,6 +788,7 @@ function PackagePickupScanHistoryGroupCard({ group }: { group: PackagePickupScan
                 <small><b>Scanned</b> {formatDateTime(scan.scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
                 {scanUndone ? <small className="is-undone"><b>Undone</b> {formatDateTime(scan.undone_at!, { timeZone: "America/New_York", showTimeZone: true })}{scan.undone_reason ? ` · ${scan.undone_reason.replaceAll("_", " ")}` : ""}</small> : null}
                 <small>{scan.message}</small>
+                {scan.reconciled_at ? <details><summary>Original scan result</summary><small>{scan.original_message}</small><small>Automatically matched {formatDateTime(scan.reconciled_at, { timeZone: "America/New_York", showTimeZone: true })}</small></details> : null}
               </div>
             )
           })}
@@ -6979,16 +6983,25 @@ function PackagePickupPage({
   }
 
   useEffect(() => {
-    void load()
+    // Reconcile saved scans before loading delivery cards and their counts.
+    void loadPickupScanHistory().then(() => load())
     // Filters are the source of truth for this operational view.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storeId, dateFrom, dateTo])
 
   useEffect(() => {
-    void loadPickupScanHistory()
-    // Today's scanner history follows the selected store, not the delivery-date filters.
+    const refreshAfterAmazon = () => {
+      if (document.visibilityState === "visible") void loadPickupScanHistory(false, pickupHistoryDate).then(() => load())
+    }
+    window.addEventListener("focus", refreshAfterAmazon)
+    document.addEventListener("visibilitychange", refreshAfterAmazon)
+    return () => {
+      window.removeEventListener("focus", refreshAfterAmazon)
+      document.removeEventListener("visibilitychange", refreshAfterAmazon)
+    }
+    // Refresh automatically when returning from Amazon after a tracking capture.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storeId])
+  }, [storeId, dateFrom, dateTo, pickupHistoryDate])
 
   function stopPickupScannerStream() {
     pickupScannerControlsRef.current?.stop()
@@ -7825,7 +7838,7 @@ function PackagePickupPage({
             <Button variant="outline" size="sm" onClick={() => setShowPackageSearch((current) => !current)} aria-expanded={showPackageSearch}>
               <Search className="size-4" /> {showPackageSearch ? "Hide package search" : "Search packages"}
             </Button>
-            <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+            <Button variant="outline" size="sm" onClick={() => void loadPickupScanHistory(true, pickupHistoryDate).then(() => load())} disabled={loading}>
               <RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} /> {loading ? "Refreshing…" : "Refresh"}
             </Button>
           </div>
