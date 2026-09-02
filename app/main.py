@@ -7217,7 +7217,25 @@ def dispatch_delivery_label(row: dict[str, Any]) -> str:
     return f"Expected: {text}"
 
 
-def dispatch_part_quality(row: dict[str, Any]) -> tuple[int, int, str]:
+def dispatch_order_shipment_key(row: dict[str, Any]) -> str:
+    """Identify one physical shipment inside one Odoo order across stale Amazon aliases."""
+    shipment_key = tracking_package_shipment_key(row)
+    if not shipment_key:
+        return ""
+    store_id = int(row.get("store_id") or 0)
+    odoo_order_id = int(row.get("odoo_order_id") or 0)
+    odoo_order_name = clean_text(row.get("odoo_order_name")).upper()
+    if odoo_order_id:
+        order_scope = f"odoo-id:{odoo_order_id}"
+    elif odoo_order_name:
+        order_scope = f"odoo-name:{odoo_order_name}"
+    else:
+        order_scope = f"amazon:{clean_text(row.get('amazon_order_id')).upper()}"
+    return f"store:{store_id}|{order_scope}|{shipment_key}"
+
+
+def dispatch_part_quality(row: dict[str, Any]) -> tuple[int, int, int, str]:
+    physical = 1 if package_tracking_id_is_physical(row.get("canonical_scan_code") or row.get("scan_code")) else 0
     received = 1 if row.get("received") else 0
     delivery = clean_text(row.get("delivery_label") or row.get("package_status") or row.get("promise")).lower()
     if "delivered" in delivery:
@@ -7228,25 +7246,62 @@ def dispatch_part_quality(row: dict[str, Any]) -> tuple[int, int, str]:
         delivery_rank = 1
     else:
         delivery_rank = 0
-    return (received, delivery_rank, clean_text(row.get("updated_at") or row.get("last_scanned_at") or row.get("placed_at")))
+    return (physical, received, delivery_rank, clean_text(row.get("updated_at") or row.get("last_scanned_at") or row.get("placed_at")))
+
+
+def merge_dispatch_shipment_rows(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Merge duplicate shipment snapshots while retaining scan evidence and the physical row id."""
+    primary, secondary = (
+        (incoming, existing)
+        if dispatch_part_quality(incoming) > dispatch_part_quality(existing)
+        else (existing, incoming)
+    )
+    merged = dict(secondary)
+    for key, value in primary.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+
+    for field in ("received_at", "last_scanned_at", "placed_at", "updated_at", "pickup_scanned_at", "pickup_last_scanned_at"):
+        merged[field] = max(clean_text(existing.get(field)), clean_text(incoming.get(field)))
+    merged["scan_count"] = max(int(existing.get("scan_count") or 0), int(incoming.get("scan_count") or 0))
+    merged["pickup_scan_count"] = max(int(existing.get("pickup_scan_count") or 0), int(incoming.get("pickup_scan_count") or 0))
+    merged["received"] = bool(
+        existing.get("received")
+        or incoming.get("received")
+        or clean_text(merged.get("received_at"))
+        or clean_text(merged.get("pickup_scanned_at"))
+    )
+    if merged["received"]:
+        merged["not_received"] = False
+        merged["not_received_at"] = ""
+
+    # A carrier tracking URL names the Amazon order that owns this shipment.
+    # Old rows can retain a previous order id after a split-order refresh; use
+    # the URL only when it contains exactly one valid Amazon order id.
+    tracking_order_ids = package_direct_amazon_order_ids({"tracking_url": merged.get("tracking_url")})
+    if len(tracking_order_ids) == 1:
+        canonical_order_id = next(iter(tracking_order_ids))
+        merged["amazon_order_id"] = canonical_order_id
+        matching_order_url = next((
+            clean_text(row.get("amazon_order_url"))
+            for row in (existing, incoming)
+            if canonical_order_id in clean_text(row.get("amazon_order_url"))
+        ), "")
+        if matching_order_url:
+            merged["amazon_order_url"] = matching_order_url
+    return merged
 
 
 def collapse_dispatch_related_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for part in parts:
-        shipment_key = tracking_package_shipment_key(part)
-        key = (
-            f"{clean_text(part.get('amazon_order_id')).upper()}|{shipment_key}"
-            if shipment_key
-            else dispatch_physical_package_key(part)
-        )
+        key = dispatch_order_shipment_key(part) or dispatch_physical_package_key(part)
         if not key:
             key = f"{clean_text(part.get('recipient_ref')).upper()}|{clean_text(part.get('amazon_order_id')).upper()}|{clean_text(part.get('order_line_ids_json'))}"
         if not key:
             key = f"{clean_text(part.get('odoo_order_name')).upper()}|{dispatch_part_sort_key(part)[:2]}"
         existing = grouped.get(key)
-        if existing is None or dispatch_part_quality(part) > dispatch_part_quality(existing):
-            grouped[key] = part
+        grouped[key] = part if existing is None else merge_dispatch_shipment_rows(existing, part)
     return sorted(grouped.values(), key=dispatch_part_sort_key)
 
 
@@ -7255,10 +7310,10 @@ def dispatch_shipment_alias_pairs(rows: list[dict[str, Any]]) -> list[tuple[int,
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         shipment_key = tracking_package_shipment_key(row)
-        order_id = clean_text(row.get("amazon_order_id"))
-        if not shipment_key or not order_id:
+        shipment_group = dispatch_order_shipment_key(row)
+        if not shipment_key or not shipment_group:
             continue
-        groups.setdefault(f"{order_id}|{shipment_key}", []).append(row)
+        groups.setdefault(shipment_group, []).append(row)
     pairs: list[tuple[int, int]] = []
     for values in groups.values():
         physical = next((
@@ -33185,6 +33240,11 @@ def package_pickup_data(
             package["pickup_last_scanned_at"] = clean_text(pickup_record.get("last_scanned_at"))
             package["pickup_scanned_code"] = clean_text(pickup_record.get("scanned_code"))
             package["pickup_scan_count"] = int(pickup_record.get("scan_count") or 0)
+        # Tracking refreshes can leave a temporary AMZPKG row beside the later
+        # physical TBA row for the same shipment. Collapse those aliases before
+        # calculating pickup totals or rendering pending rows. The grouping is
+        # scoped to one Odoo order and retains the physical row's scan record.
+        packages = collapse_dispatch_related_parts(packages)
         line_params: list[Any] = []
         line_store_sql = ""
         if store_id:

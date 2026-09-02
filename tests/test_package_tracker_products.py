@@ -4,6 +4,7 @@ import unittest
 
 from app.main import (
     canonical_tracking_packages,
+    collapse_dispatch_related_parts,
     compact_tracking_products,
     dispatch_codes_from_package,
     dispatch_shipment_alias_pairs,
@@ -160,6 +161,61 @@ class PackageTrackerProductTests(unittest.TestCase):
         ]
 
         self.assertEqual(dispatch_shipment_alias_pairs(rows), [(10, 11)])
+
+    def test_pickup_collapses_cross_amazon_order_alias_for_same_odoo_shipment(self):
+        rows = [
+            {
+                "id": 10,
+                "store_id": 1,
+                "odoo_order_id": 9484,
+                "odoo_order_name": "NC09464",
+                "amazon_order_id": "112-7385912-8100253",
+                "amazon_order_url": "https://www.amazon.com/your-orders/order-details?orderID=112-7385912-8100253",
+                "scan_code": "AMZPKG-TEMP",
+                "tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=112-7385912-8100253&shipmentId=NWPdFLTjz",
+                "package_status": "Delivered August 31",
+            },
+            {
+                "id": 11,
+                "store_id": 1,
+                "odoo_order_id": 9484,
+                "odoo_order_name": "NC09464",
+                "amazon_order_id": "112-3903581-5732250",
+                "amazon_order_url": "https://www.amazon.com/your-orders/order-details?orderID=112-3903581-5732250",
+                "scan_code": "TBA334173219360",
+                "canonical_scan_code": "TBA334173219360",
+                "tracking_url": "https://www.amazon.com/progress-tracker/package?orderId=112-7385912-8100253&shipmentId=NWPdFLTjz",
+                "package_status": "Delivered August 31",
+                "pickup_scanned_at": "2026-09-01T14:26:03+00:00",
+                "pickup_scan_count": 1,
+            },
+        ]
+
+        collapsed = collapse_dispatch_related_parts(rows)
+
+        self.assertEqual(len(collapsed), 1)
+        self.assertEqual(collapsed[0]["id"], 11)
+        self.assertEqual(collapsed[0]["canonical_scan_code"], "TBA334173219360")
+        self.assertEqual(collapsed[0]["amazon_order_id"], "112-7385912-8100253")
+        self.assertEqual(collapsed[0]["amazon_order_url"], "https://www.amazon.com/your-orders/order-details?orderID=112-7385912-8100253")
+        self.assertEqual(collapsed[0]["pickup_scanned_at"], "2026-09-01T14:26:03+00:00")
+        self.assertTrue(collapsed[0]["received"])
+
+    def test_pickup_keeps_distinct_shipments_and_odoo_orders_separate(self):
+        common = {
+            "store_id": 1,
+            "odoo_order_id": 9484,
+            "odoo_order_name": "NC09464",
+            "amazon_order_id": "112-7385912-8100253",
+            "package_status": "Delivered August 31",
+        }
+        rows = [
+            {**common, "id": 10, "scan_code": "AMZPKG-ONE", "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=ONE"},
+            {**common, "id": 11, "scan_code": "AMZPKG-TWO", "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=TWO"},
+            {**common, "id": 12, "odoo_order_id": 9485, "odoo_order_name": "NC09465", "scan_code": "AMZPKG-THREE", "tracking_url": "https://www.amazon.com/progress-tracker/package?shipmentId=ONE"},
+        ]
+
+        self.assertEqual(len(collapse_dispatch_related_parts(rows)), 3)
 
     def test_verified_quantity_survives_storage_compaction(self):
         products = compact_tracking_products([
