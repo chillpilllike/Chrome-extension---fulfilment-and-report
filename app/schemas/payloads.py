@@ -175,6 +175,8 @@ class ManualAmazonOrderMatchPayload(BaseModel):
     source_text: str = ""
     store_id: Optional[int] = None
     replace_existing: bool = False
+    asins: list[str] = []
+    cancelled: bool = False
 
 
 class ManualFulfilmentPayload(BaseModel):

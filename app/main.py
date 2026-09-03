@@ -5871,6 +5871,8 @@ def update_history_matched_order_from_tracking(conn: Any, amazon_order_id: str, 
     ).fetchone()
     if not history:
         return 0, 0
+    if "cancel" in clean_text(history["status"]).lower():
+        return 0, 0
     refs = amazon_history_order_refs_from_text(history["recipient"] or "")
     if not refs:
         return 0, 0
@@ -5907,21 +5909,24 @@ def update_history_matched_order_from_tracking(conn: Any, amazon_order_id: str, 
         WHERE UPPER(odoo_order_name) IN ({placeholders})
           AND COALESCE(order_engine, '') != 'third_party'
         ORDER BY id
+        FOR UPDATE
         """,
         [ref.upper() for ref in refs],
     ).fetchall())
-    matched_rows = [
-        row for row in candidate_rows
-        if package_asins.intersection(set(order_line_asin_aliases(row)))
-    ]
+    matched_rows, _skipped = safe_history_match_rows(candidate_rows, order_id, package_asins)
     if not matched_rows:
         return 0, 0
     now = utc_now()
     line_status = tracking_status_from_packages(package_payloads)
-    line_delivered = line_status == "Delivered" and all(tracking_package_delivered(package) for package in package_payloads)
-    tracking_payload = tracking_payload_json_for_storage(package_payloads)
+    packages_by_line, _unmatched = tracking_packages_by_line_with_one_to_one_fallback(package_payloads, matched_rows)
+    updated_ids = []
     for row in matched_rows:
-        if order_line_currently_delivered(row) and not line_delivered:
+        line_packages = packages_by_line.get(int(row["id"]), [])
+        if not line_packages:
+            continue
+        row_status = tracking_status_from_packages(line_packages)
+        row_delivered = row_status == "Delivered" and all(tracking_package_delivered(p) for p in line_packages)
+        if order_line_currently_delivered(row) and not row_delivered:
             continue
         conn.execute(
             """
@@ -5939,21 +5944,24 @@ def update_history_matched_order_from_tracking(conn: Any, amazon_order_id: str, 
             (
                 order_id,
                 clean_text(amazon_order_url) or order_line_amazon_url(order_id),
-                line_status,
-                tracking_payload,
+                row_status,
+                tracking_payload_json_for_storage(line_packages),
                 now,
-                bool(line_delivered),
+                bool(row_delivered),
                 now,
                 row["id"],
             ),
         )
+        updated_ids.append(row["id"])
+    if not updated_ids:
+        return 0, 0
     refreshed_rows = rows_to_dicts(conn.execute(
-        f"SELECT * FROM order_lines WHERE id IN ({','.join('?' for _ in matched_rows)})",
-        [row["id"] for row in matched_rows],
+        f"SELECT * FROM order_lines WHERE id IN ({','.join('?' for _ in updated_ids)})",
+        updated_ids,
     ).fetchall())
     for updated_row in refreshed_rows:
         index_order_line(updated_row)
-        if line_delivered:
+        if order_line_currently_delivered(updated_row):
             ensure_inventory_for_line(updated_row)
     _order_id, values, package_count, _error = dispatch_bulk_package_rows_for_order(order_id, refreshed_rows, now)
     bulk_upsert_dispatch_package_rows(conn, values)
@@ -10434,6 +10442,9 @@ TRACKING_ACCOUNT_PLACEHOLDERS = {
     "amazon tracking track all",
     "chrome manual matcher",
     "amazon history",
+    "default amazon business",
+    "chrome browserless history matcher",
+    "account unverified",
 }
 
 
@@ -10450,6 +10461,45 @@ def preserve_real_amazon_account_name(existing: Any, incoming: Any) -> str:
     if candidate and not tracking_account_name_is_placeholder(candidate):
         return candidate
     return current or candidate
+
+
+def safe_history_match_rows(
+    rows: list[dict[str, Any]], amazon_order_id: str, evidence_asins: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """History scans may discover a binding, never replace an existing purchase.
+
+    Track all clients historically sent every sibling line with replace_existing.
+    Candidate line IDs are not product evidence. Guard old clients server-side.
+    """
+    allowed, skipped = [], []
+    for row in rows:
+        current = clean_text(row.get("amazon_order_id"))
+        asin = normalize_asin(row.get("replacement_asin") or row.get("asin"))
+        reason = ""
+        if current and current != amazon_order_id:
+            reason = "Existing Amazon order preserved; tracking cannot replace a purchase."
+        elif row.get("state") in {"cancelled", "refunded"} or row.get("odoo_status_label") in {"cancelled", "refunded"}:
+            reason = "Cancelled/refunded fulfilment preserved."
+        elif not asin or asin not in evidence_asins:
+            reason = "No exact purchased ASIN evidence for this line."
+        elif not current and (row.get("replacement_run_id") or row.get("state") in {"inventory", "delivered", "dispatched"}):
+            reason = "Completed/replacement fulfilment cannot be assigned by an old history scan."
+        if reason:
+            skipped.append({"line_id": row["id"], "reason": reason})
+        else:
+            allowed.append(row)
+    counts: dict[str, int] = {}
+    for row in rows:
+        asin = normalize_asin(row.get("replacement_asin") or row.get("asin"))
+        counts[asin] = counts.get(asin, 0) + 1
+    unambiguous = []
+    for row in allowed:
+        asin = normalize_asin(row.get("replacement_asin") or row.get("asin"))
+        if not clean_text(row.get("amazon_order_id")) and counts.get(asin, 0) > 1:
+            skipped.append({"line_id": row["id"], "reason": "Ambiguous repeated ASIN; existing lines preserved."})
+        else:
+            unambiguous.append(row)
+    return unambiguous, skipped
 
 
 def note_manual_amazon_match(rows: list[dict[str, Any]], amazon_order_id: str, amazon_order_url: str, amazon_account_name: str) -> None:
@@ -10484,7 +10534,8 @@ def manual_amazon_match_followups(
         except Exception as exc:
             print(f"Manual Amazon match line followup failed for {row.get('id')}: {exc}", flush=True)
     try:
-        queued = enqueue_shopify_fulfilment_for_rows(updated_for_shopify)
+        newly_bound_ids = {row["id"] for row in rows if not clean_text(row.get("amazon_order_id"))}
+        queued = enqueue_shopify_fulfilment_for_rows([row for row in updated_for_shopify if row["id"] in newly_bound_ids])
         if queued:
             start_shopify_fulfilment_worker()
     except Exception as exc:
@@ -29291,6 +29342,8 @@ class ChromeBrowserlessSession:
                     source_text=clean_text(order.get("source_text")) or normalized.recipient,
                     store_id=parse_optional_int(order.get("store_id")),
                     replace_existing=order.get("replace_existing") is True,
+                    asins=normalized.asins,
+                    cancelled=normalized.cancelled,
                 )
             )
             return result
@@ -35795,6 +35848,8 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     updated_line_rows = []
                     for line_id in affected_line_ids:
                         current_line = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+                        if not current_line or clean_text(current_line.get("amazon_order_id")) != amazon_order_id:
+                            continue
                         if current_line and order_line_currently_delivered(current_line) and not line_delivered:
                             continue
                         conn.execute(
@@ -35956,6 +36011,8 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 updated_line_rows = []
                 for line_id in affected_line_ids:
                     current_line = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+                    if not current_line or clean_text(current_line.get("amazon_order_id")) != amazon_order_id:
+                        continue
                     if current_line and order_line_currently_delivered(current_line) and not line_delivered:
                         continue
                     conn.execute(
@@ -36593,6 +36650,16 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
     ordered_at = amazon_order_placed_at or utc_now()
     line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
     with db() as conn:
+        history = row_to_dict(conn.execute(
+            "SELECT asins_json, status FROM amazon_order_history_unmatched WHERE amazon_order_id=?",
+            (amazon_order_id,),
+        ).fetchone()) or {}
+        if payload.cancelled or "cancel" in clean_text(history.get("status")).lower():
+            raise HTTPException(409, "Cancelled Amazon history cannot assign or reset fulfilment lines.")
+        # Legacy clients saved ASIN evidence in their preceding history lookup.
+        evidence_asins = set(unique_normalized_asins(
+            payload.asins or parse_json_list_value(history.get("asins_json"))
+        ))
         params: list[Any] = refs[:]
         store_filter = ""
         line_filter = ""
@@ -36614,11 +36681,16 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
               {store_filter}
               {line_filter}
             ORDER BY store_id, odoo_order_id, id
+            FOR UPDATE
             """,
             params,
         ).fetchall())
         if not rows:
             return {"ok": True, "matched": 0, "skipped": len(refs), "order_names": refs, "message": f"No unmatched pulled rows found for {', '.join(refs)}."}
+        rows, skipped_lines = safe_history_match_rows(rows, amazon_order_id, evidence_asins)
+        if not rows:
+            return {"ok": True, "matched": 0, "skipped": len(skipped_lines), "skipped_lines": skipped_lines,
+                    "order_names": refs, "message": "No exact safe ASIN match; existing fulfilment data preserved."}
         date_repair_only = bool(amazon_order_placed_at) and all(clean_text(row.get("amazon_order_id")) == amazon_order_id for row in rows)
         if not date_repair_only:
             allowed_rows: list[dict[str, Any]] = []
@@ -36647,6 +36719,8 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 row.get("amazon_account_name"),
                 amazon_account_name,
             )
+            if not clean_text(row.get("amazon_order_id")):
+                resolved_account_name = amazon_account_name if not tracking_account_name_is_placeholder(amazon_account_name) else "Account unverified"
             if clean_text(row.get("amazon_order_id")) == amazon_order_id:
                 if amazon_order_placed_at:
                     conn.execute(
@@ -36654,11 +36728,6 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                         UPDATE order_lines
                         SET amazon_order_url=?,
                             amazon_account_name=?,
-                            order_engine='chrome',
-                            amazon_status='ordered',
-                            state='ordered',
-                            missing_asin=NULL,
-                            last_error=NULL,
                             ordered_at=?,
                             updated_at=?
                         WHERE id=?
@@ -36669,11 +36738,6 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                         **dict(row),
                         "amazon_order_url": amazon_order_url,
                         "amazon_account_name": resolved_account_name,
-                        "order_engine": "chrome",
-                        "amazon_status": "ordered",
-                        "state": "ordered",
-                        "missing_asin": None,
-                        "last_error": None,
                         "ordered_at": amazon_order_placed_at,
                         "updated_at": now,
                     })
@@ -36686,6 +36750,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 SET amazon_order_id=?,
                     amazon_order_url=?,
                     amazon_account_name=?,
+                    amazon_account_id=NULL,
                     amazon_cancelled_order_id=CASE
                         WHEN COALESCE(amazon_order_id, '') != '' AND amazon_order_id != ?
                         THEN COALESCE(NULLIF(amazon_cancelled_order_id, ''), amazon_order_id)
@@ -36730,6 +36795,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 "amazon_order_id": amazon_order_id,
                 "amazon_order_url": amazon_order_url,
                 "amazon_account_name": resolved_account_name,
+                "amazon_account_id": None,
                 "amazon_cancelled_order_id": clean_text(row.get("amazon_cancelled_order_id")) or (
                     clean_text(row.get("amazon_order_id"))
                     if clean_text(row.get("amazon_order_id")) and clean_text(row.get("amazon_order_id")) != amazon_order_id
@@ -36760,6 +36826,8 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
     return {
         "ok": True,
         "matched": len(rows),
+        "skipped": len(skipped_lines),
+        "skipped_lines": skipped_lines,
         "order_names": matched_refs,
         "amazon_order_id": amazon_order_id,
         "message": f"Matched Amazon order {amazon_order_id} to {len(rows)} line(s): {', '.join(matched_refs)}.",
