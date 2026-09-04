@@ -38231,12 +38231,17 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
     params: list[Any] = [after_order_cutoff_date()]
     store_sql = ""
     if store_id is not None:
-        store_sql = " AND store_id=?"
+        store_sql = " AND after_order_cases.store_id=?"
         params.append(store_id)
     with db() as conn:
         rows = rows_to_dicts(conn.execute(
             f"""SELECT id, case_type FROM after_order_cases
-                WHERE substr(COALESCE(odoo_order_date, ''), 1, 10) >= ?{store_sql}
+                WHERE COALESCE((
+                    SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+                    FROM order_lines
+                    WHERE order_lines.store_id=after_order_cases.store_id
+                      AND order_lines.odoo_order_id=after_order_cases.odoo_order_id
+                ), '') >= ?{store_sql}
                 ORDER BY updated_at DESC, id DESC""",
             tuple(params),
         ).fetchall())
