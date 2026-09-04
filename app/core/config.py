@@ -137,6 +137,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "after_order_email_test_mode": os.getenv("AFTER_ORDER_EMAIL_TEST_MODE", "true"),
     "after_order_test_recipient": os.getenv("AFTER_ORDER_TEST_RECIPIENT", "sonianuj1284@gmail.com"),
     "after_order_public_base_url": os.getenv("AFTER_ORDER_PUBLIC_BASE_URL", ""),
+    "after_order_cutoff_date": os.getenv("AFTER_ORDER_CUTOFF_DATE", "2026-08-01"),
 }
 
 

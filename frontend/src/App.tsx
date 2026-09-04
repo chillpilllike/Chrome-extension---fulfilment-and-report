@@ -11935,6 +11935,7 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
   const [loading, setLoading] = useState(false)
   const [emailTestMode, setEmailTestMode] = useState(true)
   const [emailTestRecipient, setEmailTestRecipient] = useState("sonianuj1284@gmail.com")
+  const [cutoffDate, setCutoffDate] = useState("2026-08-01")
   const [activityCase, setActivityCase] = useState<AfterOrderCase | null>(null)
   const [events, setEvents] = useState<AfterOrderEvent[]>([])
 
@@ -11944,11 +11945,12 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
       const params = new URLSearchParams({ status, page: "1", per_page: "50" })
       if (storeId) params.set("store_id", storeId)
       if (query.trim()) params.set("q", query.trim())
-      const result = await api<{ rows: AfterOrderCase[]; summary: Record<string, number>; email_test_mode: boolean; email_test_recipient: string }>(`/api/after-order/cases?${params}`)
+      const result = await api<{ rows: AfterOrderCase[]; summary: Record<string, number>; email_test_mode: boolean; email_test_recipient: string; cutoff_date: string }>(`/api/after-order/cases?${params}`)
       setRows(result.rows || [])
       setSummary(result.summary || {})
       setEmailTestMode(Boolean(result.email_test_mode))
       setEmailTestRecipient(result.email_test_recipient || "sonianuj1284@gmail.com")
+      setCutoffDate(result.cutoff_date || "2026-08-01")
     } catch (error) {
       onResult({ ok: false, title: "After-order care load failed", message: String(error) })
     } finally {
@@ -12050,6 +12052,8 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
           <div key={String(label)} className="rounded-lg border bg-card px-4 py-3"><span className="text-sm text-muted-foreground">{label}</span><strong className={`mt-1 block text-2xl ${color}`}>{count}</strong></div>
         ))}
       </div>
+
+      <p className="text-sm text-muted-foreground">Showing actionable cards only for Odoo orders dated {new Date(`${cutoffDate}T00:00:00Z`).toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "long", day: "numeric" })} or later. Earlier and undated orders cannot be actioned.</p>
 
       {loading ? <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">Loading after-order cases...</div> : null}
       {!loading && !rows.length ? <div className="rounded-lg border bg-card p-10 text-center text-muted-foreground">No after-order cases match this view.</div> : null}

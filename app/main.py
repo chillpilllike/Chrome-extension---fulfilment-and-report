@@ -37371,6 +37371,25 @@ def after_order_test_recipient() -> str:
     return clean_text(get_service_settings().get("after_order_test_recipient")) or "sonianuj1284@gmail.com"
 
 
+def after_order_cutoff_date() -> str:
+    value = clean_text(get_service_settings().get("after_order_cutoff_date"))[:10]
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return "2026-08-01"
+    return value
+
+
+def after_order_case_is_in_scope(case: dict[str, Any]) -> bool:
+    order_date = clean_text(case.get("odoo_order_date"))[:10]
+    return bool(order_date and order_date >= after_order_cutoff_date())
+
+
+def require_after_order_case_in_scope(case: dict[str, Any]) -> None:
+    if not after_order_case_is_in_scope(case):
+        raise HTTPException(410, f"This order is before the after-order cutoff of {after_order_cutoff_date()} and cannot be actioned.")
+
+
 def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
     if case.get("confirmed_at"):
         return []
@@ -37414,6 +37433,7 @@ def record_after_order_event(
 def sync_after_order_cases(store_id: Optional[int] = None) -> None:
     """Materialize provider facts into review cases without executing actions."""
     now = utc_now()
+    cutoff_date = after_order_cutoff_date()
     with db() as conn:
         missing_rows = rows_to_dicts(conn.execute(
             """
@@ -37426,23 +37446,34 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
             JOIN stores ON stores.id=order_lines.store_id
             WHERE order_lines.state='missing'
               AND COALESCE(order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+              AND COALESCE(order_lines.odoo_order_date, '') >= ?
               AND (? IS NULL OR order_lines.store_id=?)
             ORDER BY order_lines.store_id, order_lines.odoo_order_id, order_lines.id
             """,
-            (store_id, store_id),
+            (cutoff_date, store_id, store_id),
         ).fetchall())
         grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
         for row in missing_rows:
             grouped.setdefault((int(row["store_id"]), int(row["odoo_order_id"])), []).append(row)
         if store_id:
             conn.execute(
-                "UPDATE after_order_cases SET status='resolved', updated_at=? WHERE case_type='item_unavailable' AND store_id=? AND confirmed_at IS NULL",
-                (now, store_id),
+                """UPDATE after_order_cases SET status='resolved', updated_at=?
+                   WHERE case_type='item_unavailable' AND store_id=? AND confirmed_at IS NULL
+                     AND COALESCE((SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+                                   FROM order_lines
+                                   WHERE order_lines.store_id=after_order_cases.store_id
+                                     AND order_lines.odoo_order_id=after_order_cases.odoo_order_id), '') >= ?""",
+                (now, store_id, cutoff_date),
             )
         else:
             conn.execute(
-                "UPDATE after_order_cases SET status='resolved', updated_at=? WHERE case_type='item_unavailable' AND confirmed_at IS NULL",
-                (now,),
+                """UPDATE after_order_cases SET status='resolved', updated_at=?
+                   WHERE case_type='item_unavailable' AND confirmed_at IS NULL
+                     AND COALESCE((SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+                                   FROM order_lines
+                                   WHERE order_lines.store_id=after_order_cases.store_id
+                                     AND order_lines.odoo_order_id=after_order_cases.odoo_order_id), '') >= ?""",
+                (now, cutoff_date),
             )
         for (row_store_id, order_id), rows in grouped.items():
             first = rows[0]
@@ -37490,11 +37521,17 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                    COALESCE(epost_global_tracking.website_id, stores.website_id) AS resolved_website_id
             FROM epost_global_tracking
             JOIN stores ON stores.id=epost_global_tracking.store_id
-            WHERE (? IS NULL OR epost_global_tracking.store_id=?)
+            WHERE COALESCE((
+                    SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+                    FROM order_lines
+                    WHERE order_lines.store_id=epost_global_tracking.store_id
+                      AND order_lines.odoo_order_id=epost_global_tracking.odoo_order_id
+                  ), '') >= ?
+              AND (? IS NULL OR epost_global_tracking.store_id=?)
             ORDER BY epost_global_tracking.updated_at DESC
             LIMIT 5000
             """,
-            (store_id, store_id),
+            (cutoff_date, store_id, store_id),
         ).fetchall())
         for row in tracking_rows:
             events = after_order_json_list(row.get("events_json"))
@@ -37588,6 +37625,13 @@ def api_after_order_cases(
     page, per_page, offset = pagination_bounds(page, per_page)
     filters = ["(? IS NULL OR after_order_cases.store_id=?)"]
     params: list[Any] = [store_id, store_id]
+    filters.append("""COALESCE((
+        SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+        FROM order_lines
+        WHERE order_lines.store_id=after_order_cases.store_id
+          AND order_lines.odoo_order_id=after_order_cases.odoo_order_id
+    ), '') >= ?""")
+    params.append(after_order_cutoff_date())
     normalized_status = clean_text(status).lower()
     if normalized_status == "open":
         filters.append("after_order_cases.status NOT IN ('resolved', 'approved')")
@@ -37618,8 +37662,13 @@ def api_after_order_cases(
         ).fetchall()
         summary_rows = conn.execute(
             """SELECT status, COUNT(*) AS count FROM after_order_cases
-               WHERE (? IS NULL OR store_id=?) GROUP BY status""",
-            (store_id, store_id),
+               WHERE (? IS NULL OR store_id=?)
+                 AND COALESCE((SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+                               FROM order_lines
+                               WHERE order_lines.store_id=after_order_cases.store_id
+                                 AND order_lines.odoo_order_id=after_order_cases.odoo_order_id), '') >= ?
+               GROUP BY status""",
+            (store_id, store_id, after_order_cutoff_date()),
         ).fetchall()
     summary = {clean_text(row["status"]): int(row["count"] or 0) for row in summary_rows}
     return {
@@ -37631,6 +37680,7 @@ def api_after_order_cases(
         "summary": summary,
         "email_test_mode": after_order_email_test_mode(),
         "email_test_recipient": after_order_test_recipient(),
+        "cutoff_date": after_order_cutoff_date(),
     }
 
 
@@ -37856,6 +37906,7 @@ def api_after_order_email_preview(case_id: int) -> dict[str, Any]:
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
     link = api_after_order_action_link(case_id)
     action_url = clean_text(link.get("url"))
     preview = after_order_email_preview_html(case, action_url)
@@ -37890,6 +37941,7 @@ def send_after_order_email(
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
     case = hydrate_after_order_recipient_and_domain(case)
     allowed = after_order_allowed_actions(case) if not template_kind else []
     action_url = ""
@@ -38021,6 +38073,7 @@ def api_after_order_action_link(case_id: int) -> dict[str, Any]:
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
     if case.get("confirmed_at"):
         raise HTTPException(409, "This decision is already confirmed and its links are expired.")
     allowed = after_order_allowed_actions(case)
@@ -38054,6 +38107,7 @@ def after_order_action_link(token: str) -> tuple[dict[str, Any], dict[str, Any]]
     case = after_order_case_by_id(int(link["case_id"]))
     if not case:
         raise HTTPException(404, "This decision link is invalid.")
+    require_after_order_case_in_scope(case)
     return case, link
 
 
@@ -38140,6 +38194,10 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
     already_confirmed = False
     confirmed_decision = ""
     confirmed_case_type = ""
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
     with db() as conn:
         row = conn.execute("SELECT * FROM after_order_cases WHERE id=?", (case_id,)).fetchone()
         if not row:
