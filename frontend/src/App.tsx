@@ -1203,6 +1203,7 @@ type AfterOrderCase = {
   website_id?: number | null
   odoo_order_id?: number | null
   odoo_order_name: string
+  odoo_order_date?: string
   odoo_order_url: string
   case_type: string
   status: string
@@ -12053,7 +12054,7 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
       {loading ? <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">Loading after-order cases...</div> : null}
       {!loading && !rows.length ? <div className="rounded-lg border bg-card p-10 text-center text-muted-foreground">No after-order cases match this view.</div> : null}
 
-      <div className="grid gap-3">
+      <div className="grid items-stretch gap-4 md:grid-cols-2 2xl:grid-cols-3">
         {rows.map((row) => {
           const context = row.context || {}
           const currentLabel = afterOrderDecisionLabels[row.current_decision || ""] || "No customer request yet"
@@ -12064,16 +12065,17 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
           const decisionCase = itemCase || deliveryConfirmation || ["suspected_lost", "carrier_exception"].includes(String(context.risk_state || ""))
           const cardTone = row.severity === "high" ? "border-red-300 bg-red-50/40" : row.severity === "medium" ? "border-amber-300 bg-amber-50/35" : "border-emerald-200 bg-card"
           return (
-            <article key={row.id} className={`w-full rounded-xl border p-4 shadow-sm ${cardTone}`}>
-              <div className="grid gap-4 xl:grid-cols-[210px_minmax(280px,1.35fr)_minmax(230px,1fr)_minmax(220px,1fr)_190px] xl:items-center">
-                <div className="min-w-0">
+            <article key={row.id} className={`flex h-[640px] min-w-0 flex-col rounded-xl border p-5 shadow-sm ${cardTone}`}>
+              <div className="flex h-full min-h-0 flex-col gap-4">
+                <header className="min-w-0 border-b pb-4">
                   <Badge variant={row.severity === "high" ? "destructive" : "outline"}>{row.title}</Badge>
                   <h3 className="mt-2 text-lg font-bold">{row.odoo_order_name || row.tracking_code}</h3>
                   <p className="text-sm text-muted-foreground">{row.store_name}{row.website_id ? ` · Website ${row.website_id}` : ""}</p>
+                  <p className="mt-1 text-sm text-muted-foreground"><span className="font-medium text-foreground">Odoo order date:</span> {row.odoo_order_date ? formatOrderDateTime(row.odoo_order_date) : "Not recorded"}</p>
                   {row.odoo_order_url ? <a className="mt-2 inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline" href={row.odoo_order_url} target="_blank">Open in Odoo <ExternalLink className="size-3" /></a> : null}
-                </div>
+                </header>
 
-                <div className="min-w-0 border-l pl-4">
+                <div className="min-h-0 flex-1 overflow-y-auto pr-1">
                   {itemCase ? (
                     <div className="grid gap-2">
                       <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Affected product{row.affected_items.length === 1 ? "" : "s"}</span>
@@ -12090,7 +12092,7 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
                   )}
                 </div>
 
-                <div className="min-w-0 border-l pl-4">
+                <div className="min-w-0 border-t pt-4">
                   <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{decisionCase ? "Current request" : "Assessment"}</span>
                   <strong className="mt-1 block text-sm">{decisionCase ? currentLabel : context.risk_reason}</strong>
                   {previousLabel && previousLabel !== currentLabel ? <span className="mt-2 block text-xs text-muted-foreground">Previous request: {previousLabel}</span> : null}
@@ -12098,14 +12100,14 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
                   {row.confirmed_at ? <Badge variant="secondary" className="mt-2">Links expired after approval</Badge> : null}
                 </div>
 
-                <div className="min-w-0 border-l pl-4 text-sm">
+                <div className="min-w-0 border-t pt-4 text-sm">
                   <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Status</span>
                   <strong className="mt-1 block">{row.status.replaceAll("_", " ")}</strong>
                   {awaitingFirstScan ? <p className="mt-2 text-xs text-muted-foreground">No carrier events received — not classified as lost. No lost email queued.</p> : null}
                   {context.last_update_at ? <p className="mt-2 text-xs text-muted-foreground">Last update {formatDateTime(context.last_update_at)}</p> : null}
                 </div>
 
-                <div className="grid gap-2">
+                <div className="mt-auto grid shrink-0 grid-cols-2 gap-2 border-t pt-4">
                   {row.current_decision && !row.confirmed_at ? <Button onClick={() => void confirmDecision(row)}>Confirm decision</Button> : null}
                   {!row.confirmed_at && decisionCase ? <Button variant="outline" onClick={() => void createTestLink(row)}>Preview customer choices</Button> : null}
                   <Button variant="outline" onClick={() => void sendTestEmail(row)}>Send test email</Button>

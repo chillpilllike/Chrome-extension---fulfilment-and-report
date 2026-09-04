@@ -37564,7 +37564,11 @@ def after_order_case_dict(row: Any) -> dict[str, Any]:
 def after_order_case_by_id(case_id: int) -> Optional[dict[str, Any]]:
     with db() as conn:
         row = conn.execute(
-            """SELECT after_order_cases.*, stores.name AS store_name, stores.odoo_url
+            """SELECT after_order_cases.*, stores.name AS store_name, stores.odoo_url,
+                      (SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+                       FROM order_lines
+                       WHERE order_lines.store_id=after_order_cases.store_id
+                         AND order_lines.odoo_order_id=after_order_cases.odoo_order_id) AS odoo_order_date
                FROM after_order_cases JOIN stores ON stores.id=after_order_cases.store_id
                WHERE after_order_cases.id=?""",
             (case_id,),
@@ -37599,7 +37603,11 @@ def api_after_order_cases(
         total = int(conn.execute(f"SELECT COUNT(*) AS count FROM after_order_cases WHERE {where}", params).fetchone()["count"] or 0)
         rows = conn.execute(
             f"""
-            SELECT after_order_cases.*, stores.name AS store_name, stores.odoo_url
+            SELECT after_order_cases.*, stores.name AS store_name, stores.odoo_url,
+                   (SELECT MIN(NULLIF(order_lines.odoo_order_date, ''))
+                    FROM order_lines
+                    WHERE order_lines.store_id=after_order_cases.store_id
+                      AND order_lines.odoo_order_id=after_order_cases.odoo_order_id) AS odoo_order_date
             FROM after_order_cases JOIN stores ON stores.id=after_order_cases.store_id
             WHERE {where}
             ORDER BY CASE after_order_cases.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
