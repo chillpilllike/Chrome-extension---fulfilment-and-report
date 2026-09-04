@@ -115,14 +115,19 @@ function setErrorStatus(error) {
   setStatus(error.message || String(error) || "Action failed.", "error", { hold: "forever" });
 }
 
-function updateModeNotice() {
+function updateModeNotice(state = null) {
   const mode = headlessTrackingMode.checked
     ? "Headless mode starts tracking in the local app's background Chrome profile. It reuses the same Amazon parser as normal mode."
     : "Normal mode opens Amazon tabs in this Chrome window and tracks with the extension.";
   const auto = autoTrackingEnabled.checked
     ? ` Auto mode will check every ${Math.max(1, Math.min(168, Number(autoTrackingHours.value || 3)))} hour(s).`
     : " Auto mode is off.";
-  modeNotice.textContent = `${mode}${auto}`;
+  const accountName = String(state?.amazonAccountName || "").trim();
+  const accountType = String(state?.amazonAccountType || "").trim().toLowerCase();
+  const identity = accountName && ["consumer", "business"].includes(accountType)
+    ? ` Routing only ${accountName} (${accountType}) orders.`
+    : " Open an Amazon page to detect the account name and type before tracking.";
+  modeNotice.textContent = `${mode}${auto}${identity}`;
 }
 
 function progressText(progress = {}) {
@@ -230,6 +235,7 @@ async function refresh() {
   if (!targetWindowId) await resolveTargetWindowId();
   const state = await send({ type: "GET_STATE" });
   syncSettingsInputs(state);
+  updateModeNotice(state);
   const tracking = state.tracking || {};
   const trackAllRunning = tracking.running === true && tracking.source === "history";
   const trackAllResumable = canResumeTrackAll(tracking);

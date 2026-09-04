@@ -82,6 +82,7 @@ class ChromeJobCompletePayload(BaseModel):
     amazon_order_id: str = ""
     amazon_order_url: str = ""
     amazon_account_name: str = ""
+    amazon_account_type: str = ""
     order_date: str = ""
     amazon_recipient: str = ""
     amazon_asins: list[str] = []
@@ -118,6 +119,7 @@ class ChromeTrackingUpdatePayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
     amazon_account_name: str = ""
+    amazon_account_type: str = ""
     packages: list[dict[str, Any]] = []
     products: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
@@ -150,6 +152,8 @@ class DispatchPlacePayload(BaseModel):
 class AmazonHistoryOrderPayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
+    amazon_account_name: str = ""
+    amazon_account_type: str = ""
     recipient: str = ""
     status: str = ""
     order_date: str = ""
@@ -169,6 +173,7 @@ class ManualAmazonOrderMatchPayload(BaseModel):
     amazon_order_id: str
     amazon_order_url: str = ""
     amazon_account_name: str = ""
+    amazon_account_type: str = ""
     order_date: str = ""
     order_names: list[str] = []
     line_ids: list[int] = []

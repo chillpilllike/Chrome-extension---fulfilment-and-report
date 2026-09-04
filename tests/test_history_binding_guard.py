@@ -54,14 +54,14 @@ class HistoryBindingGuardTests(unittest.TestCase):
         raw.row_factory = sqlite3.Row
         self.addCleanup(raw.close)
         raw.executescript("""
-            CREATE TABLE amazon_order_history_unmatched (amazon_order_id TEXT,asins_json TEXT,status TEXT);
+            CREATE TABLE amazon_order_history_unmatched (amazon_order_id TEXT,asins_json TEXT,status TEXT,amazon_account_name TEXT,amazon_account_type TEXT);
             CREATE TABLE order_lines (id INTEGER,store_id INTEGER,odoo_order_id INTEGER,odoo_order_name TEXT,
-                asin TEXT,amazon_order_id TEXT,amazon_order_url TEXT,amazon_account_name TEXT,order_engine TEXT,
+                asin TEXT,amazon_order_id TEXT,amazon_order_url TEXT,amazon_account_name TEXT,amazon_account_type TEXT,order_engine TEXT,
                 amazon_status TEXT,state TEXT,tracking_status TEXT,tracking_payload TEXT,missing_asin TEXT,
                 last_error TEXT,ordered_at TEXT,updated_at TEXT,odoo_status_label TEXT);
         """)
         order = "114-1687848-6942605"
-        raw.execute("INSERT INTO amazon_order_history_unmatched VALUES (?,?,?)", (order, '["B00G3A1UGO"]', "Delivered"))
+        raw.execute("INSERT INTO amazon_order_history_unmatched (amazon_order_id,asins_json,status) VALUES (?,?,?)", (order, '["B00G3A1UGO"]', "Delivered"))
         for id, asin, amazon_id in [(1,"B00G3A1UGO",order),(2,"B0876DXBXN",order),(3,"B0FSG4V4H8","113-5692721-3297812")]:
             raw.execute("""INSERT INTO order_lines
                 (id,store_id,odoo_order_id,odoo_order_name,asin,amazon_order_id,amazon_account_name,

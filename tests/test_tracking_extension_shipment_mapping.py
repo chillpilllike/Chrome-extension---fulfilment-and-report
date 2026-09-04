@@ -20,7 +20,7 @@ class TrackingExtensionShipmentMappingTests(unittest.TestCase):
         self.assertLess(helper.index("if (shipmentGrid) return shipmentGrid;"), helper.index("if (shipmentComponent) return shipmentComponent;"))
 
     def test_tracking_extension_version_was_bumped(self):
-        self.assertEqual(MANIFEST["version"], "0.1.72")
+        self.assertEqual(MANIFEST["version"], "0.1.74")
 
     def test_manual_tracking_pages_sync_without_bypassing_active_queue_guard(self):
         # Execute the actual tracking-page branch, not a copy of its condition.

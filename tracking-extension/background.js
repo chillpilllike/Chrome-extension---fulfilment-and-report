@@ -23,6 +23,7 @@ async function getState() {
     tracking: { running: false, orders: [], index: 0, packages: [], packageIndex: 0 },
     recentTrackingChecks: [],
     amazonAccountName: "",
+    amazonAccountType: "",
     trackingByWindow: {},
     logs: [],
     logsByWindow: {},
@@ -318,6 +319,7 @@ async function postGuardedTrackingUpdate(amazonOrderId, payload = {}, options = 
       ...payload,
       amazon_order_id: expected,
       amazon_account_name: String(payload.amazon_account_name || state.amazonAccountName || "").trim(),
+      amazon_account_type: String(payload.amazon_account_type || state.amazonAccountType || "").trim().toLowerCase(),
       packages,
     }),
   });
@@ -878,8 +880,19 @@ async function startTracking(windowId, options = {}) {
   const state = await getState();
   const { headlessTrackingMode } = state;
   if (headlessTrackingMode) return startHeadlessTracking();
+  const accountName = String(state.amazonAccountName || "").trim();
+  const accountType = String(state.amazonAccountType || "").trim().toLowerCase();
+  if (!accountName || !["consumer", "business"].includes(accountType)) {
+    const message = "Tracking stopped: open an Amazon page in this profile so the extension can verify both the signed-in account name and whether it is a Consumer or Business account.";
+    await log(message, windowId);
+    return { ok: false, message };
+  }
   const isAutoRun = options.source === "auto";
-  const payload = await fetchAllTrackingOrders("active", { includeHistoryRefresh: !isAutoRun });
+  const payload = await fetchAllTrackingOrders("active", {
+    includeHistoryRefresh: !isAutoRun,
+    amazonAccountName: accountName,
+    amazonAccountType: accountType,
+  });
   const { recentTrackingChecks } = await getState();
   const recent = recentCheckSet(recentTrackingChecks);
   const allOrders = (payload.orders || []).filter((order) => !trackingOrderAlreadyDelivered(order));
@@ -996,15 +1009,45 @@ async function startManualOrderQueueTracking(windowId, amazonOrderIds = [], sour
   if (!orderIds.length) {
     return { ok: false, message: "Paste at least one valid Amazon order number like 113-0000000-0000000." };
   }
-  const orders = orderIds.map((orderId) => ({
-    amazon_order_id: orderId,
-    amazon_order_url: orderUrl({ amazon_order_id: orderId }),
-  }));
+  const state = await getState();
+  const accountName = String(state.amazonAccountName || "").trim();
+  const accountType = String(state.amazonAccountType || "").trim().toLowerCase();
+  if (!accountName || !["consumer", "business"].includes(accountType)) {
+    return { ok: false, message: "Open an Amazon page first so the extension can verify the account name and Consumer/Business type." };
+  }
+  const routedOrders = [];
+  for (let offset = 0; offset < orderIds.length; offset += 10) {
+    const batch = orderIds.slice(offset, offset + 10);
+    const results = await Promise.all(batch.map(async (orderId) => {
+      const params = new URLSearchParams({
+        status: "all",
+        q: orderId,
+        page: "1",
+        per_page: "100",
+        include_history_refresh: "0",
+        amazon_account_name: accountName,
+        amazon_account_type: accountType,
+      });
+      const payload = await api(`/api/tracking/orders?${params.toString()}`, { timeoutMs: 30000 });
+      return (payload.orders || []).find((order) => String(order.amazon_order_id || "").trim() === orderId) || null;
+    }));
+    routedOrders.push(...results.filter(Boolean));
+  }
+  const eligibleIds = new Set(routedOrders.map((order) => String(order.amazon_order_id || "").trim()));
+  const skippedIds = orderIds.filter((orderId) => !eligibleIds.has(orderId));
+  if (!routedOrders.length) {
+    return { ok: false, message: `No entered order belongs to ${accountName} (${accountType}) in the app. Nothing was opened on Amazon.` };
+  }
+  if (skippedIds.length) {
+    await log(`Skipped ${skippedIds.length} order(s) assigned to another Amazon identity: ${skippedIds.join(", ")}.`, windowId);
+  }
+  const orders = routedOrders;
+  const routedOrderIds = orders.map((order) => String(order.amazon_order_id || "").trim());
   const tracking = {
     running: true,
     source: source === "single" && orders.length === 1 ? "single" : source === "payment_recheck" ? "payment_recheck" : "manual",
-    singleOrderId: orders.length === 1 ? orderIds[0] : "",
-    batchOrderIds: orderIds,
+    singleOrderId: orders.length === 1 ? routedOrderIds[0] : "",
+    batchOrderIds: routedOrderIds,
     orders,
     index: 0,
     packages: [],
@@ -1018,15 +1061,15 @@ async function startManualOrderQueueTracking(windowId, amazonOrderIds = [], sour
     lastActivityAt: Date.now(),
     lastMessage: source === "payment_recheck"
       ? `Payment revision recheck started for ${orders.length} Amazon orders.`
-      : orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`,
+      : orders.length === 1 ? `Single-order tracking started for ${routedOrderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`,
   };
   await saveTracking(tracking, windowId);
   await ensureWatchdog();
-  await log(source === "payment_recheck" ? `Payment revision recheck started for ${orders.length} Amazon orders.` : orders.length === 1 ? `Single-order tracking started for ${orderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`, windowId);
+  await log(source === "payment_recheck" ? `Payment revision recheck started for ${orders.length} Amazon orders.` : orders.length === 1 ? `Single-order tracking started for ${routedOrderIds[0]}.` : `Queued-order tracking started for ${orders.length} Amazon orders.`, windowId);
   await openCurrentOrder(windowId);
   return {
     ok: true,
-    message: source === "payment_recheck" ? `Started payment revision recheck for ${orders.length} Amazon orders.` : orders.length === 1 ? `Started tracking Amazon order ${orderIds[0]}.` : `Started tracking ${orders.length} queued Amazon orders.`,
+    message: source === "payment_recheck" ? `Started payment revision recheck for ${orders.length} Amazon orders.` : orders.length === 1 ? `Started tracking Amazon order ${routedOrderIds[0]}.` : `Started tracking ${orders.length} queued Amazon orders.`,
     progress: trackingProgress(tracking),
   };
 }
@@ -1039,9 +1082,11 @@ async function fetchAllTrackingOrders(status = "active", options = {}) {
   const seen = new Set();
   const state = await getState();
   const amazonAccountName = String(options.amazonAccountName || state.amazonAccountName || "").trim();
+  const amazonAccountType = String(options.amazonAccountType || state.amazonAccountType || "").trim().toLowerCase();
   while (page <= 200) {
     const params = new URLSearchParams({ page: String(page), per_page: String(perPage), status });
     if (amazonAccountName) params.set("amazon_account_name", amazonAccountName);
+    if (["consumer", "business"].includes(amazonAccountType)) params.set("amazon_account_type", amazonAccountType);
     if (options.includeHistoryRefresh === false) params.set("include_history_refresh", "0");
     const payload = await api(`/api/tracking/orders?${params.toString()}`, { timeoutMs: 30000 });
     total = Number(payload.total || total || 0);
@@ -1096,6 +1141,7 @@ function normalizeHistoryOrder(order = {}) {
     amazon_order_id: orderId,
     amazon_order_url: order.amazon_order_url || orderUrl({ amazon_order_id: orderId }),
     amazon_account_name: String(order.amazon_account_name || order.amazonAccountName || "").trim(),
+    amazon_account_type: String(order.amazon_account_type || order.amazonAccountType || "").trim().toLowerCase(),
     recipient: String(order.recipient || "").replace(/\s+/g, " ").trim(),
     order_date: String(order.order_date || "").replace(/\s+/g, " ").trim(),
     status: String(order.status || "").replace(/\s+/g, " ").trim(),
@@ -1178,6 +1224,7 @@ async function manualMatchHistoryOrder(normalized, rows, windowId) {
       amazon_order_id: normalized.amazon_order_id,
       amazon_order_url: normalized.amazon_order_url,
       amazon_account_name: normalized.amazon_account_name || "",
+      amazon_account_type: normalized.amazon_account_type || "",
       order_date: normalized.order_date,
       order_names: orderNames,
       line_ids: lineIds,
@@ -2391,8 +2438,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === "AMAZON_ACCOUNT_CONTEXT") {
       const amazonAccountName = String(message.amazonAccountName || "").replace(/\s+/g, " ").trim().slice(0, 160);
-      if (amazonAccountName) await chrome.storage.local.set({ amazonAccountName });
-      return { ok: true, amazonAccountName };
+      const amazonAccountType = String(message.amazonAccountType || "").trim().toLowerCase();
+      const updates = {
+        amazonAccountName,
+        amazonAccountType: ["consumer", "business"].includes(amazonAccountType) ? amazonAccountType : "",
+      };
+      await chrome.storage.local.set(updates);
+      return { ok: true, ...updates };
     }
     if (message.type === "CONTENT_LOG") {
       await log(message.message || "Amazon content script reported activity.", windowId);

@@ -299,6 +299,30 @@ function amazonSignedInAccountName() {
   return "";
 }
 
+function amazonAccountType() {
+  const url = new URL(location.href);
+  const purchaseProgram = clean(url.searchParams.get("purchasePrograms") || "").toLowerCase();
+  if (
+    purchaseProgram === "amazon_business"
+    || url.pathname.includes("/checkout/entry/cart/amazon_business")
+    || url.searchParams.get("referrer") === "businessCart"
+  ) return "business";
+  const businessShell = [...document.querySelectorAll([
+    "#nav-logo a[aria-label*='Amazon Business' i]",
+    "a#nav-logo-sprites[aria-label*='Amazon Business' i]",
+    "a[href*='ref_=ab_checkout_logo']",
+    "a[href*='business.amazon.com'][aria-label*='Amazon Business' i]",
+  ].join(", "))].find(visible);
+  if (businessShell) return "business";
+  const consumerShell = [
+    document.querySelector("#navbar"),
+    document.querySelector("#nav-main"),
+    document.querySelector("#nav-link-accountList"),
+    document.querySelector("a[href*='ref_=nav_logo']"),
+  ].find(visible);
+  return consumerShell ? "consumer" : "unknown";
+}
+
 function absoluteUrl(href) {
   return new URL(href, location.href).href;
 }
@@ -621,6 +645,7 @@ function extractHistoryTrackOrders() {
       amazon_order_id: orderId,
       amazon_order_url: orderDetailsUrl(orderId),
       amazon_account_name: amazonSignedInAccountName(),
+      amazon_account_type: amazonAccountType(),
       recipient: orderCardRecipient(card),
       order_date: orderCardDate(card),
       status,
@@ -1073,8 +1098,9 @@ async function run() {
   if (!/amazon\.com$/i.test(location.hostname)) return;
   if (!isRelevantTrackingPage()) return;
   const signedInAccountName = amazonSignedInAccountName();
-  if (signedInAccountName) {
-    await send({ type: "AMAZON_ACCOUNT_CONTEXT", amazonAccountName: signedInAccountName });
+  const signedInAccountType = typeof amazonAccountType === "function" ? amazonAccountType() : "unknown";
+  if (signedInAccountName || signedInAccountType !== "unknown") {
+    await send({ type: "AMAZON_ACCOUNT_CONTEXT", amazonAccountName: signedInAccountName, amazonAccountType: signedInAccountType });
   }
   const runSignature = location.href;
   const now = Date.now();

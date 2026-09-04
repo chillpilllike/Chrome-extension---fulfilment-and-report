@@ -1053,6 +1053,7 @@ def init_db() -> None:
                 amazon_order_url TEXT,
                 amazon_account_id INTEGER,
                 amazon_account_name TEXT,
+                amazon_account_type TEXT,
                 order_engine TEXT NOT NULL DEFAULT 'rest',
                 amazon_group_key TEXT,
                 amazon_status TEXT,
@@ -1101,6 +1102,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS amazon_order_history_unmatched (
                 amazon_order_id TEXT PRIMARY KEY,
                 amazon_order_url TEXT,
+                amazon_account_name TEXT,
+                amazon_account_type TEXT,
                 recipient TEXT,
                 status TEXT,
                 order_date TEXT,
@@ -1785,8 +1788,13 @@ def init_db() -> None:
             if column not in existing_epost_cols:
                 conn.execute(ddl)
         existing_history_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_order_history_unmatched)").fetchall()}
-        if "items_json" not in existing_history_cols:
-            conn.execute("ALTER TABLE amazon_order_history_unmatched ADD COLUMN items_json TEXT NOT NULL DEFAULT '[]'")
+        for column, ddl in {
+            "items_json": "ALTER TABLE amazon_order_history_unmatched ADD COLUMN items_json TEXT NOT NULL DEFAULT '[]'",
+            "amazon_account_name": "ALTER TABLE amazon_order_history_unmatched ADD COLUMN amazon_account_name TEXT",
+            "amazon_account_type": "ALTER TABLE amazon_order_history_unmatched ADD COLUMN amazon_account_type TEXT",
+        }.items():
+            if column not in existing_history_cols:
+                conn.execute(ddl)
         existing_pickup_detail_cols = {r["name"] for r in conn.execute("PRAGMA table_info(package_pickup_non_amazon)").fetchall()}
         if "package_type" not in existing_pickup_detail_cols:
             conn.execute("ALTER TABLE package_pickup_non_amazon ADD COLUMN package_type TEXT NOT NULL DEFAULT 'non_amazon'")
@@ -1938,6 +1946,7 @@ def init_db() -> None:
             "chrome_claim_expires_at": "ALTER TABLE order_lines ADD COLUMN chrome_claim_expires_at TEXT",
             "amazon_account_id": "ALTER TABLE order_lines ADD COLUMN amazon_account_id INTEGER",
             "amazon_account_name": "ALTER TABLE order_lines ADD COLUMN amazon_account_name TEXT",
+            "amazon_account_type": "ALTER TABLE order_lines ADD COLUMN amazon_account_type TEXT",
             "order_engine": "ALTER TABLE order_lines ADD COLUMN order_engine TEXT NOT NULL DEFAULT 'rest'",
             "amazon_group_key": "ALTER TABLE order_lines ADD COLUMN amazon_group_key TEXT",
             "source_odoo_line_ids": "ALTER TABLE order_lines ADD COLUMN source_odoo_line_ids TEXT",
@@ -3349,6 +3358,11 @@ def normalize_amazon_order_id(value: Any) -> str:
     return order_id if re.fullmatch(r"\d{3}-\d{7}-\d{7}", order_id) else ""
 
 
+def normalize_amazon_account_type(value: Any) -> str:
+    account_type = clean_text(value).lower()
+    return account_type if account_type in {"consumer", "business"} else ""
+
+
 def amazon_history_order_record(order: Any) -> dict[str, Any]:
     data = order.model_dump() if hasattr(order, "model_dump") else dict(order or {})
     order_id = normalize_amazon_order_id(data.get("amazon_order_id"))
@@ -3383,6 +3397,8 @@ def amazon_history_order_record(order: Any) -> dict[str, Any]:
     return {
         "amazon_order_id": order_id,
         "amazon_order_url": clean_text(data.get("amazon_order_url")) or order_line_amazon_url(order_id),
+        "amazon_account_name": clean_text(data.get("amazon_account_name")),
+        "amazon_account_type": normalize_amazon_account_type(data.get("amazon_account_type")),
         "recipient": clean_text(data.get("recipient")),
         "status": status,
         "order_date": clean_text(data.get("order_date")),
@@ -3426,6 +3442,8 @@ def amazon_history_records_cache_key(prefix: str, records: list[dict[str, Any]])
     normalized = [
         {
             "amazon_order_id": clean_text(record.get("amazon_order_id")),
+            "amazon_account_name": clean_text(record.get("amazon_account_name")),
+            "amazon_account_type": normalize_amazon_account_type(record.get("amazon_account_type")),
             "recipient": clean_text(record.get("recipient")),
             "status": clean_text(record.get("status")),
             "order_date": clean_text(record.get("order_date")),
@@ -4462,10 +4480,18 @@ def upsert_amazon_history_unmatched(conn: Any, records: list[dict[str, Any]], ma
             conn.execute(
                 """
                 UPDATE amazon_order_history_unmatched
-                SET status=?, last_seen_at=?, resolved_at=COALESCE(resolved_at, ?)
+                SET status=?,
+                    amazon_account_name=COALESCE(NULLIF(?, ''), amazon_account_name),
+                    amazon_account_type=COALESCE(NULLIF(?, ''), amazon_account_type),
+                    last_seen_at=?, resolved_at=COALESCE(resolved_at, ?)
                 WHERE amazon_order_id=?
                 """,
-                (clean_text(record.get("status")) or "Cancelled", now, now, order_id),
+                (
+                    clean_text(record.get("status")) or "Cancelled",
+                    clean_text(record.get("amazon_account_name")),
+                    normalize_amazon_account_type(record.get("amazon_account_type")),
+                    now, now, order_id,
+                ),
             )
             continue
         resolved_at = now if order_id in matched_ids else None
@@ -4476,10 +4502,12 @@ def upsert_amazon_history_unmatched(conn: Any, records: list[dict[str, Any]], ma
         conn.execute(
             """
             INSERT INTO amazon_order_history_unmatched
-                (amazon_order_id, amazon_order_url, recipient, status, order_date, asins_json, items_json, first_seen_at, last_seen_at, seen_count, resolved_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                (amazon_order_id, amazon_order_url, amazon_account_name, amazon_account_type, recipient, status, order_date, asins_json, items_json, first_seen_at, last_seen_at, seen_count, resolved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(amazon_order_id) DO UPDATE SET
                 amazon_order_url=COALESCE(NULLIF(excluded.amazon_order_url, ''), amazon_order_history_unmatched.amazon_order_url),
+                amazon_account_name=COALESCE(NULLIF(excluded.amazon_account_name, ''), amazon_order_history_unmatched.amazon_account_name),
+                amazon_account_type=COALESCE(NULLIF(excluded.amazon_account_type, ''), amazon_order_history_unmatched.amazon_account_type),
                 recipient=COALESCE(NULLIF(excluded.recipient, ''), amazon_order_history_unmatched.recipient),
                 status=COALESCE(NULLIF(excluded.status, ''), amazon_order_history_unmatched.status),
                 order_date=COALESCE(NULLIF(excluded.order_date, ''), amazon_order_history_unmatched.order_date),
@@ -4492,6 +4520,8 @@ def upsert_amazon_history_unmatched(conn: Any, records: list[dict[str, Any]], ma
             (
                 order_id,
                 record["amazon_order_url"],
+                clean_text(record.get("amazon_account_name")),
+                normalize_amazon_account_type(record.get("amazon_account_type")),
                 record["recipient"],
                 record["status"],
                 record["order_date"],
@@ -10441,6 +10471,8 @@ def manual_order_refs_from_payload(payload: ManualAmazonOrderMatchPayload) -> li
 TRACKING_ACCOUNT_PLACEHOLDERS = {
     "amazon tracking track all",
     "chrome manual matcher",
+    "chrome history matcher",
+    "chrome extension",
     "amazon history",
     "default amazon business",
     "chrome browserless history matcher",
@@ -10461,6 +10493,31 @@ def preserve_real_amazon_account_name(existing: Any, incoming: Any) -> str:
     if candidate and not tracking_account_name_is_placeholder(candidate):
         return candidate
     return current or candidate
+
+
+def tracking_account_identity_error(
+    identity_rows: list[dict[str, Any]],
+    incoming_account_name: Any,
+    incoming_account_type: Any,
+) -> str:
+    incoming_name = clean_text(incoming_account_name).lower()
+    incoming_type = normalize_amazon_account_type(incoming_account_type)
+    expected_names = {
+        clean_text(row.get("amazon_account_name")).lower()
+        for row in identity_rows
+        if clean_text(row.get("amazon_account_name"))
+        and not tracking_account_name_is_placeholder(row.get("amazon_account_name"))
+    }
+    expected_types = {
+        normalize_amazon_account_type(row.get("amazon_account_type"))
+        for row in identity_rows
+        if normalize_amazon_account_type(row.get("amazon_account_type"))
+    }
+    if expected_names and (not incoming_name or incoming_name not in expected_names):
+        return "Amazon tracking account-name mismatch; update refused."
+    if expected_types and (not incoming_type or incoming_type not in expected_types):
+        return "Amazon tracking account-type mismatch; update refused."
+    return ""
 
 
 def safe_history_match_rows(
@@ -15005,21 +15062,41 @@ def paged_tracking_orders(
     page: int = 1,
     per_page: int = 100,
     amazon_account_name: str = "",
+    amazon_account_type: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     where_status, order_sql = tracking_filter_sql(status)
     search_clause, search_params = tracking_search_clause(q)
     account_name = clean_text(amazon_account_name)
+    account_type = normalize_amazon_account_type(amazon_account_type)
+    routed_account_name_expr = """
+        COALESCE(
+          NULLIF(CASE
+            WHEN LOWER(TRIM(COALESCE(order_lines.amazon_account_name, ''))) IN
+              ('', 'amazon tracking track all', 'chrome manual matcher', 'chrome history matcher',
+               'amazon history', 'chrome extension', 'account unverified', 'default amazon business')
+            THEN '' ELSE order_lines.amazon_account_name END, ''),
+          (SELECT NULLIF(history.amazon_account_name, '') FROM amazon_order_history_unmatched history
+           WHERE history.amazon_order_id=COALESCE(NULLIF(order_lines.amazon_order_id, ''), NULLIF(order_lines.amazon_cancelled_order_id, ''))),
+          ''
+        )
+    """
+    routed_account_type_expr = """
+        COALESCE(
+          NULLIF(order_lines.amazon_account_type, ''),
+          (SELECT NULLIF(history.amazon_account_type, '') FROM amazon_order_history_unmatched history
+           WHERE history.amazon_order_id=COALESCE(NULLIF(order_lines.amazon_order_id, ''), NULLIF(order_lines.amazon_cancelled_order_id, ''))),
+          ''
+        )
+    """
     account_clause = ""
     account_params: list[Any] = []
     if account_name:
-        account_clause = """
-          AND (
-            LOWER(COALESCE(amazon_account_name, '')) = LOWER(?)
-            OR LOWER(COALESCE(amazon_account_name, '')) IN ('', 'amazon tracking track all', 'chrome manual matcher', 'amazon history')
-          )
-        """
+        account_clause = f" AND LOWER(TRIM({routed_account_name_expr})) = LOWER(TRIM(?)) "
         account_params.append(account_name)
+    if account_type:
+        account_clause += f" AND LOWER(TRIM({routed_account_type_expr})) = ? "
+        account_params.append(account_type)
     order_expr = "COALESCE(NULLIF(amazon_order_id, ''), NULLIF(amazon_cancelled_order_id, ''), '')"
     target_order_sql = (
         """
@@ -15076,7 +15153,9 @@ def paged_tracking_orders(
                    order_lines.odoo_line_id, order_lines.asin, order_lines.product_name, order_lines.state,
                    order_lines.amazon_order_id, order_lines.amazon_order_url, order_lines.amazon_cancelled_at,
                    order_lines.amazon_cancelled_order_id, order_lines.tracking_status, order_lines.tracking_payload,
-                   order_lines.tracking_checked_at, order_lines.ordered_at, order_lines.updated_at
+                   order_lines.tracking_checked_at, order_lines.ordered_at, order_lines.updated_at,
+                   {routed_account_name_expr} AS amazon_account_name,
+                   {routed_account_type_expr} AS amazon_account_type
             FROM order_lines
             JOIN target_orders ON target_orders.amazon_key={order_expr}
             WHERE {base_where}
@@ -15110,6 +15189,8 @@ def paged_tracking_orders(
                 "tracking_status": row.get("tracking_status") or "",
                 "amazon_cancelled_at": row.get("amazon_cancelled_at") or "",
                 "amazon_cancelled_order_id": row.get("amazon_cancelled_order_id") or "",
+                "amazon_account_name": row.get("amazon_account_name") or "",
+                "amazon_account_type": row.get("amazon_account_type") or "",
             },
         )
         if row.get("odoo_order_name") not in entry["odoo_order_names"]:
@@ -15172,6 +15253,8 @@ def amazon_history_tracking_orders_for_refresh(limit: int = 500) -> list[dict[st
             "tracking_status": row.get("status") or "",
             "amazon_cancelled_at": "",
             "amazon_cancelled_order_id": "",
+            "amazon_account_name": row.get("amazon_account_name") or "",
+            "amazon_account_type": row.get("amazon_account_type") or "",
             "source": "amazon_order_history_unmatched",
             "recipient": row.get("recipient") or "",
             "asins": asins,
@@ -15190,6 +15273,8 @@ def stale_dispatch_package_tracking_orders_for_refresh(limit: int = 500) -> list
                     package.amazon_order_id,
                     MAX(COALESCE(NULLIF(package.amazon_order_url, ''), NULLIF(package.tracking_url, ''))) AS amazon_order_url,
                     STRING_AGG(DISTINCT line.odoo_order_name, ',') AS odoo_order_names,
+                    MAX(NULLIF(line.amazon_account_name, '')) AS amazon_account_name,
+                    MAX(NULLIF(line.amazon_account_type, '')) AS amazon_account_type,
                     MIN(NULLIF(package.updated_at, '')) AS oldest_package_update,
                     MAX(COALESCE(package.package_status, '') || ' ' || COALESCE(package.promise, '')) AS package_status
                 FROM amazon_dispatch_packages package
@@ -15228,6 +15313,8 @@ def stale_dispatch_package_tracking_orders_for_refresh(limit: int = 500) -> list
                 amazon_order_id,
                 MAX(amazon_order_url) AS amazon_order_url,
                 STRING_AGG(DISTINCT odoo_order_name, ',') AS odoo_order_names,
+                MAX(NULLIF(amazon_account_name, '')) AS amazon_account_name,
+                MAX(NULLIF(amazon_account_type, '')) AS amazon_account_type,
                 MIN(NULLIF(tracking_checked_at, '')) AS oldest_package_update,
                 'Mismatched stored tracking payload' AS package_status
             FROM order_lines
@@ -15256,6 +15343,8 @@ def stale_dispatch_package_tracking_orders_for_refresh(limit: int = 500) -> list
             "lines": [],
             "tracking_checked_at": row.get("oldest_package_update") or "",
             "tracking_status": clean_text(row.get("package_status")) or "Stale dispatch package",
+            "amazon_account_name": clean_text(row.get("amazon_account_name")),
+            "amazon_account_type": normalize_amazon_account_type(row.get("amazon_account_type")),
             "source": "stale_dispatch_package" if row in rows else "mismatched_tracking_payload",
         })
     return orders
@@ -32502,6 +32591,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
         raise HTTPException(409, "A valid Amazon order ID is required before a Chrome job can be completed.")
     amazon_order_url = clean_text(payload.amazon_order_url)
     chrome_account_name = clean_text(payload.amazon_account_name) or "Chrome Extension"
+    chrome_account_type = normalize_amazon_account_type(payload.amazon_account_type)
     amazon_order_placed_at = parse_amazon_order_placed_date(payload.order_date)
     ordered_at = amazon_order_placed_at or utc_now()
     pricing_by_asin: dict[str, dict[str, Any]] = {}
@@ -32623,6 +32713,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                             SET amazon_order_id=?,
                                 amazon_order_url=?,
                                 amazon_account_name=?,
+                                amazon_account_type=?,
                                 amazon_status='ordered',
                                 state='ordered',
                                 missing_asin=NULL,
@@ -32635,6 +32726,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                                 row_amazon_order_id,
                                 row_amazon_order_url,
                                 chrome_account_name,
+                                chrome_account_type or None,
                                 ordered_at,
                                 now,
                                 row["id"],
@@ -32806,6 +32898,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     asin=CASE WHEN ? THEN ? ELSE asin END,
                     product_name=CASE WHEN ? THEN ? ELSE product_name END,
                     amazon_account_name=?,
+                    amazon_account_type=?,
                     amazon_status='ordered',
                     state='ordered',
                     missing_asin=NULL,
@@ -32838,6 +32931,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
                     replacement_applies,
                     replacement_product_name,
                     chrome_account_name,
+                    chrome_account_type or None,
                     ordered_at,
                     utc_now(),
                     row["id"],
@@ -33041,8 +33135,10 @@ def api_tracking_orders(
     q: str = "",
     include_history_refresh: bool = True,
     amazon_account_name: str = "",
+    amazon_account_type: str = "",
 ) -> dict[str, Any]:
-    cache_key = ("tracking-orders", store_id, page, per_page, clean_text(status), clean_text(q), bool(include_history_refresh), clean_text(amazon_account_name).lower())
+    account_type = normalize_amazon_account_type(amazon_account_type)
+    cache_key = ("tracking-orders", store_id, page, per_page, clean_text(status), clean_text(q), bool(include_history_refresh), clean_text(amazon_account_name).lower(), account_type)
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -33053,17 +33149,26 @@ def api_tracking_orders(
         page,
         per_page,
         amazon_account_name=amazon_account_name,
+        amazon_account_type=account_type,
     )
     if include_history_refresh and page == 1 and clean_text(status).lower() in {"", "active"} and not clean_text(q):
         seen_order_ids = {clean_text(order.get("amazon_order_id")) for order in orders}
         appended_history_orders = 0
         for stale_order in stale_dispatch_package_tracking_orders_for_refresh():
+            if clean_text(amazon_account_name) and clean_text(stale_order.get("amazon_account_name")).lower() != clean_text(amazon_account_name).lower():
+                continue
+            if account_type and normalize_amazon_account_type(stale_order.get("amazon_account_type")) != account_type:
+                continue
             order_id = clean_text(stale_order.get("amazon_order_id"))
             if order_id and order_id not in seen_order_ids:
                 orders.append(stale_order)
                 seen_order_ids.add(order_id)
                 appended_history_orders += 1
         for history_order in amazon_history_tracking_orders_for_refresh():
+            if clean_text(amazon_account_name) and clean_text(history_order.get("amazon_account_name")).lower() != clean_text(amazon_account_name).lower():
+                continue
+            if account_type and normalize_amazon_account_type(history_order.get("amazon_account_type")) != account_type:
+                continue
             order_id = clean_text(history_order.get("amazon_order_id"))
             if order_id and order_id not in seen_order_ids:
                 orders.append(history_order)
@@ -35778,6 +35883,42 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
         tracking_package_delivered(package) for package in packages if isinstance(package, dict)
     )
     with db() as conn:
+        incoming_account_name = clean_text(payload.amazon_account_name)
+        incoming_account_type = normalize_amazon_account_type(payload.amazon_account_type)
+        identity_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT amazon_account_name, amazon_account_type
+            FROM order_lines
+            WHERE amazon_order_id=?
+            UNION ALL
+            SELECT amazon_account_name, amazon_account_type
+            FROM amazon_order_history_unmatched
+            WHERE amazon_order_id=?
+            """,
+            (amazon_order_id, amazon_order_id),
+        ).fetchall())
+        identity_error = tracking_account_identity_error(
+            identity_rows,
+            incoming_account_name,
+            incoming_account_type,
+        )
+        if identity_error:
+            raise HTTPException(409, identity_error)
+        if incoming_account_name or incoming_account_type:
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET amazon_account_name=CASE WHEN ? != '' THEN ? ELSE amazon_account_name END,
+                    amazon_account_type=CASE WHEN ? != '' THEN ? ELSE amazon_account_type END,
+                    updated_at=?
+                WHERE amazon_order_id=?
+                """,
+                (
+                    incoming_account_name, incoming_account_name,
+                    incoming_account_type, incoming_account_type,
+                    utc_now(), amazon_order_id,
+                ),
+            )
         otp_updated = upsert_amazon_otp_from_tracking_payload(
             conn,
             amazon_order_id,
@@ -36646,14 +36787,18 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         return {"ok": True, "matched": 0, "skipped": 0, "order_names": [], "message": f"No Nutricity order references found for {amazon_order_id}."}
     amazon_order_url = clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id)
     amazon_account_name = clean_text(payload.amazon_account_name) or "Chrome Manual Matcher"
+    amazon_account_type = normalize_amazon_account_type(payload.amazon_account_type)
     amazon_order_placed_at = parse_amazon_order_placed_date(payload.order_date)
     ordered_at = amazon_order_placed_at or utc_now()
     line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
     with db() as conn:
         history = row_to_dict(conn.execute(
-            "SELECT asins_json, status FROM amazon_order_history_unmatched WHERE amazon_order_id=?",
+            "SELECT * FROM amazon_order_history_unmatched WHERE amazon_order_id=?",
             (amazon_order_id,),
         ).fetchone()) or {}
+        if tracking_account_name_is_placeholder(amazon_account_name):
+            amazon_account_name = clean_text(history.get("amazon_account_name")) or amazon_account_name
+        amazon_account_type = amazon_account_type or normalize_amazon_account_type(history.get("amazon_account_type"))
         if payload.cancelled or "cancel" in clean_text(history.get("status")).lower():
             raise HTTPException(409, "Cancelled Amazon history cannot assign or reset fulfilment lines.")
         # Legacy clients saved ASIN evidence in their preceding history lookup.
@@ -36722,27 +36867,26 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
             if not clean_text(row.get("amazon_order_id")):
                 resolved_account_name = amazon_account_name if not tracking_account_name_is_placeholder(amazon_account_name) else "Account unverified"
             if clean_text(row.get("amazon_order_id")) == amazon_order_id:
-                if amazon_order_placed_at:
-                    conn.execute(
-                        """
-                        UPDATE order_lines
-                        SET amazon_order_url=?,
-                            amazon_account_name=?,
-                            ordered_at=?,
-                            updated_at=?
-                        WHERE id=?
-                        """,
-                        (amazon_order_url, resolved_account_name, amazon_order_placed_at, now, row["id"]),
-                    )
-                    updated_for_shopify.append({
-                        **dict(row),
-                        "amazon_order_url": amazon_order_url,
-                        "amazon_account_name": resolved_account_name,
-                        "ordered_at": amazon_order_placed_at,
-                        "updated_at": now,
-                    })
-                else:
-                    updated_for_shopify.append(dict(row))
+                conn.execute(
+                    """
+                    UPDATE order_lines
+                    SET amazon_order_url=?,
+                        amazon_account_name=?,
+                        amazon_account_type=COALESCE(NULLIF(?, ''), amazon_account_type),
+                        ordered_at=COALESCE(NULLIF(?, ''), ordered_at),
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (amazon_order_url, resolved_account_name, amazon_account_type, amazon_order_placed_at, now, row["id"]),
+                )
+                updated_for_shopify.append({
+                    **dict(row),
+                    "amazon_order_url": amazon_order_url,
+                    "amazon_account_name": resolved_account_name,
+                    "amazon_account_type": amazon_account_type or row.get("amazon_account_type"),
+                    "ordered_at": amazon_order_placed_at or row.get("ordered_at"),
+                    "updated_at": now,
+                })
                 continue
             conn.execute(
                 """
@@ -36750,6 +36894,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 SET amazon_order_id=?,
                     amazon_order_url=?,
                     amazon_account_name=?,
+                    amazon_account_type=?,
                     amazon_account_id=NULL,
                     amazon_cancelled_order_id=CASE
                         WHEN COALESCE(amazon_order_id, '') != '' AND amazon_order_id != ?
@@ -36781,6 +36926,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                     amazon_order_id,
                     amazon_order_url,
                     resolved_account_name,
+                    amazon_account_type or None,
                     amazon_order_id,
                     amazon_order_id,
                     amazon_order_id,
@@ -36795,6 +36941,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
                 "amazon_order_id": amazon_order_id,
                 "amazon_order_url": amazon_order_url,
                 "amazon_account_name": resolved_account_name,
+                "amazon_account_type": amazon_account_type or None,
                 "amazon_account_id": None,
                 "amazon_cancelled_order_id": clean_text(row.get("amazon_cancelled_order_id")) or (
                     clean_text(row.get("amazon_order_id"))
