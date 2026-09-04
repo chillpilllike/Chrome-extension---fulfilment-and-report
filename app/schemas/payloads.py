@@ -311,6 +311,11 @@ class EpostRefundPayload(BaseModel):
 class AfterOrderDecisionPayload(BaseModel):
     decision: str
     note: str = ""
+    selected_product_id: Optional[int] = None
+
+
+class AfterOrderAlternativePayload(BaseModel):
+    product_tmpl_id: int
 
 
 class AfterOrderConfirmPayload(BaseModel):

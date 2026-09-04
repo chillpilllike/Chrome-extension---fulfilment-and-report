@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+  <template id="order_update_error" name="Order update unavailable">
+    <t t-call="website.layout">
+      <main class="container py-5">
+        <div class="mx-auto" style="max-width:760px">
+          <div class="alert alert-warning shadow-sm"><h1 class="h3">Order update unavailable</h1><p class="mb-0" t-esc="message"/></div>
+        </div>
+      </main>
+    </t>
+  </template>
+
+  <template id="order_update_page" name="Order update">
+    <t t-call="website.layout">
+      <t t-set="case" t-value="payload.get('case') or {}"/>
+      <t t-set="order_data" t-value="payload.get('order') or {}"/>
+      <t t-set="allowed" t-value="payload.get('allowed_actions') or []"/>
+      <t t-set="labels" t-value="payload.get('action_labels') or {}"/>
+      <main class="container py-5">
+        <div class="mx-auto" style="max-width:1040px">
+          <div t-if="payload.get('test_mode')" class="alert alert-info">Test preview — choices on this page do not change the order.</div>
+          <div t-if="message" class="alert alert-success" t-esc="message"/>
+          <header class="mb-4">
+            <span class="badge text-bg-primary mb-2">Order <t t-esc="order_data.get('name')"/></span>
+            <h1 class="display-6 fw-bold" t-esc="case.get('title') or 'Order update'"/>
+            <p class="text-muted mb-0">Review your order and choose what you would like us to do.</p>
+          </header>
+
+          <div class="row g-4">
+            <section class="col-lg-7">
+              <div class="card shadow-sm border-0">
+                <div class="card-header bg-white"><h2 class="h5 mb-0">Order details</h2></div>
+                <div class="card-body">
+                  <t t-if="order">
+                    <t t-foreach="order.order_line" t-as="line">
+                      <div t-if="not line.display_type" class="d-flex gap-3 align-items-center border-bottom py-3">
+                        <img t-if="line.product_id" t-att-src="'/web/image/product.product/%s/image_128' % line.product_id.id" width="72" height="72" class="rounded border object-fit-contain" alt="Product"/>
+                        <div class="flex-grow-1"><strong t-esc="line.name"/><div class="text-muted">Quantity <t t-esc="line.product_uom_qty"/></div></div>
+                        <strong t-field="line.price_subtotal" t-options="{'widget': 'monetary', 'display_currency': order.currency_id}"/>
+                      </div>
+                    </t>
+                    <div class="d-flex justify-content-between pt-3"><span class="fw-semibold">Order total</span><strong t-field="order.amount_total" t-options="{'widget': 'monetary', 'display_currency': order.currency_id}"/></div>
+                    <a t-if="order_data.get('portal_path')" class="btn btn-link px-0 mt-3" t-att-href="order_data.get('portal_path')">View complete order details</a>
+                  </t>
+                </div>
+              </div>
+
+              <div t-if="'offer_alternatives' in allowed" class="card shadow-sm border-0 mt-4">
+                <div class="card-header bg-white"><h2 class="h5 mb-0">Choose an alternative</h2></div>
+                <div class="card-body">
+                  <p class="text-muted">Recommended products appear first. Select one product for our team to review.</p>
+                  <div class="row g-3">
+                    <div t-foreach="alternatives" t-as="product" class="col-6 col-md-4">
+                      <div class="card h-100">
+                        <img t-att-src="'/web/image/product.template/%s/image_256' % product.id" class="card-img-top p-3 object-fit-contain" height="170" alt="Product"/>
+                        <div class="card-body d-flex flex-column"><strong class="small" t-esc="product.name"/><span class="mt-2 fw-semibold" t-field="product.list_price" t-options="{'widget': 'monetary', 'display_currency': product.currency_id}"/>
+                          <form class="mt-auto pt-3" t-att-action="'/order-update/%s/decision' % token" method="post">
+                            <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/><input type="hidden" name="decision" value="offer_alternatives"/><input type="hidden" name="selected_product_id" t-att-value="product.id"/>
+                            <button class="btn btn-primary w-100" type="submit">Select</button>
+                          </form>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <aside class="col-lg-5">
+              <div class="card shadow-sm border-0 position-sticky" style="top:24px">
+                <div class="card-header bg-white"><h2 class="h5 mb-0">What would you like to do?</h2></div>
+                <div class="card-body d-grid gap-2">
+                  <div t-if="payload.get('locked')" class="alert alert-secondary mb-0">This request has already been completed.</div>
+                  <t t-if="not payload.get('locked')">
+                    <t t-foreach="allowed" t-as="action">
+                      <t t-if="action != 'offer_alternatives'">
+                        <form t-att-action="'/order-update/%s/decision' % token" method="post">
+                          <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/><input type="hidden" name="decision" t-att-value="action"/>
+                          <button t-attf-class="btn w-100 py-3 #{'btn-danger' if action in ['cancel_order', 'refund', 'not_received'] else ('btn-success' if action in ['proceed', 'received'] else 'btn-outline-primary')}" type="submit" t-esc="labels.get(action) or action"/>
+                        </form>
+                      </t>
+                    </t>
+                  </t>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </main>
+    </t>
+  </template>
+</odoo>

@@ -53,6 +53,7 @@ from app.schemas import (
     AdminSettingsPayload,
     AfterOrderConfirmPayload,
     AfterOrderDecisionPayload,
+    AfterOrderAlternativePayload,
     AfterOrderTestModePayload,
     AmazonAccountPayload,
     AmazonHistoryLookupPayload,
@@ -1379,6 +1380,7 @@ def init_db() -> None:
                 affected_items_json TEXT NOT NULL DEFAULT '[]',
                 context_json TEXT NOT NULL DEFAULT '{}',
                 current_decision TEXT,
+                selected_product_id INTEGER,
                 previous_decision TEXT,
                 decision_version INTEGER NOT NULL DEFAULT 0,
                 decision_updated_at TEXT,
@@ -1395,8 +1397,33 @@ def init_db() -> None:
                 case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
                 token_hash TEXT NOT NULL UNIQUE,
                 allowed_actions_json TEXT NOT NULL DEFAULT '[]',
+                test_mode INTEGER NOT NULL DEFAULT 0,
                 expires_at TEXT,
                 invalidated_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_alternatives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
+                product_tmpl_id INTEGER NOT NULL,
+                product_name TEXT NOT NULL,
+                rank INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(case_id, product_tmpl_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_refund_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL UNIQUE REFERENCES after_order_cases(id) ON DELETE CASCADE,
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                odoo_order_id INTEGER NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                currency TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -1897,6 +1924,12 @@ def init_db() -> None:
         existing_unsubscribe_cols = {r["name"] for r in conn.execute("PRAGMA table_info(after_order_unsubscribe_links)").fetchall()}
         if "case_id" not in existing_unsubscribe_cols:
             conn.execute("ALTER TABLE after_order_unsubscribe_links ADD COLUMN case_id INTEGER REFERENCES after_order_cases(id) ON DELETE CASCADE")
+        existing_action_link_cols = {r["name"] for r in conn.execute("PRAGMA table_info(after_order_action_links)").fetchall()}
+        if "test_mode" not in existing_action_link_cols:
+            conn.execute("ALTER TABLE after_order_action_links ADD COLUMN test_mode INTEGER NOT NULL DEFAULT 0")
+        existing_after_order_case_cols = {r["name"] for r in conn.execute("PRAGMA table_info(after_order_cases)").fetchall()}
+        if "selected_product_id" not in existing_after_order_case_cols:
+            conn.execute("ALTER TABLE after_order_cases ADD COLUMN selected_product_id INTEGER")
         existing_history_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_order_history_unmatched)").fetchall()}
         for column, ddl in {
             "items_json": "ALTER TABLE amazon_order_history_unmatched ADD COLUMN items_json TEXT NOT NULL DEFAULT '[]'",
@@ -37434,7 +37467,7 @@ def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
     if case.get("confirmed_at"):
         return []
     if case.get("case_type") == "item_unavailable":
-        return ["exclude_item_and_proceed", "cancel_affected_item", "offer_alternatives", "cancel_order"]
+        return ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"]
     if case.get("case_type") == "delivery_confirmation":
         return ["received", "not_received"]
     if clean_text((case.get("context") or {}).get("risk_state")) in {"suspected_lost", "carrier_exception"}:
@@ -37526,6 +37559,9 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                     "line_id": int(row["id"]),
                     "product_name": clean_text(row.get("product_name")) or asin or "Affected product",
                     "quantity": float(row.get("quantity") or 1),
+                    "original_unit_price": float(row.get("store_unit_price") or 0),
+                    "original_line_total": float(row.get("store_total_native") or row.get("store_total_price") or 0),
+                    "currency": clean_text(row.get("store_currency")),
                     "asin": asin,
                     "thumbnail_url": f"/api/public/asin-image/{quote_plus(asin)}" if asin else "",
                     "odoo_product_url": f"{odoo_base}/web#id={product_id}&model=product.product&view_type=form" if odoo_base and product_id else "",
@@ -37663,6 +37699,13 @@ def after_order_case_dict(row: Any) -> dict[str, Any]:
         item["context"] = json.loads(item.pop("context_json", "{}") or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         item["context"] = {}
+    if item.get("id"):
+        with db() as conn:
+            refund = conn.execute(
+                "SELECT amount, currency, status, last_error, updated_at FROM after_order_refund_requests WHERE case_id=?",
+                (item["id"],),
+            ).fetchone()
+        item["refund_request"] = row_to_dict(refund) if refund else None
     item["odoo_order_url"] = odoo_order_admin_url({"odoo_url": item.get("odoo_url") or ""}, item.get("odoo_order_id"))
     return item
 
@@ -37770,6 +37813,55 @@ def api_after_order_case_events(case_id: int) -> dict[str, Any]:
     return {"ok": True, "rows": rows}
 
 
+@app.get("/api/after-order/cases/{case_id}/alternatives")
+def api_after_order_alternatives(case_id: int) -> dict[str, Any]:
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
+    return {"ok": True, "rows": after_order_pinned_alternatives(case_id)}
+
+
+@app.post("/api/after-order/cases/{case_id}/alternatives")
+def api_after_order_add_alternative(case_id: int, payload: AfterOrderAlternativePayload) -> dict[str, Any]:
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
+    product_tmpl_id = int(payload.product_tmpl_id or 0)
+    if product_tmpl_id <= 0:
+        raise HTTPException(400, "Enter a valid Odoo product template ID.")
+    try:
+        odoo = OdooClient(get_store(int(case["store_id"])))
+        products = odoo.read(
+            "product.template", [product_tmpl_id],
+            odoo.existing_fields("product.template", ["id", "name", "sale_ok", "active"]),
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Could not read that product from Odoo: {clean_error_message(exc)}") from exc
+    product = products[0] if products else {}
+    if not product or product.get("active") is False or product.get("sale_ok") is False:
+        raise HTTPException(404, "That active sale product was not found in this Odoo store.")
+    product_name = clean_text(product.get("name")) or f"Product {product_tmpl_id}"
+    now = utc_now()
+    with db() as conn:
+        rank_row = conn.execute("SELECT MIN(rank) AS rank FROM after_order_alternatives WHERE case_id=?", (case_id,)).fetchone()
+        rank = int((rank_row["rank"] if rank_row and rank_row["rank"] is not None else 0)) - 1
+        conn.execute(
+            """INSERT INTO after_order_alternatives
+               (case_id, product_tmpl_id, product_name, rank, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(case_id, product_tmpl_id) DO UPDATE SET
+                 product_name=excluded.product_name, rank=excluded.rank, updated_at=excluded.updated_at""",
+            (case_id, product_tmpl_id, product_name, rank, now, now),
+        )
+        record_after_order_event(
+            conn, case_id, "alternative_product_pinned", actor_type="team", actor_label="Operations team",
+            details={"product_tmpl_id": product_tmpl_id, "product_name": product_name},
+        )
+    return {"ok": True, "message": f"{product_name} will appear first in the customer alternatives.", "rows": after_order_pinned_alternatives(case_id)}
+
+
 def after_order_absolute_url(request: Request, path: str) -> str:
     configured = clean_text(get_service_settings().get("after_order_public_base_url")).rstrip("/")
     base = configured or str(request.base_url).rstrip("/")
@@ -37795,8 +37887,12 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any]) -> dict[str, 
             partners = odoo.read("res.partner", [partner_id], odoo.existing_fields("res.partner", ["email"]))
             customer_email = clean_text((partners[0] if partners else {}).get("email"))
         if website_id:
-            websites = odoo.read("website", [int(website_id)], odoo.existing_fields("website", ["domain"]))
-            raw_domain = clean_text((websites[0] if websites else {}).get("domain"))
+            websites = odoo.read("website", [int(website_id)], odoo.existing_fields("website", ["domain", "name"]))
+            website = websites[0] if websites else {}
+            raw_domain = clean_text(website.get("domain"))
+            website_name = clean_text(website.get("name"))
+            if website_name:
+                context["website_name"] = website_name
             if raw_domain.lower() not in {"", "false", "none"}:
                 parsed_website = urlparse(raw_domain if "://" in raw_domain else f"https://{raw_domain}")
                 candidate_domain = clean_text(parsed_website.hostname).lower()
@@ -37865,7 +37961,6 @@ def after_order_email_content(
         "replacement": ("#206bc4", "#ffffff"),
         "offer_alternatives": ("#4299e1", "#ffffff"),
         "exclude_item_and_proceed": ("#626976", "#ffffff"),
-        "cancel_affected_item": ("#d63939", "#ffffff"),
         "cancel_order": ("#d63939", "#ffffff"),
         "refund": ("#d63939", "#ffffff"),
         "not_received": ("#d63939", "#ffffff"),
@@ -37906,7 +38001,7 @@ def after_order_email_content(
     elif case_type == "item_unavailable":
         subject = f"{order_number} — An item needs your choice"
         heading = "An item in your order needs your choice"
-        intro = f"Order <strong>{order_name}</strong> has one or more currently unavailable items. Only the affected items are shown."
+        intro = f"Order <strong>{order_name}</strong> has one or more currently unavailable items. Only the affected items are shown. If you remove an unavailable item, any amount charged for it will be refunded after our team reviews and confirms your request."
         body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
         plain = f"An item in order {clean_text(case.get('odoo_order_name'))} needs your choice. Respond here: {action_url}"
     elif template_kind == "package_lost" or clean_text(context.get("risk_state")) in {"suspected_lost", "carrier_exception"}:
@@ -37942,9 +38037,8 @@ def after_order_email_content(
           <h1 style="margin:16px 0 10px;color:#1d273b;font:700 25px/1.25 Arial,sans-serif">{heading}</h1>
           <div style="color:#4b5565;font:15px/1.65 Arial,sans-serif">{intro}</div>
           {body}
-          {f'<div style="margin-top:20px;padding:12px 14px;border-left:3px solid #f59f00;background:#fff8e6;color:#6b4f00;font:13px/1.5 Arial,sans-serif">You can change your request until our team confirms it. After confirmation, all action links expire.</div>' if actions else ''}
         </td></tr>
-        <tr><td style="padding:20px 28px;background:#f8f9fa;border-top:1px solid #e6e9ed;color:#667085;font:12px/1.6 Arial,sans-serif;text-align:center">This message relates to order {order_name}.{unsubscribe_html}</td></tr>
+        <tr><td style="padding:20px 28px;background:#f8f9fa;border-top:1px solid #e6e9ed;color:#667085;font:12px/1.6 Arial,sans-serif;text-align:center">This message relates to order {order_name} placed on {html.escape(clean_text(context.get('website_name')) or clean_text(case.get('store_name')) or 'our website')}.{unsubscribe_html}</td></tr>
       </table>
     </td></tr></table></body></html>"""
     return subject, html_body, plain
@@ -38028,7 +38122,7 @@ def api_after_order_email_preview(case_id: int) -> dict[str, Any]:
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
-    link = api_after_order_action_link(case_id)
+    link = create_after_order_action_link(case_id, request)
     action_url = clean_text(link.get("url"))
     subject, preview, _ = after_order_email_content(case, action_url)
     now = utc_now()
@@ -38067,7 +38161,7 @@ def send_after_order_email(
     case = hydrate_after_order_recipient_and_domain(case)
     showcase_actions = {
         "expected_dispatch": ["proceed", "cancel_order"],
-        "item_unavailable": ["offer_alternatives", "exclude_item_and_proceed", "cancel_affected_item", "cancel_order"],
+        "item_unavailable": ["offer_alternatives", "exclude_item_and_proceed", "cancel_order"],
         "delivery_confirmation": ["received", "not_received"],
         "package_lost": ["replacement", "refund"],
         "package_movement": [],
@@ -38075,11 +38169,17 @@ def send_after_order_email(
     }
     allowed = showcase_actions.get(showcase_kind, after_order_allowed_actions(case) if not template_kind else [])
     action_url = ""
+    branded_tracking_url = ""
     if showcase_kind and allowed:
-        action_url = after_order_absolute_url(request, "/after-order-care")
+        action_url = clean_text(create_after_order_action_link(
+            case_id, request, allowed_override=allowed, test_mode=True,
+        ).get("url"))
     elif allowed:
-        relative = clean_text(api_after_order_action_link(case_id).get("url"))
-        action_url = after_order_absolute_url(request, relative)
+        action_url = clean_text(create_after_order_action_link(case_id, request).get("url"))
+    elif showcase_kind == "package_movement" or (not showcase_kind and not template_kind and case.get("case_type") == "tracking"):
+        branded_tracking_url = clean_text(create_after_order_action_link(
+            case_id, request, allowed_override=[], test_mode=force_test or after_order_email_test_mode(), view_only=True,
+        ).get("url"))
     test_mode = force_test or after_order_email_test_mode()
     intended_recipient = clean_text(case.get("customer_email"))
     try:
@@ -38125,6 +38225,8 @@ def send_after_order_email(
                 request,
                 f"/package-tracker?q={quote_plus(tracker_query)}&field=all",
             )
+        if branded_tracking_url:
+            email_case["context"]["tracking_url"] = branded_tracking_url
         email_case["affected_items"] = [dict(item) for item in case.get("affected_items") or []]
         for item in email_case["affected_items"]:
             thumbnail = clean_text(item.get("thumbnail_url"))
@@ -38273,30 +38375,57 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
     }
 
 
-@app.post("/api/after-order/cases/{case_id}/action-link")
-def api_after_order_action_link(case_id: int) -> dict[str, Any]:
+def create_after_order_action_link(
+    case_id: int,
+    request: Request,
+    *,
+    allowed_override: Optional[list[str]] = None,
+    test_mode: Optional[bool] = None,
+    view_only: bool = False,
+) -> dict[str, Any]:
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
-    if case.get("confirmed_at"):
+    case = hydrate_after_order_recipient_and_domain(case)
+    is_test = after_order_email_test_mode() if test_mode is None else bool(test_mode)
+    if case.get("confirmed_at") and not is_test:
         raise HTTPException(409, "This decision is already confirmed and its links are expired.")
-    allowed = after_order_allowed_actions(case)
-    if not allowed:
+    allowed = list(allowed_override) if allowed_override is not None else after_order_allowed_actions(case)
+    if not allowed and not view_only:
         raise HTTPException(409, "This case does not currently require a customer decision.")
+    domain = clean_text(case.get("sender_domain")).lower()
+    if not domain or not re.fullmatch(r"[a-z0-9.-]+", domain):
+        raise HTTPException(409, "The order website domain is not configured in Odoo.")
     token = f"{uuid.uuid4().hex}{uuid.uuid4().hex}"
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = utc_now()
-    test_mode = after_order_email_test_mode()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
     with db() as conn:
         conn.execute(
             """INSERT INTO after_order_action_links
-               (case_id, token_hash, allowed_actions_json, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (case_id, token_hash, json.dumps(allowed), now, now),
+               (case_id, token_hash, allowed_actions_json, test_mode, expires_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (case_id, token_hash, json.dumps(allowed), 1 if is_test else 0, expires_at, now, now),
         )
-        record_after_order_event(conn, case_id, "action_link_created", details={"allowed_actions": allowed, "test_mode": test_mode})
-    return {"ok": True, "url": f"/api/public/after-order/action/{token}", "allowed_actions": allowed}
+        record_after_order_event(conn, case_id, "action_link_created", details={"allowed_actions": allowed, "test_mode": is_test, "website_domain": domain})
+    fallback_url = after_order_absolute_url(request, f"/api/public/after-order/action/{token}")
+    bridge_ready = bool(clean_text(get_service_settings().get("after_order_bridge_key"))) and clean_text(
+        get_service_settings().get("after_order_website_portal_enabled")
+    ).lower() in {"1", "true", "yes", "on"}
+    return {
+        "ok": True,
+        "url": f"https://{domain}/order-update/{token}" if bridge_ready else fallback_url,
+        "fallback_url": fallback_url,
+        "allowed_actions": allowed,
+        "test_mode": is_test,
+        "website_portal_ready": bridge_ready,
+    }
+
+
+@app.post("/api/after-order/cases/{case_id}/action-link")
+def api_after_order_action_link(case_id: int, request: Request) -> dict[str, Any]:
+    return create_after_order_action_link(case_id, request)
 
 
 def after_order_action_link(token: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -38313,7 +38442,164 @@ def after_order_action_link(token: str) -> tuple[dict[str, Any], dict[str, Any]]
     if not case:
         raise HTTPException(404, "This decision link is invalid.")
     require_after_order_case_in_scope(case)
+    expires_at = parse_any_datetime(link.get("expires_at"))
+    if expires_at and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(410, "This decision link has expired.")
     return case, link
+
+
+def require_after_order_bridge(request: Request) -> None:
+    configured = clean_text(get_service_settings().get("after_order_bridge_key"))
+    supplied = clean_text(request.headers.get("x-after-order-bridge-key"))
+    if not configured:
+        raise HTTPException(503, "The Odoo after-order bridge is not configured.")
+    if not supplied or not hmac.compare_digest(configured, supplied):
+        raise HTTPException(401, "Invalid Odoo after-order bridge credentials.")
+
+
+def require_after_order_website_host(request: Request, case: dict[str, Any]) -> dict[str, Any]:
+    hydrated = hydrate_after_order_recipient_and_domain(case)
+    expected_host = clean_text(hydrated.get("sender_domain")).lower()
+    supplied_host = clean_text(request.headers.get("x-website-host")).split(":", 1)[0].lower().removeprefix("www.")
+    if not expected_host or not supplied_host or not hmac.compare_digest(expected_host, supplied_host):
+        raise HTTPException(403, "This link belongs to another website.")
+    return hydrated
+
+
+def after_order_pinned_alternatives(case_id: int) -> list[dict[str, Any]]:
+    with db() as conn:
+        return rows_to_dicts(conn.execute(
+            """SELECT product_tmpl_id, product_name, rank
+               FROM after_order_alternatives WHERE case_id=?
+               ORDER BY rank ASC, id ASC""",
+            (case_id,),
+        ).fetchall())
+
+
+def record_after_order_customer_decision(
+    case: dict[str, Any],
+    link: dict[str, Any],
+    decision: str,
+    *,
+    selected_product_id: Optional[int] = None,
+    actor_label: str = "Email action link",
+) -> tuple[bool, dict[str, Any], str]:
+    normalized = normalize_customer_decision(decision)
+    try:
+        allowed = json.loads(link.get("allowed_actions_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "This decision is not available for the order.") from exc
+    if normalized not in allowed:
+        raise HTTPException(400, "This decision is not available for the order.")
+    if normalized == "offer_alternatives" and not int(selected_product_id or 0):
+        raise HTTPException(400, "Select an alternative product before continuing.")
+    if normalized == "offer_alternatives":
+        try:
+            odoo = OdooClient(get_store(int(case["store_id"])))
+            fields = odoo.existing_fields("product.template", ["id", "active", "sale_ok", "is_published", "website_id"])
+            products = odoo.read("product.template", [int(selected_product_id or 0)], fields)
+            product = products[0] if products else {}
+            product_website_id = many2one_id(product.get("website_id"))
+            if (
+                not product
+                or product.get("active") is False
+                or product.get("sale_ok") is False
+                or product.get("is_published") is False
+                or (product_website_id and int(product_website_id) != int(case.get("website_id") or 0))
+            ):
+                raise ValueError("The selected product is not available on this website.")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, f"Could not validate the selected product in Odoo: {clean_error_message(exc)}") from exc
+    if bool(link.get("test_mode")):
+        return False, case, "Test preview only — no customer decision or Odoo change was recorded."
+    now = utc_now()
+    recorded = False
+    with db() as conn:
+        latest = conn.execute("SELECT current_decision, confirmed_at FROM after_order_cases WHERE id=?", (case["id"],)).fetchone()
+        if latest and not latest["confirmed_at"]:
+            previous = clean_text(latest["current_decision"])
+            cursor = conn.execute(
+                """UPDATE after_order_cases
+                   SET previous_decision=current_decision, current_decision=?, selected_product_id=?, decision_version=decision_version+1,
+                       decision_updated_at=?, status='needs_confirmation', updated_at=?
+                   WHERE id=? AND confirmed_at IS NULL""",
+                (normalized, int(selected_product_id or 0) or None, now, now, case["id"]),
+            )
+            recorded = bool(cursor.rowcount)
+            if recorded:
+                record_after_order_event(
+                    conn, int(case["id"]), "customer_decision_changed" if previous else "customer_decision_received",
+                    actor_type="customer", actor_label=actor_label, decision=normalized,
+                    details={"previous_decision": previous, "selected_product_id": int(selected_product_id or 0) or None},
+                )
+    refreshed = after_order_case_by_id(int(case["id"])) or case
+    message = "Your latest request has been recorded for team confirmation." if recorded else "Our team has already confirmed this request."
+    return recorded, refreshed, message
+
+
+@app.get("/api/public/after-order-bridge/action/{token}")
+def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any]:
+    require_after_order_bridge(request)
+    case, link = after_order_action_link(token)
+    case = require_after_order_website_host(request, case)
+    expected_host = clean_text(case.get("sender_domain")).lower()
+    try:
+        allowed = json.loads(link.get("allowed_actions_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        allowed = []
+    context = case.get("context") or {}
+    affected = case.get("affected_items") or []
+    search_terms = " ".join(clean_text(item.get("product_name")) for item in affected if clean_text(item.get("product_name")))
+    return {
+        "ok": True,
+        "order": {
+            "id": case.get("odoo_order_id"),
+            "name": case.get("odoo_order_name"),
+            "portal_path": f"/my/orders/{int(case.get('odoo_order_id') or 0)}" if case.get("odoo_order_id") else "",
+        },
+        "website": {
+            "id": case.get("website_id"),
+            "name": clean_text(context.get("website_name")) or clean_text(case.get("store_name")),
+            "domain": expected_host,
+            "logo_url": clean_text(context.get("website_logo_url")),
+        },
+        "case": {
+            "id": case.get("id"),
+            "type": case.get("case_type"),
+            "title": case.get("title"),
+            "status": case.get("status"),
+            "current_decision": case.get("current_decision"),
+            "confirmed": bool(case.get("confirmed_at")),
+            "tracking_code": case.get("tracking_code"),
+            "context": {
+                "latest_status": context.get("latest_status"),
+                "latest_location": context.get("latest_location"),
+                "tracking_url": context.get("tracking_url"),
+            },
+        },
+        "affected_items": affected,
+        "allowed_actions": allowed,
+        "action_labels": {action: AFTER_ORDER_ACTION_LABELS.get(action, action) for action in allowed},
+        "alternative_search_terms": search_terms,
+        "pinned_alternatives": after_order_pinned_alternatives(int(case["id"])),
+        "locked": bool(case.get("confirmed_at") or link.get("invalidated_at")),
+        "test_mode": bool(link.get("test_mode")),
+    }
+
+
+@app.post("/api/public/after-order-bridge/action/{token}")
+def api_after_order_bridge_decision(token: str, request: Request, payload: AfterOrderDecisionPayload) -> dict[str, Any]:
+    require_after_order_bridge(request)
+    case, link = after_order_action_link(token)
+    case = require_after_order_website_host(request, case)
+    _, refreshed, message = record_after_order_customer_decision(
+        case, link, payload.decision,
+        selected_product_id=payload.selected_product_id,
+        actor_label="Odoo website order update",
+    )
+    return {"ok": True, "message": message, "decision": refreshed.get("current_decision"), "test_mode": bool(link.get("test_mode"))}
 
 
 def render_after_order_action_page(token: str, case: dict[str, Any], link: dict[str, Any], message: str = "", suggested: str = "") -> HTMLResponse:
@@ -38362,35 +38648,51 @@ def public_after_order_action_submit(token: str, decision: str = Form(...)) -> H
     if case.get("confirmed_at") or link.get("invalidated_at"):
         return render_after_order_action_page(token, case, link)
     try:
-        normalized = normalize_customer_decision(decision)
-        allowed = json.loads(link.get("allowed_actions_json") or "[]")
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        _, refreshed, message = record_after_order_customer_decision(case, link, decision)
+    except ValueError as exc:
         raise HTTPException(400, "This decision is not available for the order.") from exc
-    if normalized not in allowed:
-        raise HTTPException(400, "This decision is not available for the order.")
-    now = utc_now()
-    recorded = False
-    with db() as conn:
-        latest = conn.execute("SELECT current_decision, confirmed_at FROM after_order_cases WHERE id=?", (case["id"],)).fetchone()
-        if latest and not latest["confirmed_at"]:
-            previous = clean_text(latest["current_decision"])
-            cursor = conn.execute(
-                """UPDATE after_order_cases
-                   SET previous_decision=current_decision, current_decision=?, decision_version=decision_version+1,
-                       decision_updated_at=?, status='needs_confirmation', updated_at=?
-                   WHERE id=? AND confirmed_at IS NULL""",
-                (normalized, now, now, case["id"]),
-            )
-            recorded = bool(cursor.rowcount)
-            if recorded:
-                record_after_order_event(
-                    conn, int(case["id"]), "customer_decision_changed" if previous else "customer_decision_received",
-                    actor_type="customer", actor_label="Email action link", decision=normalized,
-                    details={"previous_decision": previous},
-                )
-    refreshed = after_order_case_by_id(int(case["id"])) or case
-    message = "Your latest request has been recorded for team confirmation." if recorded else "Our team has already confirmed this request."
     return render_after_order_action_page(token, refreshed, link, message)
+
+
+def queue_after_order_partial_refund(case: dict[str, Any]) -> dict[str, Any]:
+    items = case.get("affected_items") or []
+    amount = round(sum(float(item.get("original_line_total") or 0) for item in items), 2)
+    currency = next((clean_text(item.get("currency")) for item in items if clean_text(item.get("currency"))), "")
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO after_order_refund_requests
+               (case_id, store_id, odoo_order_id, amount, currency, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+               ON CONFLICT(case_id) DO UPDATE SET amount=excluded.amount, currency=excluded.currency,
+                 status=CASE WHEN after_order_refund_requests.status='completed' THEN after_order_refund_requests.status ELSE 'pending' END,
+                 updated_at=excluded.updated_at""",
+            (case["id"], case["store_id"], case["odoo_order_id"], amount, currency, now, now),
+        )
+        record_after_order_event(
+            conn, int(case["id"]), "partial_refund_queued", actor_type="system",
+            details={"amount": amount, "currency": currency, "line_ids": [item.get("line_id") for item in items]},
+        )
+    note = (
+        f"After-order request approved: remove unavailable item(s) and continue.\n"
+        f"Partial refund queued for {currency + ' ' if currency else ''}{amount:.2f}.\n"
+        f"Affected fulfilment line IDs: {', '.join(str(item.get('line_id')) for item in items)}."
+    )
+    try:
+        OdooClient(get_store(int(case["store_id"]))).post_order_note(int(case["odoo_order_id"]), note)
+        with db() as conn:
+            record_after_order_event(conn, int(case["id"]), "odoo_refund_chatter_logged", actor_type="system")
+    except Exception as exc:
+        error = clean_error_message(exc)
+        with db() as conn:
+            conn.execute(
+                "UPDATE after_order_refund_requests SET last_error=?, updated_at=? WHERE case_id=?",
+                (error, utc_now(), case["id"]),
+            )
+            record_after_order_event(
+                conn, int(case["id"]), "odoo_refund_chatter_failed", actor_type="system", details={"error": error},
+            )
+    return {"amount": amount, "currency": currency, "status": "pending"}
 
 
 @app.post("/api/after-order/cases/{case_id}/confirm")
@@ -38443,6 +38745,9 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
                     details={"reason": "Customer reported that the carrier-marked delivery was not received."},
                 )
     message = "Decision was already confirmed." if already_confirmed else "Latest decision confirmed. All customer action links have expired."
+    if not already_confirmed and confirmed_case_type == "item_unavailable" and confirmed_decision == "exclude_item_and_proceed":
+        refund = queue_after_order_partial_refund(after_order_case_by_id(case_id) or case)
+        message += f" Partial refund queued for {refund['currency'] + ' ' if refund['currency'] else ''}{refund['amount']:.2f}."
     if not already_confirmed and confirmed_case_type == "delivery_confirmation" and confirmed_decision == "received":
         try:
             review_result = send_after_order_email(case_id, request, template_kind="trustpilot_review")

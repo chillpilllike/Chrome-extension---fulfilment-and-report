@@ -1214,6 +1214,7 @@ type AfterOrderCase = {
   tracking_provider?: string
   tracking_code?: string
   current_decision?: string
+  selected_product_id?: number | null
   previous_decision?: string
   decision_version: number
   decision_updated_at?: string
@@ -1229,6 +1230,7 @@ type AfterOrderCase = {
     odoo_product_url: string
   }>
   context: Record<string, any>
+  refund_request?: { amount: number; currency: string; status: string; last_error?: string } | null
 }
 
 type AfterOrderEvent = {
@@ -12006,6 +12008,26 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
     }
   }
 
+  const addRecommendedProduct = async (row: AfterOrderCase) => {
+    const entered = window.prompt("Enter the Odoo product template ID to place first in the alternatives grid.")
+    if (!entered) return
+    const productTemplateId = Number(entered)
+    if (!Number.isInteger(productTemplateId) || productTemplateId <= 0) {
+      onResult({ ok: false, title: "Invalid product", message: "Enter a valid numeric Odoo product template ID." })
+      return
+    }
+    try {
+      const result = await api<{ message: string }>(`/api/after-order/cases/${row.id}/alternatives`, {
+        method: "POST",
+        body: JSON.stringify({ product_tmpl_id: productTemplateId }),
+      })
+      onResult({ ok: true, title: "Recommended product added", message: result.message })
+      await openActivity(row)
+    } catch (error) {
+      onResult({ ok: false, title: "Alternative product failed", message: String(error) })
+    }
+  }
+
   const sendAllTestEmails = async () => {
     setSendingAllTests(true)
     try {
@@ -12120,6 +12142,9 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
                   <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{decisionCase ? "Current request" : "Assessment"}</span>
                   <strong className="mt-1 block text-sm">{decisionCase ? currentLabel : context.risk_reason}</strong>
                   {previousLabel && previousLabel !== currentLabel ? <span className="mt-2 block text-xs text-muted-foreground">Previous request: {previousLabel}</span> : null}
+                  {row.current_decision === "offer_alternatives" && row.selected_product_id ? <span className="mt-2 block text-xs font-medium text-primary">Selected Odoo product template: {row.selected_product_id}</span> : null}
+                  {row.refund_request ? <span className="mt-2 block text-xs font-medium text-primary">Partial refund: {row.refund_request.currency} {Number(row.refund_request.amount || 0).toFixed(2)} · {row.refund_request.status.replaceAll("_", " ")}</span> : null}
+                  {row.refund_request?.last_error ? <span className="mt-1 block text-xs text-destructive">Odoo refund log: {row.refund_request.last_error}</span> : null}
                   {row.current_decision && !row.confirmed_at ? <Badge variant="outline" className="mt-2">Link active until confirmation</Badge> : null}
                   {row.confirmed_at ? <Badge variant="secondary" className="mt-2">Links expired after approval</Badge> : null}
                 </div>
@@ -12134,6 +12159,7 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
                 <div className="mt-auto grid shrink-0 grid-cols-2 gap-2 border-t pt-4">
                   {row.current_decision && !row.confirmed_at ? <Button onClick={() => void confirmDecision(row)}>Confirm decision</Button> : null}
                   {!row.confirmed_at && decisionCase ? <Button variant="outline" onClick={() => void createTestLink(row)}>Preview customer choices</Button> : null}
+                  {itemCase && !row.confirmed_at ? <Button variant="outline" onClick={() => void addRecommendedProduct(row)}>Add recommended product</Button> : null}
                   <Button variant="outline" onClick={() => void sendTestEmail(row)}>Send test email</Button>
                   {!itemCase && (row.odoo_order_name || row.tracking_code) ? <Button onClick={() => window.open(`/package-tracker?q=${encodeURIComponent(row.odoo_order_name || row.tracking_code || "")}&field=all`, "_blank", "noopener,noreferrer")}>Track all details</Button> : null}
                   <Button variant="outline" onClick={() => void openActivity(row)}>View activity</Button>
