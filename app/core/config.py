@@ -132,6 +132,11 @@ DEFAULT_SERVICE_SETTINGS = {
     "email_smtp_secure": os.getenv("EMAIL_SMTP_SECURE", "true"),
     "email_smtp_user": os.getenv("EMAIL_SMTP_USER", "resend"),
     "email_system_address": os.getenv("EMAIL_SYSTEM_ADDRESS", "projects@gofinch.com"),
+    # Customer communication is fail-closed. The delivery worker must check
+    # this immediately before sending, including for messages queued earlier.
+    "after_order_email_test_mode": os.getenv("AFTER_ORDER_EMAIL_TEST_MODE", "true"),
+    "after_order_test_recipient": os.getenv("AFTER_ORDER_TEST_RECIPIENT", "sonianuj1284@gmail.com"),
+    "after_order_public_base_url": os.getenv("AFTER_ORDER_PUBLIC_BASE_URL", ""),
 }
 
 

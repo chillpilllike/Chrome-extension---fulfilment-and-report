@@ -51,6 +51,9 @@ from app import redis_support
 from app.schemas import (
     AddressPayload,
     AdminSettingsPayload,
+    AfterOrderConfirmPayload,
+    AfterOrderDecisionPayload,
+    AfterOrderTestModePayload,
     AmazonAccountPayload,
     AmazonHistoryLookupPayload,
     BackupKeyPayload,
@@ -98,6 +101,13 @@ from app.schemas import (
 )
 from app.services.amazon import amz_date, normalize_amazon_endpoint
 from app.services.amazon_otp import imap_connect, imap_search_since, parse_amazon_email
+from app.services.after_order import (
+    ResendEmailProvider,
+    normalize_customer_decision,
+    resolve_delivery_recipient,
+    tracking_risk,
+    trustpilot_review_url,
+)
 from app.services.asin import decode_asin_reference, encode_asin, extract_asin_from_notes, normalize_asin, strip_html
 
 
@@ -604,6 +614,7 @@ FRONTEND_SHELL_PATHS = {
     "/",
     "/home",
     "/orders",
+    "/after-order-care",
     "/pull-jobs",
     "/tracking",
     "/dispatch-sorting",
@@ -1349,6 +1360,102 @@ def init_db() -> None:
                 UNIQUE(store_id, tracking_code)
             );
 
+            CREATE TABLE IF NOT EXISTS after_order_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_key TEXT NOT NULL UNIQUE,
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                website_id INTEGER,
+                order_line_id INTEGER REFERENCES order_lines(id) ON DELETE SET NULL,
+                odoo_order_id INTEGER,
+                odoo_order_name TEXT,
+                case_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'needs_attention',
+                severity TEXT NOT NULL DEFAULT 'medium',
+                title TEXT NOT NULL,
+                customer_email TEXT,
+                sender_domain TEXT,
+                tracking_provider TEXT,
+                tracking_code TEXT,
+                affected_items_json TEXT NOT NULL DEFAULT '[]',
+                context_json TEXT NOT NULL DEFAULT '{}',
+                current_decision TEXT,
+                previous_decision TEXT,
+                decision_version INTEGER NOT NULL DEFAULT 0,
+                decision_updated_at TEXT,
+                decision_locked_at TEXT,
+                confirmed_at TEXT,
+                confirmed_by TEXT,
+                due_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_action_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                allowed_actions_json TEXT NOT NULL DEFAULT '[]',
+                expires_at TEXT,
+                invalidated_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_case_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                actor_type TEXT NOT NULL DEFAULT 'system',
+                actor_label TEXT,
+                decision TEXT,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
+                provider TEXT NOT NULL DEFAULT 'resend',
+                recipient TEXT,
+                sender TEXT,
+                subject TEXT,
+                html_preview TEXT,
+                status TEXT NOT NULL DEFAULT 'test_preview',
+                provider_message_id TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_unsubscribe_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                website_id INTEGER,
+                email TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'tracking_updates',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_notification_preferences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                preference_key TEXT NOT NULL UNIQUE,
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                website_id INTEGER,
+                email TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'tracking_updates',
+                opted_out_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_after_order_cases_store_status
+                ON after_order_cases(store_id, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_after_order_cases_website_status
+                ON after_order_cases(website_id, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_after_order_events_case_created
+                ON after_order_case_events(case_id, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS punchout_return_urls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 label TEXT NOT NULL,
@@ -1787,6 +1894,9 @@ def init_db() -> None:
         }.items():
             if column not in existing_epost_cols:
                 conn.execute(ddl)
+        existing_unsubscribe_cols = {r["name"] for r in conn.execute("PRAGMA table_info(after_order_unsubscribe_links)").fetchall()}
+        if "case_id" not in existing_unsubscribe_cols:
+            conn.execute("ALTER TABLE after_order_unsubscribe_links ADD COLUMN case_id INTEGER REFERENCES after_order_cases(id) ON DELETE CASCADE")
         existing_history_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_order_history_unmatched)").fetchall()}
         for column, ddl in {
             "items_json": "ALTER TABLE amazon_order_history_unmatched ADD COLUMN items_json TEXT NOT NULL DEFAULT '[]'",
@@ -17345,10 +17455,16 @@ def parse_epost_datetime(value: Any) -> Optional[datetime]:
 
 
 def epost_status_from_update(status: str, last_update_at: Any, fallback_at: Any = None) -> str:
+    if re.search(r"\b(not delivered|delivery failed|undeliverable|return to sender|damaged)\b", status or "", re.IGNORECASE):
+        return "lost"
     if re.search(r"\b(delivered|recipient collected|collected by recipient|successfully delivered)\b", status or "", re.IGNORECASE):
         return "delivered"
+    if not clean_text(status) and not clean_text(last_update_at):
+        return "awaiting_first_scan"
+    if re.search(r"\b(data received|electronic information|manifest|label created|pre-advised)\b", status or "", re.IGNORECASE):
+        return "awaiting_first_scan"
     update_dt = parse_epost_datetime(last_update_at) or parse_epost_datetime(fallback_at)
-    if update_dt and datetime.now(timezone.utc) - update_dt >= timedelta(days=12):
+    if update_dt and datetime.now(timezone.utc) - update_dt >= timedelta(days=10):
         return "lost"
     return "pending"
 
@@ -17520,7 +17636,8 @@ def refresh_epost_tracking_snapshot(row_id: int) -> dict[str, Any]:
     snapshot = fetch_epg_tracking_snapshot(row["tracking_code"])
     status = clean_text(snapshot.get("status")) or clean_text(row["status"])
     last_update_at = clean_text(snapshot.get("last_update_at")) or clean_text(row["last_update_at"])
-    epost_status = epost_status_from_update(status, last_update_at, row["created_at"])
+    risk = tracking_risk(snapshot.get("events") or [], status=status, stale_days=10)
+    epost_status = risk.state
     now = utc_now()
     with db() as conn:
         conn.execute(
@@ -37229,6 +37346,861 @@ def api_epost_refund_status(tracking_id: int, payload: EpostRefundPayload) -> di
             )
     updated = epost_tracking_rows_by_ids([tracking_id])
     return {"ok": True, "row": updated[0] if updated else None}
+
+
+AFTER_ORDER_ACTION_LABELS = {
+    "proceed": "Proceed",
+    "exclude_item_and_proceed": "Remove this item and continue",
+    "cancel_affected_item": "Cancel the affected item",
+    "offer_alternatives": "Offer alternatives",
+    "cancel_order": "Cancel the entire order",
+    "refund": "Refund",
+    "replacement": "Replacement",
+    "received": "Yes, I received it",
+    "not_received": "No, I did not receive it",
+}
+
+
+def after_order_email_test_mode() -> bool:
+    return clean_text(get_service_settings().get("after_order_email_test_mode", "true")).lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def after_order_test_recipient() -> str:
+    return clean_text(get_service_settings().get("after_order_test_recipient")) or "sonianuj1284@gmail.com"
+
+
+def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
+    if case.get("confirmed_at"):
+        return []
+    if case.get("case_type") == "item_unavailable":
+        return ["exclude_item_and_proceed", "cancel_affected_item", "offer_alternatives", "cancel_order"]
+    if case.get("case_type") == "delivery_confirmation":
+        return ["received", "not_received"]
+    if clean_text((case.get("context") or {}).get("risk_state")) in {"suspected_lost", "carrier_exception"}:
+        return ["refund", "replacement"]
+    return []
+
+
+def after_order_json_list(value: Any) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+        return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def record_after_order_event(
+    conn: Any,
+    case_id: int,
+    event_type: str,
+    *,
+    actor_type: str = "system",
+    actor_label: str = "",
+    decision: str = "",
+    details: Optional[dict[str, Any]] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO after_order_case_events
+        (case_id, event_type, actor_type, actor_label, decision, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (case_id, event_type, actor_type, actor_label, decision, json.dumps(details or {}, default=str), utc_now()),
+    )
+
+
+def sync_after_order_cases(store_id: Optional[int] = None) -> None:
+    """Materialize provider facts into review cases without executing actions."""
+    now = utc_now()
+    with db() as conn:
+        missing_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT order_lines.*, stores.website_id, stores.odoo_url,
+                   (SELECT COUNT(*) FROM order_lines AS sibling
+                    WHERE sibling.store_id=order_lines.store_id
+                      AND sibling.odoo_order_id=order_lines.odoo_order_id
+                      AND COALESCE(sibling.odoo_status_label, '') NOT IN ('cancelled', 'refunded')) AS order_item_count
+            FROM order_lines
+            JOIN stores ON stores.id=order_lines.store_id
+            WHERE order_lines.state='missing'
+              AND COALESCE(order_lines.odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+              AND (? IS NULL OR order_lines.store_id=?)
+            ORDER BY order_lines.store_id, order_lines.odoo_order_id, order_lines.id
+            """,
+            (store_id, store_id),
+        ).fetchall())
+        grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for row in missing_rows:
+            grouped.setdefault((int(row["store_id"]), int(row["odoo_order_id"])), []).append(row)
+        if store_id:
+            conn.execute(
+                "UPDATE after_order_cases SET status='resolved', updated_at=? WHERE case_type='item_unavailable' AND store_id=? AND confirmed_at IS NULL",
+                (now, store_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE after_order_cases SET status='resolved', updated_at=? WHERE case_type='item_unavailable' AND confirmed_at IS NULL",
+                (now,),
+            )
+        for (row_store_id, order_id), rows in grouped.items():
+            first = rows[0]
+            items = []
+            for row in rows:
+                asin = normalize_asin(row.get("missing_asin") or row.get("asin"))
+                product_id = int(row.get("product_id") or 0)
+                odoo_base = clean_text(row.get("odoo_url")).rstrip("/")
+                items.append({
+                    "line_id": int(row["id"]),
+                    "product_name": clean_text(row.get("product_name")) or asin or "Affected product",
+                    "quantity": float(row.get("quantity") or 1),
+                    "asin": asin,
+                    "thumbnail_url": f"/api/public/asin-image/{quote_plus(asin)}" if asin else "",
+                    "odoo_product_url": f"{odoo_base}/web#id={product_id}&model=product.product&view_type=form" if odoo_base and product_id else "",
+                })
+            case_key = f"unavailable:{row_store_id}:{order_id}"
+            conn.execute(
+                """
+                INSERT INTO after_order_cases
+                (case_key, store_id, website_id, order_line_id, odoo_order_id, odoo_order_name,
+                 case_type, status, severity, title, affected_items_json, context_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'item_unavailable', 'needs_attention', 'high',
+                        'Item unavailable', ?, ?, ?, ?)
+                ON CONFLICT(case_key) DO UPDATE SET
+                    website_id=excluded.website_id,
+                    order_line_id=excluded.order_line_id,
+                    odoo_order_name=excluded.odoo_order_name,
+                    affected_items_json=excluded.affected_items_json,
+                    context_json=excluded.context_json,
+                    status=CASE WHEN after_order_cases.confirmed_at IS NULL THEN 'needs_attention' ELSE after_order_cases.status END,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    case_key, row_store_id, first.get("website_id"), int(first["id"]), order_id,
+                    clean_text(first.get("odoo_order_name")), json.dumps(items),
+                    json.dumps({"affected_count": len(items), "order_item_count": int(first.get("order_item_count") or len(items))}),
+                    now, now,
+                ),
+            )
+
+        tracking_rows = rows_to_dicts(conn.execute(
+            """
+            SELECT epost_global_tracking.*,
+                   COALESCE(epost_global_tracking.website_id, stores.website_id) AS resolved_website_id
+            FROM epost_global_tracking
+            JOIN stores ON stores.id=epost_global_tracking.store_id
+            WHERE (? IS NULL OR epost_global_tracking.store_id=?)
+            ORDER BY epost_global_tracking.updated_at DESC
+            LIMIT 5000
+            """,
+            (store_id, store_id),
+        ).fetchall())
+        for row in tracking_rows:
+            events = after_order_json_list(row.get("events_json"))
+            risk = tracking_risk(events, status=clean_text(row.get("status")), stale_days=10)
+            if risk.state == "delivered":
+                case_type, case_status, severity = "delivery_confirmation", "needs_attention", "medium"
+            elif risk.state in {"suspected_lost", "carrier_exception"}:
+                case_type, case_status, severity = "tracking", "needs_attention", "high"
+            elif risk.state == "awaiting_first_scan":
+                case_type, case_status, severity = "tracking", "needs_attention", "medium"
+            else:
+                case_type, case_status, severity = "tracking", "tracking", "low"
+            case_key = f"tracking:{int(row['store_id'])}:{clean_text(row.get('tracking_code')).upper()}"
+            context = {
+                "risk_state": risk.state,
+                "risk_reason": risk.reason,
+                "customer_lost_email_allowed": risk.customer_lost_email_allowed,
+                "latest_status": clean_text(row.get("status")),
+                "latest_location": clean_text(row.get("location")),
+                "last_update_at": clean_text(row.get("last_update_at")),
+                "tracking_url": clean_text(row.get("tracking_url")),
+                "final_mile_carrier": clean_text(row.get("final_mile_carrier")),
+                "final_mile_tracking_number": clean_text(row.get("final_mile_tracking_number")),
+            }
+            conn.execute(
+                """
+                INSERT INTO after_order_cases
+                (case_key, store_id, website_id, order_line_id, odoo_order_id, odoo_order_name,
+                 case_type, status, severity, title, tracking_provider, tracking_code,
+                 context_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'epg', ?, ?, ?, ?)
+                ON CONFLICT(case_key) DO UPDATE SET
+                    website_id=excluded.website_id,
+                    order_line_id=COALESCE(excluded.order_line_id, after_order_cases.order_line_id),
+                    odoo_order_id=COALESCE(excluded.odoo_order_id, after_order_cases.odoo_order_id),
+                    odoo_order_name=COALESCE(NULLIF(excluded.odoo_order_name, ''), after_order_cases.odoo_order_name),
+                    case_type=CASE WHEN after_order_cases.confirmed_at IS NULL THEN excluded.case_type ELSE after_order_cases.case_type END,
+                    status=CASE WHEN after_order_cases.confirmed_at IS NULL THEN excluded.status ELSE after_order_cases.status END,
+                    severity=excluded.severity,
+                    title=excluded.title,
+                    context_json=excluded.context_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    case_key, int(row["store_id"]), row.get("resolved_website_id"), row.get("order_line_id"),
+                    row.get("odoo_order_id"), clean_text(row.get("odoo_order_name")), case_type, case_status, severity,
+                    "Awaiting first carrier scan" if risk.state == "awaiting_first_scan" else
+                    "Package may be lost" if risk.state == "suspected_lost" else
+                    "Carrier exception" if risk.state == "carrier_exception" else
+                    "Please confirm delivery" if risk.state == "delivered" else "Package in transit",
+                    clean_text(row.get("tracking_code")), json.dumps(context), now, now,
+                ),
+            )
+
+
+def after_order_case_dict(row: Any) -> dict[str, Any]:
+    item = row_to_dict(row) or {}
+    item["affected_items"] = after_order_json_list(item.pop("affected_items_json", "[]"))
+    try:
+        item["context"] = json.loads(item.pop("context_json", "{}") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        item["context"] = {}
+    item["odoo_order_url"] = odoo_order_admin_url({"odoo_url": item.get("odoo_url") or ""}, item.get("odoo_order_id"))
+    return item
+
+
+def after_order_case_by_id(case_id: int) -> Optional[dict[str, Any]]:
+    with db() as conn:
+        row = conn.execute(
+            """SELECT after_order_cases.*, stores.name AS store_name, stores.odoo_url
+               FROM after_order_cases JOIN stores ON stores.id=after_order_cases.store_id
+               WHERE after_order_cases.id=?""",
+            (case_id,),
+        ).fetchone()
+    return after_order_case_dict(row) if row else None
+
+
+@app.get("/api/after-order/cases")
+def api_after_order_cases(
+    store_id: Optional[int] = None,
+    status: str = "open",
+    q: str = "",
+    page: int = 1,
+    per_page: int = 50,
+) -> dict[str, Any]:
+    sync_after_order_cases(store_id)
+    page, per_page, offset = pagination_bounds(page, per_page)
+    filters = ["(? IS NULL OR after_order_cases.store_id=?)"]
+    params: list[Any] = [store_id, store_id]
+    normalized_status = clean_text(status).lower()
+    if normalized_status == "open":
+        filters.append("after_order_cases.status NOT IN ('resolved', 'approved')")
+    elif normalized_status and normalized_status != "all":
+        filters.append("after_order_cases.status=?")
+        params.append(normalized_status)
+    query = clean_text(q)
+    if query:
+        filters.append("UPPER(COALESCE(after_order_cases.odoo_order_name, '') || ' ' || COALESCE(after_order_cases.tracking_code, '') || ' ' || after_order_cases.title) LIKE ?")
+        params.append(f"%{query.upper()}%")
+    where = " AND ".join(filters)
+    with db() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS count FROM after_order_cases WHERE {where}", params).fetchone()["count"] or 0)
+        rows = conn.execute(
+            f"""
+            SELECT after_order_cases.*, stores.name AS store_name, stores.odoo_url
+            FROM after_order_cases JOIN stores ON stores.id=after_order_cases.store_id
+            WHERE {where}
+            ORDER BY CASE after_order_cases.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                     after_order_cases.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+        summary_rows = conn.execute(
+            """SELECT status, COUNT(*) AS count FROM after_order_cases
+               WHERE (? IS NULL OR store_id=?) GROUP BY status""",
+            (store_id, store_id),
+        ).fetchall()
+    summary = {clean_text(row["status"]): int(row["count"] or 0) for row in summary_rows}
+    return {
+        "ok": True,
+        "rows": [after_order_case_dict(row) for row in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "summary": summary,
+        "email_test_mode": after_order_email_test_mode(),
+        "email_test_recipient": after_order_test_recipient(),
+    }
+
+
+@app.get("/api/after-order/cases/{case_id}/events")
+def api_after_order_case_events(case_id: int) -> dict[str, Any]:
+    if not after_order_case_by_id(case_id):
+        raise HTTPException(404, "After-order case not found.")
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            "SELECT * FROM after_order_case_events WHERE case_id=? ORDER BY created_at DESC, id DESC",
+            (case_id,),
+        ).fetchall())
+    for row in rows:
+        try:
+            row["details"] = json.loads(row.pop("details_json", "{}") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            row["details"] = {}
+    return {"ok": True, "rows": rows}
+
+
+def after_order_absolute_url(request: Request, path: str) -> str:
+    configured = clean_text(get_service_settings().get("after_order_public_base_url")).rstrip("/")
+    base = configured or str(request.base_url).rstrip("/")
+    return f"{base}/{clean_text(path).lstrip('/')}"
+
+
+def hydrate_after_order_recipient_and_domain(case: dict[str, Any]) -> dict[str, Any]:
+    """Resolve customer/site data from the case's own Odoo store at send time."""
+    if not case.get("odoo_order_id"):
+        return case
+    customer_email = clean_text(case.get("customer_email"))
+    sender_domain = clean_text(case.get("sender_domain"))
+    website_id = case.get("website_id")
+    try:
+        odoo = OdooClient(get_store(int(case["store_id"])))
+        fields = odoo.existing_fields("sale.order", ["partner_id", "partner_invoice_id", "website_id"])
+        orders = odoo.read("sale.order", [int(case["odoo_order_id"])], fields)
+        order = orders[0] if orders else {}
+        website_id = many2one_id(order.get("website_id")) or website_id
+        partner_id = many2one_id(order.get("partner_id")) or many2one_id(order.get("partner_invoice_id"))
+        if partner_id and not customer_email:
+            partners = odoo.read("res.partner", [partner_id], odoo.existing_fields("res.partner", ["email"]))
+            customer_email = clean_text((partners[0] if partners else {}).get("email"))
+        if website_id and not sender_domain:
+            websites = odoo.read("website", [int(website_id)], odoo.existing_fields("website", ["domain"]))
+            raw_domain = clean_text((websites[0] if websites else {}).get("domain"))
+            if raw_domain.lower() not in {"", "false", "none"}:
+                candidate_domain = clean_text(urlparse(raw_domain if "://" in raw_domain else f"https://{raw_domain}").hostname).lower()
+                if "." in candidate_domain:
+                    sender_domain = candidate_domain.removeprefix("www.")
+    except Exception:
+        # Sending can still use cached case values or the explicitly configured fallback sender.
+        pass
+    if customer_email or sender_domain or website_id:
+        now = utc_now()
+        with db() as conn:
+            conn.execute(
+                """UPDATE after_order_cases SET customer_email=COALESCE(NULLIF(?, ''), customer_email),
+                   sender_domain=COALESCE(NULLIF(?, ''), sender_domain), website_id=COALESCE(?, website_id), updated_at=?
+                   WHERE id=?""",
+                (customer_email, sender_domain, website_id, now, case["id"]),
+            )
+        case = after_order_case_by_id(int(case["id"])) or case
+    return case
+
+
+def after_order_sender(case: dict[str, Any]) -> tuple[str, str]:
+    settings = get_service_settings()
+    domain = clean_text(case.get("sender_domain")).lower()
+    if domain and ("." not in domain or not re.fullmatch(r"[a-z0-9.-]+", domain)):
+        raise ValueError("The website sender domain is invalid.")
+    address = f"notifications@{domain}" if domain else clean_text(settings.get("email_from_address"))
+    if not address or "\n" in address or "\r" in address or "@" not in address:
+        raise ValueError("Configure the website domain or EMAIL_FROM_ADDRESS before sending.")
+    name = clean_text(case.get("store_name")) or clean_text(settings.get("email_from_name")) or "Customer care"
+    return f"{name} <{address}>", domain
+
+
+def after_order_email_content(
+    case: dict[str, Any],
+    action_url: str,
+    *,
+    template_kind: str = "",
+    unsubscribe_url: str = "",
+) -> tuple[str, str, str]:
+    items = case.get("affected_items") or []
+    item_rows = "".join(
+        f"""<div style="display:flex;gap:14px;align-items:center;border:1px solid #e1e7ee;border-radius:10px;padding:12px;margin:12px 0">
+        {f'<img src="{html.escape(clean_text(item.get("thumbnail_url")))}" alt="" width="72" height="72" style="object-fit:contain;border-radius:8px">' if item.get('thumbnail_url') else ''}
+        <div><strong>{html.escape(clean_text(item.get('product_name')) or 'Affected product')}</strong><br>
+        <span>Quantity: {html.escape(str(item.get('quantity') or 1))}</span>
+        {f'<br><a href="{html.escape(clean_text(item.get("odoo_product_url")))}">View this product</a>' if item.get('odoo_product_url') else ''}</div></div>"""
+        for item in items
+    )
+    actions = after_order_allowed_actions(case)
+    buttons = "".join(
+        f'<a href="{html.escape(action_url)}?choice={quote_plus(action)}" style="display:block;text-align:center;background:#087f83;color:white;text-decoration:none;font-weight:700;border-radius:8px;padding:13px;margin:10px 0">{html.escape(AFTER_ORDER_ACTION_LABELS[action])}</a>'
+        for action in actions
+    )
+    order_name = html.escape(clean_text(case.get("odoo_order_name")) or "your order")
+    tracking_url = html.escape(clean_text((case.get("context") or {}).get("tracking_url")))
+    case_type = clean_text(case.get("case_type"))
+    if template_kind == "trustpilot_review":
+        _, domain = after_order_sender(case)
+        review_url = trustpilot_review_url(domain)
+        subject = "Thank you — how was your experience?"
+        heading = "Thank you for confirming delivery"
+        intro = "We’re glad your order arrived. If you have a moment, we’d appreciate your honest feedback."
+        body = f'<a href="{html.escape(review_url)}" style="display:block;text-align:center;background:#087f83;color:white;text-decoration:none;font-weight:700;border-radius:8px;padding:13px;margin:18px 0">Share an honest Trustpilot review</a>'
+        plain = f"Thank you for confirming delivery of order {clean_text(case.get('odoo_order_name'))}. Share your honest feedback: {review_url}"
+    elif case_type == "delivery_confirmation":
+        subject = f"Did order {clean_text(case.get('odoo_order_name')) or ''} arrive?".strip()
+        heading = "Please confirm your delivery"
+        intro = f"The carrier has marked order <strong>{order_name}</strong> as delivered. Please tell us whether you received it."
+        body = buttons
+        plain = f"The carrier marked order {clean_text(case.get('odoo_order_name'))} as delivered. Confirm here: {action_url}"
+    elif case_type == "item_unavailable":
+        subject = "An item in your order needs your choice"
+        heading = "An item in your order needs your choice"
+        intro = f"Order <strong>{order_name}</strong> has one or more currently unavailable items. Only the affected items are shown."
+        body = f"{item_rows}{buttons}"
+        plain = f"An item in order {clean_text(case.get('odoo_order_name'))} needs your choice. Respond here: {action_url}"
+    elif clean_text((case.get("context") or {}).get("risk_state")) in {"suspected_lost", "carrier_exception"}:
+        subject = "We need your choice about your package"
+        heading = "Your package needs attention"
+        intro = f"There has been no confirmed movement for order <strong>{order_name}</strong>. Please choose a replacement or refund."
+        body = buttons
+        plain = f"Your package for order {clean_text(case.get('odoo_order_name'))} needs attention. Respond here: {action_url}"
+    else:
+        subject = "Your package has moved"
+        heading = "Your package has a new update"
+        intro = f"There is a new carrier update for order <strong>{order_name}</strong>."
+        body = f'<a href="{tracking_url}" style="display:block;text-align:center;background:#087f83;color:white;text-decoration:none;font-weight:700;border-radius:8px;padding:13px;margin:18px 0">Track all details</a>' if tracking_url else ""
+        plain = f"There is a new carrier update for order {clean_text(case.get('odoo_order_name'))}. Track it: {clean_text((case.get('context') or {}).get('tracking_url'))}"
+    unsubscribe_html = (
+        f'<p style="font-size:12px;color:#687386;text-align:center"><a href="{html.escape(unsubscribe_url)}" style="color:#687386">Unsubscribe from package movement and review emails</a></p>'
+        if unsubscribe_url else ""
+    )
+    if unsubscribe_url:
+        plain += f"\n\nUnsubscribe from package movement and review emails: {unsubscribe_url}"
+    html_body = f"""<!doctype html><html><body style="margin:0;background:#f5f7fa;font-family:Arial,sans-serif;color:#172033">
+    <div style="max-width:620px;margin:24px auto;background:white;border-radius:14px;padding:28px">
+    <h1 style="font-size:24px">{heading}</h1><p>{intro}</p>{body}
+    {f'<p style="font-size:13px;color:#5d6878">You may change your request until our team confirms it. After confirmation, every action link in this email will expire.</p>' if actions else ''}
+    {unsubscribe_html}</div></body></html>"""
+    return subject, html_body, plain
+
+
+def after_order_email_preview_html(case: dict[str, Any], action_url: str) -> str:
+    return after_order_email_content(case, action_url)[1]
+
+
+def create_after_order_unsubscribe_url(case: dict[str, Any], request: Request, email: str) -> str:
+    token = f"{uuid.uuid4().hex}{uuid.uuid4().hex}"
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO after_order_unsubscribe_links
+               (token_hash, case_id, store_id, website_id, email, category, created_at)
+               VALUES (?, ?, ?, ?, ?, 'tracking_updates', ?)""",
+            (token_hash, case["id"], case["store_id"], case.get("website_id"), email.lower(), utc_now()),
+        )
+    return after_order_absolute_url(request, f"/api/public/after-order/unsubscribe/{token}")
+
+
+def after_order_unsubscribe_link(token: str) -> dict[str, Any]:
+    token_hash = hashlib.sha256(clean_text(token).encode("utf-8")).hexdigest()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM after_order_unsubscribe_links WHERE token_hash=?", (token_hash,)).fetchone()
+    if not row:
+        raise HTTPException(404, "This unsubscribe link is invalid.")
+    return row_to_dict(row) or {}
+
+
+@app.get("/api/public/after-order/unsubscribe/{token}")
+def public_after_order_unsubscribe_page(token: str) -> HTMLResponse:
+    after_order_unsubscribe_link(token)
+    return HTMLResponse(
+        f"""<!doctype html><html><head><meta name="viewport" content="width=device-width"></head>
+        <body style="font-family:Arial,sans-serif;background:#f5f7fa;padding:32px"><main style="max-width:560px;margin:auto;background:white;padding:28px;border-radius:14px">
+        <h1>Email preferences</h1><p>Stop package movement and review emails for this address?</p>
+        <form method="post" action="/api/public/after-order/unsubscribe/{html.escape(token)}"><button style="background:#087f83;color:white;border:0;border-radius:8px;padding:13px 18px;font-weight:700">Unsubscribe</button></form>
+        </main></body></html>""",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/public/after-order/unsubscribe/{token}")
+def public_after_order_unsubscribe(token: str) -> HTMLResponse:
+    link = after_order_unsubscribe_link(token)
+    now = utc_now()
+    preference_key = f"{int(link['store_id'])}:{link.get('website_id') or '*'}:{clean_text(link['email']).lower()}:tracking_updates"
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO after_order_notification_preferences
+               (preference_key, store_id, website_id, email, category, opted_out_at, updated_at)
+               VALUES (?, ?, ?, ?, 'tracking_updates', ?, ?)
+               ON CONFLICT(preference_key) DO UPDATE SET opted_out_at=excluded.opted_out_at, updated_at=excluded.updated_at""",
+            (preference_key, link["store_id"], link.get("website_id"), clean_text(link["email"]).lower(), now, now),
+        )
+        record_after_order_event(
+            conn, int(link["case_id"]), "customer_email_opt_out", actor_type="customer",
+            actor_label=clean_text(link["email"]).lower(),
+            details={"category": "tracking_updates", "website_id": link.get("website_id")},
+        )
+    return HTMLResponse(
+        "<!doctype html><html><body style='font-family:Arial,sans-serif;padding:32px'><h1>You are unsubscribed</h1><p>Package movement and review emails have been stopped for this site. Essential order messages may still be sent.</p></body></html>",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def after_order_tracking_updates_opted_out(case: dict[str, Any], email: str) -> bool:
+    preference_key = f"{int(case['store_id'])}:{case.get('website_id') or '*'}:{clean_text(email).lower()}:tracking_updates"
+    with db() as conn:
+        return bool(conn.execute(
+            "SELECT 1 FROM after_order_notification_preferences WHERE preference_key=?",
+            (preference_key,),
+        ).fetchone())
+
+
+@app.post("/api/after-order/cases/{case_id}/email-preview")
+def api_after_order_email_preview(case_id: int) -> dict[str, Any]:
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    link = api_after_order_action_link(case_id)
+    action_url = clean_text(link.get("url"))
+    preview = after_order_email_preview_html(case, action_url)
+    now = utc_now()
+    test_mode = after_order_email_test_mode()
+    sender = f"notifications@{clean_text(case.get('sender_domain'))}" if clean_text(case.get("sender_domain")) else "Sender domain not configured"
+    message_id = f"after-order-preview:{case_id}:{uuid.uuid4().hex}"
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO after_order_messages
+               (case_id, provider, recipient, sender, subject, html_preview, status, idempotency_key, created_at, updated_at)
+               VALUES (?, 'resend', ?, ?, ?, ?, 'test_preview', ?, ?, ?)""",
+            (
+                case_id, clean_text(case.get("customer_email")), sender,
+                "An item in your order needs your choice", preview, message_id, now, now,
+            ),
+        )
+        record_after_order_event(
+            conn, case_id, "email_preview_created", actor_type="team", actor_label="Operations team",
+            details={"recipient": clean_text(case.get("customer_email")), "sender": sender, "test_mode": test_mode},
+        )
+    return {"ok": True, "status": "test_preview", "html": preview, "action_url": action_url, "email_test_mode": test_mode}
+
+
+def send_after_order_email(
+    case_id: int,
+    request: Request,
+    *,
+    force_test: bool = False,
+    template_kind: str = "",
+) -> dict[str, Any]:
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    case = hydrate_after_order_recipient_and_domain(case)
+    allowed = after_order_allowed_actions(case) if not template_kind else []
+    action_url = ""
+    if allowed:
+        relative = clean_text(api_after_order_action_link(case_id).get("url"))
+        action_url = after_order_absolute_url(request, relative)
+    test_mode = force_test or after_order_email_test_mode()
+    intended_recipient = clean_text(case.get("customer_email"))
+    try:
+        recipient = resolve_delivery_recipient(
+            intended_recipient,
+            test_mode=test_mode,
+            test_recipient=after_order_test_recipient(),
+        )
+        sender, sender_domain = after_order_sender(case)
+        if allowed and not test_mode and urlparse(action_url).scheme != "https":
+            raise ValueError("Live customer action links require an HTTPS AFTER_ORDER_PUBLIC_BASE_URL.")
+        preference_eligible = template_kind == "trustpilot_review" or (not allowed and case.get("case_type") == "tracking")
+        if preference_eligible and not test_mode and after_order_tracking_updates_opted_out(case, recipient):
+            raise ValueError("This customer opted out of package movement and review emails for this site.")
+        unsubscribe_url = create_after_order_unsubscribe_url(case, request, recipient) if preference_eligible else ""
+        email_case = dict(case)
+        email_case["context"] = dict(case.get("context") or {})
+        tracker_query = clean_text(case.get("odoo_order_name")) or clean_text(case.get("tracking_code"))
+        if tracker_query:
+            email_case["context"]["tracking_url"] = after_order_absolute_url(
+                request,
+                f"/package-tracker?q={quote_plus(tracker_query)}&field=all",
+            )
+        email_case["affected_items"] = [dict(item) for item in case.get("affected_items") or []]
+        for item in email_case["affected_items"]:
+            thumbnail = clean_text(item.get("thumbnail_url"))
+            if thumbnail.startswith("/"):
+                item["thumbnail_url"] = after_order_absolute_url(request, thumbnail)
+        subject, html_body, text_body = after_order_email_content(
+            email_case,
+            action_url,
+            template_kind=template_kind,
+            unsubscribe_url=unsubscribe_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    idempotency_key = f"after-order:{case_id}:{template_kind or case.get('case_type')}:{'test' if test_mode else 'live'}:{uuid.uuid4().hex}"
+    now = utc_now()
+    message_id = ""
+    status = "failed"
+    try:
+        provider = ResendEmailProvider(os.getenv("RESEND_API_KEY", ""))
+        message_payload: dict[str, Any] = {
+                "from": sender,
+                "to": [recipient],
+                "reply_to": f"support@{sender_domain}" if sender_domain else clean_text(get_service_settings().get("email_from_address")),
+                "subject": subject,
+                "html": html_body,
+                "text": text_body,
+            }
+        if unsubscribe_url:
+            message_payload["headers"] = {
+                "List-Unsubscribe": f"<{unsubscribe_url}>",
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+            }
+        result = provider.send(
+            message_payload,
+            idempotency_key=idempotency_key,
+        )
+        message_id = clean_text(result.get("id"))
+        status = "sent_test" if test_mode else "sent"
+    except (ValueError, RuntimeError, requests.RequestException) as exc:
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO after_order_messages
+                   (case_id, provider, recipient, sender, subject, html_preview, status, idempotency_key, created_at, updated_at)
+                   VALUES (?, 'resend', ?, ?, ?, ?, 'failed', ?, ?, ?)""",
+                (case_id, recipient, sender, subject, html_body, idempotency_key, now, now),
+            )
+            record_after_order_event(
+                conn, case_id, "email_send_failed", actor_type="team" if force_test else "system",
+                actor_label="Send test email" if force_test else "Email worker",
+                details={"actual_recipient": recipient, "intended_recipient": intended_recipient, "test_mode": test_mode, "error": str(exc)},
+            )
+        raise HTTPException(503, f"Email was not sent: {exc}") from exc
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO after_order_messages
+               (case_id, provider, recipient, sender, subject, html_preview, status, provider_message_id,
+                idempotency_key, created_at, updated_at)
+               VALUES (?, 'resend', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (case_id, recipient, sender, subject, html_body, status, message_id, idempotency_key, now, now),
+        )
+        record_after_order_event(
+            conn, case_id, "test_email_sent" if test_mode else "customer_email_sent",
+            actor_type="team" if force_test else "system",
+            actor_label="Send test email" if force_test else "Email worker",
+            details={
+                "actual_recipient": recipient,
+                "intended_recipient": intended_recipient,
+                "sender": sender,
+                "provider_message_id": message_id,
+                "template": template_kind or clean_text(case.get("case_type")),
+                "test_mode": test_mode,
+            },
+        )
+    return {
+        "ok": True,
+        "status": status,
+        "message": f"Test email sent to {recipient}." if test_mode else f"Email sent to {recipient}.",
+        "recipient": recipient,
+        "provider_message_id": message_id,
+    }
+
+
+@app.post("/api/after-order/cases/{case_id}/send-test-email")
+def api_after_order_send_test_email(case_id: int, request: Request) -> dict[str, Any]:
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    template_kind = (
+        "trustpilot_review"
+        if case.get("case_type") == "delivery_confirmation"
+        and case.get("confirmed_at")
+        and clean_text(case.get("current_decision")) == "received"
+        else ""
+    )
+    return send_after_order_email(case_id, request, force_test=True, template_kind=template_kind)
+
+
+@app.post("/api/after-order/cases/{case_id}/action-link")
+def api_after_order_action_link(case_id: int) -> dict[str, Any]:
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    if case.get("confirmed_at"):
+        raise HTTPException(409, "This decision is already confirmed and its links are expired.")
+    allowed = after_order_allowed_actions(case)
+    if not allowed:
+        raise HTTPException(409, "This case does not currently require a customer decision.")
+    token = f"{uuid.uuid4().hex}{uuid.uuid4().hex}"
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = utc_now()
+    test_mode = after_order_email_test_mode()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO after_order_action_links
+               (case_id, token_hash, allowed_actions_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (case_id, token_hash, json.dumps(allowed), now, now),
+        )
+        record_after_order_event(conn, case_id, "action_link_created", details={"allowed_actions": allowed, "test_mode": test_mode})
+    return {"ok": True, "url": f"/api/public/after-order/action/{token}", "allowed_actions": allowed}
+
+
+def after_order_action_link(token: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    token_hash = hashlib.sha256(clean_text(token).encode("utf-8")).hexdigest()
+    with db() as conn:
+        row = conn.execute(
+            """SELECT * FROM after_order_action_links WHERE token_hash=?""",
+            (token_hash,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "This decision link is invalid.")
+    link = row_to_dict(row) or {}
+    case = after_order_case_by_id(int(link["case_id"]))
+    if not case:
+        raise HTTPException(404, "This decision link is invalid.")
+    return case, link
+
+
+def render_after_order_action_page(token: str, case: dict[str, Any], link: dict[str, Any], message: str = "", suggested: str = "") -> HTMLResponse:
+    locked = bool(case.get("confirmed_at") or link.get("invalidated_at"))
+    try:
+        allowed = json.loads(link.get("allowed_actions_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        allowed = []
+    product_html = "".join(
+        f"<li><strong>{html.escape(clean_text(item.get('product_name')))}</strong> &times; {html.escape(str(item.get('quantity') or 1))}</li>"
+        for item in case.get("affected_items") or []
+    )
+    buttons = "" if locked else "".join(
+        f"<button name='decision' value='{html.escape(action)}'>{html.escape(AFTER_ORDER_ACTION_LABELS.get(action, action))}</button>"
+        for action in allowed
+    )
+    current = AFTER_ORDER_ACTION_LABELS.get(clean_text(case.get("current_decision")), clean_text(case.get("current_decision")))
+    suggested_label = AFTER_ORDER_ACTION_LABELS.get(clean_text(suggested), "") if clean_text(suggested) in allowed else ""
+    body = f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>
+    <title>Order decision</title><style>
+    body{{font-family:system-ui,sans-serif;background:#f5f7fa;color:#172033;margin:0;padding:32px}}
+    main{{max-width:680px;margin:auto;background:white;border:1px solid #dbe2ea;border-radius:16px;padding:28px;box-shadow:0 12px 35px #1f29370f}}
+    h1{{margin-top:0}} ul{{padding-left:22px}} form{{display:grid;gap:12px;margin-top:24px}} button{{padding:14px;border:0;border-radius:9px;background:#087f83;color:white;font-weight:700;cursor:pointer}}
+    .notice{{padding:12px;border-radius:8px;background:#fff5d8;margin:16px 0}} .locked{{background:#edf2f7}}
+    </style></head><body><main><h1>{html.escape(clean_text(case.get('title')) or 'Order update')}</h1>
+    <p>Order <strong>{html.escape(clean_text(case.get('odoo_order_name')))}</strong></p>
+    <ul>{product_html}</ul>
+    {f"<div class='notice'>{html.escape(message)}</div>" if message else ""}
+    {f"<div class='notice locked'>This request was confirmed by our team. The email links have expired.</div>" if locked else ""}
+    {f"<div class='notice'>Please confirm or change your selected option: <strong>{html.escape(suggested_label)}</strong>.</div>" if suggested_label and not locked else ""}
+    {f"<p>Current request: <strong>{html.escape(current)}</strong>. You may change it until our team confirms it.</p>" if current and not locked else ""}
+    <form method='post' action='/api/public/after-order/action/{html.escape(token)}'>{buttons}</form>
+    </main></body></html>"""
+    return HTMLResponse(body, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/public/after-order/action/{token}")
+def public_after_order_action_page(token: str, choice: str = "") -> HTMLResponse:
+    case, link = after_order_action_link(token)
+    return render_after_order_action_page(token, case, link, suggested=choice)
+
+
+@app.post("/api/public/after-order/action/{token}")
+def public_after_order_action_submit(token: str, decision: str = Form(...)) -> HTMLResponse:
+    case, link = after_order_action_link(token)
+    if case.get("confirmed_at") or link.get("invalidated_at"):
+        return render_after_order_action_page(token, case, link)
+    try:
+        normalized = normalize_customer_decision(decision)
+        allowed = json.loads(link.get("allowed_actions_json") or "[]")
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "This decision is not available for the order.") from exc
+    if normalized not in allowed:
+        raise HTTPException(400, "This decision is not available for the order.")
+    now = utc_now()
+    recorded = False
+    with db() as conn:
+        latest = conn.execute("SELECT current_decision, confirmed_at FROM after_order_cases WHERE id=?", (case["id"],)).fetchone()
+        if latest and not latest["confirmed_at"]:
+            previous = clean_text(latest["current_decision"])
+            cursor = conn.execute(
+                """UPDATE after_order_cases
+                   SET previous_decision=current_decision, current_decision=?, decision_version=decision_version+1,
+                       decision_updated_at=?, status='needs_confirmation', updated_at=?
+                   WHERE id=? AND confirmed_at IS NULL""",
+                (normalized, now, now, case["id"]),
+            )
+            recorded = bool(cursor.rowcount)
+            if recorded:
+                record_after_order_event(
+                    conn, int(case["id"]), "customer_decision_changed" if previous else "customer_decision_received",
+                    actor_type="customer", actor_label="Email action link", decision=normalized,
+                    details={"previous_decision": previous},
+                )
+    refreshed = after_order_case_by_id(int(case["id"])) or case
+    message = "Your latest request has been recorded for team confirmation." if recorded else "Our team has already confirmed this request."
+    return render_after_order_action_page(token, refreshed, link, message)
+
+
+@app.post("/api/after-order/cases/{case_id}/confirm")
+def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, request: Request) -> dict[str, Any]:
+    now = utc_now()
+    already_confirmed = False
+    confirmed_decision = ""
+    confirmed_case_type = ""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM after_order_cases WHERE id=?", (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "After-order case not found.")
+        if row["confirmed_at"]:
+            already_confirmed = True
+        else:
+            decision = clean_text(row["current_decision"])
+            confirmed_decision = decision
+            confirmed_case_type = clean_text(row["case_type"])
+            if not decision:
+                raise HTTPException(409, "A customer decision is required before confirmation.")
+            if payload.decision_version is not None and int(row["decision_version"] or 0) != int(payload.decision_version):
+                raise HTTPException(409, "The customer changed their request. Refresh the case before confirming the latest decision.")
+            next_status = (
+                "resolved" if confirmed_case_type == "delivery_confirmation" and decision == "received"
+                else "needs_attention" if confirmed_case_type == "delivery_confirmation" and decision == "not_received"
+                else "approved_pending_execution"
+            )
+            cursor = conn.execute(
+                """UPDATE after_order_cases SET status=?, decision_locked_at=?, confirmed_at=?,
+                   confirmed_by=?, updated_at=? WHERE id=? AND confirmed_at IS NULL AND decision_version=?""",
+                (next_status, now, now, clean_text(payload.confirmed_by) or "Operations team", now, case_id, int(row["decision_version"] or 0)),
+            )
+            if not cursor.rowcount:
+                raise HTTPException(409, "The case changed while it was being confirmed. Refresh and try again.")
+            conn.execute(
+                "UPDATE after_order_action_links SET invalidated_at=?, updated_at=? WHERE case_id=? AND invalidated_at IS NULL",
+                (now, now, case_id),
+            )
+            record_after_order_event(
+                conn, case_id, "team_decision_confirmed", actor_type="team",
+                actor_label=clean_text(payload.confirmed_by) or "Operations team", decision=decision,
+            )
+            if confirmed_case_type == "delivery_confirmation" and decision == "not_received":
+                record_after_order_event(
+                    conn, case_id, "delivery_exception_opened", actor_type="system",
+                    details={"reason": "Customer reported that the carrier-marked delivery was not received."},
+                )
+    message = "Decision was already confirmed." if already_confirmed else "Latest decision confirmed. All customer action links have expired."
+    if not already_confirmed and confirmed_case_type == "delivery_confirmation" and confirmed_decision == "received":
+        try:
+            review_result = send_after_order_email(case_id, request, template_kind="trustpilot_review")
+            message += f" {review_result['message']}"
+        except HTTPException as exc:
+            message += f" The Trustpilot request could not be sent: {exc.detail}"
+    elif not already_confirmed and confirmed_case_type == "delivery_confirmation" and confirmed_decision == "not_received":
+        message += " A delivery exception is now open for team investigation."
+    return {"ok": True, "message": message, "row": after_order_case_by_id(case_id)}
+
+
+@app.get("/api/after-order/settings")
+def api_after_order_settings() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "email_test_mode": after_order_email_test_mode(),
+        "email_test_recipient": after_order_test_recipient(),
+        "email_provider": "resend",
+    }
+
+
+@app.post("/api/after-order/settings/test-mode")
+def api_after_order_test_mode(payload: AfterOrderTestModePayload) -> dict[str, Any]:
+    set_service_settings({"after_order_email_test_mode": "true" if payload.enabled else "false"})
+    return {
+        "ok": True,
+        "email_test_mode": after_order_email_test_mode(),
+        "email_test_recipient": after_order_test_recipient(),
+    }
 
 
 @app.get("/api/public/epost")

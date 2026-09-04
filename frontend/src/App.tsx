@@ -60,6 +60,7 @@ type SelectId = number | string
 const KNOWN_APP_PAGES = new Set([
   "home",
   "orders",
+  "after-order-care",
   "pull-jobs",
   "chrome-queue",
   "tracking",
@@ -1195,6 +1196,50 @@ type EpostTrackingRow = {
   refund_received_at?: string
 }
 
+type AfterOrderCase = {
+  id: number
+  store_id: number
+  store_name: string
+  website_id?: number | null
+  odoo_order_id?: number | null
+  odoo_order_name: string
+  odoo_order_url: string
+  case_type: string
+  status: string
+  severity: string
+  title: string
+  customer_email?: string
+  sender_domain?: string
+  tracking_provider?: string
+  tracking_code?: string
+  current_decision?: string
+  previous_decision?: string
+  decision_version: number
+  decision_updated_at?: string
+  confirmed_at?: string
+  confirmed_by?: string
+  updated_at: string
+  affected_items: Array<{
+    line_id: number
+    product_name: string
+    quantity: number
+    asin: string
+    thumbnail_url: string
+    odoo_product_url: string
+  }>
+  context: Record<string, any>
+}
+
+type AfterOrderEvent = {
+  id: number
+  event_type: string
+  actor_type: string
+  actor_label: string
+  decision: string
+  created_at: string
+  details: Record<string, any>
+}
+
 type ShippingChargeRow = {
   id: number
   import_filename: string
@@ -1443,6 +1488,7 @@ const defaultUiCopy: UiCopy = {
   },
   home: { title: "Dashboard", description: "Control panel overview for fulfilment, tracking, and exceptions." },
   orders: { title: "Orders", description: "Review Odoo order lines and queue Amazon fulfilment." },
+  "after-order-care": { title: "After-order care", description: "Review customer decisions, shipment exceptions, and approved follow-up actions." },
   "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
   "chrome-queue": { title: "Chrome Queue", description: "Review Chrome extension jobs and release stale locks." },
   tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
@@ -5004,6 +5050,7 @@ function App() {
       icon: ShoppingCart,
       items: [
         ["orders", "Orders", ShoppingCart],
+        ["after-order-care", "After-order care", Bell],
         ["pull-jobs", "Pull Jobs", RefreshCw],
         ["chrome-queue", "Chrome Queue", Lock],
         ["bulk", "Bulk Ordering", PackageCheck],
@@ -6099,6 +6146,9 @@ function App() {
             onChanged={refresh}
             onResult={setModal}
           />
+        )}
+        {page === "after-order-care" && (
+          <AfterOrderCarePage storeId={storeId} onResult={setModal} />
         )}
         {page === "tracking" && (
           <TrackingPage
@@ -10184,9 +10234,12 @@ function packageTrackerUnassignedProducts(row: PackageTrackerOrderCard) {
 }
 
 function PackageTrackerDesignPage() {
-  const [query, setQuery] = useState("")
-  const [debouncedQuery, setDebouncedQuery] = useState("")
+  const initialTrackerQuery = new URLSearchParams(window.location.search).get("q") || ""
+  const [query, setQuery] = useState(initialTrackerQuery)
+  const [debouncedQuery, setDebouncedQuery] = useState(initialTrackerQuery)
   const [searchField, setSearchField] = useState(() => {
+    const requestedField = new URLSearchParams(window.location.search).get("field")
+    if (requestedField) return requestedField
     try {
       return window.localStorage.getItem("packageTrackerSearchField") || "all"
     } catch {
@@ -11858,6 +11911,223 @@ function FulfilmentPendingPage({
       </DialogContent>
     </Dialog>
     </>
+  )
+}
+
+const afterOrderDecisionLabels: Record<string, string> = {
+  proceed: "Proceed",
+  exclude_item_and_proceed: "Remove this item and continue",
+  cancel_affected_item: "Cancel the affected item",
+  offer_alternatives: "Offer alternatives",
+  cancel_order: "Cancel the entire order",
+  refund: "Refund",
+  replacement: "Replacement",
+  received: "Yes, I received it",
+  not_received: "No, I did not receive it",
+}
+
+function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: (modal: ModalState) => void }) {
+  const [rows, setRows] = useState<AfterOrderCase[]>([])
+  const [summary, setSummary] = useState<Record<string, number>>({})
+  const [status, setStatus] = useState("open")
+  const [query, setQuery] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [emailTestMode, setEmailTestMode] = useState(true)
+  const [emailTestRecipient, setEmailTestRecipient] = useState("sonianuj1284@gmail.com")
+  const [activityCase, setActivityCase] = useState<AfterOrderCase | null>(null)
+  const [events, setEvents] = useState<AfterOrderEvent[]>([])
+
+  const load = async () => {
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({ status, page: "1", per_page: "50" })
+      if (storeId) params.set("store_id", storeId)
+      if (query.trim()) params.set("q", query.trim())
+      const result = await api<{ rows: AfterOrderCase[]; summary: Record<string, number>; email_test_mode: boolean; email_test_recipient: string }>(`/api/after-order/cases?${params}`)
+      setRows(result.rows || [])
+      setSummary(result.summary || {})
+      setEmailTestMode(Boolean(result.email_test_mode))
+      setEmailTestRecipient(result.email_test_recipient || "sonianuj1284@gmail.com")
+    } catch (error) {
+      onResult({ ok: false, title: "After-order care load failed", message: String(error) })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void load() }, [storeId, status])
+
+  const updateTestMode = async (enabled: boolean) => {
+    if (!enabled && !window.confirm("Turn off email test mode? Customer email delivery will be permitted once an email provider is connected.")) return
+    try {
+      const result = await api<{ email_test_mode: boolean; email_test_recipient: string }>("/api/after-order/settings/test-mode", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      })
+      setEmailTestMode(Boolean(result.email_test_mode))
+      setEmailTestRecipient(result.email_test_recipient || emailTestRecipient)
+    } catch (error) {
+      onResult({ ok: false, title: "Safety setting failed", message: String(error) })
+    }
+  }
+
+  const openActivity = async (row: AfterOrderCase) => {
+    setActivityCase(row)
+    try {
+      const result = await api<{ rows: AfterOrderEvent[] }>(`/api/after-order/cases/${row.id}/events`)
+      setEvents(result.rows || [])
+    } catch (error) {
+      setEvents([])
+      onResult({ ok: false, title: "Activity load failed", message: String(error) })
+    }
+  }
+
+  const createTestLink = async (row: AfterOrderCase) => {
+    try {
+      const result = await api<{ url: string }>(`/api/after-order/cases/${row.id}/action-link`, { method: "POST" })
+      window.open(result.url, "_blank", "noopener,noreferrer")
+      await openActivity(row)
+    } catch (error) {
+      onResult({ ok: false, title: "Decision link failed", message: String(error) })
+    }
+  }
+
+  const sendTestEmail = async (row: AfterOrderCase) => {
+    try {
+      const result = await api<{ message: string }>(`/api/after-order/cases/${row.id}/send-test-email`, { method: "POST" })
+      onResult({ ok: true, title: "Test email sent", message: result.message })
+      await load()
+    } catch (error) {
+      onResult({ ok: false, title: "Test email failed", message: String(error) })
+    }
+  }
+
+  const confirmDecision = async (row: AfterOrderCase) => {
+    try {
+      const result = await api<{ message: string }>(`/api/after-order/cases/${row.id}/confirm`, {
+        method: "POST",
+        body: JSON.stringify({ confirmed_by: "Operations team", decision_version: row.decision_version }),
+      })
+      onResult({ ok: true, title: "Decision confirmed", message: result.message })
+      setActivityCase(null)
+      await load()
+    } catch (error) {
+      onResult({ ok: false, title: "Confirmation failed", message: String(error) })
+    }
+  }
+
+  const needsConfirmation = Number(summary.needs_confirmation || 0)
+  const waiting = Number(summary.needs_attention || 0)
+  const tracking = Number(summary.tracking || 0)
+  const resolved = Number(summary.resolved || 0) + Number(summary.approved || 0)
+
+  return (
+    <div className="grid gap-4">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <div className="flex flex-1 flex-wrap gap-2">
+          <SearchBox value={query} onChange={setQuery} placeholder="Order, tracking number, product..." className="min-w-64 flex-1" />
+          <Button variant="outline" onClick={load} disabled={loading}><Search className="size-4" />Search</Button>
+          <SelectField className="w-48" label="Status" value={status} onChange={setStatus}>
+            <option value="open">Open cases</option>
+            <option value="needs_attention">Needs attention</option>
+            <option value="needs_confirmation">Needs confirmation</option>
+            <option value="tracking">Tracking</option>
+            <option value="approved_pending_execution">Approved — execution pending</option>
+            <option value="approved">Approved</option>
+            <option value="resolved">Resolved</option>
+            <option value="all">All</option>
+          </SelectField>
+        </div>
+        <label className={`flex min-w-[310px] items-center justify-between gap-4 rounded-lg border px-4 py-3 ${emailTestMode ? "border-amber-300 bg-amber-50 text-amber-950" : "border-destructive/40 bg-destructive/5"}`}>
+          <span><strong className="block">{emailTestMode ? "TEST MODE — Emails redirected" : "LIVE MODE — Customer delivery permitted"}</strong><small>{emailTestMode ? `Every email goes only to ${emailTestRecipient}` : "Emails use each order’s customer address"}</small></span>
+          <Checkbox checked={emailTestMode} onCheckedChange={(checked) => void updateTestMode(Boolean(checked))} aria-label="Email test mode" />
+        </label>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+        {[["Needs team confirmation", needsConfirmation, "text-destructive"], ["Waiting for customer", waiting, "text-amber-700"], ["Tracking updates", tracking, "text-primary"], ["Resolved", resolved, "text-emerald-700"]].map(([label, count, color]) => (
+          <div key={String(label)} className="rounded-lg border bg-card px-4 py-3"><span className="text-sm text-muted-foreground">{label}</span><strong className={`mt-1 block text-2xl ${color}`}>{count}</strong></div>
+        ))}
+      </div>
+
+      {loading ? <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">Loading after-order cases...</div> : null}
+      {!loading && !rows.length ? <div className="rounded-lg border bg-card p-10 text-center text-muted-foreground">No after-order cases match this view.</div> : null}
+
+      <div className="grid gap-3">
+        {rows.map((row) => {
+          const context = row.context || {}
+          const currentLabel = afterOrderDecisionLabels[row.current_decision || ""] || "No customer request yet"
+          const previousLabel = afterOrderDecisionLabels[row.previous_decision || ""] || ""
+          const awaitingFirstScan = context.risk_state === "awaiting_first_scan"
+          const itemCase = row.case_type === "item_unavailable"
+          const deliveryConfirmation = row.case_type === "delivery_confirmation"
+          const decisionCase = itemCase || deliveryConfirmation || ["suspected_lost", "carrier_exception"].includes(String(context.risk_state || ""))
+          const cardTone = row.severity === "high" ? "border-red-300 bg-red-50/40" : row.severity === "medium" ? "border-amber-300 bg-amber-50/35" : "border-emerald-200 bg-card"
+          return (
+            <article key={row.id} className={`w-full rounded-xl border p-4 shadow-sm ${cardTone}`}>
+              <div className="grid gap-4 xl:grid-cols-[210px_minmax(280px,1.35fr)_minmax(230px,1fr)_minmax(220px,1fr)_190px] xl:items-center">
+                <div className="min-w-0">
+                  <Badge variant={row.severity === "high" ? "destructive" : "outline"}>{row.title}</Badge>
+                  <h3 className="mt-2 text-lg font-bold">{row.odoo_order_name || row.tracking_code}</h3>
+                  <p className="text-sm text-muted-foreground">{row.store_name}{row.website_id ? ` · Website ${row.website_id}` : ""}</p>
+                  {row.odoo_order_url ? <a className="mt-2 inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline" href={row.odoo_order_url} target="_blank">Open in Odoo <ExternalLink className="size-3" /></a> : null}
+                </div>
+
+                <div className="min-w-0 border-l pl-4">
+                  {itemCase ? (
+                    <div className="grid gap-2">
+                      <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Affected product{row.affected_items.length === 1 ? "" : "s"}</span>
+                      {row.affected_items.map((item) => (
+                        <div key={item.line_id} className="flex min-w-0 items-center gap-3">
+                          <div className="size-14 shrink-0 overflow-hidden rounded-lg border bg-white"><img src={item.thumbnail_url} alt="" className="size-full object-contain" /></div>
+                          <div className="min-w-0"><strong className="line-clamp-2 text-sm">{item.product_name}</strong><span className="block text-xs text-muted-foreground">Qty {item.quantity}{item.asin ? ` · ${item.asin}` : ""}</span>{item.odoo_product_url ? <a href={item.odoo_product_url} target="_blank" className="text-xs text-primary hover:underline">Product in Odoo</a> : null}</div>
+                        </div>
+                      ))}
+                      <span className="text-xs font-medium text-destructive">{context.affected_count || row.affected_items.length} of {context.order_item_count || row.affected_items.length} items affected</span>
+                    </div>
+                  ) : (
+                    <div className="grid gap-1 text-sm"><span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tracking</span><strong className="font-mono">{row.tracking_code}</strong><span>{context.latest_status || row.title}</span><span className="text-muted-foreground">{context.latest_location || "Location not supplied"}</span></div>
+                  )}
+                </div>
+
+                <div className="min-w-0 border-l pl-4">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{decisionCase ? "Current request" : "Assessment"}</span>
+                  <strong className="mt-1 block text-sm">{decisionCase ? currentLabel : context.risk_reason}</strong>
+                  {previousLabel && previousLabel !== currentLabel ? <span className="mt-2 block text-xs text-muted-foreground">Previous request: {previousLabel}</span> : null}
+                  {row.current_decision && !row.confirmed_at ? <Badge variant="outline" className="mt-2">Link active until confirmation</Badge> : null}
+                  {row.confirmed_at ? <Badge variant="secondary" className="mt-2">Links expired after approval</Badge> : null}
+                </div>
+
+                <div className="min-w-0 border-l pl-4 text-sm">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Status</span>
+                  <strong className="mt-1 block">{row.status.replaceAll("_", " ")}</strong>
+                  {awaitingFirstScan ? <p className="mt-2 text-xs text-muted-foreground">No carrier events received — not classified as lost. No lost email queued.</p> : null}
+                  {context.last_update_at ? <p className="mt-2 text-xs text-muted-foreground">Last update {formatDateTime(context.last_update_at)}</p> : null}
+                </div>
+
+                <div className="grid gap-2">
+                  {row.current_decision && !row.confirmed_at ? <Button onClick={() => void confirmDecision(row)}>Confirm decision</Button> : null}
+                  {!row.confirmed_at && decisionCase ? <Button variant="outline" onClick={() => void createTestLink(row)}>Preview customer choices</Button> : null}
+                  <Button variant="outline" onClick={() => void sendTestEmail(row)}>Send test email</Button>
+                  {!itemCase && (row.odoo_order_name || row.tracking_code) ? <Button onClick={() => window.open(`/package-tracker?q=${encodeURIComponent(row.odoo_order_name || row.tracking_code || "")}&field=all`, "_blank", "noopener,noreferrer")}>Track all details</Button> : null}
+                  <Button variant="outline" onClick={() => void openActivity(row)}>View activity</Button>
+                </div>
+              </div>
+            </article>
+          )
+        })}
+      </div>
+
+      <Dialog open={Boolean(activityCase)} onOpenChange={(open) => !open && setActivityCase(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader><DialogTitle>Activity — {activityCase?.odoo_order_name || activityCase?.tracking_code}</DialogTitle><DialogDescription>Customer requests remain changeable until the team confirms the latest decision.</DialogDescription></DialogHeader>
+          <div className="max-h-[65vh] space-y-3 overflow-auto">
+            {events.map((event) => <div key={event.id} className="rounded-lg border p-3"><div className="flex justify-between gap-3"><strong className="text-sm">{event.event_type.replaceAll("_", " ")}</strong><span className="text-xs text-muted-foreground">{formatDateTime(event.created_at)}</span></div><p className="mt-1 text-sm text-muted-foreground">{event.actor_label || event.actor_type}{event.decision ? ` · ${afterOrderDecisionLabels[event.decision] || event.decision}` : ""}</p></div>)}
+            {!events.length ? <p className="py-6 text-center text-muted-foreground">No activity recorded yet.</p> : null}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
   )
 }
 

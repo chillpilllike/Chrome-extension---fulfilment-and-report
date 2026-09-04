@@ -308,6 +308,20 @@ class EpostRefundPayload(BaseModel):
     status: str
 
 
+class AfterOrderDecisionPayload(BaseModel):
+    decision: str
+    note: str = ""
+
+
+class AfterOrderConfirmPayload(BaseModel):
+    confirmed_by: str = "Operations team"
+    decision_version: Optional[int] = None
+
+
+class AfterOrderTestModePayload(BaseModel):
+    enabled: bool = True
+
+
 class ExportCreatePayload(BaseModel):
     view: str
     store_id: Optional[int] = None
