@@ -2453,6 +2453,13 @@ class OdooClient:
                 "Direct Odoo product metadata updates are disabled in the fulfilment app "
                 f"(blocked fields: {', '.join(sorted(blocked_fields))})."
             )
+        protected_sale_line_fields = {"price_unit", "discount", "price_subtotal", "price_total"}
+        blocked_sale_line_fields = protected_sale_line_fields.intersection(vals) if model == "sale.order.line" else set()
+        if blocked_sale_line_fields:
+            raise RuntimeError(
+                "Direct Odoo sale-order-line monetary updates are disabled in the fulfilment app "
+                f"(blocked fields: {', '.join(sorted(blocked_sale_line_fields))})."
+            )
         return bool(self.execute(model, "write", [ids, vals]))
 
     def read(self, model: str, ids: list[int], fields: list[str]) -> list[dict[str, Any]]:
@@ -8720,43 +8727,6 @@ def fetch_amazon_product_title(asin: str) -> str:
     return ""
 
 
-def zero_missing_order_line_prices_in_odoo(rows: list[Any]) -> int:
-    """Zero only Odoo sale lines with an explicitly recorded missing ASIN."""
-    targets_by_store: dict[int, set[int]] = {}
-    for raw_row in rows:
-        row = row_to_dict(raw_row) or {}
-        if not normalize_asin(row.get("missing_asin")):
-            continue
-        store_id = int(row.get("store_id") or 0)
-        if not store_id:
-            continue
-        line_ids = line_ids_from_row(row)
-        if line_ids:
-            targets_by_store.setdefault(store_id, set()).update(line_ids)
-    updated = 0
-    errors: list[str] = []
-    for store_id, line_ids in targets_by_store.items():
-        ordered_ids = sorted(line_ids)
-        try:
-            odoo = OdooClient(get_store(store_id))
-            if not odoo.write("sale.order.line", ordered_ids, {"price_unit": 0.0}):
-                raise RuntimeError("Odoo rejected the price update.")
-            verified = odoo.read("sale.order.line", ordered_ids, ["id", "price_unit"])
-            non_zero = [int(line["id"]) for line in verified if abs(float(line.get("price_unit") or 0)) > 0.000001]
-            verified_ids = {int(line["id"]) for line in verified}
-            missing_ids = [line_id for line_id in ordered_ids if line_id not in verified_ids]
-            if non_zero or missing_ids:
-                raise RuntimeError(f"Odoo verification failed for line IDs {non_zero + missing_ids}.")
-            updated += len(ordered_ids)
-        except Exception as exc:
-            errors.append(f"store {store_id}, lines {ordered_ids}: {clean_error_message(exc)}")
-    if errors:
-        message = "Could not set unavailable Odoo line price to zero: " + " | ".join(errors[:5])
-        send_email_alert_async("Unavailable item Odoo price update failed", message)
-        raise RuntimeError(message)
-    return updated
-
-
 def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = "", missing_line_id: Optional[int] = None) -> int:
     missing_asin = normalize_asin(missing_asin)
     updated_rows: list[dict[str, Any]] = []
@@ -8813,7 +8783,6 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
         )
     for updated in updated_rows:
         index_order_line(updated)
-    zero_missing_order_line_prices_in_odoo(updated_rows)
     return len(rows)
 
 
@@ -9048,7 +9017,6 @@ def mark_chrome_line_missing(group_key: str, message: str, missing_asin: str = "
             )
     for updated in updated_rows:
         index_order_line(updated)
-    zero_missing_order_line_prices_in_odoo(updated_rows)
     return {"count": len(target_ids), "remaining_line_ids": remaining_line_ids}
 
 
@@ -31829,7 +31797,6 @@ def api_chrome_job_post_submit_unplaced(group_key: str, payload: ChromeJobFailPa
         ).fetchall())
     for updated in updated_rows:
         index_order_line(updated)
-    zero_missing_order_line_prices_in_odoo(updated_rows)
     return {
         "ok": True,
         "message": f"Moved {len(updated_rows)} Chrome line(s) to Missing ASINs because Amazon did not place the order after submit.",
