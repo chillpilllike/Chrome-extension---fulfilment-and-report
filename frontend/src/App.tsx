@@ -11933,6 +11933,7 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
   const [status, setStatus] = useState("open")
   const [query, setQuery] = useState("")
   const [loading, setLoading] = useState(false)
+  const [sendingAllTests, setSendingAllTests] = useState(false)
   const [emailTestMode, setEmailTestMode] = useState(true)
   const [emailTestRecipient, setEmailTestRecipient] = useState("sonianuj1284@gmail.com")
   const [cutoffDate, setCutoffDate] = useState("2026-08-01")
@@ -12005,6 +12006,20 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
     }
   }
 
+  const sendAllTestEmails = async () => {
+    setSendingAllTests(true)
+    try {
+      const suffix = storeId ? `?store_id=${encodeURIComponent(storeId)}` : ""
+      const result = await api<{ message: string }>(`/api/after-order/send-all-test-emails${suffix}`, { method: "POST" })
+      onResult({ ok: true, title: "Test email suite sent", message: result.message })
+      await load()
+    } catch (error) {
+      onResult({ ok: false, title: "Test email suite failed", message: String(error) })
+    } finally {
+      setSendingAllTests(false)
+    }
+  }
+
   const confirmDecision = async (row: AfterOrderCase) => {
     try {
       const result = await api<{ message: string }>(`/api/after-order/cases/${row.id}/confirm`, {
@@ -12041,10 +12056,15 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
             <option value="all">All</option>
           </SelectField>
         </div>
-        <label className={`flex min-w-[310px] items-center justify-between gap-4 rounded-lg border px-4 py-3 ${emailTestMode ? "border-amber-300 bg-amber-50 text-amber-950" : "border-destructive/40 bg-destructive/5"}`}>
-          <span><strong className="block">{emailTestMode ? "TEST MODE — Emails redirected" : "LIVE MODE — Customer delivery permitted"}</strong><small>{emailTestMode ? `Every email goes only to ${emailTestRecipient}` : "Emails use each order’s customer address"}</small></span>
-          <Checkbox checked={emailTestMode} onCheckedChange={(checked) => void updateTestMode(Boolean(checked))} aria-label="Email test mode" />
-        </label>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
+          <Button onClick={() => void sendAllTestEmails()} disabled={!emailTestMode || sendingAllTests}>
+            {sendingAllTests ? "Sending test emails…" : "Send all test emails"}
+          </Button>
+          <label className={`flex min-w-[310px] items-center justify-between gap-4 rounded-lg border px-4 py-3 ${emailTestMode ? "border-amber-300 bg-amber-50 text-amber-950" : "border-destructive/40 bg-destructive/5"}`}>
+            <span><strong className="block">{emailTestMode ? "TEST MODE — Emails redirected" : "LIVE MODE — Customer delivery permitted"}</strong><small>{emailTestMode ? `Every email goes only to ${emailTestRecipient}` : "Emails use each order’s customer address"}</small></span>
+            <Checkbox checked={emailTestMode} onCheckedChange={(checked) => void updateTestMode(Boolean(checked))} aria-label="Email test mode" />
+          </label>
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">

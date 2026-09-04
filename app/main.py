@@ -8687,6 +8687,43 @@ def fetch_amazon_product_title(asin: str) -> str:
     return ""
 
 
+def zero_missing_order_line_prices_in_odoo(rows: list[Any]) -> int:
+    """Zero only Odoo sale lines with an explicitly recorded missing ASIN."""
+    targets_by_store: dict[int, set[int]] = {}
+    for raw_row in rows:
+        row = row_to_dict(raw_row) or {}
+        if not normalize_asin(row.get("missing_asin")):
+            continue
+        store_id = int(row.get("store_id") or 0)
+        if not store_id:
+            continue
+        line_ids = line_ids_from_row(row)
+        if line_ids:
+            targets_by_store.setdefault(store_id, set()).update(line_ids)
+    updated = 0
+    errors: list[str] = []
+    for store_id, line_ids in targets_by_store.items():
+        ordered_ids = sorted(line_ids)
+        try:
+            odoo = OdooClient(get_store(store_id))
+            if not odoo.write("sale.order.line", ordered_ids, {"price_unit": 0.0}):
+                raise RuntimeError("Odoo rejected the price update.")
+            verified = odoo.read("sale.order.line", ordered_ids, ["id", "price_unit"])
+            non_zero = [int(line["id"]) for line in verified if abs(float(line.get("price_unit") or 0)) > 0.000001]
+            verified_ids = {int(line["id"]) for line in verified}
+            missing_ids = [line_id for line_id in ordered_ids if line_id not in verified_ids]
+            if non_zero or missing_ids:
+                raise RuntimeError(f"Odoo verification failed for line IDs {non_zero + missing_ids}.")
+            updated += len(ordered_ids)
+        except Exception as exc:
+            errors.append(f"store {store_id}, lines {ordered_ids}: {clean_error_message(exc)}")
+    if errors:
+        message = "Could not set unavailable Odoo line price to zero: " + " | ".join(errors[:5])
+        send_email_alert_async("Unavailable item Odoo price update failed", message)
+        raise RuntimeError(message)
+    return updated
+
+
 def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = "", missing_line_id: Optional[int] = None) -> int:
     missing_asin = normalize_asin(missing_asin)
     updated_rows: list[dict[str, Any]] = []
@@ -8743,6 +8780,7 @@ def mark_chrome_group_missing(group_key: str, message: str, missing_asin: str = 
         )
     for updated in updated_rows:
         index_order_line(updated)
+    zero_missing_order_line_prices_in_odoo(updated_rows)
     return len(rows)
 
 
@@ -8977,6 +9015,7 @@ def mark_chrome_line_missing(group_key: str, message: str, missing_asin: str = "
             )
     for updated in updated_rows:
         index_order_line(updated)
+    zero_missing_order_line_prices_in_odoo(updated_rows)
     return {"count": len(target_ids), "remaining_line_ids": remaining_line_ids}
 
 
@@ -31757,6 +31796,7 @@ def api_chrome_job_post_submit_unplaced(group_key: str, payload: ChromeJobFailPa
         ).fetchall())
     for updated in updated_rows:
         index_order_line(updated)
+    zero_missing_order_line_prices_in_odoo(updated_rows)
     return {
         "ok": True,
         "message": f"Moved {len(updated_rows)} Chrome line(s) to Missing ASINs because Amazon did not place the order after submit.",
@@ -37533,6 +37573,33 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
             """,
             (cutoff_date, store_id, store_id),
         ).fetchall())
+        tracking_order_keys = {
+            (int(row["store_id"]), int(row.get("odoo_order_id") or 0))
+            for row in tracking_rows
+            if int(row.get("odoo_order_id") or 0) > 0
+        }
+        product_rows = rows_to_dicts(conn.execute(
+            """SELECT id, store_id, odoo_order_id, product_name, quantity, asin
+               FROM order_lines
+               WHERE COALESCE(odoo_order_date, '') >= ?
+                 AND (? IS NULL OR store_id=?)
+               ORDER BY store_id, odoo_order_id, id""",
+            (cutoff_date, store_id, store_id),
+        ).fetchall())
+        products_by_order: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for product_row in product_rows:
+            product_key = (int(product_row["store_id"]), int(product_row.get("odoo_order_id") or 0))
+            if product_key not in tracking_order_keys:
+                continue
+            asin = normalize_asin(product_row.get("asin"))
+            products_by_order.setdefault(product_key, []).append({
+                "line_id": int(product_row["id"]),
+                "product_name": clean_text(product_row.get("product_name")) or asin or "Order item",
+                "quantity": float(product_row.get("quantity") or 1),
+                "asin": asin,
+                "thumbnail_url": f"/api/public/asin-image/{quote_plus(asin)}" if asin else "",
+                "odoo_product_url": "",
+            })
         for row in tracking_rows:
             events = after_order_json_list(row.get("events_json"))
             risk = tracking_risk(events, status=clean_text(row.get("status")), stale_days=10)
@@ -37556,13 +37623,14 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                 "final_mile_carrier": clean_text(row.get("final_mile_carrier")),
                 "final_mile_tracking_number": clean_text(row.get("final_mile_tracking_number")),
             }
+            order_products = products_by_order.get((int(row["store_id"]), int(row.get("odoo_order_id") or 0)), [])
             conn.execute(
                 """
                 INSERT INTO after_order_cases
                 (case_key, store_id, website_id, order_line_id, odoo_order_id, odoo_order_name,
                  case_type, status, severity, title, tracking_provider, tracking_code,
-                 context_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'epg', ?, ?, ?, ?)
+                 affected_items_json, context_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'epg', ?, ?, ?, ?, ?)
                 ON CONFLICT(case_key) DO UPDATE SET
                     website_id=excluded.website_id,
                     order_line_id=COALESCE(excluded.order_line_id, after_order_cases.order_line_id),
@@ -37572,6 +37640,7 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                     status=CASE WHEN after_order_cases.confirmed_at IS NULL THEN excluded.status ELSE after_order_cases.status END,
                     severity=excluded.severity,
                     title=excluded.title,
+                    affected_items_json=excluded.affected_items_json,
                     context_json=excluded.context_json,
                     updated_at=excluded.updated_at
                 """,
@@ -37582,7 +37651,7 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                     "Package may be lost" if risk.state == "suspected_lost" else
                     "Carrier exception" if risk.state == "carrier_exception" else
                     "Please confirm delivery" if risk.state == "delivered" else "Package in transit",
-                    clean_text(row.get("tracking_code")), json.dumps(context), now, now,
+                    clean_text(row.get("tracking_code")), json.dumps(order_products), json.dumps(context), now, now,
                 ),
             )
 
@@ -37714,6 +37783,7 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any]) -> dict[str, 
     customer_email = clean_text(case.get("customer_email"))
     sender_domain = clean_text(case.get("sender_domain"))
     website_id = case.get("website_id")
+    context = dict(case.get("context") or {})
     try:
         odoo = OdooClient(get_store(int(case["store_id"])))
         fields = odoo.existing_fields("sale.order", ["partner_id", "partner_invoice_id", "website_id"])
@@ -37724,24 +37794,28 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any]) -> dict[str, 
         if partner_id and not customer_email:
             partners = odoo.read("res.partner", [partner_id], odoo.existing_fields("res.partner", ["email"]))
             customer_email = clean_text((partners[0] if partners else {}).get("email"))
-        if website_id and not sender_domain:
+        if website_id:
             websites = odoo.read("website", [int(website_id)], odoo.existing_fields("website", ["domain"]))
             raw_domain = clean_text((websites[0] if websites else {}).get("domain"))
             if raw_domain.lower() not in {"", "false", "none"}:
-                candidate_domain = clean_text(urlparse(raw_domain if "://" in raw_domain else f"https://{raw_domain}").hostname).lower()
+                parsed_website = urlparse(raw_domain if "://" in raw_domain else f"https://{raw_domain}")
+                candidate_domain = clean_text(parsed_website.hostname).lower()
                 if "." in candidate_domain:
                     sender_domain = candidate_domain.removeprefix("www.")
+                    website_origin = f"{parsed_website.scheme or 'https'}://{candidate_domain}"
+                    context["website_logo_url"] = f"{website_origin}/web/image/website/{int(website_id)}/logo?v={int(time.time())}"
     except Exception:
         # Sending can still use cached case values or the explicitly configured fallback sender.
         pass
-    if customer_email or sender_domain or website_id:
+    if customer_email or sender_domain or website_id or context != (case.get("context") or {}):
         now = utc_now()
         with db() as conn:
             conn.execute(
                 """UPDATE after_order_cases SET customer_email=COALESCE(NULLIF(?, ''), customer_email),
-                   sender_domain=COALESCE(NULLIF(?, ''), sender_domain), website_id=COALESCE(?, website_id), updated_at=?
+                   sender_domain=COALESCE(NULLIF(?, ''), sender_domain), website_id=COALESCE(?, website_id),
+                   context_json=?, updated_at=?
                    WHERE id=?""",
-                (customer_email, sender_domain, website_id, now, case["id"]),
+                (customer_email, sender_domain, website_id, json.dumps(context), now, case["id"]),
             )
         case = after_order_case_by_id(int(case["id"])) or case
     return case
@@ -37765,67 +37839,114 @@ def after_order_email_content(
     *,
     template_kind: str = "",
     unsubscribe_url: str = "",
+    actions_override: Optional[list[str]] = None,
 ) -> tuple[str, str, str]:
     items = case.get("affected_items") or []
-    item_rows = "".join(
-        f"""<div style="display:flex;gap:14px;align-items:center;border:1px solid #e1e7ee;border-radius:10px;padding:12px;margin:12px 0">
-        {f'<img src="{html.escape(clean_text(item.get("thumbnail_url")))}" alt="" width="72" height="72" style="object-fit:contain;border-radius:8px">' if item.get('thumbnail_url') else ''}
-        <div><strong>{html.escape(clean_text(item.get('product_name')) or 'Affected product')}</strong><br>
-        <span>Quantity: {html.escape(str(item.get('quantity') or 1))}</span>
-        {f'<br><a href="{html.escape(clean_text(item.get("odoo_product_url")))}">View this product</a>' if item.get('odoo_product_url') else ''}</div></div>"""
-        for item in items
-    )
-    actions = after_order_allowed_actions(case)
+    item_rows = "".join(f"""
+        <tr><td style="padding:0 0 12px">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #dce1e7;border-radius:10px;background:#fff">
+            <tr>
+              <td width="88" valign="middle" style="padding:12px">
+                {f'<img src="{html.escape(clean_text(item.get("thumbnail_url")))}" alt="Product thumbnail" width="72" height="72" style="display:block;width:72px;height:72px;object-fit:contain;border:1px solid #edf0f3;border-radius:8px;background:#fff">' if item.get('thumbnail_url') else '<div style="width:72px;height:72px;border-radius:8px;background:#f1f3f5"></div>'}
+              </td>
+              <td valign="middle" style="padding:12px 12px 12px 0;color:#1d273b;font:14px/1.45 Arial,sans-serif">
+                <strong style="display:block;font-size:15px">{html.escape(clean_text(item.get('product_name')) or 'Order item')}</strong>
+                <span style="color:#667085">Quantity {html.escape(str(item.get('quantity') or 1))}{f' · {html.escape(clean_text(item.get("asin")))}' if item.get('asin') else ''}</span>
+                {f'<br><a href="{html.escape(clean_text(item.get("odoo_product_url")))}" style="color:#206bc4;text-decoration:none;font-weight:600">View affected product</a>' if item.get('odoo_product_url') else ''}
+              </td>
+            </tr>
+          </table>
+        </td></tr>""" for item in items)
+    items_section = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px">{item_rows}</table>""" if item_rows else ""
+    actions = list(actions_override) if actions_override is not None else after_order_allowed_actions(case)
+    action_colors = {
+        "proceed": ("#2fb344", "#ffffff"),
+        "received": ("#2fb344", "#ffffff"),
+        "replacement": ("#206bc4", "#ffffff"),
+        "offer_alternatives": ("#4299e1", "#ffffff"),
+        "exclude_item_and_proceed": ("#626976", "#ffffff"),
+        "cancel_affected_item": ("#d63939", "#ffffff"),
+        "cancel_order": ("#d63939", "#ffffff"),
+        "refund": ("#d63939", "#ffffff"),
+        "not_received": ("#d63939", "#ffffff"),
+    }
     buttons = "".join(
-        f'<a href="{html.escape(action_url)}?choice={quote_plus(action)}" style="display:block;text-align:center;background:#087f83;color:white;text-decoration:none;font-weight:700;border-radius:8px;padding:13px;margin:10px 0">{html.escape(AFTER_ORDER_ACTION_LABELS[action])}</a>'
+        f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 10px"><tr><td align="center" bgcolor="{action_colors.get(action, ('#206bc4', '#ffffff'))[0]}" style="border-radius:7px"><a href="{html.escape(action_url)}?choice={quote_plus(action)}" style="display:block;padding:13px 18px;color:{action_colors.get(action, ('#206bc4', '#ffffff'))[1]};font:700 14px Arial,sans-serif;text-decoration:none;border-radius:7px">{html.escape(AFTER_ORDER_ACTION_LABELS[action])}</a></td></tr></table>"""
         for action in actions
     )
-    order_name = html.escape(clean_text(case.get("odoo_order_name")) or "your order")
-    tracking_url = html.escape(clean_text((case.get("context") or {}).get("tracking_url")))
+    order_number = clean_text(case.get("odoo_order_name")) or "Your order"
+    order_name = html.escape(order_number)
+    context = case.get("context") or {}
+    tracking_url = html.escape(clean_text(context.get("tracking_url")))
+    logo_url = html.escape(clean_text(context.get("website_logo_url")))
+    status_text = html.escape(clean_text(context.get("latest_status")))
+    location_text = html.escape(clean_text(context.get("latest_location")))
     case_type = clean_text(case.get("case_type"))
     if template_kind == "trustpilot_review":
         _, domain = after_order_sender(case)
         review_url = trustpilot_review_url(domain)
-        subject = "Thank you — how was your experience?"
+        subject = f"{order_number} — Thank you for confirming delivery"
         heading = "Thank you for confirming delivery"
         intro = "We’re glad your order arrived. If you have a moment, we’d appreciate your honest feedback."
-        body = f'<a href="{html.escape(review_url)}" style="display:block;text-align:center;background:#087f83;color:white;text-decoration:none;font-weight:700;border-radius:8px;padding:13px;margin:18px 0">Share an honest Trustpilot review</a>'
+        body = f"""{items_section}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px"><tr><td align="center" bgcolor="#2fb344" style="border-radius:7px"><a href="{html.escape(review_url)}" style="display:block;padding:14px 20px;color:#fff;font:700 15px Arial,sans-serif;text-decoration:none">Share an honest Trustpilot review</a></td></tr></table>"""
         plain = f"Thank you for confirming delivery of order {clean_text(case.get('odoo_order_name'))}. Share your honest feedback: {review_url}"
+    elif case_type == "expected_dispatch":
+        dispatch_date = html.escape(clean_text(context.get("expected_dispatch_date")))
+        subject = f"{order_number} — Please confirm the expected dispatch"
+        heading = "Please confirm the expected dispatch"
+        intro = f"Order <strong>{order_name}</strong> has a later expected dispatch{f' around <strong>{dispatch_date}</strong>' if dispatch_date else ''}. If we do not hear from you, we will continue processing it."
+        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
+        plain = f"Order {clean_text(case.get('odoo_order_name'))} has a later expected dispatch. If we do not hear from you, we will continue processing it. Respond here: {action_url}"
     elif case_type == "delivery_confirmation":
-        subject = f"Did order {clean_text(case.get('odoo_order_name')) or ''} arrive?".strip()
+        subject = f"{order_number} — Did your order arrive?"
         heading = "Please confirm your delivery"
         intro = f"The carrier has marked order <strong>{order_name}</strong> as delivered. Please tell us whether you received it."
-        body = buttons
+        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
         plain = f"The carrier marked order {clean_text(case.get('odoo_order_name'))} as delivered. Confirm here: {action_url}"
     elif case_type == "item_unavailable":
-        subject = "An item in your order needs your choice"
+        subject = f"{order_number} — An item needs your choice"
         heading = "An item in your order needs your choice"
         intro = f"Order <strong>{order_name}</strong> has one or more currently unavailable items. Only the affected items are shown."
-        body = f"{item_rows}{buttons}"
+        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
         plain = f"An item in order {clean_text(case.get('odoo_order_name'))} needs your choice. Respond here: {action_url}"
-    elif clean_text((case.get("context") or {}).get("risk_state")) in {"suspected_lost", "carrier_exception"}:
-        subject = "We need your choice about your package"
+    elif template_kind == "package_lost" or clean_text(context.get("risk_state")) in {"suspected_lost", "carrier_exception"}:
+        subject = f"{order_number} — Your package needs attention"
         heading = "Your package needs attention"
         intro = f"There has been no confirmed movement for order <strong>{order_name}</strong>. Please choose a replacement or refund."
-        body = buttons
+        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
         plain = f"Your package for order {clean_text(case.get('odoo_order_name'))} needs attention. Respond here: {action_url}"
     else:
-        subject = "Your package has moved"
+        subject = f"{order_number} — Your package has moved"
         heading = "Your package has a new update"
         intro = f"There is a new carrier update for order <strong>{order_name}</strong>."
-        body = f'<a href="{tracking_url}" style="display:block;text-align:center;background:#087f83;color:white;text-decoration:none;font-weight:700;border-radius:8px;padding:13px;margin:18px 0">Track all details</a>' if tracking_url else ""
-        plain = f"There is a new carrier update for order {clean_text(case.get('odoo_order_name'))}. Track it: {clean_text((case.get('context') or {}).get('tracking_url'))}"
+        update_panel = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;background:#f1f5f9;border-radius:10px"><tr><td style="padding:16px;font:14px/1.5 Arial,sans-serif;color:#334155"><strong style="color:#1d273b">{status_text or 'Shipment update'}</strong>{f'<br>{location_text}' if location_text else ''}</td></tr></table>"""
+        track_button = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px"><tr><td align="center" bgcolor="#206bc4" style="border-radius:7px"><a href="{tracking_url}" style="display:block;padding:14px 20px;color:#fff;font:700 15px Arial,sans-serif;text-decoration:none">Track all details</a></td></tr></table>""" if tracking_url else ""
+        body = f"{update_panel}{items_section}{track_button}"
+        plain = f"There is a new carrier update for order {clean_text(case.get('odoo_order_name'))}. Track it: {clean_text(context.get('tracking_url'))}"
     unsubscribe_html = (
         f'<p style="font-size:12px;color:#687386;text-align:center"><a href="{html.escape(unsubscribe_url)}" style="color:#687386">Unsubscribe from package movement and review emails</a></p>'
         if unsubscribe_url else ""
     )
     if unsubscribe_url:
         plain += f"\n\nUnsubscribe from package movement and review emails: {unsubscribe_url}"
-    html_body = f"""<!doctype html><html><body style="margin:0;background:#f5f7fa;font-family:Arial,sans-serif;color:#172033">
-    <div style="max-width:620px;margin:24px auto;background:white;border-radius:14px;padding:28px">
-    <h1 style="font-size:24px">{heading}</h1><p>{intro}</p>{body}
-    {f'<p style="font-size:13px;color:#5d6878">You may change your request until our team confirms it. After confirmation, every action link in this email will expire.</p>' if actions else ''}
-    {unsubscribe_html}</div></body></html>"""
+    preheader = html.escape(subject)
+    logo_html = f'<img src="{logo_url}" alt="{html.escape(clean_text(case.get("store_name")) or "Store")}" height="44" style="display:block;max-width:180px;max-height:44px;width:auto;height:auto">' if logo_url else f'<strong style="font:700 20px Arial,sans-serif;color:#1d273b">{html.escape(clean_text(case.get("store_name")) or "Customer care")}</strong>'
+    html_body = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"></head>
+    <body style="margin:0;padding:0;background:#f1f3f5;color:#1d273b">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0">{preheader}</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f5"><tr><td align="center" style="padding:28px 12px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#fff;border:1px solid #dce1e7;border-radius:12px;overflow:hidden;box-shadow:0 3px 12px rgba(29,39,59,.06)">
+        <tr><td style="padding:22px 28px;border-bottom:1px solid #e6e9ed">{logo_html}</td></tr>
+        <tr><td style="padding:30px 28px;font-family:Arial,sans-serif">
+          <span style="display:inline-block;padding:5px 9px;border-radius:6px;background:#e9f2ff;color:#206bc4;font:700 11px Arial,sans-serif;letter-spacing:.04em;text-transform:uppercase">Order {order_name}</span>
+          <h1 style="margin:16px 0 10px;color:#1d273b;font:700 25px/1.25 Arial,sans-serif">{heading}</h1>
+          <div style="color:#4b5565;font:15px/1.65 Arial,sans-serif">{intro}</div>
+          {body}
+          {f'<div style="margin-top:20px;padding:12px 14px;border-left:3px solid #f59f00;background:#fff8e6;color:#6b4f00;font:13px/1.5 Arial,sans-serif">You can change your request until our team confirms it. After confirmation, all action links expire.</div>' if actions else ''}
+        </td></tr>
+        <tr><td style="padding:20px 28px;background:#f8f9fa;border-top:1px solid #e6e9ed;color:#667085;font:12px/1.6 Arial,sans-serif;text-align:center">This message relates to order {order_name}.{unsubscribe_html}</td></tr>
+      </table>
+    </td></tr></table></body></html>"""
     return subject, html_body, plain
 
 
@@ -37909,7 +38030,7 @@ def api_after_order_email_preview(case_id: int) -> dict[str, Any]:
     require_after_order_case_in_scope(case)
     link = api_after_order_action_link(case_id)
     action_url = clean_text(link.get("url"))
-    preview = after_order_email_preview_html(case, action_url)
+    subject, preview, _ = after_order_email_content(case, action_url)
     now = utc_now()
     test_mode = after_order_email_test_mode()
     sender = f"notifications@{clean_text(case.get('sender_domain'))}" if clean_text(case.get("sender_domain")) else "Sender domain not configured"
@@ -37921,7 +38042,7 @@ def api_after_order_email_preview(case_id: int) -> dict[str, Any]:
                VALUES (?, 'resend', ?, ?, ?, ?, 'test_preview', ?, ?, ?)""",
             (
                 case_id, clean_text(case.get("customer_email")), sender,
-                "An item in your order needs your choice", preview, message_id, now, now,
+                subject, preview, message_id, now, now,
             ),
         )
         record_after_order_event(
@@ -37937,15 +38058,26 @@ def send_after_order_email(
     *,
     force_test: bool = False,
     template_kind: str = "",
+    showcase_kind: str = "",
 ) -> dict[str, Any]:
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
     case = hydrate_after_order_recipient_and_domain(case)
-    allowed = after_order_allowed_actions(case) if not template_kind else []
+    showcase_actions = {
+        "expected_dispatch": ["proceed", "cancel_order"],
+        "item_unavailable": ["offer_alternatives", "exclude_item_and_proceed", "cancel_affected_item", "cancel_order"],
+        "delivery_confirmation": ["received", "not_received"],
+        "package_lost": ["replacement", "refund"],
+        "package_movement": [],
+        "trustpilot_review": [],
+    }
+    allowed = showcase_actions.get(showcase_kind, after_order_allowed_actions(case) if not template_kind else [])
     action_url = ""
-    if allowed:
+    if showcase_kind and allowed:
+        action_url = after_order_absolute_url(request, "/after-order-care")
+    elif allowed:
         relative = clean_text(api_after_order_action_link(case_id).get("url"))
         action_url = after_order_absolute_url(request, relative)
     test_mode = force_test or after_order_email_test_mode()
@@ -37959,12 +38091,34 @@ def send_after_order_email(
         sender, sender_domain = after_order_sender(case)
         if allowed and not test_mode and urlparse(action_url).scheme != "https":
             raise ValueError("Live customer action links require an HTTPS AFTER_ORDER_PUBLIC_BASE_URL.")
-        preference_eligible = template_kind == "trustpilot_review" or (not allowed and case.get("case_type") == "tracking")
+        preference_eligible = (
+            template_kind == "trustpilot_review"
+            or showcase_kind in {"package_movement", "trustpilot_review"}
+            or (not allowed and case.get("case_type") == "tracking")
+        )
         if preference_eligible and not test_mode and after_order_tracking_updates_opted_out(case, recipient):
             raise ValueError("This customer opted out of package movement and review emails for this site.")
         unsubscribe_url = create_after_order_unsubscribe_url(case, request, recipient) if preference_eligible else ""
         email_case = dict(case)
         email_case["context"] = dict(case.get("context") or {})
+        effective_template_kind = template_kind
+        if showcase_kind:
+            if showcase_kind == "expected_dispatch":
+                email_case["case_type"] = "expected_dispatch"
+            elif showcase_kind == "item_unavailable":
+                email_case["case_type"] = "item_unavailable"
+            elif showcase_kind == "delivery_confirmation":
+                email_case["case_type"] = "delivery_confirmation"
+            elif showcase_kind == "package_lost":
+                email_case["case_type"] = "tracking"
+                email_case["context"]["risk_state"] = "suspected_lost"
+                effective_template_kind = "package_lost"
+            elif showcase_kind == "package_movement":
+                email_case["case_type"] = "tracking"
+                email_case["context"]["risk_state"] = "in_transit"
+                effective_template_kind = ""
+            elif showcase_kind == "trustpilot_review":
+                effective_template_kind = "trustpilot_review"
         tracker_query = clean_text(case.get("odoo_order_name")) or clean_text(case.get("tracking_code"))
         if tracker_query:
             email_case["context"]["tracking_url"] = after_order_absolute_url(
@@ -37979,12 +38133,13 @@ def send_after_order_email(
         subject, html_body, text_body = after_order_email_content(
             email_case,
             action_url,
-            template_kind=template_kind,
+            template_kind=effective_template_kind,
             unsubscribe_url=unsubscribe_url,
+            actions_override=allowed if showcase_kind else None,
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    idempotency_key = f"after-order:{case_id}:{template_kind or case.get('case_type')}:{'test' if test_mode else 'live'}:{uuid.uuid4().hex}"
+    idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{'test' if test_mode else 'live'}:{uuid.uuid4().hex}"
     now = utc_now()
     message_id = ""
     status = "failed"
@@ -38040,7 +38195,7 @@ def send_after_order_email(
                 "intended_recipient": intended_recipient,
                 "sender": sender,
                 "provider_message_id": message_id,
-                "template": template_kind or clean_text(case.get("case_type")),
+                "template": showcase_kind or template_kind or clean_text(case.get("case_type")),
                 "test_mode": test_mode,
             },
         )
@@ -38066,6 +38221,51 @@ def api_after_order_send_test_email(case_id: int, request: Request) -> dict[str,
         else ""
     )
     return send_after_order_email(case_id, request, force_test=True, template_kind=template_kind)
+
+
+@app.post("/api/after-order/send-all-test-emails")
+def api_after_order_send_all_test_emails(request: Request, store_id: Optional[int] = None) -> dict[str, Any]:
+    """Send the complete visual email suite to the configured test inbox."""
+    if not after_order_email_test_mode():
+        raise HTTPException(409, "Enable email test mode before sending the test suite.")
+    params: list[Any] = [after_order_cutoff_date()]
+    store_sql = ""
+    if store_id is not None:
+        store_sql = " AND store_id=?"
+        params.append(store_id)
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            f"""SELECT id, case_type FROM after_order_cases
+                WHERE substr(COALESCE(odoo_order_date, ''), 1, 10) >= ?{store_sql}
+                ORDER BY updated_at DESC, id DESC""",
+            tuple(params),
+        ).fetchall())
+    if not rows:
+        raise HTTPException(409, f"No order dated {after_order_cutoff_date()} or later is available for email testing.")
+    first_id = int(rows[0]["id"])
+    by_type: dict[str, int] = {}
+    for row in rows:
+        by_type.setdefault(clean_text(row.get("case_type")), int(row["id"]))
+    suite = [
+        ("expected_dispatch", first_id),
+        ("item_unavailable", by_type.get("item_unavailable", first_id)),
+        ("delivery_confirmation", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
+        ("package_lost", by_type.get("tracking", first_id)),
+        ("package_movement", by_type.get("tracking", first_id)),
+        ("trustpilot_review", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
+    ]
+    results = []
+    for index, (kind, case_id) in enumerate(suite):
+        if index:
+            time.sleep(1)
+        result = send_after_order_email(case_id, request, force_test=True, showcase_kind=kind)
+        results.append({"template": kind, "case_id": case_id, "recipient": result.get("recipient")})
+    return {
+        "ok": True,
+        "sent": len(results),
+        "results": results,
+        "message": f"Sent {len(results)} test emails to {after_order_test_recipient()}, one second apart.",
+    }
 
 
 @app.post("/api/after-order/cases/{case_id}/action-link")
