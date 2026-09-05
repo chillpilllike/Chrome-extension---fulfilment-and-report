@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, useEffect, useMemo, useRef, useState } from "react"
 import type { DragEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
 import AlertCircle from "@tabler/icons-react/dist/esm/icons/IconAlertCircle.mjs"
 import Bell from "@tabler/icons-react/dist/esm/icons/IconBell.mjs"
@@ -39,6 +39,7 @@ import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerCo
 import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { AfterCareWorkspace } from "@/components/AfterCareWorkspace"
+import { LineAlternativeButton, OrderCareTimeline } from "@/components/LineAlternatives"
 import { EmailLogWorkspace } from "@/components/EmailLogWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
 import "@/components/after-care-workspace.css"
@@ -4933,6 +4934,7 @@ function App() {
         return (
           <div className="grid justify-items-start gap-1">
             <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName={row.state === "missing" ? "text-destructive" : ""} />
+            {row.state === "missing" && !row.amazon_order_id && <LineAlternativeButton lineId={row.id} name={row.product_name || "Order item"} request={api}/>}
             {row.replacement_run_id ? (
               <Badge className="inventory-availability-badge inventory-availability-badge-partial">
                 Replacement R{Number(row.replacement_sequence || 1)} · {row.replacement_reason || "replacement"}
@@ -12141,25 +12143,6 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
     }
   }
 
-  const addRecommendedProduct = async (row: AfterOrderCase) => {
-    const entered = window.prompt("Enter the Odoo product template ID to place first in the alternatives grid.")
-    if (!entered) return
-    const productTemplateId = Number(entered)
-    if (!Number.isInteger(productTemplateId) || productTemplateId <= 0) {
-      onResult({ ok: false, title: "Invalid product", message: "Enter a valid numeric Odoo product template ID." })
-      return
-    }
-    try {
-      const result = await api<{ message: string }>(`/api/after-order/cases/${row.id}/alternatives`, {
-        method: "POST",
-        body: JSON.stringify({ product_tmpl_id: productTemplateId }),
-      })
-      onResult({ ok: true, title: "Recommended product added", message: result.message })
-      await openActivity(row)
-    } catch (error) {
-      onResult({ ok: false, title: "Alternative product failed", message: String(error) })
-    }
-  }
 
   const sendAllTestEmails = async () => {
     setSendingAllTests(true)
@@ -12234,13 +12217,13 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           const decisionCase = itemCase || deliveryConfirmation || row.case_type === "expected_dispatch" || context.risk_state === "suspected_lost"
           const nextStep = row.status === "resolved" ? "Review resolution" : row.confirmed_at ? "Review approved follow-up" : itemCase && row.unavailable_notice?.blocked ? "Resolve sourcing blocker" : itemCase && row.unavailable_notice && !row.unavailable_notice.approved ? "Review sourcing first" : row.current_decision ? "Review & confirm decision" : awaitingFirstScan ? "Check first carrier scan" : decisionCase ? "Review customer choices" : "Review tracking evidence"
 
-            return <TableRow key={row.id}>
+            return <Fragment key={row.id}><TableRow>
               <TableCell><strong className="epost-order">{row.odoo_order_name || row.tracking_code || `Case ${row.id}`}</strong><small>{row.store_name}{row.website_id ? ` · Website ${row.website_id}` : ""}</small><small title="Odoo order placement date">Placed: {row.odoo_order_date ? formatOrderDateTime(row.odoo_order_date) : "Not recorded"}</small>{row.tracking_code && <span className="epost-code">{row.tracking_code}</span>}</TableCell>
               <TableCell><span className={`epost-status ${row.severity === "high" ? "ep-confirmed_lost" : row.severity === "medium" ? "ep-carrier_exception" : "ep-in_transit"}`}>{row.title}</span><p>{itemCase ? `${row.affected_items.length} affected product${row.affected_items.length === 1 ? "" : "s"}` : context.latest_status || context.risk_reason || "Review available evidence"}</p><small>{row.severity} priority</small></TableCell>
               <TableCell><strong>{decisionCase ? currentLabel : "No customer decision required"}</strong><small>{row.status.replaceAll("_", " ")}</small>{row.confirmed_at && <small>Confirmed by team</small>}{row.execution && <small>Execution: {row.execution.status.replaceAll("_", " ")}</small>}</TableCell>
               <TableCell><strong>{nextStep}</strong><p>{row.unavailable_notice?.blocked ? row.unavailable_notice.reason : row.execution?.last_error || (awaitingFirstScan ? "Check carrier acceptance; no lost email queued." : "Review the evidence and latest request before taking action.")}</p></TableCell>
               <TableCell><Button size="sm" variant="outline" disabled={loading} onClick={() => setReviewCaseId(row.id)}>Review case</Button></TableCell>
-            </TableRow>
+            </TableRow><TableRow><TableCell colSpan={5}><OrderCareTimeline caseId={row.id} orderNumber={row.odoo_order_name || ""} request={api}/></TableCell></TableRow></Fragment>
           })}
           {(loading || !rows.length) && <TableRow><TableCell colSpan={5}><div className="epost-empty" role="status"><h3>{loading ? "Loading cases…" : "No cases in this view"}</h3><p>{loading ? "Reading the latest case records." : "Choose another queue or search for an order or tracking number."}</p></div></TableCell></TableRow>}
         </TableBody>
@@ -12294,7 +12277,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {row.execution ? <span className="mt-2 block text-xs font-medium">Execution: {row.execution.status.replaceAll("_", " ")}</span> : null}
                   {row.execution?.last_error ? <p className="mt-1 max-h-20 overflow-y-auto text-xs text-destructive">{row.execution.last_error}</p> : null}
                   {row.confirmed_at && row.execution?.status !== "completed" ? <p className="mt-1 text-xs text-amber-800">Approved only — execution is not yet complete.</p> : null}
-                  {row.current_decision && !row.confirmed_at ? <Badge variant="outline" className="mt-2">Link active until confirmation</Badge> : null}
+                  {row.current_decision && !row.confirmed_at ? <Badge variant="outline" className="mt-2">{row.current_decision === "offer_alternatives" ? "24-hour window for each line" : "Link active until confirmation"}</Badge> : null}
                   {row.confirmed_at ? <Badge variant="secondary" className="mt-2">Links expired after approval</Badge> : null}
                 </div>
 
@@ -12308,13 +12291,14 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
 
                 <div className="care-case-actions">
                   {itemCase && !row.confirmed_at && row.unavailable_notice && !row.unavailable_notice.blocked && !row.unavailable_notice.approved ? <Button variant="outline" onClick={() => void approveUnavailableNotice(row)}>Approve sourcing review</Button> : null}
-                  {row.current_decision && !row.confirmed_at ? <Button onClick={() => void confirmDecision(row)}>Confirm decision</Button> : null}
+                  {row.current_decision && row.current_decision !== "offer_alternatives" && !row.confirmed_at ? <Button onClick={() => void confirmDecision(row)}>Confirm decision</Button> : null}
                   {!row.confirmed_at && decisionCase ? <Button variant="outline" onClick={() => void createTestLink(row)}>Preview customer choices</Button> : null}
-                  {itemCase && !row.confirmed_at ? <Button variant="outline" onClick={() => void addRecommendedProduct(row)}>Add recommended product</Button> : null}
+                  {itemCase && !row.confirmed_at ? row.affected_items.map(item => <LineAlternativeButton key={item.line_id} lineId={item.line_id} name={item.product_name || "Order item"} request={api}/>) : null}
                   <Button variant="outline" disabled={itemCase && row.unavailable_notice?.blocked} onClick={() => void sendTestEmail(row)}>Send test email</Button>
                   {!itemCase && (row.odoo_order_name || row.tracking_code) ? <Button onClick={() => window.open(`/package-tracker?q=${encodeURIComponent(row.odoo_order_name || row.tracking_code || "")}&field=all`, "_blank", "noopener,noreferrer")}>Track all details</Button> : null}
                   <Button variant="outline" onClick={() => void openActivity(row)}>View activity</Button>
                 </div>
+                <OrderCareTimeline caseId={row.id} orderNumber={row.odoo_order_name || ""} request={api}/>
               </div>
 
           </DialogContent>

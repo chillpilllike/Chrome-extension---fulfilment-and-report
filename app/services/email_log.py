@@ -16,6 +16,8 @@ def retry_block_reason(message, *, test_mode, test_recipient):
         return "Five attempts reached. Resolve the underlying issue before creating a new notification."
     if not message.get("request_fingerprint"):
         return "Legacy record has no request snapshot. Use the order's current email action instead."
+    if message.get('provider') == 'odoo':
+        return 'Odoo quotation emails cannot be retried in test mode.' if test_mode or message.get('test_mode') else ''
     try:
         payload = json.loads(message.get("payload_json") or "{}")
     except (ValueError, TypeError):

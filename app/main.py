@@ -1046,6 +1046,7 @@ def public_access_login(request: Request, code: str = Form(...), next: str = For
 
 
 def init_db() -> None:
+    from app.services.alternative_workflow import SCHEMA as alternative_schema
     with db() as conn:
         conn.executescript(
             """
@@ -1988,7 +1989,7 @@ def init_db() -> None:
         for table, columns in {
             "after_order_action_links": {"request_fingerprint": "TEXT"},
             "after_order_cases": {"decision_fingerprint": "TEXT"},
-            "after_order_messages": {"payload_json": "TEXT", "last_error": "TEXT", "test_mode": "INTEGER NOT NULL DEFAULT 0", "attempt_count": "INTEGER NOT NULL DEFAULT 1", "request_fingerprint": "TEXT", "template_kind": "TEXT"},
+            "after_order_messages": {"payload_json": "TEXT", "related_items_json": "TEXT", "last_error": "TEXT", "test_mode": "INTEGER NOT NULL DEFAULT 0", "attempt_count": "INTEGER NOT NULL DEFAULT 1", "request_fingerprint": "TEXT", "template_kind": "TEXT"},
         }.items():
             existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for column, sql_type in columns.items():
@@ -2213,6 +2214,7 @@ def init_db() -> None:
         existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(shopify_order_status_cache)").fetchall()}
         if "fulfillment_at" not in existing_cols:
             conn.execute("ALTER TABLE shopify_order_status_cache ADD COLUMN fulfillment_at TEXT")
+        conn.executescript(alternative_schema)
         ensure_performance_indexes(conn)
         conn.execute("UPDATE order_lines SET pulled_at = COALESCE(NULLIF(pulled_at, ''), created_at)")
         conn.execute(
@@ -9070,6 +9072,11 @@ def mark_chrome_line_missing(group_key: str, message: str, missing_asin: str = "
         )
         for row in conn.execute(f"SELECT * FROM order_lines WHERE id IN ({placeholders})", target_ids).fetchall():
             updated_rows.append(row)
+            if clean_text(dict(row).get('odoo_order_date'))[:10] >= after_order_cutoff_date():
+                conn.execute('''INSERT INTO after_order_line_activity
+                    (store_id,odoo_order_id,line_id,product_name,event_type,details_json,created_at)
+                    VALUES(?,?,?,?,'extension_reported_unavailable',?,?)''',
+                    (row['store_id'],row['odoo_order_id'],row['id'],row['product_name'],json.dumps({'asin':missing_asin,'reason':message}),utc_now()))
         remaining = conn.execute(
             """
             SELECT *
@@ -10084,6 +10091,11 @@ def process_odoo_order_batch(
     invoice_fields: list[str],
     service_settings: dict[str, str],
 ) -> int:
+    # Price-difference quotations are payment documents, not fulfilment orders.
+    if orders and odoo.has_field("sale.order", "after_order_parent_id"):
+        adjustments = odoo.read("sale.order", [order['id'] for order in orders], ['after_order_parent_id'])
+        adjustment_ids = {order['id'] for order in adjustments if order.get('after_order_parent_id')}
+        orders = [order for order in orders if order['id'] not in adjustment_ids]
     if not orders:
         return 0
     all_line_ids = sorted({int(line_id) for order in orders for line_id in (order.get("order_line") or [])})
@@ -10447,6 +10459,8 @@ def fetch_odoo_lines(
     print(f"[pull] store={store.id} days={days} limit={limit} batch_size={batch_size} connecting to Odoo", flush=True)
     odoo = OdooClient(store)
     domain: list[Any] = [("state", "in", ["sale", "done", "cancel"])]
+    if odoo.has_field("sale.order", "after_order_parent_id"):
+        domain.append(("after_order_parent_id", "=", False))
     if store.website_id:
         domain.append(("website_id", "=", store.website_id))
     if days > 0:
@@ -38070,18 +38084,41 @@ def api_after_order_cases(
 
 @app.get("/api/after-order/cases/{case_id}/events")
 def api_after_order_case_events(case_id: int) -> dict[str, Any]:
-    if not after_order_case_by_id(case_id):
+    case = after_order_case_by_id(case_id)
+    if not case:
         raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
     with db() as conn:
         rows = rows_to_dicts(conn.execute(
             "SELECT * FROM after_order_case_events WHERE case_id=? ORDER BY created_at DESC, id DESC",
             (case_id,),
         ).fetchall())
+        attempts = rows_to_dicts(conn.execute('''SELECT a.*,m.subject,m.recipient,m.status AS message_status,m.related_items_json
+            FROM after_order_email_attempts a JOIN after_order_messages m ON m.id=a.message_id
+            WHERE m.case_id=? ORDER BY a.created_at DESC,a.id DESC''',(case_id,)).fetchall())
+        line_events = rows_to_dicts(conn.execute('''SELECT * FROM after_order_line_activity
+            WHERE store_id=? AND odoo_order_id=? ORDER BY created_at DESC,id DESC''',
+            (case['store_id'],case['odoo_order_id'])).fetchall())
     for row in rows:
         try:
             row["details"] = json.loads(row.pop("details_json", "{}") or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             row["details"] = {}
+        row['details'].setdefault('order_number',case['odoo_order_name'])
+    for attempt in attempts:
+        rows.append({'id':-int(attempt['id']),'event_type':'email_attempt_'+attempt['status'],
+            'created_at':attempt['updated_at'] or attempt['created_at'],'actor_type':'email provider',
+            'details':{'order_number':case['odoo_order_name'],'line_items':after_order_json_list(attempt.get('related_items_json')),
+                'subject':attempt['subject'],'recipient':attempt['recipient'],'attempt':attempt['attempt_number'],
+                'status':attempt['status'],'error':attempt.get('error'), 'message_id':attempt['message_id']}})
+    rows.sort(key=lambda event:(event['created_at'],event['id']),reverse=True)
+    for entry in line_events:
+        rows.append({'id':-1000000000-int(entry['id']),'event_type':entry['event_type'],'created_at':entry['created_at'],
+            'actor_type':'extension','details':{'order_number':case['odoo_order_name'],'line_id':entry['line_id'],
+                'product_name':entry['product_name'],**json.loads(entry['details_json'])}})
+    rows.append({'id':0,'event_type':'case_opened','created_at':case['created_at'],'actor_type':'system',
+        'details':{'order_number':case['odoo_order_name']}})
+    rows.sort(key=lambda event:(event['created_at'],event['id']),reverse=True)
     return {"ok": True, "rows": rows}
 
 
@@ -38362,6 +38399,8 @@ def send_after_order_email(
                 record_after_order_event(conn, case_id, "unavailable_email_blocked", actor_type="system", details={"reason": review["reason"]})
             raise HTTPException(409, review["reason"])
     case = hydrate_after_order_recipient_and_domain(case, strict=not (force_test or after_order_email_test_mode()))
+    if unavailable_email and not (force_test or after_order_email_test_mode()) and not alternative_workflow.ready(case):
+        raise HTTPException(409, "Select and publish alternatives for every affected line in Orders before notifying the customer.")
     showcase_actions = {
         "expected_dispatch": ["proceed", "cancel_order"],
         "item_unavailable": ["offer_alternatives", "exclude_item_and_proceed", "cancel_order"],
@@ -38449,6 +38488,8 @@ def send_after_order_email(
         raise HTTPException(409, str(exc)) from exc
     event_context = case.get("context") or {}
     event_revision = request_fingerprint(case)
+    if unavailable_email and not test_mode:
+        event_revision += ':' + alternative_workflow.notification_revision(case)
     if case.get("case_type") == "tracking" and not allowed:
         event_revision = hashlib.sha256(json.dumps({key: event_context.get(key) for key in ("latest_status", "latest_location", "last_update_at")}, sort_keys=True).encode()).hexdigest()
     idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{uuid.uuid4().hex if test_mode else event_revision}"
@@ -38482,10 +38523,10 @@ def send_after_order_email(
         with db() as conn:
             reserved = conn.execute(
                 """INSERT INTO after_order_messages
-                   (case_id, provider, recipient, sender, subject, html_preview, status, idempotency_key, payload_json, created_at, updated_at, test_mode, request_fingerprint, template_kind)
-                   VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, ?, ?, ?, ?, ?, ?)
+                   (case_id, provider, recipient, sender, subject, html_preview, status, idempotency_key, payload_json, created_at, updated_at, test_mode, request_fingerprint, template_kind, related_items_json)
+                   VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(idempotency_key) DO NOTHING RETURNING id""",
-                (case_id, provider_name, recipient, sender, subject, html_body, idempotency_key, json.dumps(message_payload), now, now, 1 if test_mode else 0, request_fingerprint(case), showcase_kind or template_kind or case.get("case_type")),
+                (case_id, provider_name, recipient, sender, subject, html_body, idempotency_key, json.dumps(message_payload), now, now, 1 if test_mode else 0, request_fingerprint(case), showcase_kind or template_kind or case.get("case_type"), json.dumps(case['affected_items'])),
             )
             reservation = reserved.fetchone()
             if not reservation:
@@ -38619,6 +38660,8 @@ def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, 
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    if original.get('provider') == 'odoo':
+        return alternative_workflow.retry_quote_email(original)
     reason = retry_block_reason(original, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
     if reason:
         raise HTTPException(409, reason)
@@ -38850,7 +38893,7 @@ def api_after_order_bridge_order(order_id: int, request: Request) -> dict[str, A
         rows = conn.execute(
             """SELECT c.id FROM after_order_cases c JOIN stores s ON s.id=c.store_id
                WHERE c.odoo_order_id=? AND s.odoo_db=? AND s.active=1
-               AND c.confirmed_at IS NULL ORDER BY c.id DESC LIMIT 20""",
+               ORDER BY c.id DESC LIMIT 20""",
             (order_id, database),
         ).fetchall()
     actions = []
@@ -38859,6 +38902,13 @@ def api_after_order_bridge_order(order_id: int, request: Request) -> dict[str, A
         try:
             require_after_order_case_in_scope(case)
             require_after_order_website_host(request, case)
+            if case.get('confirmed_at') and case.get('current_decision') == 'offer_alternatives':
+                actions.append({'token':'','payload':{
+                    'order':{'id':order_id}, 'case':{'type':'item_unavailable','title':'Your alternative selections'},
+                    'locked':True,'test_mode':after_order_email_test_mode(),'allowed_actions':[],
+                    'affected_items':case['affected_items'],'line_alternatives':alternative_workflow.rows(case['id']),
+                }})
+                continue
             if not after_order_allowed_actions(case):
                 continue
             link = create_after_order_action_link(int(case["id"]), request)
@@ -38894,10 +38944,15 @@ def record_after_order_customer_decision(
     decision: str,
     *,
     selected_product_id: Optional[int] = None,
+    line_id: Optional[int] = None,
     actor_label: str = "Email action link",
 ) -> tuple[bool, dict[str, Any], str]:
     normalized = normalize_customer_decision(decision)
     is_test = bool(link.get("test_mode")) or after_order_email_test_mode()
+    if case.get('case_type') == 'item_unavailable' and normalized != 'offer_alternatives':
+        selections = alternative_workflow.rows(case['id'],is_test)
+        if any((offer.get('selection') or {}).get('locked') for offer in selections):
+            raise HTTPException(409, 'The alternative selection has already locked for processing. Please contact our team for further changes.')
     if not is_test and (link.get("invalidated_at") or link.get("request_fingerprint") != request_fingerprint(case)):
         raise HTTPException(409, "The order changed. Reload its current options before choosing.")
     if not is_test and normalized not in after_order_allowed_actions(case):
@@ -38917,26 +38972,9 @@ def record_after_order_customer_decision(
     if normalized == "offer_alternatives" and not int(selected_product_id or 0):
         raise HTTPException(400, "Select an alternative product before continuing.")
     if normalized == "offer_alternatives":
-        try:
-            odoo = OdooClient(get_store(int(case["store_id"])))
-            fields = odoo.existing_fields("product.template", ["id", "active", "sale_ok", "is_published", "website_id", "product_variant_count"])
-            products = odoo.read("product.template", [int(selected_product_id or 0)], fields)
-            product = products[0] if products else {}
-            product_website_id = many2one_id(product.get("website_id"))
-            if (
-                not product
-                or product.get("active") is False
-                or product.get("sale_ok") is False
-                or product.get("is_published") is False
-                or (product_website_id and int(product_website_id) != int(case.get("website_id") or 0))
-            ):
-                raise ValueError("The selected product is not available on this website.")
-            if int(product.get("product_variant_count") or 1) != 1:
-                raise ValueError("This product has multiple variants. Ask the team to recommend the exact variant before proceeding.")
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(502, f"Could not validate the selected product in Odoo: {clean_error_message(exc)}") from exc
+        if not line_id:
+            raise HTTPException(400, "Select the affected line item first.")
+        return alternative_workflow.choose(case, link, int(line_id), int(selected_product_id))
     if bool(link.get("test_mode")) or after_order_email_test_mode():
         return False, case, "Test preview only — no customer decision or Odoo change was recorded."
     now = utc_now()
@@ -38944,6 +38982,8 @@ def record_after_order_customer_decision(
     with db() as conn:
         latest = conn.execute("SELECT * FROM after_order_cases WHERE id=? FOR UPDATE", (case["id"],)).fetchone()
         if latest and not latest["confirmed_at"]:
+            if case.get('case_type') == 'item_unavailable' and any((offer.get('selection') or {}).get('locked') for offer in alternative_workflow.rows(case['id'],False)):
+                raise HTTPException(409, 'The alternative window closed while your request was being submitted. Contact our team for further changes.')
             latest_case = dict(latest)
             latest_case["affected_items"] = after_order_json_list(latest_case.get("affected_items_json"))
             latest_case["context"] = json.loads(latest_case.get("context_json") or "{}")
@@ -39023,6 +39063,7 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
         "action_labels": {action: AFTER_ORDER_ACTION_LABELS.get(action, action) for action in allowed},
         "alternative_search_terms": search_terms,
         "pinned_alternatives": after_order_pinned_alternatives(int(case["id"])),
+        "line_alternatives": alternative_workflow.rows(int(case["id"]), bool(link.get("test_mode")) or after_order_email_test_mode()),
         "locked": bool(case.get("confirmed_at") or link.get("invalidated_at")),
         "test_mode": bool(link.get("test_mode")) or after_order_email_test_mode(),
     }
@@ -39039,6 +39080,7 @@ def api_after_order_bridge_decision(token: str, request: Request, payload: After
     _, refreshed, message = record_after_order_customer_decision(
         case, link, payload.decision,
         selected_product_id=payload.selected_product_id,
+        line_id=payload.line_id,
         actor_label="Odoo website order update",
     )
     return {"ok": True, "message": message, "decision": refreshed.get("current_decision"), "test_mode": bool(link.get("test_mode"))}
@@ -39249,6 +39291,9 @@ def execute_after_order_job(job_id: int, request: Request) -> dict[str, Any]:
 
 @app.post("/api/after-order/cases/{case_id}/confirm")
 def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, request: Request) -> dict[str, Any]:
+    current_case = after_order_case_by_id(case_id)
+    if current_case and current_case.get("current_decision") == "offer_alternatives":
+        raise HTTPException(409, "Line-item alternatives lock automatically after 24 hours. Payment and fulfilment checks run after that deadline.")
     if after_order_email_test_mode():
         return {"ok": True, "test_mode": True, "message": "Test preview only: confirmation, execution, Odoo writes and emails were not performed.", "row": after_order_case_by_id(case_id)}
     now = utc_now()
@@ -39356,6 +39401,7 @@ def run_after_order_automation() -> dict[str, Any]:
         return {"ok": True, "test_mode": True, "message": "Cases refreshed. No emails or execution in test mode."}
     if clean_text(get_service_settings().get("after_order_automation_enabled")) != "true":
         return {"ok": False, "message": "Automation is disabled."}
+    alternative_workflow.run_due()
     base = clean_text(get_service_settings().get("after_order_public_base_url") or os.getenv("AFTER_ORDER_PUBLIC_BASE_URL", ""))
     parsed = urlparse(base)
     if parsed.scheme != "https" or not parsed.hostname:
@@ -42760,6 +42806,11 @@ def amazon_order_history_unmatched_page(request: Request) -> HTMLResponse:
         "amazon_order_history_unmatched.html",
         {"request": request, "rows": rows},
     )
+
+
+from app.services.alternative_workflow import Workflow as AlternativeWorkflow
+alternative_workflow = AlternativeWorkflow(globals())
+app.include_router(alternative_workflow.router())
 
 
 @app.get("/{frontend_path:path}")

@@ -316,6 +316,7 @@ class AfterOrderDecisionPayload(BaseModel):
     decision: str
     note: str = ""
     selected_product_id: Optional[int] = None
+    line_id: Optional[int] = None
 
 
 class AfterOrderAlternativePayload(BaseModel):

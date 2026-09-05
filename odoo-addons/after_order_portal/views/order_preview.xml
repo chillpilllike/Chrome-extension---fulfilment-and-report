@@ -16,8 +16,8 @@
               <div t-if="payload.get('test_mode')" class="alert alert-info">Administrator test preview — these choices do not change the order.</div>
               <h3 class="h5" t-esc="case.get('title') or 'What would you like to do?'"/>
               <p t-if="case.get('current_decision')" class="text-muted">Your selection: <span t-esc="(payload.get('action_labels') or {}).get(case.get('current_decision'), case.get('current_decision'))"/></p>
-              <div t-if="payload.get('locked')" class="alert alert-secondary">This request has already been completed.</div>
-              <t t-else="">
+              <div t-if="payload.get('locked')" class="alert alert-secondary">These selections are locked. See each item’s processing status below.</div>
+              <t>
                 <div class="d-flex flex-wrap gap-2">
                   <t t-foreach="allowed" t-as="action">
                     <form t-if="action != 'offer_alternatives'" t-att-action="'/order-update/%s/decision' % token" method="post">
@@ -28,27 +28,24 @@
                     </form>
                   </t>
                 </div>
-                <div t-if="'offer_alternatives' in allowed" class="mt-4">
-                  <h4 class="h6">Choose an alternative</h4>
-                  <p class="text-muted">Recommended products appear first. Select a product for our team to review.</p>
-                  <p t-if="not panel['alternatives']" class="text-muted">Our team is preparing alternatives for this item.</p>
-                  <div class="row g-3">
-                    <div t-foreach="panel['alternatives']" t-as="product" class="col-6 col-md-4">
-                      <div class="card h-100">
-                        <img t-att-src="'/web/image/product.template/%s/image_256' % product.id" class="card-img-top p-3 object-fit-contain" height="150" alt="Product"/>
-                        <div class="card-body d-flex flex-column">
-                          <strong class="small" t-esc="product.name"/>
-                          <form class="mt-auto pt-3" t-att-action="'/order-update/%s/decision' % token" method="post">
-                            <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/>
-                            <input type="hidden" name="access_token" t-att-value="after_order_access_token"/>
-                            <input type="hidden" name="decision" value="offer_alternatives"/>
-                            <input type="hidden" name="selected_product_id" t-att-value="product.id"/>
-                            <button type="submit" class="btn btn-outline-primary w-100">Select alternative</button>
-                          </form>
-                        </div>
-                      </div>
+                <div t-if="panel.get('line_groups')" class="mt-4">
+                  <section t-foreach="panel['line_groups']" t-as="group" class="border rounded p-3 mb-4">
+                    <h4 class="h5">Choose an alternative for <span t-esc="group['name']"/></h4>
+                    <p class="text-muted">You have 24 hours from your first selection to change it. Any additional payment is requested after that window closes. A cheaper choice is reviewed for a refund of the difference.</p>
+                    <p t-if="group['selection'].get('deadline_at')">Selection deadline: <strong t-esc="group['selection']['deadline_at']"/></p>
+                    <a t-if="group['selection'].get('status') == 'waiting_payment' and (group['selection'].get('result') or {}).get('quote_url','').startswith('/my/orders/')" t-att-href="group['selection']['result']['quote_url']" class="btn btn-primary mb-3">View quotation &amp; pay</a>
+                    <div t-if="group['selected']" class="mb-4">
+                      <h5 class="h6">Your selected alternative</h5>
+                      <t t-set="product" t-value="group['selected']"/>
+                      <t t-call="after_order_portal.line_alternative_product"/>
+                      <p t-if="group['selection']['product'].get('difference') is not None" class="mt-2">Price difference: <span t-esc="group['selection']['product']['currency']"/> <span t-esc="group['selection']['product']['difference']"/></p>
+                      <p t-else="" class="mt-2">Our team will confirm any price difference with you before processing.</p>
                     </div>
-                  </div>
+                    <h5 class="h6">Best alternatives</h5>
+                    <div class="row g-3 mb-4"><div t-foreach="group['best']" t-as="product" class="col-6 col-md-4"><t t-call="after_order_portal.line_alternative_product"/></div></div>
+                    <h5 class="h6">More alternatives to choose from</h5>
+                    <div class="row g-3"><div t-foreach="group['more']" t-as="product" class="col-6 col-md-4"><t t-call="after_order_portal.line_alternative_product"/></div></div>
+                  </section>
                 </div>
               </t>
             </div>
@@ -56,5 +53,30 @@
         </t>
       </section>
     </xpath>
+  </template>
+  <template id="line_alternative_product" name="Alternative product choice">
+    <t t-set="selected" t-value="product.id == group['selected'].id"/>
+    <div t-attf-class="card h-100 #{'border-success' if selected else ''} #{'opacity-50' if group['locked'] and not selected else ''}">
+      <img t-att-src="'/web/image/product.template/%s/image_256' % product.id" class="card-img-top p-3 object-fit-contain" height="150" alt="Product"/>
+      <div class="card-body d-flex flex-column">
+        <strong t-esc="product.name"/>
+        <form class="mt-auto pt-3" t-att-action="'/order-update/%s/decision' % token" method="post">
+          <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/>
+          <input type="hidden" name="access_token" t-att-value="after_order_access_token"/>
+          <input type="hidden" name="decision" value="offer_alternatives"/>
+          <input type="hidden" name="line_id" t-att-value="group['line_id']"/>
+          <input type="hidden" name="selected_product_id" t-att-value="product.id"/>
+          <button type="submit" t-att-disabled="group['locked'] or selected" t-attf-class="btn w-100 #{'btn-success' if selected else 'btn-outline-primary'}">
+            <t t-if="selected and group['selection'].get('status') == 'processed'">Processed</t>
+            <t t-elif="selected and group['selection'].get('status') == 'waiting_payment'">Awaiting payment</t>
+            <t t-elif="selected and group['selection'].get('status') == 'manual_fulfilment'">Team processing</t>
+            <t t-elif="selected and group['selection'].get('status') == 'needs_review'">Under team review</t>
+            <t t-elif="selected">Selected</t>
+            <t t-elif="group['locked']">Selection closed</t>
+            <t t-else="">Select alternative</t>
+          </button>
+        </form>
+      </div>
+    </div>
   </template>
 </odoo>

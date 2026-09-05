@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+  <record id="alternative_price_adjustment" model="product.template">
+    <field name="name">Alternative price difference</field>
+    <field name="type">service</field>
+    <field name="sale_ok">True</field>
+    <field name="purchase_ok">False</field>
+    <field name="list_price">0</field>
+    <field name="invoice_policy">order</field>
+  </record>
+</odoo>

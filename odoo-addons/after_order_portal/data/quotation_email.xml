@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+  <record id="alternative_quotation_email" model="mail.template">
+    <field name="name">After-order: alternative price difference</field>
+    <field name="model_id" ref="sale.model_sale_order"/>
+    <field name="subject">{{ object.after_order_parent_id.name }} — payment for your selected alternative</field>
+    <field name="email_to">{{ object.partner_id.email or '' }}</field>
+    <field name="lang">{{ object.partner_id.lang }}</field>
+    <field name="auto_delete" eval="False"/>
+    <field name="body_html" type="html">
+      <div style="margin:0;background:#f3f6f4;padding:32px 12px;font-family:Inter,Arial,sans-serif;color:#24372e">
+        <table role="presentation" width="100%" style="max-width:600px;margin:0 auto" cellpadding="0" cellspacing="0">
+          <tr><td style="padding:0 12px 24px">
+            <img t-att-src="'%s/web/image/website/%s/logo' % (object.website_id.domain.rstrip('/'),object.website_id.id)" t-att-alt="object.website_id.name" style="max-width:170px;max-height:56px"/>
+          </td></tr>
+          <tr><td style="background:white;border:1px solid #dfe7e1;border-radius:16px;padding:32px">
+            <p style="font-size:12px;letter-spacing:2px;color:#64756a">YOUR SELECTED ALTERNATIVE</p>
+            <h1 style="font-size:30px;line-height:1.2;font-weight:600;margin:16px 0">One more step for your order.</h1>
+            <p style="font-size:15px;line-height:1.7">Your 24-hour selection window has ended. Your chosen alternative costs more than the original item. Please pay the difference below so we can continue processing your order.</p>
+            <table role="presentation" width="100%" style="background:#edf4ef;border-radius:12px;margin:24px 0" cellpadding="20"><tr><td>
+              <span style="font-size:13px;color:#64756a">Order <t t-out="object.after_order_parent_id.name"/></span><br/>
+              <strong style="font-size:26px"><t t-out="format_amount(object.amount_total,object.currency_id)"/></strong><br/>
+              <span style="font-size:13px">Additional payment · quotation <t t-out="object.name"/></span>
+            </td></tr></table>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="background:#183e2c;border-radius:10px">
+              <a t-att-href="object.website_id.domain.rstrip('/') + object.get_portal_url()" style="display:block;padding:16px 20px;color:white;font-size:15px;font-weight:600;text-decoration:none">View quotation &amp; pay securely</a>
+            </td></tr></table>
+            <p style="font-size:13px;line-height:1.7;color:#64756a;margin-top:24px">Payment is made on our website. If you need help with this quotation, please contact our team.</p>
+          </td></tr>
+          <tr><td style="text-align:center;padding:24px 16px;font-size:12px;line-height:1.7;color:#64756a">This message relates to order <t t-out="object.after_order_parent_id.name"/> placed on <t t-out="object.website_id.name"/>.</td></tr>
+        </table>
+      </div>
+    </field>
+  </record>
+</odoo>

@@ -71,7 +71,8 @@ class AfterOrderPortal(CustomerPortal):
         if case.get("type") != "item_unavailable":
             return []
         Product = request.env["product.template"].sudo()
-        domain = [("active", "=", True), ("sale_ok", "=", True)]
+        domain = [("active", "=", True), ("sale_ok", "=", True),
+                  '|', ('company_id','=',False), ('company_id','=',request.website.company_id.id)]
         if "is_published" in Product._fields:
             domain.append(("is_published", "=", True))
         if "website_id" in Product._fields:
@@ -80,7 +81,7 @@ class AfterOrderPortal(CustomerPortal):
         search_domain = list(domain)
         if words:
             search_domain += ["|"] * (len(words) - 1) + [("name", "ilike", word) for word in words]
-        searched = Product.search(search_domain, limit=24)
+        searched = Product.search(search_domain, limit=24).filtered(lambda p: p.product_variant_count == 1) if words else Product.browse([])
         pinned_ids = [int(item.get("product_tmpl_id")) for item in payload.get("pinned_alternatives") or [] if item.get("product_tmpl_id")]
         pinned = Product.search(domain + [("id", "in", pinned_ids)])
         pinned = Product.browse([pid for pid in pinned_ids if pid in pinned.ids])
@@ -95,6 +96,28 @@ class AfterOrderPortal(CustomerPortal):
         if payload.get("test_mode") and not self._is_after_order_admin():
             raise RuntimeError("Test actions are available to website administrators only.")
 
+    def _line_alternative_groups(self, payload):
+        groups = []
+        affected = {int(item['line_id']): item for item in payload.get('affected_items') or []}
+        for offer in payload.get('line_alternatives') or []:
+            item = affected.get(int(offer['line_id']), {})
+            scoped = dict(payload, pinned_alternatives=offer['recommendations'],
+                          alternative_search_terms=item.get('product_name',''))
+            products = self._alternative_products(scoped)
+            Product = request.env['product.template'].sudo()
+            if not products:
+                products = Product.browse([])
+            recommended_ids = {p['product_tmpl_id'] for p in offer['recommendations']}
+            selection = offer.get('selection') or {}
+            selected_id = (selection.get('product') or {}).get('product_tmpl_id')
+            selected = Product.browse(selected_id).exists() if selected_id else Product.browse([])
+            selected = selected.filtered(lambda p: not p.website_id or p.website_id == request.website)
+            groups.append({'line_id':offer['line_id'], 'name':item.get('product_name','Order item'),
+                'selection':selection, 'selected':selected, 'locked':bool(selection.get('locked') or payload.get('locked')),
+                'best':products.filtered(lambda p: p.id in recommended_ids and p.id != selected_id),
+                'more':products.filtered(lambda p: p.id not in recommended_ids and p.id != selected_id)})
+        return groups
+
     def _sale_order_get_page_view_values(self, order_sudo, access_token, values, history_session_key, **kwargs):
         values = super()._sale_order_get_page_view_values(order_sudo, access_token, values, history_session_key, **kwargs)
         values["after_order_panels"] = []
@@ -105,13 +128,20 @@ class AfterOrderPortal(CustomerPortal):
             return values
         try:
             token = request.params.get("after_order_token")
-            entries = [{"token": token}] if token else self._bridge(None, order_id=order_sudo.id).get("actions", [])
+            if token:
+                try:
+                    entries = [{'token':token,'payload':self._bridge(token)}]
+                except RuntimeError:
+                    entries = self._bridge(None,order_id=order_sudo.id).get('actions',[])
+            else:
+                entries = self._bridge(None, order_id=order_sudo.id).get("actions", [])
             for entry in entries:
-                payload = self._bridge(entry["token"])
+                payload = entry.get('payload') or self._bridge(entry["token"])
                 self._validate_payload(payload, order_sudo)
                 values["after_order_panels"].append({
                     "token": entry["token"], "payload": payload,
                     "alternatives": [] if payload.get("locked") else self._alternative_products(payload),
+                    "line_groups": self._line_alternative_groups(payload),
                 })
         except RuntimeError:
             # A missing bridge or hidden test panel must never break order viewing.
@@ -144,7 +174,8 @@ class AfterOrderPortal(CustomerPortal):
             if payload.get("locked"):
                 raise RuntimeError("This request has already been completed.")
             selected_id = int(selected_product_id or 0) or None
-            result = self._bridge(token, "POST", {"decision": decision, "selected_product_id": selected_id})
+            result = self._bridge(token, "POST", {"decision": decision, "selected_product_id": selected_id,
+                "line_id": int(post.get('line_id') or 0) or None})
             request.session["after_order_message_%s" % order_id] = result.get("message") or "Your request was recorded."
             query = {"after_order_token": token}
             if post.get("access_token"):
