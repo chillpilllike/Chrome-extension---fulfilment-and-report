@@ -26,7 +26,26 @@ def install_inventory_history(conn):
     """)
     conn.execute("""
         CREATE OR REPLACE FUNCTION inventory_archive_guard() RETURNS trigger AS $$
+        DECLARE shopify_fulfilled RECORD;
         BEGIN
+            IF NEW.status = 'reserved' AND NEW.reserved_order_line_id IS NOT NULL THEN
+                SELECT o.odoo_order_name, s.fulfillment_at, s.synced_at INTO shopify_fulfilled
+                FROM order_lines o JOIN shopify_order_status_cache s
+                  ON s.store_id=o.store_id AND UPPER(s.odoo_order_name)=UPPER(o.odoo_order_name)
+                WHERE o.id=NEW.reserved_order_line_id
+                  AND LOWER(COALESCE(s.fulfillment_status, ''))='fulfilled'
+                ORDER BY s.synced_at DESC LIMIT 1;
+                IF FOUND THEN
+                    NEW.status := 'archived';
+                    NEW.archived_at := CURRENT_TIMESTAMP::text;
+                    NEW.archive_reason := 'Linked order ' || shopify_fulfilled.odoo_order_name ||
+                        ' fulfilled in Shopify. ' ||
+                        CASE WHEN COALESCE(shopify_fulfilled.fulfillment_at, '') != ''
+                            THEN 'Shopify fulfilment date: ' || shopify_fulfilled.fulfillment_at
+                            ELSE 'Fulfilled status observed: ' || shopify_fulfilled.synced_at END ||
+                        '. Automatically archived; physical dispatch was not separately confirmed.';
+                END IF;
+            END IF;
             IF NEW.status = 'used' AND COALESCE(NEW.archived_at, '') = '' THEN
                 NEW.archived_at := COALESCE(NULLIF(NEW.used_at, ''), NEW.updated_at);
                 NEW.archive_reason := 'Sent to the assigned order; stock consumed.';
@@ -92,6 +111,30 @@ def install_inventory_history(conn):
     conn.execute("CREATE TRIGGER inventory_archive_guard_trigger BEFORE INSERT OR UPDATE ON inventory_items FOR EACH ROW EXECUTE FUNCTION inventory_archive_guard()")
     conn.execute("DROP TRIGGER IF EXISTS inventory_movement_trigger ON inventory_items")
     conn.execute("CREATE TRIGGER inventory_movement_trigger AFTER INSERT OR UPDATE ON inventory_items FOR EACH ROW EXECUTE FUNCTION inventory_record_movement()")
+    conn.execute("""
+        CREATE OR REPLACE FUNCTION inventory_on_shopify_fulfilled() RETURNS trigger AS $$
+        BEGIN
+            IF LOWER(COALESCE(NEW.fulfillment_status, ''))='fulfilled' THEN
+                UPDATE inventory_items i SET updated_at=CURRENT_TIMESTAMP::text
+                FROM order_lines o
+                WHERE i.status='reserved' AND i.reserved_order_line_id=o.id
+                  AND o.store_id=NEW.store_id AND UPPER(o.odoo_order_name)=UPPER(NEW.odoo_order_name);
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+    conn.execute("DROP TRIGGER IF EXISTS inventory_shopify_fulfilled_trigger ON shopify_order_status_cache")
+    conn.execute("CREATE TRIGGER inventory_shopify_fulfilled_trigger AFTER INSERT OR UPDATE ON shopify_order_status_cache FOR EACH ROW EXECUTE FUNCTION inventory_on_shopify_fulfilled()")
+    # Existing reservations follow the same rule as future Shopify status updates.
+    conn.execute("""
+        UPDATE inventory_items i SET updated_at=CURRENT_TIMESTAMP::text
+        WHERE i.status='reserved' AND EXISTS (
+            SELECT 1 FROM order_lines o JOIN shopify_order_status_cache s
+              ON s.store_id=o.store_id AND UPPER(s.odoo_order_name)=UPPER(o.odoo_order_name)
+            WHERE o.id=i.reserved_order_line_id AND LOWER(COALESCE(s.fulfillment_status, ''))='fulfilled'
+        )
+    """)
     # Reconcile legacy records once; the guard applies the same rules to future writes.
     conn.execute("""
         UPDATE inventory_items i SET updated_at=i.updated_at

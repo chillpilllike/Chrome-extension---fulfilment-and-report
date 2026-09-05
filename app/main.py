@@ -9911,7 +9911,7 @@ def ensure_inventory_for_line(row: Union[dict[str, Any], dict[str, Any]]) -> Non
                 """
                 SELECT COALESCE(SUM(quantity), 0) AS quantity
                 FROM inventory_items
-                WHERE source_inventory_item_id=? AND status IN ('reserved', 'used')
+                WHERE source_inventory_item_id=? AND status IN ('reserved', 'used', 'archived')
                 """,
                 (existing["id"],),
             ).fetchone()
@@ -10020,7 +10020,7 @@ def inventory_order_has_allocations(conn: Any, store_id: int, order_name: str) -
         JOIN inventory_items AS allocation ON allocation.source_inventory_item_id=source.id
         WHERE source.store_id=?
           AND UPPER(COALESCE(source.source_odoo_order_name, ''))=UPPER(?)
-          AND allocation.status IN ('reserved', 'used')
+          AND allocation.status IN ('reserved', 'used', 'archived')
         """,
         (store_id, order_name),
     ).fetchone()
@@ -26546,8 +26546,8 @@ def api_confirm_inventory_sent(inventory_id: int, payload: Optional[dict[str, An
         item = conn.execute("SELECT * FROM inventory_items WHERE id=? FOR UPDATE", (inventory_id,)).fetchone()
         if not item:
             raise HTTPException(404, "Inventory item not found.")
-        if clean_text(item["status"]) == "used":
-            return {"ok": True, "message": "Inventory item was already marked sent.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
+        if clean_text(item["status"]) in {"used", "archived"}:
+            return {"ok": True, "message": "Inventory item is already sent or archived.", **refresh_inventory_response(int(item["store_id"]), 1, 100)}
         line = None
         if item["reserved_order_line_id"]:
             line = conn.execute("SELECT * FROM order_lines WHERE id=? FOR UPDATE", (item["reserved_order_line_id"],)).fetchone()

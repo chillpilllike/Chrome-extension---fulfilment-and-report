@@ -23,6 +23,7 @@ class InventoryHistoryTests(unittest.TestCase):
         self.conn = PostgresConnection(self.raw)
         self.conn.execute("CREATE TEMP TABLE order_lines (id INTEGER, store_id INTEGER, amazon_cancelled_order_id TEXT, amazon_cancelled_at TEXT, odoo_order_name TEXT)")
         self.conn.execute("CREATE TEMP TABLE amazon_dispatch_packages (store_id INTEGER, amazon_order_id TEXT, received_at TEXT, package_status TEXT)")
+        self.conn.execute("CREATE TEMP TABLE shopify_order_status_cache (store_id INTEGER, odoo_order_name TEXT, fulfillment_status TEXT, fulfillment_at TEXT, synced_at TEXT)")
         self.conn.execute("""CREATE TEMP TABLE inventory_items (
             id SERIAL PRIMARY KEY, store_id INTEGER DEFAULT 1, order_line_id INTEGER,
             status TEXT DEFAULT 'incoming', quantity REAL DEFAULT 0, asin TEXT DEFAULT 'B0FWDB18WK',
@@ -152,6 +153,50 @@ class InventoryHistoryTests(unittest.TestCase):
         result = call(child["id"])
         self.assertEqual({e["inventory_id"] for e in result["items"]}, {source["id"], child["id"]})
         self.assertEqual(result["items"][0]["target_order_name"], "NC24369")
+
+    def test_shopify_fulfilled_archives_reserved_without_marking_physical_sent(self):
+        self.cancelled()
+        item = self.add(status="reserved", quantity=4, reserved_order_line_id=10)
+        self.conn.execute("INSERT INTO shopify_order_status_cache VALUES (1,'NC24369','FULFILLED','2026-09-05T10:00:00Z','2026-09-05T11:00:00Z')")
+        archived = self.conn.execute("SELECT * FROM inventory_items WHERE id=?", (item["id"],)).fetchone()
+        self.assertEqual(archived["status"], "archived")
+        self.assertEqual(archived["quantity"], 4)
+        self.assertEqual(archived["reserved_order_line_id"], 10)
+        self.assertIsNone(archived["used_at"])
+        self.assertIn("NC24369 fulfilled in Shopify", archived["archive_reason"])
+        self.assertIn("2026-09-05T10:00:00Z", archived["archive_reason"])
+        self.assertEqual(self.conn.execute("SELECT event_type FROM inventory_movements ORDER BY id DESC LIMIT 1").fetchone()["event_type"], "archived")
+        self.conn.execute("UPDATE shopify_order_status_cache SET synced_at='2026-09-05T12:00:00Z'")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) AS n FROM inventory_movements WHERE inventory_id=?", (item["id"],)).fetchone()["n"], 2)
+
+    def test_partial_and_wrong_store_do_not_archive_shared_stock(self):
+        self.conn.execute("INSERT INTO order_lines VALUES (20,2,NULL,NULL,'OTHER')")
+        item = self.add(status="reserved", quantity=2, reserved_order_line_id=20, store_id=1)
+        self.conn.execute("INSERT INTO shopify_order_status_cache VALUES (1,'OTHER','fulfilled',NULL,'2026-09-05')")
+        self.conn.execute("INSERT INTO shopify_order_status_cache VALUES (2,'OTHER','partial',NULL,'2026-09-05')")
+        self.assertEqual(self.conn.execute("SELECT status FROM inventory_items WHERE id=?", (item["id"],)).fetchone()["status"], "reserved")
+        self.conn.execute("UPDATE shopify_order_status_cache SET fulfillment_status='fulfilled' WHERE store_id=2")
+        archived = self.conn.execute("SELECT * FROM inventory_items WHERE id=?", (item["id"],)).fetchone()
+        self.assertEqual(archived["status"], "archived")
+        self.assertIn("Fulfilled status observed", archived["archive_reason"])
+
+    def test_already_fulfilled_order_archives_new_reservation_not_source(self):
+        self.cancelled()
+        self.conn.execute("INSERT INTO shopify_order_status_cache VALUES (1,'NC24369','fulfilled',NULL,'2026-09-05')")
+        source = self.add(status="available", quantity=2)
+        item = self.add(status="reserved", quantity=2, source_inventory_item_id=source["id"], reserved_order_line_id=10)
+        self.assertEqual(item["status"], "archived")
+        self.assertEqual(self.conn.execute("SELECT status FROM inventory_items WHERE id=?", (source["id"],)).fetchone()["status"], "available")
+
+    def test_existing_fulfilled_reservations_backfill_once(self):
+        self.cancelled()
+        item = self.add(status="reserved", quantity=2, reserved_order_line_id=10)
+        self.conn.execute("DROP TRIGGER inventory_shopify_fulfilled_trigger ON shopify_order_status_cache")
+        self.conn.execute("INSERT INTO shopify_order_status_cache VALUES (1,'NC24369','fulfilled',NULL,'2026-09-05')")
+        install_inventory_history(self.conn)
+        install_inventory_history(self.conn)
+        self.assertEqual(self.conn.execute("SELECT status FROM inventory_items WHERE id=?", (item["id"],)).fetchone()["status"], "archived")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) AS n FROM inventory_movements WHERE inventory_id=?", (item["id"],)).fetchone()["n"], 2)
 
 
 if __name__ == "__main__":

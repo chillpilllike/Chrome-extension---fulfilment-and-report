@@ -11,6 +11,13 @@ The authoritative PostgreSQL list avoids stale search-index allocation visibilit
 - Empty `incoming` stock from the exact confirmed cancelled Amazon purchase is
   archived only without inventory or matching package delivery/receipt evidence.
   Manual, received, positive-quantity and reserved stock are not auto-archived.
+- Reserved inventory automatically archives when the linked destination order is
+  `fulfilled` in Shopify, without requiring physical dispatch confirmation. This
+  matches the reserved order's store (which may differ from the stock's store).
+  Partial/unfulfilled states do not trigger it. The reason records the Shopify
+  fulfilment date, or the status observation date if Shopify supplies no date.
+  Existing reservations are reconciled at deployment; later Shopify status syncs
+  trigger the same rule. Archived allocations remain deducted from source stock.
 - Manual Archive requires a reason and explicitly removes the recorded stock
   from allocation. Reserved stock is rejected. Quantities and source information
   are retained, not deleted. This release does not provide automatic restoration.

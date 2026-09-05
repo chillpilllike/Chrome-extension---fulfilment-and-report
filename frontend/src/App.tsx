@@ -12783,7 +12783,7 @@ function InventoryPage({
     { key: "active", label: "All active stock", help: "Review stock awaiting receipt, available to use, or reserved for an order.", icon: Database },
     { key: "available", label: "Available", help: "Check expiry, then attach available stock to a matching order.", icon: PackageCheck },
     { key: "incoming", label: "Awaiting release", help: "Confirm delivery, warehouse receipt and customer cancellation before releasing stock.", icon: Clock },
-    { key: "reserved", label: "Reserved / to send", help: "Verify physical dispatch, then confirm sent for the assigned order.", icon: TruckDelivery },
+    { key: "reserved", label: "Reserved", help: "Automatically archived when the linked order is fulfilled in Shopify. You can also confirm physical dispatch manually.", icon: TruckDelivery },
     { key: "archived", label: "Archived", help: "Sent or removed stock stays here with its reason and movement history. It is not available for allocation.", icon: Database },
   ]
   const selectedQueue = queues.find((queue) => queue.key === view) || queues[0]
