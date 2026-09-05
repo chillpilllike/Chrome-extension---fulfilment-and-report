@@ -772,6 +772,12 @@ def request_has_public_access(request: Request) -> bool:
 
 def request_requires_public_access(request: Request) -> bool:
     path = request.url.path
+    # The Odoo bridge authenticates its own shared key and website host in
+    # both handlers. It must not require a customer's public-access session.
+    if request.method in {"GET", "POST"} and re.fullmatch(
+        r"/api/public/after-order-bridge/action/[^/]+", path
+    ):
+        return False
     if path in {"/public/access", "/api/public/access"}:
         return False
     if request.method in {"GET", "HEAD"} and path.startswith(UNAUTHENTICATED_PUBLIC_API_PREFIXES):
