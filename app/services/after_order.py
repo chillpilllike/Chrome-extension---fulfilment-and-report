@@ -52,6 +52,23 @@ def can_remove_affected_items(lines: list[dict[str, Any]], affected: list[dict[s
     return False
 
 
+def unavailable_notice_block_reason(lines: list[dict[str, Any]], affected: list[dict[str, Any]]) -> str:
+    if not lines:
+        return "Order fulfilment details are missing; review required."
+    for line in lines:
+        if str(line.get("order_engine") or "").lower() in {"third_party", "manual_amazon", "inventory"}:
+            return "Order is assigned to third-party, manual or inventory fulfilment."
+        if line.get("amazon_order_id") or str(line.get("state") or "").lower() in {"ordered", "fulfilled", "shipped", "delivered"}:
+            return "An order placement or fulfilment is already recorded."
+        if str(line.get("odoo_status_label") or "").lower() in {"cancelled", "canceled", "refunded"}:
+            return "Order contains cancelled or refunded items; review required."
+    ids = {str(item.get("line_id")) for item in affected if item.get("line_id")}
+    missing = {str(line.get("id")) for line in lines if line.get("state") == "missing"}
+    if not ids or not ids.issubset(missing):
+        return "The affected items are no longer all marked unavailable."
+    return ""
+
+
 class EmailProvider(Protocol):
     """Provider boundary for Resend today and another email service later."""
 

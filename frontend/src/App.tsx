@@ -1230,6 +1230,7 @@ type AfterOrderCase = {
     odoo_product_url: string
   }>
   context: Record<string, any>
+  unavailable_notice?: { blocked: boolean; approved: boolean; reason: string }
   refund_request?: { amount: number; currency: string; status: string; last_error?: string } | null
 }
 
@@ -11942,6 +11943,17 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
   const [activityCase, setActivityCase] = useState<AfterOrderCase | null>(null)
   const [events, setEvents] = useState<AfterOrderEvent[]>([])
 
+  const approveUnavailableNotice = async (row: AfterOrderCase) => {
+    if (!window.confirm("Confirm you checked third-party suppliers and manual fulfilment, and these items still cannot be fulfilled. This approves a customer notice; it does not send an email.")) return
+    try {
+      const result = await api<{ message: string }>(`/api/after-order/cases/${row.id}/approve-unavailable-notice`, { method: "POST" })
+      onResult({ ok: true, title: "Sourcing review", message: result.message })
+      await load()
+    } catch (error) {
+      onResult({ ok: false, title: "Review not approved", message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
   const load = async () => {
     setLoading(true)
     try {
@@ -12152,15 +12164,17 @@ function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: 
                 <div className="min-w-0 border-t pt-4 text-sm">
                   <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Status</span>
                   <strong className="mt-1 block">{row.status.replaceAll("_", " ")}</strong>
+                  {itemCase && row.unavailable_notice ? <p className="mt-2 text-xs font-medium text-amber-800">{row.unavailable_notice.blocked ? "Unavailable email suppressed: " : "Customer email: "}{row.unavailable_notice.reason}</p> : null}
                   {awaitingFirstScan ? <p className="mt-2 text-xs text-muted-foreground">No carrier events received — not classified as lost. No lost email queued.</p> : null}
                   {context.last_update_at ? <p className="mt-2 text-xs text-muted-foreground">Last update {formatDateTime(context.last_update_at)}</p> : null}
                 </div>
 
                 <div className="mt-auto grid shrink-0 grid-cols-2 gap-2 border-t pt-4">
+                  {itemCase && !row.confirmed_at && row.unavailable_notice && !row.unavailable_notice.blocked && !row.unavailable_notice.approved ? <Button variant="outline" onClick={() => void approveUnavailableNotice(row)}>Approve sourcing review</Button> : null}
                   {row.current_decision && !row.confirmed_at ? <Button onClick={() => void confirmDecision(row)}>Confirm decision</Button> : null}
                   {!row.confirmed_at && decisionCase ? <Button variant="outline" onClick={() => void createTestLink(row)}>Preview customer choices</Button> : null}
                   {itemCase && !row.confirmed_at ? <Button variant="outline" onClick={() => void addRecommendedProduct(row)}>Add recommended product</Button> : null}
-                  <Button variant="outline" onClick={() => void sendTestEmail(row)}>Send test email</Button>
+                  <Button variant="outline" disabled={itemCase && row.unavailable_notice?.blocked} onClick={() => void sendTestEmail(row)}>Send test email</Button>
                   {!itemCase && (row.odoo_order_name || row.tracking_code) ? <Button onClick={() => window.open(`/package-tracker?q=${encodeURIComponent(row.odoo_order_name || row.tracking_code || "")}&field=all`, "_blank", "noopener,noreferrer")}>Track all details</Button> : null}
                   <Button variant="outline" onClick={() => void openActivity(row)}>View activity</Button>
                 </div>

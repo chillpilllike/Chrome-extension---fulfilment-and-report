@@ -105,6 +105,7 @@ from app.services.amazon_otp import imap_connect, imap_search_since, parse_amazo
 from app.services.after_order import (
     ResendEmailProvider,
     can_remove_affected_items,
+    unavailable_notice_block_reason,
     normalize_customer_decision,
     resolve_delivery_recipient,
     tracking_risk,
@@ -37439,6 +37440,49 @@ def require_after_order_case_in_scope(case: dict[str, Any]) -> None:
         raise HTTPException(410, f"This order is before the after-order cutoff of {after_order_cutoff_date()} and cannot be actioned.")
 
 
+def after_order_unavailable_review(case: dict[str, Any]) -> dict[str, Any]:
+    with db() as conn:
+        lines = rows_to_dicts(conn.execute(
+            """SELECT id, asin, missing_asin, quantity, state, order_engine,
+                      amazon_status, amazon_order_id, amazon_order_url, odoo_status_label
+               FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id""",
+            (case["store_id"], case["odoo_order_id"]),
+        ).fetchall())
+        approval = conn.execute(
+            """SELECT details_json, created_at FROM after_order_events
+               WHERE case_id=? AND event_type='unavailable_sourcing_review_approved'
+               ORDER BY id DESC LIMIT 1""", (case["id"],),
+        ).fetchone()
+    reason = unavailable_notice_block_reason(lines, case.get("affected_items") or [])
+    if case.get("confirmed_at") or case.get("status") == "resolved":
+        reason = "This case has already been resolved or confirmed."
+    signature = hashlib.sha256(json.dumps({"lines": lines, "affected": case.get("affected_items") or []}, sort_keys=True, default=str).encode()).hexdigest()
+    approved = False
+    if approval and not reason:
+        try:
+            approved_at = parse_any_datetime(approval["created_at"])
+            approved = bool(approved_at and approved_at > datetime.now(timezone.utc) - timedelta(hours=24) and json.loads(approval["details_json"]).get("signature") == signature)
+        except (ValueError, TypeError):
+            approved = False
+    return {"blocked": bool(reason), "approved": approved, "signature": signature,
+            "reason": reason or ("Sourcing review approved; live notice permitted for 24 hours while fulfilment remains unchanged." if approved else "Waiting for team to check third-party and manual fulfilment before notifying the customer.")}
+
+
+@app.post("/api/after-order/cases/{case_id}/approve-unavailable-notice")
+def api_after_order_approve_unavailable_notice(case_id: int) -> dict[str, Any]:
+    case = after_order_case_by_id(case_id)
+    if not case or case.get("case_type") != "item_unavailable":
+        raise HTTPException(404, "Unavailable-item case not found.")
+    require_after_order_case_in_scope(case)
+    review = after_order_unavailable_review(case)
+    if review["blocked"]:
+        raise HTTPException(409, review["reason"])
+    with db() as conn:
+        record_after_order_event(conn, case_id, "unavailable_sourcing_review_approved", actor_type="team",
+            actor_label="Team checked alternative sourcing", details={"signature": review["signature"]})
+    return {"ok": True, "message": "Sourcing review approved. No email was sent. Approval expires after 24 hours or a fulfilment change."}
+
+
 def after_order_removal_allowed(case: dict[str, Any]) -> bool:
     with db() as conn:
         lines = rows_to_dicts(conn.execute(
@@ -37450,6 +37494,8 @@ def after_order_removal_allowed(case: dict[str, Any]) -> bool:
 
 
 def after_order_filter_removal(case: dict[str, Any], actions: list[str]) -> list[str]:
+    if case.get("case_type") == "item_unavailable" and after_order_unavailable_review(case)["blocked"]:
+        return []
     removal = {"exclude_item_and_proceed", "cancel_affected_item"}
     if removal.intersection(actions) and not after_order_removal_allowed(case):
         return [action for action in actions if action not in removal]
@@ -37460,6 +37506,9 @@ def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
     if case.get("confirmed_at"):
         return []
     if case.get("case_type") == "item_unavailable":
+        review = after_order_unavailable_review(case)
+        if review["blocked"] or (not after_order_email_test_mode() and not review["approved"]):
+            return []
         return after_order_filter_removal(case, ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"])
     if case.get("case_type") == "delivery_confirmation":
         return ["received", "not_received"]
@@ -37700,6 +37749,8 @@ def after_order_case_dict(row: Any) -> dict[str, Any]:
             ).fetchone()
         item["refund_request"] = row_to_dict(refund) if refund else None
     item["odoo_order_url"] = odoo_order_admin_url({"odoo_url": item.get("odoo_url") or ""}, item.get("odoo_order_id"))
+    if item.get("case_type") == "item_unavailable":
+        item["unavailable_notice"] = after_order_unavailable_review(item)
     return item
 
 
@@ -38151,6 +38202,13 @@ def send_after_order_email(
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
+    unavailable_email = showcase_kind == "item_unavailable" or (not showcase_kind and case.get("case_type") == "item_unavailable" and template_kind != "trustpilot_review")
+    if unavailable_email:
+        review = after_order_unavailable_review(case)
+        if review["blocked"] or (not (force_test or after_order_email_test_mode()) and not review["approved"]):
+            with db() as conn:
+                record_after_order_event(conn, case_id, "unavailable_email_blocked", actor_type="system", details={"reason": review["reason"]})
+            raise HTTPException(409, review["reason"])
     case = hydrate_after_order_recipient_and_domain(case)
     showcase_actions = {
         "expected_dispatch": ["proceed", "cancel_order"],
@@ -38240,6 +38298,13 @@ def send_after_order_email(
     message_id = ""
     status = "failed"
     try:
+        if unavailable_email and not test_mode:
+            latest = after_order_case_by_id(case_id)
+            review = after_order_unavailable_review(latest or case)
+            if not latest or review["blocked"] or not review["approved"]:
+                with db() as conn:
+                    record_after_order_event(conn, case_id, "unavailable_email_blocked", actor_type="system", details={"reason": review["reason"]})
+                raise HTTPException(409, review["reason"])
         provider = ResendEmailProvider(os.getenv("RESEND_API_KEY", ""))
         message_payload: dict[str, Any] = {
                 "from": sender,
@@ -38359,13 +38424,19 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
     for index, (kind, case_id) in enumerate(suite):
         if index:
             time.sleep(1)
+        if kind == "item_unavailable":
+            review = after_order_unavailable_review(after_order_case_by_id(case_id))
+            if review["blocked"]:
+                results.append({"template": kind, "case_id": case_id, "status": "skipped", "reason": review["reason"]})
+                continue
         result = send_after_order_email(case_id, request, force_test=True, showcase_kind=kind)
         results.append({"template": kind, "case_id": case_id, "recipient": result.get("recipient")})
+    sent_count = sum(1 for result in results if result.get("recipient"))
     return {
         "ok": True,
-        "sent": len(results),
+        "sent": sent_count,
         "results": results,
-        "message": f"Sent {len(results)} test emails to {after_order_test_recipient()}, one second apart.",
+        "message": f"Sent {sent_count} test emails to {after_order_test_recipient()}, one second apart. Skipped {len(results) - sent_count} suppressed templates.",
     }
 
 
@@ -38517,6 +38588,10 @@ def record_after_order_customer_decision(
     actor_label: str = "Email action link",
 ) -> tuple[bool, dict[str, Any], str]:
     normalized = normalize_customer_decision(decision)
+    if case.get("case_type") == "item_unavailable":
+        review = after_order_unavailable_review(case)
+        if review["blocked"] or (not (bool(link.get("test_mode")) or after_order_email_test_mode()) and not review["approved"]):
+            raise HTTPException(409, review["reason"])
     if normalized in {"exclude_item_and_proceed", "cancel_affected_item"} and not after_order_removal_allowed(case):
         raise HTTPException(409, "Removing this item would leave no other available product. Choose an alternative or cancel the entire order.")
     try:
@@ -38586,6 +38661,8 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
         allowed = []
     allowed = after_order_filter_removal(case, allowed)
     context = case.get("context") or {}
+    if case.get("case_type") == "item_unavailable" and not (link.get("test_mode") or after_order_email_test_mode()) and not after_order_unavailable_review(case)["approved"]:
+        allowed = []
     affected = case.get("affected_items") or []
     search_terms = " ".join(clean_text(item.get("product_name")) for item in affected if clean_text(item.get("product_name")))
     return {
@@ -38749,6 +38826,10 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
+    if case.get("case_type") == "item_unavailable" and not case.get("confirmed_at"):
+        review = after_order_unavailable_review(case)
+        if review["blocked"] or not review["approved"]:
+            raise HTTPException(409, review["reason"])
     if not case.get("confirmed_at") and case.get("current_decision") in {"exclude_item_and_proceed", "cancel_affected_item"} and not after_order_removal_allowed(case):
         raise HTTPException(409, "This removal would leave no other available product. A new customer decision is required.")
     with db() as conn:

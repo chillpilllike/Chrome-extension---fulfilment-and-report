@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.services.after_order import (
     can_remove_affected_items,
+    unavailable_notice_block_reason,
     normalize_customer_decision,
     resolve_delivery_recipient,
     tracking_risk,
@@ -36,6 +37,33 @@ class PartialRemovalTests(unittest.TestCase):
 
     def test_unknown_affected_product_fails_closed(self):
         self.assertFalse(can_remove_affected_items([self.item], []))
+
+
+class UnavailableNoticeSuppressionTests(unittest.TestCase):
+    def setUp(self):
+        self.line = {"id": 1, "state": "missing", "order_engine": "chrome"}
+        self.affected = [{"line_id": 1}]
+
+    def test_missing_item_is_eligible_for_review_not_automatic_send(self):
+        self.assertEqual("", unavailable_notice_block_reason([self.line], self.affected))
+
+    def test_manual_third_party_and_inventory_override_missing_status(self):
+        for engine in ("third_party", "manual_amazon", "inventory"):
+            self.assertTrue(unavailable_notice_block_reason([{**self.line, "order_engine": engine}], self.affected))
+
+    def test_placed_order_reference_overrides_stale_missing_status(self):
+        self.assertTrue(unavailable_notice_block_reason([{**self.line, "amazon_order_id": "supplier-reference"}], self.affected))
+
+    def test_placement_on_another_line_holds_whole_order_notice(self):
+        self.assertTrue(unavailable_notice_block_reason([self.line, {"id": 2, "state": "ordered"}], self.affected))
+
+    def test_resolved_missing_flag_or_unknown_line_blocks_notice(self):
+        for lines in ([], [{**self.line, "state": "pulled"}], [{**self.line, "id": 2}]):
+            self.assertTrue(unavailable_notice_block_reason(lines, self.affected))
+
+    def test_cancelled_or_refunded_order_blocks_notice(self):
+        for label in ("cancelled", "refunded"):
+            self.assertTrue(unavailable_notice_block_reason([{**self.line, "odoo_status_label": label}], self.affected))
 
 
 class AfterOrderTrackingRiskTests(unittest.TestCase):
