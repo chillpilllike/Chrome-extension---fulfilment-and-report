@@ -447,8 +447,10 @@ class Workflow:
                     'odoo_live_enabled':odoo.execute('ir.config_parameter','get_param',['after_order_portal.live_alternatives_enabled','false']) == 'true',
                     'message':'Schema detected; isolated payment and outgoing-mail tests are still required.' if schema_ready else 'Upgrade the Odoo addon to 18.0.2.0.0 before using line alternatives.'}
             except Exception as exc:
+                fault = getattr(exc,'faultString','')
+                explanation = '\n'.join([line for line in fault.splitlines() if line.strip()][-4:]) if fault else exc
                 return {'ok':False,'schema_ready':False,'app_test_mode':r.after_order_email_test_mode(),
-                    'message':r.clean_error_message(exc)}
+                    'message':r.clean_error_message(explanation)}
 
         @router.get('/api/after-order/cases/{case_id}/line-alternatives')
         def offers(case_id: int):
