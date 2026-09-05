@@ -1,0 +1,14 @@
+.email-log-table { min-width: 960px; table-layout: fixed; width: 100%; }
+.email-log-table th { background: var(--muted, #f5f7fa); padding: 14px 18px; }
+.email-log-table td { vertical-align: top; white-space: normal; padding: 20px 18px; overflow-wrap: anywhere; }
+.email-log-table th:nth-child(1) { width: 26%; }.email-log-table th:nth-child(2) { width: 25%; }.email-log-table th:nth-child(3) { width: 19%; }.email-log-table th:nth-child(4) { width: 17%; }.email-log-table th:nth-child(5) { width: 160px; }
+.email-order { display: block; color: var(--primary); font-weight: 650; margin-bottom: 8px; text-align: left; cursor: pointer; }
+.email-subject, .email-recipient { display: block; font-size: 14px; line-height: 1.55; margin-bottom: 5px; }
+.email-subject { font-weight: 600; }.email-mode { display: inline-block; margin-top: 8px; padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 10px; letter-spacing: .07em; font-weight: 650; }.email-mode.is-test { background: #fff6dd; color: #79530a; border-color: #eeddac; }
+.email-signal { display: inline-flex; align-items: center; gap: 7px; font-weight: 650; font-size: 12px; padding: 5px 8px; border-radius: 6px; margin-bottom: 7px; background: #edf1f6; color: #4d5a6c; }.email-signal > span { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.email-signal.signal-sent { color: #176b40; background: #ddf4e6; }.email-signal.signal-failed { color: #a31d2a; background: #fce5e6; }.email-signal.signal-retrying { color: #22589a; background: #e4efff; }.email-signal.signal-uncertain { color: #7c4a03; background: #fff0cf; }
+.email-row-actions { display: grid; gap: 8px; }.email-error-summary { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: 12px!important; color: var(--destructive, #a31d2a); }
+.email-log-error { padding: 16px; color: var(--destructive, #a31d2a); overflow-wrap: anywhere; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.email-attempts { padding-left: 20px; }.email-attempts li { margin-bottom: 16px; padding-left: 4px; }.email-attempts .email-log-error { padding: 0; }
+.email-preview-frame { width: 100%; height: 560px; border: 1px solid var(--border); border-radius: 10px; background: white; }
+.email-log-detail { max-width: 860px!important; }.email-log-workspace .epost-selection { font-size: 12px; }

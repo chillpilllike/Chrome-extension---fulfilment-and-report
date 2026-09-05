@@ -116,7 +116,12 @@ from app.services.after_order import (
     resolve_delivery_recipient,
     tracking_risk,
     trustpilot_review_url,
+    request_fingerprint,
+    merge_tracking_events,
+    create_email_provider,
+    EmailRejected,
 )
+from app.services.email_log import retry_block_reason, STATUS_LABELS as EMAIL_STATUS_LABELS
 from app.services.asin import decode_asin_reference, encode_asin, extract_asin_from_notes, normalize_asin, strip_html
 
 
@@ -637,6 +642,7 @@ FRONTEND_SHELL_PATHS = {
     "/home",
     "/orders",
     "/after-order-care",
+    "/email-log",
     "/pull-jobs",
     "/tracking",
     "/dispatch-sorting",
@@ -1458,6 +1464,20 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS after_order_execution_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
+                decision_version INTEGER NOT NULL,
+                decision TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_error TEXT,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(case_id, decision_version)
+            );
+
             CREATE TABLE IF NOT EXISTS after_order_case_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
@@ -1482,6 +1502,18 @@ def init_db() -> None:
                 idempotency_key TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS after_order_email_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL REFERENCES after_order_messages(id) ON DELETE CASCADE,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                provider_message_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(message_id, attempt_number)
             );
 
             CREATE TABLE IF NOT EXISTS after_order_unsubscribe_links (
@@ -1953,6 +1985,15 @@ def init_db() -> None:
             if column not in existing_epost_cols:
                 conn.execute(ddl)
         existing_unsubscribe_cols = {r["name"] for r in conn.execute("PRAGMA table_info(after_order_unsubscribe_links)").fetchall()}
+        for table, columns in {
+            "after_order_action_links": {"request_fingerprint": "TEXT"},
+            "after_order_cases": {"decision_fingerprint": "TEXT"},
+            "after_order_messages": {"payload_json": "TEXT", "last_error": "TEXT", "test_mode": "INTEGER NOT NULL DEFAULT 0", "attempt_count": "INTEGER NOT NULL DEFAULT 1", "request_fingerprint": "TEXT", "template_kind": "TEXT"},
+        }.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for column, sql_type in columns.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
         if "case_id" not in existing_unsubscribe_cols:
             conn.execute("ALTER TABLE after_order_unsubscribe_links ADD COLUMN case_id INTEGER REFERENCES after_order_cases(id) ON DELETE CASCADE")
         existing_action_link_cols = {r["name"] for r in conn.execute("PRAGMA table_info(after_order_action_links)").fetchall()}
@@ -25514,6 +25555,7 @@ def startup() -> None:
                 threading.Thread(target=amazon_otp_loop, daemon=True).start()
                 threading.Thread(target=odoo_chatter_outbox_schedule_loop, daemon=True).start()
                 threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
+                threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
                 if should_reindex_typesense:
                     threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
                 threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
@@ -37517,7 +37559,7 @@ def require_after_order_case_in_scope(case: dict[str, Any]) -> None:
         raise HTTPException(410, f"This order is before the after-order cutoff of {after_order_cutoff_date()} and cannot be actioned.")
 
 
-def after_order_unavailable_review(case: dict[str, Any]) -> dict[str, Any]:
+def after_order_unavailable_review(case: dict[str, Any], *, for_send: bool = False) -> dict[str, Any]:
     with db() as conn:
         lines = rows_to_dicts(conn.execute(
             """SELECT id, asin, missing_asin, quantity, state, order_engine,
@@ -37538,11 +37580,11 @@ def after_order_unavailable_review(case: dict[str, Any]) -> dict[str, Any]:
     if approval and not reason:
         try:
             approved_at = parse_any_datetime(approval["created_at"])
-            approved = bool(approved_at and approved_at > datetime.now(timezone.utc) - timedelta(hours=24) and json.loads(approval["details_json"]).get("signature") == signature)
+            approved = bool(approved_at and (not for_send or approved_at > datetime.now(timezone.utc) - timedelta(hours=24)) and json.loads(approval["details_json"]).get("signature") == signature)
         except (ValueError, TypeError):
             approved = False
     return {"blocked": bool(reason), "approved": approved, "signature": signature,
-            "reason": reason or ("Sourcing review approved; live notice permitted for 24 hours while fulfilment remains unchanged." if approved else "Waiting for team to check third-party and manual fulfilment before notifying the customer.")}
+            "reason": reason or ("Sourcing review approved while the affected fulfilment remains unchanged." if approved else "Waiting for team to check third-party and manual fulfilment before notifying the customer.")}
 
 
 @app.post("/api/after-order/cases/{case_id}/approve-unavailable-notice")
@@ -37579,8 +37621,21 @@ def after_order_filter_removal(case: dict[str, Any], actions: list[str]) -> list
     return actions
 
 
+def after_order_tracking_is_current(case: dict[str, Any]) -> bool:
+    if not case.get("tracking_code"):
+        return case.get("case_type") not in {"tracking", "delivery_confirmation"}
+    if case.get("tracking_provider") != "epg":
+        return False  # A future carrier must supply its own fresh-state adapter.
+    with db() as conn:
+        row = conn.execute("SELECT status, events_json FROM epost_global_tracking WHERE store_id=? AND tracking_code=?", (case["store_id"], case["tracking_code"])).fetchone()
+    if not row:
+        return False
+    risk = tracking_risk(after_order_json_list(row["events_json"]), status=clean_text(row["status"]))
+    return risk.state == (case.get("context") or {}).get("risk_state")
+
+
 def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
-    if case.get("confirmed_at"):
+    if case.get("confirmed_at") or case.get("status") == "resolved":
         return []
     if case.get("case_type") == "item_unavailable":
         review = after_order_unavailable_review(case)
@@ -37588,9 +37643,11 @@ def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
             return []
         return after_order_filter_removal(case, ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"])
     if case.get("case_type") == "delivery_confirmation":
-        return ["received", "not_received"]
-    if clean_text((case.get("context") or {}).get("risk_state")) in {"suspected_lost", "carrier_exception"}:
-        return ["refund", "replacement"]
+        return ["received", "not_received"] if after_order_tracking_is_current(case) and (case.get("context") or {}).get("risk_state") == "delivered" else []
+    if case.get("case_type") == "expected_dispatch":
+        return ["proceed", "cancel_order"]
+    if clean_text((case.get("context") or {}).get("risk_state")) == "suspected_lost" and (case.get("context") or {}).get("customer_lost_email_allowed"):
+        return ["refund", "replacement"] if after_order_tracking_is_current(case) else []
     return []
 
 
@@ -37627,6 +37684,47 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
     now = utc_now()
     cutoff_date = after_order_cutoff_date()
     with db() as conn:
+        conn.execute("UPDATE after_order_cases SET status='resolved', updated_at=? WHERE case_type='expected_dispatch' AND confirmed_at IS NULL AND (? IS NULL OR store_id=?)", (now, store_id, store_id))
+        # ETA notices are materialized independently of anybody opening cards.
+        eta_rows = rows_to_dicts(conn.execute(
+            """SELECT * FROM order_lines WHERE COALESCE(odoo_order_date, '') >= ?
+               AND (? IS NULL OR store_id=?) AND COALESCE(tracking_payload, '') != ''
+               AND COALESCE(amazon_order_id, '') != ''""", (cutoff_date, store_id, store_id),
+        ).fetchall())
+        eta_orders: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for line in eta_rows:
+            if line.get("state") in {"fulfilled", "shipped", "delivered", "ignored"} or line.get("odoo_status_label") in {"cancelled", "refunded"} or line.get("order_engine") in {"third_party", "manual_amazon", "inventory"}:
+                continue
+            eta_orders.setdefault((int(line["store_id"]), int(line["odoo_order_id"])), []).append(line)
+        for (eta_store, eta_order), lines in eta_orders.items():
+            dates = []
+            for line in lines:
+                for package in parse_tracking_packages(line.get("tracking_payload") or ""):
+                    try:
+                        value = datetime.fromisoformat(str(package.get("expected_delivery_date") or "").replace("Z", "+00:00")).date()
+                    except ValueError:
+                        continue
+                    dates.append(value)
+            if not dates or max(dates) <= (datetime.now(timezone.utc) + timedelta(days=6)).date():
+                continue
+            # Arrival at our facility is an estimate, not proof of dispatch.
+            # A configurable handling allowance is required before a live notice.
+            handling = clean_text(get_service_settings().get("after_order_dispatch_handling_days"))
+            if not handling.isdigit():
+                continue
+            dispatch = max(dates) + timedelta(days=int(handling))
+            first = lines[0]
+            conn.execute(
+                """INSERT INTO after_order_cases
+                   (case_key, store_id, odoo_order_id, odoo_order_name, case_type, status, severity, title, affected_items_json, context_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'expected_dispatch', 'needs_attention', 'medium', 'Expected dispatch update', ?, ?, ?, ?)
+                   ON CONFLICT(case_key) DO UPDATE SET context_json=excluded.context_json,
+                   status=CASE WHEN after_order_cases.confirmed_at IS NOT NULL THEN after_order_cases.status WHEN after_order_cases.current_decision IS NOT NULL THEN 'needs_confirmation' ELSE 'needs_attention' END,
+                   updated_at=excluded.updated_at""",
+                (f"dispatch:{eta_store}:{eta_order}", eta_store, eta_order, first.get("odoo_order_name"),
+                 json.dumps([{"line_id": line["id"], "asin": line.get("asin"), "product_name": line.get("product_name"), "quantity": line.get("quantity")} for line in lines]),
+                 json.dumps({"expected_dispatch_date": dispatch.isoformat()}), now, now),
+            )
         missing_rows = rows_to_dicts(conn.execute(
             """
             SELECT order_lines.*, stores.website_id, stores.odoo_url,
@@ -37646,6 +37744,8 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
         ).fetchall())
         grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
         for row in missing_rows:
+            if unavailable_notice_block_reason([row], [{"line_id": row["id"]}]):
+                continue
             grouped.setdefault((int(row["store_id"]), int(row["odoo_order_id"])), []).append(row)
         if store_id:
             conn.execute(
@@ -37669,6 +37769,11 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
             )
         for (row_store_id, order_id), rows in grouped.items():
             first = rows[0]
+            case_key = f"unavailable:{row_store_id}:{order_id}"
+            existing_case = conn.execute("SELECT id, case_key, affected_items_json, confirmed_at FROM after_order_cases WHERE case_type='item_unavailable' AND store_id=? AND odoo_order_id=? ORDER BY id DESC LIMIT 1", (row_store_id, order_id)).fetchone()
+            if existing_case:
+                case_key = existing_case["case_key"]
+            originals = {str(item.get("line_id")): item for item in after_order_json_list(existing_case["affected_items_json"] if existing_case else "[]")}
             items = []
             for row in rows:
                 asin = normalize_asin(row.get("missing_asin") or row.get("asin"))
@@ -37685,7 +37790,17 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                     "thumbnail_url": f"/api/public/asin-image/{quote_plus(asin)}" if asin else "",
                     "odoo_product_url": f"{odoo_base}/web#id={product_id}&model=product.product&view_type=form" if odoo_base and product_id else "",
                 })
-            case_key = f"unavailable:{row_store_id}:{order_id}"
+                original = originals.get(str(row["id"]))
+                if original:
+                    for key in ("original_unit_price", "original_line_total", "currency"):
+                        items[-1][key] = original.get(key)
+            if existing_case and existing_case["confirmed_at"]:
+                old_items = after_order_json_list(existing_case["affected_items_json"])
+                identity = lambda values: sorted((str(item.get("line_id")), str(item.get("asin")), float(item.get("quantity") or 0)) for item in values)
+                if identity(old_items) != identity(items):
+                    case_key = f"unavailable:{row_store_id}:{order_id}:{uuid.uuid4().hex[:12]}"
+                    conn.execute("UPDATE after_order_cases SET affected_items_json=?, status='execution_needs_review', updated_at=? WHERE id=?", (json.dumps(items), now, existing_case["id"]))
+                    record_after_order_event(conn, int(existing_case["id"]), "issue_changed_after_confirmation", details={"new_case_key": case_key})
             conn.execute(
                 """
                 INSERT INTO after_order_cases
@@ -37699,7 +37814,7 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                     odoo_order_name=excluded.odoo_order_name,
                     affected_items_json=excluded.affected_items_json,
                     context_json=excluded.context_json,
-                    status=CASE WHEN after_order_cases.confirmed_at IS NULL THEN 'needs_attention' ELSE after_order_cases.status END,
+                    status=CASE WHEN after_order_cases.confirmed_at IS NOT NULL THEN after_order_cases.status WHEN after_order_cases.current_decision IS NOT NULL THEN 'needs_confirmation' ELSE 'needs_attention' END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -37779,6 +37894,21 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                 "final_mile_tracking_number": clean_text(row.get("final_mile_tracking_number")),
             }
             order_products = products_by_order.get((int(row["store_id"]), int(row.get("odoo_order_id") or 0)), [])
+            context["parcel_items_verified"] = (
+                len(order_products) == 1 and float(order_products[0].get("quantity") or 0) == 1
+                and sum(1 for tracked in tracking_rows if tracked["store_id"] == row["store_id"] and tracked.get("odoo_order_id") == row.get("odoo_order_id")) == 1
+            )
+            previous_tracking = conn.execute(
+                "SELECT id, case_key, confirmed_at, context_json FROM after_order_cases WHERE store_id=? AND tracking_provider='epg' AND tracking_code=? ORDER BY id DESC LIMIT 1",
+                (row["store_id"], row.get("tracking_code")),
+            ).fetchone()
+            if previous_tracking:
+                case_key = previous_tracking["case_key"]
+                previous_risk = json.loads(previous_tracking["context_json"] or "{}").get("risk_state")
+                if previous_tracking["confirmed_at"] and previous_risk != risk.state:
+                    case_key = f"tracking:{row['store_id']}:{row.get('tracking_code')}:{uuid.uuid4().hex[:12]}"
+                    conn.execute("UPDATE after_order_cases SET context_json=?, status='execution_needs_review', updated_at=? WHERE id=?", (json.dumps(context), now, previous_tracking["id"]))
+                    record_after_order_event(conn, int(previous_tracking["id"]), "tracking_changed_after_confirmation", details={"new_case_key": case_key, "risk_state": risk.state})
             conn.execute(
                 """
                 INSERT INTO after_order_cases
@@ -37792,7 +37922,7 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                     odoo_order_id=COALESCE(excluded.odoo_order_id, after_order_cases.odoo_order_id),
                     odoo_order_name=COALESCE(NULLIF(excluded.odoo_order_name, ''), after_order_cases.odoo_order_name),
                     case_type=CASE WHEN after_order_cases.confirmed_at IS NULL THEN excluded.case_type ELSE after_order_cases.case_type END,
-                    status=CASE WHEN after_order_cases.confirmed_at IS NULL THEN excluded.status ELSE after_order_cases.status END,
+                    status=CASE WHEN after_order_cases.confirmed_at IS NOT NULL THEN after_order_cases.status WHEN after_order_cases.current_decision IS NOT NULL THEN 'needs_confirmation' ELSE excluded.status END,
                     severity=excluded.severity,
                     title=excluded.title,
                     affected_items_json=excluded.affected_items_json,
@@ -37810,6 +37940,21 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                 ),
             )
 
+        candidates = rows_to_dicts(conn.execute("SELECT * FROM after_order_cases WHERE confirmed_at IS NULL AND (? IS NULL OR store_id=?)", (store_id, store_id)).fetchall())
+        for candidate in candidates:
+            candidate["affected_items"] = after_order_json_list(candidate.get("affected_items_json"))
+            candidate["context"] = json.loads(candidate.get("context_json") or "{}")
+            signature = request_fingerprint(candidate)
+            conn.execute(
+                """UPDATE after_order_action_links SET invalidated_at=?, updated_at=?
+                   WHERE case_id=? AND test_mode=0 AND invalidated_at IS NULL
+                     AND (request_fingerprint IS NULL OR request_fingerprint!=? OR ?='resolved')""",
+                (now, now, candidate["id"], signature, candidate["status"]),
+            )
+            if candidate.get("current_decision") and candidate.get("decision_fingerprint") != signature:
+                conn.execute("UPDATE after_order_cases SET previous_decision=current_decision, current_decision=NULL, selected_product_id=NULL, decision_fingerprint=NULL, decision_version=decision_version+1, updated_at=? WHERE id=? AND confirmed_at IS NULL", (now, candidate["id"]))
+                record_after_order_event(conn, int(candidate["id"]), "customer_request_invalidated", details={"reason": "Affected items or delivery assessment changed."})
+
 
 def after_order_case_dict(row: Any) -> dict[str, Any]:
     item = row_to_dict(row) or {}
@@ -37824,10 +37969,15 @@ def after_order_case_dict(row: Any) -> dict[str, Any]:
                 "SELECT amount, currency, status, last_error, updated_at FROM after_order_refund_requests WHERE case_id=?",
                 (item["id"],),
             ).fetchone()
+            execution = conn.execute(
+                "SELECT id, decision, status, last_error, updated_at FROM after_order_execution_jobs WHERE case_id=? ORDER BY id DESC LIMIT 1",
+                (item["id"],),
+            ).fetchone()
         item["refund_request"] = row_to_dict(refund) if refund else None
+        item["execution"] = row_to_dict(execution) if execution else None
     item["odoo_order_url"] = odoo_order_admin_url({"odoo_url": item.get("odoo_url") or ""}, item.get("odoo_order_id"))
     if item.get("case_type") == "item_unavailable":
-        item["unavailable_notice"] = after_order_unavailable_review(item)
+        item["unavailable_notice"] = after_order_unavailable_review(item, for_send=True)
     return item
 
 
@@ -37914,6 +38064,7 @@ def api_after_order_cases(
         "email_test_mode": after_order_email_test_mode(),
         "email_test_recipient": after_order_test_recipient(),
         "cutoff_date": after_order_cutoff_date(),
+        "automation_enabled": clean_text(get_service_settings().get("after_order_automation_enabled")) == "true",
     }
 
 
@@ -37989,7 +38140,7 @@ def after_order_absolute_url(request: Request, path: str) -> str:
     return f"{base}/{clean_text(path).lstrip('/')}"
 
 
-def hydrate_after_order_recipient_and_domain(case: dict[str, Any]) -> dict[str, Any]:
+def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
     """Resolve customer/site data from the case's own Odoo store at send time."""
     if not case.get("odoo_order_id"):
         return case
@@ -37999,12 +38150,16 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any]) -> dict[str, 
     context = dict(case.get("context") or {})
     try:
         odoo = OdooClient(get_store(int(case["store_id"])))
-        fields = odoo.existing_fields("sale.order", ["partner_id", "partner_invoice_id", "website_id"])
+        fields = odoo.existing_fields("sale.order", ["partner_id", "partner_invoice_id", "website_id", "state"])
         orders = odoo.read("sale.order", [int(case["odoo_order_id"])], fields)
         order = orders[0] if orders else {}
+        if strict and (not order or order.get("state") == "cancel" or not many2one_id(order.get("website_id"))):
+            raise ValueError("A current, non-cancelled Odoo website order is required.")
         website_id = many2one_id(order.get("website_id")) or website_id
         partner_id = many2one_id(order.get("partner_id")) or many2one_id(order.get("partner_invoice_id"))
-        if partner_id and not customer_email:
+        if strict and not partner_id:
+            raise ValueError("Odoo did not supply the current order customer.")
+        if partner_id and (strict or not customer_email):
             partners = odoo.read("res.partner", [partner_id], odoo.existing_fields("res.partner", ["email"]))
             customer_email = clean_text((partners[0] if partners else {}).get("email"))
         if website_id:
@@ -38021,18 +38176,29 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any]) -> dict[str, 
                     sender_domain = candidate_domain.removeprefix("www.")
                     website_origin = f"{parsed_website.scheme or 'https'}://{candidate_domain}"
                     context["website_logo_url"] = f"{website_origin}/web/image/website/{int(website_id)}/logo?v={int(time.time())}"
-    except Exception:
+            elif strict:
+                raise ValueError("The order website has no domain configured.")
+        if strict and (not customer_email or not sender_domain):
+            raise ValueError("Current customer email and website domain are required.")
+    except Exception as exc:
+        if strict:
+            raise HTTPException(409, f"Could not verify current Odoo recipient and website: {clean_error_message(exc)}") from exc
         # Sending can still use cached case values or the explicitly configured fallback sender.
         pass
     if customer_email or sender_domain or website_id or context != (case.get("context") or {}):
         now = utc_now()
         with db() as conn:
+            current = conn.execute("SELECT context_json FROM after_order_cases WHERE id=? FOR UPDATE", (case["id"],)).fetchone()
+            merged_context = json.loads(current["context_json"] or "{}") if current else {}
+            for key in ("website_name", "website_logo_url"):
+                if key in context:
+                    merged_context[key] = context[key]
             conn.execute(
                 """UPDATE after_order_cases SET customer_email=COALESCE(NULLIF(?, ''), customer_email),
                    sender_domain=COALESCE(NULLIF(?, ''), sender_domain), website_id=COALESCE(?, website_id),
                    context_json=?, updated_at=?
                    WHERE id=?""",
-                (customer_email, sender_domain, website_id, json.dumps(context), now, case["id"]),
+                (customer_email, sender_domain, website_id, json.dumps(merged_context), now, case["id"]),
             )
         case = after_order_case_by_id(int(case["id"])) or case
     return case
@@ -38058,111 +38224,18 @@ def after_order_email_content(
     unsubscribe_url: str = "",
     actions_override: Optional[list[str]] = None,
 ) -> tuple[str, str, str]:
-    items = case.get("affected_items") or []
-    item_rows = "".join(f"""
-        <tr><td style="padding:0 0 12px">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #dce1e7;border-radius:10px;background:#fff">
-            <tr>
-              <td width="88" valign="middle" style="padding:12px">
-                {f'<img src="{html.escape(clean_text(item.get("thumbnail_url")))}" alt="Product thumbnail" width="72" height="72" style="display:block;width:72px;height:72px;object-fit:contain;border:1px solid #edf0f3;border-radius:8px;background:#fff">' if item.get('thumbnail_url') else '<div style="width:72px;height:72px;border-radius:8px;background:#f1f3f5"></div>'}
-              </td>
-              <td valign="middle" style="padding:12px 12px 12px 0;color:#1d273b;font:14px/1.45 Arial,sans-serif">
-                <strong style="display:block;font-size:15px">{html.escape(clean_text(item.get('product_name')) or 'Order item')}</strong>
-                <span style="color:#667085">Quantity {html.escape(str(item.get('quantity') or 1))}{f' · {html.escape(clean_text(item.get("asin")))}' if item.get('asin') else ''}</span>
-                {f'<br><a href="{html.escape(clean_text(item.get("odoo_product_url")))}" style="color:#206bc4;text-decoration:none;font-weight:600">View affected product</a>' if item.get('odoo_product_url') else ''}
-              </td>
-            </tr>
-          </table>
-        </td></tr>""" for item in items)
-    items_section = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px">{item_rows}</table>""" if item_rows else ""
+    from app.services.after_order_email import render_after_order_email
+
     actions = list(actions_override) if actions_override is not None else after_order_allowed_actions(case)
-    action_colors = {
-        "proceed": ("#2fb344", "#ffffff"),
-        "received": ("#2fb344", "#ffffff"),
-        "replacement": ("#206bc4", "#ffffff"),
-        "offer_alternatives": ("#4299e1", "#ffffff"),
-        "exclude_item_and_proceed": ("#626976", "#ffffff"),
-        "cancel_order": ("#d63939", "#ffffff"),
-        "refund": ("#d63939", "#ffffff"),
-        "not_received": ("#d63939", "#ffffff"),
-    }
-    buttons = "".join(
-        f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 10px"><tr><td align="center" bgcolor="{action_colors.get(action, ('#206bc4', '#ffffff'))[0]}" style="border-radius:7px"><a href="{html.escape(action_url)}?choice={quote_plus(action)}" style="display:block;padding:13px 18px;color:{action_colors.get(action, ('#206bc4', '#ffffff'))[1]};font:700 14px Arial,sans-serif;text-decoration:none;border-radius:7px">{html.escape(AFTER_ORDER_ACTION_LABELS[action])}</a></td></tr></table>"""
-        for action in actions
-    )
-    order_number = clean_text(case.get("odoo_order_name")) or "Your order"
-    order_name = html.escape(order_number)
-    context = case.get("context") or {}
-    tracking_url = html.escape(clean_text(context.get("tracking_url")))
-    logo_url = html.escape(clean_text(context.get("website_logo_url")))
-    status_text = html.escape(clean_text(context.get("latest_status")))
-    location_text = html.escape(clean_text(context.get("latest_location")))
-    case_type = clean_text(case.get("case_type"))
+    review_url = ""
     if template_kind == "trustpilot_review":
         _, domain = after_order_sender(case)
         review_url = trustpilot_review_url(domain)
-        subject = f"{order_number} — Thank you for confirming delivery"
-        heading = "Thank you for confirming delivery"
-        intro = "We’re glad your order arrived. If you have a moment, we’d appreciate your honest feedback."
-        body = f"""{items_section}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px"><tr><td align="center" bgcolor="#2fb344" style="border-radius:7px"><a href="{html.escape(review_url)}" style="display:block;padding:14px 20px;color:#fff;font:700 15px Arial,sans-serif;text-decoration:none">Share an honest Trustpilot review</a></td></tr></table>"""
-        plain = f"Thank you for confirming delivery of order {clean_text(case.get('odoo_order_name'))}. Share your honest feedback: {review_url}"
-    elif case_type == "expected_dispatch":
-        dispatch_date = html.escape(clean_text(context.get("expected_dispatch_date")))
-        subject = f"{order_number} — Please confirm the expected dispatch"
-        heading = "Please confirm the expected dispatch"
-        intro = f"Order <strong>{order_name}</strong> has a later expected dispatch{f' around <strong>{dispatch_date}</strong>' if dispatch_date else ''}. If we do not hear from you, we will continue processing it."
-        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
-        plain = f"Order {clean_text(case.get('odoo_order_name'))} has a later expected dispatch. If we do not hear from you, we will continue processing it. Respond here: {action_url}"
-    elif case_type == "delivery_confirmation":
-        subject = f"{order_number} — Did your order arrive?"
-        heading = "Please confirm your delivery"
-        intro = f"The carrier has marked order <strong>{order_name}</strong> as delivered. Please tell us whether you received it."
-        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
-        plain = f"The carrier marked order {clean_text(case.get('odoo_order_name'))} as delivered. Confirm here: {action_url}"
-    elif case_type == "item_unavailable":
-        subject = f"{order_number} — An item needs your choice"
-        heading = "An item in your order needs your choice"
-        intro = f"Order <strong>{order_name}</strong> has one or more currently unavailable items. Only the affected items are shown. If you remove an unavailable item, any amount charged for it will be refunded after our team reviews and confirms your request."
-        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
-        plain = f"An item in order {clean_text(case.get('odoo_order_name'))} needs your choice. Respond here: {action_url}"
-    elif template_kind == "package_lost" or clean_text(context.get("risk_state")) in {"suspected_lost", "carrier_exception"}:
-        subject = f"{order_number} — Your package needs attention"
-        heading = "Your package needs attention"
-        intro = f"There has been no confirmed movement for order <strong>{order_name}</strong>. Please choose a replacement or refund."
-        body = f'{items_section}<div style="margin-top:20px">{buttons}</div>'
-        plain = f"Your package for order {clean_text(case.get('odoo_order_name'))} needs attention. Respond here: {action_url}"
-    else:
-        subject = f"{order_number} — Your package has moved"
-        heading = "Your package has a new update"
-        intro = f"There is a new carrier update for order <strong>{order_name}</strong>."
-        update_panel = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;background:#f1f5f9;border-radius:10px"><tr><td style="padding:16px;font:14px/1.5 Arial,sans-serif;color:#334155"><strong style="color:#1d273b">{status_text or 'Shipment update'}</strong>{f'<br>{location_text}' if location_text else ''}</td></tr></table>"""
-        track_button = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px"><tr><td align="center" bgcolor="#206bc4" style="border-radius:7px"><a href="{tracking_url}" style="display:block;padding:14px 20px;color:#fff;font:700 15px Arial,sans-serif;text-decoration:none">Track all details</a></td></tr></table>""" if tracking_url else ""
-        body = f"{update_panel}{items_section}{track_button}"
-        plain = f"There is a new carrier update for order {clean_text(case.get('odoo_order_name'))}. Track it: {clean_text(context.get('tracking_url'))}"
-    unsubscribe_html = (
-        f'<p style="font-size:12px;color:#687386;text-align:center"><a href="{html.escape(unsubscribe_url)}" style="color:#687386">Unsubscribe from package movement and review emails</a></p>'
-        if unsubscribe_url else ""
+    return render_after_order_email(
+        case, action_url, actions=actions, labels=AFTER_ORDER_ACTION_LABELS,
+        template_kind=template_kind, unsubscribe_url=unsubscribe_url,
+        review_url=review_url,
     )
-    if unsubscribe_url:
-        plain += f"\n\nUnsubscribe from package movement and review emails: {unsubscribe_url}"
-    preheader = html.escape(subject)
-    logo_html = f'<img src="{logo_url}" alt="{html.escape(clean_text(case.get("store_name")) or "Store")}" height="44" style="display:block;max-width:180px;max-height:44px;width:auto;height:auto">' if logo_url else f'<strong style="font:700 20px Arial,sans-serif;color:#1d273b">{html.escape(clean_text(case.get("store_name")) or "Customer care")}</strong>'
-    html_body = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"></head>
-    <body style="margin:0;padding:0;background:#f1f3f5;color:#1d273b">
-    <div style="display:none;max-height:0;overflow:hidden;opacity:0">{preheader}</div>
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f5"><tr><td align="center" style="padding:28px 12px">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#fff;border:1px solid #dce1e7;border-radius:12px;overflow:hidden;box-shadow:0 3px 12px rgba(29,39,59,.06)">
-        <tr><td style="padding:22px 28px;border-bottom:1px solid #e6e9ed">{logo_html}</td></tr>
-        <tr><td style="padding:30px 28px;font-family:Arial,sans-serif">
-          <span style="display:inline-block;padding:5px 9px;border-radius:6px;background:#e9f2ff;color:#206bc4;font:700 11px Arial,sans-serif;letter-spacing:.04em;text-transform:uppercase">Order {order_name}</span>
-          <h1 style="margin:16px 0 10px;color:#1d273b;font:700 25px/1.25 Arial,sans-serif">{heading}</h1>
-          <div style="color:#4b5565;font:15px/1.65 Arial,sans-serif">{intro}</div>
-          {body}
-        </td></tr>
-        <tr><td style="padding:20px 28px;background:#f8f9fa;border-top:1px solid #e6e9ed;color:#667085;font:12px/1.6 Arial,sans-serif;text-align:center">This message relates to order {order_name} placed on {html.escape(clean_text(context.get('website_name')) or clean_text(case.get('store_name')) or 'our website')}.{unsubscribe_html}</td></tr>
-      </table>
-    </td></tr></table></body></html>"""
-    return subject, html_body, plain
 
 
 def after_order_email_preview_html(case: dict[str, Any], action_url: str) -> str:
@@ -38238,7 +38311,7 @@ def after_order_tracking_updates_opted_out(case: dict[str, Any], email: str) -> 
 
 
 @app.post("/api/after-order/cases/{case_id}/email-preview")
-def api_after_order_email_preview(case_id: int) -> dict[str, Any]:
+def api_after_order_email_preview(case_id: int, request: Request) -> dict[str, Any]:
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
@@ -38280,13 +38353,15 @@ def send_after_order_email(
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
     unavailable_email = showcase_kind == "item_unavailable" or (not showcase_kind and case.get("case_type") == "item_unavailable" and template_kind != "trustpilot_review")
+    if not (force_test or after_order_email_test_mode()) and not after_order_tracking_is_current(case):
+        raise HTTPException(409, "Tracking changed or could not be verified. Refresh the case before sending.")
     if unavailable_email:
-        review = after_order_unavailable_review(case)
+        review = after_order_unavailable_review(case, for_send=True)
         if review["blocked"] or (not (force_test or after_order_email_test_mode()) and not review["approved"]):
             with db() as conn:
                 record_after_order_event(conn, case_id, "unavailable_email_blocked", actor_type="system", details={"reason": review["reason"]})
             raise HTTPException(409, review["reason"])
-    case = hydrate_after_order_recipient_and_domain(case)
+    case = hydrate_after_order_recipient_and_domain(case, strict=not (force_test or after_order_email_test_mode()))
     showcase_actions = {
         "expected_dispatch": ["proceed", "cancel_order"],
         "item_unavailable": ["offer_alternatives", "exclude_item_and_proceed", "cancel_order"],
@@ -38304,12 +38379,14 @@ def send_after_order_email(
             case_id, request, allowed_override=allowed, test_mode=True,
         ).get("url"))
     elif allowed:
-        action_url = clean_text(create_after_order_action_link(case_id, request).get("url"))
+        action_url = clean_text(create_after_order_action_link(case_id, request, test_mode=force_test or after_order_email_test_mode()).get("url"))
     elif showcase_kind == "package_movement" or (not showcase_kind and not template_kind and case.get("case_type") == "tracking"):
         branded_tracking_url = clean_text(create_after_order_action_link(
             case_id, request, allowed_override=[], test_mode=force_test or after_order_email_test_mode(), view_only=True,
         ).get("url"))
     test_mode = force_test or after_order_email_test_mode()
+    if not test_mode and allowed and clean_text(get_service_settings().get("after_order_website_portal_enabled")).lower() not in {"1", "true", "yes", "on"}:
+        raise HTTPException(409, "Website portal routing must be enabled before live customer action emails.")
     intended_recipient = clean_text(case.get("customer_email"))
     try:
         recipient = resolve_delivery_recipient(
@@ -38370,19 +38447,23 @@ def send_after_order_email(
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{'test' if test_mode else 'live'}:{uuid.uuid4().hex}"
+    event_context = case.get("context") or {}
+    event_revision = request_fingerprint(case)
+    if case.get("case_type") == "tracking" and not allowed:
+        event_revision = hashlib.sha256(json.dumps({key: event_context.get(key) for key in ("latest_status", "latest_location", "last_update_at")}, sort_keys=True).encode()).hexdigest()
+    idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{uuid.uuid4().hex if test_mode else event_revision}"
     now = utc_now()
     message_id = ""
     status = "failed"
     try:
         if unavailable_email and not test_mode:
             latest = after_order_case_by_id(case_id)
-            review = after_order_unavailable_review(latest or case)
+            review = after_order_unavailable_review(latest or case, for_send=True)
             if not latest or review["blocked"] or not review["approved"]:
                 with db() as conn:
                     record_after_order_event(conn, case_id, "unavailable_email_blocked", actor_type="system", details={"reason": review["reason"]})
                 raise HTTPException(409, review["reason"])
-        provider = ResendEmailProvider(os.getenv("RESEND_API_KEY", ""))
+        provider_name = clean_text(get_service_settings().get("after_order_email_provider")) or "resend"
         message_payload: dict[str, Any] = {
                 "from": sender,
                 "to": [recipient],
@@ -38396,6 +38477,23 @@ def send_after_order_email(
                 "List-Unsubscribe": f"<{unsubscribe_url}>",
                 "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
             }
+        # Reserve the logical notification before any network side effect. An
+        # ambiguous timeout/crash remains visible and is never blindly resent.
+        with db() as conn:
+            reserved = conn.execute(
+                """INSERT INTO after_order_messages
+                   (case_id, provider, recipient, sender, subject, html_preview, status, idempotency_key, payload_json, created_at, updated_at, test_mode, request_fingerprint, template_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(idempotency_key) DO NOTHING RETURNING id""",
+                (case_id, provider_name, recipient, sender, subject, html_body, idempotency_key, json.dumps(message_payload), now, now, 1 if test_mode else 0, request_fingerprint(case), showcase_kind or template_kind or case.get("case_type")),
+            )
+            reservation = reserved.fetchone()
+            if not reservation:
+                return {"ok": True, "message": "This notification was already sent or reserved; no duplicate was sent.", "deduplicated": True}
+            conn.execute("INSERT INTO after_order_email_attempts (message_id, attempt_number, status, created_at, updated_at) VALUES (?, 1, 'sending', ?, ?)", (reservation["id"], now, now))
+        if not test_mode and after_order_email_test_mode():
+            raise ValueError("Test mode was enabled before sending; live email stopped.")
+        provider = create_email_provider(provider_name, {"api_key": os.getenv("RESEND_API_KEY", "")})
         result = provider.send(
             message_payload,
             idempotency_key=idempotency_key,
@@ -38403,27 +38501,25 @@ def send_after_order_email(
         message_id = clean_text(result.get("id"))
         status = "sent_test" if test_mode else "sent"
     except (ValueError, RuntimeError, requests.RequestException) as exc:
+        failure_status = "failed" if isinstance(exc, (ValueError, EmailRejected)) else "delivery_unknown"
         with db() as conn:
             conn.execute(
-                """INSERT INTO after_order_messages
-                   (case_id, provider, recipient, sender, subject, html_preview, status, idempotency_key, created_at, updated_at)
-                   VALUES (?, 'resend', ?, ?, ?, ?, 'failed', ?, ?, ?)""",
-                (case_id, recipient, sender, subject, html_body, idempotency_key, now, now),
+                """UPDATE after_order_messages SET status=?, last_error=?, updated_at=? WHERE idempotency_key=?""",
+                (failure_status, clean_error_message(exc), utc_now(), idempotency_key),
             )
+            conn.execute("UPDATE after_order_email_attempts SET status=?, error=?, updated_at=? WHERE message_id=(SELECT id FROM after_order_messages WHERE idempotency_key=?) AND attempt_number=1", (failure_status, clean_error_message(exc), utc_now(), idempotency_key))
             record_after_order_event(
                 conn, case_id, "email_send_failed", actor_type="team" if force_test else "system",
                 actor_label="Send test email" if force_test else "Email worker",
                 details={"actual_recipient": recipient, "intended_recipient": intended_recipient, "test_mode": test_mode, "error": str(exc)},
             )
-        raise HTTPException(503, f"Email was not sent: {exc}") from exc
+        raise HTTPException(503, f"Email {'failed' if failure_status == 'failed' else 'acceptance is uncertain; check the provider before retrying'}: {clean_error_message(exc)}") from exc
     with db() as conn:
         conn.execute(
-            """INSERT INTO after_order_messages
-               (case_id, provider, recipient, sender, subject, html_preview, status, provider_message_id,
-                idempotency_key, created_at, updated_at)
-               VALUES (?, 'resend', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (case_id, recipient, sender, subject, html_body, status, message_id, idempotency_key, now, now),
+            """UPDATE after_order_messages SET status=?, provider_message_id=?, updated_at=? WHERE idempotency_key=?""",
+            (status, message_id, utc_now(), idempotency_key),
         )
+        conn.execute("UPDATE after_order_email_attempts SET status=?, provider_message_id=?, updated_at=? WHERE message_id=(SELECT id FROM after_order_messages WHERE idempotency_key=?) AND attempt_number=1", (status, message_id, utc_now(), idempotency_key))
         record_after_order_event(
             conn, case_id, "test_email_sent" if test_mode else "customer_email_sent",
             actor_type="team" if force_test else "system",
@@ -38444,6 +38540,140 @@ def send_after_order_email(
         "recipient": recipient,
         "provider_message_id": message_id,
     }
+
+
+def email_log_row(row: Any) -> dict[str, Any]:
+    item = row_to_dict(row) or {}
+    item["status_label"] = EMAIL_STATUS_LABELS.get(item.get("status"), "Needs review")
+    item["retry_block_reason"] = retry_block_reason(item, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
+    item["can_retry"] = not item["retry_block_reason"]
+    item["test_mode"] = bool(item.get("test_mode")) or item.get("status") in {"sent_test", "test_preview"}
+    for field in ("payload_json", "request_fingerprint", "idempotency_key"):
+        item.pop(field, None)
+    return item
+
+
+@app.get("/api/after-order/emails")
+def api_after_order_email_log(store_id: Optional[int] = None, page: int = 1, per_page: int = 30,
+                            status: str = "all", mode: str = "all", q: str = "", date_from: str = "", date_to: str = "") -> dict[str, Any]:
+    queues = {"all": [], "attention": ["failed", "delivery_unknown"], "failed": ["failed"], "retrying": ["retrying", "sending"], "sent": ["sent", "sent_test"], "uncertain": ["delivery_unknown"], "preview": ["test_preview"]}
+    if status not in queues or mode not in {"all", "test", "live"}:
+        raise HTTPException(400, "Unknown email queue or mode.")
+    for value in (date_from, date_to):
+        if value:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError as exc:
+                raise HTTPException(400, "Dates must use YYYY-MM-DD.") from exc
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "The start date must not be after the end date.")
+    page, per_page, offset = pagination_bounds(page, min(100, max(1, per_page)))
+    filters = ["(? IS NULL OR c.store_id=?)"]
+    params: list[Any] = [store_id, store_id]
+    if mode == "test":
+        filters.append("(m.test_mode=1 OR m.status IN ('sent_test', 'test_preview'))")
+    elif mode == "live":
+        filters.append("(m.test_mode=0 AND m.status NOT IN ('sent_test', 'test_preview'))")
+    if clean_text(q):
+        filters.append("UPPER(COALESCE(m.subject,'') || ' ' || COALESCE(m.recipient,'') || ' ' || COALESCE(m.sender,'') || ' ' || COALESCE(c.odoo_order_name,'') || ' ' || s.name) LIKE ?")
+        params.append(f"%{clean_text(q).upper()}%")
+    if date_from:
+        filters.append("SUBSTR(m.created_at,1,10)>=?")
+        params.append(date_from)
+    if date_to:
+        filters.append("SUBSTR(m.created_at,1,10)<=?")
+        params.append(date_to)
+    source = "FROM after_order_messages m JOIN after_order_cases c ON c.id=m.case_id JOIN stores s ON s.id=c.store_id"
+    where = " AND ".join(filters)
+    with db() as conn:
+        counts = conn.execute(f"SELECT m.status, COUNT(*) AS count {source} WHERE {where} GROUP BY m.status", params).fetchall()
+        count_by_status = {row["status"]: int(row["count"]) for row in counts}
+        summary = {key: sum(count_by_status.get(value, 0) for value in values) if values else sum(count_by_status.values()) for key, values in queues.items()}
+        if queues[status]:
+            where += " AND m.status IN (" + ",".join("?" for _ in queues[status]) + ")"
+            params.extend(queues[status])
+        rows = conn.execute(f"""SELECT m.id,m.case_id,m.provider,m.recipient,m.sender,m.subject,m.status,m.last_error,
+                m.provider_message_id,m.test_mode,m.attempt_count,m.created_at,m.updated_at,m.template_kind,
+                m.payload_json,m.request_fingerprint,c.store_id,c.website_id,c.odoo_order_name,s.name AS store_name
+                {source} WHERE {where} ORDER BY m.created_at DESC,m.id DESC LIMIT ? OFFSET ?""", [*params, per_page, offset]).fetchall()
+    return {"ok": True, "rows": [email_log_row(row) for row in rows], "total": summary[status], "summary": summary,
+            "page": page, "per_page": per_page, "test_mode": after_order_email_test_mode(), "test_recipient": after_order_test_recipient()}
+
+
+@app.get("/api/after-order/emails/{message_id}")
+def api_after_order_email_detail(message_id: int, store_id: Optional[int] = None) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("""SELECT m.*,c.store_id,c.website_id,c.odoo_order_name,s.name AS store_name
+            FROM after_order_messages m JOIN after_order_cases c ON c.id=m.case_id JOIN stores s ON s.id=c.store_id
+            WHERE m.id=? AND (? IS NULL OR c.store_id=?)""", (message_id, store_id, store_id)).fetchone()
+        if not row:
+            raise HTTPException(404, "Email record not found in this store.")
+        attempts = rows_to_dicts(conn.execute("SELECT attempt_number,status,error,provider_message_id,created_at,updated_at FROM after_order_email_attempts WHERE message_id=? ORDER BY attempt_number DESC", (message_id,)).fetchall())
+    return {"ok": True, "row": email_log_row(row), "attempts": attempts}
+
+
+@app.post("/api/after-order/emails/{message_id}/retry")
+def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, Any]:
+    with db() as conn:
+        original = conn.execute("SELECT * FROM after_order_messages WHERE id=?", (message_id,)).fetchone()
+    if not original:
+        raise HTTPException(404, "Email record not found.")
+    original = row_to_dict(original)
+    reason = retry_block_reason(original, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
+    if reason:
+        raise HTTPException(409, reason)
+    case = after_order_case_by_id(int(original["case_id"]))
+    if not case:
+        raise HTTPException(404, "Order case not found.")
+    require_after_order_case_in_scope(case)
+    created = parse_any_datetime(original.get("created_at"))
+    if not created or created <= datetime.now(timezone.utc) - timedelta(days=30):
+        raise HTTPException(409, "The email's links may have expired. Create a current email from the order instead.")
+    if not original.get("test_mode"):
+        case = hydrate_after_order_recipient_and_domain(case, strict=True)
+        if case.get("confirmed_at") and original.get("template_kind") != "trustpilot_review":
+            raise HTTPException(409, "The customer request was already confirmed. Its action email cannot be retried.")
+        if original.get("request_fingerprint") != request_fingerprint(case) or not after_order_tracking_is_current(case):
+            raise HTTPException(409, "The order or tracking changed. Create a current email instead.")
+        if clean_text(case.get("customer_email")).lower() != clean_text(original["recipient"]).lower() or after_order_sender(case)[0] != original["sender"]:
+            raise HTTPException(409, "The recipient or website sender changed. Create a current email instead.")
+        if case.get("case_type") == "item_unavailable":
+            review = after_order_unavailable_review(case, for_send=True)
+            if review["blocked"] or not review["approved"]:
+                raise HTTPException(409, review["reason"])
+        preference_eligible = original.get("template_kind") in {"package_movement", "trustpilot_review"} or (original.get("template_kind") == "tracking" and (case.get("context") or {}).get("risk_state") == "in_transit")
+        if preference_eligible and after_order_tracking_updates_opted_out(case, original["recipient"]):
+            raise HTTPException(409, "This customer opted out of these notifications.")
+    with db() as conn:
+        locked = conn.execute("SELECT * FROM after_order_messages WHERE id=? FOR UPDATE", (message_id,)).fetchone()
+        locked = row_to_dict(locked)
+        reason = retry_block_reason(locked, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
+        if reason:
+            raise HTTPException(409, reason)
+        attempt = int(locked.get("attempt_count") or 1) + 1
+        now = utc_now()
+        conn.execute("UPDATE after_order_messages SET status='retrying',attempt_count=?,last_error=NULL,updated_at=? WHERE id=?", (attempt, now, message_id))
+        conn.execute("INSERT INTO after_order_email_attempts (message_id,attempt_number,status,created_at,updated_at) VALUES (?,?,'retrying',?,?)", (message_id, attempt, now, now))
+        record_after_order_event(conn, case["id"], "email_retry_started", actor_type="team", details={"message_id": message_id, "attempt": attempt})
+    error = ""
+    provider_id = ""
+    try:
+        if after_order_email_test_mode() and not locked.get("test_mode"):
+            raise ValueError("Live retry stopped because test mode is enabled.")
+        provider = create_email_provider(locked["provider"], {"api_key": os.getenv("RESEND_API_KEY", "")})
+        result = provider.send(json.loads(locked["payload_json"]), idempotency_key=f"email-log:{message_id}:attempt:{attempt}")
+        provider_id = clean_text(result.get("id"))
+        if not provider_id:
+            raise RuntimeError("No provider message ID returned. Check delivery before retrying.")
+        outcome = "sent_test" if locked.get("test_mode") else "sent"
+    except (ValueError, RuntimeError, requests.RequestException) as exc:
+        outcome = "failed" if isinstance(exc, (ValueError, EmailRejected)) else "delivery_unknown"
+        error = clean_error_message(exc)
+    with db() as conn:
+        conn.execute("UPDATE after_order_messages SET status=?,last_error=?,provider_message_id=?,updated_at=? WHERE id=?", (outcome, error or None, provider_id or None, utc_now(), message_id))
+        conn.execute("UPDATE after_order_email_attempts SET status=?,error=?,provider_message_id=?,updated_at=? WHERE message_id=? AND attempt_number=?", (outcome, error or None, provider_id or None, utc_now(), message_id, attempt))
+        record_after_order_event(conn, case["id"], "email_retry_finished", actor_type="team", details={"message_id": message_id, "attempt": attempt, "status": outcome, "error": error})
+    return {"ok": outcome in {"sent", "sent_test"}, "status": outcome, "message": f"Retry accepted by the provider for {locked['recipient']}." if not error else error}
 
 
 @app.post("/api/after-order/cases/{case_id}/send-test-email")
@@ -38547,9 +38777,9 @@ def create_after_order_action_link(
     with db() as conn:
         conn.execute(
             """INSERT INTO after_order_action_links
-               (case_id, token_hash, allowed_actions_json, test_mode, expires_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (case_id, token_hash, json.dumps(allowed), 1 if is_test else 0, expires_at, now, now),
+               (case_id, token_hash, allowed_actions_json, test_mode, expires_at, created_at, updated_at, request_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (case_id, token_hash, json.dumps(allowed), 1 if is_test else 0, expires_at, now, now, request_fingerprint(case)),
         )
         record_after_order_event(conn, case_id, "action_link_created", details={"allowed_actions": allowed, "test_mode": is_test, "website_domain": domain})
     fallback_url = after_order_absolute_url(request, f"/api/public/after-order/action/{token}")
@@ -38588,6 +38818,8 @@ def after_order_action_link(token: str) -> tuple[dict[str, Any], dict[str, Any]]
     expires_at = parse_any_datetime(link.get("expires_at"))
     if expires_at and expires_at <= datetime.now(timezone.utc):
         raise HTTPException(410, "This decision link has expired.")
+    if not link.get("test_mode") and (link.get("invalidated_at") or not link.get("request_fingerprint") or link["request_fingerprint"] != request_fingerprint(case)):
+        raise HTTPException(410, "This order has changed. Please open its order details for the current options.")
     return case, link
 
 
@@ -38665,6 +38897,11 @@ def record_after_order_customer_decision(
     actor_label: str = "Email action link",
 ) -> tuple[bool, dict[str, Any], str]:
     normalized = normalize_customer_decision(decision)
+    is_test = bool(link.get("test_mode")) or after_order_email_test_mode()
+    if not is_test and (link.get("invalidated_at") or link.get("request_fingerprint") != request_fingerprint(case)):
+        raise HTTPException(409, "The order changed. Reload its current options before choosing.")
+    if not is_test and normalized not in after_order_allowed_actions(case):
+        raise HTTPException(409, "This action is no longer applicable to the order.")
     if case.get("case_type") == "item_unavailable":
         review = after_order_unavailable_review(case)
         if review["blocked"] or (not (bool(link.get("test_mode")) or after_order_email_test_mode()) and not review["approved"]):
@@ -38682,7 +38919,7 @@ def record_after_order_customer_decision(
     if normalized == "offer_alternatives":
         try:
             odoo = OdooClient(get_store(int(case["store_id"])))
-            fields = odoo.existing_fields("product.template", ["id", "active", "sale_ok", "is_published", "website_id"])
+            fields = odoo.existing_fields("product.template", ["id", "active", "sale_ok", "is_published", "website_id", "product_variant_count"])
             products = odoo.read("product.template", [int(selected_product_id or 0)], fields)
             product = products[0] if products else {}
             product_website_id = many2one_id(product.get("website_id"))
@@ -38694,6 +38931,8 @@ def record_after_order_customer_decision(
                 or (product_website_id and int(product_website_id) != int(case.get("website_id") or 0))
             ):
                 raise ValueError("The selected product is not available on this website.")
+            if int(product.get("product_variant_count") or 1) != 1:
+                raise ValueError("This product has multiple variants. Ask the team to recommend the exact variant before proceeding.")
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except Exception as exc:
@@ -38703,15 +38942,23 @@ def record_after_order_customer_decision(
     now = utc_now()
     recorded = False
     with db() as conn:
-        latest = conn.execute("SELECT current_decision, confirmed_at FROM after_order_cases WHERE id=?", (case["id"],)).fetchone()
+        latest = conn.execute("SELECT * FROM after_order_cases WHERE id=? FOR UPDATE", (case["id"],)).fetchone()
         if latest and not latest["confirmed_at"]:
+            latest_case = dict(latest)
+            latest_case["affected_items"] = after_order_json_list(latest_case.get("affected_items_json"))
+            latest_case["context"] = json.loads(latest_case.get("context_json") or "{}")
+            if request_fingerprint(latest_case) != link.get("request_fingerprint"):
+                raise HTTPException(409, "The order changed while you were choosing. Reload the current options.")
+            fresh_link = conn.execute("SELECT invalidated_at FROM after_order_action_links WHERE id=?", (link["id"],)).fetchone()
+            if not fresh_link or fresh_link["invalidated_at"]:
+                raise HTTPException(410, "This request has expired.")
             previous = clean_text(latest["current_decision"])
             cursor = conn.execute(
                 """UPDATE after_order_cases
                    SET previous_decision=current_decision, current_decision=?, selected_product_id=?, decision_version=decision_version+1,
-                       decision_updated_at=?, status='needs_confirmation', updated_at=?
+                       decision_updated_at=?, status='needs_confirmation', updated_at=?, decision_fingerprint=?
                    WHERE id=? AND confirmed_at IS NULL""",
-                (normalized, int(selected_product_id or 0) or None, now, now, case["id"]),
+                (normalized, int(selected_product_id or 0) or None, now, now, request_fingerprint(case), case["id"]),
             )
             recorded = bool(cursor.rowcount)
             if recorded:
@@ -38737,6 +38984,8 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
     except (TypeError, ValueError, json.JSONDecodeError):
         allowed = []
     allowed = after_order_filter_removal(case, allowed)
+    if not (link.get("test_mode") or after_order_email_test_mode()):
+        allowed = [action for action in allowed if action in after_order_allowed_actions(case)]
     context = case.get("context") or {}
     if case.get("case_type") == "item_unavailable" and not (link.get("test_mode") or after_order_email_test_mode()) and not after_order_unavailable_review(case)["approved"]:
         allowed = []
@@ -38853,9 +39102,13 @@ def public_after_order_action_submit(token: str, request: Request, decision: str
 
 
 def queue_after_order_partial_refund(case: dict[str, Any]) -> dict[str, Any]:
+    if after_order_email_test_mode():
+        return {"amount": 0, "currency": "", "status": "test_preview"}
     items = case.get("affected_items") or []
     amount = round(sum(float(item.get("original_line_total") or 0) for item in items), 2)
     currency = next((clean_text(item.get("currency")) for item in items if clean_text(item.get("currency"))), "")
+    if not items or amount <= 0 or not currency or any(clean_text(item.get("currency")) != currency for item in items):
+        raise ValueError("A positive, single-currency paid-line snapshot is required before preparing a refund.")
     now = utc_now()
     with db() as conn:
         conn.execute(
@@ -38877,9 +39130,9 @@ def queue_after_order_partial_refund(case: dict[str, Any]) -> dict[str, Any]:
         f"Affected fulfilment line IDs: {', '.join(str(item.get('line_id')) for item in items)}."
     )
     try:
-        OdooClient(get_store(int(case["store_id"]))).post_order_note(int(case["odoo_order_id"]), note)
+        enqueue_odoo_chatter_note(int(case["store_id"]), int(case["odoo_order_id"]), "after_order_refund_pending", f"case-{case['id']}", note)
         with db() as conn:
-            record_after_order_event(conn, int(case["id"]), "odoo_refund_chatter_logged", actor_type="system")
+            record_after_order_event(conn, int(case["id"]), "odoo_refund_chatter_queued", actor_type="system")
     except Exception as exc:
         error = clean_error_message(exc)
         with db() as conn:
@@ -38893,8 +39146,111 @@ def queue_after_order_partial_refund(case: dict[str, Any]) -> dict[str, Any]:
     return {"amount": amount, "currency": currency, "status": "pending"}
 
 
+def execute_after_order_job(job_id: int, request: Request) -> dict[str, Any]:
+    """One-shot claim: an ambiguous remote write is investigated, never replayed."""
+    if after_order_email_test_mode():
+        return {"ok": True, "test_mode": True, "message": "No execution in test mode."}
+    with db() as conn:
+        job = conn.execute("SELECT * FROM after_order_execution_jobs WHERE id=? FOR UPDATE", (job_id,)).fetchone()
+        if not job or job["status"] != "pending":
+            return {"ok": False, "message": "Task is not pending; completed or uncertain operations are not replayed."}
+        conn.execute("UPDATE after_order_execution_jobs SET status='executing', updated_at=? WHERE id=?", (utc_now(), job_id))
+    snapshot = json.loads(job["snapshot_json"])
+    case_id = int(job["case_id"])
+    try:
+        current = after_order_case_by_id(case_id)
+        if not current:
+            raise ValueError("Order case no longer exists.")
+        require_after_order_case_in_scope(current)
+        if request_fingerprint(current) != request_fingerprint(snapshot):
+            raise ValueError("Order or delivery status changed after approval. Manual review required.")
+        if not after_order_tracking_is_current(current):
+            raise ValueError("The carrier status changed after approval. Manual review required.")
+        if after_order_email_test_mode():
+            raise ValueError("Execution stopped because test mode is enabled.")
+        decision = job["decision"]
+        odoo = OdooClient(get_store(int(current["store_id"])))
+        order_fields = odoo.existing_fields("sale.order", ["id", "state", "website_id", "invoice_ids", "transaction_ids", "picking_ids", "amount_total", "currency_id"])
+        orders = odoo.read("sale.order", [int(current["odoo_order_id"])], order_fields)
+        if not orders:
+            raise ValueError("Odoo order no longer exists.")
+        order = orders[0]
+        if not {"state", "website_id", "invoice_ids", "transaction_ids", "picking_ids"}.issubset(order):
+            raise ValueError("Odoo payment and delivery fields could not all be verified. Execution stopped.")
+        if many2one_id(order.get("website_id")) != int(current.get("website_id") or 0):
+            raise ValueError("Odoo website changed; execution stopped.")
+        if order.get("state") == "cancel":
+            raise ValueError("Odoo order is already cancelled. Reconcile payment and fulfilment before proceeding.")
+        with db() as conn:
+            lines = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE store_id=? AND odoo_order_id=?", (current["store_id"], current["odoo_order_id"])).fetchall())
+        if current.get("case_type") == "item_unavailable":
+            reason = unavailable_notice_block_reason(lines, snapshot.get("affected_items") or [])
+            if reason:
+                raise ValueError(reason)
+        result: dict[str, Any] = {}
+        if decision in {"refund", "exclude_item_and_proceed", "cancel_affected_item"}:
+            if decision != "refund":
+                queue_after_order_partial_refund(snapshot)
+            raise ValueError("Finance review required: payment-provider refund execution is not configured. Verify original paid amount, taxes, discounts and prior refunds in Odoo before refunding. No money has been refunded.")
+        elif decision == "cancel_order":
+            if order.get("invoice_ids") or order.get("transaction_ids"):
+                raise ValueError("Paid/invoiced order: refund or authorization-void verification is required before cancellation. No financial operation was attempted.")
+            if order.get("picking_ids") or any(line.get("amazon_order_id") or line.get("state") in {"ordered", "fulfilled", "shipped", "delivered", "submitted"} or line.get("order_engine") in {"third_party", "manual_amazon", "inventory"} for line in lines):
+                raise ValueError("Supplier placement or delivery exists. Confirm supplier cancellation and stop fulfilment before cancelling Odoo.")
+            odoo.execute("sale.order", "action_cancel", [[int(current["odoo_order_id"])]])
+            verified = odoo.read("sale.order", [int(current["odoo_order_id"])], ["id", "state"])
+            if not verified or verified[0].get("state") != "cancel":
+                raise RuntimeError("Odoo cancellation could not be verified; do not retry without reconciliation.")
+            mark_cancelled_odoo_order_locally(int(current["store_id"]), verified[0])
+            result = {"odoo_cancelled": True}
+        elif decision == "replacement":
+            if (current.get("context") or {}).get("risk_state") != "suspected_lost":
+                raise ValueError("Replacement is no longer supported by the current tracking assessment.")
+            # Tracking must identify this parcel's lines, not all items in a split order.
+            if not (current.get("context") or {}).get("parcel_items_verified"):
+                raise ValueError("Verify which order lines belong to the lost parcel before queueing a replacement.")
+            result = api_process_replacement(ProcessReplacementPayload(
+                store_id=int(current["store_id"]), line_ids=[int(item["line_id"]) for item in snapshot.get("affected_items") or []],
+                quantities={int(item["line_id"]): float(item["quantity"]) for item in snapshot.get("affected_items") or []},
+                reason="lost", note=f"After-order approved task {job_id}",
+            ))
+            if not result.get("ok"):
+                raise RuntimeError(result.get("message") or "Replacement created but queueing requires review. Do not recreate it.")
+        elif decision == "offer_alternatives":
+            raise ValueError("Alternative selected: verify exact variant, stock, quantity and a customer-accepted price quote before amending the order. No charge or product substitution was performed.")
+        elif decision == "received":
+            result = send_after_order_email(case_id, request, template_kind="trustpilot_review")
+        elif decision == "not_received":
+            result = {"investigation_opened": True}
+        elif decision == "proceed":
+            result = {"continue_existing_fulfilment": True}
+        else:
+            raise ValueError("No execution handler for this decision.")
+        with db() as conn:
+            conn.execute("UPDATE after_order_execution_jobs SET status='completed', result_json=?, updated_at=? WHERE id=?", (json.dumps(result, default=str), utc_now(), job_id))
+            conn.execute("UPDATE after_order_cases SET status=?, updated_at=? WHERE id=?", ("needs_attention" if decision == "not_received" else "resolved", utc_now(), case_id))
+            record_after_order_event(conn, case_id, "execution_completed", details={"job_id": job_id, "decision": decision})
+        return {"ok": True, "message": "Execution completed and verified."}
+    except Exception as exc:
+        error = clean_error_message(exc)
+        with db() as conn:
+            conn.execute("UPDATE after_order_execution_jobs SET status='needs_review', last_error=?, updated_at=? WHERE id=?", (error, utc_now(), job_id))
+            conn.execute("UPDATE after_order_cases SET status='execution_needs_review', updated_at=? WHERE id=?", (utc_now(), case_id))
+            conn.execute("UPDATE after_order_refund_requests SET status='needs_review', last_error=?, updated_at=? WHERE case_id=?", (error, utc_now(), case_id))
+            record_after_order_event(conn, case_id, "execution_needs_review", details={"job_id": job_id, "error": error})
+        try:
+            if not after_order_email_test_mode():
+                enqueue_odoo_chatter_note(int(snapshot["store_id"]), int(snapshot["odoo_order_id"]), "after_order_execution_error", f"job-{job_id}", f"After-order task {job_id} needs review: {error}")
+        except Exception as chatter_error:
+            with db() as conn:
+                record_after_order_event(conn, case_id, "odoo_chatter_failed", details={"error": clean_error_message(chatter_error), "original_error": error})
+        return {"ok": False, "message": error}
+
+
 @app.post("/api/after-order/cases/{case_id}/confirm")
 def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, request: Request) -> dict[str, Any]:
+    if after_order_email_test_mode():
+        return {"ok": True, "test_mode": True, "message": "Test preview only: confirmation, execution, Odoo writes and emails were not performed.", "row": after_order_case_by_id(case_id)}
     now = utc_now()
     already_confirmed = False
     confirmed_decision = ""
@@ -38903,6 +39259,13 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
+    if not case.get("confirmed_at"):
+        if payload.decision_version is None:
+            raise HTTPException(409, "Refresh the card before confirming its current decision version.")
+        if case.get("decision_fingerprint") != request_fingerprint(case):
+            raise HTTPException(409, "The order changed since the customer's choice. A new decision is required.")
+        if case.get("current_decision") not in after_order_allowed_actions(case):
+            raise HTTPException(409, "The customer's choice is no longer applicable to this order.")
     if case.get("case_type") == "item_unavailable" and not case.get("confirmed_at"):
         review = after_order_unavailable_review(case)
         if review["blocked"] or not review["approved"]:
@@ -38910,12 +39273,17 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
     if not case.get("confirmed_at") and case.get("current_decision") in {"exclude_item_and_proceed", "cancel_affected_item"} and not after_order_removal_allowed(case):
         raise HTTPException(409, "This removal would leave no other available product. A new customer decision is required.")
     with db() as conn:
-        row = conn.execute("SELECT * FROM after_order_cases WHERE id=?", (case_id,)).fetchone()
+        row = conn.execute("SELECT * FROM after_order_cases WHERE id=? FOR UPDATE", (case_id,)).fetchone()
         if not row:
             raise HTTPException(404, "After-order case not found.")
         if row["confirmed_at"]:
             already_confirmed = True
         else:
+            locked_case = dict(row)
+            locked_case["affected_items"] = after_order_json_list(locked_case.get("affected_items_json"))
+            locked_case["context"] = json.loads(locked_case.get("context_json") or "{}")
+            if request_fingerprint(locked_case) != case.get("decision_fingerprint"):
+                raise HTTPException(409, "The order changed during confirmation. Refresh and request a new choice.")
             decision = clean_text(row["current_decision"])
             confirmed_decision = decision
             confirmed_case_type = clean_text(row["case_type"])
@@ -38943,23 +39311,20 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
                 conn, case_id, "team_decision_confirmed", actor_type="team",
                 actor_label=clean_text(payload.confirmed_by) or "Operations team", decision=decision,
             )
+            conn.execute(
+                """INSERT INTO after_order_execution_jobs
+                   (case_id, decision_version, decision, snapshot_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(case_id, decision_version) DO NOTHING""",
+                (case_id, int(row["decision_version"] or 0), decision, json.dumps(case, default=str), now, now),
+            )
             if confirmed_case_type == "delivery_confirmation" and decision == "not_received":
                 record_after_order_event(
                     conn, case_id, "delivery_exception_opened", actor_type="system",
                     details={"reason": "Customer reported that the carrier-marked delivery was not received."},
                 )
     message = "Decision was already confirmed." if already_confirmed else "Latest decision confirmed. All customer action links have expired."
-    if not already_confirmed and confirmed_case_type == "item_unavailable" and confirmed_decision == "exclude_item_and_proceed":
-        refund = queue_after_order_partial_refund(after_order_case_by_id(case_id) or case)
-        message += f" Partial refund queued for {refund['currency'] + ' ' if refund['currency'] else ''}{refund['amount']:.2f}."
-    if not already_confirmed and confirmed_case_type == "delivery_confirmation" and confirmed_decision == "received":
-        try:
-            review_result = send_after_order_email(case_id, request, template_kind="trustpilot_review")
-            message += f" {review_result['message']}"
-        except HTTPException as exc:
-            message += f" The Trustpilot request could not be sent: {exc.detail}"
-    elif not already_confirmed and confirmed_case_type == "delivery_confirmation" and confirmed_decision == "not_received":
-        message += " A delivery exception is now open for team investigation."
+    if not already_confirmed:
+        message += " An execution task was saved atomically; approval does not mean a refund or cancellation has completed."
     return {"ok": True, "message": message, "row": after_order_case_by_id(case_id)}
 
 
@@ -38969,12 +39334,79 @@ def api_after_order_settings() -> dict[str, Any]:
         "ok": True,
         "email_test_mode": after_order_email_test_mode(),
         "email_test_recipient": after_order_test_recipient(),
-        "email_provider": "resend",
+        "email_provider": clean_text(get_service_settings().get("after_order_email_provider")) or "resend",
+        "automation_enabled": clean_text(get_service_settings().get("after_order_automation_enabled")) == "true",
     }
+
+
+def after_order_automation_loop() -> None:
+    while True:
+        time.sleep(60)
+        try:
+            if clean_text(get_service_settings().get("after_order_automation_enabled")) != "true":
+                continue
+            run_after_order_automation()
+        except Exception as exc:
+            print(f"After-order automation needs attention: {clean_error_message(exc)}", flush=True)
+
+
+def run_after_order_automation() -> dict[str, Any]:
+    sync_after_order_cases()
+    if after_order_email_test_mode():
+        return {"ok": True, "test_mode": True, "message": "Cases refreshed. No emails or execution in test mode."}
+    if clean_text(get_service_settings().get("after_order_automation_enabled")) != "true":
+        return {"ok": False, "message": "Automation is disabled."}
+    base = clean_text(get_service_settings().get("after_order_public_base_url") or os.getenv("AFTER_ORDER_PUBLIC_BASE_URL", ""))
+    parsed = urlparse(base)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("Configure an HTTPS after-order public base URL before automation.")
+    request = Request({"type": "http", "method": "POST", "scheme": "https", "server": (parsed.hostname, 443), "path": "/", "root_path": "", "query_string": b"", "headers": [(b"host", parsed.hostname.encode())]})
+    with db() as conn:
+        jobs = rows_to_dicts(conn.execute("SELECT id FROM after_order_execution_jobs WHERE status='pending' ORDER BY id LIMIT 20").fetchall())
+        cases = rows_to_dicts(conn.execute("SELECT id FROM after_order_cases WHERE confirmed_at IS NULL AND status!='resolved' ORDER BY updated_at DESC LIMIT 200").fetchall())
+    for job in jobs:
+        execute_after_order_job(int(job["id"]), request)
+    attempted = 0
+    for row in cases:
+        if after_order_email_test_mode():
+            break
+        case = after_order_case_by_id(int(row["id"]))
+        if not case or not after_order_case_is_in_scope(case) or case.get("current_decision"):
+            continue
+        context = case.get("context") or {}
+        if case.get("case_type") == "tracking" and context.get("risk_state") not in {"in_transit", "suspected_lost"}:
+            continue
+        if case.get("case_type") == "item_unavailable":
+            review = after_order_unavailable_review(case, for_send=True)
+            if review["blocked"] or not review["approved"]:
+                continue
+        try:
+            send_after_order_email(int(case["id"]), request)
+            attempted += 1
+        except HTTPException as exc:
+            # Each case is isolated so one bad website cannot stop other stores.
+            with db() as conn:
+                record_after_order_event(conn, int(case["id"]), "notification_needs_review", details={"error": str(exc.detail)})
+    return {"ok": True, "message": f"Checked {len(cases)} cases and {len(jobs)} tasks; {attempted} notification checks completed."}
+
+
+@app.post("/api/after-order/automation/run")
+def api_after_order_automation_run() -> dict[str, Any]:
+    return run_after_order_automation()
+
+
+@app.post("/api/after-order/settings/automation")
+def api_after_order_automation_settings(payload: AfterOrderTestModePayload) -> dict[str, Any]:
+    if payload.enabled and not after_order_email_test_mode():
+        raise HTTPException(409, "Enable automation while in test mode first and complete the readiness checks before going live.")
+    set_service_settings({"after_order_automation_enabled": "true" if payload.enabled else "false"})
+    return api_after_order_settings()
 
 
 @app.post("/api/after-order/settings/test-mode")
 def api_after_order_test_mode(payload: AfterOrderTestModePayload) -> dict[str, Any]:
+    if not payload.enabled and clean_text(get_service_settings().get("after_order_live_readiness_approved")) != "true":
+        raise HTTPException(409, "Live mode remains locked until payment/refund integration, dispatch handling time, website routing and end-to-end tests have been verified. Test emails remain available.")
     set_service_settings({"after_order_email_test_mode": "true" if payload.enabled else "false"})
     return {
         "ok": True,
@@ -40849,8 +41281,25 @@ def api_epost_update(payload: EpostTrackingUpdatePayload) -> dict[str, Any]:
             code = clean_text(str(item.get("tracking_code") or item.get("tracking") or "")).upper()
             if not code:
                 continue
-            status = clean_text(str(item.get("status") or ""))
-            last_update_at = clean_text(str(item.get("date") or item.get("last_update_at") or ""))
+            matches = rows_to_dicts(conn.execute(
+                "SELECT * FROM epost_global_tracking WHERE tracking_code=?", (code,),
+            ).fetchall())
+            if item.get("store_id") is not None:
+                matches = [row for row in matches if int(row["store_id"]) == int(item["store_id"])]
+            if len(matches) != 1:
+                # Legacy extension batches omit store_id. Accept only an
+                # unambiguous match; never update another site's parcel.
+                continue
+            target = matches[0]
+            history = merge_tracking_events(after_order_json_list(target.get("events_json")), item.get("events") or [])
+            incoming_date = clean_text(str(item.get("date") or item.get("last_update_at") or ""))
+            old_time, new_time = parse_any_datetime(target.get("last_update_at")), parse_any_datetime(incoming_date)
+            if old_time and (not new_time or new_time < old_time):
+                conn.execute("UPDATE epost_global_tracking SET events_json=?, last_checked_at=? WHERE id=? AND store_id=?", (json.dumps(history, default=str), utc_now(), target["id"], target["store_id"]))
+                updated += 1
+                continue
+            status = clean_text(str(item.get("status") or target.get("status") or ""))
+            last_update_at = incoming_date or clean_text(target.get("last_update_at"))
             epost_status = epost_status_from_update(status, last_update_at)
             cursor = conn.execute(
                 """
@@ -40865,20 +41314,20 @@ def api_epost_update(payload: EpostTrackingUpdatePayload) -> dict[str, Any]:
                     last_checked_at=?,
                     epost_status=?,
                     updated_at=?
-                WHERE tracking_code=?
+                WHERE id=? AND store_id=?
                 """,
                 (
                     status,
                     last_update_at,
-                    clean_text(str(item.get("location") or "")),
-                    clean_text(str(item.get("destination") or "")),
-                    clean_text(str(item.get("awb") or "")),
+                    clean_text(str(item.get("location") or target.get("location") or "")),
+                    clean_text(str(item.get("destination") or target.get("destination") or "")),
+                    clean_text(str(item.get("awb") or target.get("awb") or "")),
                     clean_text(str(item.get("tracking_url") or "")),
-                    json.dumps(item.get("events") or [], default=str)[:4000],
+                    json.dumps(history, default=str),
                     utc_now(),
                     epost_status,
                     utc_now(),
-                    code,
+                    target["id"], target["store_id"],
                 ),
             )
             updated += cursor.rowcount

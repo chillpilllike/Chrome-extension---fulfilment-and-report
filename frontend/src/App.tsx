@@ -38,6 +38,7 @@ import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerCo
 
 import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
+import { EmailLogWorkspace } from "@/components/EmailLogWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
 import "@/components/after-care-workspace.css"
 import "@/components/inventory-workspace.css"
@@ -66,6 +67,7 @@ const KNOWN_APP_PAGES = new Set([
   "home",
   "orders",
   "after-order-care",
+  "email-log",
   "pull-jobs",
   "chrome-queue",
   "tracking",
@@ -1243,6 +1245,7 @@ type AfterOrderCase = {
   context: Record<string, any>
   unavailable_notice?: { blocked: boolean; approved: boolean; reason: string }
   refund_request?: { amount: number; currency: string; status: string; last_error?: string } | null
+  execution?: { id: number; decision: string; status: string; last_error?: string } | null
 }
 
 type AfterOrderEvent = {
@@ -1509,6 +1512,7 @@ const defaultUiCopy: UiCopy = {
   home: { title: "Dashboard", description: "Control panel overview for fulfilment, tracking, and exceptions." },
   orders: { title: "Orders", description: "Review Odoo order lines and queue Amazon fulfilment." },
   "after-order-care": { title: "After-order care", description: "Review customer decisions, shipment exceptions, and approved follow-up actions." },
+  "email-log": { title: "Email log", description: "Review sent emails, failures and safe retries across your websites." },
   "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
   "chrome-queue": { title: "Chrome Queue", description: "Review Chrome extension jobs and release stale locks." },
   tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
@@ -5097,6 +5101,7 @@ function App() {
       items: [
         ["orders", "Orders", ShoppingCart],
         ["after-order-care", "After-order care", Bell],
+        ["email-log", "Email log", Bell],
         ["pull-jobs", "Pull Jobs", RefreshCw],
         ["chrome-queue", "Chrome Queue", Lock],
         ["bulk", "Bulk Ordering", PackageCheck],
@@ -6219,6 +6224,7 @@ function App() {
         {page === "after-order-care" && (
           <AfterOrderCarePage storeId={storeId} onResult={setModal} initialQuery={afterOrderInitialQuery} />
         )}
+        {page === "email-log" && <EmailLogWorkspace storeId={storeId} api={api} onResult={setModal} onNavigate={(target, order) => { setAfterOrderInitialQuery(order || ""); setPage(target) }} />}
         {page === "tracking" && (
           <TrackingPage
             storeId={storeId}
@@ -12038,6 +12044,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
   const [loading, setLoading] = useState(false)
   const [sendingAllTests, setSendingAllTests] = useState(false)
   const [emailTestMode, setEmailTestMode] = useState(true)
+  const [automationEnabled, setAutomationEnabled] = useState(false)
   const [emailTestRecipient, setEmailTestRecipient] = useState("sonianuj1284@gmail.com")
   const [cutoffDate, setCutoffDate] = useState("2026-08-01")
   const [activityCase, setActivityCase] = useState<AfterOrderCase | null>(null)
@@ -12060,10 +12067,11 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
       const params = new URLSearchParams({ status, page: "1", per_page: "50" })
       if (storeId) params.set("store_id", storeId)
       if (query.trim()) params.set("q", query.trim())
-      const result = await api<{ rows: AfterOrderCase[]; summary: Record<string, number>; email_test_mode: boolean; email_test_recipient: string; cutoff_date: string }>(`/api/after-order/cases?${params}`)
+      const result = await api<{ rows: AfterOrderCase[]; summary: Record<string, number>; email_test_mode: boolean; email_test_recipient: string; cutoff_date: string; automation_enabled: boolean }>(`/api/after-order/cases?${params}`)
       setRows(result.rows || [])
       setSummary(result.summary || {})
       setEmailTestMode(Boolean(result.email_test_mode))
+      setAutomationEnabled(Boolean(result.automation_enabled))
       setEmailTestRecipient(result.email_test_recipient || "sonianuj1284@gmail.com")
       setCutoffDate(result.cutoff_date || "2026-08-01")
     } catch (error) {
@@ -12203,11 +12211,24 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
         </div>
         <TeamTools title="Email settings & test tools" description="Sending all test emails uses the store scope, not the current search or queue. Approval is not proof that a refund, replacement or email has completed.">
         <div className="flex flex-wrap gap-2 items-center">
+          <Button variant="outline" onClick={async () => {
+            try {
+              const result = await api<{ message: string }>("/api/after-order/automation/run", { method: "POST" })
+              onResult({ ok: true, title: "After-order check", message: result.message })
+              await load()
+            } catch (error) { onResult({ ok: false, title: "Check failed", message: String(error) }) }
+          }}>{emailTestMode ? "Run safety check" : "Run approved automation"}</Button>
+          <Button variant="outline" onClick={async () => {
+            try {
+              await api("/api/after-order/settings/automation", { method: "POST", body: JSON.stringify({ enabled: !automationEnabled }) })
+              await load()
+            } catch (error) { onResult({ ok: false, title: "Automation setting", message: String(error) }) }
+          }}>{automationEnabled ? "Pause background checks" : "Enable background checks"}</Button>
           <Button onClick={() => void sendAllTestEmails()} disabled={!emailTestMode || sendingAllTests}>
             {sendingAllTests ? "Sending test emails…" : "Send all test emails"}
           </Button>
           <label className={`flex min-w-[310px] items-center justify-between gap-4 rounded-lg border px-4 py-3 ${emailTestMode ? "border-amber-300 bg-amber-50 text-amber-950" : "border-destructive/40 bg-destructive/5"}`}>
-            <span><strong className="block">{emailTestMode ? "TEST MODE — Emails redirected" : "LIVE MODE — Customer delivery permitted"}</strong><small>{emailTestMode ? `Every email goes only to ${emailTestRecipient}` : "Emails use each order’s customer address"}</small></span>
+            <span><strong className="block">{emailTestMode ? "TEST MODE — No live actions" : "LIVE MODE — Customer delivery permitted"}</strong><small>{emailTestMode ? `Manual test emails only to ${emailTestRecipient}; no execution` : "Emails use each order’s customer address"}</small></span>
             <Checkbox checked={emailTestMode} onCheckedChange={(checked) => void updateTestMode(Boolean(checked))} aria-label="Email test mode" />
           </label>
         </div>
@@ -12228,7 +12249,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           const awaitingFirstScan = context.risk_state === "awaiting_first_scan"
           const itemCase = row.case_type === "item_unavailable"
           const deliveryConfirmation = row.case_type === "delivery_confirmation"
-          const decisionCase = itemCase || deliveryConfirmation || ["suspected_lost", "carrier_exception"].includes(String(context.risk_state || ""))
+          const decisionCase = itemCase || deliveryConfirmation || row.case_type === "expected_dispatch" || context.risk_state === "suspected_lost"
           const nextStep = row.status === "resolved" ? "Review resolution" : row.confirmed_at ? "Review approved follow-up" : itemCase && row.unavailable_notice?.blocked ? "Resolve sourcing blocker" : itemCase && row.unavailable_notice && !row.unavailable_notice.approved ? "Review sourcing first" : row.current_decision ? "Review & confirm decision" : awaitingFirstScan ? "Check first carrier scan" : decisionCase ? "Review customer choices" : "Review tracking evidence"
           return (
             <details key={row.id} className={`care-case care-severity-${row.severity}`}>
@@ -12272,6 +12293,9 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {row.current_decision === "offer_alternatives" && row.selected_product_id ? <span className="mt-2 block text-xs font-medium text-primary">Selected Odoo product template: {row.selected_product_id}</span> : null}
                   {row.refund_request ? <span className="mt-2 block text-xs font-medium text-primary">Partial refund: {row.refund_request.currency} {Number(row.refund_request.amount || 0).toFixed(2)} · {row.refund_request.status.replaceAll("_", " ")}</span> : null}
                   {row.refund_request?.last_error ? <span className="mt-1 block text-xs text-destructive">Odoo refund log: {row.refund_request.last_error}</span> : null}
+                  {row.execution ? <span className="mt-2 block text-xs font-medium">Execution: {row.execution.status.replaceAll("_", " ")}</span> : null}
+                  {row.execution?.last_error ? <p className="mt-1 max-h-20 overflow-y-auto text-xs text-destructive">{row.execution.last_error}</p> : null}
+                  {row.confirmed_at && row.execution?.status !== "completed" ? <p className="mt-1 text-xs text-amber-800">Approved only — execution is not yet complete.</p> : null}
                   {row.current_decision && !row.confirmed_at ? <Badge variant="outline" className="mt-2">Link active until confirmation</Badge> : null}
                   {row.confirmed_at ? <Badge variant="secondary" className="mt-2">Links expired after approval</Badge> : null}
                 </div>

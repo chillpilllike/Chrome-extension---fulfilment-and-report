@@ -9,7 +9,7 @@ export function TeamWorkspaceHeader({ title, description, current, children }: {
   return <header className="team-workspace-header">
     <div className="team-workspace-heading"><div><h2>{title}</h2><p>{description}</p></div>{children}</div>
     <nav className="team-workspace-links" aria-label="Related operations pages">
-      {[["orders", "1 · Orders"], ["package-pickups", "2 · Pickup check"], ["package-tracker", "3 · Package tracker"], ["after-order-care", "4 · After-order care"], ["epost", "ePost exceptions"]].map(([path, label]) =>
+      {[["orders", "1 · Orders"], ["package-pickups", "2 · Pickup check"], ["package-tracker", "3 · Package tracker"], ["after-order-care", "4 · After-order care"], ["epost", "ePost exceptions"], ["email-log", "Email log"]].map(([path, label]) =>
         <a key={path} href={`/${path}`} aria-current={current === path ? "page" : undefined}>{label}</a>)}
     </nav>
   </header>

@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import re
-from typing import Any, Protocol
+import hashlib
+import json
+from typing import Any, Protocol, Callable
 from urllib.parse import urlparse
 
 import requests
@@ -55,24 +57,52 @@ def can_remove_affected_items(lines: list[dict[str, Any]], affected: list[dict[s
 def unavailable_notice_block_reason(lines: list[dict[str, Any]], affected: list[dict[str, Any]]) -> str:
     if not lines:
         return "Order fulfilment details are missing; review required."
+    ids = {str(item.get("line_id")) for item in affected if item.get("line_id")}
     for line in lines:
+        if str(line.get("id")) not in ids:
+            continue
         if str(line.get("order_engine") or "").lower() in {"third_party", "manual_amazon", "inventory"}:
             return "Order is assigned to third-party, manual or inventory fulfilment."
         if line.get("amazon_order_id") or str(line.get("state") or "").lower() in {"ordered", "fulfilled", "shipped", "delivered"}:
             return "An order placement or fulfilment is already recorded."
         if str(line.get("odoo_status_label") or "").lower() in {"cancelled", "canceled", "refunded"}:
             return "Order contains cancelled or refunded items; review required."
-    ids = {str(item.get("line_id")) for item in affected if item.get("line_id")}
     missing = {str(line.get("id")) for line in lines if line.get("state") == "missing"}
     if not ids or not ids.issubset(missing):
         return "The affected items are no longer all marked unavailable."
     return ""
 
 
+def request_fingerprint(case: dict[str, Any]) -> str:
+    """Customer consent is for these items and this issue, not a mutable case ID."""
+    context = case.get("context") or {}
+    snapshot = {
+        "store": case.get("store_id"), "website": case.get("website_id"),
+        "order": case.get("odoo_order_id"), "type": case.get("case_type"),
+        "tracking": case.get("tracking_code"), "risk": context.get("risk_state"),
+        "dispatch": context.get("expected_dispatch_date"),
+        "items": sorted([
+            {key: item.get(key) for key in ("line_id", "asin", "quantity", "original_line_total", "currency")}
+            for item in case.get("affected_items") or []
+        ], key=lambda item: str(item.get("line_id"))),
+    }
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def merge_tracking_events(previous: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep structured history; never cut serialized JSON at a character boundary."""
+    unique = {json.dumps(event, sort_keys=True, default=str): event for event in previous + incoming if isinstance(event, dict)}
+    return sorted(unique.values(), key=lambda event: str(event.get("EventDT") or event.get("timestamp") or event.get("date") or ""))
+
+
 class EmailProvider(Protocol):
     """Provider boundary for Resend today and another email service later."""
 
     def send(self, message: dict[str, Any], *, idempotency_key: str) -> dict[str, Any]: ...
+
+
+class EmailRejected(RuntimeError):
+    """A provider explicitly rejected the request; no acceptance is claimed."""
 
 
 class ResendEmailProvider:
@@ -102,7 +132,11 @@ class ResendEmailProvider:
         except ValueError:
             payload = {"message": response.text[:500]}
         if response.status_code >= 400:
+            if 400 <= response.status_code < 500 and response.status_code not in {408, 409}:
+                raise EmailRejected(str(payload.get("message") or f"Email request rejected (HTTP {response.status_code})."))
             raise RuntimeError(str(payload.get("message") or f"Resend returned HTTP {response.status_code}."))
+        if not payload.get("id"):
+            raise RuntimeError("Email provider did not return a message ID; delivery must be checked before retrying.")
         return payload
 
 
@@ -112,6 +146,20 @@ class TrackingProvider(Protocol):
     name: str
 
     def snapshot(self, tracking_code: str) -> dict[str, Any]: ...
+
+
+# Provider implementations are registered here; lifecycle/consent code never
+# needs to know a vendor endpoint or authentication scheme.
+EMAIL_PROVIDER_FACTORIES: dict[str, Callable[[dict[str, str]], EmailProvider]] = {
+    "resend": lambda config: ResendEmailProvider(config.get("api_key", "")),
+}
+
+
+def create_email_provider(name: str, config: dict[str, str]) -> EmailProvider:
+    factory = EMAIL_PROVIDER_FACTORIES.get(name)
+    if not factory:
+        raise ValueError(f"Email provider {name!r} is not installed; no email was sent.")
+    return factory(config)
 
 
 class OrderProvider(Protocol):
@@ -154,13 +202,14 @@ def tracking_risk(
     """
 
     now = now or datetime.now(timezone.utc)
-    combined_status = " ".join(
-        [status, *(str(event.get("Event") or event.get("status") or "") for event in events)]
-    ).lower()
-    exception_terms = ("damaged", "return to sender", "delivery failed", "not delivered", "undeliverable")
-    if any(term in combined_status for term in exception_terms):
-        return TrackingRisk("carrier_exception", True, "Carrier reported a delivery exception.")
-    if any(word in combined_status for word in ("delivered", "recipient collected", "successfully delivered")):
+    dated = [(parse_provider_datetime(event.get("EventDT") or event.get("timestamp") or event.get("date")), event) for event in events]
+    dated = [(stamp, event) for stamp, event in dated if stamp and stamp <= now]
+    latest_event = max(dated, key=lambda entry: entry[0])[1] if dated else {}
+    current_status = str(status or latest_event.get("Event") or latest_event.get("status") or "").lower()
+    exception_terms = ("damaged", "return to sender", "returned", "delivery failed", "not delivered", "undeliverable", "customs hold", "delivery attempted")
+    if any(term in current_status for term in exception_terms):
+        return TrackingRisk("carrier_exception", False, "Carrier exception requires investigation, not an automatic lost-parcel invitation.")
+    if re.search(r"\b(delivered|recipient collected)\b", current_status) and not any(term in current_status for term in ("not ", "pending", "to be", "out for")):
         return TrackingRisk("delivered", False, "Carrier reports delivery.")
 
     if not events:
@@ -177,11 +226,13 @@ def tracking_risk(
         "label created",
         "pre-advised",
         "shipment information",
+        "pending", "awaiting", "not yet", "expected", "pre-transit",
     )
+    physical_terms = ("parcel received", "received and processing", "arrived", "arrival", "departed", "departure", "in transit", "processed at", "out for delivery", "picked up", "accepted at", "customs clearance")
     physical_events = [
         event
         for event in events
-        if not any(
+        if any(term in str(event.get("Event") or event.get("status") or "").lower() for term in physical_terms) and not any(
             term in str(event.get("Event") or event.get("status") or "").lower()
             for term in non_physical_terms
         )
@@ -197,7 +248,7 @@ def tracking_risk(
         parse_provider_datetime(event.get("EventDT") or event.get("timestamp") or event.get("date"))
         for event in physical_events
     ]
-    latest = max((value for value in event_times if value), default=None)
+    latest = max((value for value in event_times if value and value <= now), default=None)
     if latest and now - latest >= timedelta(days=max(1, stale_days)):
         return TrackingRisk(
             "suspected_lost",

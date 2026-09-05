@@ -54,8 +54,8 @@ class UnavailableNoticeSuppressionTests(unittest.TestCase):
     def test_placed_order_reference_overrides_stale_missing_status(self):
         self.assertTrue(unavailable_notice_block_reason([{**self.line, "amazon_order_id": "supplier-reference"}], self.affected))
 
-    def test_placement_on_another_line_holds_whole_order_notice(self):
-        self.assertTrue(unavailable_notice_block_reason([self.line, {"id": 2, "state": "ordered"}], self.affected))
+    def test_placement_on_another_line_does_not_hide_missing_item(self):
+        self.assertEqual("", unavailable_notice_block_reason([self.line, {"id": 2, "state": "ordered"}], self.affected))
 
     def test_resolved_missing_flag_or_unknown_line_blocks_notice(self):
         for lines in ([], [{**self.line, "state": "pulled"}], [{**self.line, "id": 2}]):
@@ -109,7 +109,7 @@ class AfterOrderTrackingRiskTests(unittest.TestCase):
             now=self.now,
         )
         self.assertEqual("carrier_exception", risk.state)
-        self.assertTrue(risk.customer_lost_email_allowed)
+        self.assertFalse(risk.customer_lost_email_allowed)
 
 
 class AfterOrderDecisionTests(unittest.TestCase):

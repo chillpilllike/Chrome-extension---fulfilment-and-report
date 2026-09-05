@@ -54,9 +54,10 @@ class SourcingApprovalTests(unittest.TestCase):
         self.approve()
         self.assertTrue(self.review(self.case)['approved'])
 
-    def test_approval_expires_after_24_hours(self):
+    def test_send_approval_expires_but_customer_can_still_reply(self):
         self.approve(hours_ago=25)
-        self.assertFalse(self.review(self.case)['approved'])
+        self.assertFalse(self.review(self.case, for_send=True)['approved'])
+        self.assertTrue(self.review(self.case)['approved'])
 
     def test_fulfilment_change_invalidates_approval(self):
         self.approve()
@@ -87,6 +88,7 @@ class SourcingApprovalTests(unittest.TestCase):
         scope = dict(Any=Any, Request=object, HTTPException=Blocked,
                      after_order_case_by_id=lambda case_id: {**self.case, 'case_type': 'item_unavailable'},
                      require_after_order_case_in_scope=lambda case: None,
+                     after_order_tracking_is_current=lambda case: True,
                      after_order_unavailable_review=self.review,
                      after_order_email_test_mode=lambda: False,
                      db=db, record_after_order_event=lambda *args, **kwargs: events.append(args[2]))
