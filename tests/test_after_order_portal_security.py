@@ -1,4 +1,5 @@
 import ast
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -24,7 +25,7 @@ class PortalSecurityTests(unittest.TestCase):
         base = type('BasePortal', (), {
             '_sale_order_get_page_view_values': lambda self, order, access, values, history, **kw: values,
         })
-        scope = {'CustomerPortal': base, 'request': self.request}
+        scope = {'CustomerPortal': base, 'request': self.request, 're': re}
         exec(compile(ast.Module(body=[cls], type_ignores=[]), 'portal', 'exec'), scope)
         self.controller = scope['AfterOrderPortal']()
         self.order = SimpleNamespace(id=123, website_id=self.website)
@@ -33,6 +34,11 @@ class PortalSecurityTests(unittest.TestCase):
     def test_test_payload_denied_to_customer_and_ordinary_staff(self):
         with self.assertRaises(RuntimeError):
             self.controller._validate_payload(self.payload, self.order)
+
+    def test_query_token_cannot_change_bridge_path(self):
+        for token in ('../orders/123', 'token?admin=true', '', 'a' * 65):
+            with self.assertRaises(RuntimeError):
+                self.controller._bridge(token)
 
     def test_admin_can_preview_but_not_cross_order_or_website(self):
         self.admin = True

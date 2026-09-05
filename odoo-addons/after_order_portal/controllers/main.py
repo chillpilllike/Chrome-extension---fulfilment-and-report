@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
@@ -32,6 +33,8 @@ class AfterOrderPortal(CustomerPortal):
         )
 
     def _bridge(self, token, method="GET", payload=None, order_id=None):
+        if order_id is None and not re.fullmatch(r"[a-f0-9]{64}", token or ""):
+            raise RuntimeError("This order-update link is invalid.")
         base_url, bridge_key = self._configuration()
         if not base_url or not bridge_key:
             raise RuntimeError("After-order portal configuration is incomplete.")
