@@ -1,4 +1,7 @@
 import unittest
+import re
+from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from app.services.after_order_email import render_after_order_email
 
@@ -33,6 +36,25 @@ class EmailDesignTests(unittest.TestCase):
         self.assertIn("access_token=demo&amp;choice=offer_alternatives", markup)
         self.assertIn("access_token=demo&choice=cancel_order", plain)
         self.assertIn("Choose an alternative", markup)
+
+    def test_all_templates_use_white_canvas_grey_box_and_square_corners(self):
+        for kind in ("item_unavailable", "expected_dispatch", "delivery_confirmation", "package_lost", "tracking", "trustpilot_review"):
+            _, markup, _ = self.render(kind, template_kind=kind, review_url="https://example.test/review")
+            self.assertIn('bgcolor="#ffffff"', markup)
+            self.assertIn('background:#ffffff;color:#26392f', markup)
+            self.assertIn('bgcolor="#f5f5f5" style="background:#f5f5f5;', markup)
+            self.assertTrue(all(value == "0" for value in re.findall(r'border-radius:([^;"}]+)', markup)))
+            for old_colour in ("#f3f5f2", "#f6f8f6", "#edf4ef"):
+                self.assertNotIn(old_colour, markup)
+
+    def test_odoo_payment_email_matches_shared_colour_and_corner_rules(self):
+        path = Path(__file__).resolve().parents[1] / "odoo-addons/after_order_portal/data/quotation_email.xml"
+        ET.parse(path)
+        markup = path.read_text()
+        self.assertIn('background:#ffffff', markup)
+        self.assertIn('bgcolor="#f5f5f5"', markup)
+        self.assertTrue(all(value == "0" for value in re.findall(r'border-radius:([^;"}]+)', markup)))
+        self.assertNotIn('#edf4ef', markup)
 
     def test_single_item_action_filter_is_not_overridden_by_design(self):
         _, markup, _ = render_after_order_email({**self.case, "case_type": "item_unavailable"}, "https://example.test/order", actions=["cancel_order"], labels={"cancel_order": "Cancel order"})

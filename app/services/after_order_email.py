@@ -19,8 +19,8 @@ def button(label, url, *, primary=True, destructive=False):
     background = "#153e35" if primary else "#ffffff"
     border = "#153e35" if primary else "#e7d9d9" if destructive else "#d9e2de"
     return f'''<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 10px">
-      <tr><td align="center" bgcolor="{background}" style="border:1px solid {border};border-radius:10px;mso-padding-alt:15px 20px">
-      <a href="{escape(url, quote=True)}" style="display:block;padding:15px 20px;border-radius:10px;color:{color};font-family:{FONT};font-size:14px;line-height:20px;font-weight:600;text-align:center;text-decoration:none;mso-padding-alt:0;text-underline-color:{background}">{escape(label)}</a>
+      <tr><td align="center" bgcolor="{background}" style="border:1px solid {border};border-radius:0;mso-padding-alt:15px 20px">
+      <a href="{escape(url, quote=True)}" style="display:block;padding:15px 20px;border-radius:0;color:{color};font-family:{FONT};font-size:14px;line-height:20px;font-weight:600;text-align:center;text-decoration:none;mso-padding-alt:0;text-underline-color:{background}">{escape(label)}</a>
       </td></tr></table>'''
 
 
@@ -54,9 +54,9 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
             quantity = quantity[:-2]
         thumbnail = safe_url(item.get("thumbnail_url"))
         product_url = safe_url(item.get("odoo_product_url"))
-        image = f'<img src="{escape(thumbnail, quote=True)}" alt="{escape(name, quote=True)}" width="64" height="64" style="display:block;width:64px;height:64px;object-fit:contain;border:0;border-radius:8px;background:#ffffff;font-size:10px;color:#66756e">' if thumbnail else '<span style="font-size:24px;color:#a4b1aa">&#9633;</span>'
+        image = f'<img src="{escape(thumbnail, quote=True)}" alt="{escape(name, quote=True)}" width="64" height="64" style="display:block;width:64px;height:64px;object-fit:contain;border:0;border-radius:0;background:#ffffff;font-size:10px;color:#66756e">' if thumbnail else '<span style="font-size:24px;color:#a4b1aa">&#9633;</span>'
         link = f'<a href="{escape(product_url, quote=True)}" style="font-family:{FONT};font-size:12px;line-height:20px;font-weight:500;color:#28594a;text-decoration:underline">View item</a>' if product_url else ""
-        item_rows.append(f'''<tr><td style="padding:0 0 10px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f6f8f6;border-radius:12px">
+        item_rows.append(f'''<tr><td style="padding:0 0 10px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eeeeee" style="background:#eeeeee;border-radius:0">
           <tr><td width="64" valign="middle" align="center" style="width:64px;padding:16px">{image}</td>
           <td valign="middle" style="padding:16px 16px 16px 0;font-family:{FONT};font-size:14px;line-height:21px;color:#24372e">
           <strong style="font-weight:600">{escape(name)}</strong><br><span style="font-size:12px;line-height:24px;color:#64756a">Quantity {escape(quantity)}</span>{'<br>' + link if link else ''}
@@ -76,7 +76,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     else:
         panel_label = panel_value = panel_detail = ""
     if panel_label:
-        panel = f'''<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:28px;background:#edf4ef;border:1px solid #dfe9e2;border-radius:12px"><tr><td style="padding:22px 24px;font-family:{FONT}">
+        panel = f'''<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eeeeee" style="margin-top:28px;background:#eeeeee;border:1px solid #dedede;border-radius:0"><tr><td style="padding:22px 24px;font-family:{FONT}">
         <p style="margin:0 0 9px;font-size:10px;line-height:16px;letter-spacing:1.3px;font-weight:600;color:#506c5e">{panel_label}</p>
         <p style="margin:0;font-size:18px;line-height:26px;font-weight:600;color:#214f3d">{escape(panel_value)}</p>
         {f'<p style="margin:7px 0 0;font-size:13px;line-height:21px;color:#596f60">{escape(panel_detail)}</p>' if panel_detail else ''}
@@ -115,13 +115,13 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
 <!--[if !mso]><!--><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"><!--<![endif]-->
 <style>body,table,td,a{{font-family:{FONT}}}table{{border-collapse:separate}}a{{text-decoration:none}}@media only screen and (max-width:620px){{.outer{{padding:20px 12px!important}}.content{{padding:28px 24px 30px!important}}.heading{{font-size:28px!important;line-height:35px!important}}.brand{{padding:0 8px 22px!important}}}}</style>
 <!--[if mso]><style>body,table,td,a,p,h1,h2{{font-family:Arial,sans-serif!important}}</style><![endif]-->
-</head><body style="margin:0;padding:0;width:100%;background:#f3f5f2;color:#26392f;font-family:{FONT};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
+</head><body style="margin:0;padding:0;width:100%;background:#ffffff;color:#26392f;font-family:{FONT};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
 <div style="display:none!important;visibility:hidden;opacity:0;color:transparent;height:0;width:0;max-height:0;max-width:0;overflow:hidden;mso-hide:all">{escape(preheader)}</div>
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f3f5f2"><tr><td class="outer" align="center" style="padding:44px 16px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff"><tr><td class="outer" align="center" style="padding:44px 16px">
 <!--[if mso]><table role="presentation" width="600" align="center"><tr><td><![endif]-->
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;margin:0 auto">
 <tr><td class="brand" style="padding:0 4px 28px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td valign="middle">{logo}</td><td align="right" valign="middle" style="font-family:{FONT};font-size:11px;line-height:18px;color:#738076">ORDER<br><strong style="font-size:13px;font-weight:600;color:#34493c">{escape(order)}</strong></td></tr></table></td></tr>
-<tr><td bgcolor="#ffffff" style="background:#ffffff;border:1px solid #e1e7df;border-radius:18px;overflow:hidden">
+<tr><td bgcolor="#f5f5f5" style="background:#f5f5f5;border:1px solid #e0e0e0;border-radius:0;overflow:hidden">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="content" style="padding:40px 40px 36px;font-family:{FONT}">
 <p style="margin:0 0 16px;color:#557364;font-size:10px;line-height:16px;font-weight:600;letter-spacing:1.8px">{eyebrow}</p>
 <h1 class="heading" style="margin:0 0 18px;font-family:{FONT};font-size:34px;line-height:41px;letter-spacing:-1.2px;font-weight:600;color:#193b2d">{heading}</h1>
