@@ -19,7 +19,7 @@ class SourcingApprovalTests(unittest.TestCase):
           CREATE TABLE order_lines (id INTEGER, store_id INTEGER, odoo_order_id INTEGER,
             asin TEXT, missing_asin TEXT, quantity REAL, state TEXT, order_engine TEXT,
             amazon_status TEXT, amazon_order_id TEXT, amazon_order_url TEXT, odoo_status_label TEXT);
-          CREATE TABLE after_order_events (id INTEGER PRIMARY KEY, case_id INTEGER, event_type TEXT,
+          CREATE TABLE after_order_case_events (id INTEGER PRIMARY KEY, case_id INTEGER, event_type TEXT,
             details_json TEXT, created_at TEXT);
           INSERT INTO order_lines VALUES (1,1,10,'B000000001','B000000001',1,'missing','chrome','missing',NULL,NULL,'invoiced');
         ''')
@@ -41,7 +41,7 @@ class SourcingApprovalTests(unittest.TestCase):
 
     def approve(self, hours_ago=0):
         result = self.review(self.case)
-        self.conn.execute('INSERT INTO after_order_events (case_id,event_type,details_json,created_at) VALUES (?,?,?,?)',
+        self.conn.execute('INSERT INTO after_order_case_events (case_id,event_type,details_json,created_at) VALUES (?,?,?,?)',
                           (1, 'unavailable_sourcing_review_approved', json.dumps({'signature': result['signature']}),
                            (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()))
 

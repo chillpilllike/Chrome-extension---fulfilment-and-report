@@ -37449,7 +37449,7 @@ def after_order_unavailable_review(case: dict[str, Any]) -> dict[str, Any]:
             (case["store_id"], case["odoo_order_id"]),
         ).fetchall())
         approval = conn.execute(
-            """SELECT details_json, created_at FROM after_order_events
+            """SELECT details_json, created_at FROM after_order_case_events
                WHERE case_id=? AND event_type='unavailable_sourcing_review_approved'
                ORDER BY id DESC LIMIT 1""", (case["id"],),
         ).fetchone()
