@@ -1170,6 +1170,7 @@ type PartialFulfilment = {
 }
 
 type EpostTrackingRow = {
+  archived_at?: string | null
   id: number
   store_id: number
   store_name: string
@@ -12449,12 +12450,32 @@ function EpostTrackingPage({
       setLoading(false)
     }
   }
+  async function archiveShipment(id: number, archived: boolean) {
+    const shipment = rows.find(row => row.id === id)
+    if (!shipment || isLoading) return
+    const label = shipment.odoo_order_name || shipment.tracking_code
+    if (!window.confirm(archived ? `Archive ${label}? It will leave normal ePost queues but remain searchable in Archived. Tracking history and After-order care cases are unchanged.` : `Unarchive ${label} and return it to the normal ePost queues?`)) return
+    setLoading(true)
+    try {
+      await api(`/api/epost/tracking/${id}/archive`, { method: "POST", body: JSON.stringify({ archived }) })
+      onSelected([])
+      onSelectAll(false)
+      if (rows.length === 1 && page > 1) onPage(page - 1)
+      else await refresh()
+      onResult({ ok: true, title: archived ? "Shipment archived" : "Shipment unarchived", message: archived ? "Find it later in the Archived queue. No tracking history was deleted." : "The shipment is back in the normal queues. Choose its current status or All unarchived shipments to find it." })
+    } catch (error) {
+      onResult({ ok: false, title: "Archive update failed", message: String(error) })
+    } finally {
+      setLoading(false)
+    }
+  }
   return <EpostWorkspace rows={rows} total={total} page={page} pageSize={PAGE_SIZE} storeId={storeId}
     summary={summary} queue={statusFilter} query={query} staleDays={staleDays} loading={isLoading}
     selected={selected} selectAll={selectAll} syncDays={syncDays}
     onQueue={onStatusFilter} onQuery={onQuery} onStaleDays={onStaleDays} onSyncDays={setSyncDays}
     onSync={syncFromOdoo} onRefresh={refresh} onPage={onPage} onSelected={onSelected} onSelectAll={onSelectAll}
     onRefund={(row, status) => { const source = rows.find(item => item.id === row.id); if (source) void markRefund(source, status) }}
+    onArchive={(row, archived) => void archiveShipment(row.id, archived)}
     onCopy={row => { const source = rows.find(item => item.id === row.id); if (source) void copyRefundDetails(source) }}
     onCopyCodes={async items => { const ok = await copyPlainText(items.map(item => item.tracking_code).join("\n")); onResult({ok, title: ok ? "Tracking codes copied" : "Copy failed", message: ok ? "Paste these codes into the carrier portal. Use the ePost extension to save scan results." : "Clipboard access is unavailable."}) }}
     onNavigate={onNavigate} formatMoney={formatMoney}

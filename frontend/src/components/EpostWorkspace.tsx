@@ -13,6 +13,7 @@ export type EpostWorkRow = {
   picking_name: string; amazon_order_id: string; amazon_order_url: string
   shipping_total: number; shipping_fee: number; fulfilment_fee: number; shipping_match_type: string
   refund_status?: string; refund_claimed_at?: string; refund_received_at?: string
+  archived_at?: string | null
   workflow_queue?: string; workflow_label?: string; suggested_owner?: string; next_action?: string
   days_since_update?: number | null; days_since_import?: number | null
 }
@@ -31,7 +32,8 @@ const queues = [
   ["delivered", "Delivered", "Complete", "Carrier reports delivery. Use After-order care if the customer disputes receipt."],
   ["refund_claimed", "Claims awaiting payment", "Finance", "A team member recorded a carrier refund claim. Check the carrier response and record payment only when received."],
   ["refund_received", "Refunds received", "Finance", "Recorded carrier refunds. This is separate from any customer refund or replacement."],
-  ["all", "All shipments", "Overview", "Every imported ePost shipment in the selected store. Queue counts cover the store, not just this page or search."],
+  ["all", "All unarchived shipments", "Overview", "Every unarchived ePost shipment in the selected store. Queue counts cover the store, not just this page or search."],
+  ["archived", "Archived", "Archive", "Shipments set aside by the team. Search or review them here, then unarchive to return them to the normal queues. Tracking history and status are preserved."],
 ] as const
 
 type Props = {
@@ -42,6 +44,7 @@ type Props = {
   onSyncDays: (value: string) => void; onSync: () => void; onRefresh: () => void; onPage: (value: number) => void
   onSelected: (ids: number[]) => void; onSelectAll: (value: boolean) => void
   onRefund: (row: EpostWorkRow, status: "claimed" | "received" | "clear") => void
+  onArchive: (row: EpostWorkRow, archived: boolean) => void
   onCopy: (row: EpostWorkRow) => void; onCopyCodes: (rows: EpostWorkRow[]) => void
   onNavigate: (page: string, order?: string) => void; formatMoney: (value: number) => string
   exports: ReactNode
@@ -109,7 +112,7 @@ export function EpostWorkspace(p: Props) {
             <TableCell><span className={`epost-status ep-${row.workflow_queue || "needs_review"}`}>{row.workflow_label || "Status needs review"}</span><p>{row.status || "No carrier event recorded"}</p>{row.refund_status && <small>Carrier refund: {row.refund_status}</small>}</TableCell>
             <TableCell><strong>{row.last_update_at ? (row.days_since_update != null ? `${row.days_since_update}d since event` : "Event date unverified") : "No event date"}</strong><small>{row.last_update_at || "No dated carrier scan"}</small><small>Checked: {row.last_checked_at ? row.last_checked_at.replace("T", " ").replace(/\.\d+/, "") : "Never"}</small>{!row.last_update_at && row.days_since_import != null && <small>Imported {row.days_since_import}d ago (not fulfilment)</small>}</TableCell>
             <TableCell><strong>{row.suggested_owner || "Tracking team"}</strong><p>{row.next_action || "Review the carrier record."}</p></TableCell>
-            <TableCell><Button size="sm" variant="outline" disabled={p.loading} onClick={() => setDetailId(row.id)}>Review shipment</Button></TableCell>
+            <TableCell><div className="epost-inline"><Button size="sm" variant="outline" disabled={p.loading} onClick={() => setDetailId(row.id)}>Review shipment</Button><Button size="sm" variant="ghost" disabled={p.loading} onClick={() => p.onArchive(row, !row.archived_at)}>{row.archived_at ? "Unarchive" : "Archive"}</Button></div>{row.archived_at && <small>Archived: {row.archived_at.replace("T", " ").replace(/\.\d+/, "")}</small>}</TableCell>
           </TableRow>)}
           {!p.rows.length && <TableRow><TableCell colSpan={6}><div className="epost-empty"><h3>{p.loading ? "Loading shipments…" : "No shipments in this view"}</h3><p>{p.query ? "Try a different order or tracking code, or clear your search." : "Choose another queue or import completed fulfilments for your selected store."}</p></div></TableCell></TableRow>}
         </TableBody></Table>

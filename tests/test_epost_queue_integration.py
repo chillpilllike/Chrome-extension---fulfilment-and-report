@@ -63,5 +63,17 @@ class QueueIntegrationTests(unittest.TestCase):
         self.snapshots[0]["epost_status"] = "lost"
         self.assertEqual([], self.ns["filter_epost_tracking_rows"](self.snapshots, "lost", 10, False))
 
+    def test_archive_filter_before_pagination_and_search(self):
+        self.snapshots[0]["archived_at"] = "2026-09-05"
+        self.snapshots[0]["odoo_order_name"] = "OLD-ORDER"
+        rows, total, _, _ = self.ns["paged_epost_tracking_rows"](7, 1, 20, "archived")
+        self.assertEqual(1, total)
+        self.assertEqual([1], [row["id"] for row in rows])
+        normal = self.ns["filter_epost_tracking_rows"](self.snapshots, "all", 10, False)
+        self.assertNotIn(1, [row["id"] for row in normal])
+        self.assertEqual([], self.ns["filter_epost_tracking_rows"](self.snapshots, "all", 10, False, "OLD-ORDER"))
+        archived = self.ns["filter_epost_tracking_rows"](self.snapshots, "archived", 10, False, "OLD-ORDER")
+        self.assertEqual([1], [row["id"] for row in archived])
+
 
 if __name__ == "__main__": unittest.main()

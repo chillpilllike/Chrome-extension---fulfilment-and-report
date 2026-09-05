@@ -74,6 +74,7 @@ from app.schemas import (
     EnginePayload,
     EpostBrowserlessRunPayload,
     EpostRefundPayload,
+    EpostArchivePayload,
     ExportCreatePayload,
     EpostSyncPayload,
     EpostTrackingUpdatePayload,
@@ -157,6 +158,14 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "app" / "static")), name="static")
 if (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="frontend-assets")
+
+
+@app.get("/favicon-finch.svg", include_in_schema=False)
+def fulfilment_favicon() -> Response:
+    icon = FRONTEND_DIST / "favicon-finch.svg"
+    if not icon.exists():
+        raise HTTPException(status_code=404, detail="Favicon not built")
+    return FileResponse(icon, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
 
 
 def frontend_index_response() -> Response:
@@ -1367,6 +1376,7 @@ def init_db() -> None:
                 refund_status TEXT NOT NULL DEFAULT '',
                 refund_claimed_at TEXT,
                 refund_received_at TEXT,
+                archived_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(store_id, tracking_code)
@@ -1924,6 +1934,7 @@ def init_db() -> None:
             "refund_status": "ALTER TABLE epost_global_tracking ADD COLUMN refund_status TEXT NOT NULL DEFAULT ''",
             "refund_claimed_at": "ALTER TABLE epost_global_tracking ADD COLUMN refund_claimed_at TEXT",
             "refund_received_at": "ALTER TABLE epost_global_tracking ADD COLUMN refund_received_at TEXT",
+            "archived_at": "ALTER TABLE epost_global_tracking ADD COLUMN archived_at TEXT",
             "final_mile_tracking_number": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_tracking_number TEXT",
             "final_mile_tracking_url": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_tracking_url TEXT",
             "final_mile_carrier": "ALTER TABLE epost_global_tracking ADD COLUMN final_mile_carrier TEXT",
@@ -18131,7 +18142,7 @@ def paged_epost_tracking_rows(
         # Classify lightweight snapshots before enriching only this page with
         # shipping charges and linked orders. Never filter just a loaded page.
         with db() as conn:
-            snapshots = conn.execute("SELECT id, status, last_update_at, last_checked_at, created_at, refund_status FROM epost_global_tracking WHERE (? IS NULL OR store_id=?)", (store_id, store_id)).fetchall()
+            snapshots = conn.execute("SELECT id, status, last_update_at, last_checked_at, created_at, refund_status, archived_at FROM epost_global_tracking WHERE (? IS NULL OR store_id=?)", (store_id, store_id)).fetchall()
         matched = filter_epost_tracking_rows(rows_to_dicts(snapshots), status, stale_days, stale_only)
         subset, total, page, per_page = paginate_values(matched, page, per_page)
         enriched = {row["id"]: row for row in epost_tracking_rows_by_ids([row["id"] for row in subset], stale_days)}
@@ -18140,7 +18151,7 @@ def paged_epost_tracking_rows(
         rows = filter_epost_tracking_rows(epost_tracking_rows(store_id), status, stale_days, stale_only, q)
         paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
         return paged_rows, total, page, per_page
-    status_clause = ""
+    status_clause = " AND archived_at IS NULL"
     params: list[Any] = [store_id, store_id]
     if status == "pending":
         status_clause = " AND epost_status NOT IN ('delivered', 'lost')"
@@ -37348,9 +37359,9 @@ def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: 
         ) from exc
     summary = None
     if include_summary:
-        summary = {key: 0 for key in [*EPOST_WORK_QUEUES, "all", "attention", "active", "refund_claimed", "refund_received"]}
+        summary = {key: 0 for key in [*EPOST_WORK_QUEUES, "all", "attention", "active", "refund_claimed", "refund_received", "archived"]}
         with db() as conn:
-            snapshots = conn.execute("SELECT status, last_update_at, last_checked_at, created_at, refund_status FROM epost_global_tracking WHERE (? IS NULL OR store_id=?)", (store_id, store_id)).fetchall()
+            snapshots = conn.execute("SELECT status, last_update_at, last_checked_at, created_at, refund_status, archived_at FROM epost_global_tracking WHERE (? IS NULL OR store_id=?)", (store_id, store_id)).fetchall()
         for snapshot in snapshots:
             item = annotate_workflow(dict(snapshot), stale_days)
             for key in summary:
@@ -37405,6 +37416,20 @@ def api_epost_refund_status(tracking_id: int, payload: EpostRefundPayload) -> di
     updated = epost_tracking_rows_by_ids([tracking_id])
     fast_page_cache_clear_matching({"epost-tracking"})
     return {"ok": True, "row": updated[0] if updated else None}
+
+
+@app.post("/api/epost/tracking/{tracking_id}/archive")
+def api_epost_archive(tracking_id: int, payload: EpostArchivePayload) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT id FROM epost_global_tracking WHERE id=?", (tracking_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="ePost tracking row not found.")
+        if payload.archived:
+            conn.execute("UPDATE epost_global_tracking SET archived_at=COALESCE(archived_at, ?) WHERE id=?", (utc_now(), tracking_id))
+        else:
+            conn.execute("UPDATE epost_global_tracking SET archived_at=NULL WHERE id=?", (tracking_id,))
+    fast_page_cache_clear_matching({"epost-tracking"})
+    return {"ok": True, "archived": payload.archived}
 
 
 AFTER_ORDER_ACTION_LABELS = {

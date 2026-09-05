@@ -308,6 +308,10 @@ class EpostRefundPayload(BaseModel):
     status: str
 
 
+class EpostArchivePayload(BaseModel):
+    archived: bool
+
+
 class AfterOrderDecisionPayload(BaseModel):
     decision: str
     note: str = ""

@@ -69,6 +69,10 @@ def persisted_status(status, last_update_at):
 
 
 def matches_queue(row, queue):
+    if queue == "archived":
+        return bool(row.get("archived_at"))
+    if row.get("archived_at"):
+        return False
     actual = row.get("workflow_queue")
     if queue in ("all", ""):
         return True
