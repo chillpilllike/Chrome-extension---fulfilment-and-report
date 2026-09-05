@@ -37,6 +37,7 @@ import { Popover } from "@base-ui/react/popover"
 import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerControls } from "@zxing/browser"
 
 import { APP_VERSION } from "@/appVersion"
+import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -1191,6 +1192,11 @@ type EpostTrackingRow = {
   days_since_update?: number | null
   stale_days_threshold?: number
   suspected_lost?: boolean
+  workflow_queue?: string
+  workflow_label?: string
+  suggested_owner?: string
+  next_action?: string
+  days_since_import?: number | null
   refund_status?: string
   refund_claimed_at?: string
   refund_received_at?: string
@@ -1864,6 +1870,10 @@ const epostExportColumns: ExportColumn[] = [
   { key: "amazon_order_id", label: "Amazon Order" },
   { key: "tracking_code", label: "ePost Tracking" },
   { key: "status", label: "Status" },
+  { key: "workflow_label", label: "Work Queue" },
+  { key: "suggested_owner", label: "Suggested Team" },
+  { key: "next_action", label: "Next Action" },
+  { key: "days_since_update", label: "Days Since Carrier Event" },
   { key: "shipping_fee", label: "Shipping Fee" },
   { key: "fulfilment_fee", label: "Fulfilment Fee" },
   { key: "shipping_total", label: "Shipping Total" },
@@ -3483,7 +3493,9 @@ function App() {
   const [epostRows, setEpostRows] = useState<EpostTrackingRow[]>([])
   const [epostPage, setEpostPage] = useState(1)
   const [epostTotal, setEpostTotal] = useState(0)
-  const [epostStatusFilter, setEpostStatusFilter] = useState("all")
+  const [epostStatusFilter, setEpostStatusFilter] = useState("attention")
+  const [epostSummary, setEpostSummary] = useState<Record<string, number> | null>(null)
+  const [afterOrderInitialQuery, setAfterOrderInitialQuery] = useState("")
   const [epostStaleDays, setEpostStaleDays] = useState("10")
   const [epostStaleOnly, setEpostStaleOnly] = useState(false)
   const [epostQuery, setEpostQuery] = useState("")
@@ -4236,13 +4248,20 @@ function App() {
     if (page !== "epost") return
     const requestId = ++epostRequestRef.current
     setEpostLoading(true)
-    api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking${pagedQuery(storeId, epostPage, { status: epostStatusFilter, stale_days: epostStaleDays || "10", stale_only: epostStaleOnly ? "true" : "false", q: epostQuery })}`)
+    setEpostSummary(null)
+    api<{ rows: EpostTrackingRow[]; total: number; summary: Record<string, number> }>(`/api/epost/tracking${pagedQuery(storeId, epostPage, { status: epostStatusFilter, stale_days: epostStaleDays || "10", stale_only: epostStaleOnly ? "true" : "false", q: epostQuery, include_summary: "true" })}`)
       .then((result) => {
         if (requestId !== epostRequestRef.current) return
         setEpostRows(result.rows)
         setEpostTotal(result.total || 0)
+        setEpostSummary(result.summary || null)
       })
-      .catch((error) => setModal({ ok: false, title: "ePost tracking load failed", message: String(error) }))
+      .catch((error) => {
+        if (requestId !== epostRequestRef.current) return
+        setEpostRows([])
+        setEpostTotal(0)
+        setModal({ ok: false, title: "ePost tracking load failed", message: String(error) })
+      })
       .finally(() => {
         if (requestId === epostRequestRef.current) setEpostLoading(false)
       })
@@ -6152,7 +6171,7 @@ function App() {
           />
         )}
         {page === "after-order-care" && (
-          <AfterOrderCarePage storeId={storeId} onResult={setModal} />
+          <AfterOrderCarePage storeId={storeId} onResult={setModal} initialQuery={afterOrderInitialQuery} />
         )}
         {page === "tracking" && (
           <TrackingPage
@@ -6267,8 +6286,10 @@ function App() {
             query={epostQuery}
             initialLoading={epostLoading}
             onPage={setEpostPage}
-            onStatusFilter={(value) => { setEpostStatusFilter(value); setEpostStaleOnly(value === "suspected_lost"); setEpostPage(1) }}
-            onStaleDays={(value) => { setEpostStaleDays(value); setEpostStatusFilter("suspected_lost"); setEpostStaleOnly(true); setEpostPage(1) }}
+            summary={epostSummary}
+            onSummary={setEpostSummary}
+            onStatusFilter={(value) => { setEpostStatusFilter(value); setEpostStaleOnly(false); setEpostPage(1); setEpostSelected([]); setEpostSelectAll(false) }}
+            onStaleDays={(value) => { setEpostStaleDays(value); setEpostPage(1); setEpostSelected([]); setEpostSelectAll(false) }}
             onStaleOnly={(value) => { setEpostStaleOnly(value); if (value) setEpostStatusFilter("suspected_lost"); setEpostPage(1) }}
             onQuery={(value) => { setEpostQuery(value); setEpostPage(1); setEpostSelectAll(false); setEpostSelected([]) }}
             selected={epostSelected}
@@ -6276,7 +6297,7 @@ function App() {
             onSelected={setEpostSelected}
             onSelectAll={setEpostSelectAll}
             onResult={setModal}
-            onNavigate={setPage}
+            onNavigate={(target, order) => { setAfterOrderInitialQuery(order || ""); setPage(target) }}
             onRows={(rows, total) => {
               setEpostRows(rows)
               setEpostTotal(total)
@@ -11930,11 +11951,11 @@ const afterOrderDecisionLabels: Record<string, string> = {
   not_received: "No, I did not receive it",
 }
 
-function AfterOrderCarePage({ storeId, onResult }: { storeId: string; onResult: (modal: ModalState) => void }) {
+function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId: string; onResult: (modal: ModalState) => void; initialQuery?: string }) {
   const [rows, setRows] = useState<AfterOrderCase[]>([])
   const [summary, setSummary] = useState<Record<string, number>>({})
   const [status, setStatus] = useState("open")
-  const [query, setQuery] = useState("")
+  const [query, setQuery] = useState(initialQuery)
   const [loading, setLoading] = useState(false)
   const [sendingAllTests, setSendingAllTests] = useState(false)
   const [emailTestMode, setEmailTestMode] = useState(true)
@@ -12210,7 +12231,6 @@ function EpostTrackingPage({
   onPage,
   onStatusFilter,
   onStaleDays,
-  onStaleOnly,
   onQuery,
   selected,
   selectAll,
@@ -12219,6 +12239,8 @@ function EpostTrackingPage({
   onResult,
   onNavigate,
   onRows,
+  summary,
+  onSummary,
 }: {
   rows: EpostTrackingRow[]
   storeId: string
@@ -12239,16 +12261,17 @@ function EpostTrackingPage({
   onSelected: (ids: number[]) => void
   onSelectAll: (value: boolean) => void
   onResult: (modal: ModalState) => void
-  onNavigate: (page: string) => void
+  onNavigate: (page: string, order?: string) => void
   onRows: (rows: EpostTrackingRow[], total: number) => void
+  summary: Record<string, number> | null
+  onSummary: (value: Record<string, number> | null) => void
 }) {
   const [loading, setLoading] = useState(false)
   const isLoading = loading || initialLoading
   const [syncDays, setSyncDays] = useState("30")
-  const selectionAnchor = useRef<number | null>(null)
   function refundDetails(row: EpostTrackingRow) {
     return [
-      "ePost refund claim",
+      "ePost shipment investigation",
       `Store: ${row.store_name || ""}`,
       `Odoo order: ${row.odoo_order_name || ""}`,
       `Picking: ${row.picking_name || ""}`,
@@ -12256,6 +12279,8 @@ function EpostTrackingPage({
       `Tracking: ${row.tracking_code || ""}`,
       `Tracking URL: ${row.tracking_url || `https://epgtrack.com/${row.tracking_code}`}`,
       `Status: ${row.status || row.epost_status || ""}`,
+      `Work queue: ${row.workflow_label || "Needs review"}`,
+      `Next action: ${row.next_action || "Review carrier evidence"}`,
       `Last update: ${row.last_update_at || ""}`,
       `Days since update: ${typeof row.days_since_update === "number" ? row.days_since_update : ""}`,
       `Destination: ${row.destination || ""}`,
@@ -12270,7 +12295,7 @@ function EpostTrackingPage({
     const details = refundDetails(row)
     const copied = await copyPlainText(details)
     if (copied) {
-      onResult({ ok: true, title: "Refund Details Copied", message: "Shipment details copied to clipboard." })
+      onResult({ ok: true, title: "Investigation Details Copied", message: "Shipment details copied to clipboard." })
       return true
     }
     onResult({ ok: false, title: "Copy Failed", message: "Clipboard copy is not available in this browser." })
@@ -12287,8 +12312,10 @@ function EpostTrackingPage({
       params.set("stale_days", staleDays || "10")
       params.set("stale_only", staleOnly ? "true" : "false")
       if (query.trim()) params.set("q", query.trim())
-      const result = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${params.toString()}`)
+      params.set("include_summary", "true")
+      const result = await api<{ rows: EpostTrackingRow[]; total: number; summary: Record<string, number> }>(`/api/epost/tracking?${params.toString()}`)
       onRows(result.rows, result.total || 0)
+      onSummary(result.summary || null)
     } catch (error) {
       onResult({ ok: false, title: "ePost Tracking Load Failed", message: String(error) })
     } finally {
@@ -12311,8 +12338,10 @@ function EpostTrackingPage({
       params.set("stale_days", staleDays || "10")
       params.set("stale_only", staleOnly ? "true" : "false")
       if (query.trim()) params.set("q", query.trim())
-      const refreshed = await api<{ rows: EpostTrackingRow[]; total: number }>(`/api/epost/tracking?${params.toString()}`)
+      params.set("include_summary", "true")
+      const refreshed = await api<{ rows: EpostTrackingRow[]; total: number; summary: Record<string, number> }>(`/api/epost/tracking?${params.toString()}`)
       onRows(refreshed.rows, refreshed.total || 0)
+      onSummary(refreshed.summary || null)
       onResult({ ok: true, title: "ePost Sync", message: result.message })
     } catch (error) {
       onResult({ ok: false, title: "ePost Sync Failed", message: String(error) })
@@ -12321,9 +12350,10 @@ function EpostTrackingPage({
     }
   }
   async function markRefund(row: EpostTrackingRow, status: "claimed" | "received" | "clear") {
+    const confirmation = status === "claimed" ? "Have you already submitted this claim to the carrier? This only records it internally; it does not submit a claim or refund a customer." : status === "received" ? "Confirm the carrier refund payment has actually been received." : "Clear this shipment's internal refund record and timestamps?"
+    if (!window.confirm(confirmation)) return
     setLoading(true)
     try {
-      const copied = status === "claimed" ? await copyRefundDetails(row) : false
       const result = await api<{ ok: boolean; row: EpostTrackingRow | null }>(`/api/epost/tracking/${row.id}/refund`, {
         method: "POST",
         body: JSON.stringify({ status }),
@@ -12340,229 +12370,26 @@ function EpostTrackingPage({
       onResult({
         ok: true,
         title: "Refund Updated",
-        message: status === "received" ? "Shipment marked as refund received." : status === "claimed" ? `Shipment marked as refund claimed${copied ? " and details copied." : "."}` : "Refund status cleared.",
+        message: status === "received" ? "Carrier refund receipt recorded." : status === "claimed" ? "Submitted carrier claim recorded. No customer payment or carrier submission was made." : "Refund status cleared.",
       })
+      await refresh()
     } catch (error) {
       onResult({ ok: false, title: "Refund Update Failed", message: String(error) })
     } finally {
       setLoading(false)
     }
   }
-  return (
-    <Card>
-      <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div>
-          <CardTitle>ePost Global Tracking</CardTitle>
-          <CardDescription>Syncs EPG tracking codes from fulfilled Odoo pickings. Use the ePost tracking extension to refresh portal status in batches of 25.</CardDescription>
-        </div>
-        <div className="flex flex-wrap items-end gap-2">
-          <div className="w-40">
-            <Label htmlFor="epost-sync-days">Odoo fulfilled since days</Label>
-            <Input
-              id="epost-sync-days"
-              type="number"
-              min={1}
-              max={30}
-              value={syncDays}
-              onChange={(event) => setSyncDays(event.target.value)}
-            />
-          </div>
-          <SelectField className="w-36" label="Status" value={statusFilter} onChange={onStatusFilter}>
-            <option value="all">All</option>
-            <option value="active">Not delivered</option>
-            <option value="pending">Pending</option>
-            <option value="suspected_lost">Suspected lost</option>
-            <option value="lost">Lost</option>
-            <option value="delivered">Delivered</option>
-          </SelectField>
-          <div className="w-full min-w-[260px] md:w-[360px]">
-            <Label htmlFor="epost-search">Search</Label>
-            <SearchBox
-              className="w-full"
-              value={query}
-              onChange={onQuery}
-              placeholder="Any ePost field, order, tracking, AWB..."
-            />
-          </div>
-          <div className="w-32">
-            <Label htmlFor="epost-stale-days">Suspect after days</Label>
-            <Input
-              id="epost-stale-days"
-              type="number"
-              min={1}
-              max={90}
-              value={staleDays}
-              onChange={(event) => onStaleDays(event.target.value)}
-            />
-          </div>
-          <label className="form-check mb-2">
-            <Checkbox checked={staleOnly} onCheckedChange={(checked) => onStaleOnly(Boolean(checked))} />
-            <span className="form-check-label">Only no update after days</span>
-          </label>
-          <Button variant="outline" onClick={refresh} disabled={isLoading}>
-            <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
-            Refresh
-          </Button>
-          <Button onClick={syncFromOdoo} disabled={isLoading || !storeId}>
-            <PackageCheck className="size-4" />
-            Sync from Odoo
-          </Button>
-        </div>
-      </CardHeader>
-      {isLoading ? (
-        <div className="border-t px-6 py-3">
-          <div className="d-flex align-items-center justify-content-between gap-3 text-sm">
-            <span className="text-muted-foreground">Loading ePost rows, charges, and matched Amazon orders...</span>
-            <span className="text-muted-foreground">{rows.length ? `${rows.length} cached result${rows.length === 1 ? "" : "s"}` : "loading"}</span>
-          </div>
-          <div className="progress mt-2">
-            <div className="progress-bar progress-bar-striped progress-bar-animated bg-primary" style={{ width: "100%" }} />
-          </div>
-        </div>
-      ) : null}
-      <div className="border-t px-6 py-3">
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <ExportControls view="epost" storeId={storeId} columns={epostExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ status: statusFilter, stale_days: staleDays || "10", stale_only: staleOnly ? "true" : "false", q: query }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />
-          <PaginationControls page={page} total={total} onPage={onPage} disabled={isLoading} />
-        </div>
-      </div>
-      <CardContent className="p-0 epost-tracking-table-wrap">
-        <Table className="epost-tracking-table">
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-10">
-                <Checkbox
-                  checked={rows.length > 0 && rows.every((row) => selected.includes(row.id))}
-                  onCheckedChange={(checked) => {
-                    onSelectAll(false)
-                    const ids = rows.map((row) => row.id)
-                    onSelected(checked ? Array.from(new Set([...selected, ...ids])) : selected.filter((id) => !ids.includes(id)))
-                  }}
-                />
-              </TableHead>
-              <TableHead className="epost-col-store">Store</TableHead>
-              <TableHead className="epost-col-order">Odoo Order</TableHead>
-              <TableHead className="epost-col-amazon">Amazon Order</TableHead>
-              <TableHead className="epost-col-tracking">ePost Tracking</TableHead>
-              <TableHead className="epost-col-status">Status</TableHead>
-              <TableHead className="epost-col-charges">Shipping Charges</TableHead>
-              <TableHead className="epost-col-refund">Refund</TableHead>
-              <TableHead className="epost-col-date">Last Update</TableHead>
-              <TableHead className="epost-col-destination">Destination</TableHead>
-              <TableHead className="epost-col-awb">AWB</TableHead>
-              <TableHead className="epost-col-checked">Checked</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((row) => (
-              <TableRow key={row.id} className={row.refund_status === "received" ? "epost-refund-received-row" : row.refund_status === "claimed" ? "bg-success/10" : row.suspected_lost || row.epost_status === "lost" ? "bg-destructive/10" : row.epost_status === "delivered" ? "" : "bg-muted/30"}>
-                <TableCell>
-                  <Checkbox
-                    checked={selected.includes(row.id)}
-                    onCheckedChange={(checked, event) => {
-                      onSelectAll(false)
-                      const visibleIds = rows.map((item) => item.id)
-                      onSelected(rangeSelection(visibleIds, selected, row.id, Boolean(checked), event.shiftKey, selectionAnchor.current))
-                      selectionAnchor.current = row.id
-                    }}
-                  />
-                </TableCell>
-                <TableCell>{row.store_name}</TableCell>
-                <TableCell>
-                  <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} />
-                  <div className="text-xs text-muted-foreground">{row.picking_name}</div>
-                </TableCell>
-                <TableCell>
-                  {row.amazon_order_id ? (
-                    <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
-                      {row.amazon_order_id}
-                    </a>
-                  ) : <span className="text-muted-foreground">Not linked</span>}
-                </TableCell>
-                <TableCell>
-                  <a className="font-mono text-primary underline-offset-4 hover:underline" href={row.tracking_url || `https://epgtrack.com/${row.tracking_code}`} target="_blank">
-                    {row.tracking_code}
-                  </a>
-                </TableCell>
-                <TableCell className="epost-cell-status">
-                  <div className="grid gap-1">
-                    <span className="epost-status-pill"><StatusBadge value={row.epost_status === "lost" ? "lost" : row.status || row.epost_status || "pending"} /></span>
-                    {row.suspected_lost ? (
-                      <Badge variant="destructive">suspect {row.days_since_update ?? staleDays}+ days</Badge>
-                    ) : null}
-                  </div>
-                </TableCell>
-                <TableCell className="epost-cell-charges">
-                  {Number(row.shipping_total || 0) > 0 ? (
-                    <div className="grid gap-1 text-sm">
-                      <span className="font-semibold">{formatMoney(Number(row.shipping_total || 0))}</span>
-                      <span className="text-xs text-muted-foreground">
-                        Ship {formatMoney(Number(row.shipping_fee || 0))} · Fulfil {formatMoney(Number(row.fulfilment_fee || 0))}
-                      </span>
-                      <Badge variant="outline">{row.shipping_match_type === "tracking" ? "tracking matched" : "order matched"}</Badge>
-                    </div>
-                  ) : (
-                    <span className="text-muted-foreground">Not synced</span>
-                  )}
-                </TableCell>
-                <TableCell className="epost-cell-refund">
-                  <div className="grid gap-2">
-                    {row.refund_status === "received" ? (
-                      <>
-                        <Badge variant="outline" className="epost-refund-received-badge">Refund received</Badge>
-                        <span className="text-xs text-muted-foreground">{formatDateTime(row.refund_received_at)}</span>
-                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Copy refund details" onClick={() => copyRefundDetails(row)}>
-                          <Copy className="size-4" />
-                        </Button>
-                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Reset refund status" onClick={() => markRefund(row, "clear")}>
-                          <RefreshCw className="size-4" />
-                        </Button>
-                      </>
-                    ) : row.refund_status === "claimed" ? (
-                      <>
-                        <Badge variant="outline">Refund claimed</Badge>
-                        <span className="text-xs text-muted-foreground">{formatDateTime(row.refund_claimed_at)}</span>
-                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Copy refund details" onClick={() => copyRefundDetails(row)}>
-                          <Copy className="size-4" />
-                        </Button>
-                        <Button size="sm" variant="success" disabled={isLoading} onClick={() => markRefund(row, "received")}>
-                          <Check className="size-4" />
-                          Received
-                        </Button>
-                        <Button size="icon-sm" variant="outline" disabled={isLoading} title="Reset refund status" onClick={() => markRefund(row, "clear")}>
-                          <RefreshCw className="size-4" />
-                        </Button>
-                      </>
-                    ) : (
-                      <Button size="sm" variant="outline" disabled={isLoading} onClick={() => markRefund(row, "claimed")}>
-                        Claim refund
-                      </Button>
-                    )}
-                  </div>
-                </TableCell>
-                <TableCell className="epost-cell-date">
-                  <div className="grid gap-1">
-                    <span>{row.last_update_at || ""}</span>
-                    {typeof row.days_since_update === "number" ? <span className={row.suspected_lost ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>{row.days_since_update} day{row.days_since_update === 1 ? "" : "s"} ago</span> : null}
-                  </div>
-                </TableCell>
-                <TableCell>{row.destination || ""}</TableCell>
-                <TableCell>{row.awb || ""}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.last_checked_at)}</TableCell>
-              </TableRow>
-            ))}
-            {!rows.length && (
-              <TableRow>
-                <TableCell colSpan={12} className="py-8 text-center text-muted-foreground">
-                  {isLoading ? "Applying ePost tracking filter..." : "No ePost Global tracking codes match this filter."}
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-      </CardContent>
-    </Card>
-  )
+  return <EpostWorkspace rows={rows} total={total} page={page} pageSize={PAGE_SIZE} storeId={storeId}
+    summary={summary} queue={statusFilter} query={query} staleDays={staleDays} loading={isLoading}
+    selected={selected} selectAll={selectAll} syncDays={syncDays}
+    onQueue={onStatusFilter} onQuery={onQuery} onStaleDays={onStaleDays} onSyncDays={setSyncDays}
+    onSync={syncFromOdoo} onRefresh={refresh} onPage={onPage} onSelected={onSelected} onSelectAll={onSelectAll}
+    onRefund={(row, status) => { const source = rows.find(item => item.id === row.id); if (source) void markRefund(source, status) }}
+    onCopy={row => { const source = rows.find(item => item.id === row.id); if (source) void copyRefundDetails(source) }}
+    onCopyCodes={async items => { const ok = await copyPlainText(items.map(item => item.tracking_code).join("\n")); onResult({ok, title: ok ? "Tracking codes copied" : "Copy failed", message: ok ? "Paste these codes into the carrier portal. Use the ePost extension to save scan results." : "Clipboard access is unavailable."}) }}
+    onNavigate={onNavigate} formatMoney={formatMoney}
+    exports={<ExportControls view="epost" storeId={storeId} columns={epostExportColumns} selectedIds={selected} selectAll={selectAll} total={total} filters={{ status: statusFilter, stale_days: staleDays || "10", stale_only: staleOnly ? "true" : "false", q: query }} onSelectAll={() => onSelectAll(true)} onClear={() => { onSelectAll(false); onSelected([]) }} onResult={onResult} onDownloads={() => onNavigate("downloads")} />}
+  />
 }
 
 function DuplicateTrackingPage({

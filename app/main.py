@@ -102,6 +102,7 @@ from app.schemas import (
 )
 from app.services.amazon import amz_date, normalize_amazon_endpoint
 from app.services.amazon_otp import imap_connect, imap_search_since, parse_amazon_email
+from app.services.epost_workflow import QUEUES as EPOST_WORK_QUEUES, annotate_workflow, matches_queue, persisted_status
 from app.services.after_order import (
     ResendEmailProvider,
     can_remove_affected_items,
@@ -17505,18 +17506,8 @@ def parse_epost_datetime(value: Any) -> Optional[datetime]:
 
 
 def epost_status_from_update(status: str, last_update_at: Any, fallback_at: Any = None) -> str:
-    if re.search(r"\b(not delivered|delivery failed|undeliverable|return to sender|damaged)\b", status or "", re.IGNORECASE):
-        return "lost"
-    if re.search(r"\b(delivered|recipient collected|collected by recipient|successfully delivered)\b", status or "", re.IGNORECASE):
-        return "delivered"
-    if not clean_text(status) and not clean_text(last_update_at):
-        return "awaiting_first_scan"
-    if re.search(r"\b(data received|electronic information|manifest|label created|pre-advised)\b", status or "", re.IGNORECASE):
-        return "awaiting_first_scan"
-    update_dt = parse_epost_datetime(last_update_at) or parse_epost_datetime(fallback_at)
-    if update_dt and datetime.now(timezone.utc) - update_dt >= timedelta(days=10):
-        return "lost"
-    return "pending"
+    # Import time is not a carrier event or evidence of lost physical goods.
+    return persisted_status(status, last_update_at)
 
 
 def carrier_name_from_tracking_url(url: str) -> str:
@@ -17980,15 +17971,7 @@ def public_track_order_rows(
 
 
 def annotate_epost_staleness(row: dict[str, Any], stale_days: int = 10) -> None:
-    threshold = max(1, min(90, int(stale_days or 10)))
-    update_dt = parse_epost_datetime(row.get("last_update_at")) or parse_epost_datetime(row.get("created_at"))
-    days_since = None
-    if update_dt:
-        days_since = max(0, (datetime.now(timezone.utc) - update_dt).days)
-    delivered = clean_text(row.get("epost_status")).lower() == "delivered" or re.search(r"\bdelivered\b", clean_text(row.get("status")), re.IGNORECASE)
-    row["days_since_update"] = days_since
-    row["stale_days_threshold"] = threshold
-    row["suspected_lost"] = bool(not delivered and days_since is not None and days_since >= threshold)
+    annotate_workflow(row, stale_days)
 
 
 def refresh_epost_lost_statuses(store_id: Optional[int] = None) -> None:
@@ -18004,7 +17987,6 @@ def refresh_epost_lost_statuses(store_id: Optional[int] = None) -> None:
             SELECT id, status, last_update_at, created_at, epost_status
             FROM epost_global_tracking
             WHERE (? IS NULL OR store_id=?)
-              AND epost_status != 'delivered'
             """,
             (store_id, store_id),
         ).fetchall()
@@ -18122,16 +18104,13 @@ def filter_epost_tracking_rows(
     status = clean_text(status or "all").lower()
     for row in rows:
         annotate_epost_staleness(row, stale_days)
-    if status == "pending":
-        rows = [row for row in rows if row.get("epost_status") not in {"delivered", "lost"}]
-    elif status in {"active", "not_delivered"}:
-        rows = [row for row in rows if row.get("epost_status") != "delivered"]
-    elif status in {"delivered", "lost"}:
-        rows = [row for row in rows if row.get("epost_status") == status]
+    rows = [row for row in rows if matches_queue(row, status)]
     if stale_only or status in {"suspected_lost", "stale"}:
         rows = [row for row in rows if row.get("suspected_lost")]
     if clean_text(q):
         rows = [row for row in rows if epost_tracking_row_matches_query(row, q)]
+    priority = {"confirmed_lost": 0, "carrier_exception": 1, "stalled": 2, "lookup_error": 3, "awaiting_first_scan": 4, "unscanned": 5, "needs_review": 6, "in_transit": 7, "delivered": 8}
+    rows.sort(key=lambda row: (priority.get(row.get("workflow_queue"), 9), -(row.get("days_since_update") or row.get("days_since_import") or 0), row.get("id", 0)))
     return rows
 
 
@@ -18148,7 +18127,16 @@ def paged_epost_tracking_rows(
     page, per_page, offset = pagination_bounds(page, per_page)
     status = clean_text(status or "all").lower()
     stale_days = max(1, min(90, int(stale_days or 10)))
-    if clean_text(q) or stale_only or status in {"suspected_lost", "stale"}:
+    if not clean_text(q) and (stale_only or status != "all"):
+        # Classify lightweight snapshots before enriching only this page with
+        # shipping charges and linked orders. Never filter just a loaded page.
+        with db() as conn:
+            snapshots = conn.execute("SELECT id, status, last_update_at, last_checked_at, created_at, refund_status FROM epost_global_tracking WHERE (? IS NULL OR store_id=?)", (store_id, store_id)).fetchall()
+        matched = filter_epost_tracking_rows(rows_to_dicts(snapshots), status, stale_days, stale_only)
+        subset, total, page, per_page = paginate_values(matched, page, per_page)
+        enriched = {row["id"]: row for row in epost_tracking_rows_by_ids([row["id"] for row in subset], stale_days)}
+        return [enriched[row["id"]] for row in subset if row["id"] in enriched], total, page, per_page
+    if clean_text(q):
         rows = filter_epost_tracking_rows(epost_tracking_rows(store_id), status, stale_days, stale_only, q)
         paged_rows, total, page, per_page = paginate_values(rows, page, per_page)
         return paged_rows, total, page, per_page
@@ -18592,6 +18580,16 @@ DEFAULT_EXPORT_COLUMNS: dict[str, list[dict[str, str]]] = {
         {"key": "amazon_order_id", "label": "Amazon Order"},
         {"key": "tracking_code", "label": "ePost Tracking"},
         {"key": "status", "label": "Status"},
+        {"key": "workflow_label", "label": "Work Queue"},
+        {"key": "suggested_owner", "label": "Suggested Team"},
+        {"key": "next_action", "label": "Next Action"},
+        {"key": "days_since_update", "label": "Days Since Carrier Event"},
+        {"key": "shipping_fee", "label": "Shipping Fee"},
+        {"key": "fulfilment_fee", "label": "Fulfilment Fee"},
+        {"key": "shipping_total", "label": "Shipping Total"},
+        {"key": "refund_status", "label": "Refund Status"},
+        {"key": "refund_claimed_at", "label": "Refund Claimed"},
+        {"key": "refund_received_at", "label": "Refund Received"},
         {"key": "last_update_at", "label": "Last Update"},
         {"key": "destination", "label": "Destination"},
         {"key": "awb", "label": "AWB"},
@@ -37331,13 +37329,13 @@ def api_manual_line_fulfilment(payload: ManualFulfilmentPayload) -> dict[str, An
 
 
 @app.get("/api/epost/tracking")
-def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", stale_days: int = 10, stale_only: bool = False, q: str = "") -> dict[str, Any]:
+def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, status: str = "all", stale_days: int = 10, stale_only: bool = False, q: str = "", include_summary: bool = False) -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
     status = clean_text(status or "all").lower()
     stale_days = max(1, min(90, int(stale_days or 10)))
     q = clean_text(q)
     search_engine = "postgres"
-    cache_key = ("epost-tracking", store_id, page, per_page, status, stale_days, bool(stale_only), q)
+    cache_key = ("epost-tracking", store_id, page, per_page, status, stale_days, bool(stale_only), q, bool(include_summary))
     cached = fast_page_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -37348,7 +37346,17 @@ def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: 
             status_code=503,
             detail=f"ePost tracking rows are temporarily unavailable. Please refresh again shortly. {clean_error_message(exc)}",
         ) from exc
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only, "q": q}, 90)
+    summary = None
+    if include_summary:
+        summary = {key: 0 for key in [*EPOST_WORK_QUEUES, "all", "attention", "active", "refund_claimed", "refund_received"]}
+        with db() as conn:
+            snapshots = conn.execute("SELECT status, last_update_at, last_checked_at, created_at, refund_status FROM epost_global_tracking WHERE (? IS NULL OR store_id=?)", (store_id, store_id)).fetchall()
+        for snapshot in snapshots:
+            item = annotate_workflow(dict(snapshot), stale_days)
+            for key in summary:
+                if matches_queue(item, key):
+                    summary[key] += 1
+    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only, "q": q, "summary": summary}, 90)
 
 
 @app.post("/api/epost/tracking/{tracking_id}/refund")
@@ -37395,6 +37403,7 @@ def api_epost_refund_status(tracking_id: int, payload: EpostRefundPayload) -> di
                 (now, now, now, tracking_id),
             )
     updated = epost_tracking_rows_by_ids([tracking_id])
+    fast_page_cache_clear_matching({"epost-tracking"})
     return {"ok": True, "row": updated[0] if updated else None}
 
 
