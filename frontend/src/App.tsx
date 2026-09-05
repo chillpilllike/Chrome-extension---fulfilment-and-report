@@ -12209,7 +12209,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           return (
             <details key={row.id} className={`care-case care-severity-${row.severity}`}>
               <summary className="care-case-summary">
-                <span className="care-order-cell"><strong>{row.odoo_order_name || row.tracking_code || `Case ${row.id}`}</strong><small>{row.store_name}</small></span>
+                <span className="care-order-cell"><strong>{row.odoo_order_name || row.tracking_code || `Case ${row.id}`}</strong><small>{row.store_name}</small><small title="Odoo order placement date">Placed: {row.odoo_order_date ? formatOrderDateTime(row.odoo_order_date) : "Not recorded"}</small></span>
                 <span className="care-issue-cell"><strong>{row.title}</strong><small>{decisionCase ? currentLabel : context.latest_status || context.risk_reason || "Review available evidence"}</small></span>
                 <span className="care-state-cell"><span className="care-state">{row.status.replaceAll("_", " ")}</span><small>{row.severity} priority</small></span>
                 <span className="care-next-cell">{nextStep}</span>
