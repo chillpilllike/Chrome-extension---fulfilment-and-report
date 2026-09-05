@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.inventory_history import install_inventory_history, inventory_filter
+
 import csv
 import copy
 import hashlib
@@ -2338,6 +2340,7 @@ def init_db() -> None:
                     utc_now(),
                 ),
             )
+        install_inventory_history(conn)
         address_count = conn.execute("SELECT COUNT(*) AS count FROM fulfilment_addresses").fetchone()
         if int(address_count["count"]) == 0:
             conn.execute(
@@ -7958,19 +7961,23 @@ def get_default_punchout_return_url() -> str:
     return str(row["url"]) if row else ""
 
 
-def list_inventory_items(store_id: Optional[int] = None, page: int = 1, per_page: int = 100) -> tuple[list[dict[str, Any]], int]:
+def list_inventory_items(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, view: str = "active", q: str = "") -> tuple[list[dict[str, Any]], int]:
     page = max(1, int(page or 1))
     per_page = max(1, min(100, int(per_page or 100)))
     offset = (page - 1) * per_page
-    where = "WHERE status != 'used' AND (? IS NULL OR store_id=?)"
+    where = "WHERE " + inventory_filter(view) + " AND (? IS NULL OR store_id=?)"
+    params: list[Any] = [store_id, store_id]
+    if q.strip():
+        where += " AND POSITION(LOWER(?) IN LOWER(CONCAT_WS(' ', asin, product_name, source_odoo_order_name, amazon_order_id, amazon_account_name, notes, archive_reason))) > 0"
+        params.append(q.strip())
     with db() as conn:
         total = conn.execute(
             f"SELECT COUNT(*) AS count FROM inventory_items {where}",
-            (store_id, store_id),
+            params,
         ).fetchone()["count"]
         rows = conn.execute(
-            f"SELECT * FROM inventory_items {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-            (store_id, store_id, per_page, offset),
+            f"SELECT * FROM inventory_items {where} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, per_page, offset],
         ).fetchall()
     return rows, int(total)
 
@@ -9945,7 +9952,7 @@ def ensure_inventory_for_line(row: Union[dict[str, Any], dict[str, Any]]) -> Non
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(store_id, order_line_id) DO UPDATE SET
                 asin=excluded.asin,
-                quantity=CASE WHEN inventory_items.status IN ('reserved', 'used') THEN inventory_items.quantity ELSE excluded.quantity END,
+                quantity=CASE WHEN inventory_items.status IN ('reserved', 'used', 'archived') THEN inventory_items.quantity ELSE excluded.quantity END,
                 product_name=excluded.product_name,
                 source_odoo_order_id=excluded.source_odoo_order_id,
                 source_odoo_order_name=excluded.source_odoo_order_name,
@@ -9957,7 +9964,7 @@ def ensure_inventory_for_line(row: Union[dict[str, Any], dict[str, Any]]) -> Non
                 source_received_at=excluded.source_received_at,
                 source_shopify_cancelled_at=excluded.source_shopify_cancelled_at,
                 source_odoo_status=excluded.source_odoo_status,
-                status=CASE WHEN inventory_items.status IN ('reserved', 'used') THEN inventory_items.status ELSE excluded.status END,
+                status=CASE WHEN inventory_items.status IN ('reserved', 'used', 'archived') THEN inventory_items.status ELSE excluded.status END,
                 source_type=excluded.source_type,
                 notes=excluded.notes,
                 updated_at=excluded.updated_at
@@ -26127,35 +26134,22 @@ def backup_loop() -> None:
 
 
 @app.get("/api/inventory")
-def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "") -> dict[str, Any]:
+def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int = 100, q: str = "", view: str = "active") -> dict[str, Any]:
     page, per_page, _ = pagination_bounds(page, per_page)
-    cache_key = ("inventory-v2", store_id, page, per_page, clean_text(q))
-    cached = fast_page_cache_get(cache_key)
-    if cached is not None:
-        return cached
+    cache_key = ("inventory-v2", store_id, page, per_page, clean_text(q), view)
+    if view not in {"active", "available", "incoming", "reserved", "archived"}:
+        raise HTTPException(400, "Unknown inventory view.")
     search_engine = "postgres"
-    try:
-        filters = ["status:!=used"]
-        if store_id:
-            filters.append(f"store_id:={int(store_id)}")
-        filter_by = " && ".join(filters)
-        result = typesense_search_documents(
-            "inventory_items",
-            q or "*",
-            "asin,product_name,source_odoo_order_name,amazon_order_id,amazon_account_name,status,source_type,notes,manual_reference",
-            filter_by=filter_by,
-            page=page,
-            per_page=per_page,
-            sort_by="updated_ts:desc",
-        )
-        if result.get("enabled"):
-            items = sql_rows_by_ids("inventory_items", list(result.get("ids") or []))
-            total = int(result.get("total") or 0)
-            search_engine = "typesense"
-        else:
-            items, total = list_inventory_items(store_id, page, per_page)
-    except Exception:
-        items, total = list_inventory_items(store_id, page, per_page)
+    # Read authoritative stock, not an eventually consistent search-index snapshot.
+    items, total = list_inventory_items(store_id, page, per_page, view, q)
+    with db() as conn:
+        grouped = conn.execute("SELECT status, COUNT(*) AS count FROM inventory_items WHERE (? IS NULL OR store_id=?) GROUP BY status", (store_id, store_id)).fetchall()
+    counts = {key: 0 for key in ("active", "available", "incoming", "reserved", "archived")}
+    for group in grouped:
+        key = "archived" if group["status"] in {"archived", "used"} else group["status"]
+        counts[key] = counts.get(key, 0) + int(group["count"])
+        if key != "archived":
+            counts["active"] += int(group["count"])
     stores = rows_to_dicts(list_stores())
     for store in stores:
         if store.get("odoo_password"):
@@ -26168,7 +26162,42 @@ def api_inventory(store_id: Optional[int] = None, page: int = 1, per_page: int =
         "per_page": per_page,
         "total": total,
         "search_engine": search_engine,
+        "counts": counts,
     }, 90)
+
+
+@app.post("/api/inventory/{inventory_id}/archive")
+def api_archive_inventory(inventory_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    reason = clean_text(payload.get("reason"))
+    if not reason or len(reason) > 1000:
+        raise HTTPException(400, "Enter an archive reason (1–1000 characters).")
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=? FOR UPDATE", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        if item["status"] == "reserved" or (item["reserved_order_line_id"] and item["status"] != "used"):
+            raise HTTPException(409, "Reserved stock cannot be archived. Resolve the assigned order first.")
+        if item["status"] not in {"used", "archived"}:
+            conn.execute("UPDATE inventory_items SET status='archived', archived_at=?, archive_reason=?, updated_at=? WHERE id=?", (utc_now(), reason, utc_now(), inventory_id))
+    fast_page_cache_clear_matching({"inventory-v2", "orders", "dashboard"})
+    return {"ok": True, "message": "Moved to Archived. Stock details and movement history are retained."}
+
+
+@app.get("/api/inventory/{inventory_id}/timeline")
+def api_inventory_timeline(inventory_id: int) -> dict[str, Any]:
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        source_id = item.get("source_inventory_item_id") or item["id"]
+        movements = rows_to_dicts(conn.execute("""
+            SELECT m.*, o.odoo_order_name AS target_order_name FROM inventory_movements m
+            JOIN inventory_items i ON i.id=m.inventory_id
+            LEFT JOIN order_lines o ON o.id=NULLIF(m.current_state->>'reserved_order_line_id', '')::integer
+            WHERE i.id=? OR i.source_inventory_item_id=?
+            ORDER BY m.id DESC
+        """, (source_id, source_id)).fetchall())
+    return {"items": movements, "source_inventory_id": source_id}
 
 
 @app.get("/api/inventory/asin-image/{asin}")
@@ -36009,6 +36038,9 @@ def reset_cancelled_amazon_fulfilment(
             cleanup[name] += count
     if reset_rows and not review_rows:
         cleanup["dispatch_packages"] = dispatch_clear_packages_for_amazon_order(conn, amazon_order_id)
+    # Re-evaluate only this cancelled purchase; the inventory guard preserves
+    # received, available and reserved stock and archives empty incoming rows.
+    conn.execute("UPDATE inventory_items SET updated_at=updated_at WHERE amazon_order_id=? AND status='incoming'", (amazon_order_id,))
     payment_failure_resolved = bool(resolve_payment_failure_for_order(conn, amazon_order_id, now))
     return {
         "reset_rows": reset_rows,

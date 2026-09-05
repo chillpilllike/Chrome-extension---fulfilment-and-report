@@ -1315,6 +1315,8 @@ type AmazonOtpRow = {
 }
 
 type InventoryItem = {
+  archived_at?: string
+  archive_reason?: string
   id: number
   store_id: number
   asin: string
@@ -3465,6 +3467,11 @@ function App() {
   const [inventory, setInventory] = useState<InventoryItem[]>([])
   const [inventoryPage, setInventoryPage] = useState(1)
   const [inventoryTotal, setInventoryTotal] = useState(0)
+  const [inventoryView, setInventoryView] = useState("active")
+  const [inventoryQuery, setInventoryQuery] = useState("")
+  const [inventoryCounts, setInventoryCounts] = useState<Record<string, number>>({})
+  const [inventoryRevision, setInventoryRevision] = useState(0)
+  const [inventoryLoading, setInventoryLoading] = useState(false)
   const [cancelledOrders, setCancelledOrders] = useState<CancelledOrderRow[]>([])
   const [cancelledOrdersPage, setCancelledOrdersPage] = useState(1)
   const [cancelledOrdersTotal, setCancelledOrdersTotal] = useState(0)
@@ -4151,17 +4158,25 @@ function App() {
 
   useEffect(() => {
     if (page !== "inventory") return
+    let current = true
+    setInventoryLoading(true)
     const query = new URLSearchParams()
     if (storeId) query.set("store_id", storeId)
     query.set("page", String(inventoryPage))
     query.set("per_page", String(PAGE_SIZE))
-    api<{ items: InventoryItem[]; total: number }>(`/api/inventory?${query.toString()}`)
+    query.set("view", inventoryView)
+    query.set("q", inventoryQuery)
+    api<{ items: InventoryItem[]; total: number; counts: Record<string, number> }>(`/api/inventory?${query.toString()}`)
       .then((result) => {
+        if (!current) return
         setInventory(result.items)
         setInventoryTotal(result.total || 0)
+        setInventoryCounts(result.counts || {})
       })
-      .catch((error) => setModal({ ok: false, title: "Inventory load failed", message: String(error) }))
-  }, [page, storeId, inventoryPage])
+      .catch((error) => { if (current) { setInventory([]); setModal({ ok: false, title: "Inventory load failed", message: String(error) }) } })
+      .finally(() => { if (current) setInventoryLoading(false) })
+    return () => { current = false }
+  }, [page, storeId, inventoryPage, inventoryView, inventoryQuery, inventoryRevision])
 
   useEffect(() => {
     if (page !== "cancelled-orders") return
@@ -6338,14 +6353,18 @@ function App() {
         {page === "inventory" && (
           <InventoryPage
             rows={inventory}
+            view={inventoryView}
+            query={inventoryQuery}
+            counts={inventoryCounts}
+            loading={inventoryLoading}
+            onView={(value) => { setInventoryView(value); setInventoryPage(1) }}
+            onQuery={(value) => { setInventoryQuery(value); setInventoryPage(1) }}
+            onRefresh={() => setInventoryRevision((value) => value + 1)}
             storeId={storeId}
             page={inventoryPage}
             total={inventoryTotal}
             onPage={setInventoryPage}
-            onRows={(items, total) => {
-              setInventory(items)
-              setInventoryTotal(total)
-            }}
+            onRows={() => setInventoryRevision((value) => value + 1)}
             onResult={setModal}
           />
         )}
@@ -12725,6 +12744,7 @@ function DuplicateTrackingPage({
 }
 
 function InventoryPage({
+  view, query, counts, loading, onView, onQuery, onRefresh,
   rows,
   storeId,
   page,
@@ -12733,6 +12753,13 @@ function InventoryPage({
   onRows,
   onResult,
 }: {
+  view: string
+  query: string
+  counts: Record<string, number>
+  loading: boolean
+  onView: (value: string) => void
+  onQuery: (value: string) => void
+  onRefresh: () => void
   rows: InventoryItem[]
   storeId: string
   page: number
@@ -12743,6 +12770,43 @@ function InventoryPage({
 }) {
   const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string; asin?: string } | null>(null)
+  const [searchDraft, setSearchDraft] = useState(query)
+  const [manualOpen, setManualOpen] = useState(false)
+  const [archiveItem, setArchiveItem] = useState<InventoryItem | null>(null)
+  const [archiveReason, setArchiveReason] = useState("")
+  const [archiveBusy, setArchiveBusy] = useState(false)
+  const [timelineItem, setTimelineItem] = useState<InventoryItem | null>(null)
+  const [timeline, setTimeline] = useState<{ id: number; inventory_id: number; occurred_at: string; event_type: string; reason: string; target_order_name?: string; previous_state: InventoryItem | null; current_state: InventoryItem }[]>([])
+  const [timelineLoading, setTimelineLoading] = useState(false)
+  const [timelineError, setTimelineError] = useState("")
+  const queues = [
+    { key: "active", label: "All active stock", help: "Review stock awaiting receipt, available to use, or reserved for an order.", icon: Database },
+    { key: "available", label: "Available", help: "Check expiry, then attach available stock to a matching order.", icon: PackageCheck },
+    { key: "incoming", label: "Awaiting release", help: "Confirm delivery, warehouse receipt and customer cancellation before releasing stock.", icon: Clock },
+    { key: "reserved", label: "Reserved / to send", help: "Verify physical dispatch, then confirm sent for the assigned order.", icon: TruckDelivery },
+    { key: "archived", label: "Archived", help: "Sent or removed stock stays here with its reason and movement history. It is not available for allocation.", icon: Database },
+  ]
+  const selectedQueue = queues.find((queue) => queue.key === view) || queues[0]
+  useEffect(() => {
+    if (!timelineItem) return
+    let current = true
+    setTimeline([]); setTimelineError(""); setTimelineLoading(true)
+    api<{ items: typeof timeline }>(`/api/inventory/${timelineItem.id}/timeline`)
+      .then((result) => { if (current) setTimeline(result.items) })
+      .catch((error) => { if (current) setTimelineError(String(error)) })
+      .finally(() => { if (current) setTimelineLoading(false) })
+    return () => { current = false }
+  }, [timelineItem])
+  async function archiveInventory() {
+    if (!archiveItem || !archiveReason.trim()) return
+    setArchiveBusy(true)
+    try {
+      await api(`/api/inventory/${archiveItem.id}/archive`, { method: "POST", body: JSON.stringify({ reason: archiveReason.trim() }) })
+      setArchiveItem(null); setArchiveReason(""); onPage(1); onRefresh()
+    } catch (error) {
+      onResult({ ok: false, title: "Archive failed", message: String(error) })
+    } finally { setArchiveBusy(false) }
+  }
 
   async function addManualInventory() {
     try {
@@ -12793,8 +12857,9 @@ function InventoryPage({
 
   return (
     <>
-    <div className="grid gap-5">
-      <Card>
+    <div className="epost-workspace inventory-workspace">
+      <header className="epost-heading"><div><span className="epost-eyebrow">Warehouse operations</span><h2>Inventory workspace</h2><p>Receive, allocate and trace reusable stock.</p></div><div className="epost-heading-actions"><Button variant="outline" onClick={onRefresh} disabled={loading}><RefreshCw className="size-4" />Refresh</Button><Button onClick={() => setManualOpen(!manualOpen)} aria-expanded={manualOpen}><Plus className="size-4" />{manualOpen ? "Hide stock form" : "Add manual stock"}</Button></div></header>
+      {manualOpen && <Card className="mb-4">
         <CardHeader>
           <CardTitle>Add manual stock</CardTitle>
           <CardDescription>Reusable stock is released only after Amazon delivery, warehouse receipt, Shopify cancellation, and Odoo cancellation/refund are all confirmed. For manual stock, enter a title and quantity; ASIN is optional.</CardDescription>
@@ -12823,17 +12888,21 @@ function InventoryPage({
             </Button>
           </div>
         </CardContent>
-      </Card>
-
-      <Card>
+      </Card>}
+      <div className="epost-layout">
+      <aside className="epost-queues" aria-label="Inventory queues"><div className="epost-queue-title">Stock queues<span>Selected store</span></div>{queues.map(({ key, label, icon: Icon }) => <button key={key} type="button" className={`epost-queue ${key === view ? "is-active" : ""}`} aria-pressed={key === view} onClick={() => onView(key)}><span className="flex items-center gap-2"><Icon className="size-4" />{label}</span><strong>{(counts[key] || 0).toLocaleString()}</strong></button>)}<div className="epost-related"><h3>Related workspaces</h3><a className="epost-link-button" href="/orders">Orders</a><a className="epost-link-button" href="/package-pickups">Package Pickup Check</a><a className="epost-link-button" href="/cancelled-orders">Cancelled orders</a></div></aside>
+      <Card className="epost-main">
         <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
-            <CardTitle>Inventory Items · {total.toLocaleString()}</CardTitle>
-            <CardDescription>Inventory is shared across all stores. Available rows can fulfil any selected order when quantity is sufficient; rows with an ASIN must match the order ASIN exactly.</CardDescription>
+            <CardTitle>{selectedQueue.label} · {total.toLocaleString()}</CardTitle>
+            <CardDescription>{selectedQueue.help}</CardDescription>
           </div>
           <PaginationControls page={page} total={total} onPage={onPage} />
         </CardHeader>
+        <form className="epost-filters" onSubmit={(event) => { event.preventDefault(); onQuery(searchDraft) }}><div className="epost-search"><Label htmlFor="inventory-search">Find stock or an order</Label><Input id="inventory-search" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} placeholder="ASIN, product, Odoo / Amazon order or archive reason" /></div><Button type="submit" variant="outline"><Search className="size-4" />Search</Button>{query && <Button type="button" variant="ghost" onClick={() => { setSearchDraft(""); onQuery("") }}>Clear</Button>}</form>
+        <div className="epost-selection">Stock is shared across stores. Queue counts use the store filter; search narrows this list.</div>
         <CardContent className="p-0">
+          {loading ? <div className="epost-loading" role="status">Loading inventory…</div> :
           <div className="inventory-card-list">
             {rows.map((item) => (
               <article key={item.id} className="card inventory-stock-card">
@@ -12859,7 +12928,7 @@ function InventoryPage({
                     )}
                   </div>
                   <div className="inventory-product-info">
-                    <div className="inventory-stock-badges"><InventoryStatusBadge value={item.status} /><span className="text-secondary">Stock #{item.id}</span></div>
+                    <div className="inventory-stock-badges"><InventoryStatusBadge value={item.status === "used" ? "Sent / archived" : item.status} /><span className="text-secondary">Stock #{item.id}</span></div>
                     <h3 className="inventory-product-title">{item.product_name || "Untitled stock item"}</h3>
                     <div className="inventory-asin">
                     {item.asin ? (
@@ -12868,7 +12937,8 @@ function InventoryPage({
                     {item.image_source ? <div className="text-[11px] text-muted-foreground">{item.image_source === "amazon_page" ? "Amazon page image" : "Captured thumbnail"}</div> : null}
                   </div>
                   </div>
-                  <div className="inventory-quantity"><span>Stock quantity</span><strong>{item.quantity}</strong></div>
+                  <div className="inventory-quantity"><span>{view === "archived" ? "Recorded quantity" : "Stock quantity"}</span><strong>{item.quantity}</strong></div>
+                  {item.archived_at && <div className="inventory-archive-note"><strong>Archived · {formatDateTime(item.archived_at)}</strong><span>{item.archive_reason || "Historical stock record"}</span></div>}
                   <div className="inventory-stock-details">
                     <section><h4><Database className="size-4" /> Stock source</h4>
                     <Badge variant="outline">{item.source_type || "amazon_cancelled"}</Badge>
@@ -12909,26 +12979,31 @@ function InventoryPage({
                 </div>
                 <footer className="card-footer inventory-stock-footer"><span>Updated {formatDateTime(item.updated_at)}</span>
                     <div className="btn-list justify-end">
+                      <Button variant="outline" size="sm" onClick={() => setTimelineItem(item)}><Clock className="size-4" />Movement timeline</Button>
+                      {!["used", "archived", "reserved"].includes(item.status) && <Button variant="outline" size="sm" onClick={() => { setArchiveItem(item); setArchiveReason("") }}>Archive</Button>}
                       {item.status === "reserved" ? (
                         <Button size="sm" onClick={() => confirmInventorySent(item)}>
                           <CheckCircle2 className="size-4" />
                           Confirm Sent
                         </Button>
-                      ) : (
-                        <Button variant="outline" size="sm" disabled={item.status === "used"} onClick={() => attachInventory(item)}>
+                      ) : item.status === "available" ? (
+                        <Button variant="outline" size="sm" disabled={item.quantity <= 0} onClick={() => attachInventory(item)}>
                           <Link className="size-4" />
                           Attach
                         </Button>
-                      )}
+                      ) : null}
                     </div>
                   </footer>
               </article>
             ))}
-            {!rows.length && <div className="empty"><div className="empty-icon"><PackageCheck className="size-8" /></div><p className="empty-title">No inventory items on this page</p><p className="empty-subtitle text-secondary">Add manual stock above or choose another page.</p></div>}
-          </div>
+            {!rows.length && <div className="empty"><div className="empty-icon"><PackageCheck className="size-8" /></div><p className="empty-title">No matching inventory</p><p className="empty-subtitle text-secondary">Choose another queue or clear your search and store filters.</p></div>}
+          </div>}
         </CardContent>
       </Card>
+      </div>
     </div>
+    <Dialog open={Boolean(archiveItem)} onOpenChange={(open) => { if (!open && !archiveBusy) setArchiveItem(null) }}><DialogContent><DialogHeader><DialogTitle>Archive stock #{archiveItem?.id}</DialogTitle><DialogDescription>This removes {archiveItem?.quantity} unit(s) from available stock. The record and history are retained. Reserved stock cannot be archived.</DialogDescription></DialogHeader><Label htmlFor="inventory-archive-reason">Reason for archiving</Label><Input id="inventory-archive-reason" maxLength={1000} value={archiveReason} onChange={(event) => setArchiveReason(event.target.value)} placeholder="For example: damaged, expired, or no longer expected" /><Button disabled={archiveBusy || !archiveReason.trim()} onClick={archiveInventory}>{archiveBusy ? "Archiving…" : "Move to Archived"}</Button></DialogContent></Dialog>
+    <Dialog open={Boolean(timelineItem)} onOpenChange={(open) => { if (!open) setTimelineItem(null) }}><DialogContent className="epost-detail inventory-timeline-dialog"><DialogHeader><DialogTitle>Stock movement · #{timelineItem?.id}</DialogTitle><DialogDescription>{timelineItem?.product_name} · Includes the source stock and its split allocations. Earlier history is limited to saved records.</DialogDescription></DialogHeader>{timelineLoading && <p role="status">Loading movements…</p>}{timelineError && <p role="alert">{timelineError}</p>}<ol className="inventory-timeline">{timeline.map((movement) => <li key={movement.id}><div className="flex flex-wrap justify-between gap-2"><strong>{({ history_started: "History recording started", created: "Stock added", reserved: "Reserved for an order", sent: "Confirmed sent", archived: "Archived", status_changed: "Stock status changed", quantity_changed: "Quantity changed", evidence_updated: "Evidence updated" } as Record<string, string>)[movement.event_type] || movement.event_type}</strong><time>{formatDateTime(movement.occurred_at)}</time></div><div>Stock #{movement.inventory_id} · {movement.previous_state ? `${movement.previous_state.status} (${movement.previous_state.quantity}) → ` : ""}{movement.current_state.status} ({movement.current_state.quantity}){movement.current_state.reserved_order_line_id ? ` · ${movement.target_order_name || `Order line #${movement.current_state.reserved_order_line_id}`}` : ""}</div>{movement.reason && <p>{movement.reason}</p>}{movement.event_type === "history_started" && <div className="text-secondary">{movement.current_state.source_delivered_at && <div>Saved delivery date: {formatDateTime(movement.current_state.source_delivered_at)}</div>}{movement.current_state.source_received_at && <div>Saved warehouse receipt: {formatDateTime(movement.current_state.source_received_at)}</div>}</div>}</li>)}</ol>{!timelineLoading && !timelineError && !timeline.length && <p>No movement history recorded yet.</p>}</DialogContent></Dialog>
     <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
       <DialogContent className="max-w-3xl">
         <DialogHeader>

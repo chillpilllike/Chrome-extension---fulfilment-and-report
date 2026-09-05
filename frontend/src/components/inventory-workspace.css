@@ -1,4 +1,15 @@
 .inventory-card-list { display: grid; gap: 10px; padding: 12px; height: auto; max-height: none; overflow: visible; }
+.inventory-workspace .epost-heading { margin-bottom: 16px; }
+.inventory-workspace .epost-related { display: grid; gap: 8px; }
+.inventory-workspace .epost-main { box-shadow: none; }
+.inventory-workspace .inventory-stock-details h4 { margin-bottom: 5px; }
+.inventory-workspace .inventory-stock-details p { margin: 3px 0; font-size: .875rem; }
+.inventory-archive-note { grid-column: 1 / -1; display: grid; gap: 4px; padding: 10px 12px; border-left: 3px solid #69829c; border-radius: 6px; background: var(--tblr-bg-surface-secondary, #f4f7fb); font-size: .875rem; overflow-wrap: anywhere; }
+.inventory-timeline { list-style: none; padding: 0 0 0 16px; margin: 12px 0; border-left: 2px solid var(--border, #dce3ed); }
+.inventory-timeline li { position: relative; padding: 0 0 22px 10px; font-size: .875rem; overflow-wrap: anywhere; }
+.inventory-timeline li::before { content: ''; position: absolute; left: -22px; top: 5px; width: 10px; height: 10px; border-radius: 50%; background: #206bc4; }
+.inventory-timeline time { color: var(--muted-foreground, #627189); font-size: .8125rem; }
+.inventory-timeline p { color: var(--muted-foreground, #627189); }
 .inventory-stock-card.card { width: 100%; min-width: 0; border: 1px solid var(--tblr-border-color, #dce3ed); border-radius: 10px; box-shadow: 0 2px 5px #22365108; overflow: visible; }
 .inventory-stock-layout.card-body { display: grid; grid-template-columns: 72px minmax(0, 1fr) minmax(80px, auto); gap: 10px 14px; padding: 12px 14px; }
 .inventory-product-image { grid-row: 1; }
