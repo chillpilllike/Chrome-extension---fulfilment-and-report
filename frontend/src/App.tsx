@@ -12038,6 +12038,7 @@ const afterOrderDecisionLabels: Record<string, string> = {
 }
 
 function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId: string; onResult: (modal: ModalState) => void; initialQuery?: string }) {
+  const [reviewCaseId, setReviewCaseId] = useState<number | null>(null)
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [searchQuery, setSearchQuery] = useState(initialQuery)
@@ -12220,14 +12221,32 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
         </TeamTools>
       }>
 
-      <div className="epost-selection"><span>Highest severity first · open a case to review</span><span>{searchQuery ? `Search: “${searchQuery}”` : "All orders in this queue"}</span></div>
+      <div className="epost-selection"><span>Highest severity first · review a case before taking action</span><span>{searchQuery ? `Search: “${searchQuery}”` : "All orders in this queue"}</span></div>
+      <Table className="epost-work-table care-work-table">
+        <TableHeader><TableRow><TableHead>Order / store</TableHead><TableHead>Issue / evidence</TableHead><TableHead>Customer request</TableHead><TableHead>Next action</TableHead><TableHead>Manage</TableHead></TableRow></TableHeader>
+        <TableBody>
+          {(!loading ? rows : []).map(row => {
+          const context = row.context || {}
+          const currentLabel = afterOrderDecisionLabels[row.current_decision || ""] || "No customer request yet"
+          const awaitingFirstScan = context.risk_state === "awaiting_first_scan"
+          const itemCase = row.case_type === "item_unavailable"
+          const deliveryConfirmation = row.case_type === "delivery_confirmation"
+          const decisionCase = itemCase || deliveryConfirmation || row.case_type === "expected_dispatch" || context.risk_state === "suspected_lost"
+          const nextStep = row.status === "resolved" ? "Review resolution" : row.confirmed_at ? "Review approved follow-up" : itemCase && row.unavailable_notice?.blocked ? "Resolve sourcing blocker" : itemCase && row.unavailable_notice && !row.unavailable_notice.approved ? "Review sourcing first" : row.current_decision ? "Review & confirm decision" : awaitingFirstScan ? "Check first carrier scan" : decisionCase ? "Review customer choices" : "Review tracking evidence"
 
-      {loading ? <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">Loading after-order cases...</div> : null}
-      {!loading && !rows.length ? <div className="rounded-lg border bg-card p-10 text-center text-muted-foreground">No after-order cases match this view.</div> : null}
+            return <TableRow key={row.id}>
+              <TableCell><strong className="epost-order">{row.odoo_order_name || row.tracking_code || `Case ${row.id}`}</strong><small>{row.store_name}{row.website_id ? ` · Website ${row.website_id}` : ""}</small><small title="Odoo order placement date">Placed: {row.odoo_order_date ? formatOrderDateTime(row.odoo_order_date) : "Not recorded"}</small>{row.tracking_code && <span className="epost-code">{row.tracking_code}</span>}</TableCell>
+              <TableCell><span className={`epost-status ${row.severity === "high" ? "ep-confirmed_lost" : row.severity === "medium" ? "ep-carrier_exception" : "ep-in_transit"}`}>{row.title}</span><p>{itemCase ? `${row.affected_items.length} affected product${row.affected_items.length === 1 ? "" : "s"}` : context.latest_status || context.risk_reason || "Review available evidence"}</p><small>{row.severity} priority</small></TableCell>
+              <TableCell><strong>{decisionCase ? currentLabel : "No customer decision required"}</strong><small>{row.status.replaceAll("_", " ")}</small>{row.confirmed_at && <small>Confirmed by team</small>}{row.execution && <small>Execution: {row.execution.status.replaceAll("_", " ")}</small>}</TableCell>
+              <TableCell><strong>{nextStep}</strong><p>{row.unavailable_notice?.blocked ? row.unavailable_notice.reason : row.execution?.last_error || (awaitingFirstScan ? "Check carrier acceptance; no lost email queued." : "Review the evidence and latest request before taking action.")}</p></TableCell>
+              <TableCell><Button size="sm" variant="outline" disabled={loading} onClick={() => setReviewCaseId(row.id)}>Review case</Button></TableCell>
+            </TableRow>
+          })}
+          {(loading || !rows.length) && <TableRow><TableCell colSpan={5}><div className="epost-empty" role="status"><h3>{loading ? "Loading cases…" : "No cases in this view"}</h3><p>{loading ? "Reading the latest case records." : "Choose another queue or search for an order or tracking number."}</p></div></TableCell></TableRow>}
+        </TableBody>
+      </Table>
 
-      <div className="care-case-list">
-        <div className="care-column-head" aria-hidden="true"><span>Order / store</span><span>Issue / latest request</span><span>Case status</span><span>Next step</span><span /></div>
-        {(!loading ? rows : []).map((row) => {
+      {(!loading ? rows : []).filter(row => row.id === reviewCaseId).map(row => {
           const context = row.context || {}
           const currentLabel = afterOrderDecisionLabels[row.current_decision || ""] || "No customer request yet"
           const previousLabel = afterOrderDecisionLabels[row.previous_decision || ""] || ""
@@ -12235,16 +12254,10 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           const itemCase = row.case_type === "item_unavailable"
           const deliveryConfirmation = row.case_type === "delivery_confirmation"
           const decisionCase = itemCase || deliveryConfirmation || row.case_type === "expected_dispatch" || context.risk_state === "suspected_lost"
-          const nextStep = row.status === "resolved" ? "Review resolution" : row.confirmed_at ? "Review approved follow-up" : itemCase && row.unavailable_notice?.blocked ? "Resolve sourcing blocker" : itemCase && row.unavailable_notice && !row.unavailable_notice.approved ? "Review sourcing first" : row.current_decision ? "Review & confirm decision" : awaitingFirstScan ? "Check first carrier scan" : decisionCase ? "Review customer choices" : "Review tracking evidence"
-          return (
-            <details key={row.id} className={`care-case care-severity-${row.severity}`}>
-              <summary className="care-case-summary">
-                <span className="care-order-cell"><strong>{row.odoo_order_name || row.tracking_code || `Case ${row.id}`}</strong><small>{row.store_name}</small><small title="Odoo order placement date">Placed: {row.odoo_order_date ? formatOrderDateTime(row.odoo_order_date) : "Not recorded"}</small></span>
-                <span className="care-issue-cell"><strong>{row.title}</strong><small>{decisionCase ? currentLabel : context.latest_status || context.risk_reason || "Review available evidence"}</small></span>
-                <span className="care-state-cell"><span className="care-state">{row.status.replaceAll("_", " ")}</span><small>{row.severity} priority</small></span>
-                <span className="care-next-cell">{nextStep}</span>
-                <ChevronDown className="care-expand size-4" />
-              </summary>
+
+        return <Dialog key={row.id} open={true} onOpenChange={open => { if (!open) setReviewCaseId(null) }}>
+          <DialogContent className="epost-detail care-review-dialog">
+            <DialogHeader><DialogTitle>{row.odoo_order_name || row.tracking_code} · Case review</DialogTitle><DialogDescription>Review the latest request and evidence before confirming an action. Approval does not mean execution has completed.</DialogDescription></DialogHeader>
               <div className="care-case-detail">
                 <header className="care-detail-meta">
                   <Badge variant={row.severity === "high" ? "destructive" : "outline"}>{row.title}</Badge>
@@ -12303,10 +12316,10 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   <Button variant="outline" onClick={() => void openActivity(row)}>View activity</Button>
                 </div>
               </div>
-            </details>
-          )
-        })}
-      </div>
+
+          </DialogContent>
+        </Dialog>
+      })}
 
       <Dialog open={Boolean(activityCase)} onOpenChange={(open) => !open && setActivityCase(null)}>
         <DialogContent className="max-w-2xl">

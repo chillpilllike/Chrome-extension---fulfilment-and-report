@@ -1,83 +1,29 @@
 .care-workspace { min-width: 0; }
+.care-mode { border: 1px solid #e9ce94; background: #fffbef; color: #795514; border-radius: 6px; padding: 7px 10px; font-size: 14px; }
+.care-mode.is-live { background: #fff0f1; border-color: #ebacb4; color: #9e2838; }
 .care-admin-tools { margin-bottom: 22px; }
+.care-admin-tools .team-tools { background: var(--card); }
+.care-admin-tools .team-tools > summary { padding: 14px 18px; }
 .care-queue-note { margin: 18px 8px 4px; padding-top: 14px; border-top: 1px solid var(--ep-line); }
 .care-workspace .epost-related a { display: block; padding: 7px 0; color: var(--primary); line-height: 1.5; }
 .care-workspace .epost-related a:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
-.care-workspace .epost-main .care-case-list { border: 0; border-radius: 0; background: var(--card); }
-.care-workspace .epost-main .care-column-head { background: var(--muted); color: var(--muted-foreground); font-size: 14px; }
-.care-workspace .epost-main .care-case-summary { padding: 18px 20px; color: var(--foreground); }
-.care-workspace .epost-main .care-case { border-top-color: var(--ep-line); }
-.care-workspace .epost-main .care-case-detail { background: var(--muted); padding: 22px; }
-.care-workspace .epost-main .care-case-summary:hover,
-.care-workspace .epost-main .care-case[open] > summary { background: var(--muted); }
-.care-workspace .epost-main .care-state { background: var(--muted); border-color: var(--ep-line); }
-.care-workspace .epost-main .care-case-summary small { color: var(--muted-foreground); }
-.care-workspace .team-tools { background: var(--card); }
-.care-workspace .team-tools > summary { padding: 14px 18px; }
-.care-workspace .epost-main .care-column-head,
-.care-workspace .epost-main .care-case-summary { grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.5fr) minmax(130px, 1fr) minmax(120px, 1fr) 18px; }
-.care-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-.care-heading h2 { margin: 0; font-size: 1.2rem; }
-.care-heading p { margin: 3px 0 0; color: #526176; font-size: .875rem; }
-.care-mode { border: 1px solid #e9ce94; background: #fffbef; color: #795514; border-radius: 6px; padding: 5px 9px; font-size: .875rem; }
-.care-mode.is-live { background: #fff0f1; border-color: #ebacb4; color: #9e2838; }
-.care-queue-bar .team-section-label, .care-queue-bar .team-queues button span { display: none; }
-.care-queue-bar .team-queues { display: flex; flex-wrap: wrap; gap: 4px; padding: 5px; border: 1px solid #dce3ed; border-radius: 8px; background: #f5f7fa; }
-.care-queue-bar .team-queues button { min-height: 36px; padding: 7px 12px; border: 1px solid transparent; background: transparent; border-radius: 5px; box-shadow: none; }
-.care-queue-bar .team-queues button strong { font-size: .875rem; }
-.care-queue-bar .team-queues button.is-active { background: #fff; border-color: #b9cee8; color: #195fae; box-shadow: 0 1px 3px #142e4a14; }
-.care-workspace .team-filter-bar { padding: 0; background: transparent; }
-.care-workspace .team-filter-bar > div { align-items: end; }
-.care-workspace .team-tools > summary { padding: 7px 10px; font-size: .875rem; }
-.care-workspace .team-tools { background: #fafbfd; }
-.care-scope { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; color: #637186; font-size: .8125rem; }
-.care-case-list { border: 1px solid #dce3ed; border-radius: 9px; overflow: hidden; background: #fff; }
-.care-column-head, .care-case-summary { display: grid; grid-template-columns: minmax(135px, .8fr) minmax(220px, 1.8fr) minmax(150px, 1fr) minmax(170px, 1.1fr) 18px; gap: 16px; align-items: center; padding: 12px 16px; }
-.care-column-head { background: #f5f7fa; color: #526176; font-size: .8125rem; font-weight: 650; }
-.care-case { border-top: 1px solid #e2e8f0; border-left: 3px solid #c6d2df; }
-.care-case.care-severity-high { border-left-color: #d44950; }
-.care-case.care-severity-medium { border-left-color: #d69a36; }
-.care-case-summary { cursor: pointer; list-style: none; min-height: 76px; font-size: .875rem; color: #26394f; }
-.care-case-summary::-webkit-details-marker { display: none; }
-.care-case-summary:hover { background: #f8faff; }
-.care-case-summary:focus-visible { outline: 3px solid #206bc4; outline-offset: -3px; }
-.care-case-summary > span { min-width: 0; }
-.care-case-summary strong { display: block; overflow-wrap: anywhere; font-weight: 600; }
-.care-case-summary small { display: block; margin-top: 4px; font-size: .8125rem; color: #637186; overflow-wrap: anywhere; }
-.care-issue-cell small { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.care-state { display: inline-block; background: #eef2f7; border: 1px solid #e1e7ef; padding: 3px 7px; border-radius: 5px; text-transform: capitalize; }
-.care-next-cell { color: #245d9f; font-weight: 550; }
-.care-case[open] > summary { background: #eef5ff; border-bottom: 1px solid #dbe5f2; }
-.care-case[open] .care-expand { transform: rotate(180deg); }
-.care-case-detail { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; padding: 16px; background: #fcfdff; }
-.care-detail-meta { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0; }
-.care-detail-meta h3, .care-detail-meta p, .care-detail-meta a { margin: 0; }
-.care-detail-meta h3 { font-size: 1rem; }
-.care-evidence, .care-decision, .care-status-detail { min-width: 0; overflow-wrap: anywhere; font-size: .875rem; }
-.care-case-detail .text-xs { font-size: .8125rem; }
-.care-case-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; padding-top: 12px; border-top: 1px solid #dce3ed; }
-@media (max-width: 1000px) {
- .care-column-head { display: none; }
- .care-case-summary { grid-template-columns: minmax(120px, .7fr) minmax(180px, 1.4fr) minmax(130px, 1fr) 18px; gap: 10px; }
- .care-next-cell { grid-column: 2 / 4; }
- .care-expand { grid-column: 4; grid-row: 1; }
- .care-case-detail { grid-template-columns: 1fr 1fr; }
- .care-status-detail { grid-column: 1 / -1; }
-}
-@media (min-width: 1051px) and (max-width: 1300px) {
- .care-workspace .care-column-head { display: none; }
- .care-workspace .epost-main .care-case-summary { grid-template-columns: minmax(100px, 1fr) minmax(140px, 1.5fr) 18px; }
- .care-workspace .care-state-cell { grid-column: 1; }
- .care-workspace .care-next-cell { grid-column: 2; }
- .care-workspace .care-expand { grid-column: 3; grid-row: 1; }
- .care-workspace .care-case-detail { grid-template-columns: 1fr; }
-}
-@media (max-width: 600px) {
- .care-workspace .epost-main .care-case-summary { grid-template-columns: minmax(0, 1fr) 22px; }
- .care-case-summary > span { grid-column: 1; }
- .care-case-summary .care-expand { grid-column: 2; }
- .care-case-detail { grid-template-columns: 1fr; }
- .care-detail-meta { display: grid; }
- .care-case-actions > button { width: 100%; }
- .care-admin-tools label { min-width: 0; width: 100%; }
+/* Same table primitive, spacing and typography as ePost, without a selection column. */
+.epost-work-table.care-work-table th:first-child { width: 20%; }
+.epost-work-table.care-work-table th:nth-child(2) { width: 23%; }
+.epost-work-table.care-work-table th:nth-child(3) { width: 20%; }
+.epost-work-table.care-work-table th:nth-child(4) { width: 23%; }
+.epost-work-table.care-work-table th:last-child { width: 140px; }
+.care-work-table .epost-order { margin-bottom: 6px; }
+.care-work-table .epost-code { margin-top: 8px; }
+.care-review-dialog .care-case-detail { display: grid; gap: 20px; font-size: 14px; }
+.care-review-dialog .care-detail-meta,
+.care-review-dialog .care-evidence,
+.care-review-dialog .care-decision,
+.care-review-dialog .care-status-detail,
+.care-review-dialog .care-case-actions { border-top: 1px solid var(--border); padding-top: 18px; min-width: 0; overflow-wrap: anywhere; }
+.care-review-dialog .care-case-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.care-review-dialog .text-xs { font-size: 13px; }
+@media (max-width: 640px) {
+  .care-admin-tools label { min-width: 0; width: 100%; }
+  .care-review-dialog .care-case-actions > button { width: 100%; }
 }
