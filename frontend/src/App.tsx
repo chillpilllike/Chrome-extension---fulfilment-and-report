@@ -1315,6 +1315,8 @@ type AmazonOtpRow = {
 }
 
 type InventoryItem = {
+  source_label?: string
+  amazon_tracking_status?: string
   archived_at?: string
   archive_reason?: string
   id: number
@@ -12941,18 +12943,19 @@ function InventoryPage({
                   {item.archived_at && <div className="inventory-archive-note"><strong>Archived · {formatDateTime(item.archived_at)}</strong><span>{item.archive_reason || "Historical stock record"}</span></div>}
                   <div className="inventory-stock-details">
                     <section><h4><Database className="size-4" /> Stock source</h4>
-                    <Badge variant="outline">{item.source_type || "amazon_cancelled"}</Badge>
+                    <Badge variant="outline">{item.source_label || ({ manual: "Manual stock", amazon_cancelled: "Cancelled customer order", cancelled_order: "Cancelled customer order" } as Record<string, string>)[item.source_type] || "Legacy / other stock"}</Badge>
                     {item.source_odoo_order_name ? <OdooOrderRef name={item.source_odoo_order_name} className="text-xs text-muted-foreground" /> : <div className="text-xs text-muted-foreground">{item.notes || ""}</div>}
                   <div className="inventory-detail-label">Amazon order / account</div>
                     {item.amazon_order_id ? <a className="font-mono text-xs text-primary underline-offset-4 hover:underline" href={item.amazon_order_url} target="_blank">{item.amazon_order_id}</a> : <span className="text-muted-foreground">Manual</span>}
                     <div className="text-xs text-muted-foreground">{item.amazon_account_name || ""}</div>
+                    {item.amazon_order_id && <div className="text-xs"><span className="text-muted-foreground">Amazon status: </span>{item.amazon_tracking_status || "Not recorded"}</div>}
                   </section>
                     <section><h4><CheckCircle2 className="size-4" /> Release evidence</h4>
                     {item.source_type === "manual" ? (
                       <Badge variant="outline">Manual stock</Badge>
                     ) : (
                       <div className="grid min-w-44 gap-1 text-xs">
-                        <span className={item.source_delivered_at ? "text-emerald-700" : "text-amber-700"}>{item.source_delivered_at ? `Delivered ${formatDateTime(item.source_delivered_at)}` : "Delivery pending"}</span>
+                        <span className={item.source_delivered_at ? "text-emerald-700" : "text-amber-700"}>{item.source_delivered_at ? `Delivered ${formatDateTime(item.source_delivered_at)}` : "Delivery proof not saved on this stock record"}</span>
                         <span className={item.source_received_at ? "text-emerald-700" : "text-amber-700"}>{item.source_received_at ? `Received ${formatDateTime(item.source_received_at)}` : "Receipt pending"}</span>
                         <span className={item.source_shopify_cancelled_at ? "text-emerald-700" : "text-amber-700"}>{item.source_shopify_cancelled_at ? `Shopify cancelled ${formatDateTime(item.source_shopify_cancelled_at)}` : "Shopify cancellation pending"}</span>
                         <span className={item.source_odoo_status ? "text-emerald-700" : "text-amber-700"}>Odoo: {item.source_odoo_status || "pending"}</span>

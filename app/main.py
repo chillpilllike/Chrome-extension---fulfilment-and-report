@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services.inventory_history import install_inventory_history, inventory_filter
+from app.services.inventory_labels import annotate_inventory_labels
 
 import csv
 import copy
@@ -8087,6 +8088,7 @@ def inventory_items_payload(items: list[Any]) -> list[dict[str, Any]]:
     })
     with db() as conn:
         image_by_item_id = inventory_product_images(data, conn)
+        annotate_inventory_labels(data, conn)
         lines_by_id: dict[int, dict[str, Any]] = {}
         if reserved_ids:
             placeholders = ",".join("?" for _ in reserved_ids)
