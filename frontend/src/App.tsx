@@ -39,6 +39,8 @@ import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerCo
 import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
+import "@/components/after-care-workspace.css"
+import "@/components/pickup-controls.css"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -7900,7 +7902,7 @@ function PackagePickupPage({
         </DialogContent>
       </Dialog>
 
-      <section className="pickup-toolbar">
+      <section className="pickup-toolbar pickup-controls-workspace">
         <div className="pickup-toolbar-body">
           <button
             type="button"
@@ -7917,6 +7919,9 @@ function PackagePickupPage({
             <span className="pickup-today-scan-metric is-error"><small>Unsuccessful</small><strong>{todayPickupScanSummary.unsuccessful}</strong></span>
             <ChevronRight className="size-4" />
           </button>
+          <div className="pickup-control-layout">
+          <section className="pickup-control-panel" aria-labelledby="pickup-filter-title">
+            <header className="pickup-control-heading"><span className="pickup-control-icon"><StoreIcon className="size-5" /></span><div><h3 id="pickup-filter-title">Filter packages</h3><p>Choose the store and Amazon delivery dates to review.</p></div></header>
           <div className="pickup-filter-grid">
             <SelectField label="Store" value={storeId} onChange={onStoreChange}>
               <option value="">All stores</option>
@@ -7928,8 +7933,10 @@ function PackagePickupPage({
               <option value="all">All packages</option>
               <option value="amazon_unfulfilled">Amazon delivered · Shopify unfulfilled</option>
             </SelectField>
-            <button type="button" className="pickup-cutoff-chip" onClick={openPickupTimeEditor} title="Edit team pickup time"><Clock className="size-4" /><span>Team pickup <strong>{pickupTimeLabel(data?.cutoff || "09:30")}</strong></span><Edit className="size-3.5" /></button>
           </div>
+          </section>
+          <section className="pickup-control-panel pickup-action-panel" aria-labelledby="pickup-tools-title">
+            <header className="pickup-control-heading"><span className="pickup-control-icon"><Camera className="size-5" /></span><div><h3 id="pickup-tools-title">Scan & pickup tools</h3><p>Record packages physically received by the team.</p></div></header>
           <div className="pickup-toolbar-actions">
             <Button className="pickup-scanner-launch" size="sm" onClick={() => openPickupScanner("camera")}>
               <Camera className="size-4" /> Scan received packages
@@ -7939,15 +7946,21 @@ function PackagePickupPage({
                 <CheckCircle2 className="size-4" /> Last session
               </Button>
             ) : null}
-            <Button variant="outline" size="sm" onClick={() => setShowPackageSearch((current) => !current)} aria-expanded={showPackageSearch}>
-              <Search className="size-4" /> {showPackageSearch ? "Hide package search" : "Search packages"}
-            </Button>
             <Button variant="outline" size="sm" onClick={() => void loadPickupScanHistory(true, pickupHistoryDate).then(() => load())} disabled={loading}>
               <RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} /> {loading ? "Refreshing…" : "Refresh"}
             </Button>
           </div>
+          <button type="button" className="pickup-cutoff-chip" onClick={openPickupTimeEditor} title="Edit team pickup time"><Clock className="size-4" /><span>Team pickup <strong>{pickupTimeLabel(data?.cutoff || "09:30")}</strong></span><Edit className="size-3.5" /></button>
+          </section>
+          </div>
+          <section className="pickup-control-panel pickup-find-panel" aria-labelledby="pickup-find-title">
+            <header className="pickup-control-heading"><span className="pickup-control-icon"><Search className="size-5" /></span><div><h3 id="pickup-find-title">Find a specific package</h3><p>Enter a complete order or tracking number. The filters above still apply.</p></div>
+              <Button variant="outline" size="sm" onClick={() => setShowPackageSearch((current) => !current)} aria-expanded={showPackageSearch} aria-controls="pickup-exact-search">
+                <Search className="size-4" /> {showPackageSearch ? "Hide search" : "Show search"}
+              </Button>
+            </header>
           {showPackageSearch && (
-            <div className="pickup-search-grid pickup-search-panel">
+            <div id="pickup-exact-search" className="pickup-search-grid pickup-search-panel">
               <SelectField label="Exact search field" value={searchField} onChange={setSearchField}>
                 <option value="all">All fields</option>
                 <option value="odoo_order">Odoo order</option>
@@ -7961,26 +7974,28 @@ function PackagePickupPage({
               {normalizedExactSearch && <div className="pickup-search-result">{visiblePackageCount} exact package match{visiblePackageCount === 1 ? "" : "es"}</div>}
             </div>
           )}
-          <div className="team-results-label"><span>{visiblePackageCount} matching packages across {visibleCards.length} date cards</span><span>Search requires a complete number; store and date filters still apply.</span></div>
+          <div className="pickup-result-count"><PackageCheck className="size-4" /><span><strong>{visiblePackageCount.toLocaleString()}</strong> matching packages <span className="pickup-result-divider">·</span> <strong>{visibleCards.length.toLocaleString()}</strong> date cards</span>{normalizedExactSearch && <span className="pickup-search-applied">Search: {exactSearch}</span>}</div>
           {packageView === "amazon_unfulfilled" && (
             <div className="pickup-active-filter">
               <span><strong>{visiblePackageCount}</strong> Amazon-delivered package{visiblePackageCount === 1 ? "" : "s"} not fulfilled in Shopify</span>
               <button type="button" onClick={() => setPackageView("all")}>Clear filter</button>
             </div>
           )}
+          </section>
         </div>
       </section>
 
-      <div className="pickup-rule-note">
-        <Clock className="size-4" />
-        <span><strong>Scan-date rule:</strong> an expected package stays on its Amazon delivery-date card until received, then moves to the Brooklyn date card on which it was first scanned. Its original Amazon delivery time remains visible in small text and is included by the date filters.</span>
-      </div>
-
-      <section className="pickup-summary-strip" aria-label="Selected date range totals">
-        <div><span>Amazon delivered</span><strong>{summary.amazon_reported_delivered}</strong></div>
-        <div><span>Amazon picked up</span><strong>{summary.amazon_picked_up}</strong></div>
-        <div><span>Non-Amazon picked up</span><strong>{summary.non_amazon_picked_up}</strong></div>
-        <div className={summary.missing_amazon || summary.unreported_amazon ? "is-missing" : "is-complete"}><span>Difference</span><strong>{summary.missing_amazon ? `Missing ${summary.missing_amazon}` : summary.unreported_amazon ? `Extra ${summary.unreported_amazon}` : "Matched"}</strong></div>
+      <section className="pickup-overview" aria-label="Selected date range totals">
+        <header className="pickup-overview-heading"><h3>Pickup reconciliation</h3><span>Selected store & date range · totals do not narrow with package search</span></header>
+        <div className="pickup-metric-grid">
+          <div className="pickup-metric"><TruckDelivery className="size-5" /><span>Amazon delivered</span><strong>{summary.amazon_reported_delivered.toLocaleString()}</strong><small>Reported by Amazon</small></div>
+          <div className="pickup-metric"><PackageCheck className="size-5" /><span>Amazon picked up</span><strong>{summary.amazon_picked_up.toLocaleString()}</strong><small>Recorded team pickup</small></div>
+          <div className="pickup-metric"><PackageCheck className="size-5" /><span>Non-Amazon picked up</span><strong>{summary.non_amazon_picked_up.toLocaleString()}</strong><small>Other package sources</small></div>
+          <div className={`pickup-metric ${summary.missing_amazon || summary.unreported_amazon ? "has-discrepancy" : "is-reconciled"}`}>
+            {summary.missing_amazon || summary.unreported_amazon ? <AlertCircle className="size-5" /> : <CheckCircle2 className="size-5" />}<span>Reconciliation difference</span><strong>{summary.missing_amazon ? `Missing ${summary.missing_amazon.toLocaleString()}` : summary.unreported_amazon ? `Extra ${summary.unreported_amazon.toLocaleString()}` : "Matched"}</strong><small>{summary.missing_amazon || summary.unreported_amazon ? "Review the affected date cards below" : "Recorded counts match"}</small>
+          </div>
+        </div>
+        <details className="pickup-date-explainer"><summary><Clock className="size-4" /> How delivery dates and scan dates work</summary><p>An expected package stays on its Amazon delivery-date card until received, then moves to the Brooklyn date card on which it was first scanned. Its original Amazon delivery time remains visible in small text and is included by the date filters.</p></details>
       </section>
 
       {visibleCards.length > pickupDaysPerPage && (
@@ -12132,26 +12147,23 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
   const needsConfirmation = Number(summary.needs_confirmation || 0)
   const waiting = Number(summary.needs_attention || 0)
   const tracking = Number(summary.tracking || 0)
-  const resolved = Number(summary.resolved || 0) + Number(summary.approved || 0)
 
   return (
-    <div className="grid gap-4">
-      <TeamWorkspaceHeader title="After-order care workspace" description="Review the case, check the customer's latest request, then use the available case actions. Approval is a decision checkpoint—not proof that a refund, replacement or email has completed." current="after-order-care" />
-      <div className={`team-mode-strip ${emailTestMode ? "" : "is-live"}`} role="status">
-        <strong>{emailTestMode ? "Test mode · emails redirected" : "Live mode · customer delivery permitted"}</strong>
-        {" · "}Email mode controls are under Email testing & settings.
-      </div>
+    <div className="care-workspace">
+      <header className="care-heading"><div><h2>After-order care</h2><p>Review an issue → check the latest request → take the next action.</p></div><span className={`care-mode ${emailTestMode ? "" : "is-live"}`} role="status">{emailTestMode ? "Test mode · emails redirected" : "Live mode · customer emails permitted"}</span></header>
+      <div className="care-queue-bar">
       <TeamQueues value={status} onChange={setStatus} queues={[
-        { value: "needs_confirmation", label: "Confirm decisions", hint: "Review the customer's latest choice" },
-        { value: "needs_attention", label: "Needs attention", hint: "Review each case and available actions" },
-        { value: "approved_pending_execution", label: "Execution pending", hint: "Approved, but not completed yet" },
-        { value: "tracking", label: "Tracking follow-up", hint: "Review carrier updates and risk notes" },
-        { value: "open", label: "All open cases", hint: "Work across the active queues" },
+        { value: "open", label: "All open", hint: "All active cases" },
+        { value: "needs_confirmation", label: `Confirm decisions · ${needsConfirmation}`, hint: "Review the latest choice" },
+        { value: "needs_attention", label: `Needs attention · ${waiting}`, hint: "Review the case" },
+        { value: "approved_pending_execution", label: `Execution pending · ${Number(summary.approved_pending_execution || 0)}`, hint: "Approved, not completed" },
+        { value: "tracking", label: `Tracking · ${tracking}`, hint: "Review carrier evidence" },
       ]} />
+      </div>
       <div className="grid gap-3">
         <div className="team-filter-bar">
         <div className="flex flex-1 flex-wrap gap-2">
-          <SearchBox value={query} onChange={setQuery} placeholder="Order, tracking number, product..." className="min-w-64 flex-1" />
+          <SearchBox value={query} onChange={setQuery} placeholder="Order, tracking number or case title…" className="min-w-64 flex-1" />
           <Button variant="outline" onClick={load} disabled={loading}><Search className="size-4" />Search</Button>
           <SelectField className="w-48" label="Case queue" value={status} onChange={setStatus}>
             <option value="open">Open cases</option>
@@ -12165,7 +12177,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           </SelectField>
         </div>
         </div>
-        <TeamTools title="Email testing & settings" description="Administrative controls, separate from the case list. Sending all test emails uses the store scope, not the current search or case queue.">
+        <TeamTools title="Email settings & test tools" description="Sending all test emails uses the store scope, not the current search or queue. Approval is not proof that a refund, replacement or email has completed.">
         <div className="flex flex-wrap gap-2 items-center">
           <Button onClick={() => void sendAllTestEmails()} disabled={!emailTestMode || sendingAllTests}>
             {sendingAllTests ? "Sending test emails…" : "Send all test emails"}
@@ -12178,19 +12190,13 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
         </TeamTools>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-        {[["Needs team confirmation", needsConfirmation, "text-destructive"], ["Needs attention", waiting, "text-amber-700"], ["Tracking updates", tracking, "text-primary"], ["Approved / resolved", resolved, "text-emerald-700"]].map(([label, count, color]) => (
-          <div key={String(label)} className="rounded-lg border bg-card px-4 py-3"><span className="text-sm text-muted-foreground">{label}</span><strong className={`mt-1 block text-2xl ${color}`}>{count}</strong></div>
-        ))}
-      </div>
-
-      <p className="text-sm text-muted-foreground">Showing actionable cards only for Odoo orders dated {new Date(`${cutoffDate}T00:00:00Z`).toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "long", day: "numeric" })} or later. Earlier and undated orders cannot be actioned.</p>
-      <div className="team-results-label"><strong>{rows.length} cases loaded · up to 50 per view</strong><span>Use Search to apply the entered text. Narrow the queue or search to find a specific case.</span></div>
+      <div className="care-scope"><span>{rows.length} cases loaded · maximum 50 · queue counts cover the store, not search results</span><span>Orders from {cutoffDate} · highest severity first · open a row to review</span></div>
 
       {loading ? <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">Loading after-order cases...</div> : null}
       {!loading && !rows.length ? <div className="rounded-lg border bg-card p-10 text-center text-muted-foreground">No after-order cases match this view.</div> : null}
 
-      <div className="grid items-stretch gap-4 md:grid-cols-2 2xl:grid-cols-3">
+      <div className="care-case-list">
+        <div className="care-column-head" aria-hidden="true"><span>Order / store</span><span>Issue / latest request</span><span>Case status</span><span>Next step</span><span /></div>
         {rows.map((row) => {
           const context = row.context || {}
           const currentLabel = afterOrderDecisionLabels[row.current_decision || ""] || "No customer request yet"
@@ -12199,11 +12205,18 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           const itemCase = row.case_type === "item_unavailable"
           const deliveryConfirmation = row.case_type === "delivery_confirmation"
           const decisionCase = itemCase || deliveryConfirmation || ["suspected_lost", "carrier_exception"].includes(String(context.risk_state || ""))
-          const cardTone = row.severity === "high" ? "border-red-300 bg-red-50/40" : row.severity === "medium" ? "border-amber-300 bg-amber-50/35" : "border-emerald-200 bg-card"
+          const nextStep = row.status === "resolved" ? "Review resolution" : row.confirmed_at ? "Review approved follow-up" : itemCase && row.unavailable_notice?.blocked ? "Resolve sourcing blocker" : itemCase && row.unavailable_notice && !row.unavailable_notice.approved ? "Review sourcing first" : row.current_decision ? "Review & confirm decision" : awaitingFirstScan ? "Check first carrier scan" : decisionCase ? "Review customer choices" : "Review tracking evidence"
           return (
-            <article key={row.id} className={`team-care-card flex min-w-0 flex-col rounded-xl border p-5 shadow-sm ${cardTone}`}>
-              <div className="flex h-full min-h-0 flex-col gap-4">
-                <header className="min-w-0 border-b pb-4">
+            <details key={row.id} className={`care-case care-severity-${row.severity}`}>
+              <summary className="care-case-summary">
+                <span className="care-order-cell"><strong>{row.odoo_order_name || row.tracking_code || `Case ${row.id}`}</strong><small>{row.store_name}</small></span>
+                <span className="care-issue-cell"><strong>{row.title}</strong><small>{decisionCase ? currentLabel : context.latest_status || context.risk_reason || "Review available evidence"}</small></span>
+                <span className="care-state-cell"><span className="care-state">{row.status.replaceAll("_", " ")}</span><small>{row.severity} priority</small></span>
+                <span className="care-next-cell">{nextStep}</span>
+                <ChevronDown className="care-expand size-4" />
+              </summary>
+              <div className="care-case-detail">
+                <header className="care-detail-meta">
                   <Badge variant={row.severity === "high" ? "destructive" : "outline"}>{row.title}</Badge>
                   <h3 className="mt-2 text-lg font-bold">{row.odoo_order_name || row.tracking_code}</h3>
                   <p className="text-sm text-muted-foreground">{row.store_name}{row.website_id ? ` · Website ${row.website_id}` : ""}</p>
@@ -12211,7 +12224,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {row.odoo_order_url ? <a className="mt-2 inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline" href={row.odoo_order_url} target="_blank">Open in Odoo <ExternalLink className="size-3" /></a> : null}
                 </header>
 
-                <div className="team-case-content min-h-0 flex-1 pr-1">
+                <div className="care-evidence">
                   {itemCase ? (
                     <div className="grid gap-2">
                       <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Affected product{row.affected_items.length === 1 ? "" : "s"}</span>
@@ -12228,7 +12241,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   )}
                 </div>
 
-                <div className="min-w-0 border-t pt-4">
+                <div className="care-decision">
                   <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{decisionCase ? "Current request" : "Assessment"}</span>
                   <strong className="mt-1 block text-sm">{decisionCase ? currentLabel : context.risk_reason}</strong>
                   {previousLabel && previousLabel !== currentLabel ? <span className="mt-2 block text-xs text-muted-foreground">Previous request: {previousLabel}</span> : null}
@@ -12239,7 +12252,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {row.confirmed_at ? <Badge variant="secondary" className="mt-2">Links expired after approval</Badge> : null}
                 </div>
 
-                <div className="min-w-0 border-t pt-4 text-sm">
+                <div className="care-status-detail">
                   <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Status</span>
                   <strong className="mt-1 block">{row.status.replaceAll("_", " ")}</strong>
                   {itemCase && row.unavailable_notice ? <p className="mt-2 text-xs font-medium text-amber-800">{row.unavailable_notice.blocked ? "Unavailable email suppressed: " : "Customer email: "}{row.unavailable_notice.reason}</p> : null}
@@ -12247,7 +12260,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {context.last_update_at ? <p className="mt-2 text-xs text-muted-foreground">Last update {formatDateTime(context.last_update_at)}</p> : null}
                 </div>
 
-                <div className="mt-auto grid shrink-0 grid-cols-2 gap-2 border-t pt-4">
+                <div className="care-case-actions">
                   {itemCase && !row.confirmed_at && row.unavailable_notice && !row.unavailable_notice.blocked && !row.unavailable_notice.approved ? <Button variant="outline" onClick={() => void approveUnavailableNotice(row)}>Approve sourcing review</Button> : null}
                   {row.current_decision && !row.confirmed_at ? <Button onClick={() => void confirmDecision(row)}>Confirm decision</Button> : null}
                   {!row.confirmed_at && decisionCase ? <Button variant="outline" onClick={() => void createTestLink(row)}>Preview customer choices</Button> : null}
@@ -12257,7 +12270,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   <Button variant="outline" onClick={() => void openActivity(row)}>View activity</Button>
                 </div>
               </div>
-            </article>
+            </details>
           )
         })}
       </div>
