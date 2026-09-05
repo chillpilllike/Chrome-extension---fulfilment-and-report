@@ -799,6 +799,10 @@ def request_has_public_access(request: Request) -> bool:
 
 def request_requires_public_access(request: Request) -> bool:
     path = request.url.path
+    # Email image proxies have no app cookie. Exempt only the product-image
+    # lookup, never the surrounding order/tracking APIs or write methods.
+    if request.method in {"GET", "HEAD"} and re.fullmatch(r"/api/public/asin-image/[A-Za-z0-9]{10}", path):
+        return False
     # The Odoo bridge authenticates its own shared key and website host in
     # both handlers. It must not require a customer's public-access session.
     if request.method in {"GET", "POST"} and re.fullmatch(
@@ -37732,11 +37736,11 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                 """INSERT INTO after_order_cases
                    (case_key, store_id, odoo_order_id, odoo_order_name, case_type, status, severity, title, affected_items_json, context_json, created_at, updated_at)
                    VALUES (?, ?, ?, ?, 'expected_dispatch', 'needs_attention', 'medium', 'Expected dispatch update', ?, ?, ?, ?)
-                   ON CONFLICT(case_key) DO UPDATE SET context_json=excluded.context_json,
+                   ON CONFLICT(case_key) DO UPDATE SET context_json=excluded.context_json, affected_items_json=excluded.affected_items_json,
                    status=CASE WHEN after_order_cases.confirmed_at IS NOT NULL THEN after_order_cases.status WHEN after_order_cases.current_decision IS NOT NULL THEN 'needs_confirmation' ELSE 'needs_attention' END,
                    updated_at=excluded.updated_at""",
                 (f"dispatch:{eta_store}:{eta_order}", eta_store, eta_order, first.get("odoo_order_name"),
-                 json.dumps([{"line_id": line["id"], "asin": line.get("asin"), "product_name": line.get("product_name"), "quantity": line.get("quantity")} for line in lines]),
+                 json.dumps([{"line_id": line["id"], "asin": line.get("asin"), "product_name": line.get("product_name"), "quantity": line.get("quantity"), "thumbnail_url": f"/api/public/asin-image/{quote_plus(line['asin'])}" if line.get("asin") else ""} for line in lines]),
                  json.dumps({"expected_dispatch_date": dispatch.isoformat()}), now, now),
             )
         missing_rows = rows_to_dicts(conn.execute(
@@ -38355,6 +38359,8 @@ def api_after_order_email_preview(case_id: int, request: Request) -> dict[str, A
     require_after_order_case_in_scope(case)
     link = create_after_order_action_link(case_id, request)
     action_url = clean_text(link.get("url"))
+    from app.services.after_order_email_images import with_email_images
+    case = with_email_images(case, after_order_absolute_url(request, "/"))
     subject, preview, _ = after_order_email_content(case, action_url)
     now = utc_now()
     test_mode = after_order_email_test_mode()
@@ -38472,11 +38478,8 @@ def send_after_order_email(
             )
         if branded_tracking_url:
             email_case["context"]["tracking_url"] = branded_tracking_url
-        email_case["affected_items"] = [dict(item) for item in case.get("affected_items") or []]
-        for item in email_case["affected_items"]:
-            thumbnail = clean_text(item.get("thumbnail_url"))
-            if thumbnail.startswith("/"):
-                item["thumbnail_url"] = after_order_absolute_url(request, thumbnail)
+        from app.services.after_order_email_images import with_email_images
+        email_case = with_email_images(email_case, after_order_absolute_url(request, "/"))
         subject, html_body, text_body = after_order_email_content(
             email_case,
             action_url,

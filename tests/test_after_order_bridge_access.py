@@ -43,6 +43,17 @@ class BridgeAccessTests(unittest.TestCase):
             self.assertTrue(self.requires_access(path))
         self.assertTrue(self.requires_access("/api/public/after-order-bridge/action/token", "DELETE"))
 
+    def test_email_product_images_do_not_require_a_browser_session(self):
+        for method in ('GET', 'HEAD'):
+            self.assertFalse(self.requires_access('/api/public/asin-image/B00IP1E3O0', method))
+
+    def test_image_exemption_does_not_expose_orders_or_writes(self):
+        for path in ('/api/public/package-tracker', '/api/public/asin-image/',
+                     '/api/public/asin-image/invalid', '/api/public/asin-image/B00IP1E3O0/private'):
+            self.assertTrue(self.requires_access(path))
+        for method in ('POST', 'PUT', 'DELETE'):
+            self.assertTrue(self.requires_access('/api/public/asin-image/B00IP1E3O0', method))
+
 
 if __name__ == "__main__":
     unittest.main()
