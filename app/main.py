@@ -162,10 +162,15 @@ if (FRONTEND_DIST / "assets").exists():
 
 @app.get("/favicon-finch.svg", include_in_schema=False)
 def fulfilment_favicon() -> Response:
-    icon = FRONTEND_DIST / "favicon-finch.svg"
+    return RedirectResponse("/favicon-gofinch.png?v=1")
+
+
+@app.get("/favicon-gofinch.png", include_in_schema=False)
+def gofinch_favicon() -> Response:
+    icon = FRONTEND_DIST / "favicon-gofinch.png"
     if not icon.exists():
         raise HTTPException(status_code=404, detail="Favicon not built")
-    return FileResponse(icon, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+    return FileResponse(icon, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 def frontend_index_response() -> Response:
