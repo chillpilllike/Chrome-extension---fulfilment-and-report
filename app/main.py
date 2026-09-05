@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.services.inventory_history import install_inventory_history, inventory_filter
 from app.services.inventory_labels import annotate_inventory_labels
+from app.services.inventory_legacy import install_inventory_legacy, legacy_delivery_available
 
 import csv
 import copy
@@ -2342,6 +2343,7 @@ def init_db() -> None:
                 ),
             )
         install_inventory_history(conn)
+        install_inventory_legacy(conn)
         address_count = conn.execute("SELECT COUNT(*) AS count FROM fulfilment_addresses").fetchone()
         if int(address_count["count"]) == 0:
             conn.execute(
@@ -9904,7 +9906,7 @@ def ensure_inventory_for_line(row: Union[dict[str, Any], dict[str, Any]]) -> Non
     with db() as conn:
         evidence = inventory_source_evidence(conn, row)
         existing = conn.execute(
-            "SELECT id, status FROM inventory_items WHERE store_id=? AND order_line_id=?",
+            "SELECT id, status, legacy_delivery_order_id FROM inventory_items WHERE store_id=? AND order_line_id=? FOR UPDATE",
             (row["store_id"], row["id"]),
         ).fetchone()
         allocated_from_source = 0.0
@@ -9918,15 +9920,14 @@ def ensure_inventory_for_line(row: Union[dict[str, Any], dict[str, Any]]) -> Non
                 (existing["id"],),
             ).fetchone()
             allocated_from_source = max(0.0, float((allocated_row or {}).get("quantity") or 0))
+        legacy_available = legacy_delivery_available(existing, row, evidence)
         evidenced_quantity = min(
             max(0.0, float(row.get("quantity") or 0)),
-            max(0.0, float(evidence.get("received_quantity") or 0)),
+            max(0.0, float(row.get("quantity") or 0) if legacy_available and not evidence.get("received_at") else float(evidence.get("received_quantity") or 0)),
         )
         inventory_quantity = max(0.0, evidenced_quantity - allocated_from_source)
         ready = bool(
-            evidence["delivered"]
-            and evidence["received_at"]
-            and evidence["shopify_cancelled_at"]
+            (legacy_available or (evidence["delivered"] and evidence["received_at"] and evidence["shopify_cancelled_at"]))
             and inventory_quantity > 0
         )
         inventory_status = "available" if ready else "incoming"
@@ -9944,6 +9945,9 @@ def ensure_inventory_for_line(row: Union[dict[str, Any], dict[str, Any]]) -> Non
             if ready
             else f"Inventory pending: Odoo {status_label}; " + "; ".join(missing_guards) + "."
         )
+        if legacy_available:
+            receipt_note = "physical receipt confirmed" if evidence.get("received_at") else "no physical receipt scan"
+            notes = f"Legacy stock exception: Amazon delivered; Odoo {status_label}; {receipt_note}. Remaining qty {inventory_quantity:g} after allocations."
         conn.execute(
             """
             INSERT INTO inventory_items

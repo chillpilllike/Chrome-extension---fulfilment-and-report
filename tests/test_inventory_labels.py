@@ -39,3 +39,9 @@ class InventoryLabelsTests(unittest.TestCase):
         annotate_inventory_labels(rows, self.conn)
         self.assertEqual([row["source_label"] for row in rows], ["Manual stock", "Legacy / other stock"])
         annotate_inventory_labels([], self.conn)
+
+    def test_legacy_and_physical_scan_confidence_are_distinct(self):
+        rows = [{"id": 1, "legacy_delivery_order_id": "amazon-1", "amazon_order_id": "amazon-1"},
+                {"id": 28, "legacy_delivery_order_id": "amazon-1", "amazon_order_id": "amazon-1", "source_received_at": "2026-09-05"}]
+        annotate_inventory_labels(rows, self.conn)
+        self.assertEqual([row['stock_confidence'] for row in rows], ['legacy_delivery', 'scanned'])

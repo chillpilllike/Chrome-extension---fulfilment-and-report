@@ -25,6 +25,20 @@ The authoritative PostgreSQL list avoids stale search-index allocation visibilit
   become available. Existing receipt, expiry and allocation guards remain intact.
 - Cancellation processing rechecks this purchase's incoming inventory immediately.
 
+## Legacy delivery exception
+
+At the first deployment of this exception, only existing non-manual, unscanned
+source records with an exact Amazon purchase marked Delivered, a cancelled/refunded
+Odoo order and positive unallocated quantity enter a fixed cohort. Reserved, used,
+archived, Amazon-cancelled and physically received records are not enrolled.
+The saved purchase ID prevents replacement purchases from inheriting the exception;
+later records do not enter it. Existing allocation quantities remain deducted.
+
+Eligible legacy stock is Available in light green without inventing a warehouse
+receipt or requiring a Shopify cancellation. Confirmed physical receipt is dark
+green. Standard release guards remain unchanged for records outside the cohort.
+The migration and subsequent evidence changes appear in the movement history.
+
 ## Timeline
 
 `inventory_movements` captures inserts and meaningful updates in the same database

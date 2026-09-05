@@ -1315,6 +1315,7 @@ type AmazonOtpRow = {
 }
 
 type InventoryItem = {
+  stock_confidence?: string
   source_label?: string
   amazon_tracking_status?: string
   archived_at?: string
@@ -12930,7 +12931,7 @@ function InventoryPage({
                     )}
                   </div>
                   <div className="inventory-product-info">
-                    <div className="inventory-stock-badges"><InventoryStatusBadge value={item.status === "used" ? "Sent / archived" : item.status} /><span className="text-secondary">Stock #{item.id}</span></div>
+                    <div className="inventory-stock-badges">{item.status === "available" && ["legacy_delivery", "scanned"].includes(item.stock_confidence || "") ? <Badge className={`inventory-confidence-${item.stock_confidence}`}>{item.stock_confidence === "scanned" ? "Available · scan confirmed" : "Available · legacy delivery"}</Badge> : <InventoryStatusBadge value={item.status === "used" ? "Sent / archived" : item.status} />}<span className="text-secondary">Stock #{item.id}</span></div>
                     <h3 className="inventory-product-title">{item.product_name || "Untitled stock item"}</h3>
                     <div className="inventory-asin">
                     {item.asin ? (
@@ -12956,7 +12957,7 @@ function InventoryPage({
                     ) : (
                       <div className="grid min-w-44 gap-1 text-xs">
                         <span className={item.source_delivered_at ? "text-emerald-700" : "text-amber-700"}>{item.source_delivered_at ? `Delivered ${formatDateTime(item.source_delivered_at)}` : "Delivery proof not saved on this stock record"}</span>
-                        <span className={item.source_received_at ? "text-emerald-700" : "text-amber-700"}>{item.source_received_at ? `Received ${formatDateTime(item.source_received_at)}` : "Receipt pending"}</span>
+                        <span className={item.source_received_at ? "text-emerald-700" : "text-amber-700"}>{item.source_received_at ? `Received ${formatDateTime(item.source_received_at)}` : item.stock_confidence === "legacy_delivery" ? "Legacy exception · no physical scan" : "Receipt pending"}</span>
                         <span className={item.source_shopify_cancelled_at ? "text-emerald-700" : "text-amber-700"}>{item.source_shopify_cancelled_at ? `Shopify cancelled ${formatDateTime(item.source_shopify_cancelled_at)}` : "Shopify cancellation pending"}</span>
                         <span className={item.source_odoo_status ? "text-emerald-700" : "text-amber-700"}>Odoo: {item.source_odoo_status || "pending"}</span>
                         {item.source_tracking_id ? <span className="font-mono text-muted-foreground">Tracking {item.source_tracking_id}</span> : null}

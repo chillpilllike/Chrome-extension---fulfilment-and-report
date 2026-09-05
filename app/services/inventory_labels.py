@@ -18,10 +18,14 @@ def annotate_inventory_labels(items, conn):
         """, ids).fetchall()
         source_rows = {int(row["id"]): dict(row) for row in rows}
     for item in items:
+        item["stock_confidence"] = (
+            "scanned" if item.get("source_received_at")
+            else "legacy_delivery" if item.get("legacy_delivery_order_id") == item.get("amazon_order_id") and item.get("legacy_delivery_order_id")
+            else "manual" if item.get("source_type") == "manual" else "pending"
+        )
         item["source_label"] = {
             "manual": "Manual stock",
             "amazon_cancelled": "Cancelled customer order",
             "cancelled_order": "Cancelled customer order",
         }.get(item.get("source_type"), "Legacy / other stock")
         item["amazon_tracking_status"] = source_rows.get(int(item["id"]), {}).get("tracking_status") or "Not recorded"
-

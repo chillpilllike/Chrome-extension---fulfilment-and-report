@@ -1,4 +1,6 @@
 .inventory-card-list { display: grid; gap: 10px; padding: 12px; height: auto; max-height: none; overflow: visible; }
+.inventory-confidence-legacy_delivery { background: #dcfce7 !important; color: #166534 !important; border: 1px solid #86c99b !important; }
+.inventory-confidence-scanned { background: #166534 !important; color: #ffffff !important; border: 1px solid #14532d !important; }
 .inventory-workspace .epost-heading { margin-bottom: 16px; }
 .inventory-workspace .epost-related { display: grid; gap: 8px; }
 .inventory-workspace .epost-main { box-shadow: none; }
