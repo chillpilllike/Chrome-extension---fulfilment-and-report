@@ -38,6 +38,7 @@ import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerCo
 
 import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
+import { AfterCareWorkspace } from "@/components/AfterCareWorkspace"
 import { EmailLogWorkspace } from "@/components/EmailLogWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
 import "@/components/after-care-workspace.css"
@@ -12037,6 +12038,10 @@ const afterOrderDecisionLabels: Record<string, string> = {
 }
 
 function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId: string; onResult: (modal: ModalState) => void; initialQuery?: string }) {
+  const [page, setPage] = useState(1)
+  const [total, setTotal] = useState(0)
+  const [searchQuery, setSearchQuery] = useState(initialQuery)
+  const requestRef = useRef(0)
   const [rows, setRows] = useState<AfterOrderCase[]>([])
   const [summary, setSummary] = useState<Record<string, number>>({})
   const [status, setStatus] = useState("open")
@@ -12062,26 +12067,33 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
   }
 
   const load = async () => {
+    const requestId = ++requestRef.current
     setLoading(true)
     try {
-      const params = new URLSearchParams({ status, page: "1", per_page: "50" })
+      const params = new URLSearchParams({ status, page: String(page), per_page: "50" })
       if (storeId) params.set("store_id", storeId)
-      if (query.trim()) params.set("q", query.trim())
-      const result = await api<{ rows: AfterOrderCase[]; summary: Record<string, number>; email_test_mode: boolean; email_test_recipient: string; cutoff_date: string; automation_enabled: boolean }>(`/api/after-order/cases?${params}`)
+      if (searchQuery.trim()) params.set("q", searchQuery.trim())
+      const result = await api<{ rows: AfterOrderCase[]; total: number; summary: Record<string, number>; email_test_mode: boolean; email_test_recipient: string; cutoff_date: string; automation_enabled: boolean }>(`/api/after-order/cases?${params}`)
+      if (requestId !== requestRef.current) return
       setRows(result.rows || [])
+      setTotal(result.total || 0)
       setSummary(result.summary || {})
       setEmailTestMode(Boolean(result.email_test_mode))
       setAutomationEnabled(Boolean(result.automation_enabled))
       setEmailTestRecipient(result.email_test_recipient || "sonianuj1284@gmail.com")
       setCutoffDate(result.cutoff_date || "2026-08-01")
     } catch (error) {
+      if (requestId !== requestRef.current) return
+      setRows([])
+      setTotal(0)
       onResult({ ok: false, title: "After-order care load failed", message: String(error) })
     } finally {
-      setLoading(false)
+      if (requestId === requestRef.current) setLoading(false)
     }
   }
 
-  useEffect(() => { void load() }, [storeId, status])
+  useEffect(() => { setPage(1) }, [storeId])
+  useEffect(() => { void load(); return () => { requestRef.current += 1 } }, [storeId, status, page, searchQuery])
 
   const updateTestMode = async (enabled: boolean) => {
     if (!enabled && !window.confirm("Turn off email test mode? Customer email delivery will be permitted once an email provider is connected.")) return
@@ -12176,39 +12188,12 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
     }
   }
 
-  const needsConfirmation = Number(summary.needs_confirmation || 0)
-  const waiting = Number(summary.needs_attention || 0)
-  const tracking = Number(summary.tracking || 0)
-
   return (
-    <div className="care-workspace">
-      <header className="care-heading"><div><h2>After-order care</h2><p>Review an issue → check the latest request → take the next action.</p></div><span className={`care-mode ${emailTestMode ? "" : "is-live"}`} role="status">{emailTestMode ? "Test mode · emails redirected" : "Live mode · customer emails permitted"}</span></header>
-      <div className="care-queue-bar">
-      <TeamQueues value={status} onChange={setStatus} queues={[
-        { value: "open", label: "All open", hint: "All active cases" },
-        { value: "needs_confirmation", label: `Confirm decisions · ${needsConfirmation}`, hint: "Review the latest choice" },
-        { value: "needs_attention", label: `Needs attention · ${waiting}`, hint: "Review the case" },
-        { value: "approved_pending_execution", label: `Execution pending · ${Number(summary.approved_pending_execution || 0)}`, hint: "Approved, not completed" },
-        { value: "tracking", label: `Tracking · ${tracking}`, hint: "Review carrier evidence" },
-      ]} />
-      </div>
-      <div className="grid gap-3">
-        <div className="team-filter-bar">
-        <div className="flex flex-1 flex-wrap gap-2">
-          <SearchBox value={query} onChange={setQuery} placeholder="Order, tracking number or case title…" className="min-w-64 flex-1" />
-          <Button variant="outline" onClick={load} disabled={loading}><Search className="size-4" />Search</Button>
-          <SelectField className="w-48" label="Case queue" value={status} onChange={setStatus}>
-            <option value="open">Open cases</option>
-            <option value="needs_attention">Needs attention</option>
-            <option value="needs_confirmation">Needs confirmation</option>
-            <option value="tracking">Tracking</option>
-            <option value="approved_pending_execution">Approved — execution pending</option>
-            <option value="approved">Approved</option>
-            <option value="resolved">Resolved</option>
-            <option value="all">All</option>
-          </SelectField>
-        </div>
-        </div>
+    <AfterCareWorkspace status={status} summary={summary} loading={loading} total={total}
+      query={query} onQuery={setQuery} onSearch={() => { setPage(1); setSearchQuery(query.trim()); if (page === 1 && searchQuery === query.trim()) void load() }}
+      onQueue={value => { setPage(1); setStatus(value) }} onRefresh={() => void load()}
+      testMode={emailTestMode} automationEnabled={automationEnabled} cutoffDate={cutoffDate}
+      tools={
         <TeamTools title="Email settings & test tools" description="Sending all test emails uses the store scope, not the current search or queue. Approval is not proof that a refund, replacement or email has completed.">
         <div className="flex flex-wrap gap-2 items-center">
           <Button variant="outline" onClick={async () => {
@@ -12233,16 +12218,16 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           </label>
         </div>
         </TeamTools>
-      </div>
+      }>
 
-      <div className="care-scope"><span>{rows.length} cases loaded · maximum 50 · queue counts cover the store, not search results</span><span>Orders from {cutoffDate} · highest severity first · open a row to review</span></div>
+      <div className="epost-selection"><span>Highest severity first · open a case to review</span><span>{searchQuery ? `Search: “${searchQuery}”` : "All orders in this queue"}</span></div>
 
       {loading ? <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">Loading after-order cases...</div> : null}
       {!loading && !rows.length ? <div className="rounded-lg border bg-card p-10 text-center text-muted-foreground">No after-order cases match this view.</div> : null}
 
       <div className="care-case-list">
         <div className="care-column-head" aria-hidden="true"><span>Order / store</span><span>Issue / latest request</span><span>Case status</span><span>Next step</span><span /></div>
-        {rows.map((row) => {
+        {(!loading ? rows : []).map((row) => {
           const context = row.context || {}
           const currentLabel = afterOrderDecisionLabels[row.current_decision || ""] || "No customer request yet"
           const previousLabel = afterOrderDecisionLabels[row.previous_decision || ""] || ""
@@ -12332,7 +12317,8 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+      <footer className="epost-table-footer"><span>{total ? `${(page - 1) * 50 + 1}–${Math.min(page * 50, total)} of ${total}` : "0 results"}</span><div><Button size="sm" variant="outline" disabled={loading || page <= 1} onClick={() => setPage(value => value - 1)}>Previous</Button><span>Page {page}</span><Button size="sm" variant="outline" disabled={loading || page * 50 >= total} onClick={() => setPage(value => value + 1)}>Next</Button></div></footer>
+    </AfterCareWorkspace>
   )
 }
 
