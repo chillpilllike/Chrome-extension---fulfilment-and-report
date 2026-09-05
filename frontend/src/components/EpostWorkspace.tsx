@@ -64,7 +64,14 @@ export function EpostWorkspace(p: Props) {
   const count = (key: string) => p.summary ? (p.summary[key] || 0).toLocaleString() : "—"
   const toggleRow = (row: EpostWorkRow, checked: boolean) => {
     p.onSelectAll(false)
-    p.onSelected(checked ? [...new Set([...p.selected, row.id])] : p.selected.filter(id => id !== row.id))
+    // Leaving all-matching mode becomes an explicit selection on this page.
+    const ids = p.selectAll ? p.rows.map(item => item.id) : p.selected
+    p.onSelected(checked ? [...new Set([...ids, row.id])] : ids.filter(id => id !== row.id))
+  }
+  const pageSelected = p.rows.length > 0 && (p.selectAll || p.rows.every(row => p.selected.includes(row.id)))
+  const selectPage = (checked: boolean) => {
+    p.onSelectAll(false)
+    p.onSelected(checked ? [...new Set([...p.selected, ...p.rows.map(row => row.id)])] : p.selectAll ? [] : p.selected.filter(id => !p.rows.some(row => row.id === id)))
   }
   const carrierLink = (row: EpostWorkRow) => row.tracking_url || `https://epgtrack.com/${encodeURIComponent(row.tracking_code)}`
   return <div className="epost-workspace" aria-busy={p.loading}>
@@ -100,14 +107,21 @@ export function EpostWorkspace(p: Props) {
           <div><label htmlFor="epost-threshold">Stalled after</label><select id="epost-threshold" value={p.staleDays} onChange={e => p.onStaleDays(e.target.value)}><option value="7">7 days without movement</option><option value="10">10 days without movement</option><option value="14">14 days without movement</option><option value="21">21 days without movement</option><option value="30">30 days without movement</option></select></div>
           <Button type="submit" variant="outline" disabled={p.loading}>Search</Button><Button type="button" variant="ghost" disabled={p.loading} onClick={() => { setDraftQuery(""); p.onQuery(""); p.onStaleDays("10"); p.onQueue("attention") }}>Reset filters</Button>
         </form>
-        <div className="epost-selection"><span>{p.selectAll ? `All ${p.total} matching shipments selected for export` : `${p.selected.length} selected`} {p.query && <span> · Search: “{p.query}”</span>}</span><div><Button size="sm" variant="ghost" onClick={() => { p.onSelected([]); p.onSelectAll(false) }}>Clear selection</Button><Button size="sm" variant="outline" disabled={!canCopyBatch} onClick={() => p.onCopyCodes(selectedRows)}>Copy codes (up to 25)</Button></div></div>
+        <section className="epost-selection" aria-label="Select shipments and download CSV">
+          <div className="epost-selection-page">
+            <label><Checkbox checked={pageSelected} disabled={p.loading || !p.rows.length} onCheckedChange={selectPage} /> Select this page ({p.rows.length})</label>
+            <Button size="sm" variant="outline" disabled={!canCopyBatch} onClick={() => p.onCopyCodes(selectedRows)}>Copy codes (up to 25)</Button>
+          </div>
+          <fieldset className="epost-export-actions" disabled={p.loading} aria-label="CSV export controls">{p.exports}</fieldset>
+          <p className="epost-selection-help" role="status">{p.selectAll ? `All ${p.total.toLocaleString()} matching shipments across every page are selected.` : `${p.selected.length.toLocaleString()} individually selected. Select all to include every page in this queue.`} {p.query && <>Search: “{p.query}”. </>}CSV uses the current store and filters; files open in Export downloads. {p.selectAll && <>Unchecking a row switches to individual selection on this page.</>}</p>
+        </section>
         {p.loading && <div role="status" className="epost-loading">Loading saved shipment records…</div>}
         <Table className="epost-work-table"><TableHeader><TableRow>
-          <TableHead><Checkbox aria-label="Select visible shipments" checked={p.rows.length > 0 && p.rows.every(row => p.selected.includes(row.id))} disabled={p.loading} onCheckedChange={checked => { p.onSelectAll(false); p.onSelected(checked ? [...new Set([...p.selected, ...p.rows.map(row => row.id)])] : p.selected.filter(id => !p.rows.some(row => row.id === id))) }} /></TableHead>
+          <TableHead><Checkbox aria-label="Select visible shipments" checked={pageSelected} disabled={p.loading || !p.rows.length} onCheckedChange={selectPage} /></TableHead>
           <TableHead>Order / shipment</TableHead><TableHead>Carrier evidence</TableHead><TableHead>Activity</TableHead><TableHead>Next action</TableHead><TableHead>Manage</TableHead>
         </TableRow></TableHeader><TableBody>
-          {p.rows.map(row => <TableRow key={row.id}>
-            <TableCell><Checkbox aria-label={`Select ${row.odoo_order_name || row.tracking_code}`} checked={p.selected.includes(row.id)} disabled={p.loading} onCheckedChange={checked => toggleRow(row, Boolean(checked))} /></TableCell>
+          {p.rows.map(row => <TableRow key={row.id} data-selected={p.selectAll || p.selected.includes(row.id) ? "true" : undefined}>
+            <TableCell><Checkbox aria-label={`Select ${row.odoo_order_name || row.tracking_code}`} checked={p.selectAll || p.selected.includes(row.id)} disabled={p.loading} onCheckedChange={checked => toggleRow(row, Boolean(checked))} /></TableCell>
             <TableCell><a className="epost-order" href={row.odoo_order_url || carrierLink(row)} target="_blank" rel="noreferrer">{row.odoo_order_name || "Order not linked"} ↗</a><a className="epost-code" href={carrierLink(row)} target="_blank" rel="noreferrer">{row.tracking_code}</a><small>{row.store_name} · {row.destination || "Destination unknown"}</small></TableCell>
             <TableCell><span className={`epost-status ep-${row.workflow_queue || "needs_review"}`}>{row.workflow_label || "Status needs review"}</span><p>{row.status || "No carrier event recorded"}</p>{row.refund_status && <small>Carrier refund: {row.refund_status}</small>}</TableCell>
             <TableCell><strong>{row.last_update_at ? (row.days_since_update != null ? `${row.days_since_update}d since event` : "Event date unverified") : "No event date"}</strong><small>{row.last_update_at || "No dated carrier scan"}</small><small>Checked: {row.last_checked_at ? row.last_checked_at.replace("T", " ").replace(/\.\d+/, "") : "Never"}</small>{!row.last_update_at && row.days_since_import != null && <small>Imported {row.days_since_import}d ago (not fulfilment)</small>}</TableCell>
@@ -117,7 +131,6 @@ export function EpostWorkspace(p: Props) {
           {!p.rows.length && <TableRow><TableCell colSpan={6}><div className="epost-empty"><h3>{p.loading ? "Loading shipments…" : "No shipments in this view"}</h3><p>{p.query ? "Try a different order or tracking code, or clear your search." : "Choose another queue or import completed fulfilments for your selected store."}</p></div></TableCell></TableRow>}
         </TableBody></Table>
         <footer className="epost-table-footer"><span>{p.total ? `${(p.page - 1) * p.pageSize + 1}–${Math.min(p.page * p.pageSize, p.total)} of ${p.total}` : "0 results"}</span><div><Button variant="outline" size="sm" disabled={p.loading || p.page <= 1} onClick={() => p.onPage(p.page - 1)}>Previous</Button><span>Page {p.page}</span><Button variant="outline" size="sm" disabled={p.loading || p.page * p.pageSize >= p.total} onClick={() => p.onPage(p.page + 1)}>Next</Button></div></footer>
-        <details className="epost-export"><summary>Export this queue or selected shipments</summary><div>{p.exports}</div></details>
       </section>
     </div>
     <Dialog open={Boolean(detail)} onOpenChange={open => { if (!open) setDetailId(null) }}><DialogContent className="epost-detail"><DialogHeader><DialogTitle>{detail?.odoo_order_name} · Shipment review</DialogTitle><DialogDescription>Review carrier evidence before recording a claim or requesting a customer action.</DialogDescription></DialogHeader>

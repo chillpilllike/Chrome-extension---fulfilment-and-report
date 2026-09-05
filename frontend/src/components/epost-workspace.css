@@ -30,7 +30,13 @@
 .epost-search { flex: 1 1 260px; }
 .epost-filters select { min-height: 36px; border: 1px solid var(--ep-line); border-radius: 6px; padding: 6px 10px; background: var(--card); color: inherit; }
 .epost-selection { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 24px; background: var(--muted, #f5f7fa); font-size: 13px; }
-.epost-selection > div { display: flex; gap: 8px; }
+.epost-selection > div { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.epost-selection-page label { display: inline-flex; align-items: center; gap: 10px; margin: 0; font-size: 14px; font-weight: 600; cursor: pointer; }
+.epost-export-actions { border: 0; margin: 0; padding: 0; min-width: 0; }
+.epost-selection .epost-selection-help { flex-basis: 100%; margin: 0; color: var(--muted-foreground); font-size: 13px; }
+/* Override the shared viewport cap only here: page scrolling, not a nested panel. */
+.epost-workspace .epost-main > .tabler-sticky-table-wrap { height: auto; max-height: none; overflow-x: auto; }
+.epost-workspace .epost-work-table tr[data-selected="true"] > td { background: var(--tblr-primary-lt, #edf4fc); }
 .epost-work-table { width: 100%; min-width: 900px; table-layout: fixed; font-size: 14px; }
 .epost-work-table th:first-child { width: 42px; }
 .epost-work-table th:nth-child(2) { width: 23%; }
@@ -51,9 +57,6 @@
 .epost-status.ep-in_transit { background: #e4efff; color: #22589a; }
 .epost-table-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 24px; border-top: 1px solid var(--ep-line); }
 .epost-table-footer > div { display: flex; align-items: center; gap: 12px; }
-.epost-export { border-top: 1px solid var(--ep-line); padding: 18px 24px; }
-.epost-export summary { cursor: pointer; font-weight: 600; }
-.epost-export > div { padding-top: 18px; }
 .epost-empty { text-align: center; padding: 36px 20px; }
 .epost-tools { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--ep-line); border-radius: 12px; margin: 0 0 22px; background: var(--card); }
 .epost-tools > div { padding: 24px; }
