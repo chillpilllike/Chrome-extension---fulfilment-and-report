@@ -2,11 +2,40 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from app.services.after_order import (
+    can_remove_affected_items,
     normalize_customer_decision,
     resolve_delivery_recipient,
     tracking_risk,
     trustpilot_review_url,
 )
+
+
+class PartialRemovalTests(unittest.TestCase):
+    def setUp(self):
+        self.item = {"id": 1, "asin": "B000000001", "quantity": 3, "state": "missing"}
+        self.affected = [{"line_id": 1, "asin": "B000000001"}]
+
+    def test_single_asin_with_multiple_units_cannot_be_removed(self):
+        self.assertFalse(can_remove_affected_items([self.item], self.affected))
+
+    def test_shipping_or_duplicate_asin_does_not_count_as_remaining_product(self):
+        for other in ({"id": 2, "asin": "", "quantity": 1}, {"id": 2, "asin": "B000000001", "quantity": 1}):
+            self.assertFalse(can_remove_affected_items([self.item, other], self.affected))
+
+    def test_other_available_asin_allows_partial_removal(self):
+        self.assertTrue(can_remove_affected_items([self.item, {"id": 2, "asin": "B000000002", "quantity": 1}], self.affected))
+
+    def test_all_affected_items_cannot_be_removed(self):
+        other = {"id": 2, "asin": "B000000002", "quantity": 1}
+        self.assertFalse(can_remove_affected_items([self.item, other], self.affected + [{"line_id": 2, "asin": "B000000002"}]))
+
+    def test_missing_cancelled_refunded_or_zero_quantity_do_not_count(self):
+        for fields in ({"state": "missing"}, {"odoo_status_label": "cancelled"}, {"odoo_status_label": "refunded"}, {"quantity": 0}):
+            other = {"id": 2, "asin": "B000000002", "quantity": 1, **fields}
+            self.assertFalse(can_remove_affected_items([self.item, other], self.affected))
+
+    def test_unknown_affected_product_fails_closed(self):
+        self.assertFalse(can_remove_affected_items([self.item], []))
 
 
 class AfterOrderTrackingRiskTests(unittest.TestCase):

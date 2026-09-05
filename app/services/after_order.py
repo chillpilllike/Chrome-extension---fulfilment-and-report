@@ -22,6 +22,36 @@ CUSTOMER_DECISIONS = {
 }
 
 
+def can_remove_affected_items(lines: list[dict[str, Any]], affected: list[dict[str, Any]]) -> bool:
+    """Removing an unavailable ASIN must leave another fulfillable product.
+
+    Quantity, shipping charges and multiple rows of the same ASIN do not
+    turn a single-product order into a partially removable order.
+    """
+    affected_ids = {str(item.get("line_id")) for item in affected if item.get("line_id")}
+    affected_asins = {str(item.get("asin") or "").strip().upper() for item in affected} - {""}
+    affected_asins.update(
+        str(line.get("asin") or "").strip().upper()
+        for line in lines if str(line.get("id")) in affected_ids
+    )
+    affected_asins.discard("")
+    if not affected_asins:
+        return False
+    for line in lines:
+        asin = str(line.get("asin") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+            continue
+        if str(line.get("id")) in affected_ids or asin in affected_asins:
+            continue
+        if str(line.get("odoo_status_label") or "").lower() in {"cancelled", "canceled", "refunded"}:
+            continue
+        if str(line.get("state") or "").lower() in {"missing", "cancelled", "canceled", "refunded"}:
+            continue
+        if float(line.get("quantity") or 0) > 0:
+            return True
+    return False
+
+
 class EmailProvider(Protocol):
     """Provider boundary for Resend today and another email service later."""
 

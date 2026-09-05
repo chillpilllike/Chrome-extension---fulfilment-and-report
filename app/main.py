@@ -104,6 +104,7 @@ from app.services.amazon import amz_date, normalize_amazon_endpoint
 from app.services.amazon_otp import imap_connect, imap_search_since, parse_amazon_email
 from app.services.after_order import (
     ResendEmailProvider,
+    can_remove_affected_items,
     normalize_customer_decision,
     resolve_delivery_recipient,
     tracking_risk,
@@ -37438,11 +37439,28 @@ def require_after_order_case_in_scope(case: dict[str, Any]) -> None:
         raise HTTPException(410, f"This order is before the after-order cutoff of {after_order_cutoff_date()} and cannot be actioned.")
 
 
+def after_order_removal_allowed(case: dict[str, Any]) -> bool:
+    with db() as conn:
+        lines = rows_to_dicts(conn.execute(
+            """SELECT id, asin, quantity, state, odoo_status_label FROM order_lines
+               WHERE store_id=? AND odoo_order_id=?""",
+            (case["store_id"], case["odoo_order_id"]),
+        ).fetchall())
+    return can_remove_affected_items(lines, case.get("affected_items") or [])
+
+
+def after_order_filter_removal(case: dict[str, Any], actions: list[str]) -> list[str]:
+    removal = {"exclude_item_and_proceed", "cancel_affected_item"}
+    if removal.intersection(actions) and not after_order_removal_allowed(case):
+        return [action for action in actions if action not in removal]
+    return actions
+
+
 def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
     if case.get("confirmed_at"):
         return []
     if case.get("case_type") == "item_unavailable":
-        return ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"]
+        return after_order_filter_removal(case, ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"])
     if case.get("case_type") == "delivery_confirmation":
         return ["received", "not_received"]
     if clean_text((case.get("context") or {}).get("risk_state")) in {"suspected_lost", "carrier_exception"}:
@@ -38143,6 +38161,7 @@ def send_after_order_email(
         "trustpilot_review": [],
     }
     allowed = showcase_actions.get(showcase_kind, after_order_allowed_actions(case) if not template_kind else [])
+    allowed = after_order_filter_removal(case, allowed)
     action_url = ""
     branded_tracking_url = ""
     if showcase_kind and allowed:
@@ -38367,6 +38386,7 @@ def create_after_order_action_link(
     if case.get("confirmed_at") and not is_test:
         raise HTTPException(409, "This decision is already confirmed and its links are expired.")
     allowed = list(allowed_override) if allowed_override is not None else after_order_allowed_actions(case)
+    allowed = after_order_filter_removal(case, allowed)
     if not allowed and not view_only:
         raise HTTPException(409, "This case does not currently require a customer decision.")
     domain = clean_text(case.get("sender_domain")).lower()
@@ -38497,6 +38517,8 @@ def record_after_order_customer_decision(
     actor_label: str = "Email action link",
 ) -> tuple[bool, dict[str, Any], str]:
     normalized = normalize_customer_decision(decision)
+    if normalized in {"exclude_item_and_proceed", "cancel_affected_item"} and not after_order_removal_allowed(case):
+        raise HTTPException(409, "Removing this item would leave no other available product. Choose an alternative or cancel the entire order.")
     try:
         allowed = json.loads(link.get("allowed_actions_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -38562,6 +38584,7 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
         allowed = json.loads(link.get("allowed_actions_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         allowed = []
+    allowed = after_order_filter_removal(case, allowed)
     context = case.get("context") or {}
     affected = case.get("affected_items") or []
     search_terms = " ".join(clean_text(item.get("product_name")) for item in affected if clean_text(item.get("product_name")))
@@ -38624,6 +38647,7 @@ def render_after_order_action_page(token: str, case: dict[str, Any], link: dict[
         allowed = json.loads(link.get("allowed_actions_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         allowed = []
+    allowed = after_order_filter_removal(case, allowed)
     product_html = "".join(
         f"<li><strong>{html.escape(clean_text(item.get('product_name')))}</strong> &times; {html.escape(str(item.get('quantity') or 1))}</li>"
         for item in case.get("affected_items") or []
@@ -38725,6 +38749,8 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
+    if not case.get("confirmed_at") and case.get("current_decision") in {"exclude_item_and_proceed", "cancel_affected_item"} and not after_order_removal_allowed(case):
+        raise HTTPException(409, "This removal would leave no other available product. A new customer decision is required.")
     with db() as conn:
         row = conn.execute("SELECT * FROM after_order_cases WHERE id=?", (case_id,)).fetchone()
         if not row:
