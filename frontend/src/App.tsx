@@ -40,6 +40,7 @@ import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
 import "@/components/after-care-workspace.css"
+import "@/components/inventory-workspace.css"
 import "@/components/pickup-controls.css"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -12795,7 +12796,7 @@ function InventoryPage({
     <div className="grid gap-5">
       <Card>
         <CardHeader>
-          <CardTitle>Inventory</CardTitle>
+          <CardTitle>Add manual stock</CardTitle>
           <CardDescription>Reusable stock is released only after Amazon delivery, warehouse receipt, Shopify cancellation, and Odoo cancellation/refund are all confirmed. For manual stock, enter a title and quantity; ASIN is optional.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.5fr_120px_1fr_1.2fr_auto]">
@@ -12818,7 +12819,7 @@ function InventoryPage({
           <div className="flex items-end">
             <Button disabled={!form.product_name.trim() || Number(form.quantity || 0) <= 0} onClick={addManualInventory}>
               <Plus className="size-4" />
-              Add
+              Add stock
             </Button>
           </div>
         </CardContent>
@@ -12827,32 +12828,17 @@ function InventoryPage({
       <Card>
         <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
-            <CardTitle>Inventory Items</CardTitle>
+            <CardTitle>Inventory Items · {total.toLocaleString()}</CardTitle>
             <CardDescription>Inventory is shared across all stores. Available rows can fulfil any selected order when quantity is sufficient; rows with an ASIN must match the order ASIN exactly.</CardDescription>
           </div>
           <PaginationControls page={page} total={total} onPage={onPage} />
         </CardHeader>
         <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Image</TableHead>
-                <TableHead>ASIN</TableHead>
-                <TableHead>Qty</TableHead>
-                <TableHead>Product</TableHead>
-                <TableHead>Source</TableHead>
-                <TableHead>Amazon Order</TableHead>
-                <TableHead>Source Evidence</TableHead>
-                <TableHead>Reserved For</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Updated</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((item) => (
-                <TableRow key={item.id}>
-                  <TableCell>
+          <div className="inventory-card-list">
+            {rows.map((item) => (
+              <article key={item.id} className="card inventory-stock-card">
+                <div className="card-body inventory-stock-layout">
+                  <div className="inventory-product-image">
                     {item.image_url ? (
                       <button
                         type="button"
@@ -12871,24 +12857,27 @@ function InventoryPage({
                         ASIN
                       </div>
                     )}
-                  </TableCell>
-                  <TableCell>
+                  </div>
+                  <div className="inventory-product-info">
+                    <div className="inventory-stock-badges"><InventoryStatusBadge value={item.status} /><span className="text-secondary">Stock #{item.id}</span></div>
+                    <h3 className="inventory-product-title">{item.product_name || "Untitled stock item"}</h3>
+                    <div className="inventory-asin">
                     {item.asin ? (
                       <a className="font-mono text-primary underline-offset-4 hover:underline" href={item.asin_url || `https://www.amazon.com/dp/${item.asin}`} target="_blank">{item.asin}</a>
                     ) : <span className="text-muted-foreground">Not set</span>}
                     {item.image_source ? <div className="text-[11px] text-muted-foreground">{item.image_source === "amazon_page" ? "Amazon page image" : "Captured thumbnail"}</div> : null}
-                  </TableCell>
-                  <TableCell>{item.quantity}</TableCell>
-                  <TableCell className="max-w-[360px] truncate">{item.product_name}</TableCell>
-                  <TableCell>
+                  </div>
+                  </div>
+                  <div className="inventory-quantity"><span>Stock quantity</span><strong>{item.quantity}</strong></div>
+                  <div className="inventory-stock-details">
+                    <section><h4><Database className="size-4" /> Stock source</h4>
                     <Badge variant="outline">{item.source_type || "amazon_cancelled"}</Badge>
                     {item.source_odoo_order_name ? <OdooOrderRef name={item.source_odoo_order_name} className="text-xs text-muted-foreground" /> : <div className="text-xs text-muted-foreground">{item.notes || ""}</div>}
-                  </TableCell>
-                  <TableCell>
+                  <div className="inventory-detail-label">Amazon order / account</div>
                     {item.amazon_order_id ? <a className="font-mono text-xs text-primary underline-offset-4 hover:underline" href={item.amazon_order_url} target="_blank">{item.amazon_order_id}</a> : <span className="text-muted-foreground">Manual</span>}
                     <div className="text-xs text-muted-foreground">{item.amazon_account_name || ""}</div>
-                  </TableCell>
-                  <TableCell>
+                  </section>
+                    <section><h4><CheckCircle2 className="size-4" /> Release evidence</h4>
                     {item.source_type === "manual" ? (
                       <Badge variant="outline">Manual stock</Badge>
                     ) : (
@@ -12900,8 +12889,8 @@ function InventoryPage({
                         {item.source_tracking_id ? <span className="font-mono text-muted-foreground">Tracking {item.source_tracking_id}</span> : null}
                       </div>
                     )}
-                  </TableCell>
-                  <TableCell>
+                  </section>
+                    <section><h4><Link className="size-4" /> Reserved for</h4>
                     {item.reserved_order_line_id ? (
                       <div className="grid gap-1">
                         {item.reserved_odoo_order_name ? (
@@ -12914,10 +12903,11 @@ function InventoryPage({
                         </span>
                       </div>
                     ) : <span className="text-muted-foreground">Not attached</span>}
-                  </TableCell>
-                  <TableCell><InventoryStatusBadge value={item.status} /></TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(item.updated_at)}</TableCell>
-                  <TableCell className="text-right">
+                  {item.reserved_product_name ? <div className="inventory-notes"><div className="inventory-detail-label">Reserved product</div><p>{item.reserved_product_name}</p></div> : null}
+                  {item.notes && item.source_odoo_order_name ? <div className="inventory-notes"><div className="inventory-detail-label">Notes</div><p>{item.notes}</p></div> : null}</section>
+                  </div>
+                </div>
+                <footer className="card-footer inventory-stock-footer"><span>Updated {formatDateTime(item.updated_at)}</span>
                     <div className="btn-list justify-end">
                       {item.status === "reserved" ? (
                         <Button size="sm" onClick={() => confirmInventorySent(item)}>
@@ -12931,16 +12921,11 @@ function InventoryPage({
                         </Button>
                       )}
                     </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {!rows.length && (
-                <TableRow>
-                  <TableCell colSpan={11} className="py-8 text-center text-muted-foreground">No inventory rows on this page.</TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
+                  </footer>
+              </article>
+            ))}
+            {!rows.length && <div className="empty"><div className="empty-icon"><PackageCheck className="size-8" /></div><p className="empty-title">No inventory items on this page</p><p className="empty-subtitle text-secondary">Add manual stock above or choose another page.</p></div>}
+          </div>
         </CardContent>
       </Card>
     </div>
