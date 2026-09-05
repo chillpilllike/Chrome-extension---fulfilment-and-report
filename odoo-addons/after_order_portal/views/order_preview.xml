@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+  <template id="standard_order_updates" inherit_id="sale.sale_order_portal_template" name="Order preview updates">
+    <xpath expr="//div[@id='quote_content']" position="inside">
+      <section id="after-order-updates" class="my-4 d-print-none" t-if="after_order_panels or after_order_error">
+        <h2 class="h4">Order updates</h2>
+        <div t-if="after_order_error" class="alert alert-warning" t-esc="after_order_error"/>
+        <div t-if="after_order_message" class="alert alert-success" t-esc="after_order_message"/>
+        <t t-foreach="after_order_panels" t-as="panel">
+          <t t-set="payload" t-value="panel['payload']"/>
+          <t t-set="token" t-value="panel['token']"/>
+          <t t-set="case" t-value="payload.get('case') or {}"/>
+          <t t-set="allowed" t-value="payload.get('allowed_actions') or []"/>
+          <div class="card shadow-sm mb-3" t-if="not payload.get('test_mode') or request.env.user.has_group('base.group_system')">
+            <div class="card-body">
+              <div t-if="payload.get('test_mode')" class="alert alert-info">Administrator test preview — these choices do not change the order.</div>
+              <h3 class="h5" t-esc="case.get('title') or 'What would you like to do?'"/>
+              <p t-if="case.get('current_decision')" class="text-muted">Your selection: <span t-esc="(payload.get('action_labels') or {}).get(case.get('current_decision'), case.get('current_decision'))"/></p>
+              <div t-if="payload.get('locked')" class="alert alert-secondary">This request has already been completed.</div>
+              <t t-else="">
+                <div class="d-flex flex-wrap gap-2">
+                  <t t-foreach="allowed" t-as="action">
+                    <form t-if="action != 'offer_alternatives'" t-att-action="'/order-update/%s/decision' % token" method="post">
+                      <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/>
+                      <input type="hidden" name="access_token" t-att-value="after_order_access_token"/>
+                      <input type="hidden" name="decision" t-att-value="action"/>
+                      <button type="submit" t-attf-class="btn #{'btn-danger' if action in ['cancel_order', 'refund', 'not_received'] else 'btn-primary'}" t-esc="(payload.get('action_labels') or {}).get(action, action)"/>
+                    </form>
+                  </t>
+                </div>
+                <div t-if="'offer_alternatives' in allowed" class="mt-4">
+                  <h4 class="h6">Choose an alternative</h4>
+                  <p class="text-muted">Recommended products appear first. Select a product for our team to review.</p>
+                  <p t-if="not panel['alternatives']" class="text-muted">Our team is preparing alternatives for this item.</p>
+                  <div class="row g-3">
+                    <div t-foreach="panel['alternatives']" t-as="product" class="col-6 col-md-4">
+                      <div class="card h-100">
+                        <img t-att-src="'/web/image/product.template/%s/image_256' % product.id" class="card-img-top p-3 object-fit-contain" height="150" alt="Product"/>
+                        <div class="card-body d-flex flex-column">
+                          <strong class="small" t-esc="product.name"/>
+                          <form class="mt-auto pt-3" t-att-action="'/order-update/%s/decision' % token" method="post">
+                            <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/>
+                            <input type="hidden" name="access_token" t-att-value="after_order_access_token"/>
+                            <input type="hidden" name="decision" value="offer_alternatives"/>
+                            <input type="hidden" name="selected_product_id" t-att-value="product.id"/>
+                            <button type="submit" class="btn btn-outline-primary w-100">Select alternative</button>
+                          </form>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </t>
+            </div>
+          </div>
+        </t>
+      </section>
+    </xpath>
+  </template>
+</odoo>

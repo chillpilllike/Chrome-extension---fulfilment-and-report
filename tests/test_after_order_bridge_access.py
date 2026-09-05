@@ -30,6 +30,8 @@ class BridgeAccessTests(unittest.TestCase):
     def test_bridge_get_and_post_use_handler_authentication(self):
         for method in ("GET", "POST"):
             self.assertFalse(self.requires_access("/api/public/after-order-bridge/action/test-token", method))
+        self.assertFalse(self.requires_access("/api/public/after-order-bridge/orders/123"))
+        self.assertTrue(self.requires_access("/api/public/after-order-bridge/orders/123", "POST"))
 
     def test_exemption_does_not_cover_other_routes_or_methods(self):
         for path in (

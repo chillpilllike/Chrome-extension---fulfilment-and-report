@@ -778,6 +778,8 @@ def request_requires_public_access(request: Request) -> bool:
         r"/api/public/after-order-bridge/action/[^/]+", path
     ):
         return False
+    if request.method == "GET" and re.fullmatch(r"/api/public/after-order-bridge/orders/\d+", path):
+        return False
     if path in {"/public/access", "/api/public/access"}:
         return False
     if request.method in {"GET", "HEAD"} and path.startswith(UNAUTHENTICATED_PUBLIC_API_PREFIXES):
@@ -38430,6 +38432,43 @@ def require_after_order_bridge(request: Request) -> None:
         raise HTTPException(401, "Invalid Odoo after-order bridge credentials.")
 
 
+def require_after_order_test_admin(request: Request, link: dict[str, Any]) -> None:
+    # This assertion is trusted only after authenticating the server-side bridge.
+    if (after_order_email_test_mode() or bool(link.get("test_mode"))) and request.headers.get("x-after-order-admin") != "true":
+        raise HTTPException(403, "Test actions are available to website administrators only.")
+
+
+@app.get("/api/public/after-order-bridge/orders/{order_id}")
+def api_after_order_bridge_order(order_id: int, request: Request) -> dict[str, Any]:
+    require_after_order_bridge(request)
+    if after_order_email_test_mode() and request.headers.get("x-after-order-admin") != "true":
+        return {"actions": []}
+    database = clean_text(request.headers.get("x-odoo-database"))
+    if not database:
+        raise HTTPException(400, "Odoo database is required.")
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT c.id FROM after_order_cases c JOIN stores s ON s.id=c.store_id
+               WHERE c.odoo_order_id=? AND s.odoo_db=? AND s.active=1
+               AND c.confirmed_at IS NULL ORDER BY c.id DESC LIMIT 20""",
+            (order_id, database),
+        ).fetchall()
+    actions = []
+    for row in rows:
+        case = after_order_case_by_id(int(row["id"]))
+        try:
+            require_after_order_case_in_scope(case)
+            require_after_order_website_host(request, case)
+            if not after_order_allowed_actions(case):
+                continue
+            link = create_after_order_action_link(int(case["id"]), request)
+            actions.append({"token": link["fallback_url"].rsplit("/", 1)[-1]})
+        except HTTPException as exc:
+            if exc.status_code not in {403, 404, 409, 410}:
+                raise
+    return {"actions": actions}
+
+
 def require_after_order_website_host(request: Request, case: dict[str, Any]) -> dict[str, Any]:
     hydrated = hydrate_after_order_recipient_and_domain(case)
     expected_host = clean_text(hydrated.get("sender_domain")).lower()
@@ -38485,7 +38524,7 @@ def record_after_order_customer_decision(
             raise HTTPException(400, str(exc)) from exc
         except Exception as exc:
             raise HTTPException(502, f"Could not validate the selected product in Odoo: {clean_error_message(exc)}") from exc
-    if bool(link.get("test_mode")):
+    if bool(link.get("test_mode")) or after_order_email_test_mode():
         return False, case, "Test preview only — no customer decision or Odoo change was recorded."
     now = utc_now()
     recorded = False
@@ -38516,6 +38555,7 @@ def record_after_order_customer_decision(
 def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any]:
     require_after_order_bridge(request)
     case, link = after_order_action_link(token)
+    require_after_order_test_admin(request, link)
     case = require_after_order_website_host(request, case)
     expected_host = clean_text(case.get("sender_domain")).lower()
     try:
@@ -38558,7 +38598,7 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
         "alternative_search_terms": search_terms,
         "pinned_alternatives": after_order_pinned_alternatives(int(case["id"])),
         "locked": bool(case.get("confirmed_at") or link.get("invalidated_at")),
-        "test_mode": bool(link.get("test_mode")),
+        "test_mode": bool(link.get("test_mode")) or after_order_email_test_mode(),
     }
 
 
@@ -38566,7 +38606,10 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
 def api_after_order_bridge_decision(token: str, request: Request, payload: AfterOrderDecisionPayload) -> dict[str, Any]:
     require_after_order_bridge(request)
     case, link = after_order_action_link(token)
+    require_after_order_test_admin(request, link)
     case = require_after_order_website_host(request, case)
+    if case.get("confirmed_at") or link.get("invalidated_at"):
+        raise HTTPException(410, "This request has already been completed.")
     _, refreshed, message = record_after_order_customer_decision(
         case, link, payload.decision,
         selected_product_id=payload.selected_product_id,
@@ -38610,14 +38653,18 @@ def render_after_order_action_page(token: str, case: dict[str, Any], link: dict[
 
 
 @app.get("/api/public/after-order/action/{token}")
-def public_after_order_action_page(token: str, choice: str = "") -> HTMLResponse:
+def public_after_order_action_page(token: str, request: Request, choice: str = "") -> HTMLResponse:
     case, link = after_order_action_link(token)
+    if (after_order_email_test_mode() or link.get("test_mode")) and not request_has_admin_access(request):
+        raise HTTPException(403, "Test actions are available to administrators only.")
     return render_after_order_action_page(token, case, link, suggested=choice)
 
 
 @app.post("/api/public/after-order/action/{token}")
-def public_after_order_action_submit(token: str, decision: str = Form(...)) -> HTMLResponse:
+def public_after_order_action_submit(token: str, request: Request, decision: str = Form(...)) -> HTMLResponse:
     case, link = after_order_action_link(token)
+    if (after_order_email_test_mode() or link.get("test_mode")) and not request_has_admin_access(request):
+        raise HTTPException(403, "Test actions are available to administrators only.")
     if case.get("confirmed_at") or link.get("invalidated_at"):
         return render_after_order_action_page(token, case, link)
     try:
