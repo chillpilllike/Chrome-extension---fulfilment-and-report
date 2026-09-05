@@ -38,6 +38,7 @@ import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerCo
 
 import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
+import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -5499,10 +5500,27 @@ function App() {
 
         {page === "orders" && (
           <>
+            <TeamWorkspaceHeader title="Order fulfilment workspace" description="Choose a store and queue, review the order lines, then select the lines to act on. Import and store-wide actions are separate below." current="orders" />
+            <div className="team-filter-bar">
+              <SelectField className="max-w-md" label="Working store" value={storeId} onChange={updateStoreView}>
+                <option value="">All stores</option>
+                {stores.map((store) => <option key={store.id} value={store.id}>{store.name}</option>)}
+              </SelectField>
+              <span className="team-help">{ordersTotal.toLocaleString()} matching order lines · Store-specific actions require a store.</span>
+            </div>
+            <TeamQueues value={orderCondition} onChange={updateOrderCondition} queues={[
+              { value: "ready", label: "Ready to fulfil", hint: "Review and select lines to place" },
+              { value: "error", label: "Fix errors", hint: "Inspect the failure before retrying" },
+              { value: "costly", label: "Review cost", hint: "Check pricing before purchasing" },
+              { value: "missing", label: "Missing items", hint: "Review sourcing or replacement" },
+              { value: "ordered", label: "Ordered / dispatched", hint: "Follow up in Package Tracker" },
+              { value: "all", label: "All lines", hint: "Use the filters for other states" },
+            ]} />
+            <TeamTools title="Import orders, purchase setup & store-wide actions" description="Import stores and the working-store filter are separate. Store-wide actions below do not use your selected table rows.">
             <section className="grid gap-3 lg:grid-cols-[1.1fr_1fr]">
               <Card>
                 <CardHeader>
-                  <CardTitle>Order Controls</CardTitle>
+                  <CardTitle>Import & purchase setup</CardTitle>
                 </CardHeader>
                 <CardContent className="grid gap-4">
                     <div className="grid gap-4">
@@ -5536,6 +5554,7 @@ function App() {
                         Save Engine
                       </Button>
                     </div>
+                    <div className="team-section-label">Import scope · Odoo orders to pull</div>
                     <div className="grid gap-3 lg:grid-cols-[1fr_0.5fr_0.5fr_auto] lg:items-end">
                     <MultiStoreDropdown stores={stores} selected={pullStoreIds} onChange={setPullStoreIds} />
                     <div className="grid gap-1.5">
@@ -5563,14 +5582,7 @@ function App() {
                         Pull These Orders
                       </Button>
                     </div>
-                    <SelectField className="max-w-md" label="Store filter" value={storeId} onChange={updateStoreView}>
-                      <option value="">All stores</option>
-                      {stores.map((store) => (
-                        <option key={store.id} value={store.id}>
-                          {store.name}
-                        </option>
-                      ))}
-                    </SelectField>
+                    <div className="team-section-label">Purchase destination & account · uses the working store above</div>
                     <div className="grid gap-3 lg:grid-cols-2">
                     <SelectField className="min-w-[260px]" label="Ship to" value={addressId} onChange={setAddressId}>
                       {addresses.map((address) => (
@@ -5629,7 +5641,7 @@ function App() {
                       }
                     >
                       <ShoppingCart className="size-4" />
-                      Place Orders
+                      Place eligible orders · working store
                     </Button>
                     <Button
                       variant="outline"
@@ -5652,7 +5664,7 @@ function App() {
                       }
                     >
                       <PackageCheck className="size-4" />
-                      Check Delivered
+                      Check delivered & dispatch · working store
                     </Button>
                     <Button variant="outline" disabled={!storeId} onClick={() => window.open(`/reports/latest?store_id=${storeId}`, "_blank")}>
                       <Download className="size-4" />
@@ -5735,12 +5747,13 @@ function App() {
                 </CardFooter>
               </Card>
             </section>
+            </TeamTools>
 
             <Card>
               <CardHeader className="gap-4">
-                <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                  <CardTitle>Odoo Order Lines</CardTitle>
-                  <div className="btn-list">
+                <div className="grid gap-3">
+                  <CardTitle>Review order lines</CardTitle>
+                  <div className="team-filter-bar">
                     <SelectField className="w-[190px]" label="Sort by" value={sortKey} onChange={(value) => updateSortKey(value as SortKey)}>
                       <option value="odoo_order_date">Order date</option>
                       <option value="pulled_at">Pulled date</option>
@@ -5761,7 +5774,7 @@ function App() {
                         {sortDirection === "asc" ? "Ascending" : "Descending"}
                       </Button>
                     </div>
-                    <SelectField className="w-[210px]" label="Filter" value={orderCondition} onChange={updateOrderCondition}>
+                    <SelectField className="w-[210px]" label="Work queue / state" value={orderCondition} onChange={updateOrderCondition}>
                       {orderConditionOptions.map((option) => (
                         <option key={option.value} value={option.value}>{option.label}</option>
                       ))}
@@ -5785,8 +5798,15 @@ function App() {
                       onClick={forceSyncShopifyStatuses}
                     >
                       <RefreshCw className="size-4" />
-                      Force Sync Shopify
+                      Refresh Shopify statuses · working store
                     </Button>
+                  </div>
+                </div>
+                <div className="team-action-panel">
+                  <div className="team-section-label">Selected lines · {selected.length.toLocaleString()} selected</div>
+                  <div className="team-results-label"><span>Purchase account: <strong>{selectedAmazonAccount?.name || "Not selected"}</strong> · {engineLabel}{selectedAmazonAccount ? selectedAmazonAccount.api_base_url.includes("sandbox.") ? " · Sandbox" : " · Production" : ""}</span><span>Ship to: <strong>{addresses.find((address) => String(address.id) === String(addressId))?.label || "Not selected"}</strong></span></div>
+                  <p className="team-help">Select rows below. Purchase actions use the account, ship-to address and engine in Purchase setup. Disabled actions retain their existing eligibility checks.</p>
+                  <div className="btn-list">
 	                    <Button
 	                      variant="outline"
 	                      disabled={!canRunSelectedPlaceAction || Boolean(busy)}
@@ -5843,6 +5863,9 @@ function App() {
 	                    >
                       Club Place
                     </Button>
+                  </div>
+                  <TeamTools title="Hold, cancel, reset or delete selected lines" description="Correction actions affect the selected lines. Review the selection and any confirmation before proceeding.">
+                  <div className="btn-list">
 	                    <Button
 	                      variant="outline"
 	                      disabled={!canRunSelectedStoreAction || Boolean(busy)}
@@ -5876,6 +5899,7 @@ function App() {
                       Delete
                     </Button>
                   </div>
+                  </TeamTools>
                 </div>
                 {shopifyStatusForceSync?.status === "running" && (
                   <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
@@ -6933,7 +6957,7 @@ function PackagePickupPage({
   const [searchField, setSearchField] = useState("all")
   const [exactSearch, setExactSearch] = useState("")
   const [packageView, setPackageView] = useState<"all" | "amazon_unfulfilled">("all")
-  const [showPackageSearch, setShowPackageSearch] = useState(false)
+  const [showPackageSearch, setShowPackageSearch] = useState(true)
   const [savingDate, setSavingDate] = useState("")
   const [receivingId, setReceivingId] = useState("")
   const [pickupTimeOpen, setPickupTimeOpen] = useState(false)
@@ -7606,6 +7630,11 @@ function PackagePickupPage({
 
   return (
     <div className="pickup-page grid gap-4">
+      <TeamWorkspaceHeader title="Package pickup check" description="Record physical receipt, reconcile delivery-date counts, then check whether every package for an order is ready. Amazon delivery is not the same as team pickup." current="package-pickups" />
+      <TeamQueues value={packageView} onChange={(value) => setPackageView(value as "all" | "amazon_unfulfilled")} queues={[
+        { value: "all", label: "Receive & reconcile", hint: "All packages in the selected date range" },
+        { value: "amazon_unfulfilled", label: "Review Shopify pending", hint: "Amazon delivered · not Shopify fulfilled" },
+      ]} />
       <Dialog open={pickupScannerOpen} onOpenChange={(open) => !open && closePickupScanner(true)}>
         <DialogContent className="pickup-scanner-dialog max-w-2xl p-0">
           <DialogHeader className="border-b px-4 py-3">
@@ -7903,7 +7932,7 @@ function PackagePickupPage({
           </div>
           <div className="pickup-toolbar-actions">
             <Button className="pickup-scanner-launch" size="sm" onClick={() => openPickupScanner("camera")}>
-              <Camera className="size-4" /> Scan packages
+              <Camera className="size-4" /> Scan received packages
             </Button>
             {lastPickupScanEntries.length ? (
               <Button variant="outline" size="sm" onClick={() => setPickupSummaryOpen(true)}>
@@ -7932,6 +7961,7 @@ function PackagePickupPage({
               {normalizedExactSearch && <div className="pickup-search-result">{visiblePackageCount} exact package match{visiblePackageCount === 1 ? "" : "es"}</div>}
             </div>
           )}
+          <div className="team-results-label"><span>{visiblePackageCount} matching packages across {visibleCards.length} date cards</span><span>Search requires a complete number; store and date filters still apply.</span></div>
           {packageView === "amazon_unfulfilled" && (
             <div className="pickup-active-filter">
               <span><strong>{visiblePackageCount}</strong> Amazon-delivered package{visiblePackageCount === 1 ? "" : "s"} not fulfilled in Shopify</span>
@@ -7961,6 +7991,7 @@ function PackagePickupPage({
       )}
 
       {loading && !data ? <div className="card"><div className="card-body text-secondary">Loading pickup records…</div></div> : null}
+      {!loading && data && !visibleCards.length ? <div className="card"><div className="card-body">No packages match this view. Check the store, delivery-date range and complete search number.</div></div> : null}
       {pagedPickupCards.map((card) => {
         const draft = drafts[card.pickup_date] || { amazon: String(card.amazon_picked_up), nonAmazon: String(card.non_amazon_picked_up), orderNumbers: "" }
         const allCardRows = [...card.amazon_packages, ...(card.manual_amazon_packages || []), ...card.non_amazon_packages]
@@ -10275,7 +10306,7 @@ function PackageTrackerDesignPage() {
   const [sortBy, setSortBy] = useState("recent_delivery")
   const [fromDate, setFromDate] = useState("")
   const [toDate, setToDate] = useState("")
-  const [showTrackerFilters, setShowTrackerFilters] = useState(false)
+  const [showTrackerFilters, setShowTrackerFilters] = useState(true)
   const [expandedHistory, setExpandedHistory] = useState<string[]>([])
   const [expandedPackages, setExpandedPackages] = useState<string[]>([])
   const [page, setPage] = useState(1)
@@ -10361,6 +10392,14 @@ function PackageTrackerDesignPage() {
 
   return (
     <div className="package-tracker-page d-grid gap-3">
+      <TeamWorkspaceHeader title="Package tracking workspace" description="Review package delivery separately from Shopify fulfilment. This tracker searches across stores; check recipient and product warnings before acting on an order." current="package-tracker" />
+      <TeamQueues value={status} onChange={setStatus} queues={[
+        { value: "shopify_pending", label: "Shopify follow-up", hint: "Delivered packages, fulfilment pending" },
+        { value: "partial", label: "Partially delivered", hint: "Check which packages are still missing" },
+        { value: "arriving", label: "Arriving", hint: "Review delivery estimates and updates" },
+        { value: "suspected_duplicate", label: "Duplicate review", hint: "Inspect quantities and order history" },
+        { value: "all", label: "All orders", hint: "Search any order or tracking number" },
+      ]} />
       <section className="package-tracker-toolbar">
         <div className="package-tracker-primary-filters">
           <div className="package-tracker-search">
@@ -10397,7 +10436,7 @@ function PackageTrackerDesignPage() {
           </div>
           <div className="package-tracker-filter-actions">
             <Button variant="outline" size="sm" onClick={() => setShowTrackerFilters((current) => !current)} aria-expanded={showTrackerFilters}>
-              {showTrackerFilters ? "Hide filters" : "More filters"}<ChevronDown className={`size-4 transition-transform ${showTrackerFilters ? "rotate-180" : ""}`} />
+              {showTrackerFilters ? "Hide dates & sorting" : "Show dates & sorting"}<ChevronDown className={`size-4 transition-transform ${showTrackerFilters ? "rotate-180" : ""}`} />
             </Button>
             <span className="package-tracker-guard"><Check className="size-4" /> Recipient guard</span>
           </div>
@@ -10441,6 +10480,7 @@ function PackageTrackerDesignPage() {
         <div className="is-delivered"><span>Delivered</span><strong>{totals.delivered_packages.toLocaleString()}</strong></div>
         <div className={totals.shopify_pending ? "is-action" : "is-delivered"}><span>Shopify action</span><strong>{totals.shopify_pending.toLocaleString()}</strong></div>
       </section>
+      <p className="team-help">Sync Shopify refreshes the recorded Shopify status; it is not a dispatch button. Resolve any blocked product or recipient checks before using fulfilment actions in Orders. Use After-order care for customer follow-up.</p>
 
       <div className="package-tracker-pagination-bar">
           <PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="Odoo cards" />
@@ -12096,11 +12136,24 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
 
   return (
     <div className="grid gap-4">
-      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+      <TeamWorkspaceHeader title="After-order care workspace" description="Review the case, check the customer's latest request, then use the available case actions. Approval is a decision checkpoint—not proof that a refund, replacement or email has completed." current="after-order-care" />
+      <div className={`team-mode-strip ${emailTestMode ? "" : "is-live"}`} role="status">
+        <strong>{emailTestMode ? "Test mode · emails redirected" : "Live mode · customer delivery permitted"}</strong>
+        {" · "}Email mode controls are under Email testing & settings.
+      </div>
+      <TeamQueues value={status} onChange={setStatus} queues={[
+        { value: "needs_confirmation", label: "Confirm decisions", hint: "Review the customer's latest choice" },
+        { value: "needs_attention", label: "Needs attention", hint: "Review each case and available actions" },
+        { value: "approved_pending_execution", label: "Execution pending", hint: "Approved, but not completed yet" },
+        { value: "tracking", label: "Tracking follow-up", hint: "Review carrier updates and risk notes" },
+        { value: "open", label: "All open cases", hint: "Work across the active queues" },
+      ]} />
+      <div className="grid gap-3">
+        <div className="team-filter-bar">
         <div className="flex flex-1 flex-wrap gap-2">
           <SearchBox value={query} onChange={setQuery} placeholder="Order, tracking number, product..." className="min-w-64 flex-1" />
           <Button variant="outline" onClick={load} disabled={loading}><Search className="size-4" />Search</Button>
-          <SelectField className="w-48" label="Status" value={status} onChange={setStatus}>
+          <SelectField className="w-48" label="Case queue" value={status} onChange={setStatus}>
             <option value="open">Open cases</option>
             <option value="needs_attention">Needs attention</option>
             <option value="needs_confirmation">Needs confirmation</option>
@@ -12111,7 +12164,9 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
             <option value="all">All</option>
           </SelectField>
         </div>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
+        </div>
+        <TeamTools title="Email testing & settings" description="Administrative controls, separate from the case list. Sending all test emails uses the store scope, not the current search or case queue.">
+        <div className="flex flex-wrap gap-2 items-center">
           <Button onClick={() => void sendAllTestEmails()} disabled={!emailTestMode || sendingAllTests}>
             {sendingAllTests ? "Sending test emails…" : "Send all test emails"}
           </Button>
@@ -12120,15 +12175,17 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
             <Checkbox checked={emailTestMode} onCheckedChange={(checked) => void updateTestMode(Boolean(checked))} aria-label="Email test mode" />
           </label>
         </div>
+        </TeamTools>
       </div>
 
       <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-        {[["Needs team confirmation", needsConfirmation, "text-destructive"], ["Waiting for customer", waiting, "text-amber-700"], ["Tracking updates", tracking, "text-primary"], ["Resolved", resolved, "text-emerald-700"]].map(([label, count, color]) => (
+        {[["Needs team confirmation", needsConfirmation, "text-destructive"], ["Needs attention", waiting, "text-amber-700"], ["Tracking updates", tracking, "text-primary"], ["Approved / resolved", resolved, "text-emerald-700"]].map(([label, count, color]) => (
           <div key={String(label)} className="rounded-lg border bg-card px-4 py-3"><span className="text-sm text-muted-foreground">{label}</span><strong className={`mt-1 block text-2xl ${color}`}>{count}</strong></div>
         ))}
       </div>
 
       <p className="text-sm text-muted-foreground">Showing actionable cards only for Odoo orders dated {new Date(`${cutoffDate}T00:00:00Z`).toLocaleDateString(undefined, { timeZone: "UTC", year: "numeric", month: "long", day: "numeric" })} or later. Earlier and undated orders cannot be actioned.</p>
+      <div className="team-results-label"><strong>{rows.length} cases loaded · up to 50 per view</strong><span>Use Search to apply the entered text. Narrow the queue or search to find a specific case.</span></div>
 
       {loading ? <div className="rounded-lg border bg-card p-6 text-center text-muted-foreground">Loading after-order cases...</div> : null}
       {!loading && !rows.length ? <div className="rounded-lg border bg-card p-10 text-center text-muted-foreground">No after-order cases match this view.</div> : null}
@@ -12144,7 +12201,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
           const decisionCase = itemCase || deliveryConfirmation || ["suspected_lost", "carrier_exception"].includes(String(context.risk_state || ""))
           const cardTone = row.severity === "high" ? "border-red-300 bg-red-50/40" : row.severity === "medium" ? "border-amber-300 bg-amber-50/35" : "border-emerald-200 bg-card"
           return (
-            <article key={row.id} className={`flex h-[640px] min-w-0 flex-col rounded-xl border p-5 shadow-sm ${cardTone}`}>
+            <article key={row.id} className={`team-care-card flex min-w-0 flex-col rounded-xl border p-5 shadow-sm ${cardTone}`}>
               <div className="flex h-full min-h-0 flex-col gap-4">
                 <header className="min-w-0 border-b pb-4">
                   <Badge variant={row.severity === "high" ? "destructive" : "outline"}>{row.title}</Badge>
@@ -12154,7 +12211,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {row.odoo_order_url ? <a className="mt-2 inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline" href={row.odoo_order_url} target="_blank">Open in Odoo <ExternalLink className="size-3" /></a> : null}
                 </header>
 
-                <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+                <div className="team-case-content min-h-0 flex-1 pr-1">
                   {itemCase ? (
                     <div className="grid gap-2">
                       <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Affected product{row.affected_items.length === 1 ? "" : "s"}</span>
