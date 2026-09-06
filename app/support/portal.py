@@ -81,7 +81,6 @@ def libre(path, *, data=None, token=None, method=None):
 
 class StartVerification(BaseModel):
     email: str = Field(max_length=254)
-    order_number: str = Field(default='',max_length=80)
 
 class Verify(BaseModel):
     challenge: str = Field(min_length=30,max_length=100)

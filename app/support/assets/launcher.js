@@ -1,1 +1,13 @@
-(()=>{if(location.origin!=='https://secretgreen.com.au'||document.getElementById('secretgreen-support-launcher'))return;const host='https://fulfilment.gofinch.com';const button=document.createElement('button');button.id='secretgreen-support-launcher';button.type='button';button.textContent='Chat with Secretgreen';button.setAttribute('aria-expanded','false');button.style.cssText='position:fixed;right:20px;bottom:20px;z-index:2147483000;background:#176147;color:white;border:0;border-radius:28px;padding:15px 22px;font:600 15px system-ui;box-shadow:0 4px 20px #0003;cursor:pointer';const frame=document.createElement('iframe');frame.title='Secretgreen support';frame.style.cssText='display:none;position:fixed;right:20px;bottom:82px;width:min(420px,calc(100vw - 32px));height:min(680px,calc(100dvh - 110px));border:1px solid #d1ded4;border-radius:14px;background:white;box-shadow:0 8px 40px #0003;z-index:2147482999';frame.referrerPolicy='no-referrer';button.onclick=()=>{const opened=frame.style.display==='none';if(!frame.src)frame.src=host+'/public/secretgreen-support';frame.style.display=opened?'block':'none';button.textContent=opened?'Close support':'Chat with Secretgreen';button.setAttribute('aria-expanded',String(opened))};document.body.append(frame,button)})();
+(()=>{
+  if(location.origin!=='https://secretgreen.com.au'||window.__secretgreenSupportLoaded)return;
+  window.__secretgreenSupportLoaded=true;
+  // Use LibreDesk's unmodified official launcher, home screen and chat UI.
+  window.LibredeskSettings={
+    baseURL:'https://libredesk.185.194.236.161.sslip.io',
+    inboxID:'339d24ef-d7ab-4d1a-83ad-f2d0212335e0'
+  };
+  const script=document.createElement('script');
+  script.src=window.LibredeskSettings.baseURL+'/static/widget.js';
+  script.async=true;
+  document.head.appendChild(script);
+})();
