@@ -643,6 +643,7 @@ FRONTEND_SHELL_PATHS = {
     "/orders",
     "/after-order-care",
     "/email-log",
+    "/support",
     "/pull-jobs",
     "/tracking",
     "/dispatch-sorting",
@@ -799,6 +800,8 @@ def request_has_public_access(request: Request) -> bool:
 
 def request_requires_public_access(request: Request) -> bool:
     path = request.url.path
+    if path == "/public/secretgreen-support" or path.startswith(("/public/secretgreen-support/", "/api/public/secretgreen-support/")):
+        return False
     # Email image proxies have no app cookie. Exempt only the product-image
     # lookup, never the surrounding order/tracking APIs or write methods.
     if request.method in {"GET", "HEAD"} and re.fullmatch(r"/api/public/asin-image/[A-Za-z0-9]{10}", path):
@@ -42814,6 +42817,13 @@ def amazon_order_history_unmatched_page(request: Request) -> HTMLResponse:
 from app.services.alternative_workflow import Workflow as AlternativeWorkflow
 alternative_workflow = AlternativeWorkflow(globals())
 app.include_router(alternative_workflow.router())
+
+
+from app.support.portal import create_portal_router
+from app.support.routes import create_router as create_support_router
+app.include_router(create_portal_router(db=db, get_store=get_store, client_factory=OdooClient))
+app.include_router(create_support_router(db=db, get_store=get_store, list_stores=list_stores,
+                                       client_factory=OdooClient, admin_token=effective_admin_access_token))
 
 
 @app.get("/{frontend_path:path}")

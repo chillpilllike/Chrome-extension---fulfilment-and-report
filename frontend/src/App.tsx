@@ -1,3 +1,4 @@
+import { SupportWorkspace } from "@/components/SupportWorkspace"
 import { Fragment, useEffect, useMemo, useRef, useState } from "react"
 import type { DragEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
 import AlertCircle from "@tabler/icons-react/dist/esm/icons/IconAlertCircle.mjs"
@@ -70,6 +71,7 @@ const KNOWN_APP_PAGES = new Set([
   "orders",
   "after-order-care",
   "email-log",
+  "support",
   "pull-jobs",
   "chrome-queue",
   "tracking",
@@ -1514,6 +1516,7 @@ const defaultUiCopy: UiCopy = {
   home: { title: "Dashboard", description: "Control panel overview for fulfilment, tracking, and exceptions." },
   orders: { title: "Orders", description: "Review Odoo order lines and queue Amazon fulfilment." },
   "after-order-care": { title: "After-order care", description: "Review customer decisions, shipment exceptions, and approved follow-up actions." },
+  "support": { title: "Customer support", description: "Secretgreen order context and customer-safe replies." },
   "email-log": { title: "Email log", description: "Review sent emails, failures and safe retries across your websites." },
   "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
   "chrome-queue": { title: "Chrome Queue", description: "Review Chrome extension jobs and release stale locks." },
@@ -5105,6 +5108,7 @@ function App() {
         ["orders", "Orders", ShoppingCart],
         ["after-order-care", "After-order care", Bell],
         ["email-log", "Email log", Bell],
+        ["support", "Customer support", Bell],
         ["pull-jobs", "Pull Jobs", RefreshCw],
         ["chrome-queue", "Chrome Queue", Lock],
         ["bulk", "Bulk Ordering", PackageCheck],
@@ -6227,6 +6231,7 @@ function App() {
         {page === "after-order-care" && (
           <AfterOrderCarePage storeId={storeId} onResult={setModal} initialQuery={afterOrderInitialQuery} />
         )}
+        {page === "support" && <SupportWorkspace api={api} />}
         {page === "email-log" && <EmailLogWorkspace storeId={storeId} api={api} onResult={setModal} onNavigate={(target, order) => { setAfterOrderInitialQuery(order || ""); setPage(target) }} />}
         {page === "tracking" && (
           <TrackingPage
