@@ -119,6 +119,10 @@ class PortalTests(unittest.TestCase):
     def test_customer_and_staff_html_do_not_include_secrets(self):
         for path in ['/public/secretgreen-support','/public/secretgreen-support/agent']:
             r=self.api.get(path);self.assertEqual(200,r.status_code);self.assertNotIn('x'*32,r.text)
+    def test_storefront_order_reference_is_preserved_without_source_text(self):
+        from app.support.policy import safe_reference
+        self.assertEqual('#5381',safe_reference('#5381'))
+        self.assertEqual('Your order',safe_reference('Amazon #5381'))
     def test_email_wildcards_are_rejected(self):
         self.assertEqual(422,self.api.post(self.p+'/request-code',json={'email':'%test@example.com'}).status_code)
 

@@ -70,7 +70,7 @@ def public_status(state: str, evidence: Evidence, now: datetime | None = None) -
 def safe_reference(value):
     value = str(value or "")
     # References, free-text titles, notes and URLs are not interchangeable.
-    return value if re.fullmatch(r"[A-Za-z]{1,12}[0-9][A-Za-z0-9/-]{0,35}", value) and not re.search(r"amazon|asin|drop", value, re.I) else "Your order"
+    return value if re.fullmatch(r"(?:#[0-9]{1,20}|[A-Za-z]{1,12}[0-9][A-Za-z0-9/-]{0,35})", value) and not re.search(r"amazon|asin|drop", value, re.I) else "Your order"
 
 
 def amount(value):
