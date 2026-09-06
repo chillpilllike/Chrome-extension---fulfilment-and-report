@@ -94,7 +94,10 @@ class Website(models.Model):
             emails = site._libredesk_api('GET', '/inboxes')
             matching_emails = [x for x in emails if x['channel'] == 'email' and x['enabled'] and
                 re.search(r'@' + re.escape(domain) + r'(?:>|$)', (x.get('config', {}).get('from') or x.get('from') or '').strip(), re.I)]
-            remote['linked_email_inbox_id'] = matching_emails[0]['id'] if len(matching_emails) == 1 else None
+            # Preserve an administrator-selected active alias mailbox when no exact match exists.
+            current_mail = remote.get('linked_email_inbox_id')
+            valid_current = any(x['id'] == current_mail and x['channel'] == 'email' and x['enabled'] for x in emails)
+            remote['linked_email_inbox_id'] = matching_emails[0]['id'] if len(matching_emails) == 1 else (current_mail if valid_current else None)
             config.setdefault('continuity', {'offline_threshold': '10m', 'max_messages_per_email': 10, 'min_email_interval': '30m'})
             for kind in ('users', 'visitors'):
                 config.setdefault(kind, {})['prevent_reply_to_closed_conversation'] = True
