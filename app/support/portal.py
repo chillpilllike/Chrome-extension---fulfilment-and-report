@@ -429,7 +429,11 @@ def create_portal_router(*, db, get_store, client_factory):
             pass  # Durable binding and secured agent context remain available.
         try: synced=sync_contact(uuid,email,order)
         except HTTPException: synced=False
-        return {'linked':True,'profile_synced':synced,'order_id':payload.order_id,**preview}
+        try:
+            from app.support.sidebar import sync_sidebar_order
+            sidebar_synced=sync_sidebar_order(client(),libre,uuid,email,order)
+        except Exception:sidebar_synced=False
+        return {'linked':True,'profile_synced':synced,'sidebar_synced':sidebar_synced,'order_id':payload.order_id,**preview}
 
     @router.get('/public/secretgreen-support/agent')
     def agent_page():
