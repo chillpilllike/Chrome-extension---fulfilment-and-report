@@ -411,10 +411,17 @@ def create_portal_router(*, db, get_store, client_factory):
         c=client();order=owned_order(c,row['email'],row['order_id']);history=SupportOrders(c,WEBSITE).timeline(row['order_id'])
         # Images are fetched using Odoo service credentials and stay inside this encrypted staff context.
         ids=list({line['product_id'][0] for line in order['items'] if isinstance(line.get('product_id'),(list,tuple))})[:100]
-        images={}
-        if ids and 'image_128' in c.fields_get('product.product'):
-            products=c.search_read('product.product',[['id','in',ids]],['id','image_128'],limit=100)
+        images={}; product_urls={}
+        fields=c.fields_get('product.product')
+        if ids:
+            wanted=[f for f in ['id','image_128','website_url','website_id','is_published','active'] if f in fields]
+            products=c.search_read('product.product',[['id','in',ids]],wanted,limit=100)
             for product in products:
+                website=product.get('website_id')
+                website=website[0] if isinstance(website,(list,tuple)) and website else website
+                path=product.get('website_url')
+                if product.get('active') and product.get('is_published') and website in (False,WEBSITE) and isinstance(path,str) and path.startswith('/shop/') and not any(x in path for x in ('\\','\n','\r')):
+                    product_urls[product['id']]='https://secretgreen.com.au'+path
                 value=product.get('image_128')
                 if isinstance(value,str) and len(value)<100000:
                     try:
@@ -424,7 +431,9 @@ def create_portal_router(*, db, get_store, client_factory):
                     except ValueError:pass
         for line in order['items']:
             product=line.get('product_id')
-            if isinstance(product,(list,tuple)):line['thumbnail']=images.get(product[0])
+            if isinstance(product,(list,tuple)):
+                line['thumbnail']=images.get(product[0])
+                line['product_url']=product_urls.get(product[0])
         with db() as conn:
             procurement=[dict(r) for r in conn.execute('SELECT id,asin,quantity,state,ordered_at,amazon_order_id,amazon_status FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id LIMIT 200',(STORE,row['order_id'])).fetchall()]
         return {'order':order,'history':history,'internal_fulfilment':procurement,'customer_preview':card(order),'link_version':row['link_version']}
