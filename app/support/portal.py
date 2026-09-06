@@ -267,7 +267,7 @@ def create_portal_router(*, db, get_store, client_factory):
         with db() as conn:conn.execute('UPDATE support_portal_sessions SET status_card_state=? WHERE token_hash=?',(state,user['token_hash']))
         return {'session_token':widget,'conversation_uuid':uuid,'reply':preview['reply'],'libredesk_url':LIBRE,'inbox_uuid':INBOX_UUID}
 
-    def tool_identity(request, verified=False):
+    def tool_identity(request, verified=False, require_email=True):
         active()
         supplied=request.headers.get('X-Secretgreen-Tool-Key','')
         if not hmac.compare_digest(supplied,secret('SUPPORT_LIBREDESK_TOOL_KEY')):
@@ -279,10 +279,26 @@ def create_portal_router(*, db, get_store, client_factory):
             raise HTTPException(403,'Conversation identity required.')
         if verified and request.headers.get('X-Libredesk-Contact-Verified')!='true':
             raise HTTPException(403,'Email verification is required before accessing orders.')
-        return uuid,email_value(request.headers.get('X-Libredesk-Contact-Email',''))
+        return uuid,email_value(request.headers.get('X-Libredesk-Contact-Email','')) if require_email else ''
 
     def customer_domain(c,email):
         return [['website_id','=',WEBSITE],['partner_id','in',partners(c,email)],['order_line','!=',False]]
+
+    @router.post(PREFIX+'/tools/support-hours')
+    def native_support_hours(request:Request):
+        tool_identity(request,require_email=False)
+        from zoneinfo import ZoneInfo
+        # The official app settings are the source of truth for hours and timezone.
+        settings=libre('/settings/general')
+        tz=ZoneInfo(settings['app.timezone'])
+        schedule=libre('/business-hours/'+str(settings['app.business_hours_id']))
+        now=datetime.now(tz);day=now.strftime('%A');hours=schedule.get('hours',{}).get(day)
+        opened=bool(schedule.get('is_always_open') or (hours and hours['open']<=now.strftime('%H:%M')<hours['close']))
+        holiday=any(x.get('date')==now.date().isoformat() for x in schedule.get('holidays',[]))
+        opened=opened and not holiday
+        return {'team_online_hours':opened,'day':day,'support_days':'Monday–Saturday','reply_target':'24 business hours',
+                'message':('Our team is within support hours.' if opened else ('Our team is offline on Sunday and will be back online on Monday.' if day=='Sunday' and not holiday else 'Our team is currently outside support hours.'))+' Your chat is automatically saved as a support ticket. The team will reply within 24 business hours.',
+                'note':'Business hours describe team coverage, not the real-time presence of an individual. Do not claim a location.'}
 
     @router.post(PREFIX+'/tools/customer-match')
     def customer_match(request:Request):
@@ -321,7 +337,14 @@ def create_portal_router(*, db, get_store, client_factory):
             else:
                 conn.execute("INSERT INTO support_portal_sessions(token_hash,email,expires_at,created_at,conversation_uuid,order_id,state,status_card_state) VALUES(?,?,?,?,?,?,'linked','native_ai')",
                              (digest(secrets.token_urlsafe(32)),email,time.time()+1800,time.time(),uuid,payload.order_id))
-        return {'linked':True,'order_id':payload.order_id,**card(order)}
+        preview=card(order)
+        try:
+            attributes=dict(libre('/conversations/'+uuid).get('custom_attributes') or {})
+            attributes.update({'sg_store':'Secretgreen','sg_order_reference':preview['reference'],'sg_order_id':payload.order_id,'sg_topic':'Order help'})
+            libre('/conversations/'+uuid+'/custom-attributes',method='PUT',data=attributes)
+        except HTTPException:
+            pass  # Durable binding and secured agent context remain available.
+        return {'linked':True,'order_id':payload.order_id,**preview}
 
     @router.get('/public/secretgreen-support/agent')
     def agent_page():
