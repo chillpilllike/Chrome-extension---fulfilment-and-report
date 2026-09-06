@@ -69,6 +69,19 @@ class PortalTests(unittest.TestCase):
     def test_upstream_mail_failure_is_generic(self):
         self.odoo.fail=True;r=self.api.post(self.p+'/request-code',json={'email':'test@example.com'})
         self.assertEqual(503,r.status_code);self.assertNotIn('secret source',r.text)
+    def test_send_rpc_fault_after_delivery_still_returns_challenge(self):
+        execute=self.odoo.execute
+        def send_fault(model,method,args):
+            if method=='send':raise ValueError('cannot marshal None')
+            return execute(model,method,args)
+        with patch.object(self.odoo,'execute',side_effect=send_fault):
+            r=self.api.post(self.p+'/request-code',json={'email':'test@example.com'})
+        self.assertEqual(200,r.status_code)
+        self.assertEqual('sent',self.db.c.execute('SELECT delivery_state FROM support_portal_challenges').fetchone()[0])
+    def test_send_rpc_fault_without_delivery_is_failure(self):
+        with patch.object(self.odoo,'read',return_value=[{'state':'exception'}]):
+            r=self.api.post(self.p+'/request-code',json={'email':'test@example.com'})
+        self.assertEqual(503,r.status_code)
     def test_orders_are_scoped_and_safe(self):
         h=self.authenticate();r=self.api.get(self.p+'/orders',headers=h);self.assertEqual(200,r.status_code)
         self.assertEqual('no-store',r.headers['cache-control']);self.assertNotIn('partner_id',r.text)

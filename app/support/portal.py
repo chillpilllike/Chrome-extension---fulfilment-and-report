@@ -187,7 +187,13 @@ def create_portal_router(*, db, get_store, client_factory):
               'subject':'Your Secretgreen support verification code', 'email_to':email,
               'body_html':f'<p>Your Secretgreen support verification code is <strong>{code}</strong>.</p><p>It expires in 10 minutes. If you did not request this code, you can ignore this email.</p>',
               'auto_delete':False}])
-            odoo.execute('mail.mail','send',[[mail_id]])
+            # Some Odoo deployments send successfully but return an XML-RPC
+            # serialization fault for the method's None result. Check the persisted
+            # delivery state before deciding whether the email failed. Never resend.
+            try:
+                odoo.execute('mail.mail','send',[[mail_id]])
+            except Exception:
+                pass
             sent=odoo.read('mail.mail',[mail_id],['state'])
             if not sent or sent[0]['state']!='sent':raise ValueError()
             with db() as c:c.execute("UPDATE support_portal_challenges SET delivery_state='sent' WHERE id=?",(challenge,))
