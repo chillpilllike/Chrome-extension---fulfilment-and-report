@@ -126,6 +126,7 @@ def create_portal_router(*, db, get_store, client_factory):
                   created_at DOUBLE PRECISION NOT NULL, conversation_uuid TEXT UNIQUE, order_id BIGINT,
                   state TEXT NOT NULL DEFAULT 'ready', link_version INTEGER NOT NULL DEFAULT 1,
                   widget_token TEXT, status_card_state TEXT NOT NULL DEFAULT 'pending')''')
+                c.execute('''CREATE TABLE IF NOT EXISTS support_review_requests (conversation_uuid TEXT NOT NULL, order_id BIGINT NOT NULL, email TEXT NOT NULL, requested_at TEXT NOT NULL, forwarded_at TEXT, PRIMARY KEY(conversation_uuid,order_id))''')
                 c.execute('CREATE INDEX IF NOT EXISTS support_challenge_created ON support_portal_challenges(created_at)')
             ready=True
     def active():
@@ -341,9 +342,38 @@ def create_portal_router(*, db, get_store, client_factory):
         if not row or not row['order_id'] or row['email'].lower()!=email:
             raise HTTPException(409,'Select and link an order in this conversation first.')
         try:
-            return card(owned_order(client(),email,row['order_id']))
+            order=owned_order(client(),email,row['order_id'])
+            result=card(order)
+            from app.support.journey import shipment_history,email_history
+            for key,reader in [('tracking',lambda conn:shipment_history(conn,STORE,order['id'],WEBSITE)),('after_order_care',lambda conn:email_history(conn,STORE,order['id'],email,WEBSITE))]:
+                try:
+                    with db() as conn:result[key]=reader(conn)
+                except Exception:result[key]={'unavailable':True,'instruction':'This source could not be checked. Do not infer no records or no response; offer team review.'}
+            result['cancellation_guidance']={'review_required':True,'dispatch_estimate_available':bool(result.get('estimated_dispatch')),'instruction':'For an explicit cancellation/refund request, call secretgreen_request_cancellation_review to save the request and forward this existing ticket to the team. If no estimate or tracking is available, say status could not be confirmed, never claim not dispatched. Only after successful handoff say the ticket was forwarded for the team to review the cancellation/refund and contact the customer. Do not promise approval, payment, timing or automatic cancellation. A tracked shipment also requires review, not automatic denial.'}
+            return result
         except HTTPException:raise
         except Exception:raise HTTPException(503,'The latest order status is unavailable; offer human assistance.') from None
+
+    @router.post(PREFIX+'/tools/request-cancellation-review')
+    def cancellation_review(request:Request):
+        uuid,email=tool_identity(request,verified=True)
+        with db() as conn:
+            row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+        if not row or not row['order_id'] or row['email'].lower()!=email:
+            raise HTTPException(409,'Select and link an order first.')
+        order=owned_order(client(),email,row['order_id']);preview=card(order)
+        with db() as conn:
+            conn.execute('INSERT INTO support_review_requests(conversation_uuid,order_id,email,requested_at) VALUES(?,?,?,?) ON CONFLICT(conversation_uuid,order_id) DO NOTHING',(uuid,order['id'],email,datetime.now(timezone.utc).isoformat()))
+        # Official assignments are idempotent. Read back before claiming a successful handoff.
+        libre('/conversations/'+uuid+'/status',method='PUT',data={'status':'Return or refund review'})
+        libre('/conversations/'+uuid+'/assignee/team',method='PUT',data={'assignee_id':1})
+        libre('/conversations/'+uuid+'/assignee/user',method='PUT',data={'assignee_id':2})
+        assigned=libre('/conversations/'+uuid)
+        if assigned.get('assigned_team_id')!=1 or assigned.get('assigned_user_id')!=2:
+            raise HTTPException(503,'The request is saved, but team assignment could not be confirmed. Do not claim it was forwarded.')
+        with db() as conn:
+            conn.execute('UPDATE support_review_requests SET forwarded_at=? WHERE conversation_uuid=? AND order_id=?',(datetime.now(timezone.utc).isoformat(),uuid,order['id']))
+        return {'forwarded':True,'order_reference':preview['reference'],'ticket_reference':assigned.get('reference_number'),'reply':'Your cancellation/refund request has been saved on this support ticket and forwarded to our team. They will review it and process any approved refund or contact you with the next steps.','instruction':'Use this confirmation. Do not call another handoff tool, create a duplicate ticket, resolve the ticket or claim cancellation/refund execution. Missing dispatch evidence is not proof of non-dispatch.'}
 
     def sync_contact(uuid,email,order):
         conversation=libre('/conversations/'+uuid)
@@ -436,5 +466,7 @@ def create_portal_router(*, db, get_store, client_factory):
                 line['product_url']=product_urls.get(product[0])
         with db() as conn:
             procurement=[dict(r) for r in conn.execute('SELECT id,asin,quantity,state,ordered_at,amazon_order_id,amazon_status FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id LIMIT 200',(STORE,row['order_id'])).fetchall()]
-        return {'order':order,'history':history,'internal_fulfilment':procurement,'customer_preview':card(order),'link_version':row['link_version']}
+        with db() as conn:
+            review=conn.execute('SELECT requested_at,forwarded_at FROM support_review_requests WHERE conversation_uuid=? AND order_id=?',(uuid,order['id'])).fetchone()
+        return {'review_request':dict(review) if review else None,'order':order,'history':history,'internal_fulfilment':procurement,'customer_preview':card(order),'link_version':row['link_version']}
     return router
