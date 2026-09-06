@@ -98,6 +98,8 @@ class PortalTests(unittest.TestCase):
         def upstream(path,**kwargs):
             if 'exchange' in path:return {'session_token':'widget-session'}
             if 'init' in path:return {'conversation':{'uuid':'test-conversation'}}
+            self.assertEqual('agent',kwargs['data']['sender_type'])
+            self.assertFalse(kwargs['data']['private'])
             return {}
         with patch('app.support.portal.libre',side_effect=upstream) as call:
             body={'order_id':4,'message':'Please check my order'}

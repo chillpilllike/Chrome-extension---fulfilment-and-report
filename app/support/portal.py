@@ -258,7 +258,7 @@ def create_portal_router(*, db, get_store, client_factory):
         # One attempt only: transport uncertainty must never blindly replay a customer message.
         with db() as conn:conn.execute("UPDATE support_portal_sessions SET status_card_state='sending' WHERE token_hash=?",(user['token_hash'],))
         try:
-            libre('/conversations/'+uuid+'/messages',data={'message':'<p>'+html.escape(preview['reply'])+'</p>','private':False})
+            libre('/conversations/'+uuid+'/messages',data={'message':'<p>'+html.escape(preview['reply'])+'</p>','private':False,'sender_type':'agent'})
             state='sent'
         except Exception:state='uncertain'
         with db() as conn:conn.execute('UPDATE support_portal_sessions SET status_card_state=? WHERE token_hash=?',(state,user['token_hash']))
