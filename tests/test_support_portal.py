@@ -164,6 +164,13 @@ class PortalTests(unittest.TestCase):
         h=self.native_headers(True);h['X-Libredesk-Contact-Email']='different@example.com'
         self.assertEqual(409,self.api.post(self.p+'/tools/order-status',headers=h).status_code)
 
+    def test_product_context_needs_no_email_or_otp(self):
+        h=self.native_headers();h.pop('X-Libredesk-Contact-Email')
+        with patch('app.support.portal.libre',return_value=[]):
+            r=self.api.post(self.p+'/tools/product-context',headers=h,json={})
+        self.assertEqual(200,r.status_code);self.assertFalse(r.json()['found'])
+        self.assertEqual(403,self.api.post(self.p+'/tools/product-context',json={}).status_code)
+
     def test_native_no_match_continues_general_without_code(self):
         with patch.object(self.odoo,'search_read',return_value=[]):
             r=self.api.post(self.p+'/tools/customer-match',headers=self.native_headers(),json={})

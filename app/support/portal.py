@@ -303,6 +303,15 @@ def create_portal_router(*, db, get_store, client_factory):
                 'message':('Our team is within support hours.' if opened else ('Our team is offline on Sunday and will be back online on Monday.' if day=='Sunday' and not holiday else 'Our team is currently outside support hours.'))+' Your chat is automatically saved as a support ticket. The team will reply within 24 business hours.',
                 'note':'Business hours describe team coverage, not the real-time presence of an individual. Do not claim a location.'}
 
+    @router.post(PREFIX+'/tools/product-context')
+    def native_product_context(request:Request):
+        uuid,_=tool_identity(request,require_email=False)
+        try:
+            from app.support.products import product_context
+            return product_context(client(),libre('/conversations/'+uuid+'/page-visits'),WEBSITE)
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Product information is unavailable. Ask the customer for the product name and offer staff help.') from None
+
     @router.post(PREFIX+'/tools/customer-match')
     def customer_match(request:Request):
         # Native LibreDesk injects contact identity separately from model arguments.
