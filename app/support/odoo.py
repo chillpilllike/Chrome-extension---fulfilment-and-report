@@ -1,6 +1,6 @@
 """Bounded, read-only order queries using the existing Odoo client."""
-ORDER_FIELDS = ["id", "name", "state", "date_order", "amount_total", "amount_untaxed", "amount_tax", "currency_id", "partner_id", "website_id", "write_date"]
-LINE_FIELDS = ["id", "name", "product_uom_qty", "price_unit", "discount", "price_subtotal", "price_total", "display_type"]
+ORDER_FIELDS = ["id", "name", "state", "date_order", "amount_total", "amount_untaxed", "amount_tax", "currency_id", "partner_id", "website_id", "write_date", "margin", "margin_percent"]
+LINE_FIELDS = ["id", "name", "product_uom_qty", "price_unit", "discount", "price_subtotal", "price_total", "display_type", "product_id", "is_delivery", "purchase_price", "margin"]
 
 
 class ScopeError(ValueError):
@@ -49,6 +49,17 @@ class SupportOrders:
         order["items_truncated"] = len(order["items"]) > 500
         order["items"] = order["items"][:500]
         order["odoo_url"] = self.client.order_url(order_id)
+        partner = order.get("partner_id")
+        order["customer"] = {}
+        if isinstance(partner, (list, tuple)) and partner:
+            fields = self.client.existing_fields("res.partner", ["id", "name", "email", "phone", "mobile", "street", "street2", "city", "zip", "country_id"])
+            matches = self.client.search_read("res.partner", [["id", "=", partner[0]]], fields, limit=1)
+            order["customer"] = matches[0] if matches else {}
+        order["financials"] = {"available": False, "reason": "Odoo order margin is not available. Historical cost must not be inferred from today's product cost."}
+        if isinstance(order.get("margin"), (int, float)) and not isinstance(order.get("margin"), bool):
+            revenue = float(order.get("amount_untaxed") or 0)
+            margin = float(order["margin"])
+            order["financials"] = {"available": True, "basis": "Odoo recorded margin, excluding tax", "cost": revenue-margin, "margin": margin, "margin_percent": margin/revenue*100 if revenue else None}
         return order
 
     def timeline(self, order_id, page=1):

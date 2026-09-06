@@ -42,6 +42,7 @@ class Odoo:
 
 class PortalTests(unittest.TestCase):
     def setUp(self):
+        self.upstream=patch("app.support.portal.libre",return_value={});self.upstream.start();self.addCleanup(self.upstream.stop)
         self.env=patch.dict(os.environ,{'SUPPORT_SECRETGREEN_ENABLED':'true','SUPPORT_SESSION_KEY':'x'*32,'SUPPORT_LIBREDESK_INBOX_SECRET':'y'*32,'SUPPORT_CONTEXT_KEY':'z'*32,'SUPPORT_LIBREDESK_TOOL_KEY':'k'*32});self.env.start();self.addCleanup(self.env.stop)
         self.db=DB();self.odoo=Odoo();app=FastAPI();app.include_router(create_portal_router(db=self.db.connect,get_store=lambda _:None,client_factory=lambda _:self.odoo));self.api=TestClient(app);self.p='/api/public/secretgreen-support'
     def issue(self):return self.api.post(self.p+'/request-code',json={'email':'test@example.com'}).json()['challenge']
@@ -87,7 +88,7 @@ class PortalTests(unittest.TestCase):
         self.assertEqual('no-store',r.headers['cache-control']);self.assertNotIn('partner_id',r.text)
         call=[x for x in self.odoo.calls if x[0]=='sale.order'][-1]
         self.assertIn(['website_id','=',1],call[1]);self.assertIn(['partner_id','in',[7]],call[1])
-        self.assertIn('confirmed',r.json()['orders'][0]['reply'])
+        self.assertIsNone(r.json()['orders'][0]['estimated_dispatch'])
     def test_foreign_order_cannot_start_conversation(self):
         h=self.authenticate()
         with patch('app.support.portal.libre') as upstream:
@@ -153,11 +154,38 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(200,r.status_code);self.assertTrue(r.json()['linked'])
         row=self.db.c.execute('SELECT order_id,email FROM support_portal_sessions').fetchone()
         self.assertEqual(4,row['order_id']);self.assertEqual('test@example.com',row['email'])
+    def test_status_requires_verified_matching_bound_contact(self):
+        self.assertEqual(403,self.api.post(self.p+'/tools/order-status',headers=self.native_headers()).status_code)
+        self.assertEqual(409,self.api.post(self.p+'/tools/order-status',headers=self.native_headers(True)).status_code)
+        self.api.post(self.p+'/tools/link-order',headers=self.native_headers(True),json={'order_id':4})
+        response=self.api.post(self.p+'/tools/order-status',headers=self.native_headers(True))
+        self.assertEqual(200,response.status_code)
+        self.assertNotIn('customer',response.json())
+        h=self.native_headers(True);h['X-Libredesk-Contact-Email']='different@example.com'
+        self.assertEqual(409,self.api.post(self.p+'/tools/order-status',headers=h).status_code)
+
     def test_native_no_match_continues_general_without_code(self):
         with patch.object(self.odoo,'search_read',return_value=[]):
             r=self.api.post(self.p+'/tools/customer-match',headers=self.native_headers(),json={})
         self.assertEqual(200,r.status_code);self.assertFalse(r.json()['has_orders'])
         self.assertEqual('continue_general_chat',r.json()['next_step'])
+        self.assertEqual([],self.odoo.calls)
+    def test_native_link_preserves_other_conversation_attributes(self):
+        with patch('app.support.portal.libre',side_effect=[{'custom_attributes':{'existing':'keep'}},True,{}]) as upstream:
+            r=self.api.post(self.p+'/tools/link-order',headers=self.native_headers(True),json={'order_id':4})
+        self.assertEqual(200,r.status_code)
+        saved=upstream.call_args_list[1].kwargs['data']
+        self.assertEqual('keep',saved['existing'])
+        self.assertEqual('SG1234',saved['sg_order_reference'])
+    def test_support_hours_sunday_requires_no_email_or_order(self):
+        from datetime import datetime
+        h=self.native_headers();h.pop('X-Libredesk-Contact-Email')
+        with patch('app.support.portal.libre',side_effect=[{'app.timezone':'Asia/Kolkata','app.business_hours_id':'2'},{'hours':{'Monday':{'open':'09:00','close':'17:00'}},'holidays':[]}]),patch('app.support.portal.datetime') as clock:
+            clock.now.return_value=datetime.fromisoformat('2026-09-06T12:00:00+05:30')
+            r=self.api.post(self.p+'/tools/support-hours',headers=h,json={})
+        self.assertEqual(200,r.status_code)
+        self.assertFalse(r.json()['team_online_hours'])
+        self.assertIn('Monday',r.json()['message'])
         self.assertEqual([],self.odoo.calls)
     def test_email_wildcards_are_rejected(self):
         self.assertEqual(422,self.api.post(self.p+'/request-code',json={'email':'%test@example.com'}).status_code)

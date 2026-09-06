@@ -64,7 +64,7 @@ def email_value(value):
     return value
 
 
-def libre(path, *, data=None, token=None, method=None):
+def libre(path, *, data=None, token=None, method=None, multipart=False):
     headers={'X-Libredesk-Inbox-ID':INBOX_UUID, 'Origin':ORIGIN}
     if token:
         headers['Authorization']='Bearer '+token
@@ -72,7 +72,7 @@ def libre(path, *, data=None, token=None, method=None):
         headers['Authorization']='token '+os.getenv('SUPPORT_LIBREDESK_API_KEY','')+':'+secret('SUPPORT_LIBREDESK_API_SECRET')
     try:
         response=requests.request(method or ('POST' if data is not None else 'GET'), LIBRE+'/api/v1'+path,
-                                  headers=headers,json=data,timeout=20)
+                                  headers=headers,timeout=20,**({'files':{k:(None,str(v or '')) for k,v in data.items()}} if multipart else {'json':data}))
         if not response.ok: raise ValueError()
         return response.json()['data']
     except Exception:
@@ -151,10 +151,13 @@ def create_portal_router(*, db, get_store, client_factory):
         if not rows:raise HTTPException(404,'No matching order was found on this website.')
         return SupportOrders(c,WEBSITE).detail(order_id)
     def card(order):
-        result=public_order(order,Evidence(observed_at=datetime.now(timezone.utc)))
-        if order.get('state') in {'sale','done'}:
-            result.update(status='confirmed',reply='Your order is confirmed. Our team will check the latest dispatch and tracking details for you.')
-        return result
+        from app.support.live import order_evidence
+        try:
+            with db() as conn:
+                evidence=order_evidence(conn, STORE, order)
+        except Exception:
+            evidence=Evidence(observed_at=datetime.min.replace(tzinfo=timezone.utc))
+        return public_order(order,evidence)
     def no_store(response):
         response.headers['Cache-Control']='no-store'
         response.headers['Referrer-Policy']='no-referrer'
@@ -321,6 +324,36 @@ def create_portal_router(*, db, get_store, client_factory):
         except HTTPException:raise
         except Exception:raise HTTPException(503,'Orders are unavailable; offer human assistance.') from None
 
+    @router.post(PREFIX+'/tools/order-status')
+    def native_status(request:Request):
+        uuid,email=tool_identity(request,verified=True)
+        with db() as conn:
+            row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+        if not row or not row['order_id'] or row['email'].lower()!=email:
+            raise HTTPException(409,'Select and link an order in this conversation first.')
+        try:
+            return card(owned_order(client(),email,row['order_id']))
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'The latest order status is unavailable; offer human assistance.') from None
+
+    def sync_contact(uuid,email,order):
+        conversation=libre('/conversations/'+uuid)
+        contact_id=conversation.get('contact_id')
+        if not contact_id: return False
+        contact=libre('/contacts/'+str(contact_id))
+        customer=order.get('customer') or {}
+        if str(contact.get('email') or '').strip().lower()!=email or str(customer.get('email') or '').strip().lower()!=email:
+            return False
+        full_name=str(customer.get('name') or '').strip()
+        if not full_name:return False
+        names=full_name.split(' ',1)
+        data={k:contact.get(k) or '' for k in ['email','avatar_url','phone_number','phone_number_country_code','country']}
+        data.update(first_name=names[0],last_name=names[1] if len(names)>1 else '')
+        phone=customer.get('mobile') or customer.get('phone')
+        if phone:data['phone_number']=phone;data['phone_number_country_code']=''
+        libre('/contacts/'+str(contact_id),method='PUT',data=data,multipart=True)
+        return True
+
     @router.post(PREFIX+'/tools/link-order')
     def native_link(payload:NativeOrderSelection,request:Request):
         uuid,email=tool_identity(request,verified=True)
@@ -340,11 +373,13 @@ def create_portal_router(*, db, get_store, client_factory):
         preview=card(order)
         try:
             attributes=dict(libre('/conversations/'+uuid).get('custom_attributes') or {})
-            attributes.update({'sg_store':'Secretgreen','sg_order_reference':preview['reference'],'sg_order_id':payload.order_id,'sg_topic':'Order help'})
+            attributes.update({'sg_store':'Secretgreen','sg_order_reference':preview['reference'],'sg_order_id':payload.order_id,'sg_topic':'Order help','sg_odoo_order_url':order['odoo_url']})
             libre('/conversations/'+uuid+'/custom-attributes',method='PUT',data=attributes)
         except HTTPException:
             pass  # Durable binding and secured agent context remain available.
-        return {'linked':True,'order_id':payload.order_id,**preview}
+        try: synced=sync_contact(uuid,email,order)
+        except HTTPException: synced=False
+        return {'linked':True,'profile_synced':synced,'order_id':payload.order_id,**preview}
 
     @router.get('/public/secretgreen-support/agent')
     def agent_page():
@@ -365,6 +400,22 @@ def create_portal_router(*, db, get_store, client_factory):
         except Exception:raise HTTPException(403,'Open the order panel again from the linked LibreDesk conversation.') from None
         if not row['order_id']:return {'order':None,'message':'No order linked to this conversation.'}
         c=client();order=owned_order(c,row['email'],row['order_id']);history=SupportOrders(c,WEBSITE).timeline(row['order_id'])
+        # Images are fetched using Odoo service credentials and stay inside this encrypted staff context.
+        ids=list({line['product_id'][0] for line in order['items'] if isinstance(line.get('product_id'),(list,tuple))})[:100]
+        images={}
+        if ids and 'image_128' in c.fields_get('product.product'):
+            products=c.search_read('product.product',[['id','in',ids]],['id','image_128'],limit=100)
+            for product in products:
+                value=product.get('image_128')
+                if isinstance(value,str) and len(value)<100000:
+                    try:
+                        raw=base64.b64decode(value,validate=True)
+                        mime='image/png' if raw.startswith(b'\x89PNG') else 'image/jpeg' if raw.startswith(b'\xff\xd8') else 'image/webp' if raw.startswith(b'RIFF') and raw[8:12]==b'WEBP' else None
+                        if mime:images[product['id']]='data:'+mime+';base64,'+value
+                    except ValueError:pass
+        for line in order['items']:
+            product=line.get('product_id')
+            if isinstance(product,(list,tuple)):line['thumbnail']=images.get(product[0])
         with db() as conn:
             procurement=[dict(r) for r in conn.execute('SELECT id,asin,quantity,state,ordered_at,amazon_order_id,amazon_status FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id LIMIT 200',(STORE,row['order_id'])).fetchall()]
         return {'order':order,'history':history,'internal_fulfilment':procurement,'customer_preview':card(order),'link_version':row['link_version']}
