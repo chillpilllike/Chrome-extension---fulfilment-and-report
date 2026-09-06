@@ -127,6 +127,7 @@ def create_portal_router(*, db, get_store, client_factory):
                   state TEXT NOT NULL DEFAULT 'ready', link_version INTEGER NOT NULL DEFAULT 1,
                   widget_token TEXT, status_card_state TEXT NOT NULL DEFAULT 'pending')''')
                 c.execute('''CREATE TABLE IF NOT EXISTS support_review_requests (conversation_uuid TEXT NOT NULL, order_id BIGINT NOT NULL, email TEXT NOT NULL, requested_at TEXT NOT NULL, forwarded_at TEXT, PRIMARY KEY(conversation_uuid,order_id))''')
+                c.execute('''CREATE TABLE IF NOT EXISTS support_review_receipts (conversation_uuid TEXT NOT NULL, order_id BIGINT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(conversation_uuid,order_id))''')
                 c.execute('CREATE INDEX IF NOT EXISTS support_challenge_created ON support_portal_challenges(created_at)')
             ready=True
     def active():
@@ -373,7 +374,17 @@ def create_portal_router(*, db, get_store, client_factory):
             raise HTTPException(503,'The request is saved, but team assignment could not be confirmed. Do not claim it was forwarded.')
         with db() as conn:
             conn.execute('UPDATE support_review_requests SET forwarded_at=? WHERE conversation_uuid=? AND order_id=?',(datetime.now(timezone.utc).isoformat(),uuid,order['id']))
-        return {'forwarded':True,'order_reference':preview['reference'],'ticket_reference':assigned.get('reference_number'),'reply':'Your cancellation/refund request has been saved on this support ticket and forwarded to our team. They will review it and process any approved refund or contact you with the next steps.','instruction':'Use this confirmation. Do not call another handoff tool, create a duplicate ticket, resolve the ticket or claim cancellation/refund execution. Missing dispatch evidence is not proof of non-dispatch.'}
+        confirmation='Your cancellation/refund request has been saved on this support ticket and forwarded to our team. They will review it and process any approved refund or contact you with the next steps.'
+        with db() as conn:
+            conn.execute('SELECT pg_advisory_xact_lock(81910414)')
+            receipt=conn.execute('SELECT state FROM support_review_receipts WHERE conversation_uuid=? AND order_id=?',(uuid,order['id'])).fetchone()
+            if not receipt:conn.execute("INSERT INTO support_review_receipts VALUES(?,?,'sending')",(uuid,order['id']))
+        if not receipt:
+            # Reassignment stops the native AI turn, so queue the verified confirmation explicitly.
+            # An uncertain send stays reserved for staff review rather than risking duplicate messages.
+            libre('/conversations/'+uuid+'/messages',method='POST',data={'message':confirmation,'private':False,'sender_type':'agent'})
+            with db() as conn:conn.execute("UPDATE support_review_receipts SET state='queued' WHERE conversation_uuid=? AND order_id=?",(uuid,order['id']))
+        return {'forwarded':True,'confirmation_queued':not receipt or receipt['state']=='queued','order_reference':preview['reference'],'ticket_reference':assigned.get('reference_number'),'reply':'Your cancellation/refund request has been saved on this support ticket and forwarded to our team. They will review it and process any approved refund or contact you with the next steps.','instruction':'The confirmation was queued through LibreDesk; do not repeat it. Do not call another handoff tool, create a duplicate ticket, resolve the ticket or claim cancellation/refund execution. Missing dispatch evidence is not proof of non-dispatch.'}
 
     def sync_contact(uuid,email,order):
         conversation=libre('/conversations/'+uuid)
