@@ -95,9 +95,11 @@ class ResendRequest(BaseModel):
     message_id: int = Field(gt=0)
 
 class ContactChangeRequest(BaseModel):
+    edit_token: str = Field(default='',max_length=2000)
     kind: str = Field(pattern='^(address|phone)$')
     recipient_name: str = Field(default='',max_length=160)
     street_address: str = Field(default='',max_length=400)
+    address_line_2: str = Field(default='',max_length=200)
     city: str = Field(default='',max_length=120)
     state_region: str = Field(default='',max_length=120)
     postal_code: str = Field(default='',max_length=30)
@@ -384,26 +386,39 @@ def create_portal_router(*, db, get_store, client_factory):
         from app.support.followup import resend_action_email
         return resend_action_email(db,STORE,WEBSITE,order,email,uuid,payload.message_id)
 
+    @router.post(PREFIX+'/tools/contact-details')
+    def contact_details(request:Request):
+        uuid,email,order=verified_link(request)
+        from app.support.address import live_context,public_current,snapshot
+        try:raw,current,picks,shops=live_context(db,client(),STORE,order)
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'The current delivery details could not be verified. Offer team assistance.') from None
+        claims={'uuid':uuid,'email':email,'order':order['id'],'snapshot':snapshot(raw,current,shops),'expires':time.time()+900}
+        body=base64.urlsafe_b64encode(json.dumps(claims).encode()).decode()
+        signature=hmac.new(secret('SUPPORT_SESSION_KEY').encode(),body.encode(),hashlib.sha256).hexdigest()
+        return {'can_update':True,'current_details':public_current(current),'edit_token':body+'.'+signature,'instruction':'Show the current delivery address and phone. Ask for the complete new details including postal code and country (or the new phone with country code). Once supplied, apply directly without an extra confirmation question. Keep the edit token internal.'}
+
     @router.post(PREFIX+'/tools/request-contact-change')
     def contact_change(payload:ContactChangeRequest,request:Request):
         uuid,email,order=verified_link(request)
-        from app.support.followup import change_eligibility
-        with db() as conn:eligible=change_eligibility(conn,STORE,order)
-        if not eligible['can_collect_change']:raise HTTPException(409,'The latest fulfilment state does not confirm this change can be requested automatically. Ask the team to review; do not promise a change.')
-        fields=payload.model_dump()
+        try:
+            body,signature=payload.edit_token.rsplit('.',1)
+            if not hmac.compare_digest(signature,hmac.new(secret('SUPPORT_SESSION_KEY').encode(),body.encode(),hashlib.sha256).hexdigest()):raise ValueError()
+            claims=json.loads(base64.urlsafe_b64decode(body))
+            if claims['uuid']!=uuid or claims['email']!=email or claims['order']!=order['id'] or claims['expires']<time.time():raise ValueError()
+        except Exception:raise HTTPException(409,'Retrieve the current delivery details before applying this change.') from None
+        fields=payload.model_dump();fields.pop('edit_token')
         required=['phone'] if payload.kind=='phone' else ['recipient_name','street_address','city','state_region','postal_code','country']
-        if any(not fields[k].strip() for k in required):raise HTTPException(422,'Please supply all requested details, including postal code for an address and country code for a phone number.')
-        if payload.kind=='phone' and not re.fullmatch(r'\+[0-9 ()-]{6,30}',payload.phone):raise HTTPException(422,'Please include the phone country code, starting with +.')
-        note='<p>Customer requested '+payload.kind+' change for '+html.escape(str(order['name']))+'. Review required; no address or phone has been changed.</p><ul>'+''.join('<li>'+html.escape(k.replace('_',' '))+': '+html.escape(fields[k])+'</li>' for k in required)+'</ul>'
-        # Store the requested details in the actual conversation, not in the customer profile.
-        libre('/conversations/'+uuid+'/messages',method='POST',data={'private':True,'sender_type':'agent','message':note})
-        libre('/conversations/'+uuid+'/assignee/team',method='PUT',data={'assignee_id':1})
-        libre('/conversations/'+uuid+'/assignee/user',method='PUT',data={'assignee_id':2})
-        conv=libre('/conversations/'+uuid)
-        if conv.get('assigned_user_id')!=2 or conv.get('assigned_team_id')!=1:raise HTTPException(503,'The details were recorded but team assignment needs checking.')
-        reply='Your '+payload.kind+' change request has been forwarded to our team for review. The order details have not been changed yet.'
-        libre('/conversations/'+uuid+'/messages',method='POST',data={'private':False,'sender_type':'agent','message':reply})
-        return {'forwarded':True,'confirmation_queued':True,'instruction':'Do not duplicate the confirmation or claim that order details were changed.'}
+        if any(not fields[k].strip() for k in required):raise HTTPException(422,'Please supply the complete new address including postal code and country, or the full phone number.')
+        if payload.phone and not re.fullmatch(r'\+[0-9 ()-]{6,30}',payload.phone):raise HTTPException(422,'Please include the phone country code, starting with +.')
+        from app.support.address import update_delivery
+        result=update_delivery(db,client(),STORE,order,uuid,email,fields,claims['snapshot'])
+        if result.get('needs_human'):
+            libre('/conversations/'+uuid+'/messages',method='POST',data={'private':True,'sender_type':'agent','message':'Delivery-detail update needs reconciliation. '+html.escape(json.dumps(result))})
+            libre('/conversations/'+uuid+'/assignee/team',method='PUT',data={'assignee_id':1})
+            libre('/conversations/'+uuid+'/assignee/user',method='PUT',data={'assignee_id':2})
+            libre('/conversations/'+uuid+'/messages',method='POST',data={'private':False,'sender_type':'agent','message':'Your delivery-detail update needs a team check before we can confirm it is complete. Your request has been forwarded for review.'})
+        return result
 
     @router.post(PREFIX+'/tools/request-cancellation-review')
     def cancellation_review(request:Request):

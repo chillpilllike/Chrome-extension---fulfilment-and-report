@@ -183,15 +183,17 @@ class PortalTests(unittest.TestCase):
             self.assertEqual(403,self.api.post(self.p+'/tools/'+route,headers=self.native_headers(),json=payload).status_code)
             self.assertEqual(409,self.api.post(self.p+'/tools/'+route,headers=self.native_headers(True),json=payload).status_code)
 
-    def test_contact_change_records_review_without_changing_odoo(self):
+    def test_contact_change_requires_bound_fresh_edit_token(self):
         h=self.native_headers(True);self.api.post(self.p+'/tools/link-order',headers=h,json={'order_id':4})
-        with patch('app.support.followup.change_eligibility',return_value={'can_collect_change':True}),patch('app.support.portal.libre',return_value={'assigned_user_id':2,'assigned_team_id':1}) as api:
-            self.assertEqual(422,self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'address'}).status_code)
-            self.assertEqual(422,self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'0400000000'}).status_code)
-            r=self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'+61400000000'})
-            self.assertTrue(r.json()['forwarded'])
-            self.assertTrue(any(c.kwargs.get('data',{}).get('private') is True for c in api.call_args_list))
-        self.assertFalse(any(c[0]=='write' for c in self.odoo.calls))
+        self.assertEqual(409,self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'+61400000000'}).status_code)
+        with patch('app.support.address.live_context',return_value=({'id':4},{'id':7,'phone':'+61000000000'},[],[])):
+            token=self.api.post(self.p+'/tools/contact-details',headers=h).json()['edit_token']
+        with patch('app.support.address.update_delivery',return_value={'updated':True,'odoo_updated':True,'shopify_exists':False}) as update:
+            self.assertEqual(422,self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'0400000000','edit_token':token}).status_code)
+            r=self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'+61400000000','edit_token':token})
+            self.assertTrue(r.json()['updated']);self.assertEqual(1,update.call_count)
+            r=self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'+61400000000','edit_token':token+'x'})
+            self.assertEqual(409,r.status_code);self.assertEqual(1,update.call_count)
 
     def test_product_context_needs_no_email_or_otp(self):
         h=self.native_headers();h.pop('X-Libredesk-Contact-Email')
