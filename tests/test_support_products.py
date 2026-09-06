@@ -27,3 +27,7 @@ class ProductTests(unittest.TestCase):
   self.c.rows[0]['website_description']='Supplier Amazon sourcing';self.assertEqual('',self.run_product()['published_description'])
  def test_variant_not_inferred_from_query(self):
   self.visits[0]['url']+='?attribute_values=9';self.assertNotIn('variant',self.run_product())
+
+ def test_catalog_identifier_and_empty_weight_are_not_product_facts(self):
+  self.c.rows[0]['website_description']='Steel handle. SKU : ADIB0000VYXL6 Weight: 0.0 oz Package Dimensions: .'
+  result=self.run_product()['published_description'];self.assertEqual('Steel handle.',result)

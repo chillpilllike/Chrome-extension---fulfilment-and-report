@@ -37,6 +37,11 @@ def product_context(client,visits,website=1,now=None):
     product=rows[0]
     if unquote(urlsplit(product.get('website_url') or '').path).rstrip('/')!=path:return missing
     parser=PlainText();parser.feed(str(product.get('website_description') or '')[:50000]);description=re.sub(r'\s+',' ',' '.join(parser.parts)).strip()[:6000]
+    # Remove catalog identifiers and empty import placeholders; they are not product benefits.
+    description=re.sub(r'\bSKU\s*:\s*\S+', '', description, flags=re.I)
+    description=re.sub(r'[A-Za-z]*B0[A-Z0-9]{8}\b', '', description)
+    description=re.sub(r'Package Dimensions:\s*\.|(?:Assembled Product )?Weight:?\s*0(?:\.0)?\s*(?:oz|Ounces)\b', '', description, flags=re.I)
+    description=re.sub(r'\s+', ' ', description).strip()
     # Do not pass obvious sourcing copy into a customer-facing AI tool.
     if re.search(r'amazon|\basin\b|dropship|supplier|procurement',description,re.I):description=''
     name=str(product['name'])[:400]
