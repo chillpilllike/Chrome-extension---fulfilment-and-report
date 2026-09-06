@@ -42,7 +42,7 @@ class Odoo:
 
 class PortalTests(unittest.TestCase):
     def setUp(self):
-        self.env=patch.dict(os.environ,{'SUPPORT_SECRETGREEN_ENABLED':'true','SUPPORT_SESSION_KEY':'x'*32,'SUPPORT_LIBREDESK_INBOX_SECRET':'y'*32,'SUPPORT_CONTEXT_KEY':'z'*32});self.env.start();self.addCleanup(self.env.stop)
+        self.env=patch.dict(os.environ,{'SUPPORT_SECRETGREEN_ENABLED':'true','SUPPORT_SESSION_KEY':'x'*32,'SUPPORT_LIBREDESK_INBOX_SECRET':'y'*32,'SUPPORT_CONTEXT_KEY':'z'*32,'SUPPORT_LIBREDESK_TOOL_KEY':'k'*32});self.env.start();self.addCleanup(self.env.stop)
         self.db=DB();self.odoo=Odoo();app=FastAPI();app.include_router(create_portal_router(db=self.db.connect,get_store=lambda _:None,client_factory=lambda _:self.odoo));self.api=TestClient(app);self.p='/api/public/secretgreen-support'
     def issue(self):return self.api.post(self.p+'/request-code',json={'email':'test@example.com'}).json()['challenge']
     def authenticate(self):
@@ -123,6 +123,42 @@ class PortalTests(unittest.TestCase):
         from app.support.policy import safe_reference
         self.assertEqual('#5381',safe_reference('#5381'))
         self.assertEqual('Your order',safe_reference('Amazon #5381'))
+    def native_headers(self,verified=False):
+        return {'X-Secretgreen-Tool-Key':'k'*32,'X-Libredesk-Inbox-Id':'1',
+                'X-Libredesk-Conversation-UUID':'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+                'X-Libredesk-Contact-Email':'test@example.com',
+                'X-Libredesk-Contact-Verified':'true' if verified else 'false'}
+    def test_native_tools_require_server_auth(self):
+        for path in ['/customer-match','/orders','/link-order']:
+            r=self.api.post(self.p+'/tools'+path,json={'order_id':4})
+            self.assertEqual(403,r.status_code)
+        self.assertEqual([],self.odoo.calls)
+    def test_native_match_reveals_only_existence(self):
+        r=self.api.post(self.p+'/tools/customer-match',headers=self.native_headers(),json={'email':'victim@example.com'})
+        self.assertEqual(200,r.status_code);self.assertTrue(r.json()['has_orders'])
+        self.assertNotIn('SG1234',r.text);self.assertNotIn('amount_total',r.text)
+        partner=[c for c in self.odoo.calls if c[0]=='res.partner'][0]
+        self.assertIn(['email_normalized','=','test@example.com'],partner[1])
+    def test_native_unverified_cannot_list_or_link(self):
+        for path in ['/orders','/link-order']:
+            self.assertEqual(403,self.api.post(self.p+'/tools'+path,headers=self.native_headers(),json={'order_id':4}).status_code)
+        self.assertEqual([],self.odoo.calls)
+    def test_native_wrong_inbox_is_rejected(self):
+        h=self.native_headers(True);h['X-Libredesk-Inbox-Id']='2'
+        self.assertEqual(403,self.api.post(self.p+'/tools/orders',headers=h,json={}).status_code)
+    def test_native_verified_order_binding(self):
+        h=self.native_headers(True)
+        self.assertEqual(404,self.api.post(self.p+'/tools/link-order',headers=h,json={'order_id':99}).status_code)
+        r=self.api.post(self.p+'/tools/link-order',headers=h,json={'order_id':4})
+        self.assertEqual(200,r.status_code);self.assertTrue(r.json()['linked'])
+        row=self.db.c.execute('SELECT order_id,email FROM support_portal_sessions').fetchone()
+        self.assertEqual(4,row['order_id']);self.assertEqual('test@example.com',row['email'])
+    def test_native_no_match_continues_general_without_code(self):
+        with patch.object(self.odoo,'search_read',return_value=[]):
+            r=self.api.post(self.p+'/tools/customer-match',headers=self.native_headers(),json={})
+        self.assertEqual(200,r.status_code);self.assertFalse(r.json()['has_orders'])
+        self.assertEqual('continue_general_chat',r.json()['next_step'])
+        self.assertEqual([],self.odoo.calls)
     def test_email_wildcards_are_rejected(self):
         self.assertEqual(422,self.api.post(self.p+'/request-code',json={'email':'%test@example.com'}).status_code)
 

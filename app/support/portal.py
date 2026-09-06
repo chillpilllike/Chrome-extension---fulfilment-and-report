@@ -91,6 +91,10 @@ class BeginChat(BaseModel):
     message: str = Field(min_length=1,max_length=4000)
 
 
+class NativeOrderSelection(BaseModel):
+    order_id: int = Field(gt=0)
+
+
 class PrivateResponseRoute(APIRoute):
     def get_route_handler(self):
         original=super().get_route_handler()
@@ -262,6 +266,62 @@ def create_portal_router(*, db, get_store, client_factory):
         except Exception:state='uncertain'
         with db() as conn:conn.execute('UPDATE support_portal_sessions SET status_card_state=? WHERE token_hash=?',(state,user['token_hash']))
         return {'session_token':widget,'conversation_uuid':uuid,'reply':preview['reply'],'libredesk_url':LIBRE,'inbox_uuid':INBOX_UUID}
+
+    def tool_identity(request, verified=False):
+        active()
+        supplied=request.headers.get('X-Secretgreen-Tool-Key','')
+        if not hmac.compare_digest(supplied,secret('SUPPORT_LIBREDESK_TOOL_KEY')):
+            raise HTTPException(403,'Tool authentication required.')
+        if request.headers.get('X-Libredesk-Inbox-Id')!=str(INBOX):
+            raise HTTPException(403,'Wrong support inbox.')
+        uuid=request.headers.get('X-Libredesk-Conversation-UUID','')
+        if not re.fullmatch(r'[0-9a-fA-F-]{36}',uuid):
+            raise HTTPException(403,'Conversation identity required.')
+        if verified and request.headers.get('X-Libredesk-Contact-Verified')!='true':
+            raise HTTPException(403,'Email verification is required before accessing orders.')
+        return uuid,email_value(request.headers.get('X-Libredesk-Contact-Email',''))
+
+    def customer_domain(c,email):
+        return [['website_id','=',WEBSITE],['partner_id','in',partners(c,email)],['order_line','!=',False]]
+
+    @router.post(PREFIX+'/tools/customer-match')
+    def customer_match(request:Request):
+        # Native LibreDesk injects contact identity separately from model arguments.
+        _,email=tool_identity(request)
+        try:
+            c=client();found=bool(c.search_read('sale.order',customer_domain(c,email),['id'],limit=1))
+            return {'has_orders':found,'next_step':'send_email_verification' if found else 'continue_general_chat',
+                    'message':'Verify email before retrieving any order details.' if found else 'No orders found with this email on Secretgreen. Continue general chat.'}
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Order lookup is unavailable; offer human assistance.') from None
+
+    @router.post(PREFIX+'/tools/orders')
+    def native_orders(request:Request):
+        _,email=tool_identity(request,verified=True)
+        try:
+            c=client();rows=c.search_read('sale.order',customer_domain(c,email),['id','name','state','amount_total','currency_id','date_order'],limit=26,order='date_order desc,id desc')
+            return {'orders':[{'id':r['id'],'date':r['date_order'],**card(r)} for r in rows[:25]],
+                    'has_more':len(rows)>25,'instruction':'Ask which order the customer means. Only use the listed customer-safe fields. If there are more orders and none match, offer human assistance.'}
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Orders are unavailable; offer human assistance.') from None
+
+    @router.post(PREFIX+'/tools/link-order')
+    def native_link(payload:NativeOrderSelection,request:Request):
+        uuid,email=tool_identity(request,verified=True)
+        if not payload.order_id:raise HTTPException(422,'Choose an order first.')
+        try:order=owned_order(client(),email,payload.order_id)
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Order lookup is unavailable; offer human assistance.') from None
+        # Conversation binding also powers the official secured agent context link.
+        with db() as conn:
+            conn.execute('SELECT pg_advisory_xact_lock(81910413)')
+            row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+            if row:
+                conn.execute("UPDATE support_portal_sessions SET email=?,order_id=?,link_version=link_version+1 WHERE conversation_uuid=?",(email,payload.order_id,uuid))
+            else:
+                conn.execute("INSERT INTO support_portal_sessions(token_hash,email,expires_at,created_at,conversation_uuid,order_id,state,status_card_state) VALUES(?,?,?,?,?,?,'linked','native_ai')",
+                             (digest(secrets.token_urlsafe(32)),email,time.time()+1800,time.time(),uuid,payload.order_id))
+        return {'linked':True,'order_id':payload.order_id,**card(order)}
 
     @router.get('/public/secretgreen-support/agent')
     def agent_page():
