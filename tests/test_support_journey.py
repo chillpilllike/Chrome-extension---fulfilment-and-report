@@ -6,14 +6,14 @@ NOW=datetime(2026,9,6,12,tzinfo=timezone.utc)
 class JourneyTests(unittest.TestCase):
  def setUp(self):
   self.c=sqlite3.connect(':memory:');self.c.row_factory=sqlite3.Row
-  self.c.executescript('''CREATE TABLE after_order_cases(id INTEGER,store_id INTEGER,odoo_order_id INTEGER,website_id INTEGER,customer_email TEXT,case_type TEXT,current_decision TEXT,decision_updated_at TEXT,confirmed_at TEXT,status TEXT,updated_at TEXT);
-CREATE TABLE after_order_messages(id INTEGER,case_id INTEGER,provider TEXT,provider_message_id TEXT,recipient TEXT,status TEXT,created_at TEXT);
+  self.c.executescript('''CREATE TABLE after_order_cases(id INTEGER,store_id INTEGER,odoo_order_id INTEGER,website_id INTEGER,customer_email TEXT,case_type TEXT,current_decision TEXT,decision_updated_at TEXT,confirmed_at TEXT,status TEXT,updated_at TEXT,context_json TEXT);
+CREATE TABLE after_order_messages(id INTEGER,case_id INTEGER,provider TEXT,provider_message_id TEXT,recipient TEXT,status TEXT,created_at TEXT,template_kind TEXT,test_mode INTEGER DEFAULT 0);
 CREATE TABLE after_order_case_events(case_id INTEGER,event_type TEXT,actor_type TEXT,details_json TEXT,created_at TEXT);
 CREATE TABLE epost_global_tracking(store_id INTEGER,odoo_order_id INTEGER,website_id INTEGER,archived_at TEXT,tracking_code TEXT,tracking_url TEXT,status TEXT,last_update_at TEXT,location TEXT,final_mile_tracking_number TEXT,final_mile_tracking_url TEXT,final_mile_carrier TEXT,events_json TEXT,last_checked_at TEXT);''')
-  self.c.execute("INSERT INTO after_order_cases VALUES(1,8,4,1,'test@example.com','item_unavailable',NULL,NULL,NULL,'needs_attention',?)",(NOW.isoformat(),))
+  self.c.execute("INSERT INTO after_order_cases VALUES(1,8,4,1,'test@example.com','item_unavailable',NULL,NULL,NULL,'needs_attention',?,'{}')",(NOW.isoformat(),))
  def history(self,**kwargs):return email_history(self.c,8,4,'test@example.com',now=NOW,provider_key=kwargs.pop('provider_key',''),**kwargs)
  def message(self,status='sent',email='test@example.com'):
-  self.c.execute('INSERT INTO after_order_messages VALUES(1,1,?,?,?,?,?)',('resend','12345678-1234-1234-1234-123456789abc',email,status,NOW.isoformat()))
+  self.c.execute("INSERT INTO after_order_messages VALUES(1,1,?,?,?,?,?,'item_unavailable',0)",('resend','12345678-1234-1234-1234-123456789abc',email,status,NOW.isoformat()))
  def test_test_failed_and_other_recipient_excluded(self):
   self.message('sent_test');self.message('failed');self.message(email='other@example.com')
   self.assertEqual([],self.history()['cases'][0]['emails'])

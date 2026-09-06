@@ -42,11 +42,11 @@ def shipment_history(conn,store,order_id,website=1,now=None):
 
 def email_history(conn,store,order_id,email,website=1,now=None,provider_key=None):
     now=now or datetime.now(timezone.utc)
-    cases=conn.execute('SELECT id,case_type,current_decision,decision_updated_at,confirmed_at,status FROM after_order_cases WHERE store_id=? AND odoo_order_id=? AND website_id=? AND lower(trim(customer_email))=? ORDER BY updated_at DESC LIMIT 21',(store,order_id,website,email)).fetchall()
+    cases=conn.execute('SELECT id,case_type,current_decision,decision_updated_at,confirmed_at,status,context_json FROM after_order_cases WHERE store_id=? AND odoo_order_id=? AND website_id=? AND lower(trim(customer_email))=? ORDER BY updated_at DESC LIMIT 21',(store,order_id,website,email)).fetchall()
     result=[];budget=3
     for row in cases[:20]:
         case=dict(row);messages=[]
-        rows=conn.execute("SELECT id,provider,provider_message_id,recipient,status,created_at FROM after_order_messages WHERE case_id=? AND lower(trim(recipient))=? AND status='sent' ORDER BY created_at DESC LIMIT 5",(case['id'],email)).fetchall()
+        rows=conn.execute("SELECT id,provider,provider_message_id,recipient,status,created_at,template_kind,test_mode FROM after_order_messages WHERE case_id=? AND lower(trim(recipient))=? AND status='sent' AND test_mode=0 ORDER BY created_at DESC LIMIT 5",(case['id'],email)).fetchall()
         for record in rows:
             msg=dict(record);observation=None
             saved=conn.execute("SELECT details_json,created_at FROM after_order_case_events WHERE case_id=? AND event_type='support_email_provider_observed' ORDER BY created_at DESC LIMIT 30",(case['id'],)).fetchall()
@@ -65,7 +65,7 @@ def email_history(conn,store,order_id,email,website=1,now=None,provider_key=None
                         observation={'event':data['last_event'],'observed_at':now.isoformat()}
                         conn.execute("INSERT INTO after_order_case_events(case_id,event_type,actor_type,details_json,created_at) VALUES(?,'support_email_provider_observed','system',?,?)",(case['id'],json.dumps({'message_id':msg['id'],'event':observation['event']}),now.isoformat()))
                 except (requests.RequestException,ValueError,TypeError):pass
-            messages.append({'sent_at':msg['created_at'] if msg['status']=='sent' else None,'send_status':msg['status'],'provider_observation':observation})
+            messages.append({'message_id':msg['id'],'response_email':msg.get('template_kind') not in {'package_movement','trustpilot_review'} and (case['case_type'] in {'item_unavailable','expected_dispatch','delivery_confirmation'} or 'suspected_lost' in str(case.get('context_json') or '')),'sent_at':msg['created_at'] if msg['status']=='sent' else None,'send_status':msg['status'],'provider_observation':observation})
         decision=DECISIONS.get(case.get('current_decision'))
-        result.append({'topic':{'item_unavailable':'item availability','delivery_confirmation':'delivery confirmation','tracking':'tracking update'}.get(case['case_type'],'order follow-up'),'emails':messages,'recorded_request':decision,'request_recorded_at':case.get('decision_updated_at') if decision else None,'team_confirmed_at':case.get('confirmed_at') if decision else None,'response_state':'request_recorded' if decision else 'no_current_choice_recorded'})
+        result.append({'topic':{'item_unavailable':'item availability','delivery_confirmation':'delivery confirmation','tracking':'tracking update'}.get(case['case_type'],'order follow-up'),'emails':messages,'awaiting_choice':bool(messages) and case.get('status') not in {'resolved','closed'} and not case.get('current_decision') and not case.get('confirmed_at') and any(x['response_email'] for x in messages),'recorded_request':decision,'request_recorded_at':case.get('decision_updated_at') if decision else None,'team_confirmed_at':case.get('confirmed_at') if decision else None,'response_state':'request_recorded' if decision else 'no_current_choice_recorded'})
     return {'cases':result,'has_more':len(cases)>20,'instruction':'Mention only real sent emails, not test/failed/uncertain attempts. Sent is provider acceptance, delivered means recipient mail server acceptance. Open/click signals do not prove reading or consent. No current choice means no choice recorded in After-order care, NOT that the customer never replied by email/chat. Never blame the customer. A recorded refund/cancellation request or team confirmation does not prove payment refunded or order cancelled. Do not expose raw subjects, email bodies, action tokens or internal notes.'}

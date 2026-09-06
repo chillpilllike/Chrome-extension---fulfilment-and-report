@@ -91,6 +91,19 @@ class BeginChat(BaseModel):
     message: str = Field(min_length=1,max_length=4000)
 
 
+class ResendRequest(BaseModel):
+    message_id: int = Field(gt=0)
+
+class ContactChangeRequest(BaseModel):
+    kind: str = Field(pattern='^(address|phone)$')
+    recipient_name: str = Field(default='',max_length=160)
+    street_address: str = Field(default='',max_length=400)
+    city: str = Field(default='',max_length=120)
+    state_region: str = Field(default='',max_length=120)
+    postal_code: str = Field(default='',max_length=30)
+    country: str = Field(default='',max_length=80)
+    phone: str = Field(default='',max_length=50)
+
 class NativeOrderSelection(BaseModel):
     order_id: int = Field(gt=0)
 
@@ -350,10 +363,47 @@ def create_portal_router(*, db, get_store, client_factory):
                 try:
                     with db() as conn:result[key]=reader(conn)
                 except Exception:result[key]={'unavailable':True,'instruction':'This source could not be checked. Do not infer no records or no response; offer team review.'}
+            from app.support.followup import change_eligibility
+            try:
+                with db() as conn:result['contact_change']=change_eligibility(conn,STORE,order)
+            except Exception:result['contact_change']={'can_collect_change':False,'instruction':'Order change eligibility could not be checked; offer team review.'}
             result['cancellation_guidance']={'review_required':True,'dispatch_estimate_available':bool(result.get('estimated_dispatch')),'instruction':'For an explicit cancellation/refund request, call secretgreen_request_cancellation_review to save the request and forward this existing ticket to the team. If no estimate or tracking is available, say status could not be confirmed, never claim not dispatched. Only after successful handoff say the ticket was forwarded for the team to review the cancellation/refund and contact the customer. Do not promise approval, payment, timing or automatic cancellation. A tracked shipment also requires review, not automatic denial.'}
             return result
         except HTTPException:raise
         except Exception:raise HTTPException(503,'The latest order status is unavailable; offer human assistance.') from None
+
+    def verified_link(request):
+        uuid,email=tool_identity(request,verified=True)
+        with db() as conn:row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+        if not row or not row['order_id'] or row['email'].lower()!=email:raise HTTPException(409,'Select and link an order first.')
+        return uuid,email,owned_order(client(),email,row['order_id'])
+
+    @router.post(PREFIX+'/tools/resend-choice-email')
+    def resend_choice(payload:ResendRequest,request:Request):
+        uuid,email,order=verified_link(request)
+        from app.support.followup import resend_action_email
+        return resend_action_email(db,STORE,WEBSITE,order,email,uuid,payload.message_id)
+
+    @router.post(PREFIX+'/tools/request-contact-change')
+    def contact_change(payload:ContactChangeRequest,request:Request):
+        uuid,email,order=verified_link(request)
+        from app.support.followup import change_eligibility
+        with db() as conn:eligible=change_eligibility(conn,STORE,order)
+        if not eligible['can_collect_change']:raise HTTPException(409,'The latest fulfilment state does not confirm this change can be requested automatically. Ask the team to review; do not promise a change.')
+        fields=payload.model_dump()
+        required=['phone'] if payload.kind=='phone' else ['recipient_name','street_address','city','state_region','postal_code','country']
+        if any(not fields[k].strip() for k in required):raise HTTPException(422,'Please supply all requested details, including postal code for an address and country code for a phone number.')
+        if payload.kind=='phone' and not re.fullmatch(r'\+[0-9 ()-]{6,30}',payload.phone):raise HTTPException(422,'Please include the phone country code, starting with +.')
+        note='<p>Customer requested '+payload.kind+' change for '+html.escape(str(order['name']))+'. Review required; no address or phone has been changed.</p><ul>'+''.join('<li>'+html.escape(k.replace('_',' '))+': '+html.escape(fields[k])+'</li>' for k in required)+'</ul>'
+        # Store the requested details in the actual conversation, not in the customer profile.
+        libre('/conversations/'+uuid+'/messages',method='POST',data={'private':True,'sender_type':'agent','message':note})
+        libre('/conversations/'+uuid+'/assignee/team',method='PUT',data={'assignee_id':1})
+        libre('/conversations/'+uuid+'/assignee/user',method='PUT',data={'assignee_id':2})
+        conv=libre('/conversations/'+uuid)
+        if conv.get('assigned_user_id')!=2 or conv.get('assigned_team_id')!=1:raise HTTPException(503,'The details were recorded but team assignment needs checking.')
+        reply='Your '+payload.kind+' change request has been forwarded to our team for review. The order details have not been changed yet.'
+        libre('/conversations/'+uuid+'/messages',method='POST',data={'private':False,'sender_type':'agent','message':reply})
+        return {'forwarded':True,'confirmation_queued':True,'instruction':'Do not duplicate the confirmation or claim that order details were changed.'}
 
     @router.post(PREFIX+'/tools/request-cancellation-review')
     def cancellation_review(request:Request):
@@ -484,4 +534,14 @@ def create_portal_router(*, db, get_store, client_factory):
         with db() as conn:
             review=conn.execute('SELECT requested_at,forwarded_at FROM support_review_requests WHERE conversation_uuid=? AND order_id=?',(uuid,order['id'])).fetchone()
         return {'review_request':dict(review) if review else None,'order':order,'history':history,'internal_fulfilment':procurement,'customer_preview':card(order),'link_version':row['link_version']}
+    @router.on_event('startup')
+    def start_wait_monitor():
+        if os.getenv('SUPPORT_SECRETGREEN_ENABLED','false').lower()=='true':
+            from app.support.waiting import WaitMonitor
+            router.wait_monitor=WaitMonitor(db,libre);router.wait_monitor.start()
+
+    @router.on_event('shutdown')
+    def stop_wait_monitor():
+        if hasattr(router,'wait_monitor'):router.wait_monitor.stop.set()
+
     return router
