@@ -29,7 +29,7 @@ class WaitMonitor:
     def tick(self):
         with self.db() as c:enabled=c.execute("SELECT due_at FROM support_wait_receipts WHERE conversation_uuid='__enabled_since__'").fetchone()['due_at']
         for page in range(1,6):
-            listing=self.libre('/conversations/all?page_size=100&page='+str(page)+'&order=desc&order_by=last_message_at')
+            listing=self.libre('/conversations/all?page_size=100&page='+str(page)+'&order=desc')
             for brief in listing.get('results',[]):
                 if brief.get('inbox_channel')!='livechat' or brief.get('inbox_name')!='Secretgreen Support' or brief.get('assigned_user_id')==5:continue
                 uuid=brief['uuid'];conv=self.libre('/conversations/'+uuid)
