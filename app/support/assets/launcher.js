@@ -7,7 +7,7 @@
     inboxID:'339d24ef-d7ab-4d1a-83ad-f2d0212335e0'
   };
   const script=document.createElement('script');
-  script.src=window.LibredeskSettings.baseURL+'/static/widget.js';
+  script.src=window.LibredeskSettings.baseURL+'/widget.js';
   script.async=true;
   document.head.appendChild(script);
 })();
