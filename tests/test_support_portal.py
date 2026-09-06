@@ -178,6 +178,21 @@ class PortalTests(unittest.TestCase):
         h['X-Libredesk-Contact-Email']='other@example.com'
         self.assertEqual(409,self.api.post(route,headers=h).status_code)
 
+    def test_followup_tools_require_verification_and_binding(self):
+        for route,payload in [('resend-choice-email',{'message_id':1}),('request-contact-change',{'kind':'phone','phone':'+61400000000'})]:
+            self.assertEqual(403,self.api.post(self.p+'/tools/'+route,headers=self.native_headers(),json=payload).status_code)
+            self.assertEqual(409,self.api.post(self.p+'/tools/'+route,headers=self.native_headers(True),json=payload).status_code)
+
+    def test_contact_change_records_review_without_changing_odoo(self):
+        h=self.native_headers(True);self.api.post(self.p+'/tools/link-order',headers=h,json={'order_id':4})
+        with patch('app.support.followup.change_eligibility',return_value={'can_collect_change':True}),patch('app.support.portal.libre',return_value={'assigned_user_id':2,'assigned_team_id':1}) as api:
+            self.assertEqual(422,self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'address'}).status_code)
+            self.assertEqual(422,self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'0400000000'}).status_code)
+            r=self.api.post(self.p+'/tools/request-contact-change',headers=h,json={'kind':'phone','phone':'+61400000000'})
+            self.assertTrue(r.json()['forwarded'])
+            self.assertTrue(any(c.kwargs.get('data',{}).get('private') is True for c in api.call_args_list))
+        self.assertFalse(any(c[0]=='write' for c in self.odoo.calls))
+
     def test_product_context_needs_no_email_or_otp(self):
         h=self.native_headers();h.pop('X-Libredesk-Contact-Email')
         with patch('app.support.portal.libre',return_value=[]):
