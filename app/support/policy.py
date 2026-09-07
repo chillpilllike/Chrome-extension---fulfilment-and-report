@@ -84,7 +84,8 @@ def amount(value):
 def public_order(order: dict, evidence: Evidence) -> dict:
     currency = order.get("currency_id")
     code = currency[1] if isinstance(currency, (list, tuple)) and len(currency) > 1 else ""
-    return {"reference": safe_reference(order.get("name")),
+    return {"confirmation_status": {"sale": "confirmed", "done": "confirmed", "draft": "not_confirmed", "sent": "not_confirmed", "cancel": "cancelled"}.get(order.get("state"), "unknown"),
+            "reference": safe_reference(order.get("name")),
             "total": amount(order.get("amount_total")),
             "currency": code if re.fullmatch(r"[A-Z]{3}", str(code)) else None,
             **public_status(order.get("state", ""), evidence)}
