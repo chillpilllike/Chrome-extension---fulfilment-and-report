@@ -350,6 +350,7 @@ class InventoryCreatePayload(BaseModel):
     asin: str
     quantity: float = 1
     product_name: str = ""
+    location: str
     notes: str = ""
 
 

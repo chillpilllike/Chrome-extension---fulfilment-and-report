@@ -1331,6 +1331,7 @@ type InventoryItem = {
   asin_url?: string
   quantity: number
   product_name: string
+  location: string
   image_url?: string
   image_source?: string
   image_title?: string
@@ -5229,7 +5230,7 @@ function App() {
                 <div className="min-w-0 flex-1">
                   <div className="font-medium">{item.product_name || "Untitled inventory item"}</div>
                   <div className="text-xs text-muted-foreground">
-                    Qty {Number(item.quantity).toLocaleString()} · {item.asin ? `ASIN ${item.asin}` : "No ASIN (will use the order ASIN)"} · Inventory #{item.id}
+                    Qty {Number(item.quantity).toLocaleString()} · {item.asin ? `ASIN ${item.asin}` : "No ASIN (will use the order ASIN)"} · {item.location || "Brooklyn, USA"} · Inventory #{item.id}
                   </div>
                 </div>
               </label>
@@ -12778,7 +12779,7 @@ function InventoryPage({
   onRows: (rows: InventoryItem[], total: number) => void
   onResult: (modal: ModalState) => void
 }) {
-  const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
+  const [form, setForm] = useState({ asin: "", quantity: "1", product_name: "", location: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string; asin?: string } | null>(null)
   const [searchDraft, setSearchDraft] = useState(query)
   const [manualOpen, setManualOpen] = useState(false)
@@ -12824,7 +12825,7 @@ function InventoryPage({
         method: "POST",
         body: JSON.stringify({ ...form, store_id: Number(storeId || 0) || null, quantity: Number(form.quantity || 0) }),
       })
-      setForm({ asin: "", quantity: "1", product_name: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
+      setForm({ asin: "", quantity: "1", product_name: "", location: "", odoo_order_name: "", amazon_order_id: "", amazon_order_url: "", notes: "" })
       onPage(1)
       onRows(result.items, result.total || 0)
       onResult({ ok: true, title: "Inventory Added", message: result.message })
@@ -12874,7 +12875,7 @@ function InventoryPage({
           <CardTitle>Add manual stock</CardTitle>
           <CardDescription>Reusable stock is released only after Amazon delivery, warehouse receipt, Shopify cancellation, and Odoo cancellation/refund are all confirmed. For manual stock, enter a title and quantity; ASIN is optional.</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.5fr_120px_1fr_1.2fr_auto]">
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.5fr_120px_1fr_1.2fr_1.2fr_auto]">
           <div className="grid gap-1.5">
             <Label>Title <span className="text-destructive">*</span></Label>
             <Input value={form.product_name} onChange={(event) => setForm({ ...form, product_name: event.target.value })} placeholder="Product name" />
@@ -12888,11 +12889,19 @@ function InventoryPage({
             <Input value={form.asin} onChange={(event) => setForm({ ...form, asin: event.target.value.toUpperCase() })} placeholder="B0…" />
           </div>
           <div className="grid gap-1.5">
+            <Label>Location <span className="text-destructive">*</span></Label>
+            <select className="h-9 rounded-md border border-input bg-background px-3 text-sm" value={form.location} onChange={(event) => setForm({ ...form, location: event.target.value })}>
+              <option value="">Select location</option>
+              <option value="Brooklyn, USA">Brooklyn, USA</option>
+              <option value="Werribee, Australia">Werribee, Australia</option>
+            </select>
+          </div>
+          <div className="grid gap-1.5">
             <Label>Notes</Label>
             <Input value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} />
           </div>
           <div className="flex items-end">
-            <Button disabled={!form.product_name.trim() || Number(form.quantity || 0) <= 0} onClick={addManualInventory}>
+            <Button disabled={!form.product_name.trim() || Number(form.quantity || 0) <= 0 || !form.location} onClick={addManualInventory}>
               <Plus className="size-4" />
               Add stock
             </Button>
@@ -12938,7 +12947,7 @@ function InventoryPage({
                     )}
                   </div>
                   <div className="inventory-product-info">
-                    <div className="inventory-stock-badges">{item.status === "available" && ["legacy_delivery", "scanned"].includes(item.stock_confidence || "") ? <Badge className={`inventory-confidence-${item.stock_confidence}`}>{item.stock_confidence === "scanned" ? "Available · scan confirmed" : "Available · legacy delivery"}</Badge> : <InventoryStatusBadge value={item.status === "used" ? "Sent / archived" : item.status} />}<span className="text-secondary">Stock #{item.id}</span></div>
+                    <div className="inventory-stock-badges">{item.status === "available" && ["legacy_delivery", "scanned"].includes(item.stock_confidence || "") ? <Badge className={`inventory-confidence-${item.stock_confidence}`}>{item.stock_confidence === "scanned" ? "Available · scan confirmed" : "Available · legacy delivery"}</Badge> : <InventoryStatusBadge value={item.status === "used" ? "Sent / archived" : item.status} />}<Badge variant="outline">{item.location || "Brooklyn, USA"}</Badge><span className="text-secondary">Stock #{item.id}</span></div>
                     <h3 className="inventory-product-title">{item.product_name || "Untitled stock item"}</h3>
                     <div className="inventory-asin">
                     {item.asin ? (

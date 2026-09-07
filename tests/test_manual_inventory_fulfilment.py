@@ -44,6 +44,29 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("!form.product_name.trim()", FRONTEND)
         self.assertIn("Number(form.quantity || 0) <= 0", FRONTEND)
 
+    def test_inventory_location_is_required_for_manual_stock(self) -> None:
+        source = inspect.getsource(main.api_create_inventory)
+
+        self.assertEqual(main.normalize_inventory_location("brooklyn, usa", required=True), "Brooklyn, USA")
+        self.assertEqual(main.normalize_inventory_location("WERRIBEE, AUSTRALIA", required=True), "Werribee, Australia")
+        with self.assertRaisesRegex(Exception, "Select an inventory location"):
+            main.normalize_inventory_location("", required=True)
+        self.assertIn('normalize_inventory_location(payload.get("location"), required=True)', source)
+        self.assertIn("Brooklyn, USA", FRONTEND)
+        self.assertIn("Werribee, Australia", FRONTEND)
+        self.assertIn("!form.location", FRONTEND)
+        self.assertIn('{item.location || "Brooklyn, USA"}', FRONTEND)
+
+    def test_existing_inventory_defaults_to_brooklyn_and_allocations_keep_location(self) -> None:
+        init_source = inspect.getsource(main.init_db)
+        reserve_source = inspect.getsource(main.reserve_inventory_for_line)
+        attach_source = inspect.getsource(main.api_attach_inventory_item)
+
+        self.assertIn("location TEXT NOT NULL DEFAULT 'Brooklyn, USA'", init_source)
+        self.assertIn("SET location=?", init_source)
+        self.assertIn('normalize_inventory_location(item.get("location"))', reserve_source)
+        self.assertIn("image_url, image_source, location", attach_source)
+
     def test_orders_picker_uses_shared_inventory_across_stores(self) -> None:
         self.assertIn('api<{ items: InventoryItem[] }>("/api/inventory?page=1&per_page=100")', FRONTEND)
         source = inspect.getsource(main.api_attach_inventory_item)
