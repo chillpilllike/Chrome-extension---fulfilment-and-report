@@ -1,0 +1,23 @@
+<odoo>
+  <record id="settings" model="ir.ui.view">
+    <field name="name">LibreDesk website settings</field>
+    <field name="model">res.config.settings</field>
+    <field name="inherit_id" ref="website.res_config_settings_view_form"/>
+    <field name="arch" type="xml">
+      <xpath expr="//app[@name='website']" position="inside">
+        <block title="LibreDesk chat" name="libredesk_chat" groups="base.group_system">
+          <setting string="LibreDesk connection" help="Paste API key:secret. Save and refresh to match website domains automatically.">
+            <field name="libredesk_base_url" placeholder="https://support.example.com"/>
+            <field name="libredesk_api_token" password="True" placeholder="API key:API secret"/>
+            <button name="action_libredesk_sync" type="object" string="Save and match widgets" class="btn-primary"/>
+          </setting>
+          <setting string="Widget for this website" help="Choose manually if no unique URL match exists. Connecting configures the brand and signing key; a new key invalidates previous signed sessions for this inbox.">
+            <field name="libredesk_inbox_id" domain="[('enabled','=',True)]" options="{'no_create': True}"/>
+            <button name="action_libredesk_connect" type="object" string="Connect selected widget" class="btn-secondary"/>
+            <field name="libredesk_enabled"/>
+          </setting>
+        </block>
+      </xpath>
+    </field>
+  </record>
+</odoo>

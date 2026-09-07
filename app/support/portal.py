@@ -1,0 +1,562 @@
+"""Secretgreen verified customer entry and LibreDesk conversation bridge.
+
+All order/customer scope is resolved server-side. Public data is an allowlist.
+No procurement data or raw upstream errors reach customer endpoints.
+"""
+from __future__ import annotations
+import base64
+import hashlib
+import hmac
+import html
+import json
+import os
+from pathlib import Path
+from typing import Optional
+import re
+import secrets
+import threading
+import time
+from datetime import datetime, timezone
+import requests
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, Field
+from app.support.odoo import SupportOrders
+from app.support.policy import Evidence, public_order
+
+STORE, WEBSITE, INBOX = 8, 1, 1
+ORIGIN = 'https://secretgreen.com.au'
+LIBRE = 'https://libredesk.185.194.236.161.sslip.io'
+INBOX_UUID = '339d24ef-d7ab-4d1a-83ad-f2d0212335e0'
+PREFIX = '/api/public/secretgreen-support'
+ASSETS = Path(__file__).parent / 'assets'
+_lock = threading.Lock()
+
+
+def digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def secret(name):
+    value = os.getenv(name, '')
+    if len(value) < 24:
+        raise HTTPException(503, 'Support is temporarily unavailable. Please try again later.')
+    return value
+
+
+def code_digest(challenge, code):
+    return hmac.new(secret('SUPPORT_SESSION_KEY').encode(), (challenge+':'+code).encode(), hashlib.sha256).hexdigest()
+
+
+def sign_jwt(payload, key):
+    def enc(value):
+        return base64.urlsafe_b64encode(json.dumps(value,separators=(',',':')).encode()).rstrip(b'=').decode()
+    body=enc({'alg':'HS256','typ':'JWT'})+'.'+enc(payload)
+    sig=base64.urlsafe_b64encode(hmac.new(key.encode(),body.encode(),hashlib.sha256).digest()).rstrip(b'=').decode()
+    return body+'.'+sig
+
+
+def email_value(value):
+    value=value.strip().lower()
+    if len(value)>254 or not re.fullmatch(r"[a-z0-9.!#$&'*+/=?^`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+",value):
+        raise HTTPException(422,'Enter a valid email address.')
+    return value
+
+
+def libre(path, *, data=None, token=None, method=None, multipart=False):
+    headers={'X-Libredesk-Inbox-ID':INBOX_UUID, 'Origin':ORIGIN}
+    if token:
+        headers['Authorization']='Bearer '+token
+    elif not path.startswith('/widget/'):
+        headers['Authorization']='token '+os.getenv('SUPPORT_LIBREDESK_API_KEY','')+':'+secret('SUPPORT_LIBREDESK_API_SECRET')
+    try:
+        response=requests.request(method or ('POST' if data is not None else 'GET'), LIBRE+'/api/v1'+path,
+                                  headers=headers,timeout=20,**({'files':{k:(None,str(v or '')) for k,v in data.items()}} if multipart else {'json':data}))
+        if not response.ok: raise ValueError()
+        return response.json()['data']
+    except Exception:
+        raise HTTPException(503,'Chat is temporarily unavailable. Please try again later.') from None
+
+
+class StartVerification(BaseModel):
+    email: str = Field(max_length=254)
+
+class Verify(BaseModel):
+    challenge: str = Field(min_length=30,max_length=100)
+    code: str = Field(pattern=r'^\d{6}$')
+
+class BeginChat(BaseModel):
+    order_id: Optional[int] = Field(default=None,gt=0)
+    message: str = Field(min_length=1,max_length=4000)
+
+
+class ResendRequest(BaseModel):
+    message_id: int = Field(gt=0)
+
+class ContactChangeRequest(BaseModel):
+    edit_token: str = Field(default='',max_length=2000)
+    kind: str = Field(pattern='^(address|phone)$')
+    recipient_name: str = Field(default='',max_length=160)
+    street_address: str = Field(default='',max_length=400)
+    address_line_2: str = Field(default='',max_length=200)
+    city: str = Field(default='',max_length=120)
+    state_region: str = Field(default='',max_length=120)
+    postal_code: str = Field(default='',max_length=30)
+    country: str = Field(default='',max_length=80)
+    phone: str = Field(default='',max_length=50)
+
+class NativeOrderSelection(BaseModel):
+    order_id: int = Field(gt=0)
+
+
+class PrivateResponseRoute(APIRoute):
+    def get_route_handler(self):
+        original=super().get_route_handler()
+        async def handle(request):
+            response=await original(request)
+            response.headers['Cache-Control']='no-store'
+            response.headers['Referrer-Policy']='no-referrer'
+            response.headers['X-Content-Type-Options']='nosniff'
+            return response
+        return handle
+
+
+def create_portal_router(*, db, get_store, client_factory):
+    router=APIRouter(route_class=PrivateResponseRoute)
+    ready=False
+    def ensure():
+        nonlocal ready
+        if ready:return
+        with _lock:
+            if ready:return
+            with db() as c:
+                c.execute('''CREATE TABLE IF NOT EXISTS support_portal_challenges (
+                  id TEXT PRIMARY KEY, email TEXT NOT NULL, ip_hash TEXT NOT NULL, code_hash TEXT NOT NULL,
+                  created_at DOUBLE PRECISION NOT NULL, expires_at DOUBLE PRECISION NOT NULL,
+                  attempts INTEGER NOT NULL DEFAULT 0, consumed INTEGER NOT NULL DEFAULT 0,
+                  delivery_state TEXT NOT NULL DEFAULT 'pending')''')
+                c.execute('''CREATE TABLE IF NOT EXISTS support_portal_sessions (
+                  token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, expires_at DOUBLE PRECISION NOT NULL,
+                  created_at DOUBLE PRECISION NOT NULL, conversation_uuid TEXT UNIQUE, order_id BIGINT,
+                  state TEXT NOT NULL DEFAULT 'ready', link_version INTEGER NOT NULL DEFAULT 1,
+                  widget_token TEXT, status_card_state TEXT NOT NULL DEFAULT 'pending')''')
+                c.execute('''CREATE TABLE IF NOT EXISTS support_review_requests (conversation_uuid TEXT NOT NULL, order_id BIGINT NOT NULL, email TEXT NOT NULL, requested_at TEXT NOT NULL, forwarded_at TEXT, PRIMARY KEY(conversation_uuid,order_id))''')
+                c.execute('''CREATE TABLE IF NOT EXISTS support_review_receipts (conversation_uuid TEXT NOT NULL, order_id BIGINT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(conversation_uuid,order_id))''')
+                c.execute('CREATE INDEX IF NOT EXISTS support_challenge_created ON support_portal_challenges(created_at)')
+            ready=True
+    def active():
+        if os.getenv('SUPPORT_SECRETGREEN_ENABLED','false').lower()!='true':
+            raise HTTPException(503,'Support chat is not available yet.')
+        secret('SUPPORT_SESSION_KEY');ensure()
+    def client():return client_factory(get_store(STORE))
+    def session(request):
+        active()
+        token=request.headers.get('Authorization','').removeprefix('Bearer ')
+        if not 30<=len(token)<=100:raise HTTPException(401,'Please verify your email again.')
+        with db() as c:
+            row=c.execute('SELECT * FROM support_portal_sessions WHERE token_hash=? AND expires_at>?',(digest(token),time.time())).fetchone()
+        if not row:raise HTTPException(401,'Please verify your email again.')
+        return dict(row)
+    def partners(c,email):
+        rows=c.search_read('res.partner',[['email_normalized','=',email]],['id','email'],limit=101)
+        if len(rows)>100:raise HTTPException(409,'Our team needs to help locate your order.')
+        return [r['id'] for r in rows if str(r.get('email') or '').strip().lower()==email]
+    def owned_order(c,email,order_id):
+        ids=partners(c,email)
+        rows=c.search_read('sale.order',[['id','=',order_id],['website_id','=',WEBSITE],['partner_id','in',ids]],['id'],limit=1)
+        if not rows:raise HTTPException(404,'No matching order was found on this website.')
+        return SupportOrders(c,WEBSITE).detail(order_id)
+    def card(order):
+        from app.support.live import order_evidence
+        try:
+            with db() as conn:
+                evidence=order_evidence(conn, STORE, order)
+        except Exception:
+            evidence=Evidence(observed_at=datetime.min.replace(tzinfo=timezone.utc))
+        return public_order(order,evidence)
+    def no_store(response):
+        response.headers['Cache-Control']='no-store'
+        response.headers['Referrer-Policy']='no-referrer'
+        response.headers['X-Content-Type-Options']='nosniff'
+        return response
+
+    @router.get('/public/secretgreen-support')
+    def page():
+        response=HTMLResponse((ASSETS/'customer.html').read_text())
+        response.headers['Content-Security-Policy']="frame-ancestors 'self' https://secretgreen.com.au"
+        return no_store(response)
+
+    @router.get('/public/secretgreen-support/launcher.js')
+    def launcher():
+        return no_store(Response((ASSETS/'launcher.js').read_text(),media_type='application/javascript'))
+
+    @router.post(PREFIX+'/request-code')
+    def request_code(payload:StartVerification,request:Request):
+        active();email=email_value(payload.email);now=time.time()
+        # The reverse proxy supplies the client address to Uvicorn. Do not trust an arbitrary XFF list here.
+        ip=digest((request.client.host if request.client else 'unknown')+secret('SUPPORT_SESSION_KEY'))
+        challenge=secrets.token_urlsafe(32);code=f'{secrets.randbelow(1000000):06d}'
+        with db() as c:
+            c.execute('SELECT pg_advisory_xact_lock(81910412)')
+            rows=c.execute('SELECT email,ip_hash FROM support_portal_challenges WHERE created_at>?',(now-3600,)).fetchall()
+            if len(rows)>=60 or sum(r['email']==email for r in rows)>=3 or sum(r['ip_hash']==ip for r in rows)>=20:
+                raise HTTPException(429,'Too many code requests. Please try again later.')
+            c.execute('INSERT INTO support_portal_challenges(id,email,ip_hash,code_hash,created_at,expires_at) VALUES(?,?,?,?,?,?)',
+                      (challenge,email,ip,code_digest(challenge,code),now,now+600))
+        # Do not look up an order before verifying email: the response does not enumerate customers.
+        try:
+            odoo=client();mail_id=odoo.execute('mail.mail','create',[{
+              'subject':'Your Secretgreen support verification code', 'email_to':email,
+              'body_html':f'<p>Your Secretgreen support verification code is <strong>{code}</strong>.</p><p>It expires in 10 minutes. If you did not request this code, you can ignore this email.</p>',
+              'auto_delete':False}])
+            # Some Odoo deployments send successfully but return an XML-RPC
+            # serialization fault for the method's None result. Check the persisted
+            # delivery state before deciding whether the email failed. Never resend.
+            try:
+                odoo.execute('mail.mail','send',[[mail_id]])
+            except Exception:
+                pass
+            sent=odoo.read('mail.mail',[mail_id],['state'])
+            if not sent or sent[0]['state']!='sent':raise ValueError()
+            with db() as c:c.execute("UPDATE support_portal_challenges SET delivery_state='sent' WHERE id=?",(challenge,))
+        except Exception:
+            with db() as c:c.execute("UPDATE support_portal_challenges SET delivery_state='failed',consumed=1 WHERE id=?",(challenge,))
+            raise HTTPException(503,'We could not send your verification code. Please try again later.') from None
+        return {'challenge':challenge,'message':'Check your email for a six-digit verification code.'}
+
+    @router.post(PREFIX+'/verify')
+    def verify(payload:Verify):
+        active();token=secrets.token_urlsafe(32);now=time.time();valid=False
+        with db() as c:
+            row=c.execute('SELECT * FROM support_portal_challenges WHERE id=? FOR UPDATE',(payload.challenge,)).fetchone()
+            if row and not row['consumed'] and row['attempts']<5 and row['expires_at']>now and row['delivery_state']=='sent':
+                c.execute('UPDATE support_portal_challenges SET attempts=attempts+1 WHERE id=?',(payload.challenge,))
+                valid=hmac.compare_digest(row['code_hash'],code_digest(payload.challenge,payload.code))
+                if valid:
+                    c.execute('UPDATE support_portal_challenges SET consumed=1 WHERE id=?',(payload.challenge,))
+                    c.execute('INSERT INTO support_portal_sessions(token_hash,email,expires_at,created_at) VALUES(?,?,?,?)',(digest(token),row['email'],now+3600,now))
+        if not valid:raise HTTPException(401,'That code is invalid or expired. Request a new code if needed.')
+        return {'token':token,'expires_in':3600}
+
+    @router.get(PREFIX+'/orders')
+    def orders(request:Request,page:int=1,q:str=''):
+        user=session(request)
+        if page<1 or page>1000 or len(q)>80:raise HTTPException(422,'Invalid search.')
+        try:
+            c=client();ids=partners(c,user['email'])
+            domain=[['website_id','=',WEBSITE],['partner_id','in',ids],['order_line','!=',False]]
+            if q:domain.append(['name','ilike',q.replace('%','\\%').replace('_','\\_')])
+            rows=c.search_read('sale.order',domain,['id','name','state','amount_total','currency_id','date_order'],limit=26,offset=(page-1)*25,order='date_order desc,id desc')
+            return {'orders':[{'id':r['id'],'date':r['date_order'],**card(r)} for r in rows[:25]],'has_more':len(rows)>25,'page':page}
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'We could not load your orders. You can still start a chat without selecting an order.') from None
+
+    @router.post(PREFIX+'/start')
+    def start(payload:BeginChat,request:Request):
+        user=session(request)
+        if not payload.message.strip():raise HTTPException(422,'Enter a message for the team.')
+        c=client();order=owned_order(c,user['email'],payload.order_id) if payload.order_id else None
+        preview=card(order) if order else {'reply':'No order is linked. Our support team can help with your question.'}
+        with db() as conn:
+            current=conn.execute('SELECT * FROM support_portal_sessions WHERE token_hash=? FOR UPDATE',(user['token_hash'],)).fetchone()
+            if current['state']=='linked':
+                if current['order_id'] != payload.order_id:raise HTTPException(409,'This chat is already linked to another selection.')
+                return {'session_token':current['widget_token'],'conversation_uuid':current['conversation_uuid'],'reply':preview['reply'],'libredesk_url':LIBRE,'inbox_uuid':INBOX_UUID}
+            if current['state']!='ready':raise HTTPException(409,'Your chat request is being checked. Please do not start another copy.')
+            conn.execute("UPDATE support_portal_sessions SET state='starting',order_id=? WHERE token_hash=?",(payload.order_id,user['token_hash']))
+        # Stable per-brand identity; email verification precedes signing.
+        jwt=sign_jwt({'external_user_id':'secretgreen:'+digest(user['email']), 'email':user['email'],
+                      'first_name':'Customer','iat':int(time.time()),'exp':int(time.time())+120},secret('SUPPORT_LIBREDESK_INBOX_SECRET'))
+        try:
+            auth=libre('/widget/chat/auth/exchange',data={'jwt':jwt});widget=auth['session_token']
+            message=payload.message.strip()
+            if order:message='Order '+preview['reference']+'\n'+message
+            conversation=libre('/widget/chat/conversations/init',data={'message':message,'form_data':{}},token=widget)['conversation']
+            uuid=conversation['uuid']
+            with db() as conn:conn.execute("UPDATE support_portal_sessions SET state='linked',conversation_uuid=?,widget_token=? WHERE token_hash=?",(uuid,widget,user['token_hash']))
+        except Exception:
+            with db() as conn:conn.execute("UPDATE support_portal_sessions SET state='uncertain' WHERE token_hash=?",(user['token_hash'],))
+            raise HTTPException(503,'We could not confirm that your chat started. Our team will need to check before another attempt.') from None
+        # One attempt only: transport uncertainty must never blindly replay a customer message.
+        with db() as conn:conn.execute("UPDATE support_portal_sessions SET status_card_state='sending' WHERE token_hash=?",(user['token_hash'],))
+        try:
+            libre('/conversations/'+uuid+'/messages',data={'message':'<p>'+html.escape(preview['reply'])+'</p>','private':False,'sender_type':'agent'})
+            state='sent'
+        except Exception:state='uncertain'
+        with db() as conn:conn.execute('UPDATE support_portal_sessions SET status_card_state=? WHERE token_hash=?',(state,user['token_hash']))
+        return {'session_token':widget,'conversation_uuid':uuid,'reply':preview['reply'],'libredesk_url':LIBRE,'inbox_uuid':INBOX_UUID}
+
+    def tool_identity(request, verified=False, require_email=True):
+        active()
+        supplied=request.headers.get('X-Secretgreen-Tool-Key','')
+        if not hmac.compare_digest(supplied,secret('SUPPORT_LIBREDESK_TOOL_KEY')):
+            raise HTTPException(403,'Tool authentication required.')
+        if request.headers.get('X-Libredesk-Inbox-Id')!=str(INBOX):
+            raise HTTPException(403,'Wrong support inbox.')
+        uuid=request.headers.get('X-Libredesk-Conversation-UUID','')
+        if not re.fullmatch(r'[0-9a-fA-F-]{36}',uuid):
+            raise HTTPException(403,'Conversation identity required.')
+        if verified and request.headers.get('X-Libredesk-Contact-Verified')!='true':
+            raise HTTPException(403,'Email verification is required before accessing orders.')
+        return uuid,email_value(request.headers.get('X-Libredesk-Contact-Email','')) if require_email else ''
+
+    def customer_domain(c,email):
+        return [['website_id','=',WEBSITE],['partner_id','in',partners(c,email)],['order_line','!=',False]]
+
+    @router.post(PREFIX+'/tools/support-hours')
+    def native_support_hours(request:Request):
+        tool_identity(request,require_email=False)
+        from zoneinfo import ZoneInfo
+        # The official app settings are the source of truth for hours and timezone.
+        settings=libre('/settings/general')
+        tz=ZoneInfo(settings['app.timezone'])
+        schedule=libre('/business-hours/'+str(settings['app.business_hours_id']))
+        now=datetime.now(tz);day=now.strftime('%A');hours=schedule.get('hours',{}).get(day)
+        opened=bool(schedule.get('is_always_open') or (hours and hours['open']<=now.strftime('%H:%M')<hours['close']))
+        holiday=any(x.get('date')==now.date().isoformat() for x in schedule.get('holidays',[]))
+        opened=opened and not holiday
+        return {'team_online_hours':opened,'day':day,'support_days':'Monday–Saturday','reply_target':'24 business hours',
+                'message':('Our team is within support hours.' if opened else ('Our team is offline on Sunday and will be back online on Monday.' if day=='Sunday' and not holiday else 'Our team is currently outside support hours.'))+' Your chat is automatically saved as a support ticket. The team will reply within 24 business hours.',
+                'note':'Business hours describe team coverage, not the real-time presence of an individual. Do not claim a location.'}
+
+    @router.post(PREFIX+'/tools/product-context')
+    def native_product_context(request:Request):
+        uuid,_=tool_identity(request,require_email=False)
+        try:
+            from app.support.products import product_context
+            return product_context(client(),libre('/conversations/'+uuid+'/page-visits'),WEBSITE)
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Product information is unavailable. Ask the customer for the product name and offer staff help.') from None
+
+    @router.post(PREFIX+'/tools/customer-match')
+    def customer_match(request:Request):
+        # Native LibreDesk injects contact identity separately from model arguments.
+        _,email=tool_identity(request)
+        try:
+            c=client();found=bool(c.search_read('sale.order',customer_domain(c,email),['id'],limit=1))
+            return {'has_orders':found,'next_step':'send_email_verification' if found else 'continue_general_chat',
+                    'message':'Verify email before retrieving any order details.' if found else 'No orders found with this email on Secretgreen. Continue general chat.'}
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Order lookup is unavailable; offer human assistance.') from None
+
+    @router.post(PREFIX+'/tools/orders')
+    def native_orders(request:Request):
+        _,email=tool_identity(request,verified=True)
+        try:
+            c=client();rows=c.search_read('sale.order',customer_domain(c,email),['id','name','state','amount_total','currency_id','date_order'],limit=26,order='date_order desc,id desc')
+            return {'orders':[{'id':r['id'],'date':r['date_order'],**card(r)} for r in rows[:25]],
+                    'has_more':len(rows)>25,'instruction':'Ask which order the customer means. Only use the listed customer-safe fields. If there are more orders and none match, offer human assistance.'}
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Orders are unavailable; offer human assistance.') from None
+
+    @router.post(PREFIX+'/tools/order-status')
+    def native_status(request:Request):
+        uuid,email=tool_identity(request,verified=True)
+        with db() as conn:
+            row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+        if not row or not row['order_id'] or row['email'].lower()!=email:
+            raise HTTPException(409,'Select and link an order in this conversation first.')
+        try:
+            order=owned_order(client(),email,row['order_id'])
+            result=card(order)
+            from app.support.journey import shipment_history,email_history
+            for key,reader in [('tracking',lambda conn:shipment_history(conn,STORE,order['id'],WEBSITE)),('after_order_care',lambda conn:email_history(conn,STORE,order['id'],email,WEBSITE))]:
+                try:
+                    with db() as conn:result[key]=reader(conn)
+                except Exception:result[key]={'unavailable':True,'instruction':'This source could not be checked. Do not infer no records or no response; offer team review.'}
+            from app.support.followup import change_eligibility
+            try:
+                with db() as conn:result['contact_change']=change_eligibility(conn,STORE,order)
+            except Exception:result['contact_change']={'can_collect_change':False,'instruction':'Order change eligibility could not be checked; offer team review.'}
+            result['cancellation_guidance']={'review_required':True,'dispatch_estimate_available':bool(result.get('estimated_dispatch')),'instruction':'For an explicit cancellation/refund request, call secretgreen_request_cancellation_review to save the request and forward this existing ticket to the team. If no estimate or tracking is available, say status could not be confirmed, never claim not dispatched. Only after successful handoff say the ticket was forwarded for the team to review the cancellation/refund and contact the customer. Do not promise approval, payment, timing or automatic cancellation. A tracked shipment also requires review, not automatic denial.'}
+            return result
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'The latest order status is unavailable; offer human assistance.') from None
+
+    def verified_link(request):
+        uuid,email=tool_identity(request,verified=True)
+        with db() as conn:row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+        if not row or not row['order_id'] or row['email'].lower()!=email:raise HTTPException(409,'Select and link an order first.')
+        return uuid,email,owned_order(client(),email,row['order_id'])
+
+    @router.post(PREFIX+'/tools/resend-choice-email')
+    def resend_choice(payload:ResendRequest,request:Request):
+        uuid,email,order=verified_link(request)
+        from app.support.followup import resend_action_email
+        return resend_action_email(db,STORE,WEBSITE,order,email,uuid,payload.message_id)
+
+    @router.post(PREFIX+'/tools/contact-details')
+    def contact_details(request:Request):
+        uuid,email,order=verified_link(request)
+        from app.support.address import live_context,public_current,snapshot
+        try:raw,current,picks,shops=live_context(db,client(),STORE,order)
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'The current delivery details could not be verified. Offer team assistance.') from None
+        claims={'uuid':uuid,'email':email,'order':order['id'],'snapshot':snapshot(raw,current,shops),'expires':time.time()+900}
+        body=base64.urlsafe_b64encode(json.dumps(claims).encode()).decode()
+        signature=hmac.new(secret('SUPPORT_SESSION_KEY').encode(),body.encode(),hashlib.sha256).hexdigest()
+        return {'can_update':True,'current_details':public_current(current),'edit_token':body+'.'+signature,'instruction':'Show the current delivery address and phone. Ask for the complete new details including postal code and country (or the new phone with country code). Once supplied, apply directly without an extra confirmation question. Keep the edit token internal.'}
+
+    @router.post(PREFIX+'/tools/request-contact-change')
+    def contact_change(payload:ContactChangeRequest,request:Request):
+        uuid,email,order=verified_link(request)
+        try:
+            body,signature=payload.edit_token.rsplit('.',1)
+            if not hmac.compare_digest(signature,hmac.new(secret('SUPPORT_SESSION_KEY').encode(),body.encode(),hashlib.sha256).hexdigest()):raise ValueError()
+            claims=json.loads(base64.urlsafe_b64decode(body))
+            if claims['uuid']!=uuid or claims['email']!=email or claims['order']!=order['id'] or claims['expires']<time.time():raise ValueError()
+        except Exception:raise HTTPException(409,'Retrieve the current delivery details before applying this change.') from None
+        fields=payload.model_dump();fields.pop('edit_token')
+        required=['phone'] if payload.kind=='phone' else ['recipient_name','street_address','city','state_region','postal_code','country']
+        if any(not fields[k].strip() for k in required):raise HTTPException(422,'Please supply the complete new address including postal code and country, or the full phone number.')
+        if payload.phone and not re.fullmatch(r'\+[0-9 ()-]{6,30}',payload.phone):raise HTTPException(422,'Please include the phone country code, starting with +.')
+        from app.support.address import update_delivery
+        result=update_delivery(db,client(),STORE,order,uuid,email,fields,claims['snapshot'])
+        if result.get('needs_human'):
+            libre('/conversations/'+uuid+'/messages',method='POST',data={'private':True,'sender_type':'agent','message':'Delivery-detail update needs reconciliation. '+html.escape(json.dumps(result))})
+            libre('/conversations/'+uuid+'/assignee/team',method='PUT',data={'assignee_id':1})
+            libre('/conversations/'+uuid+'/assignee/user',method='PUT',data={'assignee_id':2})
+            libre('/conversations/'+uuid+'/messages',method='POST',data={'private':False,'sender_type':'agent','message':'Your delivery-detail update needs a team check before we can confirm it is complete. Your request has been forwarded for review.'})
+        return result
+
+    @router.post(PREFIX+'/tools/request-cancellation-review')
+    def cancellation_review(request:Request):
+        uuid,email=tool_identity(request,verified=True)
+        with db() as conn:
+            row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+        if not row or not row['order_id'] or row['email'].lower()!=email:
+            raise HTTPException(409,'Select and link an order first.')
+        order=owned_order(client(),email,row['order_id']);preview=card(order)
+        with db() as conn:
+            conn.execute('INSERT INTO support_review_requests(conversation_uuid,order_id,email,requested_at) VALUES(?,?,?,?) ON CONFLICT(conversation_uuid,order_id) DO NOTHING',(uuid,order['id'],email,datetime.now(timezone.utc).isoformat()))
+        # Official assignments are idempotent. Read back before claiming a successful handoff.
+        libre('/conversations/'+uuid+'/status',method='PUT',data={'status':'Return or refund review'})
+        libre('/conversations/'+uuid+'/assignee/team',method='PUT',data={'assignee_id':1})
+        libre('/conversations/'+uuid+'/assignee/user',method='PUT',data={'assignee_id':2})
+        assigned=libre('/conversations/'+uuid)
+        if assigned.get('assigned_team_id')!=1 or assigned.get('assigned_user_id')!=2:
+            raise HTTPException(503,'The request is saved, but team assignment could not be confirmed. Do not claim it was forwarded.')
+        with db() as conn:
+            conn.execute('UPDATE support_review_requests SET forwarded_at=? WHERE conversation_uuid=? AND order_id=?',(datetime.now(timezone.utc).isoformat(),uuid,order['id']))
+        confirmation='Your cancellation/refund request has been saved on this support ticket and forwarded to our team. They will review it and process any approved refund or contact you with the next steps.'
+        with db() as conn:
+            conn.execute('SELECT pg_advisory_xact_lock(81910414)')
+            receipt=conn.execute('SELECT state FROM support_review_receipts WHERE conversation_uuid=? AND order_id=?',(uuid,order['id'])).fetchone()
+            if not receipt:conn.execute("INSERT INTO support_review_receipts VALUES(?,?,'sending')",(uuid,order['id']))
+        if not receipt:
+            # Reassignment stops the native AI turn, so queue the verified confirmation explicitly.
+            # An uncertain send stays reserved for staff review rather than risking duplicate messages.
+            libre('/conversations/'+uuid+'/messages',method='POST',data={'message':confirmation,'private':False,'sender_type':'agent'})
+            with db() as conn:conn.execute("UPDATE support_review_receipts SET state='queued' WHERE conversation_uuid=? AND order_id=?",(uuid,order['id']))
+        return {'forwarded':True,'confirmation_queued':not receipt or receipt['state']=='queued','order_reference':preview['reference'],'ticket_reference':assigned.get('reference_number'),'reply':'Your cancellation/refund request has been saved on this support ticket and forwarded to our team. They will review it and process any approved refund or contact you with the next steps.','instruction':'The confirmation was queued through LibreDesk; do not repeat it. Do not call another handoff tool, create a duplicate ticket, resolve the ticket or claim cancellation/refund execution. Missing dispatch evidence is not proof of non-dispatch.'}
+
+    def sync_contact(uuid,email,order):
+        conversation=libre('/conversations/'+uuid)
+        contact_id=conversation.get('contact_id')
+        if not contact_id: return False
+        contact=libre('/contacts/'+str(contact_id))
+        customer=order.get('customer') or {}
+        if str(contact.get('email') or '').strip().lower()!=email or str(customer.get('email') or '').strip().lower()!=email:
+            return False
+        full_name=str(customer.get('name') or '').strip()
+        if not full_name:return False
+        names=full_name.split(' ',1)
+        data={k:contact.get(k) or '' for k in ['email','avatar_url','phone_number','phone_number_country_code','country']}
+        data.update(first_name=names[0],last_name=names[1] if len(names)>1 else '')
+        phone=customer.get('mobile') or customer.get('phone')
+        if phone:data['phone_number']=phone;data['phone_number_country_code']=''
+        libre('/contacts/'+str(contact_id),method='PUT',data=data,multipart=True)
+        return True
+
+    @router.post(PREFIX+'/tools/link-order')
+    def native_link(payload:NativeOrderSelection,request:Request):
+        uuid,email=tool_identity(request,verified=True)
+        if not payload.order_id:raise HTTPException(422,'Choose an order first.')
+        try:order=owned_order(client(),email,payload.order_id)
+        except HTTPException:raise
+        except Exception:raise HTTPException(503,'Order lookup is unavailable; offer human assistance.') from None
+        # Conversation binding also powers the official secured agent context link.
+        with db() as conn:
+            conn.execute('SELECT pg_advisory_xact_lock(81910413)')
+            row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+            if row:
+                conn.execute("UPDATE support_portal_sessions SET email=?,order_id=?,link_version=link_version+1 WHERE conversation_uuid=?",(email,payload.order_id,uuid))
+            else:
+                conn.execute("INSERT INTO support_portal_sessions(token_hash,email,expires_at,created_at,conversation_uuid,order_id,state,status_card_state) VALUES(?,?,?,?,?,?,'linked','native_ai')",
+                             (digest(secrets.token_urlsafe(32)),email,time.time()+1800,time.time(),uuid,payload.order_id))
+        preview=card(order)
+        try:
+            attributes=dict(libre('/conversations/'+uuid).get('custom_attributes') or {})
+            attributes.update({'sg_store':'Secretgreen','sg_order_reference':preview['reference'],'sg_order_id':payload.order_id,'sg_topic':'Order help','sg_odoo_order_url':order['odoo_url']})
+            libre('/conversations/'+uuid+'/custom-attributes',method='PUT',data=attributes)
+        except HTTPException:
+            pass  # Durable binding and secured agent context remain available.
+        try: synced=sync_contact(uuid,email,order)
+        except HTTPException: synced=False
+        try:
+            from app.support.sidebar import sync_sidebar_order
+            sidebar_synced=sync_sidebar_order(client(),libre,uuid,email,order)
+        except Exception:sidebar_synced=False
+        return {'linked':True,'profile_synced':synced,'sidebar_synced':sidebar_synced,'order_id':payload.order_id,**preview}
+
+    @router.get('/public/secretgreen-support/agent')
+    def agent_page():
+        return no_store(HTMLResponse((ASSETS/'agent.html').read_text()))
+
+    @router.get(PREFIX+'/agent-context')
+    def agent_context(request:Request):
+        active()
+        # LibreDesk grants this encrypted token only after enforcing conversation access.
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            raw=base64.b64decode(request.headers.get('X-Support-Context',''),validate=True)
+            claims=json.loads(AESGCM(secret('SUPPORT_CONTEXT_KEY').encode()).decrypt(raw[:12],raw[12:],None))
+            if claims['exp']<time.time() or claims['iat']>time.time()+30 or claims['exp']-claims['iat']>1200 or int(claims['agent_id'])<=0:raise ValueError()
+            uuid=claims['conversation_uuid']
+            with db() as conn:row=conn.execute('SELECT * FROM support_portal_sessions WHERE conversation_uuid=?',(uuid,)).fetchone()
+            if not row or row['email'].lower()!=claims['email'].lower():raise ValueError()
+        except Exception:raise HTTPException(403,'Open the order panel again from the linked LibreDesk conversation.') from None
+        if not row['order_id']:return {'order':None,'message':'No order linked to this conversation.'}
+        c=client();order=owned_order(c,row['email'],row['order_id']);history=SupportOrders(c,WEBSITE).timeline(row['order_id'])
+        # Images are fetched using Odoo service credentials and stay inside this encrypted staff context.
+        ids=list({line['product_id'][0] for line in order['items'] if isinstance(line.get('product_id'),(list,tuple))})[:100]
+        images={}; product_urls={}
+        fields=c.fields_get('product.product')
+        if ids:
+            wanted=[f for f in ['id','image_128','website_url','website_id','is_published','active'] if f in fields]
+            products=c.search_read('product.product',[['id','in',ids]],wanted,limit=100)
+            for product in products:
+                website=product.get('website_id')
+                website=website[0] if isinstance(website,(list,tuple)) and website else website
+                path=product.get('website_url')
+                if product.get('active') and product.get('is_published') and website in (False,WEBSITE) and isinstance(path,str) and path.startswith('/shop/') and not any(x in path for x in ('\\','\n','\r')):
+                    product_urls[product['id']]='https://secretgreen.com.au'+path
+                value=product.get('image_128')
+                if isinstance(value,str) and len(value)<100000:
+                    try:
+                        raw=base64.b64decode(value,validate=True)
+                        mime='image/png' if raw.startswith(b'\x89PNG') else 'image/jpeg' if raw.startswith(b'\xff\xd8') else 'image/webp' if raw.startswith(b'RIFF') and raw[8:12]==b'WEBP' else None
+                        if mime:images[product['id']]='data:'+mime+';base64,'+value
+                    except ValueError:pass
+        for line in order['items']:
+            product=line.get('product_id')
+            if isinstance(product,(list,tuple)):
+                line['thumbnail']=images.get(product[0])
+                line['product_url']=product_urls.get(product[0])
+        with db() as conn:
+            procurement=[dict(r) for r in conn.execute('SELECT id,asin,quantity,state,ordered_at,amazon_order_id,amazon_status FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id LIMIT 200',(STORE,row['order_id'])).fetchall()]
+        with db() as conn:
+            review=conn.execute('SELECT requested_at,forwarded_at FROM support_review_requests WHERE conversation_uuid=? AND order_id=?',(uuid,order['id'])).fetchone()
+        return {'review_request':dict(review) if review else None,'order':order,'history':history,'internal_fulfilment':procurement,'customer_preview':card(order),'link_version':row['link_version']}
+    @router.on_event('startup')
+    def start_wait_monitor():
+        if os.getenv('SUPPORT_SECRETGREEN_ENABLED','false').lower()=='true':
+            from app.support.waiting import WaitMonitor
+            router.wait_monitor=WaitMonitor(db,libre);router.wait_monitor.start()
+
+    @router.on_event('shutdown')
+    def stop_wait_monitor():
+        if hasattr(router,'wait_monitor'):router.wait_monitor.stop.set()
+
+    return router
