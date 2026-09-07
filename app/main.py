@@ -1246,6 +1246,7 @@ def init_db() -> None:
                 amazon_account_name TEXT,
                 image_url TEXT,
                 image_source TEXT,
+                location TEXT NOT NULL DEFAULT 'Brooklyn, USA',
                 source_tracking_id TEXT,
                 source_delivered_at TEXT,
                 source_received_at TEXT,
@@ -1956,6 +1957,7 @@ def init_db() -> None:
             "manual_reference": "ALTER TABLE inventory_items ADD COLUMN manual_reference TEXT",
             "image_url": "ALTER TABLE inventory_items ADD COLUMN image_url TEXT",
             "image_source": "ALTER TABLE inventory_items ADD COLUMN image_source TEXT",
+            "location": "ALTER TABLE inventory_items ADD COLUMN location TEXT NOT NULL DEFAULT 'Brooklyn, USA'",
             "source_tracking_id": "ALTER TABLE inventory_items ADD COLUMN source_tracking_id TEXT",
             "source_delivered_at": "ALTER TABLE inventory_items ADD COLUMN source_delivered_at TEXT",
             "source_received_at": "ALTER TABLE inventory_items ADD COLUMN source_received_at TEXT",
@@ -1966,6 +1968,10 @@ def init_db() -> None:
             existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(inventory_items)").fetchall()}
             if column not in existing_cols:
                 conn.execute(ddl)
+        conn.execute(
+            "UPDATE inventory_items SET location=? WHERE COALESCE(TRIM(location), '')=''",
+            ("Brooklyn, USA",),
+        )
         for column, ddl in {
             "attempt_count": "ALTER TABLE odoo_chatter_note_log ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
             "last_attempt_at": "ALTER TABLE odoo_chatter_note_log ADD COLUMN last_attempt_at TEXT",
@@ -8021,7 +8027,7 @@ def list_inventory_items(store_id: Optional[int] = None, page: int = 1, per_page
     where = "WHERE " + inventory_filter(view) + " AND (? IS NULL OR store_id=?)"
     params: list[Any] = [store_id, store_id]
     if q.strip():
-        where += " AND POSITION(LOWER(?) IN LOWER(CONCAT_WS(' ', asin, product_name, source_odoo_order_name, amazon_order_id, amazon_account_name, notes, archive_reason))) > 0"
+        where += " AND POSITION(LOWER(?) IN LOWER(CONCAT_WS(' ', asin, product_name, location, source_odoo_order_name, amazon_order_id, amazon_account_name, notes, archive_reason))) > 0"
         params.append(q.strip())
     with db() as conn:
         total = conn.execute(
@@ -8209,6 +8215,19 @@ def cancelled_order_rows_payload(rows: list[Any], stores: Optional[list[dict[str
     return data
 
 
+INVENTORY_LOCATIONS = ("Brooklyn, USA", "Werribee, Australia")
+
+
+def normalize_inventory_location(value: Any, *, required: bool = False) -> str:
+    candidate = clean_text(value)
+    for location in INVENTORY_LOCATIONS:
+        if candidate.casefold() == location.casefold():
+            return location
+    if required:
+        raise HTTPException(400, f"Select an inventory location: {', '.join(INVENTORY_LOCATIONS)}.")
+    return INVENTORY_LOCATIONS[0]
+
+
 def effective_inventory_asin(line: Any) -> str:
     """Return the exact ASIN inventory should match for an order line."""
     replacement_asin = normalize_asin(line.get("replacement_asin") or "")
@@ -8294,16 +8313,17 @@ def reserve_inventory_for_line(line: dict[str, Any]) -> float:
                 """
                 INSERT INTO inventory_items
                 (store_id, order_line_id, asin, quantity, product_name, source_odoo_order_id, source_odoo_order_name,
-                 amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source,
+                 amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source, location,
                  source_tracking_id, source_delivered_at, source_received_at, source_shopify_cancelled_at,
                  source_odoo_status, source_inventory_item_id, status, source_type, notes, reserved_order_line_id, reserved_quantity,
                  reserved_at, manual_reference, created_at, updated_at)
-                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["store_id"], item["asin"], allocated, item["product_name"],
                     item["source_odoo_order_id"], item["source_odoo_order_name"], item["amazon_order_id"],
                     item["amazon_order_url"], item["amazon_account_name"], item.get("image_url"), item.get("image_source"),
+                    normalize_inventory_location(item.get("location")),
                     item.get("source_tracking_id"), item.get("source_delivered_at"), item.get("source_received_at"),
                     item.get("source_shopify_cancelled_at"), item.get("source_odoo_status"), item["id"], item.get("source_type") or "manual",
                     append_note(item.get("notes"), f"Allocated qty {allocated:g} to {line['odoo_order_name']}."),
@@ -26348,6 +26368,7 @@ def api_cancelled_orders_sync(payload: Optional[dict[str, Any]] = None) -> dict[
 
 @app.post("/api/inventory")
 def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+    location = normalize_inventory_location(payload.get("location"), required=True)
     store_id = int(payload.get("store_id") or 0)
     if not store_id:
         configured_stores = list_stores()
@@ -26409,8 +26430,8 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             f"""
             INSERT INTO inventory_items
             (store_id, order_line_id, asin, quantity, product_name, source_odoo_order_id, source_odoo_order_name,
-             amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source, status, source_type, notes, manual_reference, created_at, updated_at)
-            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 'manual', ?, ?, ?, ?)
+             amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source, location, status, source_type, notes, manual_reference, created_at, updated_at)
+            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 'manual', ?, ?, ?, ?)
             RETURNING id
             """,
             (
@@ -26425,6 +26446,7 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 amazon_account_name,
                 page_image_url,
                 "amazon_page" if page_image_url else "",
+                location,
                 notes,
                 manual_reference,
                 utc_now(),
@@ -26443,7 +26465,7 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
         _TYPESENSE_INDEX_EXECUTOR.submit(lambda snapshot=row_to_dict(row) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot)))
     fast_page_cache_clear_matching({"inventory-v2", "orders", "dashboard"})
     item_label = f"ASIN {asin}" if asin else product_name
-    return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {item_label}.", **refresh_inventory_response(store_id, 1, 100)}
+    return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {item_label} at {location}.", **refresh_inventory_response(store_id, 1, 100)}
 
 
 @app.post("/api/inventory/{inventory_id}/attach")
@@ -26529,12 +26551,12 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             """
             INSERT INTO inventory_items
             (store_id, order_line_id, asin, quantity, product_name, source_odoo_order_id, source_odoo_order_name,
-             amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source,
+             amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source, location,
              source_tracking_id, source_delivered_at, source_received_at, source_shopify_cancelled_at,
              source_odoo_status, source_inventory_item_id, status, source_type, notes, reserved_order_line_id,
              reserved_quantity, reserved_at, manual_reference, created_at, updated_at)
             SELECT store_id, NULL, ?, ?, product_name, source_odoo_order_id, source_odoo_order_name,
-                   amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source,
+                   amazon_order_id, amazon_order_url, amazon_account_name, image_url, image_source, location,
                    source_tracking_id, source_delivered_at, source_received_at, source_shopify_cancelled_at,
                    source_odoo_status, id, 'reserved', source_type, ?, ?, ?, ?, ?, ?, ?
             FROM inventory_items WHERE id=?
