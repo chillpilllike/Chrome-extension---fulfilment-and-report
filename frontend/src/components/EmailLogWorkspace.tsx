@@ -24,11 +24,13 @@ const queues = [
   ["failed", "Failed", "Requests that failed before sending or were explicitly rejected. Eligible records can be retried individually."],
   ["retrying", "Sending & retrying", "An attempt is in progress. Do not send another copy while its outcome is unknown."],
   ["sent", "Sent", "Accepted by the email provider. This is not proof of inbox delivery or that the customer read it."],
+  ["delivered", "Delivered", "The provider confirmed delivery to the recipient mail server. This does not prove the message was read."],
+  ["suppressed", "Bounces & complaints", "Further emails to these recipients are blocked. Resolve the cause before contacting them again."],
   ["uncertain", "Check delivery", "A timeout or incomplete response left acceptance uncertain. Check the provider; blind retries are disabled."],
   ["preview", "Preview only", "Saved previews. No email was sent and these records cannot be retried."],
 ] as const
 const formatDate = (value: string) => value ? new Date(value).toLocaleString() : "—"
-const signal = (status: string) => status === "failed" ? "failed" : ["sent", "sent_test"].includes(status) ? "sent" : ["sending", "retrying"].includes(status) ? "retrying" : status === "delivery_unknown" ? "uncertain" : "preview"
+const signal = (status: string) => ["failed", "bounced", "complained"].includes(status) ? "failed" : ["sent", "sent_test", "delivered"].includes(status) ? "sent" : ["sending", "retrying"].includes(status) ? "retrying" : ["delivery_unknown", "delivery_delayed"].includes(status) ? "uncertain" : "preview"
 function Status({ row }: { row: Pick<Email, "status" | "status_label"> }) {
   return <span className={`email-signal signal-${signal(row.status)}`}><span aria-hidden="true" />{row.status_label}</span>
 }

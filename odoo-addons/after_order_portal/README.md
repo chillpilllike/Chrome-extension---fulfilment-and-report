@@ -15,7 +15,14 @@ Existing `/order-update/<opaque-token>` links redirect to that standard preview 
 
 When the fulfilment app is in email test mode, only signed-in Odoo Settings administrators (`base.group_system`) can see or submit test actions. Portal customers, anonymous visitors and ordinary internal staff cannot. The bridge verifies this server-side assertion after checking its shared key. Test links stay test-only even after test mode is disabled; live links also become non-mutating while test mode is enabled.
 
-## Upgrade to 18.0.2.0.0
+## Upgrade to 18.0.2.1.0 (unreleased checkpoint)
+
+This checkpoint adds a stored selected-product field for quotation thumbnails,
+line-specific removal requests, email-focused alternatives and a safe payment-email
+preview. Upgrade the installed module after loading the code; restarting alone
+does not create the required database column. Keep live alternatives disabled.
+Actual payment refunds are not implemented. Isolated payment/provider and mail
+tests are required before a live rollout.
 
 Replace the installed addon with the updated ZIP contents, restart the Odoo workers to load the Python controller, then upgrade **After-order Customer Portal** in Apps so its inherited order-preview view is loaded. Retain both existing system parameters. Uploading files or refreshing the Apps list alone is not enough.
 

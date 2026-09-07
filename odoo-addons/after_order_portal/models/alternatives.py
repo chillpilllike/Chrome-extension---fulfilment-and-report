@@ -16,6 +16,7 @@ class SaleOrder(models.Model):
     after_order_parent_id = fields.Many2one('sale.order', copy=False, readonly=True)
     after_order_mail_id = fields.Many2one('mail.mail', copy=False, readonly=True)
     after_order_pricing_signature = fields.Char(copy=False, readonly=True)
+    after_order_selected_product_id = fields.Many2one('product.product',copy=False,readonly=True)
     after_order_resolution_log = fields.Text(copy=False, readonly=True, default='[]')
 
     _sql_constraints = [('after_order_operation_unique', 'unique(after_order_operation_key)', 'An adjustment quotation already exists for this request.')]
@@ -78,7 +79,7 @@ class SaleOrder(models.Model):
         alternative = self.currency_id.round(totals['total_included'])
         difference = self.currency_id.round(alternative-original)
         data = {'product_id': product.id, 'product_tmpl_id': product.product_tmpl_id.id,
-                'name': product.display_name, 'default_code': product.default_code,
+                'name': product.display_name, 'default_code': product.default_code, 'website_url': product.website_url,
                 'description': product.description or '', 'quantity': quantity,
                 'original_total': original, 'alternative_total': alternative, 'difference': difference,
                 'currency': self.currency_id.name, 'unit_price': price,
@@ -86,7 +87,7 @@ class SaleOrder(models.Model):
                 'tax_ids': taxes.ids, 'invoice_ids': paid.move_id.ids,
                 'same_taxes': all(set(item.tax_ids.ids) == set(taxes.ids) for item in paid),
                 'simple_taxes': all(tax.amount_type == 'percent' and not tax.include_base_amount for tax in taxes)}
-        signature_data = {k: v for k, v in data.items() if k not in ('name','description')}
+        signature_data = {k: v for k, v in data.items() if k not in ('name','description','website_url')}
         data['pricing_signature'] = hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
         return data
 
@@ -98,7 +99,7 @@ class SaleOrder(models.Model):
             # A valid recommendation is still useful when accounting cannot yet
             # establish a trustworthy price difference. Never substitute zero.
             return {'product_id':product.id,'product_tmpl_id':product.product_tmpl_id.id,
-                'name':product.display_name,'default_code':product.default_code,
+                'name':product.display_name,'default_code':product.default_code,'website_url':product.website_url,
                 'description':product.description or '', 'quantity':line.product_uom_qty,
                 'currency':self.currency_id.name,'pricing_error':str(exc),'pricing_signature':''}
 
@@ -147,7 +148,7 @@ class SaleOrder(models.Model):
                 'fiscal_position_id':self.fiscal_position_id.id, 'currency_id':self.currency_id.id,
                 'origin':self.name, 'client_order_ref': '%s — alternative price difference' % self.name,
                 'after_order_parent_id':self.id, 'after_order_operation_key':operation_key,
-                'after_order_pricing_signature':pricing_signature,
+                'after_order_pricing_signature':pricing_signature, 'after_order_selected_product_id':product.id,
                 'require_payment':True, 'prepayment_percent':1.0, 'require_signature':False,
                 'order_line':[(0,0,{'product_id':adjustment_product.product_variant_id.id,
                     'name':'Price difference for %s: %s → %s' % (self.name,line.name,product.display_name),
@@ -187,6 +188,8 @@ class SaleOrder(models.Model):
             paid = True
         if quote.invoice_ids.filtered(lambda move: move.move_type == 'out_refund' and move.state != 'cancel'):
             paid = False
+        if not paid and quote.is_expired:
+            raise UserError('The payment quotation expired. Team review is required; no replacement was released.')
         result.update({'status':'ready' if paid else 'waiting_payment', 'quote_id':quote.id,
             'quote_name':quote.name, 'quote_url':quote.get_portal_url(),
             'payment_verified':bool(paid), 'email_status':quote.after_order_mail_id.state or 'unknown',
@@ -213,3 +216,41 @@ class SaleOrder(models.Model):
         mail.write({'state':'outgoing'})
         self.message_post(body=Markup('Quotation email retry queued for <b>%s</b>.') % quote.name,subtype_xmlid='mail.mt_note')
         return True
+
+    def after_order_exclude_unavailable_line(self, line_id, website_id, operation_key):
+        """Exclude a never-fulfilled line; refund approval remains a separate operation."""
+        self.ensure_one()
+        if not self.env.user.has_group('base.group_system'):
+            raise AccessError('Administrator access is required.')
+        if self.env['ir.config_parameter'].sudo().get_param('after_order_portal.live_alternatives_enabled') != 'true':
+            raise UserError('Live order changes are disabled.')
+        if not operation_key.startswith('care:remove:') or len(operation_key)>160 or self.website_id.id!=int(website_id):
+            raise UserError('Invalid removal scope.')
+        self.env.cr.execute('SELECT id FROM sale_order WHERE id=%s FOR UPDATE',(self.id,))
+        self.invalidate_recordset(['after_order_resolution_log'])
+        recorded = json.loads(self.after_order_resolution_log or '[]')
+        if operation_key in recorded:
+            return {'excluded':True,'refund_status':'pending_approval'}
+        line = self._after_order_guard(line_id,website_id)
+        others = self.order_line.filtered(lambda item: item!=line and not item.display_type and item.product_id.type!='service'
+                                          and ('is_delivery' not in item._fields or not item.is_delivery) and item.product_uom_qty>0)
+        if not others:
+            raise UserError('No remaining product. Whole-order cancellation and refund require approval.')
+        if 'move_ids' in line._fields and line.move_ids.filtered(lambda move: move.state not in ('cancel',)):
+            raise UserError('Stock movements exist. Resolve reservations or shipment before removing this line.')
+        line.write({'product_uom_qty':0})
+        self.after_order_resolution_log = json.dumps([*recorded,operation_key])
+        self.message_post(body=Markup('Unavailable line %s excluded from further fulfilment. Any amount previously paid still requires a verified refund; no refund was sent by this operation.') % line.id,subtype_xmlid='mail.mt_note')
+        return {'excluded':True,'refund_status':'pending_approval'}
+
+    def after_order_payment_email_preview(self, website_id, product_id=0):
+        self.ensure_one()
+        if not self.env.user.has_group('base.group_system') or self.website_id.id!=int(website_id):
+            raise AccessError('Administrator access on the matching website is required.')
+        product = self.env['product.product'].browse(int(product_id)).exists() if product_id else self.order_line[:1].product_id
+        if product and ((product.website_id and product.website_id!=self.website_id) or (product.company_id and product.company_id!=self.company_id)):
+            raise AccessError('This product belongs to another website or company.')
+        template = self.env.ref('after_order_portal.alternative_quotation_email').with_context(care_email_preview=True,care_preview_product_id=product.id)
+        markup = template._render_field('body_html',self.ids)[self.id]
+        return {'subject':'%s — TEST payment-email preview' % self.name,'html':markup,
+                'text':'TEST ONLY: payment email layout preview for order %s. No quotation, payment request or financial operation was created.' % self.name}

@@ -14,6 +14,7 @@ import requests
 CUSTOMER_DECISIONS = {
     "proceed",
     "exclude_item_and_proceed",
+    "remove_line",
     "cancel_affected_item",
     "offer_alternatives",
     "cancel_order",
@@ -86,6 +87,8 @@ def request_fingerprint(case: dict[str, Any]) -> str:
             for item in case.get("affected_items") or []
         ], key=lambda item: str(item.get("line_id"))),
     }
+    if context.get('parcel_mapping'):
+        snapshot['parcel_mapping'] = context['parcel_mapping']
     return hashlib.sha256(json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
 
 

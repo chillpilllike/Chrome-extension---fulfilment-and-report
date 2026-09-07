@@ -109,11 +109,19 @@ class AfterOrderPortal(CustomerPortal):
                 products = Product.browse([])
             recommended_ids = {p['product_tmpl_id'] for p in offer['recommendations']}
             selection = offer.get('selection') or {}
+            removal = next((row for row in (payload.get('line_requests') or {}).get('removals',[])
+                            if int(row['line_id'])==int(offer['line_id']) and row['status']!='withdrawn'),{})
             selected_id = (selection.get('product') or {}).get('product_tmpl_id')
             selected = Product.browse(selected_id).exists() if selected_id else Product.browse([])
             selected = selected.filtered(lambda p: not p.website_id or p.website_id == request.website)
-            groups.append({'line_id':offer['line_id'], 'name':item.get('product_name','Order item'),
-                'selection':selection, 'selected':selected, 'locked':bool(selection.get('locked') or payload.get('locked')),
+            try:
+                focused = int(request.params.get('line_id') or 0) == int(offer['line_id'])
+                proposed_id = int(request.params.get('selected_product_id') or 0) if focused else 0
+            except (TypeError, ValueError):
+                proposed_id = 0
+            proposed = products.filtered(lambda p: p.id == proposed_id and p.id != selected_id)
+            groups.append({'line_id':offer['line_id'], 'name':item.get('product_name','Order item'), 'proposed':proposed,
+                'selection':selection, 'selected':selected, 'removal':removal, 'locked':bool(selection.get('locked') or removal.get('approved_at') or payload.get('locked')),
                 'best':products.filtered(lambda p: p.id in recommended_ids and p.id != selected_id),
                 'more':products.filtered(lambda p: p.id not in recommended_ids and p.id != selected_id)})
         return groups
@@ -154,7 +162,11 @@ class AfterOrderPortal(CustomerPortal):
         try:
             payload = self._bridge(token)
             order_id = int(payload["order"]["id"])
-            target = "/my/orders/%s?%s" % (order_id, urlencode({"after_order_token": token}))
+            parameters = {"after_order_token": token}
+            for key in ('line_id', 'selected_product_id'):
+                if str(query.get(key) or '').isdigit():
+                    parameters[key] = str(int(query[key]))
+            target = "/my/orders/%s?%s#after-order-updates" % (order_id, urlencode(parameters))
             if request.env.user._is_public():
                 return request.redirect("/web/login?" + urlencode({"redirect": target}))
             return request.redirect(target)

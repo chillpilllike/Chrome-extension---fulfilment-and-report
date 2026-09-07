@@ -3,10 +3,23 @@ import re
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from app.services.after_order_email import render_after_order_email
+from app.services.after_order_email import render_after_order_email,storefront_product_url
 
 
 class EmailDesignTests(unittest.TestCase):
+    def test_customer_product_links_reject_backend_and_wrong_store(self):
+        for url in ('https://backend.nutricityusa.com/web#id=5&model=product.product',
+                    'https://nutricity.com.au/web#id=5','https://nutricity.ca/shop/product',
+                    'https://nutricity.com.au@evil.example/shop/product','http://nutricity.com.au/shop/product'):
+            self.assertEqual('',storefront_product_url(url,'nutricity.com.au'))
+        self.assertEqual('https://nutricity.com.au/shop/product',storefront_product_url('https://nutricity.com.au/shop/product','nutricity.com.au'))
+
+    def test_backend_product_link_is_never_rendered_in_any_template(self):
+        self.case['sender_domain']='nutricity.com.au'
+        self.case['affected_items'][0]['odoo_product_url']='https://backend.nutricityusa.com/web#id=5&model=product.product'
+        for kind in ('item_unavailable','expected_dispatch','delivery_confirmation','package_lost','tracking','trustpilot_review'):
+            self.assertNotIn('backend.nutricityusa.com',self.render(kind)[1])
+
     def setUp(self):
         self.case = {
             "odoo_order_name": "DEMO-1042", "store_name": "Store fallback",
@@ -82,3 +95,37 @@ class EmailDesignTests(unittest.TestCase):
         _, markup, _ = self.render()
         self.assertIn("Nutricity Australia", markup)
         self.assertNotIn('src=""', markup)
+
+    def test_single_item_no_response_requires_team_approval(self):
+        self.case['context']['three_day_policy_enabled'] = True
+        _, markup, plain = self.render()
+        for body in (markup, plain):
+            self.assertIn("within 3 days", body)
+            self.assertIn("cancellation and refund review", body)
+            self.assertIn("neither happens automatically", body)
+            self.assertNotIn("process the rest of your order", body)
+
+    def test_removable_item_no_response_continues_remaining_order(self):
+        self.case['context']['three_day_policy_enabled'] = True
+        _, markup, plain = render_after_order_email(
+            {**self.case, "case_type": "item_unavailable"}, "https://example.test/order",
+            actions=["exclude_item_and_proceed", "offer_alternatives", "cancel_order"], labels={})
+        for body in (markup, plain):
+            self.assertIn("process the rest of your order without this unavailable item", body)
+            self.assertIn("refund review and approval", body)
+            self.assertIn("separate 24-hour window", body)
+            self.assertIn("does not cancel a choice you have already made", body)
+
+    def test_multiple_affected_rows_do_not_imply_removal_is_safe(self):
+        self.case['context']['three_day_policy_enabled'] = True
+        self.case["affected_items"] *= 2
+        _, _, plain = self.render()
+        self.assertIn("cancellation and refund review", plain)
+        self.assertNotIn("process the rest", plain)
+
+    def test_no_cancellation_deadline_for_unrelated_templates(self):
+        for kind in ("expected_dispatch", "delivery_confirmation", "package_lost", "tracking", "trustpilot_review"):
+            _, markup, plain = self.render(kind, template_kind=kind)
+            self.assertNotIn("3 days", markup)
+            self.assertNotIn("3 days", plain)
+        self.assertIn("continue processing your order", self.render("expected_dispatch")[2])

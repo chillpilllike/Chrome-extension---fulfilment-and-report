@@ -20,7 +20,7 @@
               <t>
                 <div class="d-flex flex-wrap gap-2">
                   <t t-foreach="allowed" t-as="action">
-                    <form t-if="action != 'offer_alternatives'" t-att-action="'/order-update/%s/decision' % token" method="post">
+                    <form t-if="action not in ['offer_alternatives','remove_line'] and not (action == 'exclude_item_and_proceed' and panel.get('line_groups'))" t-att-action="'/order-update/%s/decision' % token" method="post">
                       <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/>
                       <input type="hidden" name="access_token" t-att-value="after_order_access_token"/>
                       <input type="hidden" name="decision" t-att-value="action"/>
@@ -29,10 +29,23 @@
                   </t>
                 </div>
                 <div t-if="panel.get('line_groups')" class="mt-4">
-                  <section t-foreach="panel['line_groups']" t-as="group" class="border rounded p-3 mb-4">
+                  <section t-foreach="panel['line_groups']" t-as="group" t-att-id="'after-order-line-%s' % group['line_id']" class="border rounded p-3 mb-4">
                     <h4 class="h5">Choose an alternative for <span t-esc="group['name']"/></h4>
+                    <p t-if="group.get('removal')" class="alert alert-info">Removal selected: <span t-esc="group['removal']['status'].replace('_',' ')"/>. Refund completion will be verified separately.</p>
+                    <form t-if="'remove_line' in allowed and not group['locked']" t-att-action="'/order-update/%s/decision' % token" method="post" class="mb-3">
+                      <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/>
+                      <input type="hidden" name="access_token" t-att-value="after_order_access_token"/>
+                      <input type="hidden" name="decision" value="remove_line"/>
+                      <input type="hidden" name="line_id" t-att-value="group['line_id']"/>
+                      <button type="submit" class="btn btn-outline-danger">Remove this item · refund subject to approval</button>
+                    </form>
                     <p class="text-muted">You have 24 hours from your first selection to change it. Any additional payment is requested after that window closes. A cheaper choice is reviewed for a refund of the difference.</p>
                     <p t-if="group['selection'].get('deadline_at')">Selection deadline: <strong t-esc="group['selection']['deadline_at']"/></p>
+                    <div t-if="group.get('proposed') and not group['locked']" class="border border-primary p-3 mb-3">
+                      <h5>Confirm the alternative you opened from your email</h5>
+                      <t t-set="product" t-value="group['proposed']"/>
+                      <t t-call="after_order_portal.line_alternative_product"/>
+                    </div>
                     <a t-if="group['selection'].get('status') == 'waiting_payment' and (group['selection'].get('result') or {}).get('quote_url','').startswith('/my/orders/')" t-att-href="group['selection']['result']['quote_url']" class="btn btn-primary mb-3">View quotation &amp; pay</a>
                     <div t-if="group['selected']" class="mb-4">
                       <h5 class="h6">Your selected alternative</h5>
@@ -60,6 +73,7 @@
       <img t-att-src="'/web/image/product.template/%s/image_256' % product.id" class="card-img-top p-3 object-fit-contain" height="150" alt="Product"/>
       <div class="card-body d-flex flex-column">
         <strong t-esc="product.name"/>
+        <a t-att-href="product.website_url" target="_blank" rel="noopener noreferrer" class="mt-2">View full product details</a>
         <form class="mt-auto pt-3" t-att-action="'/order-update/%s/decision' % token" method="post">
           <input type="hidden" name="csrf_token" t-att-value="request.csrf_token()"/>
           <input type="hidden" name="access_token" t-att-value="after_order_access_token"/>

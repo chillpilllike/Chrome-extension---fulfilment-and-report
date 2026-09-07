@@ -113,6 +113,8 @@ class Workflow:
         result = []
         for offer in offers:
             selection = selections.get(offer['line_id'])
+            if selection and selection['status'] == 'withdrawn':
+                selection = None
             if selection:
                 selection['product'] = json.loads(selection.pop('product_json'))
                 selection['result'] = json.loads(selection.pop('result_json'))
@@ -248,6 +250,17 @@ class Workflow:
                 raise HTTPException(409, 'This order changed. Reload before choosing.')
             prior = conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=?',
                 (case['id'],line_id,int(test_mode))).fetchone()
+            prior = dict(prior) if prior else None
+            if hasattr(r,'care_requests'):
+                removal = conn.execute('SELECT * FROM after_order_line_removals WHERE case_id=? AND line_id=? AND test_mode=?',
+                    (case['id'],line_id,int(test_mode))).fetchone()
+                if removal and removal['approved_at']:
+                    raise HTTPException(409,'This line removal was already approved.')
+                if not test_mode and not prior and r.care_requests.response_closed(conn,case,line_id):
+                    raise HTTPException(409,'The initial response deadline has passed. Contact our team.')
+                if prior and prior['status']=='withdrawn':
+                    prior['status']='choosing'  # selection_change still enforces the original deadline.
+                conn.execute("UPDATE after_order_line_removals SET status='withdrawn',updated_at=? WHERE case_id=? AND line_id=? AND test_mode=?",(r.utc_now(),case['id'],line_id,int(test_mode)))
             try:
                 change = selection_change(dict(prior) if prior else None, product, now)
             except ValueError as exc:
@@ -255,7 +268,7 @@ class Workflow:
             conn.execute('''INSERT INTO after_order_line_selections
                 (case_id,line_id,test_mode,version,product_json,first_selected_at,deadline_at,status,issue_fingerprint,updated_at)
                 VALUES(?,?,?,?,?,?,?,'choosing',?,?) ON CONFLICT(case_id,line_id,test_mode) DO UPDATE SET
-                version=excluded.version,product_json=excluded.product_json,updated_at=excluded.updated_at''',
+                version=excluded.version,product_json=excluded.product_json,status='choosing',updated_at=excluded.updated_at''',
                 (case['id'],line_id,int(test_mode),change['version'],json.dumps(product),change['first_selected_at'],change['deadline_at'],r.request_fingerprint(case),r.utc_now()))
             if not test_mode:
                 conn.execute("UPDATE after_order_cases SET current_decision='offer_alternatives', decision_version=decision_version+1, decision_updated_at=?, status='needs_confirmation', decision_fingerprint=?, updated_at=? WHERE id=?",
@@ -296,6 +309,11 @@ class Workflow:
                 odoo = r.OdooClient(r.get_store(case['store_id']))
                 if r.after_order_email_test_mode():
                     return
+                previous_result = json.loads(row['result_json'])
+                if (product['difference'] > 0 and not previous_result.get('quote_id')
+                        and hasattr(r, 'care_delivery')
+                        and r.care_delivery.suppressed(case.get('customer_email') or '', False)):
+                    raise ValueError('Payment email recipient is suppressed. Team review required before creating a quotation.')
                 result = odoo.execute('sale.order','after_order_process_alternative', [[case['odoo_order_id']],
                     int(line['odoo_line_id']),int(case['website_id']), product['product_id'],
                     f'care:{case_id}:line:{line_id}:v:{row["version"]}',row['deadline_at'],product['pricing_signature']])
@@ -326,7 +344,9 @@ class Workflow:
             return
         with r.db() as conn:
             due = [dict(row) for row in conn.execute("SELECT case_id,line_id FROM after_order_line_selections WHERE test_mode=0 AND status IN ('choosing','waiting_payment','processing') AND deadline_at<=? ORDER BY updated_at LIMIT 50",(r.utc_now(),)).fetchall()]
-            ready = [dict(row) for row in conn.execute("SELECT DISTINCT case_id FROM after_order_line_selections WHERE test_mode=0 AND status='ready_to_release' LIMIT 200").fetchall()]
+            ready = [dict(row) for row in conn.execute("SELECT case_id FROM after_order_line_selections WHERE test_mode=0 AND status='ready_to_release' GROUP BY case_id ORDER BY MIN(updated_at),case_id LIMIT 200").fetchall()]
+            for candidate in ready:
+                conn.execute("UPDATE after_order_line_selections SET updated_at=? WHERE case_id=? AND test_mode=0 AND status='ready_to_release'",(r.utc_now(),candidate['case_id']))
         for row in due:
             self.process(row['case_id'],row['line_id'])
         for case_id in {row['case_id'] for row in due+ready}:
@@ -367,11 +387,16 @@ class Workflow:
             case = r.after_order_case_by_id(case_id)
             if not case or case['current_decision'] != 'offer_alternatives' or case.get('confirmed_at'):
                 return
-            selections = [dict(row) for row in conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND test_mode=0',(case_id,)).fetchall()]
+            selections = [dict(row) for row in conn.execute("SELECT * FROM after_order_line_selections WHERE case_id=? AND test_mode=0 AND status!='withdrawn'",(case_id,)).fetchall()]
+            removals = [dict(row) for row in conn.execute("SELECT * FROM after_order_line_removals WHERE case_id=? AND test_mode=0 AND status!='withdrawn'",(case_id,)).fetchall()] if hasattr(r,'care_requests') else []
             affected = {int(item['line_id']) for item in case['affected_items']}
-            if not affected or {s['line_id'] for s in selections} != affected or any(s['status'] != 'ready_to_release' for s in selections):
+            if not affected or ({s['line_id'] for s in selections} | {s['line_id'] for s in removals}) != affected or any(s['status'] != 'ready_to_release' for s in selections) or any(s['status'] not in ('auto_remove_pending','finance_review') for s in removals):
                 return
-            if r.after_order_unavailable_review(case)['blocked'] or any(s['issue_fingerprint'] != r.request_fingerprint(case) for s in selections):
+            if removals and not selections and not r.after_order_removal_allowed(case):
+                return  # Never release an empty order as a partial continuation.
+            if {s['line_id'] for s in selections}.intersection(s['line_id'] for s in removals):
+                return
+            if r.after_order_unavailable_review(case)['blocked'] or any(s['issue_fingerprint'] != r.request_fingerprint(case) for s in selections+removals):
                 return
             conn.execute('SELECT id FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id FOR UPDATE',
                 (case['store_id'],case['odoo_order_id'])).fetchall()
@@ -394,6 +419,20 @@ class Workflow:
                     return
             if r.after_order_email_test_mode():
                 return
+            for removal in removals:
+                _,line = self.case_line(case_id,removal['line_id'])
+                try:
+                    result = r.OdooClient(r.get_store(case['store_id'])).execute('sale.order','after_order_exclude_unavailable_line',
+                        [[case['odoo_order_id']],line['odoo_line_id'],case['website_id'],f'care:remove:{case_id}:{removal["line_id"]}:{removal["version"]}'])
+                    if not result.get('excluded'):
+                        raise ValueError('Odoo did not verify line exclusion.')
+                except Exception as exc:
+                    self.event(conn,case,'removal_execution_needs_review',removal['line_id'],error=r.clean_error_message(exc))
+                    return
+            for removal in removals:
+                conn.execute("UPDATE order_lines SET state='ignored',chrome_claimed_by=NULL,chrome_claimed_at=NULL,chrome_claim_expires_at=NULL,last_error='Unavailable item excluded; refund pending approval',updated_at=? WHERE id=? AND store_id=?",(r.utc_now(),removal['line_id'],case['store_id']))
+                conn.execute("UPDATE after_order_line_removals SET status='removed_refund_pending',updated_at=? WHERE case_id=? AND line_id=? AND test_mode=0",(r.utc_now(),case_id,removal['line_id']))
+                self.event(conn,case,'line_excluded_refund_pending',removal['line_id'],origin=removal['origin'])
             for selection in selections:
                 product = json.loads(selection['product_json'])
                 result = json.loads(selection['result_json'])
@@ -411,7 +450,7 @@ class Workflow:
                     (status,r.utc_now(),case_id,selection['line_id']))
                 self.event(conn,case,'alternative_'+status,selection['line_id'],product_name=product['name'],asin=asin,
                     refund_amount=abs(min(product['difference'],0)))
-            attention = any(not json.loads(s['result_json']).get('asin') or json.loads(s['product_json'])['difference'] < 0 for s in selections)
+            attention = bool(removals) or any(not json.loads(s['result_json']).get('asin') or json.loads(s['product_json'])['difference'] < 0 for s in selections)
             conn.execute("UPDATE after_order_cases SET status=?,confirmed_at=?,confirmed_by='24-hour alternative processing',decision_locked_at=?,updated_at=? WHERE id=?",('execution_needs_review' if attention else 'resolved',r.utc_now(),r.utc_now(),r.utc_now(),case_id))
             conn.execute('UPDATE after_order_action_links SET invalidated_at=?,updated_at=? WHERE case_id=?',(r.utc_now(),r.utc_now(),case_id))
         r.fast_page_cache_clear_matching({'orders','missing','dashboard','bulk'})

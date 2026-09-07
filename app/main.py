@@ -799,6 +799,10 @@ def request_has_public_access(request: Request) -> bool:
 
 def request_requires_public_access(request: Request) -> bool:
     path = request.url.path
+    if request.method == 'POST' and path == '/api/public/after-order-webhooks/resend':
+        return False  # Raw-body signature and replay checks are enforced by this handler.
+    if request.method in {'GET','POST'} and re.fullmatch(r'/api/public/after-order/unsubscribe/[a-f0-9]{64}',path):
+        return False  # Scoped opaque token; GET only shows preferences, POST opts out.
     # Email image proxies have no app cookie. Exempt only the product-image
     # lookup, never the surrounding order/tracking APIs or write methods.
     if request.method in {"GET", "HEAD"} and re.fullmatch(r"/api/public/asin-image/[A-Za-z0-9]{10}", path):
@@ -2219,6 +2223,12 @@ def init_db() -> None:
         if "fulfillment_at" not in existing_cols:
             conn.execute("ALTER TABLE shopify_order_status_cache ADD COLUMN fulfillment_at TEXT")
         conn.executescript(alternative_schema)
+        from app.services.care_delivery import SCHEMA as delivery_schema
+        conn.executescript(delivery_schema)
+        from app.services.care_requests import SCHEMA as request_schema
+        conn.executescript(request_schema)
+        from app.services.care_reminders import SCHEMA as reminder_schema
+        conn.executescript(reminder_schema)
         ensure_performance_indexes(conn)
         conn.execute("UPDATE order_lines SET pulled_at = COALESCE(NULLIF(pulled_at, ''), created_at)")
         conn.execute(
@@ -37538,6 +37548,7 @@ def api_epost_archive(tracking_id: int, payload: EpostArchivePayload) -> dict[st
 AFTER_ORDER_ACTION_LABELS = {
     "proceed": "Proceed",
     "exclude_item_and_proceed": "Remove this item and continue",
+    "remove_line": "Remove this item",
     "cancel_affected_item": "Cancel the affected item",
     "offer_alternatives": "Offer alternatives",
     "cancel_order": "Cancel the entire order",
@@ -37659,7 +37670,10 @@ def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
         review = after_order_unavailable_review(case)
         if review["blocked"] or (not after_order_email_test_mode() and not review["approved"]):
             return []
-        return after_order_filter_removal(case, ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"])
+        actions = after_order_filter_removal(case, ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"])
+        if len(case.get('affected_items') or []) > 1 or after_order_removal_allowed(case):
+            actions.append('remove_line')
+        return actions
     if case.get("case_type") == "delivery_confirmation":
         return ["received", "not_received"] if after_order_tracking_is_current(case) and (case.get("context") or {}).get("risk_state") == "delivered" else []
     if case.get("case_type") == "expected_dispatch":
@@ -37920,6 +37934,18 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                 "SELECT id, case_key, confirmed_at, context_json FROM after_order_cases WHERE store_id=? AND tracking_provider='epg' AND tracking_code=? ORDER BY id DESC LIMIT 1",
                 (row["store_id"], row.get("tracking_code")),
             ).fetchone()
+            if previous_tracking:
+                mapping = rows_to_dicts(conn.execute('''SELECT line_id,quantity FROM after_order_parcel_mapping WHERE case_id=(
+                    SELECT MAX(p.case_id) FROM after_order_parcel_mapping p JOIN after_order_cases c ON c.id=p.case_id
+                    WHERE c.store_id=? AND c.odoo_order_id=? AND c.tracking_code=?) ORDER BY line_id''',
+                    (row['store_id'],row['odoo_order_id'],row['tracking_code'])).fetchall())
+                if mapping:
+                    products = {int(product['line_id']):product for product in order_products}
+                    verified = all(int(item['line_id']) in products and 0 < float(item['quantity']) <= float(products[int(item['line_id'])]['quantity']) for item in mapping)
+                    context['parcel_items_verified'] = verified
+                    context['parcel_mapping'] = mapping
+                    if verified:
+                        order_products = [{**products[int(item['line_id'])], 'quantity':float(item['quantity'])} for item in mapping]
             if previous_tracking:
                 case_key = previous_tracking["case_key"]
                 previous_risk = json.loads(previous_tracking["context_json"] or "{}").get("risk_state")
@@ -38253,7 +38279,7 @@ def after_order_sender(case: dict[str, Any]) -> tuple[str, str]:
     address = f"notifications@{domain}" if domain else clean_text(settings.get("email_from_address"))
     if not address or "\n" in address or "\r" in address or "@" not in address:
         raise ValueError("Configure the website domain or EMAIL_FROM_ADDRESS before sending.")
-    name = clean_text(case.get("store_name")) or clean_text(settings.get("email_from_name")) or "Customer care"
+    name = clean_text((case.get('context') or {}).get('website_name')) or clean_text(case.get("store_name")) or clean_text(settings.get("email_from_name")) or "Customer care"
     return f"{name} <{address}>", domain
 
 
@@ -38266,6 +38292,33 @@ def after_order_email_content(
     actions_override: Optional[list[str]] = None,
 ) -> tuple[str, str, str]:
     from app.services.after_order_email import render_after_order_email
+    from app.services.after_order_email_images import with_email_recommendations
+
+    # Resolve product pages through this order's store, never use backend /web links.
+    try:
+        with db() as conn:
+            lines = rows_to_dicts(conn.execute('SELECT id,product_id FROM order_lines WHERE store_id=? AND odoo_order_id=?',
+                (case['store_id'],case['odoo_order_id'])).fetchall())
+        product_ids = list({int(row['product_id']) for row in lines if row.get('product_id')})
+        odoo = OdooClient(get_store(case['store_id']))
+        products = odoo.read('product.product',product_ids,['website_url']) if product_ids else []
+        paths = {int(p['id']):clean_text(p.get('website_url')) for p in products}
+        by_line = {int(row['id']):paths.get(int(row.get('product_id') or 0),'') for row in lines}
+        items = []
+        for source in case.get('affected_items') or []:
+            item = dict(source)
+            path = by_line.get(int(item.get('line_id') or 0),'')
+            item['odoo_product_url'] = 'https://' + case['sender_domain'] + path if path.startswith('/shop/') else ''
+            items.append(item)
+        case = {**case,'affected_items':items}
+    except Exception:
+        # Renderer still rejects internal/cross-site URLs if product lookup fails.
+        pass
+
+    if (template_kind or case.get('case_type')) == 'item_unavailable':
+        offers = [offer for offer in alternative_workflow.rows(case['id'])
+                  if offer['issue_fingerprint'] == request_fingerprint(case)]
+        case = with_email_recommendations(case, offers, action_url)
 
     actions = list(actions_override) if actions_override is not None else after_order_allowed_actions(case)
     review_url = ""
@@ -38390,6 +38443,8 @@ def send_after_order_email(
     force_test: bool = False,
     template_kind: str = "",
     showcase_kind: str = "",
+    reminder_parent: int = 0,
+    reminder_number: int = 0,
 ) -> dict[str, Any]:
     case = after_order_case_by_id(case_id)
     if not case:
@@ -38405,6 +38460,12 @@ def send_after_order_email(
                 record_after_order_event(conn, case_id, "unavailable_email_blocked", actor_type="system", details={"reason": review["reason"]})
             raise HTTPException(409, review["reason"])
     case = hydrate_after_order_recipient_and_domain(case, strict=not (force_test or after_order_email_test_mode()))
+    reminder_source = None
+    if reminder_parent:
+        try:
+            reminder_source = care_reminders.validate(reminder_parent,reminder_number,case)
+        except ValueError as exc:
+            raise HTTPException(409,str(exc)) from exc
     if unavailable_email and not (force_test or after_order_email_test_mode()) and not alternative_workflow.ready(case):
         raise HTTPException(409, "Select and publish alternatives for every affected line in Orders before notifying the customer.")
     showcase_actions = {
@@ -38414,12 +38475,17 @@ def send_after_order_email(
         "package_lost": ["replacement", "refund"],
         "package_movement": [],
         "trustpilot_review": [],
+        "alternative_payment": [],
     }
     allowed = showcase_actions.get(showcase_kind, after_order_allowed_actions(case) if not template_kind else [])
     allowed = after_order_filter_removal(case, allowed)
     action_url = ""
     branded_tracking_url = ""
-    if showcase_kind and allowed:
+    if reminder_source:
+        # Rendering below is discarded in favour of the original saved message.
+        # Do not create fresh action tokens merely to send a reminder.
+        action_url = f"https://{clean_text(case.get('sender_domain'))}/my/orders"
+    elif showcase_kind and allowed:
         action_url = clean_text(create_after_order_action_link(
             case_id, request, allowed_override=allowed, test_mode=True,
         ).get("url"))
@@ -38440,6 +38506,9 @@ def send_after_order_email(
             test_recipient=after_order_test_recipient(),
         )
         sender, sender_domain = after_order_sender(case)
+        suppression = care_delivery.suppressed(recipient, test_mode)
+        if suppression:
+            raise ValueError('Email suppressed after provider reported ' + suppression + '. Verify the customer email before further contact.')
         if allowed and not test_mode and urlparse(action_url).scheme != "https":
             raise ValueError("Live customer action links require an HTTPS AFTER_ORDER_PUBLIC_BASE_URL.")
         preference_eligible = (
@@ -38452,6 +38521,7 @@ def send_after_order_email(
         unsubscribe_url = create_after_order_unsubscribe_url(case, request, recipient) if preference_eligible else ""
         email_case = dict(case)
         email_case["context"] = dict(case.get("context") or {})
+        email_case['context']['three_day_policy_enabled'] = test_mode or clean_text(get_service_settings().get('after_order_completion_enabled')) == 'true'
         effective_template_kind = template_kind
         if showcase_kind:
             if showcase_kind == "expected_dispatch":
@@ -38487,19 +38557,44 @@ def send_after_order_email(
             unsubscribe_url=unsubscribe_url,
             actions_override=allowed if showcase_kind else None,
         )
+        if showcase_kind == 'alternative_payment':
+            if not test_mode:
+                raise ValueError('Payment-email layout previews are test-only.')
+            recommendations = [product for offer in alternative_workflow.rows(case_id) for product in offer['recommendations']]
+            product_id = int(recommendations[0]['product_id']) if recommendations else 0
+            preview = OdooClient(get_store(case['store_id'])).execute('sale.order','after_order_payment_email_preview',
+                [[case['odoo_order_id']],int(case['website_id']),product_id])
+            subject,html_body,text_body = preview['subject'],preview['html'],preview['text']
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     event_context = case.get("context") or {}
     event_revision = request_fingerprint(case)
+    if email_case['context'].get('three_day_policy_enabled') and unavailable_email:
+        event_revision += ':three-day-v1'
     if unavailable_email and not test_mode:
         event_revision += ':' + alternative_workflow.notification_revision(case)
     if case.get("case_type") == "tracking" and not allowed:
         event_revision = hashlib.sha256(json.dumps({key: event_context.get(key) for key in ("latest_status", "latest_location", "last_update_at")}, sort_keys=True).encode()).hexdigest()
     idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{uuid.uuid4().hex if test_mode else event_revision}"
+    if reminder_source:
+        idempotency_key = f'after-order-reminder:{reminder_parent}:{reminder_number}'
+        # Reuse the original action links, product snapshot and policy wording.
+        # A reminder never starts a new customer-response window.
+        original_payload = json.loads(reminder_source['payload_json'])
+        subject = f'Reminder {reminder_number}/3 — ' + original_payload['subject']
+        reminder_note = 'A friendly reminder: we are still waiting for your response. This reminder does not extend your original response deadline.'
+        if unavailable_email:
+            deadline = parse_any_datetime(reminder_source['delivered_at']) + timedelta(days=3)
+            reminder_note += ' Please respond by ' + deadline.strftime('%d %b %Y, %H:%M UTC') + '.'
+        html_body = '<div style="background:#ffffff;color:#333333;padding:16px;font-family:Inter,Arial,sans-serif">' + html.escape(reminder_note) + '</div>' + original_payload['html']
+        text_body = reminder_note + '\n\n' + original_payload.get('text','')
     now = utc_now()
     message_id = ""
     status = "failed"
     try:
+        if reminder_source:
+            care_reminders.validate(reminder_parent,reminder_number,
+                hydrate_after_order_recipient_and_domain(after_order_case_by_id(case_id),strict=True))
         if unavailable_email and not test_mode:
             latest = after_order_case_by_id(case_id)
             review = after_order_unavailable_review(latest or case, for_send=True)
@@ -38523,6 +38618,16 @@ def send_after_order_email(
             }
         # Reserve the logical notification before any network side effect. An
         # ambiguous timeout/crash remains visible and is never blindly resent.
+        if unavailable_email and email_case['context'].get('three_day_policy_enabled'):
+            message_payload['_care_policy'] = 'three-day-v1'
+        if reminder_source:
+            message_payload['_care_reminder_parent'] = reminder_parent
+            message_payload['_care_reminder_number'] = reminder_number
+            message_payload['_care_reminder_expires_at'] = (parse_any_datetime(reminder_source['delivered_at']) + timedelta(days=3)).isoformat()
+            # Only the original delivery may establish the response deadline.
+            message_payload.pop('_care_policy',None)
+        elif allowed and not template_kind and not showcase_kind and not test_mode:
+            message_payload['_care_reminders'] = True
         with db() as conn:
             reserved = conn.execute(
                 """INSERT INTO after_order_messages
@@ -38539,7 +38644,7 @@ def send_after_order_email(
             raise ValueError("Test mode was enabled before sending; live email stopped.")
         provider = create_email_provider(provider_name, {"api_key": os.getenv("RESEND_API_KEY", "")})
         result = provider.send(
-            message_payload,
+            {key:value for key,value in message_payload.items() if not key.startswith('_care_')},
             idempotency_key=idempotency_key,
         )
         message_id = clean_text(result.get("id"))
@@ -38575,6 +38680,8 @@ def send_after_order_email(
                 "provider_message_id": message_id,
                 "template": showcase_kind or template_kind or clean_text(case.get("case_type")),
                 "test_mode": test_mode,
+                "reminder_number": reminder_number,
+                "reminder_parent_message_id": reminder_parent,
             },
         )
     return {
@@ -38600,7 +38707,7 @@ def email_log_row(row: Any) -> dict[str, Any]:
 @app.get("/api/after-order/emails")
 def api_after_order_email_log(store_id: Optional[int] = None, page: int = 1, per_page: int = 30,
                             status: str = "all", mode: str = "all", q: str = "", date_from: str = "", date_to: str = "") -> dict[str, Any]:
-    queues = {"all": [], "attention": ["failed", "delivery_unknown"], "failed": ["failed"], "retrying": ["retrying", "sending"], "sent": ["sent", "sent_test"], "uncertain": ["delivery_unknown"], "preview": ["test_preview"]}
+    queues = {"all": [], "attention": ["failed", "delivery_unknown", "bounced", "complained", "delivery_delayed"], "failed": ["failed"], "retrying": ["retrying", "sending"], "sent": ["sent", "sent_test"], "delivered": ["delivered"], "suppressed": ["bounced", "complained"], "uncertain": ["delivery_unknown", "delivery_delayed"], "preview": ["test_preview"]}
     if status not in queues or mode not in {"all", "test", "live"}:
         raise HTTPException(400, "Unknown email queue or mode.")
     for value in (date_from, date_to):
@@ -38658,14 +38765,25 @@ def api_after_order_email_detail(message_id: int, store_id: Optional[int] = None
 
 @app.post("/api/after-order/emails/{message_id}/retry")
 def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, Any]:
+    return retry_after_order_email(message_id, request)
+
+
+def retry_after_order_email(message_id: int, request: Request, *, automatic: bool = False) -> dict[str, Any]:
+    from app.services.email_log import automatic_retry_reason
     with db() as conn:
         original = conn.execute("SELECT * FROM after_order_messages WHERE id=?", (message_id,)).fetchone()
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    if automatic:
+        reason = automatic_retry_reason(original)
+        if reason:
+            raise HTTPException(409, reason)
+    if care_delivery.suppressed(original['recipient'], bool(original.get('test_mode'))):
+        raise HTTPException(409, 'This recipient is suppressed after a bounce or complaint.')
     if original.get('provider') == 'odoo':
         return alternative_workflow.retry_quote_email(original)
-    reason = retry_block_reason(original, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
+    reason = retry_block_reason({**original, 'status': 'failed'} if automatic else original, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
     if reason:
         raise HTTPException(409, reason)
     case = after_order_case_by_id(int(original["case_id"]))
@@ -38677,6 +38795,8 @@ def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, 
         raise HTTPException(409, "The email's links may have expired. Create a current email from the order instead.")
     if not original.get("test_mode"):
         case = hydrate_after_order_recipient_and_domain(case, strict=True)
+        if automatic and case.get('current_decision'):
+            raise HTTPException(409, 'Customer already responded; review before resending an old action email.')
         if case.get("confirmed_at") and original.get("template_kind") != "trustpilot_review":
             raise HTTPException(409, "The customer request was already confirmed. Its action email cannot be retried.")
         if original.get("request_fingerprint") != request_fingerprint(case) or not after_order_tracking_is_current(case):
@@ -38693,21 +38813,31 @@ def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, 
     with db() as conn:
         locked = conn.execute("SELECT * FROM after_order_messages WHERE id=? FOR UPDATE", (message_id,)).fetchone()
         locked = row_to_dict(locked)
-        reason = retry_block_reason(locked, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
+        if automatic:
+            reason = automatic_retry_reason(locked)
+            if reason or after_order_email_test_mode():
+                raise HTTPException(409, reason or 'Automatic live recovery is disabled in test mode.')
+        reason = retry_block_reason({**locked, 'status': 'failed'} if automatic else locked, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
         if reason:
             raise HTTPException(409, reason)
         attempt = int(locked.get("attempt_count") or 1) + 1
+        saved_payload = json.loads(locked['payload_json'])
+        # Recover the exact prior request, never create a new key for a timeout.
+        retry_key = (saved_payload.get('_care_retry_key') or
+                     (locked['idempotency_key'] if attempt == 2 else f'email-log:{message_id}:attempt:{attempt-1}')) if automatic else f'email-log:{message_id}:attempt:{attempt}'
+        saved_payload['_care_retry_key'] = retry_key
+        conn.execute('UPDATE after_order_messages SET payload_json=? WHERE id=?', (json.dumps(saved_payload), message_id))
         now = utc_now()
         conn.execute("UPDATE after_order_messages SET status='retrying',attempt_count=?,last_error=NULL,updated_at=? WHERE id=?", (attempt, now, message_id))
         conn.execute("INSERT INTO after_order_email_attempts (message_id,attempt_number,status,created_at,updated_at) VALUES (?,?,'retrying',?,?)", (message_id, attempt, now, now))
-        record_after_order_event(conn, case["id"], "email_retry_started", actor_type="team", details={"message_id": message_id, "attempt": attempt})
+        record_after_order_event(conn, case["id"], "email_retry_started", actor_type="system" if automatic else "team", details={"message_id": message_id, "attempt": attempt, "automatic": automatic})
     error = ""
     provider_id = ""
     try:
         if after_order_email_test_mode() and not locked.get("test_mode"):
             raise ValueError("Live retry stopped because test mode is enabled.")
         provider = create_email_provider(locked["provider"], {"api_key": os.getenv("RESEND_API_KEY", "")})
-        result = provider.send(json.loads(locked["payload_json"]), idempotency_key=f"email-log:{message_id}:attempt:{attempt}")
+        result = provider.send({k:v for k,v in saved_payload.items() if not k.startswith('_care_')}, idempotency_key=retry_key)
         provider_id = clean_text(result.get("id"))
         if not provider_id:
             raise RuntimeError("No provider message ID returned. Check delivery before retrying.")
@@ -38718,7 +38848,7 @@ def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, 
     with db() as conn:
         conn.execute("UPDATE after_order_messages SET status=?,last_error=?,provider_message_id=?,updated_at=? WHERE id=?", (outcome, error or None, provider_id or None, utc_now(), message_id))
         conn.execute("UPDATE after_order_email_attempts SET status=?,error=?,provider_message_id=?,updated_at=? WHERE message_id=? AND attempt_number=?", (outcome, error or None, provider_id or None, utc_now(), message_id, attempt))
-        record_after_order_event(conn, case["id"], "email_retry_finished", actor_type="team", details={"message_id": message_id, "attempt": attempt, "status": outcome, "error": error})
+        record_after_order_event(conn, case["id"], "email_retry_finished", actor_type="system" if automatic else "team", details={"message_id": message_id, "attempt": attempt, "status": outcome, "error": error, "automatic": automatic})
     return {"ok": outcome in {"sent", "sent_test"}, "status": outcome, "message": f"Retry accepted by the provider for {locked['recipient']}." if not error else error}
 
 
@@ -38772,6 +38902,7 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
         ("package_lost", by_type.get("tracking", first_id)),
         ("package_movement", by_type.get("tracking", first_id)),
         ("trustpilot_review", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
+        ("alternative_payment", by_type.get("item_unavailable", first_id)),
     ]
     results = []
     for index, (kind, case_id) in enumerate(suite):
@@ -38782,14 +38913,20 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
             if review["blocked"]:
                 results.append({"template": kind, "case_id": case_id, "status": "skipped", "reason": review["reason"]})
                 continue
-        result = send_after_order_email(case_id, request, force_test=True, showcase_kind=kind)
-        results.append({"template": kind, "case_id": case_id, "recipient": result.get("recipient")})
+        try:
+            result = send_after_order_email(case_id, request, force_test=True, showcase_kind=kind)
+            results.append({"template": kind, "case_id": case_id, "recipient": result.get("recipient")})
+        except Exception as exc:
+            results.append({'template':kind,'case_id':case_id,'status':'failed','reason':clean_error_message(exc)})
+            with db() as conn:
+                record_after_order_event(conn,case_id,'test_suite_template_failed',actor_type='team',details={'template':kind,'error':clean_error_message(exc),'test_mode':True})
     sent_count = sum(1 for result in results if result.get("recipient"))
+    failed_count = sum(result.get('status')=='failed' for result in results)
     return {
-        "ok": True,
+        "ok": failed_count == 0,
         "sent": sent_count,
         "results": results,
-        "message": f"Sent {sent_count} test emails to {after_order_test_recipient()}, one second apart. Skipped {len(results) - sent_count} suppressed templates.",
+        "message": f"Sent {sent_count} test emails to {after_order_test_recipient()}, one second apart. Failed {failed_count}; skipped {len(results) - sent_count - failed_count} suppressed templates.",
     }
 
 
@@ -38954,7 +39091,7 @@ def record_after_order_customer_decision(
     is_test = bool(link.get("test_mode")) or after_order_email_test_mode()
     if case.get('case_type') == 'item_unavailable' and normalized != 'offer_alternatives':
         selections = alternative_workflow.rows(case['id'],is_test)
-        if any((offer.get('selection') or {}).get('locked') for offer in selections):
+        if any((offer.get('selection') or {}).get('locked') for offer in selections if not line_id or int(offer['line_id'])==int(line_id)):
             raise HTTPException(409, 'The alternative selection has already locked for processing. Please contact our team for further changes.')
     if not is_test and (link.get("invalidated_at") or link.get("request_fingerprint") != request_fingerprint(case)):
         raise HTTPException(409, "The order changed. Reload its current options before choosing.")
@@ -38978,6 +39115,10 @@ def record_after_order_customer_decision(
         if not line_id:
             raise HTTPException(400, "Select the affected line item first.")
         return alternative_workflow.choose(case, link, int(line_id), int(selected_product_id))
+    if normalized == 'remove_line':
+        if not line_id:
+            raise HTTPException(400,'Select the affected line to remove.')
+        return care_requests.remove(case,link,int(line_id))
     if bool(link.get("test_mode")) or after_order_email_test_mode():
         return False, case, "Test preview only — no customer decision or Odoo change was recorded."
     now = utc_now()
@@ -38985,7 +39126,9 @@ def record_after_order_customer_decision(
     with db() as conn:
         latest = conn.execute("SELECT * FROM after_order_cases WHERE id=? FOR UPDATE", (case["id"],)).fetchone()
         if latest and not latest["confirmed_at"]:
-            if case.get('case_type') == 'item_unavailable' and any((offer.get('selection') or {}).get('locked') for offer in alternative_workflow.rows(case['id'],False)):
+            if case.get('case_type') == 'item_unavailable' and conn.execute("SELECT 1 FROM after_order_line_removals WHERE case_id=? AND test_mode=0 AND approved_at IS NOT NULL AND status!='withdrawn'",(case['id'],)).fetchone():
+                raise HTTPException(409,'An affected line was already approved for removal. Contact our team before changing the whole-order request.')
+            if case.get('case_type') == 'item_unavailable' and any((offer.get('selection') or {}).get('locked') for offer in alternative_workflow.rows(case['id'],False) if not line_id or int(offer['line_id'])==int(line_id)):
                 raise HTTPException(409, 'The alternative window closed while your request was being submitted. Contact our team for further changes.')
             latest_case = dict(latest)
             latest_case["affected_items"] = after_order_json_list(latest_case.get("affected_items_json"))
@@ -39032,10 +39175,12 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
     context = case.get("context") or {}
     if case.get("case_type") == "item_unavailable" and not (link.get("test_mode") or after_order_email_test_mode()) and not after_order_unavailable_review(case)["approved"]:
         allowed = []
+    line_requests = care_requests.rows(case['id'],bool(link.get('test_mode')) or after_order_email_test_mode())
     affected = case.get("affected_items") or []
     search_terms = " ".join(clean_text(item.get("product_name")) for item in affected if clean_text(item.get("product_name")))
     return {
         "ok": True,
+        "line_requests": line_requests,
         "order": {
             "id": case.get("odoo_order_id"),
             "name": case.get("odoo_order_name"),
@@ -39400,19 +39545,29 @@ def after_order_automation_loop() -> None:
 
 def run_after_order_automation() -> dict[str, Any]:
     sync_after_order_cases()
+    care_delivery.reconcile()
+    care_requests.sync_delivered()
     if after_order_email_test_mode():
         return {"ok": True, "test_mode": True, "message": "Cases refreshed. No emails or execution in test mode."}
     if clean_text(get_service_settings().get("after_order_automation_enabled")) != "true":
         return {"ok": False, "message": "Automation is disabled."}
     alternative_workflow.run_due()
+    care_requests.run_due()
     base = clean_text(get_service_settings().get("after_order_public_base_url") or os.getenv("AFTER_ORDER_PUBLIC_BASE_URL", ""))
     parsed = urlparse(base)
     if parsed.scheme != "https" or not parsed.hostname:
         raise ValueError("Configure an HTTPS after-order public base URL before automation.")
     request = Request({"type": "http", "method": "POST", "scheme": "https", "server": (parsed.hostname, 443), "path": "/", "root_path": "", "query_string": b"", "headers": [(b"host", parsed.hostname.encode())]})
+    care_delivery.recover_sends(request)
+    care_reminders.run_due(request)
     with db() as conn:
         jobs = rows_to_dicts(conn.execute("SELECT id FROM after_order_execution_jobs WHERE status='pending' ORDER BY id LIMIT 20").fetchall())
-        cases = rows_to_dicts(conn.execute("SELECT id FROM after_order_cases WHERE confirmed_at IS NULL AND status!='resolved' ORDER BY updated_at DESC LIMIT 200").fetchall())
+        cases = rows_to_dicts(conn.execute("""SELECT c.id FROM after_order_cases c LEFT JOIN after_order_case_checks k ON k.case_id=c.id
+            WHERE c.confirmed_at IS NULL AND c.status!='resolved'
+            ORDER BY COALESCE(k.checked_at,''),c.id LIMIT 200""").fetchall())
+        for candidate in cases:
+            conn.execute('''INSERT INTO after_order_case_checks(case_id,checked_at) VALUES(?,?)
+                ON CONFLICT(case_id) DO UPDATE SET checked_at=excluded.checked_at''',(candidate['id'],utc_now()))
     for job in jobs:
         execute_after_order_job(int(job["id"]), request)
     attempted = 0
@@ -42814,6 +42969,14 @@ def amazon_order_history_unmatched_page(request: Request) -> HTMLResponse:
 from app.services.alternative_workflow import Workflow as AlternativeWorkflow
 alternative_workflow = AlternativeWorkflow(globals())
 app.include_router(alternative_workflow.router())
+from app.services.care_delivery import Delivery as CareDelivery
+care_delivery = CareDelivery(globals())
+app.include_router(care_delivery.router())
+from app.services.care_requests import Requests as CareRequests
+care_requests = CareRequests(globals())
+app.include_router(care_requests.router())
+from app.services.care_reminders import Reminders as CareReminders
+care_reminders = CareReminders(globals())
 
 
 @app.get("/{frontend_path:path}")

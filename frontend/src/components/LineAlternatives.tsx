@@ -6,7 +6,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 
 type Fetcher = <T>(path: string, init?: RequestInit) => Promise<T>
 type Product = { name: string; default_code: string; original_total?: number; alternative_total?: number; difference?: number; currency: string; pricing_error?: string }
-type Offer = { line_id: number; recommendations: Product[]; selection?: { status: string; deadline_at: string; product: Product; last_error?: string; refund_status?: string; result: { quote_name?: string; email_status?: string } } }
+type Offer = { line_id: number; recommendations: Product[]; selection?: { version: number; status: string; deadline_at: string; product: Product; last_error?: string; refund_status?: string; result: { quote_name?: string; email_status?: string; payment_verified?: boolean } } }
+type Requests = { tracking_code?: string; mapping_candidates?: {id:number;product_name:string;quantity:number}[]; removals: {line_id: number; version: number; status: string; origin: string}[]; deadlines: {line_id: number; deadline_at: string; state: string; outcome: string}[]; parcel_items: {line_id: number; quantity: number}[] }
 type Event = { id: number; event_type: string; created_at: string; actor_label?: string; actor_type?: string; decision?: string; details?: Record<string, unknown> }
 
 const date = (value: string) => value ? new Date(value).toLocaleString() : '—'
@@ -56,23 +57,45 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
   const [open, setOpen] = useState(false)
   const [events, setEvents] = useState<Event[]>([])
   const [offers, setOffers] = useState<Offer[]>([])
+  const [requests, setRequests] = useState<Requests>({removals:[],deadlines:[],parcel_items:[]})
+  const [mappingOpen,setMappingOpen] = useState(false)
+  const [mapping,setMapping] = useState<Record<number,number>>({})
+  const [mappingChecked,setMappingChecked] = useState(false)
+  const [notice,setNotice] = useState('')
   const [error, setError] = useState('')
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   async function load() {
     setLoading(true); setError('')
     try {
-      const [activity, alternatives] = await Promise.all([
+      const [activity, alternatives, decisions] = await Promise.all([
         request<{rows: Event[]}>(`/api/after-order/cases/${caseId}/events`),
         request<{rows: Offer[]}>(`/api/after-order/cases/${caseId}/line-alternatives`),
+        request<Requests>(`/api/after-order/cases/${caseId}/requests`),
       ])
       setEvents(activity.rows); setOffers(alternatives.rows)
+      setRequests(decisions)
     } catch (error) { setError(String(error)) } finally { setLoading(false) }
   }
   return <details className="mt-3 rounded-lg border bg-background p-3" onToggle={event => { const expanded = event.currentTarget.open; setOpen(expanded); if (expanded) void load() }}>
     <summary className="cursor-pointer text-sm font-semibold">Timeline & price differences · {orderNumber}</summary>
     {open && <div className="mt-3 space-y-4">
       <div className="flex gap-2"><Input aria-label="Filter timeline by line or event" placeholder="Filter by line, product or event…" value={filter} onChange={event => setFilter(event.target.value)}/><Button size="sm" variant="outline" onClick={() => void load()} disabled={loading}>Refresh</Button></div>
+      {notice && <p role="status" className="text-sm">{notice}</p>}
+      {requests.tracking_code && <Button size="sm" variant="outline" onClick={() => {setMapping(Object.fromEntries(requests.parcel_items.map(x=>[x.line_id,x.quantity])));setMappingChecked(false);setMappingOpen(true)}}>Verify contents of parcel {requests.tracking_code}</Button>}
+      <Dialog open={mappingOpen} onOpenChange={setMappingOpen}><DialogContent><DialogHeader><DialogTitle>Verify parcel contents</DialogTitle><DialogDescription>{orderNumber} · {requests.tracking_code}. Include only quantities packed in this parcel; leave other lines at zero.</DialogDescription></DialogHeader>
+        {requests.mapping_candidates?.map(line => <label key={line.id} className="grid grid-cols-[1fr_90px] items-center gap-3 text-sm">{line.product_name} · line {line.id}<Input type="number" min="0" max={line.quantity} step="any" value={mapping[line.id] || 0} onChange={e=>setMapping({...mapping,[line.id]:Number(e.target.value)})}/></label>)}
+        <label className="flex gap-2 text-sm"><Checkbox checked={mappingChecked} onCheckedChange={v=>setMappingChecked(v===true)}/>I checked the packing records and verified these quantities belong to this parcel.</label>
+        <Button disabled={loading || !mappingChecked} onClick={async()=>{setLoading(true);try{const result=await request<{message:string}>(`/api/after-order/cases/${caseId}/parcel-items`,{method:'POST',body:JSON.stringify({items:Object.entries(mapping).filter(([,qty])=>qty>0).map(([id,quantity])=>({line_id:Number(id),quantity})),verified_by:'Operations team'})});setNotice(result.message);setMappingOpen(false);await load()}catch(error){setError(String(error))}finally{setLoading(false)}}}>Save verified parcel contents</Button>
+      </DialogContent></Dialog>
+      {requests.deadlines.map(row => <p key={`${row.line_id}-${row.deadline_at}`} className="text-sm">Line {row.line_id} · respond by {date(row.deadline_at)} · {row.outcome || row.state}</p>)}
+      {requests.removals.filter(row => row.status !== 'withdrawn').map(row => <div key={row.line_id} className="rounded border p-3 text-sm">
+        <p>Line {row.line_id} · removal · {row.status.replaceAll('_',' ')} · {row.origin.replaceAll('_',' ')}</p>
+        {['needs_approval','cancel_review'].includes(row.status) && <Button variant="outline" size="sm" disabled={loading} onClick={async () => {
+          setLoading(true); try { const result = await request<{message:string}>(`/api/after-order/cases/${caseId}/lines/${row.line_id}/approve-removal`,{method:'POST',body:JSON.stringify({version:row.version,approved_by:'Operations team'})}); setNotice(result.message); await load() } catch(error) {setError(String(error))} finally {setLoading(false)}
+        }}>Approve removal for finance review</Button>}
+      </div>)}
+      {requests.parcel_items.length > 0 && <p className="text-sm">Verified parcel contents: {requests.parcel_items.map(row => `line ${row.line_id} × ${row.quantity}`).join(', ')}</p>}
       {offers.map(offer => <section className="rounded border p-3 text-sm" key={offer.line_id}>
         <strong>Line {offer.line_id}</strong>
         <p className="text-muted-foreground">Best alternatives: {offer.recommendations.map(p => p.name).join(', ')}</p>
@@ -81,6 +104,11 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
           <p>Original paid line: {offer.selection.product.currency} {offer.selection.product.original_total?.toFixed(2) ?? 'Needs review'} · Replacement: {offer.selection.product.alternative_total?.toFixed(2) ?? 'Needs review'}</p>
           {offer.selection.product.difference != null ? <p className="font-medium">{offer.selection.product.difference < 0 ? 'Refund difference' : 'Additional payment'}: {offer.selection.product.currency} {Math.abs(offer.selection.product.difference).toFixed(2)}{offer.selection.refund_status && ` · ${offer.selection.refund_status.replaceAll('_',' ')}`}</p> : <p className="text-amber-800">Price needs review: {offer.selection.product.pricing_error}</p>}
           {offer.selection.result.quote_name && <p>Quotation {offer.selection.result.quote_name} · email {offer.selection.result.email_status || 'not verified'}</p>}
+          {offer.selection.result.payment_verified && <p className="font-medium text-green-700">Payment verified</p>}
+          {['processed','manual_fulfilment'].includes(offer.selection.status) && <p className="font-medium text-green-700">Replacement applied · {offer.selection.status === 'processed' ? 'ready for fulfilment' : 'manual fulfilment required'}</p>}
+          {offer.selection.status === 'needs_review' && <Button size="sm" variant="outline" disabled={loading} onClick={async () => {
+            setLoading(true); try { await request(`/api/after-order/cases/${caseId}/lines/${offer.line_id}/retry-processing`,{method:'POST',body:JSON.stringify({version:offer.selection?.version,approved_by:'Operations team'})}); await load() } catch(error) {setError(String(error))} finally {setLoading(false)}
+          }}>Retry unchanged request after review</Button>}
           {offer.selection.last_error && <p className="text-destructive">{offer.selection.last_error}</p>}
         </>}
       </section>)}

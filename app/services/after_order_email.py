@@ -11,6 +11,17 @@ def safe_url(value):
     return value if urlsplit(value).scheme in {"https", "http"} else ""
 
 
+def storefront_product_url(value, domain):
+    """Internal Odoo record URLs must never become customer product links."""
+    parts = urlsplit(str(value or '').strip())
+    host = str(domain or '').lower().removeprefix('www.')
+    if (parts.scheme != 'https' or not host or parts.username or parts.password
+            or (parts.hostname or '').lower().removeprefix('www.') != host
+            or not parts.path.startswith('/shop/') or parts.fragment):
+        return ''
+    return value
+
+
 def button(label, url, *, primary=True, destructive=False):
     url = safe_url(url)
     if not url:
@@ -40,6 +51,26 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         "tracking": ("ON ITS WAY", "A little closer to your door.", "Your package has moved", "There’s a new update on your package. You can find the latest details below.", "Follow your delivery", "See the full tracking history and the latest carrier updates."),
     }
     eyebrow, heading, subject_text, intro, action_heading, note = content.get(kind, content["tracking"])
+    if kind == "item_unavailable" and context.get('three_day_policy_enabled'):
+        # Filtered actions, not row count: quantities/shipping/duplicate ASINs
+        # do not establish that another fulfilable product will remain.
+        removable = bool({"exclude_item_and_proceed", "cancel_affected_item"}.intersection(actions))
+        affected = "these unavailable items" if len(case.get("affected_items") or []) > 1 else "this unavailable item"
+        outcome = (
+            f"If you make no choice within 3 days, we will process the rest of your order without {affected}. "
+            "Any amount paid for the removed items will go to our team for refund review and approval."
+            if removable else
+            "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. "
+            "Cancellation and any refund require team approval; neither happens automatically."
+        )
+        note = (
+            "Please choose an option within 3 days of this notification. " + outcome + " "
+            "Once you select an alternative, you have a separate 24-hour window from your first selection to change it. "
+            "The 3-day no-response rule does not cancel a choice you have already made. "
+            "After the 24-hour window, a higher-priced choice requires payment of the difference; "
+            "a cheaper choice is reviewed for a difference refund. "
+            "If you choose to remove an item, any amount paid for it is subject to our team's refund review and approval."
+        )
     subject = f"{order} — {subject_text}"
     preheader = f"{subject_text} for {order}. {intro}"
     logo_url = safe_url(context.get("website_logo_url"))
@@ -53,7 +84,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         if quantity.endswith(".0"):
             quantity = quantity[:-2]
         thumbnail = safe_url(item.get("thumbnail_url"))
-        product_url = safe_url(item.get("odoo_product_url"))
+        product_url = storefront_product_url(item.get("odoo_product_url"),case.get('sender_domain'))
         image = f'<img src="{escape(thumbnail, quote=True)}" alt="{escape(name, quote=True)}" width="64" height="64" style="display:block;width:64px;height:64px;object-fit:contain;border:0;border-radius:0;background:#ffffff;font-size:10px;color:#66756e">' if thumbnail else '<span style="font-size:24px;color:#a4b1aa">&#9633;</span>'
         link = f'<a href="{escape(product_url, quote=True)}" style="font-family:{FONT};font-size:12px;line-height:20px;font-weight:500;color:#28594a;text-decoration:underline">View item</a>' if product_url else ""
         item_rows.append(f'''<tr><td style="padding:0 0 10px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eeeeee" style="background:#eeeeee;border-radius:0">
@@ -62,6 +93,19 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
           <strong style="font-weight:600">{escape(name)}</strong><br><span style="font-size:12px;line-height:24px;color:#64756a">Quantity {escape(quantity)}</span>{'<br>' + link if link else ''}
           </td></tr></table></td></tr>''')
         plain_items.append(f"{name} — Quantity {quantity}")
+        recommendations = item.get('recommendations') or []
+        if kind == 'item_unavailable' and recommendations:
+            item_rows.append('<tr><td style="padding:14px 0 10px;font-size:16px;font-weight:600">Best alternatives for this item</td></tr>')
+            for alternative in recommendations:
+                title = escape(str(alternative.get('name') or 'Alternative product'))
+                photo = safe_url(alternative.get('thumbnail_url'))
+                details = safe_url(alternative.get('details_url'))
+                selection = safe_url(alternative.get('select_url'))
+                item_rows.append(f'''<tr><td style="padding:0 0 16px"><table role="presentation" width="100%" cellpadding="12" cellspacing="0" bgcolor="#eeeeee"><tr>
+                  <td width="80"><a href="{escape(details, quote=True)}" target="_blank" rel="noopener noreferrer"><img src="{escape(photo, quote=True)}" alt="{title}" width="80" height="80" style="display:block;object-fit:contain;border:0;background:#ffffff"></a></td>
+                  <td style="font-size:14px;line-height:22px"><strong>{title}</strong><br><a href="{escape(details, quote=True)}" target="_blank" rel="noopener noreferrer" style="color:#28594a;text-decoration:underline">View full product details</a></td></tr>
+                  <tr><td colspan="2">{button('Review and confirm this alternative', selection)}</td></tr></table></td></tr>''')
+                plain_items.append(f"Recommended: {alternative.get('name')}\nProduct details: {details}\nReview and confirm: {selection}")
     items_html = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:28px">' + "".join(item_rows) + "</table>" if item_rows else ""
 
     panel = ""
@@ -94,6 +138,8 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         plain_actions.append(f"Track all details: {tracking_url}")
     else:
         for index, action in enumerate(actions):
+            if action == 'remove_line':
+                continue  # Requires selecting a specific line on the order page.
             if not safe_url(action_url):
                 continue
             parts = urlsplit(action_url)

@@ -76,6 +76,7 @@ class LogHandlersTests(unittest.TestCase):
         self.HTTPError = HTTPError
         self.provider = Mock(send=Mock(return_value={"id":"provider-demo"}))
         self.scope = {"Any":Any,"Optional":Optional,"Request":object,"db":db,"json":json,"requests":requests,
+            "care_delivery":Mock(suppressed=Mock(return_value='')),
             "datetime":datetime,"timedelta":timedelta,"timezone":timezone,"HTTPException":HTTPError,
             "row_to_dict":lambda row: dict(row) if row else None,"rows_to_dicts":lambda rows:[dict(row) for row in rows],
             "after_order_email_test_mode":lambda:True,"after_order_test_recipient":lambda:"test@example.test",
@@ -87,7 +88,7 @@ class LogHandlersTests(unittest.TestCase):
             "utc_now":lambda:datetime.now(timezone.utc).isoformat(),"record_after_order_event":lambda *a,**kw:None,
             "create_email_provider":lambda *a:self.provider,"EmailRejected":EmailRejected,"os":Mock(getenv=lambda *a: "fake")}
         tree = ast.parse((Path(__file__).parents[1]/"app/main.py").read_text())
-        for name in ("email_log_row","api_after_order_email_log","api_after_order_email_detail","api_after_order_email_retry"):
+        for name in ("email_log_row","api_after_order_email_log","api_after_order_email_detail","api_after_order_email_retry","retry_after_order_email"):
             node = next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name==name)
             node.decorator_list=[]
             exec(compile(ast.Module(body=[node],type_ignores=[]),"email-log","exec"),self.scope)
@@ -137,3 +138,30 @@ class LogHandlersTests(unittest.TestCase):
         with self.assertRaises(self.HTTPError):
             self.scope["api_after_order_email_retry"](1,object())
         self.provider.send.assert_not_called()
+
+    def test_automatic_timeout_recovery_reuses_key_and_respects_hour(self):
+        self.scope.update(after_order_email_test_mode=lambda:False,
+            hydrate_after_order_recipient_and_domain=lambda c,**kw:{**c,'customer_email':'test@example.test'},
+            request_fingerprint=lambda c:'snapshot',after_order_tracking_is_current=lambda c:True,
+            after_order_sender=lambda c:('notifications@example.test','example.test'))
+        old=(datetime.now(timezone.utc)-timedelta(hours=2)).isoformat()
+        self.conn.execute("UPDATE after_order_messages SET test_mode=0,status='delivery_unknown',created_at=?,updated_at=? WHERE id=1",(old,old))
+        self.provider.send.side_effect=requests.Timeout('timeout')
+        self.scope['retry_after_order_email'](1,object(),automatic=True)
+        self.assertEqual('secret-link-key',self.provider.send.call_args.kwargs['idempotency_key'])
+        with self.assertRaises(self.HTTPError):
+            self.scope['retry_after_order_email'](1,object(),automatic=True)
+        self.conn.execute('UPDATE after_order_messages SET updated_at=? WHERE id=1',(old,))
+        self.provider.send.side_effect=None
+        self.scope['retry_after_order_email'](1,object(),automatic=True)
+        self.assertEqual('secret-link-key',self.provider.send.call_args.kwargs['idempotency_key'])
+
+    def test_automatic_retry_policy_limits_and_test_guard(self):
+        from app.services.email_log import automatic_retry_reason
+        now=datetime.now(timezone.utc)
+        row={'provider':'resend','test_mode':0,'status':'delivery_unknown','attempt_count':1,
+             'created_at':(now-timedelta(hours=2)).isoformat(),'updated_at':(now-timedelta(hours=1)).isoformat(),'idempotency_key':'key'}
+        self.assertEqual('',automatic_retry_reason(row,now))
+        for change in ({'test_mode':1},{'attempt_count':4},{'status':'bounced'},{'status':'complained'},
+                       {'updated_at':now.isoformat()},{'created_at':(now-timedelta(hours=24)).isoformat()}):
+            self.assertTrue(automatic_retry_reason({**row,**change},now))
