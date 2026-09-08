@@ -4,6 +4,8 @@ from app.services.inventory_history import install_inventory_history, inventory_
 from app.services.inventory_labels import annotate_inventory_labels
 from app.services.inventory_legacy import install_inventory_legacy, legacy_delivery_available
 
+import base64
+from app.services.replacement_images import ReplacementImageSyncError, image_failure_details, validate_image_base64
 import csv
 import copy
 import hashlib
@@ -1770,6 +1772,17 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS replacement_product_images (
+                order_line_id INTEGER NOT NULL REFERENCES order_lines(id) ON DELETE CASCADE,
+                asin TEXT NOT NULL,
+                image_base64 TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(order_line_id, asin)
+            );
+
             CREATE TABLE IF NOT EXISTS shopify_fulfilment_jobs (
                 id TEXT PRIMARY KEY,
                 store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
@@ -2206,6 +2219,8 @@ def init_db() -> None:
             "original_asin": "ALTER TABLE order_lines ADD COLUMN original_asin TEXT",
             "original_product_name": "ALTER TABLE order_lines ADD COLUMN original_product_name TEXT",
             "replacement_asin": "ALTER TABLE order_lines ADD COLUMN replacement_asin TEXT",
+            "replacement_quantity": "ALTER TABLE order_lines ADD COLUMN replacement_quantity REAL",
+            "original_quantity": "ALTER TABLE order_lines ADD COLUMN original_quantity REAL",
             "replacement_product_name": "ALTER TABLE order_lines ADD COLUMN replacement_product_name TEXT",
             "replacement_note": "ALTER TABLE order_lines ADD COLUMN replacement_note TEXT",
             "replacement_assigned_at": "ALTER TABLE order_lines ADD COLUMN replacement_assigned_at TEXT",
@@ -4812,6 +4827,12 @@ def amazon_product_page_image_url(asin: str) -> str:
         if response.status_code >= 400:
             return ""
         text = response.text or ""
+        for pattern in (r'"hiRes"\s*:\s*"([^"\s]+)"', r'data-old-hires=["\']([^"\']+)["\']'):
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                url = html.unescape(match.group(1)).replace("\\/", "/")
+                if is_safe_amazon_image_url(url):
+                    return url
         dynamic_match = re.search(r'data-a-dynamic-image=["\'](\{.*?\})["\']', text, re.IGNORECASE)
         if dynamic_match:
             try:
@@ -8665,6 +8686,8 @@ def consolidate_existing_asin_lines(store_id: Optional[int] = None) -> None:
             ).fetchall()
             if len(rows) < 2:
                 continue
+            if any(row["replacement_asin"] for row in rows):
+                continue
             keep = rows[0]
             remove_ids = [row["id"] for row in rows[1:]]
             quantity = sum(float(row["quantity"] or 0) for row in rows)
@@ -9725,7 +9748,7 @@ def save_combined_order_line(
                     ELSE excluded.asin
                 END,
                 supplier_part_auxiliary_id=COALESCE(NULLIF(order_lines.supplier_part_auxiliary_id, ''), excluded.supplier_part_auxiliary_id),
-                quantity=excluded.quantity,
+                quantity=COALESCE(order_lines.replacement_quantity, excluded.quantity),
                 store_unit_price=excluded.store_unit_price,
                 store_total_price=excluded.store_total_price,
                 store_currency=excluded.store_currency,
@@ -10430,7 +10453,7 @@ def process_odoo_order_batch(
                         ELSE excluded.asin
                     END,
                     supplier_part_auxiliary_id=COALESCE(NULLIF(order_lines.supplier_part_auxiliary_id, ''), excluded.supplier_part_auxiliary_id),
-                    quantity=excluded.quantity,
+                    quantity=COALESCE(order_lines.replacement_quantity, excluded.quantity),
                     store_unit_price=excluded.store_unit_price,
                     store_total_price=excluded.store_total_price,
                     store_currency=excluded.store_currency,
@@ -23102,7 +23125,7 @@ def repair_shopify_synced_products(store_id: Optional[int] = None, limit: int = 
                     odoo = module.OdooClient(target["odoo_url"], target["odoo_db"], target["odoo_user"], target["odoo_password"])
                     odoo.connect()
                     odoo_cache[store_id_value] = odoo
-                odoo = odoo_cache[store_id_value]
+                odoo = shopify_replacement_export_client(odoo_cache[store_id_value], store_id_value, order_name)
                 order = odoo.get_order_by_number(order_name)
                 if not order:
                     missing += 1
@@ -23218,6 +23241,76 @@ def repair_shopify_synced_products(store_id: Optional[int] = None, limit: int = 
         _SHOPIFY_PRODUCT_REPAIR_RUNNING_LOCK.release()
 
 
+def shopify_replacement_export_client(odoo: Any, store_id: int, order_name: str) -> Any:
+    from app.services.replacement_export import ReplacementExportOdoo
+
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            """SELECT * FROM order_lines
+               WHERE store_id=? AND odoo_order_name=?
+                 AND COALESCE(replacement_asin, '') != ''
+                 AND COALESCE(replacement_run_id, '') = ''""",
+            (store_id, order_name),
+        ).fetchall())
+    if not rows:
+        return odoo
+    for row in rows:
+        row["source_ids"] = source_odoo_line_ids(row)
+
+    with db() as conn:
+        for row in rows:
+            saved = conn.execute(
+                "SELECT image_base64 FROM replacement_product_images WHERE order_line_id=? AND asin=?",
+                (row["id"], row["replacement_asin"]),
+            ).fetchone()
+            if saved:
+                row["replacement_image_base64"] = saved["image_base64"]
+
+    def load_image(asin: str) -> str:
+        image_url = amazon_product_page_image_url(asin)
+        if not image_url:
+            raise RuntimeError(f"Replacement image unavailable for {asin}. Retry the Shopify export once Amazon is available.")
+        response = fetch_remote_image_response(image_url)
+        return validate_image_base64(base64.b64encode(response.body).decode("ascii"))["image_base64"]
+
+    return ReplacementExportOdoo(odoo, rows, load_image)
+
+
+
+def sync_existing_shopify_replacement_images(module: Any, odoo: Any, shop: Any, order_name: str, order_id: Any, rename_manager: Any) -> None:
+    """Retry image uploads on linked orders without creating another order."""
+    replacements = getattr(odoo, "replacements", [])
+    if not replacements:
+        return
+    order = odoo.get_order_by_number(order_name)
+    if not order:
+        raise RuntimeError("Odoo order not found while retrying replacement images.")
+    lines = odoo.get_order_lines(order.get("order_line") or [])
+    variants = shopify_order_line_variants(module, shop, order_id)
+    for replacement in replacements:
+        product_id = -int(replacement["id"])
+        if not any((line.get("product_id") or [0])[0] == product_id for line in lines):
+            raise RuntimeError("Replacement source line was not found while retrying its image.")
+        product = odoo.get_product_product(product_id)
+        asin = replacement["replacement_asin"]
+        destination_sku = rename_manager.destination_sku(source_sku=asin, source_title=product["name"])
+        matches = [variant for variant in variants if variant.get("old_sku") in {asin, destination_sku} and variant.get("product_id")]
+        if not matches:
+            raise RuntimeError(f"The linked Shopify order does not contain replacement ASIN {asin}. Review its products before retrying.")
+        for target_id in sorted({int(variant["product_id"]) for variant in matches}):
+            try:
+                response = shop._request("PUT", shop.rest_base + f"products/{target_id}.json", {
+                    "product": {"id": target_id, "images": [{"attachment": product["image_1920"]}]},
+                })
+            except Exception as exc:
+                if re.search(r"image|attachment|media", str(exc), re.IGNORECASE):
+                    raise ReplacementImageSyncError(replacement["id"], asin) from exc
+                raise
+            if not any(clean_text(image.get("src")) and not image.get("errors") for image in (response.get("product") or {}).get("images", [])):
+                raise ReplacementImageSyncError(replacement["id"], asin)
+
+
+
 def run_shopify_script_export(job: dict[str, Any]) -> None:
     settings = get_service_settings()
     store = get_store(int(job["store_id"]))
@@ -23226,6 +23319,24 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
     module = load_external_script(script_path, f"shopify_export_{route}_{uuid.uuid4().hex}")
     apply_shopify_runtime_settings(module, route, settings)
     request_rate, request_burst = shopify_api_rate_config(settings)
+    current_replacement: Optional[dict[str, Any]] = None
+    original_ensure_product = module.ensure_product_variant_for_line
+
+    def ensure_replacement_product(odoo: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal current_replacement
+        product = (kwargs.get("line") or {}).get("product_id") or [0]
+        product_id = int(product[0])
+        current_replacement = next((row for row in getattr(odoo, "replacements", []) if -int(row["id"]) == product_id), None)
+        update_existing = module.UPDATE_EXISTING_SKU_PRODUCTS
+        try:
+            if current_replacement:
+                module.UPDATE_EXISTING_SKU_PRODUCTS = True
+            return original_ensure_product(odoo, *args, **kwargs)
+        finally:
+            module.UPDATE_EXISTING_SKU_PRODUCTS = update_existing
+            current_replacement = None
+
+    module.ensure_product_variant_for_line = ensure_replacement_product
     original_shopify_client = module.ShopifyClient
 
     class RateLimitedShopifyClient(original_shopify_client):  # type: ignore[misc, valid-type]
@@ -23237,7 +23348,19 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
             **request_options: Any,
         ) -> dict[str, Any]:
             shopify_wait_for_api_slot(getattr(self, "shop", "") or getattr(self, "name", "") or route, request_rate, request_burst)
-            return super()._request(method, url, json_body, **request_options)
+            uploading_image = bool(current_replacement and (json_body or {}).get("product", {}).get("images"))
+            try:
+                result = super()._request(method, url, json_body, **request_options)
+            except Exception as exc:
+                if uploading_image and re.search(r"image|attachment|media", str(exc), re.IGNORECASE):
+                    raise ReplacementImageSyncError(current_replacement["id"], current_replacement["replacement_asin"]) from exc
+                raise
+            if uploading_image and not any(
+                clean_text(image.get("src")) and not image.get("errors")
+                for image in (result.get("product") or {}).get("images", [])
+            ):
+                raise ReplacementImageSyncError(current_replacement["id"], current_replacement["replacement_asin"])
+            return result
 
     module.ShopifyClient = RateLimitedShopifyClient
     module.ODOO_URL = store.odoo_url
@@ -23266,6 +23389,7 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
     state = module.StateDB(route)
     odoo = module.OdooClient(store.odoo_url, store.odoo_db, store.odoo_user, store.odoo_password)
     odoo.connect()
+    odoo = shopify_replacement_export_client(odoo, int(job["store_id"]), str(job["odoo_order_name"]))
     shops = []
     for dest in module.DESTS:
         token = module.get_shopify_access_token(dest, state)
@@ -23280,6 +23404,7 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
             if active_existing:
                 fulfilled = [order for order in active_existing if shopify_order_is_fulfilled(order)]
                 keep = fulfilled[0] if fulfilled else active_existing[0]
+                sync_existing_shopify_replacement_images(module, odoo, shop, str(job["odoo_order_name"]), keep.get("id"), rename_manager)
                 state.mark_order_synced(shop.name, src_order_key, clean_text(keep.get("id")) or None)
                 upsert_shopify_order_status(int(job["store_id"]), route, shop.name, shop.shop, str(job["odoo_order_name"]), keep)
                 inventory_note = inventory_fulfilment_note_for_order(int(job["store_id"]), str(job["odoo_order_name"]))
@@ -23342,6 +23467,8 @@ def process_one_shopify_fulfilment_job(worker_name: str = "") -> bool:
         next_run = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
         next_status = "failed" if int(job["attempts"] or 0) < int(job["max_attempts"] or 5) else "dead"
         error_text = str(exc)[:2000]
+        if isinstance(exc, ReplacementImageSyncError):
+            next_status = "dead"
         with db() as conn:
             conn.execute(
                 """
@@ -23585,6 +23712,7 @@ def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str
         ).fetchall()
     result = rows_to_dicts(rows)
     for row in result:
+        row["image_sync_failure"] = image_failure_details(row.get("last_error") or "")
         row["odoo_order_url"] = odoo_order_admin_url({"odoo_url": row.get("odoo_url") or ""}, row.get("odoo_order_id")) if row.get("odoo_url") else ""
         shopify_order_id = clean_text(row.get("shopify_order_id"))
         shop = clean_text(row.get("shopify_shop"))
@@ -27535,21 +27663,78 @@ def api_process_replacement(payload: ProcessReplacementPayload) -> dict[str, Any
     return data
 
 
+def replacement_upload_image(value: str) -> dict[str, Any]:
+    try:
+        return validate_image_base64(value)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+
+def save_replacement_product_image(conn: Any, line_id: int, asin: str, image: dict[str, Any]) -> None:
+    conn.execute(
+        """INSERT INTO replacement_product_images
+           (order_line_id, asin, image_base64, content_type, width, height, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(order_line_id, asin) DO UPDATE SET
+             image_base64=excluded.image_base64, content_type=excluded.content_type,
+             width=excluded.width, height=excluded.height, updated_at=excluded.updated_at""",
+        (line_id, asin, image["image_base64"], image["content_type"], image["width"], image["height"], utc_now()),
+    )
+
+
+
+@app.post("/api/shopify/fulfilment/jobs/{job_id}/replacement-image")
+def api_shopify_replacement_image(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    image = replacement_upload_image(payload.get("image_base64"))
+    asin = normalize_asin(payload.get("asin"))
+    with db() as conn:
+        job = conn.execute("SELECT * FROM shopify_fulfilment_jobs WHERE id=? FOR UPDATE", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, "Shopify sync job not found.")
+        failure = image_failure_details(job["last_error"] or "")
+        if job["status"] not in {"failed", "dead"} or not failure or failure["asin"] != asin:
+            raise HTTPException(409, "This image failure has changed. Refresh Shopify Sync Jobs before uploading.")
+        row = conn.execute(
+            "SELECT * FROM order_lines WHERE id=? AND store_id=? AND odoo_order_name=? FOR UPDATE",
+            (failure["line_id"], job["store_id"], job["odoo_order_name"]),
+        ).fetchone()
+        if not row or row["replacement_asin"] != asin:
+            raise HTTPException(409, "The replacement ASIN has changed. Refresh the job before uploading.")
+        save_replacement_product_image(conn, failure["line_id"], asin, image)
+        conn.execute(
+            """UPDATE shopify_fulfilment_jobs SET status='amazon_placed', attempts=0,
+               next_run_at=?, last_error='', updated_at=? WHERE id=?""",
+            (utc_now(), utc_now(), job_id),
+        )
+    start_shopify_fulfilment_worker()
+    return {"ok": True, "message": f"Image saved for {asin} ({image['width']} × {image['height']}). Shopify sync queued for retry."}
+
+
+
 @app.post("/api/lines/{line_id}/replacement")
 def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[str, Any]:
     replacement_asin = normalize_asin(payload.asin)
     if not replacement_asin:
         raise HTTPException(400, "Replacement ASIN must be a valid 10-character ASIN.")
+    uploaded_image = replacement_upload_image(payload.image_base64) if payload.image_base64 is not None else None
     title = fetch_amazon_product_title(replacement_asin)
     with db() as conn:
-        row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, payload.store_id)).fetchone()
+        row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=? FOR UPDATE", (line_id, payload.store_id)).fetchone()
         if not row:
-            row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+            row = conn.execute("SELECT * FROM order_lines WHERE id=? FOR UPDATE", (line_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Order line not found.")
         effective_store_id = int(row["store_id"])
         if row["amazon_order_id"]:
             raise HTTPException(400, "Reset fulfilment before changing the ASIN on an already fulfilled line.")
+        if clean_text(row["chrome_claimed_by"] or "") or clean_text(row["amazon_status"] or "") in {"chrome_queued", "chrome_ordering", "chrome_submitting", "order_submitted", "submitted", "reporting_complete"}:
+            raise HTTPException(400, "Remove this order from the Chrome queue before changing its replacement.")
+        if float(row["inventory_allocated_quantity"] or 0) > 0:
+            raise HTTPException(400, "Release allocated inventory before changing its replacement.")
+        replacement_quantity = payload.quantity if payload.quantity is not None else float(row["quantity"] or 0)
+        if replacement_quantity <= 0 or not float(replacement_quantity).is_integer():
+            raise HTTPException(400, "Replacement quantity must be a positive whole number.")
         original_asin = row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"]
         replacement_name = title or f"Replacement ASIN {replacement_asin}"
         conn.execute(
@@ -27557,6 +27742,9 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
             UPDATE order_lines
             SET original_asin=COALESCE(NULLIF(original_asin, ''), asin),
                 original_product_name=COALESCE(NULLIF(original_product_name, ''), product_name),
+                original_quantity=COALESCE(original_quantity, quantity),
+                replacement_quantity=?,
+                quantity=?,
                 replacement_asin=?,
                 replacement_product_name=?,
                 replacement_note=?,
@@ -27572,6 +27760,8 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
             WHERE id=? AND store_id=?
             """,
             (
+                replacement_quantity,
+                replacement_quantity,
                 replacement_asin,
                 replacement_name,
                 clean_text(payload.note),
@@ -27583,6 +27773,8 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
                 effective_store_id,
             ),
         )
+        if uploaded_image:
+            save_replacement_product_image(conn, line_id, replacement_asin, uploaded_image)
         updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     try:
         store = get_store(effective_store_id)
@@ -27590,7 +27782,8 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
             "Replacement item assigned in fulfilment app.<br/>"
             f"Original ASIN: <a href=\"{asin_product_url(original_asin)}\" target=\"_blank\">{original_asin}</a><br/>"
             f"Replacement ASIN: <a href=\"{asin_product_url(replacement_asin)}\" target=\"_blank\">{replacement_asin}</a><br/>"
-            f"Replacement title: {html.escape(replacement_name)}"
+            f"Replacement title: {html.escape(replacement_name)}<br/>"
+            f"Quantity: {float(row['quantity']):g} → {replacement_quantity:g}"
         )
         if payload.note:
             note += f"<br/>Note: {html.escape(clean_text(payload.note))}"
@@ -27606,7 +27799,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
         with db() as conn:
             updated = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
     fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
-    message = f"Replacement {replacement_asin} assigned."
+    message = f"Replacement {replacement_asin} assigned, quantity {replacement_quantity:g}."
     if queued:
         message += f" {queue_message}"
     elif auto_chrome_ordering_enabled() and queue_message:
@@ -27638,12 +27831,16 @@ def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, An
         raise HTTPException(400, "Store is required.")
     now = utc_now()
     with db() as conn:
-        row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=?", (line_id, store_id)).fetchone()
+        row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=? FOR UPDATE", (line_id, store_id)).fetchone()
         if not row:
-            row = conn.execute("SELECT * FROM order_lines WHERE id=?", (line_id,)).fetchone()
+            row = conn.execute("SELECT * FROM order_lines WHERE id=? FOR UPDATE", (line_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Order line not found.")
         effective_store_id = int(row["store_id"])
+        if row["amazon_order_id"] or clean_text(row["chrome_claimed_by"] or "") or clean_text(row["amazon_status"] or "") in {"chrome_queued", "chrome_ordering", "chrome_submitting", "order_submitted", "submitted", "reporting_complete"}:
+            raise HTTPException(400, "Reset fulfilment and remove this order from the Chrome queue before resetting its replacement.")
+        if float(row["inventory_allocated_quantity"] or 0) > 0:
+            raise HTTPException(400, "Release allocated inventory before resetting its replacement.")
         original_asin = normalize_asin(row["original_asin"] if "original_asin" in row.keys() and row["original_asin"] else row["asin"])
         if not original_asin:
             raise HTTPException(400, "Could not find the original ASIN for this line.")
@@ -27653,6 +27850,9 @@ def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, An
             UPDATE order_lines
             SET asin=?,
                 product_name=?,
+                quantity=COALESCE(original_quantity, quantity),
+                original_quantity=NULL,
+                replacement_quantity=NULL,
                 replacement_asin=NULL,
                 replacement_product_name=NULL,
                 replacement_note=NULL,
@@ -28896,7 +29096,7 @@ def api_shopify_fulfilment_retry(job_id: str) -> dict[str, Any]:
     start_shopify_fulfilment_worker()
     return {
         "ok": True,
-        "message": f"Started sync for {cursor.rowcount} Shopify fulfilment job(s).",
+        "message": f"Started sync for {cursor.rowcount} Shopify fulfilment job(s). Replacement images will be retried from Amazon unless a manual image is saved.",
         "progress": shopify_fulfilment_progress(),
     }
 

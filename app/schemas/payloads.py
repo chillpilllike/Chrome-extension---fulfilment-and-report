@@ -368,6 +368,8 @@ class ReplacementPayload(BaseModel):
     store_id: int
     asin: str
     note: str = ""
+    quantity: Optional[int] = Field(default=None, strict=True, gt=0)
+    image_base64: Optional[str] = Field(default=None, max_length=16777216)
 
 
 class ProcessReplacementPayload(BaseModel):

@@ -1704,6 +1704,7 @@ type PullJob = {
 }
 
 type ShopifyFulfilmentJob = {
+  image_sync_failure?: { line_id: number; asin: string } | null
   id: string
   store_name: string
   odoo_order_name: string
@@ -14687,6 +14688,51 @@ function PullJobsPage({ onResult }: { onResult: (modal: ModalState) => void }) {
   )
 }
 
+async function replacementImageBase64(file: File): Promise<string> {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type) || file.size > 12 * 1024 * 1024) {
+    throw new Error("Choose a JPEG, PNG, or WebP image no larger than 12 MB.")
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "")
+    reader.onerror = () => reject(new Error("Could not read the selected image."))
+    reader.readAsDataURL(file)
+  })
+}
+
+function ReplacementImagePicker({ file, onChange, disabled = false }: { file: File | null; onChange: (file: File | null) => void; disabled?: boolean }) {
+  const [preview, setPreview] = useState("")
+  useEffect(() => {
+    if (!file) { setPreview(""); return }
+    const url = URL.createObjectURL(file)
+    setPreview(url)
+    return () => URL.revokeObjectURL(url)
+  }, [file])
+  return (
+    <div className="grid gap-2">
+      <label className="grid gap-2 text-sm">
+        Replacement ASIN image (optional)
+        <Input type="file" accept="image/jpeg,image/png,image/webp" disabled={disabled} onChange={(event) => onChange(event.target.files?.[0] || null)} />
+      </label>
+      <p className="text-xs text-muted-foreground">JPEG, PNG, or WebP · up to 12 MB / 25 megapixels. Use a high-resolution image; uploaded resolution is preserved.</p>
+      {preview && <img src={preview} alt="Selected replacement ASIN image" className="size-28 rounded border object-contain" />}
+      {file && <p className="text-xs">Selected: {file.name}. This image will be used instead of Amazon’s image.</p>}
+    </div>
+  )
+}
+
+function ReplacementImageRecovery({ asin, disabled, onUpload }: { asin: string; disabled: boolean; onUpload: (file: File) => Promise<void> }) {
+  const [file, setFile] = useState<File | null>(null)
+  return (
+    <div className="grid min-w-[260px] gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3" role="alert">
+      <strong className="text-sm text-destructive">Image sync failed — upload manually</strong>
+      <span className="font-mono text-xs">Replacement ASIN: {asin}</span>
+      <ReplacementImagePicker file={file} onChange={setFile} disabled={disabled} />
+      <Button size="sm" disabled={!file || disabled} onClick={() => file && onUpload(file)}>Upload image &amp; retry</Button>
+    </div>
+  )
+}
+
 function ReplacementDialog({
   line,
   storeId,
@@ -14700,11 +14746,18 @@ function ReplacementDialog({
   onSaved: (message: string, row?: OrderLine) => Promise<void>
   onResult: (modal: ModalState) => void
 }) {
+  const [imageFile, setImageFile] = useState<File | null>(null)
   const [asin, setAsin] = useState("")
+  const [changeQuantity, setChangeQuantity] = useState(false)
+  const [quantity, setQuantity] = useState(String(line.quantity))
+  const validQuantity = Number.isSafeInteger(Number(quantity)) && Number(quantity) > 0
   const [note, setNote] = useState("")
   const [saving, setSaving] = useState(false)
   const [resetting, setResetting] = useState(false)
   useEffect(() => {
+    setImageFile(null)
+    setChangeQuantity(false)
+    setQuantity(String(line.quantity))
     setAsin(line.replacement_asin || "")
     setNote(line.replacement_note || "")
   }, [line])
@@ -14717,6 +14770,14 @@ function ReplacementDialog({
         </DialogHeader>
         <div className="form-fieldset grid gap-3">
           <TextField label="Replacement ASIN" value={asin} onChange={(value) => setAsin(value.toUpperCase())} />
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={changeQuantity} onCheckedChange={(checked) => setChangeQuantity(Boolean(checked))} />
+            Change quantity too? (current: {line.quantity})
+          </label>
+          {changeQuantity && <TextField label="New quantity (number of packs/units)" value={quantity} onChange={setQuantity} type="number" />}
+          {changeQuantity && !validQuantity && <p className="text-sm text-destructive">Enter a positive whole number.</p>}
+          <p className="text-sm text-muted-foreground">Example: replace 1 × 400-count pack with 2 × 200-count packs. The new Shopify DTC/DTB order will use the replacement ASIN, its image, and the selected quantity.</p>
+          <ReplacementImagePicker file={imageFile} onChange={setImageFile} disabled={saving || resetting} />
           <TextField label="Internal note" value={note} onChange={setNote} />
         </div>
         <DialogFooter className="gap-2 sm:justify-between">
@@ -14744,13 +14805,13 @@ function ReplacementDialog({
           <div className="flex gap-2">
           <Button variant="outline" disabled={saving || resetting} onClick={onClose}>Cancel</Button>
           <Button
-            disabled={saving || resetting}
+            disabled={saving || resetting || (changeQuantity && !validQuantity)}
             onClick={async () => {
               try {
                 setSaving(true)
                 const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement`, {
                   method: "POST",
-                  body: JSON.stringify({ store_id: storeId, asin, note }),
+                  body: JSON.stringify({ store_id: storeId, asin, note, ...(changeQuantity ? { quantity: Number(quantity) } : {}), ...(imageFile ? { image_base64: await replacementImageBase64(imageFile) } : {}) }),
                 })
                 await onSaved(result.message, result.row)
               } catch (error) {
@@ -15367,6 +15428,23 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
       setBusy("")
     }
   }
+  async function uploadReplacementImage(job: ShopifyFulfilmentJob, file: File) {
+    setBusy(`Image-${job.id}`)
+    try {
+      const image_base64 = await replacementImageBase64(file)
+      const result = await api<{ ok: boolean; message: string }>(`/api/shopify/fulfilment/jobs/${job.id}/replacement-image`, {
+        method: "POST",
+        body: JSON.stringify({ asin: job.image_sync_failure?.asin, image_base64 }),
+      })
+      await load()
+      onResult({ ok: result.ok, title: "Replacement Image", message: result.message })
+    } catch (error) {
+      onResult({ ok: false, title: "Image Upload Failed", message: String(error) })
+    } finally {
+      setBusy("")
+    }
+  }
+
   async function retryJob(jobId: string) {
     setBusy(`Retry-${jobId}`)
     setProgress({
@@ -15961,12 +16039,16 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                   </TableCell>
                   <TableCell>{job.attempts}/{job.max_attempts}</TableCell>
                   <TableCell>{formatDateTime(job.updated_at || job.created_at)}</TableCell>
-                  <TableCell className="max-w-md"><ErrorTooltip value={job.last_error} /></TableCell>
+                  <TableCell className="max-w-md">
+                    {job.image_sync_failure ? (
+                      <ReplacementImageRecovery asin={job.image_sync_failure.asin} disabled={Boolean(busy) || !["failed", "dead"].includes(job.status)} onUpload={(file) => uploadReplacementImage(job, file)} />
+                    ) : <ErrorTooltip value={job.last_error} />}
+                  </TableCell>
                   <TableCell>
                     <div className="flex flex-wrap gap-2">
                       {["amazon_placed", "queued", "failed", "dead"].includes(job.status) ? (
                         <Button size="sm" variant="outline" disabled={Boolean(busy)} onClick={() => retryJob(job.id)}>
-                          {busy === `Retry-${job.id}` ? "Syncing..." : ["amazon_placed", "queued"].includes(job.status) ? "Sync Now" : "Retry"}
+                          {busy === `Retry-${job.id}` ? "Syncing..." : job.image_sync_failure ? "Retry image sync" : ["amazon_placed", "queued"].includes(job.status) ? "Sync Now" : "Retry"}
                         </Button>
                       ) : null}
                       {job.shopify_order_id && ["completed", "failed", "dead"].includes(job.status) ? (
