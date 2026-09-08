@@ -45,9 +45,9 @@ export function LineAlternativeButton({ lineId, name, request }: { lineId: numbe
       <DialogHeader><DialogTitle>Alternatives for this line</DialogTitle><DialogDescription>{name} · line {lineId}</DialogDescription></DialogHeader>
       <label className="text-sm font-medium" htmlFor={`alternative-refs-${lineId}`}>Odoo Internal References, in recommendation order</label>
       <textarea id={`alternative-refs-${lineId}`} className="min-h-32 w-full rounded-md border p-3 text-sm" value={references} onChange={event => setReferences(event.target.value)} placeholder="One reference per line" disabled={busy || !caseId}/>
-      <p className="text-sm text-muted-foreground">Exact references are matched on this order’s store. These products appear under “Best alternatives”. The email is sent only after every affected line has recommendations. In test mode, it goes only to the test recipient.</p>
+      <p className="text-sm text-muted-foreground">Exact references are matched on this order’s store. After every affected line has recommendations, an email is prepared in the approval queue. It is not sent until the team approves it.</p>
       <label className="flex items-start gap-2 text-sm"><Checkbox checked={checked} onCheckedChange={value => setChecked(value === true)}/>I checked third-party and manual fulfilment; this item still needs a customer choice.</label>
-      <Button disabled={busy || !checked || !references.trim() || !caseId} onClick={() => void save()}>{busy ? 'Checking…' : 'Save alternatives & notify customer'}</Button>
+      <Button disabled={busy || !checked || !references.trim() || !caseId} onClick={() => void save()}>{busy ? 'Checking…' : 'Save alternatives & prepare email'}</Button>
       {message && <p role="status" className="text-sm whitespace-pre-wrap">{message}</p>}
     </DialogContent></Dialog>
   </>
@@ -104,6 +104,14 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
         <p className="text-muted-foreground">Best alternatives: {offer.recommendations.map(p => p.name).join(', ')}</p>
         {offer.selection && <><p className="mt-2 font-medium">{offer.selection.product.name} · {offer.selection.status.replaceAll('_',' ')}</p>
           <p>Selection deadline: {date(offer.selection.deadline_at)}</p>
+          {offer.selection.product.difference != null && ['choosing','needs_review','waiting_payment','waiting_refund'].includes(offer.selection.status) && <Button size="sm" variant="outline" disabled={loading || new Date(offer.selection.deadline_at).getTime()>Date.now()} onClick={async () => {
+            const selection=offer.selection!
+            if(!window.confirm(`Approve processing ${orderNumber}, line ${offer.line_id}, ${selection.product.name}, difference ${selection.product.currency} ${selection.product.difference}? Any payment email requires a separate send approval. Refund execution requires recorded refund approval.`))return
+            setLoading(true);try {
+              const result=await request<{message:string}>(`/api/after-order/cases/${caseId}/lines/${offer.line_id}/approve-processing`,{method:'POST',body:JSON.stringify({version:selection.version,confirm_amount:selection.product.difference})})
+              setNotice(result.message);await load()
+            }catch(error){setError(String(error))}finally{setLoading(false)}
+          }}>Approve processing / recheck payment</Button>}
           <p>Original paid line: {offer.selection.product.currency} {offer.selection.product.original_total?.toFixed(2) ?? 'Needs review'} · Replacement: {offer.selection.product.alternative_total?.toFixed(2) ?? 'Needs review'}</p>
           {offer.selection.product.difference != null ? <p className="font-medium">{offer.selection.product.difference < 0 ? 'Refund difference' : 'Additional payment'}: {offer.selection.product.currency} {Math.abs(offer.selection.product.difference).toFixed(2)}{offer.selection.refund_status && ` · ${offer.selection.refund_status.replaceAll('_',' ')}`}</p> : <p className="text-amber-800">Price needs review: {offer.selection.product.pricing_error}</p>}
           {offer.selection.result.quote_name && <p>Quotation {offer.selection.result.quote_name} · email {offer.selection.result.email_status || 'not verified'}</p>}
@@ -125,6 +133,11 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
           {offer.selection.last_error && <p className="text-destructive">{offer.selection.last_error}</p>}
         </>}
       </section>)}
+      {(offers.some(o=>o.selection?.status==='ready_to_release') || requests.removals.some(r=>r.status==='finance_review')) && <Button variant="outline" disabled={loading} onClick={async()=>{
+        if(!window.confirm(`Approve release of the reviewed selections for ${orderNumber}? Current payment, refund and all-line checks still apply.`))return
+        const versions=Object.fromEntries([...offers.filter(o=>o.selection).map(o=>[o.line_id,o.selection!.version]),...requests.removals.filter(r=>r.status!=='withdrawn').map(r=>[r.line_id,r.version])])
+        setLoading(true);try {const result=await request<{message:string}>(`/api/after-order/cases/${caseId}/approve-release`,{method:'POST',body:JSON.stringify({versions})});setNotice(result.message);await load()}catch(error){setError(String(error))}finally{setLoading(false)}
+      }}>Approve reviewed replacement release</Button>}
       {loading && <p role="status">Loading timeline…</p>}{error && <p role="alert" className="text-destructive">{error}</p>}
       <Dialog open={!!costOffer} onOpenChange={open => {if(!loading && !open)setCostOffer(null)}}><DialogContent>
         <DialogHeader><DialogTitle>Accept replacement extra cost</DialogTitle><DialogDescription>{orderNumber} · line {costOffer?.line_id} · {costOffer?.selection?.product.name}. The business absorbs this extra cost; no additional payment is requested. The 24-hour selection window stays unchanged.</DialogDescription></DialogHeader>

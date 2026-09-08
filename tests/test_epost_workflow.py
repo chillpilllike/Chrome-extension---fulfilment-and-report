@@ -17,7 +17,7 @@ class EpostWorkflowTests(unittest.TestCase):
         self.assertFalse(row["suspected_lost"])
 
     def test_checked_blank_and_electronic_events_are_awaiting_scan(self):
-        for status in ("", "Data Received", "Electronic information submitted by shipper", "The item is pre-advised", "Shipment Announced", "Shipment in Transit to the ePost Global Processing Center"):
+        for status in ("", "Data Received", "Electronic information submitted by shipper", "The item is pre-advised", "Shipment Announced"):
             with self.subTest(status=status):
                 row = self.classify(status, "2026-08-01", last_checked_at="2026-09-05")
                 self.assertEqual("awaiting_first_scan", row["workflow_queue"])

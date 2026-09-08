@@ -72,6 +72,15 @@ class CostAcceptance(RefundApproval):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class ProcessingApproval(BaseModel):
+    version: int = Field(ge=1)
+    confirm_amount: float = Field(allow_inf_nan=False)
+
+
+class ReleaseApproval(BaseModel):
+    versions: dict[int, int]
+
+
 class Runtime:
     def __init__(self, namespace):
         self.namespace = namespace
@@ -191,7 +200,7 @@ class Workflow:
         if not mail.get('id'):
             return
         r = self.r
-        status = {'outgoing':'sending','sent':'sent','exception':'failed','cancel':'failed'}.get(mail['state'],'delivery_unknown')
+        status = {'outgoing':'sending','sent':'sent','exception':'failed','cancel':'awaiting_approval'}.get(mail['state'],'delivery_unknown')
         key = f"odoo-quote:{case['store_id']}:{result['quote_id']}"
         conn.execute('''INSERT INTO after_order_messages
             (case_id,provider,recipient,sender,subject,html_preview,status,idempotency_key,provider_message_id,
@@ -201,12 +210,20 @@ class Workflow:
             (case['id'],mail['recipient'],mail['sender'],mail['subject'],status,key,str(mail['id']),r.utc_now(),r.utc_now(),
              r.request_fingerprint(case),json.dumps([item for item in case['affected_items'] if item['line_id']==line_id]),mail.get('error') or None))
         message = conn.execute('SELECT id,attempt_count FROM after_order_messages WHERE idempotency_key=?',(key,)).fetchone()
+        if mail.get('approval_digest') and 'html' in mail:
+            conn.execute('UPDATE after_order_messages SET html_preview=?,payload_json=? WHERE id=?',
+                (mail['html'], json.dumps({'odoo_approval_digest':mail['approval_digest'],'quote_id':result['quote_id']}),message['id']))
+        if status == 'awaiting_approval':
+            conn.execute('UPDATE after_order_messages SET attempt_count=0 WHERE id=?',(message['id'],))
+            return
         conn.execute('''INSERT INTO after_order_email_attempts
             (message_id,attempt_number,status,error,provider_message_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(message_id,attempt_number) DO UPDATE SET status=excluded.status,error=excluded.error,updated_at=excluded.updated_at''',
             (message['id'],message['attempt_count'],status,mail.get('error') or None,str(mail['id']),r.utc_now(),r.utc_now()))
 
-    def retry_quote_email(self, message):
+    def retry_quote_email(self, message, approval_digest=''):
+        if not approval_digest:
+            raise HTTPException(409, 'Review and approve the saved quotation email before sending.')
         r = self.r
         if r.after_order_email_test_mode():
             raise HTTPException(409,'Odoo quotation emails cannot be retried in test mode.')
@@ -221,17 +238,26 @@ class Workflow:
         with r.db() as conn:
             conn.execute('SELECT id FROM after_order_cases WHERE id=? FOR UPDATE',(case['id'],)).fetchone()
             latest = conn.execute('SELECT * FROM after_order_messages WHERE id=? FOR UPDATE',(message['id'],)).fetchone()
-            if latest['status'] != 'failed' or latest['attempt_count'] >= 5:
+            if (latest['status'] not in ('awaiting_approval','failed') or latest['attempt_count'] >= 5
+                    or hashlib.sha256(str(latest['payload_json']).encode()).hexdigest() != approval_digest):
                 raise HTTPException(409,'Only a failed quotation email with fewer than five attempts may be retried.')
             row = next((offer for offer in self.rows(case['id'],False) if
                 str((offer.get('selection') or {}).get('result',{}).get('mail',{}).get('id')) == str(message['provider_message_id'])),None)
             if not row or row['selection']['status'] != 'waiting_payment' or case.get('current_decision') != 'offer_alternatives':
                 raise HTTPException(409,'The quotation is no longer awaiting payment for this customer choice.')
+            attempt=int(latest['attempt_count'] or 0)+1
+            conn.execute("INSERT INTO after_order_email_attempts(message_id,attempt_number,status,created_at,updated_at) VALUES(?,?,'sending',?,?)",
+                (message['id'],attempt,r.utc_now(),r.utc_now()))
+            self.event(conn,case,'quotation_email_send_approved',row['line_id'],actor='team',message_id=message['id'],attempt=attempt,approval_digest=approval_digest)
             try:
                 r.OdooClient(r.get_store(case['store_id'])).execute('sale.order','after_order_retry_quote_email',
-                    [[case['odoo_order_id']],row['selection']['result']['quote_id']])
+                    [[case['odoo_order_id']],row['selection']['result']['quote_id'],json.loads(latest['payload_json'])['odoo_approval_digest']])
             except Exception as exc:
-                raise HTTPException(409,r.clean_error_message(exc)) from exc
+                error=r.clean_error_message(exc)
+                conn.execute("UPDATE after_order_messages SET status='delivery_unknown',attempt_count=?,last_error=?,updated_at=? WHERE id=?",(attempt,error,r.utc_now(),message['id']))
+                conn.execute("UPDATE after_order_email_attempts SET status='delivery_unknown',error=?,updated_at=? WHERE message_id=? AND attempt_number=?",(error,r.utc_now(),message['id'],attempt))
+                self.event(conn,case,'quotation_email_needs_reconciliation',row['line_id'],actor='team',message_id=message['id'],error=error)
+                return {'ok':False,'message':'Approval outcome is uncertain. Check Odoo before attempting another send.'}
             conn.execute("UPDATE after_order_messages SET status='retrying',attempt_count=attempt_count+1,updated_at=? WHERE id=?",(r.utc_now(),message['id']))
             self.event(conn,case,'quotation_email_retry_queued',row['line_id'],actor='team',message_id=message['id'])
         return {'ok':True,'message':'Odoo quotation email retry queued. Its mail worker will send it.'}
@@ -289,19 +315,26 @@ class Workflow:
                 deadline_at=change['deadline_at'], difference=product.get('difference'), currency=product['currency'],pricing_error=product.get('pricing_error'))
         return True, case, ('Test selection saved. No Odoo order, payment or fulfilment changes. ' if test_mode else '') + 'Your selection is saved. You can change it until ' + change['deadline_at'] + '.'
 
-    def process(self, case_id, line_id):
+    def process(self, case_id, line_id, approval=None):
         r = self.r
         if r.after_order_email_test_mode():
             return {'status': 'test_mode', 'message': 'No financial or fulfilment actions in test mode.'}
+        # Approval-only rollout: expiry is not financial authorization.
+        # Keep the selection intact for manual review. The guarded Odoo
+        # quotation/release integration must be completed before lifting this.
+        if approval is None:
+            return {'status': 'needs_approval', 'message': 'Team approval required. No quotation, refund or replacement was executed.'}
         # Hold a cross-worker lock throughout this bounded operation. Odoo commits
         # independently; its unique operation key makes a lost RPC response safe.
         with r.db() as conn:
             conn.execute('SELECT id FROM after_order_cases WHERE id=? FOR UPDATE', (case_id,)).fetchone()
             row = conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=0 FOR UPDATE', (case_id,line_id)).fetchone()
-            if not row or row['status'] not in ('choosing','waiting_payment','waiting_refund','processing'):
+            if not row or row['status'] not in ('choosing','waiting_payment','waiting_refund','processing','needs_review'):
                 return
+            if row['version'] != approval.version or Decimal(str(json.loads(row['product_json']).get('difference'))) != Decimal(str(approval.confirm_amount)):
+                raise HTTPException(409, 'Selection or amount changed. Review again before approval.')
             if moment(row['deadline_at']) > datetime.now(timezone.utc):
-                return
+                raise HTTPException(409, 'The 24-hour customer selection window is still open.')
             case = r.after_order_case_by_id(case_id)
             try:
                 case, line = self.case_line(case_id, line_id)
@@ -315,6 +348,7 @@ class Workflow:
                     raise ValueError(product.get('pricing_error') or current['pricing_error'])
                 if price_fingerprint(current) != price_fingerprint(product):
                     raise ValueError('The product price or paid amount changed after selection. Team review required.')
+                self.event(conn,case,'replacement_processing_approved',line_id,actor='team',version=row['version'],difference=product['difference'])
                 asin = resolved_asin(current,r.extract_asin_from_notes,r.decode_asin_reference,r.normalize_asin)
                 odoo = r.OdooClient(r.get_store(case['store_id']))
                 if r.after_order_email_test_mode():
@@ -332,7 +366,7 @@ class Workflow:
                     raise ValueError('Payment email recipient is suppressed. Team review required before creating a quotation.')
                 result = odoo.execute('sale.order','after_order_process_alternative', [[case['odoo_order_id']],
                     int(line['odoo_line_id']),int(case['website_id']), product['product_id'],
-                    f'care:{case_id}:line:{line_id}:v:{row["version"]}',row['deadline_at'],product['pricing_signature']])
+                    f'care:{case_id}:line:{line_id}:v:{row["version"]}',row['deadline_at'],product['pricing_signature'],True])
                 self.log_quote_email(conn,case,line_id,result)
                 previous_result = json.loads(row['result_json'])
                 status = result['status']
@@ -394,8 +428,10 @@ class Workflow:
                 # Unknown delivery is not a confirmed failure and cannot trigger a resend.
                 continue
 
-    def release(self, case_id):
+    def release(self, case_id, approval=None):
         r = self.r
+        if approval is None:
+            return {'status': 'needs_approval', 'message': 'Automatic replacement release is held for team review.'}
         if r.after_order_email_test_mode():
             return
         with r.db() as conn:
@@ -405,6 +441,8 @@ class Workflow:
                 return
             selections = [dict(row) for row in conn.execute("SELECT * FROM after_order_line_selections WHERE case_id=? AND test_mode=0 AND status!='withdrawn'",(case_id,)).fetchall()]
             removals = [dict(row) for row in conn.execute("SELECT * FROM after_order_line_removals WHERE case_id=? AND test_mode=0 AND status!='withdrawn'",(case_id,)).fetchall()] if hasattr(r,'care_requests') else []
+            if {s['line_id']:s['version'] for s in selections+removals} != approval.versions:
+                raise HTTPException(409, 'Order selections changed. Review all lines again before release.')
             affected = {int(item['line_id']) for item in case['affected_items']}
             if not affected or ({s['line_id'] for s in selections} | {s['line_id'] for s in removals}) != affected or any(s['status'] != 'ready_to_release' for s in selections) or any(s['status'] not in ('auto_remove_pending','finance_review') for s in removals):
                 return
@@ -433,7 +471,7 @@ class Workflow:
                             return
                     verified = r.OdooClient(r.get_store(case['store_id'])).execute('sale.order','after_order_process_alternative',
                         [[case['odoo_order_id']],int(line['odoo_line_id']),int(case['website_id']),product['product_id'],
-                         f'care:{case_id}:line:{selection["line_id"]}:v:{selection["version"]}',selection['deadline_at'],product['pricing_signature']])
+                         f'care:{case_id}:line:{selection["line_id"]}:v:{selection["version"]}',selection['deadline_at'],product['pricing_signature'],True])
                     if verified['status'] != 'ready':
                         conn.execute("UPDATE after_order_line_selections SET status='waiting_payment',result_json=? WHERE case_id=? AND line_id=? AND test_mode=0",(json.dumps(verified),case_id,selection['line_id']))
                         return
@@ -494,6 +532,16 @@ class Workflow:
     def router(self):
         # Financial approvals use the app's existing authenticated admin middleware.
         router = APIRouter()
+
+        @router.post('/api/after-order/cases/{case_id}/lines/{line_id}/approve-processing')
+        def approve_processing(case_id: int, line_id: int, payload: ProcessingApproval):
+            result = self.process(case_id,line_id,approval=payload)
+            return {'ok':True,'message': (result or {}).get('message') or 'Processing reviewed. Check the line status and email approval queue.', 'rows':self.rows(case_id)}
+
+        @router.post('/api/after-order/cases/{case_id}/approve-release')
+        def approve_release(case_id: int, payload: ReleaseApproval):
+            self.release(case_id,approval=payload)
+            return {'ok':True,'message':'Release checks completed. Only eligible, unchanged lines can be released; check the timeline.', 'rows':self.rows(case_id)}
 
         @router.post('/api/after-order/cases/{case_id}/lines/{line_id}/accept-replacement-cost')
         def accept_cost(case_id: int, line_id: int, payload: CostAcceptance):

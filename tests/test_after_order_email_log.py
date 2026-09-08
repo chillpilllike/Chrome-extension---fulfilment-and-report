@@ -1,6 +1,7 @@
 """Offline email log/retry tests: providers are fake and the DB is in-memory."""
 import ast
 import json
+import hashlib
 import sqlite3
 import unittest
 from contextlib import contextmanager
@@ -75,7 +76,7 @@ class LogHandlersTests(unittest.TestCase):
                 self.status_code, self.detail = code, detail
         self.HTTPError = HTTPError
         self.provider = Mock(send=Mock(return_value={"id":"provider-demo"}))
-        self.scope = {"Any":Any,"Optional":Optional,"Request":object,"db":db,"json":json,"requests":requests,
+        self.scope = {"hashlib":hashlib,"Any":Any,"Optional":Optional,"Request":object,"db":db,"json":json,"requests":requests,
             "care_delivery":Mock(suppressed=Mock(return_value='')),
             "datetime":datetime,"timedelta":timedelta,"timezone":timezone,"HTTPException":HTTPError,
             "row_to_dict":lambda row: dict(row) if row else None,"rows_to_dicts":lambda rows:[dict(row) for row in rows],
@@ -96,6 +97,10 @@ class LogHandlersTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
+    def approve(self):
+        payload = self.conn.execute('SELECT payload_json FROM after_order_messages WHERE id=1').fetchone()[0]
+        return self.scope['retry_after_order_email'](1,object(),approval_digest=hashlib.sha256(payload.encode()).hexdigest())
+
     def test_list_filters_and_detail_enforce_store_scope_without_payload_leak(self):
         result=self.scope["api_after_order_email_log"](store_id=1,status="failed")
         self.assertEqual(1,result["total"])
@@ -110,8 +115,17 @@ class LogHandlersTests(unittest.TestCase):
         with self.assertRaises(self.HTTPError):
             self.scope["api_after_order_email_log"](date_from="not-a-date")
 
+    def test_prepared_email_first_approval_and_stale_digest(self):
+        self.conn.execute("UPDATE after_order_messages SET status='awaiting_approval',attempt_count=0 WHERE id=1")
+        with self.assertRaises(self.HTTPError):
+            self.scope['retry_after_order_email'](1,object(),approval_digest='stale')
+        self.provider.send.assert_not_called()
+        self.assertEqual('sent_test',self.approve()['status'])
+        self.assertEqual(1,self.conn.execute('SELECT attempt_count FROM after_order_messages WHERE id=1').fetchone()[0])
+        self.provider.send.assert_called_once()
+
     def test_retry_uses_saved_payload_and_records_attempt_without_duplicate_send(self):
-        response=self.scope["api_after_order_email_retry"](1,object())
+        response=self.approve()
         self.assertTrue(response["ok"])
         self.assertEqual("sent_test",response["status"])
         self.assertEqual(["test@example.test"],self.provider.send.call_args.args[0]["to"])
@@ -123,14 +137,14 @@ class LogHandlersTests(unittest.TestCase):
 
     def test_timeout_marks_uncertain_and_disables_retry(self):
         self.provider.send.side_effect=requests.Timeout("Test timeout")
-        self.assertEqual("delivery_unknown",self.scope["api_after_order_email_retry"](1,object())["status"])
+        self.assertEqual("delivery_unknown",self.approve()["status"])
         with self.assertRaises(self.HTTPError):
             self.scope["api_after_order_email_retry"](1,object())
         self.provider.send.assert_called_once()
 
     def test_rejection_remains_failed_and_preserves_error(self):
         self.provider.send.side_effect=EmailRejected("Invalid sender")
-        self.assertEqual("failed",self.scope["api_after_order_email_retry"](1,object())["status"])
+        self.assertEqual("failed",self.approve()["status"])
         self.assertEqual("Invalid sender",self.conn.execute("SELECT error FROM after_order_email_attempts").fetchone()[0])
 
     def test_live_email_in_test_mode_never_reaches_provider(self):
@@ -139,7 +153,7 @@ class LogHandlersTests(unittest.TestCase):
             self.scope["api_after_order_email_retry"](1,object())
         self.provider.send.assert_not_called()
 
-    def test_automatic_timeout_recovery_reuses_key_and_respects_hour(self):
+    def test_automatic_timeout_recovery_is_held_for_team_review(self):
         self.scope.update(after_order_email_test_mode=lambda:False,
             hydrate_after_order_recipient_and_domain=lambda c,**kw:{**c,'customer_email':'test@example.test'},
             request_fingerprint=lambda c:'snapshot',after_order_tracking_is_current=lambda c:True,
@@ -147,14 +161,9 @@ class LogHandlersTests(unittest.TestCase):
         old=(datetime.now(timezone.utc)-timedelta(hours=2)).isoformat()
         self.conn.execute("UPDATE after_order_messages SET test_mode=0,status='delivery_unknown',created_at=?,updated_at=? WHERE id=1",(old,old))
         self.provider.send.side_effect=requests.Timeout('timeout')
-        self.scope['retry_after_order_email'](1,object(),automatic=True)
-        self.assertEqual('secret-link-key',self.provider.send.call_args.kwargs['idempotency_key'])
         with self.assertRaises(self.HTTPError):
             self.scope['retry_after_order_email'](1,object(),automatic=True)
-        self.conn.execute('UPDATE after_order_messages SET updated_at=? WHERE id=1',(old,))
-        self.provider.send.side_effect=None
-        self.scope['retry_after_order_email'](1,object(),automatic=True)
-        self.assertEqual('secret-link-key',self.provider.send.call_args.kwargs['idempotency_key'])
+        self.provider.send.assert_not_called()
 
     def test_automatic_retry_policy_limits_and_test_guard(self):
         from app.services.email_log import automatic_retry_reason

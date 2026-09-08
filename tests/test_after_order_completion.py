@@ -234,8 +234,19 @@ class CompletionDB(unittest.TestCase):
         self.conn.commit()
         workflow.release(1)
         for row in self.conn.execute('SELECT * FROM order_lines'):
-            self.assertEqual(row['state'],'pulled');self.assertEqual(row['asin'],'B0000000'+str(row['id']))
-        queue.assert_called_once();workflow.release(1);queue.assert_called_once()
+            self.assertEqual(row['state'],'missing')
+        # Payment alone is no longer authorization to release a replacement.
+        queue.assert_not_called();workflow.release(1);queue.assert_not_called()
+        from app.services.alternative_workflow import ReleaseApproval
+        with self.assertRaises(Exception):
+            workflow.release(1,approval=ReleaseApproval(versions={11:2,12:1}))
+        queue.assert_not_called()
+        workflow.release(1,approval=ReleaseApproval(versions={11:1,12:1}))
+        for row in self.conn.execute('SELECT * FROM order_lines'):
+            self.assertEqual(row['state'],'pulled')
+        queue.assert_called_once()
+        workflow.release(1,approval=ReleaseApproval(versions={11:1,12:1}))
+        queue.assert_called_once()
 
 
 class RecommendationEmailTests(unittest.TestCase):

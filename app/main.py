@@ -37795,16 +37795,23 @@ def after_order_test_recipient() -> str:
 
 
 def after_order_cutoff_date() -> str:
+    # Fixed rollout floor, not a rolling 'today' filter. Settings may only
+    # narrow eligibility further; old environment values cannot widen it.
+    rollout_floor = "2026-09-09"
     value = clean_text(get_service_settings().get("after_order_cutoff_date"))[:10]
     try:
         datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
-        return "2026-08-01"
-    return value
+        return rollout_floor
+    return max(value, rollout_floor)
 
 
 def after_order_case_is_in_scope(case: dict[str, Any]) -> bool:
     order_date = clean_text(case.get("odoo_order_date"))[:10]
+    try:
+        datetime.strptime(order_date, "%Y-%m-%d")
+    except ValueError:
+        return False
     return bool(order_date and order_date >= after_order_cutoff_date())
 
 
@@ -38845,6 +38852,8 @@ def send_after_order_email(
         # ambiguous timeout/crash remains visible and is never blindly resent.
         if unavailable_email and email_case['context'].get('three_day_policy_enabled'):
             message_payload['_care_policy'] = 'three-day-v1'
+        if unavailable_email:
+            message_payload['_care_recommendations_revision'] = alternative_workflow.notification_revision(case)
         if reminder_source:
             message_payload['_care_reminder_parent'] = reminder_parent
             message_payload['_care_reminder_number'] = reminder_number
@@ -38857,14 +38866,17 @@ def send_after_order_email(
             reserved = conn.execute(
                 """INSERT INTO after_order_messages
                    (case_id, provider, recipient, sender, subject, html_preview, status, idempotency_key, payload_json, created_at, updated_at, test_mode, request_fingerprint, template_kind, related_items_json)
-                   VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(idempotency_key) DO NOTHING RETURNING id""",
                 (case_id, provider_name, recipient, sender, subject, html_body, idempotency_key, json.dumps(message_payload), now, now, 1 if test_mode else 0, request_fingerprint(case), showcase_kind or template_kind or case.get("case_type"), json.dumps(case['affected_items'])),
             )
             reservation = reserved.fetchone()
             if not reservation:
                 return {"ok": True, "message": "This notification was already sent or reserved; no duplicate was sent.", "deduplicated": True}
-            conn.execute("INSERT INTO after_order_email_attempts (message_id, attempt_number, status, created_at, updated_at) VALUES (?, 1, 'sending', ?, ?)", (reservation["id"], now, now))
+            conn.execute("UPDATE after_order_messages SET attempt_count=0 WHERE id=?", (reservation["id"],))
+            record_after_order_event(conn, case_id, "email_awaiting_team_approval", details={"message_id": reservation["id"], "test_mode": test_mode})
+        return {"ok": True, "status": "awaiting_approval", "message_id": reservation["id"],
+                "message": "Email prepared for team approval. Nothing has been sent.", "recipient": recipient}
         if not test_mode and after_order_email_test_mode():
             raise ValueError("Test mode was enabled before sending; live email stopped.")
         provider = create_email_provider(provider_name, {"api_key": os.getenv("RESEND_API_KEY", "")})
@@ -38923,6 +38935,10 @@ def email_log_row(row: Any) -> dict[str, Any]:
     item["status_label"] = EMAIL_STATUS_LABELS.get(item.get("status"), "Needs review")
     item["retry_block_reason"] = retry_block_reason(item, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
     item["can_retry"] = not item["retry_block_reason"]
+    item["can_approve"] = item.get("provider") in {"resend", "odoo"} and item.get("status") in {"awaiting_approval", "failed"}
+    item["approval_digest"] = hashlib.sha256(str(item.get("payload_json") or "").encode()).hexdigest()
+    if item.get("status") == "awaiting_approval":
+        item["status_label"] = "Awaiting team approval"
     item["test_mode"] = bool(item.get("test_mode")) or item.get("status") in {"sent_test", "test_preview"}
     for field in ("payload_json", "request_fingerprint", "idempotency_key"):
         item.pop(field, None)
@@ -38933,6 +38949,7 @@ def email_log_row(row: Any) -> dict[str, Any]:
 def api_after_order_email_log(store_id: Optional[int] = None, page: int = 1, per_page: int = 30,
                             status: str = "all", mode: str = "all", q: str = "", date_from: str = "", date_to: str = "") -> dict[str, Any]:
     queues = {"all": [], "attention": ["failed", "delivery_unknown", "bounced", "complained", "delivery_delayed"], "failed": ["failed"], "retrying": ["retrying", "sending"], "sent": ["sent", "sent_test"], "delivered": ["delivered"], "suppressed": ["bounced", "complained"], "uncertain": ["delivery_unknown", "delivery_delayed"], "preview": ["test_preview"]}
+    queues["approval"] = ["awaiting_approval"]
     if status not in queues or mode not in {"all", "test", "live"}:
         raise HTTPException(400, "Unknown email queue or mode.")
     for value in (date_from, date_to):
@@ -38993,13 +39010,30 @@ def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, 
     return retry_after_order_email(message_id, request)
 
 
-def retry_after_order_email(message_id: int, request: Request, *, automatic: bool = False) -> dict[str, Any]:
+@app.post("/api/after-order/emails/{message_id}/approve-send")
+def api_after_order_approve_email(message_id: int, payload: dict[str, str], request: Request) -> dict[str, Any]:
+    digest = clean_text(payload.get("approval_digest"))
+    if not digest:
+        raise HTTPException(400, "Open and review the current email before approving.")
+    return retry_after_order_email(message_id, request, approval_digest=digest)
+
+
+
+def retry_after_order_email(message_id: int, request: Request, *, automatic: bool = False, approval_digest: str = "") -> dict[str, Any]:
+    # Approval-only rollout: each individual send attempt requires a fresh
+    # authenticated team action. Workers and legacy retry routes cannot send.
+    if automatic or not approval_digest:
+        raise HTTPException(409, "Team approval is required for each email attempt. Review it in Email log.")
     from app.services.email_log import automatic_retry_reason
     with db() as conn:
         original = conn.execute("SELECT * FROM after_order_messages WHERE id=?", (message_id,)).fetchone()
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    if original.get('status') not in {'awaiting_approval', 'failed'} or original.get('provider') not in {'resend','odoo'}:
+        raise HTTPException(409, 'This email cannot be approved. Check its current state.')
+    if hashlib.sha256(str(original.get('payload_json') or '').encode()).hexdigest() != approval_digest:
+        raise HTTPException(409, 'The email changed. Review it again before approving.')
     if automatic:
         reason = automatic_retry_reason(original)
         if reason:
@@ -39007,8 +39041,8 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if care_delivery.suppressed(original['recipient'], bool(original.get('test_mode'))):
         raise HTTPException(409, 'This recipient is suppressed after a bounce or complaint.')
     if original.get('provider') == 'odoo':
-        return alternative_workflow.retry_quote_email(original)
-    reason = retry_block_reason({**original, 'status': 'failed'} if automatic else original, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
+        return alternative_workflow.retry_quote_email(original, approval_digest=approval_digest)
+    reason = retry_block_reason({**original, 'status': 'failed'}, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
     if reason:
         raise HTTPException(409, reason)
     case = after_order_case_by_id(int(original["case_id"]))
@@ -39038,15 +39072,23 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     with db() as conn:
         locked = conn.execute("SELECT * FROM after_order_messages WHERE id=? FOR UPDATE", (message_id,)).fetchone()
         locked = row_to_dict(locked)
+        if locked.get('status') not in {'awaiting_approval', 'failed'} or hashlib.sha256(str(locked.get('payload_json') or '').encode()).hexdigest() != approval_digest:
+            raise HTTPException(409, 'Email already processed or changed; approval was not applied.')
         if automatic:
             reason = automatic_retry_reason(locked)
             if reason or after_order_email_test_mode():
                 raise HTTPException(409, reason or 'Automatic live recovery is disabled in test mode.')
-        reason = retry_block_reason({**locked, 'status': 'failed'} if automatic else locked, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
+        reason = retry_block_reason({**locked, 'status': 'failed'}, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
         if reason:
             raise HTTPException(409, reason)
-        attempt = int(locked.get("attempt_count") or 1) + 1
+        attempt = int(locked.get("attempt_count") or 0) + 1
         saved_payload = json.loads(locked['payload_json'])
+        if saved_payload.get('_care_reminder_parent'):
+            care_reminders.validate(int(saved_payload['_care_reminder_parent']),int(saved_payload['_care_reminder_number']),case)
+        if not locked.get('test_mode') and case.get('case_type') == 'item_unavailable':
+            current_revision = alternative_workflow.notification_revision(case)
+            if saved_payload.get('_care_recommendations_revision') != current_revision:
+                raise HTTPException(409, 'Recommendations changed. Prepare and review a current email.')
         # Recover the exact prior request, never create a new key for a timeout.
         retry_key = (saved_payload.get('_care_retry_key') or
                      (locked['idempotency_key'] if attempt == 2 else f'email-log:{message_id}:attempt:{attempt-1}')) if automatic else f'email-log:{message_id}:attempt:{attempt}'
@@ -39056,6 +39098,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         conn.execute("UPDATE after_order_messages SET status='retrying',attempt_count=?,last_error=NULL,updated_at=? WHERE id=?", (attempt, now, message_id))
         conn.execute("INSERT INTO after_order_email_attempts (message_id,attempt_number,status,created_at,updated_at) VALUES (?,?,'retrying',?,?)", (message_id, attempt, now, now))
         record_after_order_event(conn, case["id"], "email_retry_started", actor_type="system" if automatic else "team", details={"message_id": message_id, "attempt": attempt, "automatic": automatic})
+        record_after_order_event(conn, case["id"], "email_send_approved", actor_type="team", details={"message_id": message_id, "attempt": attempt, "approval_digest": approval_digest})
     error = ""
     provider_id = ""
     try:
@@ -39666,7 +39709,7 @@ def execute_after_order_job(job_id: int, request: Request) -> dict[str, Any]:
 def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, request: Request) -> dict[str, Any]:
     current_case = after_order_case_by_id(case_id)
     if current_case and current_case.get("current_decision") == "offer_alternatives":
-        raise HTTPException(409, "Line-item alternatives lock automatically after 24 hours. Payment and fulfilment checks run after that deadline.")
+        raise HTTPException(409, "Use the line-specific processing and release approvals after the 24-hour selection window closes.")
     if after_order_email_test_mode():
         return {"ok": True, "test_mode": True, "message": "Test preview only: confirmation, execution, Odoo writes and emails were not performed.", "row": after_order_case_by_id(case_id)}
     now = utc_now()
@@ -39750,6 +39793,9 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
 def api_after_order_settings() -> dict[str, Any]:
     return {
         "ok": True,
+        "email_approval_required": True,
+        "financial_approval_required": True,
+        "cutoff_date": after_order_cutoff_date(),
         "email_test_mode": after_order_email_test_mode(),
         "email_test_recipient": after_order_test_recipient(),
         "email_provider": clean_text(get_service_settings().get("after_order_email_provider")) or "resend",
