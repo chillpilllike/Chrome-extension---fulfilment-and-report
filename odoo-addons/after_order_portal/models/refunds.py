@@ -76,7 +76,8 @@ class SaleOrder(models.Model):
             raise UserError('Replacement product no longer exists.')
         info=self.after_order_alternative_info(line_id,website_id,reference=product.default_code)
         if (info.get('pricing_error') or info.get('pricing_signature')!=pricing_signature or info.get('product_id')!=product.id
-                or info['difference']>=0 or not info['same_taxes'] or not info['simple_taxes'] or len(info['invoice_ids'])!=1):
+                or info['difference']>=0 or info['alternative_total']<0 or -info['difference']>info['original_total']
+                or not info['same_taxes'] or not info['simple_taxes'] or len(info['invoice_ids'])!=1):
             raise UserError('Refund pricing, invoice allocation or tax treatment requires accounting review.')
         invoice=self.env['account.move'].browse(info['invoice_ids'])
         sources=self.transaction_ids.filtered(lambda t:t.state=='done' and t.operation!='refund' and t.sale_order_ids==self
@@ -129,7 +130,7 @@ class SaleOrder(models.Model):
         try:
             if job.credit_signature!=job._credit_fingerprint():
                 raise UserError('Credit-note accounts, taxes or allocation changed after approval. Review required.')
-            if source.provider_code!='stripe' or source.state!='done' or source.company_id!=self.company_id or tx.currency_id!=self.currency_id:
+            if source.provider_code!='stripe' or source.provider_id.state not in ('enabled','test') or source.state!='done' or source.company_id!=self.company_id or tx.currency_id!=self.currency_id:
                 raise UserError('Original payment changed; accounting review required.')
             if credit.state=='cancel' or credit.currency_id!=self.currency_id or credit.partner_id.commercial_partner_id!=self.partner_invoice_id.commercial_partner_id or self.currency_id.compare_amounts(credit.amount_total,-tx.amount):
                 raise UserError('Approved credit note changed; accounting review required.')
