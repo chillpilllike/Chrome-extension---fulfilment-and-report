@@ -100,7 +100,8 @@ class ReplacementTrackingTests(unittest.TestCase):
         script = '''
 const assert = require('node:assert/strict');
 const orderDetailsUrl = id => id;
-const businessBundleCompletionEvidence = () => false;
+let verifiedBusinessBundle = false;
+const businessBundleCompletionEvidence = () => verifiedBusinessBundle;
 const active = {amazonAccountExperience:'consumer',job:{items:[{asin:'B000000001',line_ids:[1]},{asin:'B000000002',line_ids:[2]}]}};
 const a = {amazon_order_id:'111-1111111-1111111',asins:['B000000001']};
 const b = {amazon_order_id:'222-2222222-2222222',asins:['B000000002']};
@@ -109,6 +110,11 @@ assert.equal(buildOrderMappings(active,[a]).length,1);
 assert.equal(buildOrderMappings(active,[{...a,asins:[]}]).length,0);
 assert.equal(buildOrderMappings(active,[a,{...b,asins:a.asins}]).length,0);
 assert.equal(buildOrderMappings(active,[{...a,asins:[...a.asins,...b.asins]}]).length,2);
+const business = {amazonAccountExperience:'business',job:{items:[active.job.items[0]]}};
+assert.equal(buildOrderMappings(business,[b]).length,0);
+verifiedBusinessBundle = true;
+assert.equal(buildOrderMappings(business,[b]).length,1);
+assert.equal(buildOrderMappings({...business,amazonAccountExperience:'consumer'},[b]).length,0);
 '''
         subprocess.run(['node', '-e', helper+'\n'+script], check=True, capture_output=True, text=True)
 
