@@ -125,6 +125,13 @@ class SaleOrder(models.Model):
         if info['difference'] <= 0:
             # Credit notes/refunds are deliberately left for the team's approval.
             result['refund_amount'] = abs(info['difference'])
+            if info['difference'] < 0:
+                job = self.env['after.order.refund'].sudo().search([('operation_key','=',operation_key),('order_id','=',self.id)],limit=1)
+                if job:
+                    if job.line_id!=line or job.product_id!=product or job.pricing_signature!=pricing_signature:
+                        raise UserError('Refund does not match the selected replacement.')
+                    result.update(job._result())
+                result['status'] = 'ready' if result.get('refund_verified') else 'waiting_refund'
             recorded = json.loads(self.after_order_resolution_log or '[]')
             if operation_key not in recorded:
                 self.message_post(body=Markup('Customer alternative selected for line %s: <b>%s</b>. The 24-hour window has closed. Difference refund for team review: %s %s. No refund has been issued.') % (line.id,product.display_name,self.currency_id.name,result['refund_amount']),subtype_xmlid='mail.mt_note')
@@ -181,13 +188,15 @@ class SaleOrder(models.Model):
         eligible = transactions.filtered(lambda tx: tx.currency_id == quote.currency_id and tx.sale_order_ids == quote)
         refunds = quote.transaction_ids.filtered(lambda tx: tx.operation == 'refund' and tx.state != 'cancel')
         refunds |= self.env['payment.transaction'].search([('source_transaction_id','in',eligible.ids),('operation','=','refund'),('state','!=','cancel')])
-        paid = not refunds and self.currency_id.compare_amounts(sum(eligible.mapped('amount')),quote.amount_total) >= 0
+        paid = not refunds and self.currency_id.compare_amounts(sum(eligible.mapped('amount')),quote.amount_total) == 0
         invoices = quote.invoice_ids.filtered(lambda move: move.move_type == 'out_invoice' and move.state == 'posted')
         if (not refunds and invoices and all(move.payment_state == 'paid' and move.currency_id == quote.currency_id for move in invoices)
                 and self.currency_id.compare_amounts(sum(invoices.mapped('amount_total')),quote.amount_total) == 0):
             paid = True
         if quote.invoice_ids.filtered(lambda move: move.move_type == 'out_refund' and move.state != 'cancel'):
             paid = False
+        if eligible and self.currency_id.compare_amounts(sum(eligible.mapped('amount')),quote.amount_total):
+            paid = False  # Do not hide a partial/overpayment behind an invoice status.
         if not paid and quote.is_expired:
             raise UserError('The payment quotation expired. Team review is required; no replacement was released.')
         result.update({'status':'ready' if paid else 'waiting_payment', 'quote_id':quote.id,

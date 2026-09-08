@@ -7,6 +7,7 @@ creation and the accounting/payment checks; an RPC retry uses the same operation
 import json
 import hashlib
 from datetime import datetime, timezone
+from decimal import Decimal
 from email.utils import parseaddr
 
 from fastapi import APIRouter, HTTPException, Request
@@ -60,6 +61,11 @@ ON after_order_line_activity(store_id,odoo_order_id,created_at);
 class Recommendations(BaseModel):
     references: list[str] = Field(min_length=1, max_length=12)
     sourcing_checked: bool = False
+
+
+class RefundApproval(BaseModel):
+    version: int = Field(ge=1)
+    confirm_amount: float = Field(gt=0, allow_inf_nan=False)
 
 
 class Runtime:
@@ -288,7 +294,7 @@ class Workflow:
         with r.db() as conn:
             conn.execute('SELECT id FROM after_order_cases WHERE id=? FOR UPDATE', (case_id,)).fetchone()
             row = conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=0 FOR UPDATE', (case_id,line_id)).fetchone()
-            if not row or row['status'] not in ('choosing','waiting_payment','processing'):
+            if not row or row['status'] not in ('choosing','waiting_payment','waiting_refund','processing'):
                 return
             if moment(row['deadline_at']) > datetime.now(timezone.utc):
                 return
@@ -310,6 +316,11 @@ class Workflow:
                 if r.after_order_email_test_mode():
                     return
                 previous_result = json.loads(row['result_json'])
+                if product['difference'] < 0 and previous_result.get('refund_id'):
+                    refund = odoo.execute('sale.order','after_order_execute_replacement_refund',
+                        [[case['odoo_order_id']],int(case['website_id']),f'care:{case_id}:line:{line_id}:v:{row["version"]}'])
+                    if refund.get('refund_status') == 'needs_review':
+                        raise ValueError(refund.get('error') or 'Refund requires reconciliation.')
                 if (product['difference'] > 0 and not previous_result.get('quote_id')
                         and hasattr(r, 'care_delivery')
                         and r.care_delivery.suppressed(case.get('customer_email') or '', False)):
@@ -327,7 +338,7 @@ class Workflow:
                     self.event(conn,case,'alternative_' + status,line_id,**result)
                 conn.execute('''UPDATE after_order_line_selections SET status=?, result_json=?, refund_status=?, last_error=NULL,updated_at=?
                     WHERE case_id=? AND line_id=? AND test_mode=0''',
-                    (status,json.dumps(result),'pending_review' if product['difference'] < 0 else '',r.utc_now(),case_id,line_id))
+                    (status,json.dumps(result),result.get('refund_status','pending_review') if product['difference'] < 0 else '',r.utc_now(),case_id,line_id))
             except Exception as exc:
                 error = r.clean_error_message(exc)
                 conn.execute("UPDATE after_order_line_selections SET status='needs_review',last_error=?,updated_at=? WHERE case_id=? AND line_id=? AND test_mode=0", (error,r.utc_now(),case_id,line_id))
@@ -343,7 +354,7 @@ class Workflow:
         if r.after_order_email_test_mode():
             return
         with r.db() as conn:
-            due = [dict(row) for row in conn.execute("SELECT case_id,line_id FROM after_order_line_selections WHERE test_mode=0 AND status IN ('choosing','waiting_payment','processing') AND deadline_at<=? ORDER BY updated_at LIMIT 50",(r.utc_now(),)).fetchall()]
+            due = [dict(row) for row in conn.execute("SELECT case_id,line_id FROM after_order_line_selections WHERE test_mode=0 AND status IN ('choosing','waiting_payment','waiting_refund','processing') AND deadline_at<=? ORDER BY updated_at LIMIT 50",(r.utc_now(),)).fetchall()]
             ready = [dict(row) for row in conn.execute("SELECT case_id FROM after_order_line_selections WHERE test_mode=0 AND status='ready_to_release' GROUP BY case_id ORDER BY MIN(updated_at),case_id LIMIT 200").fetchall()]
             for candidate in ready:
                 conn.execute("UPDATE after_order_line_selections SET updated_at=? WHERE case_id=? AND test_mode=0 AND status='ready_to_release'",(r.utc_now(),candidate['case_id']))
@@ -408,6 +419,13 @@ class Workflow:
                 product = json.loads(selection['product_json'])
                 _, line = self.case_line(case_id,selection['line_id'])
                 try:
+                    if product['difference'] < 0:
+                        refund = r.OdooClient(r.get_store(case['store_id'])).execute('sale.order','after_order_execute_replacement_refund',
+                            [[case['odoo_order_id']],int(case['website_id']),f'care:{case_id}:line:{selection["line_id"]}:v:{selection["version"]}'])
+                        if not refund.get('refund_verified'):
+                            conn.execute("UPDATE after_order_line_selections SET status='needs_review',refund_status=?,last_error=? WHERE case_id=? AND line_id=? AND test_mode=0",
+                                (refund.get('refund_status','needs_review'),refund.get('error') or 'Refund not verified',case_id,selection['line_id']))
+                            return
                     verified = r.OdooClient(r.get_store(case['store_id'])).execute('sale.order','after_order_process_alternative',
                         [[case['odoo_order_id']],int(line['odoo_line_id']),int(case['website_id']),product['product_id'],
                          f'care:{case_id}:line:{selection["line_id"]}:v:{selection["version"]}',selection['deadline_at'],product['pricing_signature']])
@@ -450,7 +468,7 @@ class Workflow:
                     (status,r.utc_now(),case_id,selection['line_id']))
                 self.event(conn,case,'alternative_'+status,selection['line_id'],product_name=product['name'],asin=asin,
                     refund_amount=abs(min(product['difference'],0)))
-            attention = bool(removals) or any(not json.loads(s['result_json']).get('asin') or json.loads(s['product_json'])['difference'] < 0 for s in selections)
+            attention = bool(removals) or any(not json.loads(s['result_json']).get('asin') for s in selections)
             conn.execute("UPDATE after_order_cases SET status=?,confirmed_at=?,confirmed_by='24-hour alternative processing',decision_locked_at=?,updated_at=? WHERE id=?",('execution_needs_review' if attention else 'resolved',r.utc_now(),r.utc_now(),r.utc_now(),case_id))
             conn.execute('UPDATE after_order_action_links SET invalidated_at=?,updated_at=? WHERE case_id=?',(r.utc_now(),r.utc_now(),case_id))
         r.fast_page_cache_clear_matching({'orders','missing','dashboard','bulk'})
@@ -469,7 +487,46 @@ class Workflow:
                 conn.execute("UPDATE after_order_cases SET status='execution_needs_review' WHERE id=?",(case_id,))
 
     def router(self):
+        # Financial approvals use the app's existing authenticated admin middleware.
         router = APIRouter()
+
+        @router.post('/api/after-order/cases/{case_id}/lines/{line_id}/approve-replacement-refund')
+        def approve_refund(case_id: int, line_id: int, payload: RefundApproval):
+            r = self.r
+            if r.after_order_email_test_mode():
+                return {'ok':True,'message':'Test preview: no refund, credit note or payment was created.'}
+            with r.db() as conn:
+                conn.execute('SELECT id FROM after_order_cases WHERE id=? FOR UPDATE',(case_id,)).fetchone()
+                case,line = self.case_line(case_id,line_id)
+                row = conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=0 FOR UPDATE',(case_id,line_id)).fetchone()
+                if (not row or row['version']!=payload.version or row['status'] not in ('waiting_refund','needs_review')
+                        or moment(row['deadline_at'])>datetime.now(timezone.utc) or case.get('confirmed_at')
+                        or case.get('current_decision')!='offer_alternatives' or row['issue_fingerprint']!=r.request_fingerprint(case)):
+                    raise HTTPException(409,'Selection changed or is not ready for refund approval. Refresh first.')
+                product=json.loads(row['product_json'])
+                if product.get('pricing_error') or Decimal(str(product['difference']))>=0 or Decimal(str(payload.confirm_amount))!=-Decimal(str(product['difference'])):
+                    raise HTTPException(409,'Confirm the exact current refund difference.')
+                odoo=r.OdooClient(r.get_store(case['store_id']))
+                try:
+                    # Separate committed RPC: a timeout cannot erase the provider idempotency key.
+                    result=odoo.execute('sale.order','after_order_prepare_replacement_refund',[[case['odoo_order_id']],
+                        int(line['odoo_line_id']),int(case['website_id']),product['product_id'],
+                        f'care:{case_id}:line:{line_id}:v:{row["version"]}',row['deadline_at'],product['pricing_signature']])
+                except Exception as exc:
+                    error=r.clean_error_message(exc)
+                    self.event(conn,case,'replacement_refund_approval_failed',line_id,error=error)
+                    try:
+                        odoo.post_order_note(case['odoo_order_id'],'Replacement refund approval failed: '+r.html.escape(error))
+                    except Exception as note_error:
+                        self.event(conn,case,'odoo_chatter_failed',line_id,error=r.clean_error_message(note_error))
+                    return {'ok':False,'message':error}
+                previous=json.loads(row['result_json'])
+                conn.execute("UPDATE after_order_line_selections SET status='waiting_refund',refund_status=?,result_json=?,last_error=NULL,updated_at=? WHERE case_id=? AND line_id=? AND test_mode=0",
+                    (result['refund_status'],json.dumps({**previous,**result}),r.utc_now(),case_id,line_id))
+                self.event(conn,case,'replacement_refund_approved',line_id,actor='team',version=row['version'],**result)
+            self.process(case_id,line_id)
+            self.release(case_id)
+            return {'ok':True,'message':'Refund approval recorded. Provider and accounting verification determine release; check the timeline for the result.'}
 
         @router.get('/api/after-order/alternative-readiness')
         def readiness(store_id: int):

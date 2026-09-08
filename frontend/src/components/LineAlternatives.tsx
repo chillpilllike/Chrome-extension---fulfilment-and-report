@@ -105,6 +105,14 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
           {offer.selection.product.difference != null ? <p className="font-medium">{offer.selection.product.difference < 0 ? 'Refund difference' : 'Additional payment'}: {offer.selection.product.currency} {Math.abs(offer.selection.product.difference).toFixed(2)}{offer.selection.refund_status && ` · ${offer.selection.refund_status.replaceAll('_',' ')}`}</p> : <p className="text-amber-800">Price needs review: {offer.selection.product.pricing_error}</p>}
           {offer.selection.result.quote_name && <p>Quotation {offer.selection.result.quote_name} · email {offer.selection.result.email_status || 'not verified'}</p>}
           {offer.selection.result.payment_verified && <p className="font-medium text-green-700">Payment verified</p>}
+          {offer.selection.product.difference != null && offer.selection.product.difference < 0 && ['waiting_refund','needs_review'].includes(offer.selection.status) && <Button size="sm" variant="outline" disabled={loading} onClick={async () => {
+            const amount = Math.abs(offer.selection!.product.difference!)
+            if (!window.confirm(`Approve ${offer.selection!.product.currency} ${amount.toFixed(2)} refund for ${orderNumber}, line ${offer.line_id}? Fulfilment waits for verified refund and accounting reconciliation.`)) return
+            setLoading(true); try {
+              const result = await request<{message:string}>(`/api/after-order/cases/${caseId}/lines/${offer.line_id}/approve-replacement-refund`,{method:'POST',body:JSON.stringify({version:offer.selection!.version,confirm_amount:amount})})
+              setNotice(result.message); await load()
+            } catch(error) {setError(String(error))} finally {setLoading(false)}
+          }}>Approve / reconcile replacement refund</Button>}
           {['processed','manual_fulfilment'].includes(offer.selection.status) && <p className="font-medium text-green-700">Replacement applied · {offer.selection.status === 'processed' ? 'ready for fulfilment' : 'manual fulfilment required'}</p>}
           {offer.selection.status === 'needs_review' && <Button size="sm" variant="outline" disabled={loading} onClick={async () => {
             setLoading(true); try { await request(`/api/after-order/cases/${caseId}/lines/${offer.line_id}/retry-processing`,{method:'POST',body:JSON.stringify({version:offer.selection?.version,approved_by:'Operations team'})}); await load() } catch(error) {setError(String(error))} finally {setLoading(false)}

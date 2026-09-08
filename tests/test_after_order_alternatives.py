@@ -6,11 +6,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from fastapi import HTTPException
 from app.services.alternative_selection import selection_change, money_difference, price_fingerprint, resolved_asin
-from app.services.alternative_workflow import Workflow, SCHEMA, Recommendations
+from app.services.alternative_workflow import Workflow, SCHEMA, Recommendations, RefundApproval
 from app.services.asin import encode_asin, extract_asin_from_notes, decode_asin_reference, normalize_asin
 
 
@@ -170,6 +170,39 @@ class StoredSelections(unittest.TestCase):
             'default_code':f'SKU-{template_id}','difference':5,'currency':'USD'}
 
     def tearDown(self): self.conn.close()
+
+    def refund_endpoint(self):
+        return next(route.endpoint for route in self.workflow.router().routes if route.path.endswith('/approve-replacement-refund'))
+
+    def prepare_refund_choice(self):
+        self.choose(10,100,datetime.now(timezone.utc)-timedelta(days=2))
+        row=self.conn.execute('SELECT * FROM after_order_line_selections WHERE line_id=10').fetchone()
+        product={**json.loads(row['product_json']),'difference':-10,'pricing_signature':'agreed'}
+        self.conn.execute("UPDATE after_order_line_selections SET product_json=?,status='waiting_refund' WHERE line_id=10",(json.dumps(product),))
+        self.case.update(current_decision='offer_alternatives',confirmed_at=None)
+        self.odoo=Mock(execute=Mock(return_value={'refund_id':9,'refund_status':'prepared'}))
+        self.namespace.update(OdooClient=lambda store:self.odoo,get_store=lambda sid:object())
+        self.workflow.process=Mock();self.workflow.release=Mock()
+
+    def test_refund_test_mode_never_contacts_odoo(self):
+        self.namespace['after_order_email_test_mode']=lambda:True
+        self.namespace['OdooClient']=Mock(side_effect=AssertionError('Live call'))
+        self.assertIn('Test preview',self.refund_endpoint()(1,10,RefundApproval(version=1,confirm_amount=10))['message'])
+        self.namespace['OdooClient'].assert_not_called()
+
+    def test_refund_approval_requires_current_version_and_exact_amount(self):
+        self.prepare_refund_choice()
+        for version,amount in ((2,10),(1,9)):
+            with self.assertRaises(HTTPException):self.refund_endpoint()(1,10,RefundApproval(version=version,confirm_amount=amount))
+        self.odoo.execute.assert_not_called()
+
+    def test_refund_preparation_persists_before_processing(self):
+        self.prepare_refund_choice()
+        self.assertTrue(self.refund_endpoint()(1,10,RefundApproval(version=1,confirm_amount=10))['ok'])
+        self.assertEqual(self.odoo.execute.call_args.args[1],'after_order_prepare_replacement_refund')
+        saved=self.conn.execute('SELECT * FROM after_order_line_selections WHERE line_id=10').fetchone()
+        self.assertEqual(json.loads(saved['result_json'])['refund_id'],9)
+        self.workflow.process.assert_called_once_with(1,10)
 
     def choose(self,line_id,product_id,now,test=False):
         with patch('app.services.alternative_workflow.datetime') as clock:
