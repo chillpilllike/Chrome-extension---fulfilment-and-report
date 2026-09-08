@@ -12,13 +12,14 @@ type Email = {
   provider: string; provider_message_id?: string; status: string; status_label: string
   test_mode: boolean; attempt_count: number; template_kind?: string
   last_error?: string; created_at: string; updated_at: string; html_preview?: string
-  can_retry: boolean; retry_block_reason: string
+  can_retry: boolean; retry_block_reason: string; can_approve: boolean; approval_digest: string
 }
 type Attempt = { attempt_number: number; status: string; error?: string; provider_message_id?: string; created_at: string; updated_at: string }
 type Result = { rows: Email[]; total: number; summary: Record<string, number>; test_mode: boolean; test_recipient: string }
 type Props = { storeId: string; api: <T>(path: string, options?: RequestInit) => Promise<T>; onResult: (result: { ok: boolean; title: string; message: string }) => void; onNavigate: (page: string, order?: string) => void }
 
 const queues = [
+  ["approval", "Awaiting approval", "Prepared emails. Nothing is sent until the team reviews and approves an individual attempt."],
   ["all", "All emails", "Every saved email in the selected store, including test sends and previews."],
   ["attention", "Needs attention", "Confirmed failures and uncertain sends. Read the error before taking action."],
   ["failed", "Failed", "Requests that failed before sending or were explicitly rejected. Eligible records can be retried individually."],
@@ -36,7 +37,7 @@ function Status({ row }: { row: Pick<Email, "status" | "status_label"> }) {
 }
 
 export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props) {
-  const [queue, setQueue] = useState("all")
+  const [queue, setQueue] = useState("approval")
   const [mode, setMode] = useState("all")
   const [query, setQuery] = useState("")
   const [draft, setDraft] = useState("")
@@ -84,10 +85,10 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
     return () => window.clearInterval(timer)
   }, [data])
   async function retry(row: Email) {
-    if (!row.can_retry || retryId !== null) return
+    if (!row.can_approve || retryId !== null) return
     setRetryId(row.id)
     try {
-      const result = await api<{ ok: boolean; message: string }>(`/api/after-order/emails/${row.id}/retry`, { method: "POST" })
+      const result = await api<{ ok: boolean; message: string }>(`/api/after-order/emails/${row.id}/approve-send`, { method: "POST", body: JSON.stringify({ approval_digest: row.approval_digest }) })
       onResult({ ok: result.ok, title: result.ok ? "Retry sent" : "Retry needs attention", message: result.message })
     } catch (reason) { onResult({ ok: false, title: "Retry stopped", message: String(reason) }) }
     finally { setRetryId(null); setRetryTarget(null); setTick(value => value + 1) }
@@ -137,10 +138,10 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
       {detailError && <p role="alert">{detailError}</p>}{!detail && !detailError && <p role="status">Loading email…</p>}
       {detail && <><Status row={detail.row} /><dl><dt>Order / store</dt><dd>{detail.row.odoo_order_name} · {detail.row.store_name}</dd><dt>Recipient</dt><dd>{detail.row.recipient}</dd><dt>Sender</dt><dd>{detail.row.sender}</dd><dt>Provider message ID</dt><dd>{detail.row.provider_message_id || "No acceptance ID recorded"}</dd><dt>Mode</dt><dd>{detail.row.test_mode ? "Test" : "Live"}</dd></dl>
         <section><h3>Send attempts</h3>{!detail.attempts.length && <p>Detailed attempt history is unavailable for this older record. Its saved status is shown above.</p>}<ol className="email-attempts">{detail.attempts.map(attempt => <li key={attempt.attempt_number}><strong>Attempt {attempt.attempt_number} · {attempt.status.replaceAll("_", " ")}</strong><small>{formatDate(attempt.created_at)} → {formatDate(attempt.updated_at)}</small>{attempt.error && <p className="email-log-error">{attempt.error}</p>}</li>)}</ol>
-          {detail.row.can_retry ? <Button disabled={retryId !== null} onClick={() => { setDetailId(null); setRetryTarget(detail.row) }}>Retry failed email</Button> : <p>{detail.row.retry_block_reason}</p>}</section>
+          {detail.row.can_approve ? <Button disabled={retryId !== null} onClick={() => { setDetailId(null); setRetryTarget(detail.row) }}>Approve sending this email</Button> : <p>{detail.row.retry_block_reason}</p>}</section>
         <section><h3>Email preview</h3>{preview ? <iframe title="Saved email preview" sandbox="" referrerPolicy="no-referrer" srcDoc={preview} className="email-preview-frame" tabIndex={-1} /> : <p>No HTML preview was saved.</p>}</section></>}
     </DialogContent></Dialog>
-    <Dialog open={retryTarget !== null} onOpenChange={open => { if (!open && retryId === null) setRetryTarget(null) }}><DialogContent><DialogHeader><DialogTitle>Retry this email?</DialogTitle><DialogDescription>The saved email will be sent again only if the order and safety checks still pass.</DialogDescription></DialogHeader>
+    <Dialog open={retryTarget !== null} onOpenChange={open => { if (!open && retryId === null) setRetryTarget(null) }}><DialogContent><DialogHeader><DialogTitle>Approve this email attempt?</DialogTitle><DialogDescription>This approval sends the exact saved email to the recipient below, only if current order and safety checks still pass. Failures require another approval.</DialogDescription></DialogHeader>
       {retryTarget && <><p><strong>{retryTarget.test_mode ? "TEST EMAIL" : "LIVE CUSTOMER EMAIL"}</strong></p><p>{retryTarget.subject}</p><p>To: <strong>{retryTarget.recipient}</strong></p><p>Order: {retryTarget.odoo_order_name} · Attempt {(retryTarget.attempt_count || 1) + 1}</p><div className="epost-inline"><Button variant="outline" disabled={retryId !== null} onClick={() => setRetryTarget(null)}>Cancel</Button><Button disabled={retryId !== null} onClick={() => void retry(retryTarget)}>{retryId !== null ? "Retrying…" : "Confirm retry"}</Button></div></>}
     </DialogContent></Dialog>
   </div>

@@ -38,8 +38,8 @@ def annotate_workflow(row, stale_days=10, now=None):
     exception = re.search(r"\b(not delivered|undeliverable|delivery failed|failed delivery|attempted delivery|delivery attempted|return(?:ed)? to sender|return to warehouse|damaged|confiscated|invalid kyc|customs hold|held|delayed by customs|unsafe to leave)\b", status)
     loss = re.search(r"\b(?:parcel|package|shipment|item) (?:is |was |has been |reported |declared )?lost\b|^lost$|\blost in transit\b", status)
     delivered = re.search(r"\b(delivered|recipient collected|collected by recipient)\b", status) and not re.search(r"\b(not|pending|expected|will be|to be|out for)\b", status)
-    electronic = any(term in status for term in ("data received", "electronic information", "manifest", "label created", "pre-advised", "pre advised", "shipment information", "shipment announced", "shipment in transit to the epost global processing center"))
-    physical = any(term in status for term in ("in transit", "in-transit", "arrived", "arrival", "departed", "departure", "received", "processing", "processed", "out for delivery", "picked up", "accepted", "customs clearance", "into customs", "handing over")) and not re.search(r"\b(expected|awaiting|pending|not yet)\b", status)
+    electronic = any(term in status for term in ("data received", "electronic information", "manifest", "label created", "pre-advised", "pre advised", "shipment information", "shipment announced"))
+    physical = any(term in status for term in ("in transit", "in-transit", "heading to", "arrived", "arrival", "departed", "departure", "received", "processing", "processed", "out for delivery", "picked up", "accepted", "customs clearance", "into customs", "handing over")) and not re.search(r"\b(expected|awaiting|pending|not yet)\b", status)
     if "error locating tracking number" in status or "tracking number not found" in status:
         queue = "lookup_error"
     elif exception:

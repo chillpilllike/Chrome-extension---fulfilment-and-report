@@ -184,11 +184,13 @@ def parse_provider_datetime(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
+    for fmt in (None, "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p"):
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00")) if fmt is None else datetime.strptime(text, fmt)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
 
 
 def tracking_risk(
@@ -209,6 +211,8 @@ def tracking_risk(
     dated = [(stamp, event) for stamp, event in dated if stamp and stamp <= now]
     latest_event = max(dated, key=lambda entry: entry[0])[1] if dated else {}
     current_status = str(status or latest_event.get("Event") or latest_event.get("status") or "").lower()
+    if any(term in current_status for term in ("error locating tracking", "tracking number not found")):
+        return TrackingRisk("awaiting_first_scan", False, "Tracking lookup failed; no loss invitation is allowed.")
     exception_terms = ("damaged", "return to sender", "returned", "delivery failed", "not delivered", "undeliverable", "customs hold", "delivery attempted")
     if any(term in current_status for term in exception_terms):
         return TrackingRisk("carrier_exception", False, "Carrier exception requires investigation, not an automatic lost-parcel invitation.")
@@ -229,9 +233,10 @@ def tracking_risk(
         "label created",
         "pre-advised",
         "shipment information",
+        "shipment announced", "pre advised",
         "pending", "awaiting", "not yet", "expected", "pre-transit",
     )
-    physical_terms = ("parcel received", "received and processing", "arrived", "arrival", "departed", "departure", "in transit", "processed at", "out for delivery", "picked up", "accepted at", "customs clearance")
+    physical_terms = ("parcel received", "received and processing", "arrived", "arrival", "departed", "departure", "in transit", "in-transit", "processed at", "parcel processed", "parcel shipped", "heading to", "out for delivery", "picked up", "accepted at", "customs clearance")
     physical_events = [
         event
         for event in events
@@ -252,6 +257,10 @@ def tracking_risk(
         for event in physical_events
     ]
     latest = max((value for value in event_times if value and value <= now), default=None)
+    if latest is None:
+        return TrackingRisk("awaiting_first_scan", False, "No valid dated movement exists; the inactivity clock cannot start.")
+    # A newer carrier update must not be ignored in favour of an older scan.
+    latest = max(latest, max((stamp for stamp, _ in dated), default=latest))
     if latest and now - latest >= timedelta(days=max(1, stale_days)):
         return TrackingRisk(
             "suspected_lost",
