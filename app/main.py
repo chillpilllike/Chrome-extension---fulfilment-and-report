@@ -5,7 +5,7 @@ from app.services.inventory_labels import annotate_inventory_labels
 from app.services.inventory_legacy import install_inventory_legacy, legacy_delivery_available
 
 import base64
-from app.services import replacement_bundle
+from app.services import replacement_bundle, replacement_tracking
 from app.services.replacement_images import ReplacementImageSyncError, image_failure_details, validate_image_base64
 import csv
 import copy
@@ -3740,6 +3740,8 @@ def amazon_history_records_cache_key(prefix: str, records: list[dict[str, Any]])
 
 
 def order_line_asin_aliases(row: dict[str, Any]) -> list[str]:
+    if replacement_tracking.strict_line(row):
+        return [value for value in [normalize_asin(row.get("replacement_asin") or row.get("asin"))] if value]
     aliases = [
         normalize_asin(row.get("asin") if "asin" in row.keys() else ""),
         normalize_asin(row.get("replacement_asin") if "replacement_asin" in row.keys() else ""),
@@ -5236,6 +5238,7 @@ def merge_order_products_into_tracking_packages(packages: list[dict[str, Any]], 
         if single_package and not package_products and not package_asins:
             package["products"] = order_products
             package["asins"] = order_asins
+            package["asin_evidence_source"] = "order_inferred"
         else:
             if package_products:
                 package["products"] = package_products
@@ -6090,6 +6093,10 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
         incoming_promise = tracking_package_promise_text(package)
         row_line_ids = package_line_ids(row.get("order_line_ids_json"))
         matching_rows = [lines_by_id[line_id] for line_id in row_line_ids if line_id in lines_by_id]
+        matching_rows = [line for line in matching_rows if not replacement_tracking.strict_line(line) or package_matches_line(package, line)]
+        if not matching_rows:
+            continue
+        row_line_ids = [int(line["id"]) for line in matching_rows]
         package_asins, package_products = dispatch_package_asins_and_products(package, matching_rows)
         if not package_products and package_asins:
             package_products = [
@@ -6228,8 +6235,14 @@ def update_history_matched_order_from_tracking(conn: Any, amazon_order_id: str, 
         line_packages = packages_by_line.get(int(row["id"]), [])
         if not line_packages:
             continue
+        if replacement_tracking.strict_line(row):
+            previous = [p for p in parse_tracking_packages(row.get("tracking_payload") or "") if package_matches_line(p, row)]
+            line_packages = merge_replacement_tracking_packages([*previous, *line_packages])
         row_status = tracking_status_from_packages(line_packages)
         row_delivered = row_status == "Delivered" and all(tracking_package_delivered(p) for p in line_packages)
+        if replacement_tracking.strict_line(row) and row_delivered and not replacement_tracking.delivered_quantity_complete(row, line_packages):
+            row_delivered = False
+            row_status = "ASIN quantity verification pending"
         if order_line_currently_delivered(row) and not row_delivered:
             continue
         conn.execute(
@@ -6395,6 +6408,19 @@ def update_related_tracking_orders_from_packages(
         if rows:
             updated_row_ids: list[int] = []
             for row in rows:
+                row_packages = related_packages
+                if replacement_tracking.strict_line(row):
+                    row_packages = [package for package in related_packages if package_matches_line(package, row)]
+                    if not row_packages:
+                        continue
+                    previous = [p for p in parse_tracking_packages(row.get("tracking_payload") or "") if package_matches_line(p, row)]
+                    row_packages = merge_replacement_tracking_packages([*previous, *row_packages])
+                related_status = tracking_status_from_packages(row_packages)
+                related_delivered = related_status == "Delivered" and all(tracking_package_delivered(package) for package in row_packages)
+                if replacement_tracking.strict_line(row) and related_delivered and not replacement_tracking.delivered_quantity_complete(row, row_packages):
+                    related_delivered = False
+                    related_status = "ASIN quantity verification pending"
+                related_tracking_payload = tracking_payload_json_for_storage(row_packages)
                 if order_line_currently_delivered(row) and not related_delivered:
                     continue
                 conn.execute(
@@ -6497,7 +6523,9 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
         codes = dispatch_codes_from_package(package, order_id)
         if not codes:
             continue
-        matching_rows = [row for row in rows if package_matches_line(package, row)] or list(rows)
+        matching_rows = [row for row in rows if package_matches_line(package, row)] or [row for row in rows if not replacement_tracking.strict_line(row)]
+        if not matching_rows:
+            continue
         primary = matching_rows[0]
         code, display_code = codes[0]
         recipient_ref = dispatch_recipient_ref_from_rows(rows_to_dicts(matching_rows))
@@ -6604,7 +6632,9 @@ def dispatch_bulk_package_rows_for_order(order_id: str, rows: list[dict[str, Any
             codes = dispatch_codes_from_package(package, order_id)
             if not codes:
                 continue
-            matching_rows = [row for row in rows if package_matches_line(package, row)] or list(rows)
+            matching_rows = [row for row in rows if package_matches_line(package, row)] or [row for row in rows if not replacement_tracking.strict_line(row)]
+            if not matching_rows:
+                continue
             primary = matching_rows[0]
             code, display_code = codes[0]
             recipient_ref = dispatch_recipient_ref_from_rows(rows_to_dicts(matching_rows))
@@ -14920,9 +14950,24 @@ def dispatch_status_rows(
 
 
 def package_matches_line(package: dict[str, Any], line: dict[str, Any]) -> bool:
-    asins = {normalize_asin(str(value)) for value in package.get("asins") or []}
+    asins = replacement_tracking.package_asins(package) if replacement_tracking.strict_line(line) else {normalize_asin(str(value)) for value in package.get("asins") or []}
     line_asins = set(order_line_asin_aliases(line))
     return bool(asins and line_asins and line_asins.intersection(asins))
+
+
+def merge_replacement_tracking_packages(packages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = []
+    positions = {}
+    for package in canonical_tracking_packages(packages):
+        key = tracking_package_physical_id(package) or tracking_package_shipment_key(package)
+        if key and key in positions:
+            index = positions[key]
+            merged[index] = merge_tracking_shipment_snapshots(merged[index], package)
+        else:
+            if key:
+                positions[key] = len(merged)
+            merged.append(package)
+    return merged
 
 
 def tracking_packages_by_line_with_one_to_one_fallback(
@@ -14941,7 +14986,7 @@ def tracking_packages_by_line_with_one_to_one_fallback(
         else:
             unmatched_rows.append(row)
     unclaimed_packages = [package for package in packages if id(package) not in claimed_package_ids]
-    if len(unmatched_rows) == 1 and len(unclaimed_packages) == 1:
+    if len(unmatched_rows) == 1 and len(unclaimed_packages) == 1 and not replacement_tracking.strict_line(unmatched_rows[0]):
         mapped[int(unmatched_rows[0]["id"])] = unclaimed_packages
         unmatched_rows = []
     return mapped, unmatched_rows
@@ -14952,7 +14997,7 @@ def tracking_unambiguous_replacement_product(
     row: Any,
 ) -> dict[str, Any]:
     """Return replacement metadata only for a fallback mapping with one ASIN."""
-    if not packages or any(package_matches_line(package, row) for package in packages):
+    if replacement_tracking.strict_line(row) or not packages or any(package_matches_line(package, row) for package in packages):
         return {}
     products = normalize_amazon_product_items([
         product
@@ -33141,6 +33186,9 @@ def chrome_completion_history_evidence_error(
     the extension: a stale content script must never be able to write a
     neighbouring order's Amazon number.
     """
+    mapping_error = replacement_tracking.completion_error(rows, payload.order_mappings)
+    if mapping_error:
+        return mapping_error
     if not re.fullmatch(r"\d{3}-\d{7}-\d{7}", amazon_order_id):
         return ""
     recipient = clean_text(payload.amazon_recipient)
@@ -36498,6 +36546,24 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             422,
             "Empty Amazon tracking update rejected; existing shipment data was preserved.",
         )
+    with db() as conn:
+        strict_rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_order_id=?", (amazon_order_id,)).fetchall())
+        strict_order = any(replacement_tracking.strict_line(row) for row in strict_rows)
+        if strict_order:
+            identity_error = tracking_account_identity_error(strict_rows, clean_text(payload.amazon_account_name), normalize_amazon_account_type(payload.amazon_account_type))
+            if identity_error:
+                raise HTTPException(409, identity_error)
+        matching_error = "" if payload.order_cancelled or payload_has_payment_revision(payload) else replacement_tracking.tracking_error(strict_rows, packages)
+        if matching_error:
+            for row in strict_rows:
+                if replacement_tracking.strict_line(row):
+                    conn.execute("UPDATE order_lines SET last_error=?, updated_at=? WHERE id=?", (matching_error, utc_now(), row["id"]))
+    if matching_error:
+        for row in strict_rows:
+            if replacement_tracking.strict_line(row):
+                index_order_line(dict(row, last_error=matching_error))
+        fast_page_cache_clear_matching({"orders", "tracking-orders", "fulfilment-pending"})
+        raise HTTPException(409, matching_error)
     status = tracking_status_from_packages(packages)
     status_only_payload = bool(packages) and all(package.get("status_only") and not package.get("tracking_id") for package in packages)
     delivered_flag = status == "Delivered" and packages and all(
@@ -36549,7 +36615,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
         )
         if otp_updated:
             fast_page_cache_clear_matching({"amazon-otp", "public-amazon-otp"})
-        if status_only_payload and not payload.order_cancelled and not payload_has_payment_revision(payload):
+        if status_only_payload and not strict_order and not payload.order_cancelled and not payload_has_payment_revision(payload):
             now = utc_now()
             line_delivered = status == "Delivered" and packages and all(
                 tracking_package_delivered(package) for package in packages if isinstance(package, dict)
@@ -37116,6 +37182,9 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 if package_asins_present:
                     continue
                 line_packages = packages
+            if replacement_tracking.strict_line(row):
+                previous = [p for p in parse_tracking_packages(row.get("tracking_payload") or "") if package_matches_line(p, row)]
+                line_packages = merge_replacement_tracking_packages([*previous, *line_packages])
             replacement_product = tracking_unambiguous_replacement_product(line_packages, row)
             if replacement_product:
                 conn.execute(
@@ -37135,6 +37204,9 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             line_delivered = line_status == "Delivered" and line_packages and all(
                 tracking_package_delivered(package) for package in line_packages if isinstance(package, dict)
             )
+            if replacement_tracking.strict_line(row) and line_delivered and not replacement_tracking.delivered_quantity_complete(row, line_packages):
+                line_delivered = False
+                line_status = "ASIN quantity verification pending"
             if order_line_currently_delivered(row) and not line_delivered:
                 continue
             conn.execute(
@@ -37195,6 +37267,9 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 updated_row = conn.execute("SELECT * FROM order_lines WHERE id=?", (row["id"],)).fetchone()
                 if updated_row:
                     updated_rows_for_index.append(updated_row)
+        if strict_order:
+            current_rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_order_id=?", (amazon_order_id,)).fetchall())
+            delivered_flag = bool(current_rows) and all(order_line_currently_delivered(row) for row in current_rows)
     for updated_row in updated_rows_for_index:
         index_order_line(updated_row)
     related_updated = 0

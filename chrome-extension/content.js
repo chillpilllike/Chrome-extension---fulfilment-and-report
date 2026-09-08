@@ -10787,16 +10787,19 @@ function buildOrderMappings(activeJob, orders) {
   for (const item of items) {
     const requestedAsin = String(item.asin || "").toUpperCase();
     const itemAsins = [requestedAsin].filter(Boolean);
-    let order = orders.find((candidate) => {
+    const candidates = orders.filter((candidate) => {
       const candidateAsins = (candidate.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean);
       return candidateAsins.length && itemAsins.some((asin) => candidateAsins.includes(asin));
     });
-    if (!order && singleOrder) {
+    let order = candidates.length === 1 ? candidates[0] : null;
+    // Preserve the separately verified Business bundle reporting path only.
+    if (!order && !candidates.length && singleOrder && activeJob?.amazonAccountExperience === "business" && businessBundleCompletionEvidence(activeJob, orders)) {
       order = singleOrder;
     }
     if (!order) continue;
     mappings.push({
       asin: requestedAsin,
+      observed_asins: order.asins || [],
       line_ids: item.line_ids || [],
       amazon_order_id: order.amazon_order_id,
       amazon_order_url: order.amazon_order_url || orderDetailsUrl(order.amazon_order_id),
