@@ -11,3 +11,4 @@ dramatiq[redis]==1.17.1
 redis==5.0.7
 
 cryptography==46.0.5
+Pillow==11.3.0
