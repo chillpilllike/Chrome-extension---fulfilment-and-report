@@ -1,7 +1,7 @@
 {
     "name": "After-order Customer Portal",
     "summary": "Branded, secure customer decisions for after-order care",
-    "version": "18.0.2.2.0",
+    "version": "18.0.2.2.1",
     "category": "Website/Website",
     "license": "LGPL-3",
     "depends": ["website_sale", "sale_management", "portal"],

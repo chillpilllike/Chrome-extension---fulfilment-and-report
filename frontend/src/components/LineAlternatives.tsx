@@ -6,7 +6,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 
 type Fetcher = <T>(path: string, init?: RequestInit) => Promise<T>
 type Product = { name: string; default_code: string; original_total?: number; alternative_total?: number; difference?: number; currency: string; pricing_error?: string }
-type Offer = { line_id: number; recommendations: Product[]; selection?: { version: number; status: string; deadline_at: string; product: Product; last_error?: string; refund_status?: string; result: { quote_name?: string; email_status?: string; payment_verified?: boolean } } }
+type Offer = { line_id: number; recommendations: Product[]; selection?: { version: number; status: string; deadline_at: string; product: Product; last_error?: string; refund_status?: string; result: { quote_name?: string; email_status?: string; payment_verified?: boolean; cost_absorbed?: boolean; absorbed_amount?: number; approval_reason?: string } } }
 type Requests = { tracking_code?: string; mapping_candidates?: {id:number;product_name:string;quantity:number}[]; removals: {line_id: number; version: number; status: string; origin: string}[]; deadlines: {line_id: number; deadline_at: string; state: string; outcome: string}[]; parcel_items: {line_id: number; quantity: number}[] }
 type Event = { id: number; event_type: string; created_at: string; actor_label?: string; actor_type?: string; decision?: string; details?: Record<string, unknown> }
 
@@ -57,6 +57,9 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
   const [open, setOpen] = useState(false)
   const [events, setEvents] = useState<Event[]>([])
   const [offers, setOffers] = useState<Offer[]>([])
+  const [costOffer,setCostOffer] = useState<Offer | null>(null)
+  const [costReason,setCostReason] = useState('')
+  const [costAmount,setCostAmount] = useState('')
   const [requests, setRequests] = useState<Requests>({removals:[],deadlines:[],parcel_items:[]})
   const [mappingOpen,setMappingOpen] = useState(false)
   const [mapping,setMapping] = useState<Record<number,number>>({})
@@ -105,6 +108,8 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
           {offer.selection.product.difference != null ? <p className="font-medium">{offer.selection.product.difference < 0 ? 'Refund difference' : 'Additional payment'}: {offer.selection.product.currency} {Math.abs(offer.selection.product.difference).toFixed(2)}{offer.selection.refund_status && ` · ${offer.selection.refund_status.replaceAll('_',' ')}`}</p> : <p className="text-amber-800">Price needs review: {offer.selection.product.pricing_error}</p>}
           {offer.selection.result.quote_name && <p>Quotation {offer.selection.result.quote_name} · email {offer.selection.result.email_status || 'not verified'}</p>}
           {offer.selection.result.payment_verified && <p className="font-medium text-green-700">Payment verified</p>}
+          {offer.selection.result.cost_absorbed && <p className="font-medium text-green-700">Extra cost accepted by team · {offer.selection.product.currency} {offer.selection.result.absorbed_amount?.toFixed(2)} · No additional customer payment. {offer.selection.result.approval_reason}</p>}
+          {!!offer.selection.product.difference && offer.selection.product.difference > 0 && !offer.selection.result.cost_absorbed && !offer.selection.result.quote_name && ['choosing','needs_review'].includes(offer.selection.status) && <Button size="sm" variant="outline" disabled={loading} onClick={() => {setCostOffer(offer);setCostReason('');setCostAmount('')}}>Accept extra cost — no quotation</Button>}
           {offer.selection.product.difference != null && offer.selection.product.difference < 0 && ['waiting_refund','needs_review'].includes(offer.selection.status) && <Button size="sm" variant="outline" disabled={loading} onClick={async () => {
             const amount = Math.abs(offer.selection!.product.difference!)
             if (!window.confirm(`Approve ${offer.selection!.product.currency} ${amount.toFixed(2)} refund for ${orderNumber}, line ${offer.line_id}? Fulfilment waits for verified refund and accounting reconciliation.`)) return
@@ -121,6 +126,21 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
         </>}
       </section>)}
       {loading && <p role="status">Loading timeline…</p>}{error && <p role="alert" className="text-destructive">{error}</p>}
+      <Dialog open={!!costOffer} onOpenChange={open => {if(!loading && !open)setCostOffer(null)}}><DialogContent>
+        <DialogHeader><DialogTitle>Accept replacement extra cost</DialogTitle><DialogDescription>{orderNumber} · line {costOffer?.line_id} · {costOffer?.selection?.product.name}. The business absorbs this extra cost; no additional payment is requested. The 24-hour selection window stays unchanged.</DialogDescription></DialogHeader>
+        <p>Extra cost: {costOffer?.selection?.product.currency} {costOffer?.selection?.product.difference?.toFixed(2)}</p>
+        <label htmlFor={`cost-amount-${caseId}`}>Type the exact amount to confirm</label>
+        <Input id={`cost-amount-${caseId}`} inputMode="decimal" value={costAmount} onChange={e=>setCostAmount(e.target.value)} disabled={loading}/>
+        <label htmlFor={`cost-reason-${caseId}`}>Approval reason</label>
+        <Input id={`cost-reason-${caseId}`} value={costReason} onChange={e=>setCostReason(e.target.value)} maxLength={500} disabled={loading}/>
+        <Button disabled={loading || costReason.trim().length<3 || !costAmount.trim() || Number(costAmount)!==costOffer?.selection?.product.difference} onClick={async()=>{
+          if(!costOffer?.selection)return
+          setLoading(true);try {
+            const result=await request<{ok:boolean;message:string}>(`/api/after-order/cases/${caseId}/lines/${costOffer.line_id}/accept-replacement-cost`,{method:'POST',body:JSON.stringify({version:costOffer.selection.version,confirm_amount:Number(costAmount),reason:costReason.trim()})})
+            setNotice(result.message);if(result.ok)setCostOffer(null);await load()
+          }catch(error){setError(String(error))}finally{setLoading(false)}
+        }}>Confirm business absorbs extra cost</Button>
+      </DialogContent></Dialog>
       <ol className="space-y-3 border-l-2 border-primary/20 pl-4">
         {events.filter(event => JSON.stringify(event).toLowerCase().includes(filter.toLowerCase())).map(event => <li key={event.id} className="text-sm">
           <div className="flex flex-wrap justify-between gap-2"><strong>{event.event_type.replaceAll('_',' ')}</strong><time dateTime={event.created_at}>{date(event.created_at)}</time></div>

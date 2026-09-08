@@ -10,7 +10,7 @@ from unittest.mock import patch, Mock
 
 from fastapi import HTTPException
 from app.services.alternative_selection import selection_change, money_difference, price_fingerprint, resolved_asin
-from app.services.alternative_workflow import Workflow, SCHEMA, Recommendations, RefundApproval
+from app.services.alternative_workflow import Workflow, SCHEMA, Recommendations, RefundApproval, CostAcceptance
 from app.services.asin import encode_asin, extract_asin_from_notes, decode_asin_reference, normalize_asin
 
 
@@ -173,6 +173,39 @@ class StoredSelections(unittest.TestCase):
 
     def refund_endpoint(self):
         return next(route.endpoint for route in self.workflow.router().routes if route.path.endswith('/approve-replacement-refund'))
+
+    def cost_endpoint(self):
+        return next(route.endpoint for route in self.workflow.router().routes if route.path.endswith('/accept-replacement-cost'))
+
+    def test_cost_acceptance_test_mode_has_no_side_effects(self):
+        self.namespace['after_order_email_test_mode']=lambda:True
+        self.namespace['OdooClient']=Mock(side_effect=AssertionError('Live call'))
+        self.assertIn('Test preview',self.cost_endpoint()(1,10,CostAcceptance(version=1,confirm_amount=2,reason='Goodwill'))['message'])
+        self.namespace['OdooClient'].assert_not_called()
+
+    def test_cost_acceptance_records_approval_without_resetting_deadline(self):
+        self.prepare_refund_choice()
+        self.conn.execute("UPDATE after_order_line_selections SET status='choosing',product_json=? WHERE line_id=10",(json.dumps({'product_id':100,'difference':2,'pricing_signature':'agreed'}),))
+        before=self.conn.execute('SELECT deadline_at FROM after_order_line_selections WHERE line_id=10').fetchone()[0]
+        self.odoo.execute.return_value={'cost_absorbed':True,'absorbed_amount':2}
+        self.assertTrue(self.cost_endpoint()(1,10,CostAcceptance(version=1,confirm_amount=2,reason='Goodwill'))['ok'])
+        self.assertEqual(self.odoo.execute.call_args.args[1],'after_order_accept_replacement_cost')
+        self.assertEqual(before,self.conn.execute('SELECT deadline_at FROM after_order_line_selections WHERE line_id=10').fetchone()[0])
+
+    def test_cost_acceptance_rejects_negative_price_and_existing_quote(self):
+        self.prepare_refund_choice()
+        with self.assertRaises(HTTPException):self.cost_endpoint()(1,10,CostAcceptance(version=1,confirm_amount=2,reason='Goodwill'))
+        self.conn.execute("UPDATE after_order_line_selections SET status='choosing',product_json=?,result_json=? WHERE line_id=10",(json.dumps({'difference':2}),json.dumps({'quote_id':99})))
+        with self.assertRaises(HTTPException):self.cost_endpoint()(1,10,CostAcceptance(version=1,confirm_amount=2,reason='Goodwill'))
+        self.odoo.execute.assert_not_called()
+
+    def test_new_selection_clears_previous_team_cost_approval(self):
+        now=datetime.now(timezone.utc)
+        self.choose(10,100,now)
+        self.conn.execute('UPDATE after_order_line_selections SET result_json=? WHERE line_id=10',(json.dumps({'cost_absorbed':True}),))
+        self.choose(10,101,now+timedelta(hours=1))
+        row=self.conn.execute('SELECT version,result_json FROM after_order_line_selections WHERE line_id=10').fetchone()
+        self.assertEqual(row['version'],2);self.assertEqual(json.loads(row['result_json']),{})
 
     def prepare_refund_choice(self):
         self.choose(10,100,datetime.now(timezone.utc)-timedelta(days=2))

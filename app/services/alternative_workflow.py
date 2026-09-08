@@ -68,6 +68,10 @@ class RefundApproval(BaseModel):
     confirm_amount: float = Field(gt=0, allow_inf_nan=False)
 
 
+class CostAcceptance(RefundApproval):
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class Runtime:
     def __init__(self, namespace):
         self.namespace = namespace
@@ -274,7 +278,7 @@ class Workflow:
             conn.execute('''INSERT INTO after_order_line_selections
                 (case_id,line_id,test_mode,version,product_json,first_selected_at,deadline_at,status,issue_fingerprint,updated_at)
                 VALUES(?,?,?,?,?,?,?,'choosing',?,?) ON CONFLICT(case_id,line_id,test_mode) DO UPDATE SET
-                version=excluded.version,product_json=excluded.product_json,status='choosing',updated_at=excluded.updated_at''',
+                version=excluded.version,product_json=excluded.product_json,status='choosing',result_json='{}',refund_status='',last_error=NULL,updated_at=excluded.updated_at''',
                 (case['id'],line_id,int(test_mode),change['version'],json.dumps(product),change['first_selected_at'],change['deadline_at'],r.request_fingerprint(case),r.utc_now()))
             if not test_mode:
                 conn.execute("UPDATE after_order_cases SET current_decision='offer_alternatives', decision_version=decision_version+1, decision_updated_at=?, status='needs_confirmation', decision_fingerprint=?, updated_at=? WHERE id=?",
@@ -322,6 +326,7 @@ class Workflow:
                     if refund.get('refund_status') == 'needs_review':
                         raise ValueError(refund.get('error') or 'Refund requires reconciliation.')
                 if (product['difference'] > 0 and not previous_result.get('quote_id')
+                        and not previous_result.get('cost_absorbed')
                         and hasattr(r, 'care_delivery')
                         and r.care_delivery.suppressed(case.get('customer_email') or '', False)):
                     raise ValueError('Payment email recipient is suppressed. Team review required before creating a quotation.')
@@ -489,6 +494,42 @@ class Workflow:
     def router(self):
         # Financial approvals use the app's existing authenticated admin middleware.
         router = APIRouter()
+
+        @router.post('/api/after-order/cases/{case_id}/lines/{line_id}/accept-replacement-cost')
+        def accept_cost(case_id: int, line_id: int, payload: CostAcceptance):
+            r=self.r
+            if r.after_order_email_test_mode():
+                return {'ok':True,'message':'Test preview: no cost approval, quotation or fulfilment change was made.'}
+            if len(payload.reason.strip())<3:
+                raise HTTPException(400,'Enter a reason for accepting the cost.')
+            with r.db() as conn:
+                conn.execute('SELECT id FROM after_order_cases WHERE id=? FOR UPDATE',(case_id,)).fetchone()
+                case,line=self.case_line(case_id,line_id)
+                row=conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=0 FOR UPDATE',(case_id,line_id)).fetchone()
+                if (not row or row['version']!=payload.version or row['status'] not in ('choosing','needs_review','waiting_payment')
+                        or case.get('confirmed_at') or case.get('current_decision')!='offer_alternatives'
+                        or row['issue_fingerprint']!=r.request_fingerprint(case)):
+                    raise HTTPException(409,'The selection changed or processing has already started. Refresh before approving.')
+                product=json.loads(row['product_json']);previous=json.loads(row['result_json'])
+                if (product.get('pricing_error') or previous.get('quote_id') or previous.get('refund_id')
+                        or Decimal(str(product['difference']))<=0 or Decimal(str(payload.confirm_amount))!=Decimal(str(product['difference']))):
+                    raise HTTPException(409,'Only the exact extra cost can be absorbed, before a quotation or refund exists.')
+                odoo=r.OdooClient(r.get_store(case['store_id']))
+                try:
+                    result=odoo.execute('sale.order','after_order_accept_replacement_cost',[[case['odoo_order_id']],
+                        int(line['odoo_line_id']),int(case['website_id']),product['product_id'],
+                        f'care:{case_id}:line:{line_id}:v:{row["version"]}',product['pricing_signature'],payload.confirm_amount,payload.reason.strip()])
+                except Exception as exc:
+                    error=r.clean_error_message(exc)
+                    self.event(conn,case,'replacement_cost_approval_failed',line_id,error=error)
+                    return {'ok':False,'message':error}
+                conn.execute("UPDATE after_order_line_selections SET status='choosing',result_json=?,last_error=NULL,updated_at=? WHERE case_id=? AND line_id=? AND test_mode=0",
+                    (json.dumps({**previous,**result}),r.utc_now(),case_id,line_id))
+                if not previous.get('cost_absorbed'):
+                    self.event(conn,case,'replacement_extra_cost_accepted',line_id,actor='team',version=row['version'],**result)
+            self.process(case_id,line_id)  # Retains the original 24-hour deadline.
+            self.release(case_id)
+            return {'ok':True,'message':'Extra cost accepted. No additional quotation will be created for this selection. Processing still waits for the selection deadline and other line checks.'}
 
         @router.post('/api/after-order/cases/{case_id}/lines/{line_id}/approve-replacement-refund')
         def approve_refund(case_id: int, line_id: int, payload: RefundApproval):

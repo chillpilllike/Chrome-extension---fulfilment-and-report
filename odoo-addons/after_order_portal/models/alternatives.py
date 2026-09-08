@@ -113,6 +113,9 @@ class SaleOrder(models.Model):
         if not operation_key.startswith('care:') or len(operation_key) > 160:
             raise UserError('Invalid alternative operation key.')
         self.env.cr.execute('SELECT id FROM sale_order WHERE id=%s FOR UPDATE', (self.id,))
+        self.invalidate_recordset()
+        self.order_line.invalidate_recordset()
+        line = self._after_order_guard(line_id, website_id)
         product = self.env['product.product'].browse(int(product_id)).exists()
         if not product:
             raise UserError('Selected product no longer exists.')
@@ -122,6 +125,11 @@ class SaleOrder(models.Model):
         if info['product_id'] != product.id or info['pricing_signature'] != pricing_signature:
             raise UserError('Alternative pricing changed; obtain a new customer agreement.')
         result = {'difference': info['difference'], 'currency': info['currency'], 'status': 'ready'}
+        if info['difference'] > 0:
+            approved=self._after_order_accepted_cost(operation_key,line,product,info)
+            if approved:
+                return {**result,'cost_absorbed':True,'absorbed_amount':approved['amount'],
+                        'approval_reason':approved['reason'],'payment_required':False}
         if info['difference'] <= 0:
             # Credit notes/refunds are deliberately left for the team's approval.
             result['refund_amount'] = abs(info['difference'])
