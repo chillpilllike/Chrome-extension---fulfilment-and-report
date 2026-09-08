@@ -28,7 +28,7 @@ class ReplacementQuantityTests(unittest.TestCase):
                   'replacement_assigned_at': None, 'amazon_order_id': None, 'amazon_status': None,
                   'amazon_group_key': None, 'missing_asin': None, 'last_error': None,
                   'updated_at': None, 'state': 'pulled', 'chrome_claimed_by': None,
-                  'inventory_allocated_quantity': 0}
+                  'inventory_allocated_quantity': 0, 'bundle_parent_line_id': None, 'bundle_component_count': 1, 'bundle_price_share': None}
         self.conn.execute('CREATE TABLE order_lines (' + ', '.join(fields) + ')')
         self.conn.execute('INSERT INTO order_lines VALUES (' + ','.join('?' for _ in fields) + ')', list(fields.values()))
         self.conn.commit()

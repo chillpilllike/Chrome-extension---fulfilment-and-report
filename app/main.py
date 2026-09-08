@@ -5,6 +5,7 @@ from app.services.inventory_labels import annotate_inventory_labels
 from app.services.inventory_legacy import install_inventory_legacy, legacy_delivery_available
 
 import base64
+from app.services import replacement_bundle
 from app.services.replacement_images import ReplacementImageSyncError, image_failure_details, validate_image_base64
 import csv
 import copy
@@ -2220,6 +2221,9 @@ def init_db() -> None:
             "original_product_name": "ALTER TABLE order_lines ADD COLUMN original_product_name TEXT",
             "replacement_asin": "ALTER TABLE order_lines ADD COLUMN replacement_asin TEXT",
             "replacement_quantity": "ALTER TABLE order_lines ADD COLUMN replacement_quantity REAL",
+            "bundle_parent_line_id": "ALTER TABLE order_lines ADD COLUMN bundle_parent_line_id INTEGER REFERENCES order_lines(id) ON DELETE CASCADE",
+            "bundle_component_count": "ALTER TABLE order_lines ADD COLUMN bundle_component_count INTEGER NOT NULL DEFAULT 1",
+            "bundle_price_share": "ALTER TABLE order_lines ADD COLUMN bundle_price_share REAL",
             "original_quantity": "ALTER TABLE order_lines ADD COLUMN original_quantity REAL",
             "replacement_product_name": "ALTER TABLE order_lines ADD COLUMN replacement_product_name TEXT",
             "replacement_note": "ALTER TABLE order_lines ADD COLUMN replacement_note TEXT",
@@ -8503,6 +8507,7 @@ ORDER_LINE_PAGE_SELECT = """
     amazon_order_url, amazon_account_id, amazon_account_name, order_engine, amazon_group_key,
     amazon_status, tracking_status, tracking_checked_at, amazon_cancelled_at,
     amazon_cancelled_order_id, chrome_claimed_by, chrome_claimed_at, chrome_claim_expires_at,
+    bundle_parent_line_id, bundle_component_count,
     last_error, missing_asin, original_asin, replacement_asin, replacement_product_name,
     replacement_note, replacement_assigned_at, original_product_name, cost_approved_at, cost_review_loss,
     replacement_run_id, replacement_sequence, replacement_reason, replacement_original_line_id,
@@ -8525,6 +8530,7 @@ ORDER_LINE_PAGE_COLUMNS = (
     "amazon_order_url", "amazon_account_id", "amazon_account_name", "order_engine", "amazon_group_key",
     "amazon_status", "tracking_status", "tracking_checked_at", "amazon_cancelled_at",
     "amazon_cancelled_order_id", "chrome_claimed_by", "chrome_claimed_at", "chrome_claim_expires_at",
+    "bundle_parent_line_id", "bundle_component_count",
     "last_error", "missing_asin", "original_asin", "replacement_asin", "replacement_product_name",
     "replacement_note", "replacement_assigned_at", "original_product_name", "cost_approved_at", "cost_review_loss",
     "replacement_run_id", "replacement_sequence", "replacement_reason", "replacement_original_line_id",
@@ -9749,15 +9755,15 @@ def save_combined_order_line(
                 END,
                 supplier_part_auxiliary_id=COALESCE(NULLIF(order_lines.supplier_part_auxiliary_id, ''), excluded.supplier_part_auxiliary_id),
                 quantity=COALESCE(order_lines.replacement_quantity, excluded.quantity),
-                store_unit_price=excluded.store_unit_price,
-                store_total_price=excluded.store_total_price,
+                store_unit_price=CASE WHEN order_lines.bundle_price_share IS NOT NULL THEN excluded.store_unit_price * excluded.quantity * order_lines.bundle_price_share / COALESCE(NULLIF(order_lines.replacement_quantity, 0), excluded.quantity) ELSE excluded.store_unit_price END,
+                store_total_price=excluded.store_total_price * COALESCE(order_lines.bundle_price_share, 1),
                 store_currency=excluded.store_currency,
                 store_currency_rate_to_usd=excluded.store_currency_rate_to_usd,
-                store_subtotal_native=excluded.store_subtotal_native,
-                store_delivery_native=excluded.store_delivery_native,
-                store_discount_native=excluded.store_discount_native,
-                store_adjustment_native=excluded.store_adjustment_native,
-                store_total_native=excluded.store_total_native,
+                store_subtotal_native=excluded.store_subtotal_native * COALESCE(order_lines.bundle_price_share, 1),
+                store_delivery_native=excluded.store_delivery_native * COALESCE(order_lines.bundle_price_share, 1),
+                store_discount_native=excluded.store_discount_native * COALESCE(order_lines.bundle_price_share, 1),
+                store_adjustment_native=excluded.store_adjustment_native * COALESCE(order_lines.bundle_price_share, 1),
+                store_total_native=excluded.store_total_native * COALESCE(order_lines.bundle_price_share, 1),
                 odoo_order_state=excluded.odoo_order_state,
                 odoo_invoice_status=excluded.odoo_invoice_status,
                 odoo_status_label=excluded.odoo_status_label,
@@ -9833,6 +9839,7 @@ def save_combined_order_line(
                 utc_now(),
             ),
         )
+        replacement_bundle.sync_imported_bundle_finances(conn, store.id)
         saved = None
         if post_process:
             saved = conn.execute(
@@ -10454,15 +10461,15 @@ def process_odoo_order_batch(
                     END,
                     supplier_part_auxiliary_id=COALESCE(NULLIF(order_lines.supplier_part_auxiliary_id, ''), excluded.supplier_part_auxiliary_id),
                     quantity=COALESCE(order_lines.replacement_quantity, excluded.quantity),
-                    store_unit_price=excluded.store_unit_price,
-                    store_total_price=excluded.store_total_price,
+                    store_unit_price=CASE WHEN order_lines.bundle_price_share IS NOT NULL THEN excluded.store_unit_price * excluded.quantity * order_lines.bundle_price_share / COALESCE(NULLIF(order_lines.replacement_quantity, 0), excluded.quantity) ELSE excluded.store_unit_price END,
+                    store_total_price=excluded.store_total_price * COALESCE(order_lines.bundle_price_share, 1),
                     store_currency=excluded.store_currency,
                     store_currency_rate_to_usd=excluded.store_currency_rate_to_usd,
-                    store_subtotal_native=excluded.store_subtotal_native,
-                    store_delivery_native=excluded.store_delivery_native,
-                    store_discount_native=excluded.store_discount_native,
-                    store_adjustment_native=excluded.store_adjustment_native,
-                    store_total_native=excluded.store_total_native,
+                    store_subtotal_native=excluded.store_subtotal_native * COALESCE(order_lines.bundle_price_share, 1),
+                    store_delivery_native=excluded.store_delivery_native * COALESCE(order_lines.bundle_price_share, 1),
+                    store_discount_native=excluded.store_discount_native * COALESCE(order_lines.bundle_price_share, 1),
+                    store_adjustment_native=excluded.store_adjustment_native * COALESCE(order_lines.bundle_price_share, 1),
+                    store_total_native=excluded.store_total_native * COALESCE(order_lines.bundle_price_share, 1),
                     odoo_order_state=excluded.odoo_order_state,
                     odoo_invoice_status=excluded.odoo_invoice_status,
                     odoo_status_label=excluded.odoo_status_label,
@@ -10494,6 +10501,7 @@ def process_odoo_order_batch(
                 template=f"({','.join('?' for _ in range(45))})",
                 page_size=500,
             )
+            replacement_bundle.sync_imported_bundle_finances(conn, store.id)
             count = new_record_count
         print(f"[pull] store={store.id} saved {len(bulk_rows)} local order-line records; new={count}", flush=True)
     return count
@@ -13270,6 +13278,7 @@ def normalize_selected_chrome_line_ids(
     selected_ids = sorted({int(line_id) for line_id in line_ids if int(line_id or 0) > 0})
     if not selected_ids:
         return []
+    selected_ids = replacement_bundle.expand_bundle_selection(conn, store_id, selected_ids)
     selected_rows = conn.execute(
         f"""
         SELECT id
@@ -13478,6 +13487,7 @@ def persist_chrome_order_groups(
     queued_line_ids: list[int] = []
     queued_snapshots: list[dict[str, Any]] = []
     for group_key_seed, group_lines in grouped.items():
+        require_complete_bundle_queue(conn, group_lines)
         group_key = f"chrome-{group_lines[0]['store_id']}-{group_key_seed}-{uuid.uuid4().hex[:10]}"
         order_names = list(dict.fromkeys(str(line["odoo_order_name"]) for line in group_lines))
         attempt_payload = {
@@ -13593,6 +13603,7 @@ def queue_chrome_order_groups_fast(
         selected_ids = sorted({int(line_id) for line_id in (line_ids or []) if int(line_id or 0) > 0})
         if selected_scope and not selected_ids:
             return 0, 0, 0, {}, []
+        selected_ids = replacement_bundle.expand_bundle_selection(conn, store_id, selected_ids)
         selected_id_set = set(selected_ids)
         cleared_count = 0
         if not selected_scope:
@@ -27663,6 +27674,91 @@ def api_process_replacement(payload: ProcessReplacementPayload) -> dict[str, Any
     return data
 
 
+def replacement_bundle_read(conn: Any, line_id: int, store_id: Optional[int] = None, lock: bool = False) -> tuple[dict, list[dict]]:
+    try:
+        return replacement_bundle.read_bundle(conn, line_id, store_id, lock)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/lines/{line_id}/replacement")
+def api_get_replacement_components(line_id: int) -> dict[str, Any]:
+    with db() as conn:
+        root, rows = replacement_bundle_read(conn, line_id)
+    return {"root_line_id": root["id"], "original_asin": root.get("original_asin") or root["asin"],
+            "note": root.get("replacement_note") or "", "has_replacement": bool(root.get("replacement_asin")),
+            "components": [{"line_id": row["id"], "asin": row.get("replacement_asin") or "", "quantity": row["quantity"]} for row in rows]}
+
+
+def replacement_components_result(root_id: int, removed: list[int], message: str, allow_auto_queue: bool = False) -> dict[str, Any]:
+    for line_id in removed:
+        delete_order_line_index(line_id)
+    with db() as conn:
+        root, rows = replacement_bundle_read(conn, root_id)
+    for row in rows:
+        index_order_line(row)
+    queued = 0
+    if allow_auto_queue and auto_chrome_ordering_enabled():
+        queued, queue_message = auto_queue_ready_missing_order(int(root["store_id"]), int(root["odoo_order_id"]))
+        if queue_message:
+            message += " " + queue_message
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "missing", "bulk", "back-in-stock", "chrome-jobs", "fulfilment-pending"})
+    return {"ok": True, "message": message, "queued": queued, "row": row_to_dict(root), "removed_line_ids": removed}
+
+
+def api_assign_replacement_components(line_id: int, payload: ReplacementPayload) -> dict[str, Any]:
+    components = []
+    seen = set()
+    for component in payload.components or []:
+        asin = normalize_asin(component.asin)
+        if not asin or asin in seen:
+            raise HTTPException(400, "Enter a different valid 10-character ASIN for each replacement component.")
+        seen.add(asin)
+        components.append({"asin": asin, "quantity": component.quantity,
+                           "image": replacement_upload_image(component.image_base64) if component.image_base64 is not None else None,
+                           "title": fetch_amazon_product_title(asin) or f"Replacement ASIN {asin}"})
+    if not components:
+        raise HTTPException(400, "Add at least one replacement ASIN.")
+    with db() as conn:
+        root, existing = replacement_bundle_read(conn, line_id, payload.store_id, lock=True)
+        saved_images = {}
+        for row in existing:
+            image = conn.execute("SELECT * FROM replacement_product_images WHERE order_line_id=? AND asin=?", (row["id"], row.get("replacement_asin") or "")).fetchone()
+            if image:
+                saved_images[row["replacement_asin"]] = dict(image)
+        try:
+            ids, removed = replacement_bundle.assign_components(conn, root, existing, components, clean_text(payload.note), utc_now())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        for row_id, component in zip(ids, components):
+            image = component["image"] or saved_images.get(component["asin"])
+            if image:
+                save_replacement_product_image(conn, row_id, component["asin"], image)
+    summary = ", ".join(f"{item['asin']} × {item['quantity']}" for item in components)
+    return replacement_components_result(root["id"], removed, f"Replacement saved: {summary}. All bundle components will be queued together.", allow_auto_queue=True)
+
+
+def api_reset_replacement_components(line_id: int, store_id: int) -> dict[str, Any]:
+    with db() as conn:
+        root, existing = replacement_bundle_read(conn, line_id, store_id, lock=True)
+        try:
+            removed = replacement_bundle.reset_components(conn, root, existing, utc_now())
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    return replacement_components_result(root["id"], removed, "Replacement bundle reset to the original ASIN and quantity.")
+
+
+def require_complete_bundle_queue(conn: Any, lines: list[dict[str, Any]]) -> None:
+    selected = {int(row["id"]) for row in lines}
+    roots = {int(row.get("bundle_parent_line_id") or row["id"]) for row in lines if int(row.get("bundle_component_count") or 1) > 1}
+    for root_id in roots:
+        _, siblings = replacement_bundle_read(conn, root_id)
+        for sibling in siblings:
+            fulfilled = bool(sibling.get("amazon_order_id")) or float(sibling.get("inventory_sent_quantity") or 0) >= float(sibling.get("quantity") or 1)
+            if not fulfilled and sibling["id"] not in selected:
+                raise HTTPException(409, "All unfulfilled bundle components must be ready and selected together before Chrome can process this order.")
+
+
 def replacement_upload_image(value: str) -> dict[str, Any]:
     try:
         return validate_image_base64(value)
@@ -27714,6 +27810,8 @@ def api_shopify_replacement_image(job_id: str, payload: dict[str, Any]) -> dict[
 
 @app.post("/api/lines/{line_id}/replacement")
 def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[str, Any]:
+    if payload.components is not None:
+        return api_assign_replacement_components(line_id, payload)
     replacement_asin = normalize_asin(payload.asin)
     if not replacement_asin:
         raise HTTPException(400, "Replacement ASIN must be a valid 10-character ASIN.")
@@ -27725,6 +27823,8 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
             row = conn.execute("SELECT * FROM order_lines WHERE id=? FOR UPDATE", (line_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Order line not found.")
+        if int(row.get("bundle_component_count") or 1) > 1:
+            raise HTTPException(409, "Edit all replacement ASINs together using the bundle editor.")
         effective_store_id = int(row["store_id"])
         if row["amazon_order_id"]:
             raise HTTPException(400, "Reset fulfilment before changing the ASIN on an already fulfilled line.")
@@ -27829,6 +27929,10 @@ def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, An
     store_id = int(payload.get("store_id") or 0)
     if not store_id:
         raise HTTPException(400, "Store is required.")
+    with db() as conn:
+        root, existing = replacement_bundle_read(conn, line_id, store_id)
+        if int(root.get("bundle_component_count") or 1) > 1 or root.get("bundle_price_share") is not None:
+            return api_reset_replacement_components(line_id, store_id)
     now = utc_now()
     with db() as conn:
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=? FOR UPDATE", (line_id, store_id)).fetchone()
@@ -32768,6 +32872,9 @@ def sync_amazon_order_products_to_odoo(
             odoo = OdooClient(get_store(store_id))
             line_plan: dict[int, dict[str, Any]] = {}
             for row in store_rows:
+                if int(row.get("bundle_component_count") or 1) > 1:
+                    summary["replacement_skipped"] += 1
+                    continue
                 requested_asin = normalize_asin(row.get("asin") or "")
                 pricing = pricing_by_asin.get(requested_asin, {})
                 purchased_asin = normalize_asin(pricing.get("purchased_asin") or requested_asin)

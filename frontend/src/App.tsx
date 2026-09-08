@@ -212,6 +212,8 @@ type OrderLine = {
   missing_asin_url?: string
   original_asin?: string
   original_product_name?: string
+  bundle_parent_line_id?: number
+  bundle_component_count?: number
   replacement_asin?: string
   replacement_product_name?: string
   replacement_note?: string
@@ -4997,6 +4999,7 @@ function App() {
               <TooltipContent side="top" align="start" className="max-w-sm whitespace-normal leading-relaxed">
                 Original ASIN: {row.original_asin || "unknown"}<br />
                 Replacement ASIN: {row.replacement_asin}
+                {Number(row.bundle_component_count || 1) > 1 ? <><br />Bundle component · {row.bundle_component_count} ASINs linked to original line #{row.bundle_parent_line_id || row.id}</> : null}
                 {row.replacement_note ? <><br />Note: {row.replacement_note}</> : null}
               </TooltipContent>
             </Tooltip>
@@ -6529,6 +6532,9 @@ function App() {
                 } : current)
                 selectedOrderRowsRef.current.set(row.id, row)
               }
+              setSelected([])
+              selectedOrderRowsRef.current.clear()
+              await refreshCurrentOrdersPage()
               const result = await api<{ rows: OrderLine[]; total: number }>(`/api/missing${pagedQuery(storeId, missingPage)}`)
               setMissingRows(result.rows)
               setMissingTotal(result.total || 0)
@@ -14733,96 +14739,86 @@ function ReplacementImageRecovery({ asin, disabled, onUpload }: { asin: string; 
   )
 }
 
-function ReplacementDialog({
-  line,
-  storeId,
-  onClose,
-  onSaved,
-  onResult,
-}: {
+function ReplacementDialog({ line, storeId, onClose, onSaved, onResult }: {
   line: OrderLine
   storeId: number
   onClose: () => void
   onSaved: (message: string, row?: OrderLine) => Promise<void>
   onResult: (modal: ModalState) => void
 }) {
-  const [imageFile, setImageFile] = useState<File | null>(null)
-  const [asin, setAsin] = useState("")
-  const [changeQuantity, setChangeQuantity] = useState(false)
-  const [quantity, setQuantity] = useState(String(line.quantity))
-  const validQuantity = Number.isSafeInteger(Number(quantity)) && Number(quantity) > 0
+  type Component = { key: string; asin: string; quantity: string; image: File | null }
+  const [components, setComponents] = useState<Component[]>([])
   const [note, setNote] = useState("")
-  const [saving, setSaving] = useState(false)
-  const [resetting, setResetting] = useState(false)
+  const [originalAsin, setOriginalAsin] = useState(line.original_asin || line.asin)
+  const [hasReplacement, setHasReplacement] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
   useEffect(() => {
-    setImageFile(null)
-    setChangeQuantity(false)
-    setQuantity(String(line.quantity))
-    setAsin(line.replacement_asin || "")
-    setNote(line.replacement_note || "")
-  }, [line])
+    let active = true
+    setLoading(true)
+    api<{ original_asin: string; note: string; has_replacement: boolean; components: { line_id: number; asin: string; quantity: number }[] }>(`/api/lines/${line.id}/replacement`)
+      .then((result) => {
+        if (!active) return
+        setComponents(result.components.map((item) => ({ key: String(item.line_id), asin: item.asin, quantity: String(item.quantity), image: null })))
+        setOriginalAsin(result.original_asin)
+        setNote(result.note)
+        setHasReplacement(result.has_replacement)
+        setError("")
+      }).catch((failure) => active && setError(String(failure)))
+      .finally(() => active && setLoading(false))
+    return () => { active = false }
+  }, [line.id])
+  const valid = components.length > 0 && components.every((item) => /^[A-Z0-9]{10}$/.test(item.asin) && Number.isSafeInteger(Number(item.quantity)) && Number(item.quantity) > 0)
+    && new Set(components.map((item) => item.asin)).size === components.length
+  function change(key: string, values: Partial<Component>) {
+    setComponents((current) => current.map((item) => item.key === key ? { ...item, ...values } : item))
+  }
+  async function save(reset = false) {
+    setBusy(true)
+    try {
+      const body = reset ? { store_id: storeId } : {
+        store_id: storeId, note,
+        components: await Promise.all(components.map(async (item) => ({
+          asin: item.asin, quantity: Number(item.quantity),
+          ...(item.image ? { image_base64: await replacementImageBase64(item.image) } : {}),
+        }))),
+      }
+      const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement${reset ? "/reset" : ""}`, { method: "POST", body: JSON.stringify(body) })
+      await onSaved(result.message, result.row)
+    } catch (failure) {
+      onResult({ ok: false, title: "Replacement Save Failed", message: String(failure) })
+    } finally { setBusy(false) }
+  }
   return (
-    <Dialog open onOpenChange={(next) => !next && onClose()}>
-      <DialogContent className="sm:max-w-xl">
+    <Dialog open onOpenChange={(next) => !next && !busy && onClose()}>
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Assign Replacement ASIN</DialogTitle>
-          <DialogDescription>{line.odoo_order_name} / current {line.asin}</DialogDescription>
+          <DialogTitle>Assign Replacement ASINs</DialogTitle>
+          <DialogDescription>{line.odoo_order_name} · Original bundle ASIN: {originalAsin}</DialogDescription>
         </DialogHeader>
-        <div className="form-fieldset grid gap-3">
-          <TextField label="Replacement ASIN" value={asin} onChange={(value) => setAsin(value.toUpperCase())} />
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={changeQuantity} onCheckedChange={(checked) => setChangeQuantity(Boolean(checked))} />
-            Change quantity too? (current: {line.quantity})
-          </label>
-          {changeQuantity && <TextField label="New quantity (number of packs/units)" value={quantity} onChange={setQuantity} type="number" />}
-          {changeQuantity && !validQuantity && <p className="text-sm text-destructive">Enter a positive whole number.</p>}
-          <p className="text-sm text-muted-foreground">Example: replace 1 × 400-count pack with 2 × 200-count packs. The new Shopify DTC/DTB order will use the replacement ASIN, its image, and the selected quantity.</p>
-          <ReplacementImagePicker file={imageFile} onChange={setImageFile} disabled={saving || resetting} />
-          <TextField label="Internal note" value={note} onChange={setNote} />
-        </div>
+        <p className="text-sm text-muted-foreground">Replace the original item with one or more ASINs. Enter the total quantity to send for each ASIN. Chrome will process every component together; the new Shopify order will contain each ASIN and its image.</p>
+        {loading && <p>Loading replacements…</p>}
+        {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+        {components.map((item, index) => (
+          <fieldset key={item.key} disabled={busy || loading} className="grid gap-3 rounded-md border p-3">
+            <legend className="px-1 text-sm font-medium">Replacement {index + 1}</legend>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <TextField label="ASIN" value={item.asin} onChange={(asin) => change(item.key, { asin: asin.trim().toUpperCase() })} />
+              <TextField label="Quantity (packs/units)" value={item.quantity} type="number" onChange={(quantity) => change(item.key, { quantity })} />
+            </div>
+            <ReplacementImagePicker file={item.image} onChange={(image) => change(item.key, { image })} disabled={busy || loading} />
+            {components.length > 1 && <Button variant="outline" size="sm" onClick={() => setComponents((current) => current.filter((candidate) => candidate.key !== item.key))}>Remove this ASIN</Button>}
+          </fieldset>
+        ))}
+        {!loading && !error && <Button variant="outline" disabled={busy || components.length >= 10} onClick={() => setComponents((current) => [...current, { key: crypto.randomUUID(), asin: "", quantity: "1", image: null }])}>Add another ASIN</Button>}
+        {!loading && !error && !valid && <p className="text-xs text-destructive">Each component needs a different valid ASIN and a positive whole-number quantity.</p>}
+        <TextField label="Internal note" value={note} onChange={setNote} />
         <DialogFooter className="gap-2 sm:justify-between">
-          <Button
-            variant="outline"
-            disabled={!line.replacement_asin || saving || resetting}
-            onClick={async () => {
-              try {
-                setResetting(true)
-                const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement/reset`, {
-                  method: "POST",
-                  body: JSON.stringify({ store_id: storeId }),
-                })
-                await onSaved(result.message, result.row)
-              } catch (error) {
-                onResult({ ok: false, title: "Replacement Reset Failed", message: String(error) })
-              } finally {
-                setResetting(false)
-              }
-            }}
-          >
-            <RefreshCw className="size-4" />
-            {resetting ? "Resetting" : "Reset Replacement"}
-          </Button>
+          <Button variant="outline" disabled={busy || loading || !hasReplacement} onClick={() => save(true)}>Reset to original item</Button>
           <div className="flex gap-2">
-          <Button variant="outline" disabled={saving || resetting} onClick={onClose}>Cancel</Button>
-          <Button
-            disabled={saving || resetting || (changeQuantity && !validQuantity)}
-            onClick={async () => {
-              try {
-                setSaving(true)
-                const result = await api<{ ok: boolean; message: string; row?: OrderLine }>(`/api/lines/${line.id}/replacement`, {
-                  method: "POST",
-                  body: JSON.stringify({ store_id: storeId, asin, note, ...(changeQuantity ? { quantity: Number(quantity) } : {}), ...(imageFile ? { image_base64: await replacementImageBase64(imageFile) } : {}) }),
-                })
-                await onSaved(result.message, result.row)
-              } catch (error) {
-                onResult({ ok: false, title: "Replacement Save Failed", message: String(error) })
-              } finally {
-                setSaving(false)
-              }
-            }}
-          >
-            {saving ? "Saving" : "Save Replacement"}
-          </Button>
+            <Button variant="outline" disabled={busy} onClick={onClose}>Cancel</Button>
+            <Button disabled={busy || loading || Boolean(error) || !valid} onClick={() => save()}>{busy ? "Saving…" : "Save Replacements"}</Button>
           </div>
         </DialogFooter>
       </DialogContent>

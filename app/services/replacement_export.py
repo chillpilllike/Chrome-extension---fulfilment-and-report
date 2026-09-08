@@ -22,11 +22,26 @@ class ReplacementExportOdoo:
         lines = self.client.get_order_lines(line_ids)
         by_id = {int(line["id"]): line for line in lines}
         consumed: set[int] = set()
-        overrides: dict[int, dict] = {}
+        overrides: dict[int, list[dict]] = {}
+        groups: dict[int, list[dict]] = {}
+        for item in self.replacements:
+            groups.setdefault(int(item.get("bundle_parent_line_id") or item["id"]), []).append(item)
+        group_sources: dict[int, list[int]] = {}
+        for members in groups.values():
+            expected = int(members[0].get("bundle_component_count") or 1)
+            if len(members) != expected:
+                raise RuntimeError("Replacement bundle is incomplete; review all components before Shopify export.")
         for replacement in self.replacements:
             ids = replacement["source_ids"]
-            if not ids or any(i not in by_id or i in consumed for i in ids):
-                raise RuntimeError("Replacement source lines changed in Odoo; review the order before exporting to Shopify.")
+            group_id = int(replacement.get("bundle_parent_line_id") or replacement["id"])
+            if group_id not in group_sources:
+                if not ids or any(i not in by_id or i in consumed for i in ids):
+                    raise RuntimeError("Replacement source lines changed in Odoo; review the order before exporting to Shopify.")
+                group_sources[group_id] = ids
+                consumed.update(ids)
+            elif ids != group_sources[group_id]:
+                raise RuntimeError("Replacement components have conflicting Odoo source lines.")
+            share = 1 / len(groups[group_id])
             source = [by_id[i] for i in ids]
             quantity = float(replacement["quantity"])
             if quantity <= 0 or not quantity.is_integer():
@@ -56,15 +71,19 @@ class ReplacementExportOdoo:
             net = sum(float(item.get("price_unit") or 0) * float(item.get("product_uom_qty") or 0) * (1 - float(item.get("discount") or 0) / 100) for item in source)
             line.update(
                 name=title, product_id=[product_id, title], product_uom_qty=int(quantity),
-                price_unit=gross / quantity,
+                price_unit=gross * share / quantity,
                 discount=(1 - net / gross) * 100 if gross else 0,
-                price_total=sum(float(item.get("price_total") or 0) for item in source),
-                price_subtotal=sum(float(item.get("price_subtotal") or 0) for item in source),
+                price_total=sum(float(item.get("price_total") or 0) for item in source) * share,
+                price_subtotal=sum(float(item.get("price_subtotal") or 0) for item in source) * share,
             )
-            overrides[ids[0]] = line
-            consumed.update(ids)
-        return [overrides[int(line["id"])] if int(line["id"]) in overrides else line
-                for line in lines if int(line["id"]) not in consumed or int(line["id"]) in overrides]
+            overrides.setdefault(ids[0], []).append(line)
+        result = []
+        for line in lines:
+            if int(line["id"]) in overrides:
+                result.extend(overrides[int(line["id"])])
+            elif int(line["id"]) not in consumed:
+                result.append(line)
+        return result
 
     def get_product_product(self, product_id: int) -> dict | None:
         if product_id in self.products:

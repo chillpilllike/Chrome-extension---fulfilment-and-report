@@ -364,9 +364,16 @@ class LineSpaidPayload(BaseModel):
     supplier_part_auxiliary_id: str = ""
 
 
+class ReplacementComponentPayload(BaseModel):
+    asin: str
+    quantity: int = Field(strict=True, gt=0)
+    image_base64: Optional[str] = Field(default=None, max_length=16777216)
+
+
 class ReplacementPayload(BaseModel):
     store_id: int
-    asin: str
+    asin: str = ""
+    components: Optional[list[ReplacementComponentPayload]] = Field(default=None, min_length=1, max_length=10)
     note: str = ""
     quantity: Optional[int] = Field(default=None, strict=True, gt=0)
     image_base64: Optional[str] = Field(default=None, max_length=16777216)
