@@ -36617,11 +36617,32 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             identity_error = tracking_account_identity_error(strict_rows, clean_text(payload.amazon_account_name), normalize_amazon_account_type(payload.amazon_account_type))
             if identity_error:
                 raise HTTPException(409, identity_error)
-        matching_error = "" if payload.order_cancelled or payload_has_payment_revision(payload) else replacement_tracking.tracking_error(strict_rows, packages)
+        pending_bundle_status = bool(
+            strict_rows and all(amazon_bundles.line_components(row) for row in strict_rows)
+            and packages and all(package.get("status_only") and not tracking_package_physical_id(package)
+                                    and not tracking_package_delivered(package) for package in packages)
+            and not payload.order_cancelled and not payload_has_payment_revision(payload)
+        )
+        pending_bundle_updated = 0
+        if pending_bundle_status:
+            pending_status = tracking_status_from_packages(packages)
+            for row in strict_rows:
+                # A pre-shipment estimate cannot replace shipment evidence or
+                # regress a shipped/delivered bundle to an order-level status.
+                if row.get("state") != "ordered" or parse_tracking_packages(row.get("tracking_payload") or ""):
+                    continue
+                conn.execute("UPDATE order_lines SET tracking_status=?, tracking_checked_at=?, last_error=NULL, updated_at=? WHERE id=?",
+                             (pending_status, utc_now(), utc_now(), row["id"]))
+                pending_bundle_updated += 1
+        matching_error = "" if pending_bundle_status or payload.order_cancelled or payload_has_payment_revision(payload) else replacement_tracking.tracking_error(strict_rows, packages)
         if matching_error:
             for row in strict_rows:
                 if replacement_tracking.strict_line(row):
                     conn.execute("UPDATE order_lines SET last_error=?, updated_at=? WHERE id=?", (matching_error, utc_now(), row["id"]))
+    if pending_bundle_status:
+        fast_page_cache_clear_matching({"orders", "tracking-orders", "fulfilment-pending"})
+        return {"ok": True, "updated": pending_bundle_updated, "status_only": True,
+                "tracking_status": pending_status, "message": "Bundle order status saved; waiting for shipment evidence."}
     if matching_error:
         for row in strict_rows:
             if replacement_tracking.strict_line(row):

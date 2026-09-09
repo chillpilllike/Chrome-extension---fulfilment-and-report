@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import unittest
 import sqlite3
+import inspect
 from unittest.mock import patch
 
 from app import main
@@ -60,6 +61,29 @@ class VirtualBundleTests(unittest.TestCase):
         records[0]['asin_quantities'] = {A: 1}
         main.amazon_history_apply_quantity_checks(records, {ORDER: [candidate]})
         self.assertFalse(candidate['quantity_matches'])
+
+    def test_preshipment_estimate_updates_status_without_claiming_contents_or_delivery(self):
+        with sqlite3.connect(':memory:') as conn:
+            conn.row_factory = lambda cursor, values: dict(zip([col[0] for col in cursor.description], values))
+            conn.execute('CREATE TABLE app_settings(key TEXT, value TEXT)')
+            conn.execute('CREATE TABLE order_lines(id INTEGER, asin TEXT, quantity REAL, state TEXT, amazon_order_id TEXT, tracking_payload TEXT, tracking_status TEXT, tracking_checked_at TEXT, last_error TEXT, updated_at TEXT)')
+            conn.execute('INSERT INTO order_lines(id, asin, quantity, state, amazon_order_id, last_error) VALUES(1, ?, 1, ?, ?, ?)', (PARENT, 'ordered', ORDER, 'missing shipment ASIN'))
+            conn.commit()
+            source = inspect.getsource(main.api_tracking_update_impl)
+            source = source[:source.index('    status = tracking_status_from_packages(packages)')] + '    return strict_order\n'
+            namespace = dict(main.__dict__, db=lambda: conn, fast_page_cache_clear_matching=lambda *a: None, index_order_line=lambda *a: None)
+            exec(source, namespace)
+            payload = main.ChromeTrackingUpdatePayload(amazon_order_id=ORDER, packages=[dict(status_only=True, status='Arriving tomorrow')])
+            result = namespace['api_tracking_update_impl'](payload)
+            self.assertTrue(result['ok'])
+            saved = conn.execute('SELECT * FROM order_lines').fetchone()
+            self.assertEqual(saved['state'], 'ordered')
+            self.assertEqual(saved['tracking_status'], 'Arriving tomorrow')
+            self.assertIsNone(saved['tracking_payload'])
+            self.assertIsNone(saved['last_error'])
+            payload.packages[0]['status'] = 'Delivered'
+            with self.assertRaises(main.HTTPException):
+                namespace['api_tracking_update_impl'](payload)
 
     def test_split_packages_preserve_parent_and_require_every_component(self):
         first = dict(asins=[A], tracking_id='TBA123456789001', status='Delivered')
