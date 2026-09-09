@@ -177,7 +177,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.202")
+        self.assertEqual(MANIFEST["version"], "0.1.203")
 
     def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
         self.assertIn('id="odooOrderNumber"', POPUP_HTML)

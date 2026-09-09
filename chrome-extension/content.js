@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-09-09-cart-readiness-v202";
+const CONTENT_SCRIPT_BUILD = "2026-09-09-cart-row-ownership-v203";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -1999,9 +1999,9 @@ function cartActiveRoots() {
     "[data-name='Active Items']",
     "[data-csa-c-content-id*='activeCart' i]",
   ];
-  const roots = selectors
+  const roots = [...new Set(selectors
     .flatMap((selector) => [...document.querySelectorAll(selector)])
-    .filter((root) => root && visible(root));
+    .filter((root) => root && visible(root)))];
   return roots.filter((root, index) => !roots.some((other, otherIndex) => (
     otherIndex !== index && other.contains(root)
   )));
@@ -2023,7 +2023,14 @@ function cartActiveItems() {
     .filter((item) => {
       if (!item || !visible(item)) return false;
       const text = (item.innerText || item.textContent || "").replace(/\s+/g, " ");
-      if (/saved for later|sponsored|discover more|buy it again/i.test(text)) return false;
+      // Amazon can nest a Buy it again card inside a genuine active row.
+      // Use row ownership first so recommendation text cannot discard that row
+      // and recommendation descendants cannot become extra purchased items.
+      const owner = item.closest("[data-itemtype='active'], .sc-list-item");
+      if (owner && owner !== item) return false;
+      const explicitActive = item.getAttribute("data-itemtype") === "active";
+      if (item.closest("#sc-saved-cart, [data-itemtype='saved']")) return false;
+      if (!explicitActive && /saved for later|sponsored|discover more|buy it again/i.test(text)) return false;
       if (!cartItemAsin(item)) return false;
       if (!item.querySelector?.("button[aria-label*='Delete' i], input[aria-label*='Delete' i], button[title*='Delete' i], input[value*='Delete' i], button[value*='Delete' i], button[data-action*='delete' i], input[data-action*='delete' i], button[name*='delete' i], input[name*='delete' i], [data-itemtype='active'], .sc-list-item, [data-quantity], [data-a-selector*='stepper' i], select[name='quantity'], input[name='quantity']")) return false;
       if (seen.has(item)) return false;
@@ -4648,8 +4655,9 @@ async function handleCart(activeJob) {
     && nextIndex < itemCount
     && itemWasAdded(activeJob)
   );
-  if (shouldVerifyCurrentItemBeforeContinuing && /\/cart\/smart-wagon/i.test(location.pathname)) {
-    showPanel("Nutricity fulfilment", "Opening the full Amazon cart to verify this line item before adding the next selected item.", null, null);
+  if (!['clear_cart', 'cleanup_after_failure'].includes(activeJob.stage)
+      && /\/cart\/smart-wagon/i.test(location.pathname)) {
+    showPanel("Nutricity fulfilment", "Opening the full Amazon cart to verify purchased ASINs and quantities before continuing.", null, null);
     location.href = "https://www.amazon.com/cart?ref_=sw_gtc";
     return;
   }
