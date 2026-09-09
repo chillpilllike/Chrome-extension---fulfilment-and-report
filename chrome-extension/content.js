@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-09-09-multipack-verification-v200";
+const CONTENT_SCRIPT_BUILD = "2026-09-09-payment-loading-v201";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -7897,7 +7897,6 @@ async function openPaymentSelectionIfAvailable() {
   if (!changePayment) return false;
   showPanel("Nutricity checkout", "Opening payment method selection.", null, null);
   await clickElement(changePayment, "Change payment method button", { preClickDelayMs: 80, delayMs: 180 });
-  await waitUntil(findPaymentRadio, 1200, 150);
   return true;
 }
 
@@ -7984,7 +7983,11 @@ async function ensurePreferredCheckoutPayment(activeJob) {
       : `Could not verify the checkout card, and I could not find the Change payment method link to select ${expected}.`);
     return false;
   }
-  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 2500, 150)) {
+  // Opening payment may navigate or asynchronously hydrate the card widget.
+  // Allow one bounded load window; short sequential waits can pause a healthy
+  // checkout before Amazon renders the saved cards. Selection and confirmation
+  // still run through the existing account-specific payment guards.
+  if (findPaymentRadio() || await waitUntil(findPaymentRadio, 15000, 150)) {
     await handlePaymentSelection(activeJob);
     if (activeJob.paused) return false;
     const confirmedDigits = await waitForPreferredCheckoutPayment(cardPreferences, 10000);
