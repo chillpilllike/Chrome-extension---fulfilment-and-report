@@ -4553,12 +4553,13 @@ function App() {
       const result = await api<{ items: InventoryItem[] }>("/api/inventory?page=1&per_page=100")
       const requiredQuantity = Math.max(0, Number(line.quantity || 0) - Number(line.inventory_allocated_quantity || 0))
       const lineAsin = String(line.replacement_asin || line.asin || "").trim().toUpperCase()
-      const available = (result.items || []).filter((item) => {
-        const itemAsin = String(item.asin || "").trim().toUpperCase()
-        return item.status === "available"
-          && Number(item.quantity || 0) >= requiredQuantity
-          && (!itemAsin || itemAsin === lineAsin)
-      })
+      const available = (result.items || [])
+        .filter((item) => item.status === "available" && Number(item.quantity || 0) >= requiredQuantity)
+        .sort((left, right) => {
+          const leftExact = !left.asin || String(left.asin).trim().toUpperCase() === lineAsin
+          const rightExact = !right.asin || String(right.asin).trim().toUpperCase() === lineAsin
+          return Number(rightExact) - Number(leftExact)
+        })
       setInventoryFulfilmentItems(available)
       if (available.length === 1) setSelectedInventoryId(available[0].id)
     } catch (error) {
@@ -4572,11 +4573,18 @@ function App() {
   async function confirmInventoryFulfilment() {
     const line = selectedRows.length === 1 ? selectedRows[0] : null
     if (!line || !selectedInventoryId || !inventoryExpiryConfirmed) return
+    const inventoryItem = inventoryFulfilmentItems.find((item) => item.id === selectedInventoryId)
+    const orderAsin = String(line.replacement_asin || line.asin || "").trim().toUpperCase()
+    const inventoryAsin = String(inventoryItem?.asin || "").trim().toUpperCase()
+    const replacementConfirmed = Boolean(inventoryAsin && inventoryAsin !== orderAsin)
+    if (replacementConfirmed && !window.confirm(
+      `Replacement ASIN warning: this order currently requires ${orderAsin || "an unrecorded ASIN"}, but the selected stock is ${inventoryAsin}. Confirm the customer accepted this alternative product.`,
+    )) return
     setInventoryFulfilmentOpen(false)
     await runAction("Fulfill from Inventory", () =>
       api<{ ok: boolean; message: string }>(`/api/inventory/${selectedInventoryId}/attach`, {
         method: "POST",
-        body: JSON.stringify({ line_id: line.id, expiry_confirmed: true }),
+        body: JSON.stringify({ line_id: line.id, expiry_confirmed: true, replacement_confirmed: replacementConfirmed }),
       }),
     )
   }
@@ -5240,12 +5248,15 @@ function App() {
                   <div className="text-xs text-muted-foreground">
                     Qty {Number(item.quantity).toLocaleString()} · {item.asin ? `ASIN ${item.asin}` : "No ASIN (will use the order ASIN)"} · {item.location || "Brooklyn, USA"} · Inventory #{item.id}
                   </div>
+                  {item.asin && selectedRows.length === 1 && String(item.asin).trim().toUpperCase() !== String(selectedRows[0].replacement_asin || selectedRows[0].asin || "").trim().toUpperCase() ? (
+                    <Badge variant="outline" className="mt-1 border-amber-400 text-amber-800">Alternative ASIN · customer acceptance required</Badge>
+                  ) : null}
                 </div>
               </label>
             ))}
             {!inventoryFulfilmentLoading && !inventoryFulfilmentItems.length ? (
               <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-                No compatible inventory row has enough available quantity. Add stock on the Inventory page, then try again.
+                No inventory row has enough available quantity. Add stock on the Inventory page, then try again.
               </div>
             ) : null}
           </div>
@@ -12850,16 +12861,30 @@ function InventoryPage({
     const orderRef = window.prompt(`Attach ${item.product_name || item.asin || `inventory #${item.id}`} to which new Odoo order? Enter order name, e.g. NC12345.`)
     if (!orderRef?.trim()) return
     if (!window.confirm("Expiry warning: physically check the item. Confirm its expiry date has been checked and the item is not expired.")) return
-    try {
-      const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${item.id}/attach`, {
+    const submitAttachment = (replacementConfirmed: boolean) => api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${item.id}/attach`, {
         method: "POST",
-        body: JSON.stringify({ order_ref: orderRef.trim(), expiry_confirmed: true }),
+        body: JSON.stringify({ order_ref: orderRef.trim(), expiry_confirmed: true, replacement_confirmed: replacementConfirmed }),
       })
+    try {
+      const result = await submitAttachment(false)
       onPage(1)
       onRows(result.items || [], result.total || 0)
       onResult({ ok: result.ok, title: "Inventory Attached", message: result.message })
     } catch (error) {
-      onResult({ ok: false, title: "Inventory Attach Failed", message: String(error) })
+      const message = String(error)
+      if (message.includes("Replacement confirmation required:") && window.confirm(`${message}\n\nConfirm the customer accepted this alternative product and attach it as the replacement ASIN?`)) {
+        try {
+          const result = await submitAttachment(true)
+          onPage(1)
+          onRows(result.items || [], result.total || 0)
+          onResult({ ok: result.ok, title: "Replacement Inventory Attached", message: result.message })
+          return
+        } catch (replacementError) {
+          onResult({ ok: false, title: "Replacement Inventory Attach Failed", message: String(replacementError) })
+          return
+        }
+      }
+      onResult({ ok: false, title: "Inventory Attach Failed", message })
     }
   }
 

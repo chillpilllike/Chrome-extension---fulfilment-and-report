@@ -26694,6 +26694,7 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
 def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     order_ref = clean_text(payload.get("order_ref") or payload.get("odoo_order_name"))
     line_id = int(payload.get("line_id") or 0)
+    replacement_confirmed = payload.get("replacement_confirmed") is True
     if not order_ref and not line_id:
         raise HTTPException(400, "Select an order line or enter the Odoo order name for this inventory item.")
     if payload.get("expiry_confirmed") is not True:
@@ -26742,12 +26743,20 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
                 required_asins = sorted({effective_inventory_asin(row) for row in candidates if effective_inventory_asin(row)})
                 required_label = ", ".join(required_asins) or "an ASIN that has not been recorded"
                 target = f"line {line_id}" if line_id else order_ref
-                raise HTTPException(
-                    409,
-                    f"Cannot attach stock #{inventory_id}: its ASIN is {inventory_asin}, but {target} requires {required_label}. "
-                    "ASINs must match exactly. The inventory stock was not changed.",
-                )
-            candidates = matching_candidates
+                if len(candidates) > 1:
+                    raise HTTPException(
+                        409,
+                        f"More than one open line in {target} could receive alternative stock. Select the exact line on the Orders page, "
+                        f"then choose inventory item #{inventory_id}. The inventory stock was not changed.",
+                    )
+                if not replacement_confirmed:
+                    raise HTTPException(
+                        409,
+                        f"Replacement confirmation required: stock #{inventory_id} has ASIN {inventory_asin}, while {target} requires {required_label}. "
+                        "Only continue if the customer accepted this alternative. The inventory stock was not changed.",
+                    )
+            else:
+                candidates = matching_candidates
         if len(candidates) > 1:
             raise HTTPException(
                 409,
@@ -26755,7 +26764,9 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
                 f"Inventory item #{inventory_id} was not changed.",
             )
         line = candidates[0]
-        asin = effective_inventory_asin(line)
+        required_asin = effective_inventory_asin(line)
+        replacement_override = bool(inventory_asin and inventory_asin != required_asin)
+        asin = inventory_asin if replacement_override else required_asin
         quantity_needed = float(line["quantity"] or 1)
         quantity_available = float(item["quantity"] or 0)
         already_allocated = max(0.0, float(line.get("inventory_allocated_quantity") or 0))
@@ -26771,12 +26782,35 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
         allocated_quantity = already_allocated + reserved_quantity
         amazon_quantity = max(0.0, quantity_needed - allocated_quantity)
         inventory_only = amazon_quantity <= 0
-        note = (
+        replacement_note = (
+            f"Customer accepted inventory alternative ASIN {inventory_asin} instead of {required_asin}. "
+            if replacement_override else ""
+        )
+        note = replacement_note + (
             f"Fulfilled from inventory item #{inventory_id}: expiry date checked and item confirmed not expired; "
             f"qty {reserved_quantity:g} allocated; total local qty {allocated_quantity:g} of {quantity_needed:g}; "
             f"Amazon remaining qty {amazon_quantity:g}. Manually verify dispatch, then confirm sent from Inventory."
         )
         now = utc_now()
+        if replacement_override:
+            conn.execute(
+                """
+                UPDATE order_lines
+                SET original_asin=COALESCE(NULLIF(original_asin, ''), asin),
+                    original_product_name=COALESCE(NULLIF(original_product_name, ''), product_name),
+                    replacement_asin=?, replacement_product_name=?,
+                    replacement_note=?, replacement_assigned_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    inventory_asin,
+                    clean_text(item["product_name"]),
+                    append_note(clean_text(line.get("replacement_note")), replacement_note.strip()),
+                    now,
+                    now,
+                    line["id"],
+                ),
+            )
         conn.execute(
             "UPDATE inventory_items SET quantity=?, updated_at=? WHERE id=?",
             (max(0.0, quantity_available - reserved_quantity), now, inventory_id),
@@ -26859,7 +26893,8 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
         "ok": True,
         "message": (
             f"Attached qty {reserved_quantity:g} from inventory item #{reserved_inventory_id} to {line['odoo_order_name']}. "
-            f"Amazon remaining qty: {amazon_quantity:g}. Confirm sent after manual verification."
+            + (f"Recorded customer-approved replacement ASIN {inventory_asin}. " if replacement_override else "")
+            + f"Amazon remaining qty: {amazon_quantity:g}. Confirm sent after manual verification."
         ),
         **refresh_inventory_response(int(item["store_id"]), 1, 100),
     }

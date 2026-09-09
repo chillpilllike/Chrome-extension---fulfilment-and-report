@@ -37,7 +37,7 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("Fulfill from Inventory", FRONTEND)
         self.assertIn("setInventoryFulfilmentItems(available)", FRONTEND)
         self.assertIn("I checked the expiry date and confirm this item is not expired.", FRONTEND)
-        self.assertIn("body: JSON.stringify({ line_id: line.id, expiry_confirmed: true })", FRONTEND)
+        self.assertIn("body: JSON.stringify({ line_id: line.id, expiry_confirmed: true, replacement_confirmed: replacementConfirmed })", FRONTEND)
 
     def test_manual_inventory_form_does_not_require_a_store(self) -> None:
         self.assertNotIn('label="Store" value={manualStoreId}', FRONTEND)
@@ -86,9 +86,20 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         source = inspect.getsource(main.api_attach_inventory_item)
 
         self.assertNotIn('candidate_clauses.append("store_id=?")', source)
-        self.assertIn("ASINs must match exactly", source)
+        self.assertIn("Replacement confirmation required:", source)
         self.assertIn("The inventory stock was not changed", source)
         self.assertIn("if len(candidates) > 1:", source)
+
+    def test_customer_accepted_alternative_can_be_recorded_as_replacement_asin(self) -> None:
+        source = inspect.getsource(main.api_attach_inventory_item)
+
+        self.assertIn('replacement_confirmed = payload.get("replacement_confirmed") is True', source)
+        self.assertIn("Replacement confirmation required:", source)
+        self.assertIn("replacement_asin=?", source)
+        self.assertIn("Customer accepted inventory alternative ASIN", source)
+        self.assertIn("Alternative ASIN · customer acceptance required", FRONTEND)
+        self.assertIn("Confirm the customer accepted this alternative product", FRONTEND)
+        self.assertIn("replacement_confirmed: replacementConfirmed", FRONTEND)
 
     def test_inventory_matching_is_global_and_uses_effective_replacement_asin(self) -> None:
         reserve_source = inspect.getsource(main.reserve_inventory_for_line)
