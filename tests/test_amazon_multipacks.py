@@ -11,6 +11,29 @@ PARENT = 'B0BV67RXQH'
 CHILD = 'B076F324JN'
 
 class AmazonMultipackTests(unittest.TestCase):
+    def test_bundle_save_endpoint_obeys_real_settings_constraints(self):
+        import sqlite3
+        from contextlib import contextmanager
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = lambda cursor, values: dict(zip([col[0] for col in cursor.description], values))
+        conn.execute('CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)')
+        conn.execute('CREATE TABLE order_lines(asin TEXT, replacement_asin TEXT, amazon_group_key TEXT)')
+        conn.execute('INSERT INTO order_lines VALUES (?, NULL, ?)', (PARENT, 'test-pack'))
+        @contextmanager
+        def database():
+            yield conn
+            conn.commit()
+        with patch.object(main, 'db', database), patch.object(main, 'ensure_chrome_job_owner'), patch.dict(bundles.CATALOG, dict(bundles.CATALOG), clear=True):
+            payload = {'worker_id': 'test-worker', 'evidence': bundles.multipack_evidence(PARENT)}
+            result = main.api_chrome_bundle_components('test-pack', payload)
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['components'], {CHILD: 2})
+            saved = conn.execute('SELECT * FROM app_settings').fetchone()
+            self.assertTrue(saved['updated_at'])
+            self.assertEqual(main.api_chrome_bundle_components('test-pack', payload)['components'], {CHILD: 2})
+            self.assertEqual(main.api_chrome_bundle_components('test-pack', {'read_only': True})['items'][PARENT]['components'], {CHILD: 2})
+        conn.close()
+
     def test_verified_pack_evidence_rejects_variant_and_count_conflicts(self):
         evidence = bundles.multipack_evidence(PARENT)
         self.assertEqual(bundles.validate_evidence(evidence), (PARENT, {CHILD: 2}))

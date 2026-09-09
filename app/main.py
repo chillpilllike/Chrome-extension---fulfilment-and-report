@@ -33310,7 +33310,7 @@ def api_chrome_bundle_components(group_key: str, payload: dict[str, Any]) -> dic
             raise HTTPException(409, "Bundle parent is not authorized by this fulfilment job.")
         saved = {**evidence, "components": children, "verified_at": utc_now()}
         key = "amazon_bundle:" + parent
-        conn.execute("INSERT INTO app_settings(key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING", (key, json.dumps(saved)))
+        conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING", (key, json.dumps(saved), saved["verified_at"]))
         stored = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
         if json.loads(stored["value"])["components"] != children:
             raise HTTPException(409, "Bundle composition conflicts with previously verified evidence; review required.")
