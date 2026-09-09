@@ -74,6 +74,22 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertNotIn('candidate_clauses.append("store_id=?")', line_id_branch.split("else:", 1)[0])
         self.assertIn('get_store(int(line["store_id"]))', source)
 
+    def test_inventory_search_by_stock_id_is_global(self) -> None:
+        source = inspect.getsource(main.list_inventory_items)
+
+        self.assertIn("CAST(id AS TEXT)=?", source)
+        self.assertIn('stock_id_match = re.fullmatch', source)
+        self.assertLess(source.index("if search:"), source.index("store_id, store_id"))
+        self.assertIn("Stock #, ASIN", FRONTEND)
+
+    def test_inventory_page_attach_is_cross_store_and_reports_exact_asin_mismatch(self) -> None:
+        source = inspect.getsource(main.api_attach_inventory_item)
+
+        self.assertNotIn('candidate_clauses.append("store_id=?")', source)
+        self.assertIn("ASINs must match exactly", source)
+        self.assertIn("The inventory stock was not changed", source)
+        self.assertIn("if len(candidates) > 1:", source)
+
     def test_inventory_matching_is_global_and_uses_effective_replacement_asin(self) -> None:
         reserve_source = inspect.getsource(main.reserve_inventory_for_line)
         attach_source = inspect.getsource(main.api_attach_inventory_item)
@@ -82,7 +98,7 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("asin = effective_inventory_asin(line)", reserve_source)
         self.assertIn("WHERE asin=? AND status='available'", reserve_source)
         self.assertNotIn("WHERE store_id=? AND asin=?", reserve_source)
-        self.assertIn("COALESCE(NULLIF(replacement_asin, ''), asin)=?", attach_source)
+        self.assertIn("effective_inventory_asin(row) == inventory_asin", attach_source)
         self.assertIn('{"inventory-v2", "orders", "dashboard"}', create_source)
         self.assertIn("line.replacement_asin || line.asin", FRONTEND)
         exact_search_source = inspect.getsource(main.fast_exact_order_reference_search)

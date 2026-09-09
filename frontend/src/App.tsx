@@ -12930,7 +12930,7 @@ function InventoryPage({
           </div>
           <PaginationControls page={page} total={total} onPage={onPage} />
         </CardHeader>
-        <form className="epost-filters" onSubmit={(event) => { event.preventDefault(); onQuery(searchDraft) }}><div className="epost-search"><Label htmlFor="inventory-search">Find stock or an order</Label><Input id="inventory-search" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} placeholder="ASIN, product, Odoo / Amazon order or archive reason" /></div><Button type="submit" variant="outline"><Search className="size-4" />Search</Button>{query && <Button type="button" variant="ghost" onClick={() => { setSearchDraft(""); onQuery("") }}>Clear</Button>}</form>
+        <form className="epost-filters" onSubmit={(event) => { event.preventDefault(); onQuery(searchDraft) }}><div className="epost-search"><Label htmlFor="inventory-search">Find stock or an order</Label><Input id="inventory-search" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} placeholder="Stock #, ASIN, product, location, Odoo / Amazon order or archive reason" /></div><Button type="submit" variant="outline"><Search className="size-4" />Search</Button>{query && <Button type="button" variant="ghost" onClick={() => { setSearchDraft(""); onQuery("") }}>Clear</Button>}</form>
         <div className="epost-selection">Stock is shared across stores. Queue counts use the store filter; search narrows this list.</div>
         <CardContent className="p-0">
           {loading ? <div className="epost-loading" role="status">Loading inventory…</div> :

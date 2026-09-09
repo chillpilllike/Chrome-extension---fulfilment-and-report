@@ -8102,11 +8102,19 @@ def list_inventory_items(store_id: Optional[int] = None, page: int = 1, per_page
     page = max(1, int(page or 1))
     per_page = max(1, min(100, int(per_page or 100)))
     offset = (page - 1) * per_page
-    where = "WHERE " + inventory_filter(view) + " AND (? IS NULL OR store_id=?)"
-    params: list[Any] = [store_id, store_id]
-    if q.strip():
-        where += " AND POSITION(LOWER(?) IN LOWER(CONCAT_WS(' ', asin, product_name, location, source_odoo_order_name, amazon_order_id, amazon_account_name, notes, archive_reason))) > 0"
-        params.append(q.strip())
+    search = clean_text(q)
+    where = "WHERE " + inventory_filter(view)
+    params: list[Any] = []
+    if search:
+        # Inventory is globally shared. A search must not hide a matching row
+        # merely because its legacy schema owner differs from the selected store.
+        stock_id_match = re.fullmatch(r"(?:stock\s*)?#?\s*(\d+)", search, re.IGNORECASE)
+        stock_id = stock_id_match.group(1) if stock_id_match else ""
+        where += " AND (CAST(id AS TEXT)=? OR POSITION(LOWER(?) IN LOWER(CONCAT_WS(' ', CAST(id AS TEXT), asin, product_name, location, source_odoo_order_name, amazon_order_id, amazon_account_name, notes, archive_reason))) > 0)"
+        params.extend([stock_id, search])
+    else:
+        where += " AND (? IS NULL OR store_id=?)"
+        params.extend([store_id, store_id])
     with db() as conn:
         total = conn.execute(
             f"SELECT COUNT(*) AS count FROM inventory_items {where}",
@@ -26711,15 +26719,10 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             candidate_clauses.append("id=?")
             candidate_params.append(line_id)
         else:
-            # The legacy order-name prompt remains scoped for disambiguation.
-            # The Orders-page line_id flow intentionally allows cross-store use.
-            candidate_clauses.append("store_id=?")
-            candidate_params.append(item["store_id"])
+            # Stock is globally shared, so its internal schema owner must never
+            # restrict which storefront order can consume it.
             candidate_clauses.append("UPPER(odoo_order_name)=UPPER(?)")
             candidate_params.append(order_ref)
-        if inventory_asin:
-            candidate_clauses.append("COALESCE(NULLIF(replacement_asin, ''), asin)=?")
-            candidate_params.append(inventory_asin)
         candidates = conn.execute(
             f"""
             SELECT *
@@ -26732,8 +26735,25 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
         ).fetchall()
         if not candidates:
             target = f"line {line_id}" if line_id else order_ref
-            asin_detail = f" with ASIN {inventory_asin}" if inventory_asin else ""
-            raise HTTPException(404, f"No open order line{asin_detail} found for {target}.")
+            raise HTTPException(404, f"No open order line found for {target}. Inventory item #{inventory_id} was not changed.")
+        if inventory_asin:
+            matching_candidates = [row for row in candidates if effective_inventory_asin(row) == inventory_asin]
+            if not matching_candidates:
+                required_asins = sorted({effective_inventory_asin(row) for row in candidates if effective_inventory_asin(row)})
+                required_label = ", ".join(required_asins) or "an ASIN that has not been recorded"
+                target = f"line {line_id}" if line_id else order_ref
+                raise HTTPException(
+                    409,
+                    f"Cannot attach stock #{inventory_id}: its ASIN is {inventory_asin}, but {target} requires {required_label}. "
+                    "ASINs must match exactly. The inventory stock was not changed.",
+                )
+            candidates = matching_candidates
+        if len(candidates) > 1:
+            raise HTTPException(
+                409,
+                f"More than one open line matches {order_ref}. Select the exact line on the Orders page and use Fulfill from Inventory. "
+                f"Inventory item #{inventory_id} was not changed.",
+            )
         line = candidates[0]
         asin = effective_inventory_asin(line)
         quantity_needed = float(line["quantity"] or 1)
