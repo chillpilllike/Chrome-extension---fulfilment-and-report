@@ -20,7 +20,20 @@ class TrackingExtensionShipmentMappingTests(unittest.TestCase):
         self.assertLess(helper.index("if (shipmentGrid) return shipmentGrid;"), helper.index("if (shipmentComponent) return shipmentComponent;"))
 
     def test_tracking_extension_version_was_bumped(self):
-        self.assertEqual(MANIFEST["version"], "0.1.74")
+        self.assertEqual(MANIFEST["version"], "0.1.76")
+
+    def test_account_identity_is_reverified_after_amazon_page_readiness(self):
+        ready_index = CONTENT.index("await waitForTrackingPageReady();")
+        verify_index = CONTENT.index("await requireAmazonAccountContext(data.amazonOrderId);", ready_index)
+        post_index = CONTENT.index('type: "PACKAGE_TRACKING"', verify_index)
+
+        self.assertLess(ready_index, verify_index)
+        self.assertLess(verify_index, post_index)
+        self.assertIn('amazonAccountName: "", amazonAccountType: "unknown"', CONTENT)
+
+    def test_account_identity_mismatch_does_not_stop_the_queue(self):
+        self.assertIn("function isTrackingAccountIdentityMismatchError", BACKGROUND)
+        self.assertIn("after an Amazon account identity mismatch and continued", BACKGROUND)
 
     def test_manual_tracking_pages_sync_without_bypassing_active_queue_guard(self):
         # Execute the actual tracking-page branch, not a copy of its condition.
@@ -35,6 +48,8 @@ async function check(state, pageMatches, expected) {
   const sandbox = {
     extensionContextAlive: true, location: {hostname:'www.amazon.com', href:'https://www.amazon.com/progress-tracker/package?orderId=111-4064278-0332216', pathname:'/progress-tracker/package'},
     window: {}, isRelevantTrackingPage:()=>true, amazonSignedInAccountName:()=>'',
+    verifiedAmazonAccountContext:async()=>({amazonAccountName:'Amit',amazonAccountType:'consumer'}),
+    requireAmazonAccountContext:async()=>({amazonAccountName:'Amit',amazonAccountType:'consumer'}),
     showPanel:()=>{}, send:async()=>state, isOrderHistoryPage:()=>false,
     isTrackingPage:()=>true, currentPageMatchesActiveTracking:()=>pageMatches,
     recoverActiveTrackingPage:async()=>calls.push('recover'),

@@ -76,6 +76,7 @@ class ReplacementTrackingTests(unittest.TestCase):
         conn = sqlite3.connect(':memory:')
         self.addCleanup(conn.close)
         conn.row_factory = lambda cursor, row: dict(zip([c[0] for c in cursor.description], row))
+        conn.execute('CREATE TABLE app_settings(key TEXT, value TEXT)')
         conn.execute('CREATE TABLE order_lines (id INTEGER, asin TEXT, replacement_asin TEXT, bundle_component_count INTEGER, amazon_order_id TEXT, tracking_payload TEXT, last_error TEXT, updated_at TEXT)')
         conn.execute('INSERT INTO order_lines VALUES (1, ?, ?, 2, ?, ?, NULL, NULL)', (A, A, ORDER1, 'saved tracking'))
         conn.commit()

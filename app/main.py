@@ -5,7 +5,7 @@ from app.services.inventory_labels import annotate_inventory_labels
 from app.services.inventory_legacy import install_inventory_legacy, legacy_delivery_available
 
 import base64
-from app.services import replacement_bundle, replacement_tracking
+from app.services import replacement_bundle, replacement_tracking, amazon_bundles
 from app.services.replacement_images import ReplacementImageSyncError, image_failure_details, validate_image_base64
 import csv
 import copy
@@ -3740,6 +3740,8 @@ def amazon_history_records_cache_key(prefix: str, records: list[dict[str, Any]])
 
 
 def order_line_asin_aliases(row: dict[str, Any]) -> list[str]:
+    if amazon_bundles.line_components(row):
+        return list(amazon_bundles.line_components(row))
     if replacement_tracking.strict_line(row):
         return [value for value in [normalize_asin(row.get("replacement_asin") or row.get("asin"))] if value]
     aliases = [
@@ -3766,6 +3768,7 @@ def order_line_display_asins(row: dict[str, Any]) -> list[str]:
 def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[str, Any]]:
     if not order_ids:
         return {}
+    amazon_bundles.load_catalog(conn)
     placeholders = ",".join("?" for _ in order_ids)
     rows = conn.execute(
         f"""
@@ -3827,6 +3830,8 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
             ordered_at = clean_text(row["ordered_at"])
             replacement_asin = normalize_asin(row["replacement_asin"] if "replacement_asin" in row.keys() else "")
             asin_aliases = order_line_asin_aliases(row)
+            if amazon_bundles.line_components(row):
+                order.setdefault("bundle_components", {})[asin] = amazon_bundles.line_components(row)
             order["lines"].append({
                 "id": row["id"],
                 "asin": asin,
@@ -3842,7 +3847,7 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
             for alias in asin_aliases:
                 if alias not in order["asins"]:
                     order["asins"].append(alias)
-                order["asin_quantities"][alias] = float(order["asin_quantities"].get(alias) or 0) + float(row["quantity"] or 1)
+                order["asin_quantities"][alias] = float(order["asin_quantities"].get(alias) or 0) + float(row["quantity"] or 1) * amazon_bundles.line_components(row).get(alias, 1)
     return matches
 
 
@@ -3940,6 +3945,8 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                     ordered_at = clean_text(row.get("ordered_at"))
                     current_amazon_order_id = clean_text(row.get("current_amazon_order_id"))
                     asin_aliases = order_line_asin_aliases(row)
+                    if amazon_bundles.line_components(row):
+                        suggestion.setdefault("bundle_components", {})[asin] = amazon_bundles.line_components(row)
                     replacement_asin = normalize_asin(row.get("replacement_asin") if "replacement_asin" in row.keys() else "")
                     suggestion["lines"].append({
                         "id": row["id"],
@@ -3960,7 +3967,7 @@ def amazon_history_name_suggestions(conn: Any, records: list[dict[str, Any]], ma
                     for alias in asin_aliases:
                         if alias not in suggestion["asins"]:
                             suggestion["asins"].append(alias)
-                        suggestion["asin_quantities"][alias] = float(suggestion["asin_quantities"].get(alias) or 0) + float(row.get("quantity") or 1)
+                        suggestion["asin_quantities"][alias] = float(suggestion["asin_quantities"].get(alias) or 0) + float(row.get("quantity") or 1) * amazon_bundles.line_components(row).get(alias, 1)
                     if replacement_asin:
                         suggestion["replacement_asin"] = replacement_asin
                         suggestion["lines"][-1]["replacement_asin"] = replacement_asin
@@ -4124,8 +4131,14 @@ def amazon_history_apply_quantity_checks(records: list[dict[str, Any]], *groups:
             for candidate in candidates or []:
                 checks: list[dict[str, Any]] = []
                 expected_by_asin = candidate.get("asin_quantities") or {}
+                bundles = {asin: amazon_bundles.components(asin) for asin in expected_by_asin if amazon_bundles.components(asin)}
+                if bundles and not set(bundles).intersection(actual_by_asin):
+                    expected_by_asin = amazon_bundles.expand_quantities(expected_by_asin)
+                    candidate["bundle_components"] = bundles
+                    candidate["asins"] = sorted(expected_by_asin)
+                    candidate["asin_quantities"] = expected_by_asin
                 for asin in sorted({normalize_asin(value) for value in expected_by_asin.keys() if normalize_asin(value)}):
-                    if asin not in actual_by_asin:
+                    if asin not in actual_by_asin and not candidate.get("bundle_components"):
                         continue
                     expected = float(expected_by_asin.get(asin) or 0)
                     actual = float(actual_by_asin.get(asin) or 0)
@@ -10865,6 +10878,7 @@ def tracking_account_identity_error(
 
 def safe_history_match_rows(
     rows: list[dict[str, Any]], amazon_order_id: str, evidence_asins: set[str],
+    evidence_quantities: Optional[dict[str, float]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """History scans may discover a binding, never replace an existing purchase.
 
@@ -10880,7 +10894,7 @@ def safe_history_match_rows(
             reason = "Existing Amazon order preserved; tracking cannot replace a purchase."
         elif row.get("state") in {"cancelled", "refunded"} or row.get("odoo_status_label") in {"cancelled", "refunded"}:
             reason = "Cancelled/refunded fulfilment preserved."
-        elif not asin or asin not in evidence_asins:
+        elif not asin or (asin not in evidence_asins and not amazon_bundles.history_matches(row, evidence_asins, evidence_quantities)):
             reason = "No exact purchased ASIN evidence for this line."
         elif not current and (row.get("replacement_run_id") or row.get("state") in {"inventory", "delivered", "dispatched"}):
             reason = "Completed/replacement fulfilment cannot be assigned by an old history scan."
@@ -12792,6 +12806,7 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
         "items": [
             {
                 "asin": item["asin"],
+                "bundle_components": amazon_bundles.components(item["asin"]),
                 "quantity": item["quantity"],
                 "requested_quantity": item.get("requested_quantity") or item["quantity"],
                 "inventory_quantity": item.get("inventory_quantity") or 0,
@@ -20428,6 +20443,10 @@ def get_service_settings() -> dict[str, str]:
     with db() as conn:
         rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
     for row in rows:
+        if row["key"].startswith("amazon_bundle:"):
+            evidence = json.loads(row["value"])
+            parent, children = amazon_bundles.validate_evidence(evidence)
+            amazon_bundles.CATALOG[parent] = {**evidence, "components": children}
         if row["key"] in settings:
             settings[row["key"]] = str(row["value"] or "")
     for key in ("shopify_dtc_script_path", "shopify_dtb_script_path", "shopify_tracking_script_path"):
@@ -29648,6 +29667,7 @@ def api_chrome_order_history_odoo_direct(payload: AmazonHistoryLookupPayload) ->
     else:
         raise last_db_error or RuntimeError("Amazon order-history direct Odoo lookup failed.")
     direct_odoo = amazon_history_direct_odoo_matches_from_targets(records, targets)
+    amazon_history_apply_quantity_checks(records, direct_odoo)
     amazon_history_apply_recipient_ref_card_asins(records, direct_odoo)
     return fast_page_cache_set(cache_key, {"ok": True, "odoo_direct": direct_odoo}, 300)
 
@@ -29911,6 +29931,8 @@ class ChromeBrowserlessSession:
         message_type = clean_text(message.get("type"))
         if self.should_stop() and message_type not in {"GET_ACTIVE_JOB", "GET_STATE", "HEARTBEAT_JOB"}:
             return {"ok": False, "stopped": True, "message": "Browserless stop requested."}
+        if message_type == "SAVE_BUNDLE_COMPONENTS":
+            return api_chrome_bundle_components(clean_text(message.get("groupKey")), {"worker_id": self.worker_id, "evidence": message.get("evidence") or {}})
         if message_type == "GET_ACTIVE_JOB":
             return {"ok": True, "activeJob": self.active_job}
         if message_type == "GET_STATE":
@@ -30092,6 +30114,7 @@ class ChromeBrowserlessSession:
                     store_id=parse_optional_int(order.get("store_id")),
                     replace_existing=order.get("replace_existing") is True,
                     asins=normalized.asins,
+                    items=order.get("items") or [],
                     cancelled=normalized.cancelled,
                 )
             )
@@ -31314,9 +31337,10 @@ def exact_amazon_history_match_for_chrome_job(job: dict[str, Any]) -> Optional[d
                 asin = normalize_asin(value)
                 if asin:
                     actual[asin] = actual.get(asin, 0.0) + 1.0
-        if set(actual) != set(expected):
+        comparison = expected if set(actual) == set(expected) else amazon_bundles.expand_quantities(expected)
+        if set(actual) != set(comparison):
             continue
-        if any(abs(float(actual[asin]) - float(quantity)) >= 0.0001 for asin, quantity in expected.items()):
+        if any(abs(float(actual[asin]) - float(quantity)) >= 0.0001 for asin, quantity in comparison.items()):
             continue
         matches.append({
             "amazon_order_id": amazon_order_id,
@@ -31324,6 +31348,7 @@ def exact_amazon_history_match_for_chrome_job(job: dict[str, Any]) -> Optional[d
             "recipient": clean_text(row.get("recipient")),
             "order_date": clean_text(row.get("order_date")),
             "asins": sorted(actual),
+            "asin_quantities": actual,
         })
     # Multiple exact Amazon orders are suspected duplicates and must be
     # reviewed rather than silently selecting one for the Odoo lines.
@@ -31362,6 +31387,8 @@ def complete_chrome_job_from_exact_history_match(
                     "amazon_order_id": amazon_order_id,
                     "amazon_order_url": amazon_order_url,
                     "asin": normalize_asin(item.get("asin")),
+                    "observed_asins": existing.get("asins") or [],
+                    "observed_quantities": existing.get("asin_quantities") or {},
                     "line_ids": [
                         int(value)
                         for value in item.get("line_ids") or []
@@ -33214,6 +33241,18 @@ def chrome_completion_history_evidence_error(
         for pricing in pricing_by_asin.values()
         if normalize_asin(str(pricing.get("purchased_asin") or ""))
     )
+    catalog_expected = set(amazon_bundles.expand_quantities({asin: 1 for asin in expected_asins}))
+    if any(amazon_bundles.line_components(row) for row in rows):
+        if observed_asins != expected_asins and observed_asins != catalog_expected:
+            return "Bundle reporting requires the complete verified component ASIN set; unexpected or missing components were found."
+        if observed_asins == catalog_expected:
+            for row in rows:
+                if not amazon_bundles.line_components(row):
+                    continue
+                mappings = [mapping for mapping in payload.order_mappings if int(row["id"]) in [int(value) for value in mapping.get("line_ids") or []]]
+                if len(mappings) != 1 or not amazon_bundles.history_matches(row, mappings[0].get("observed_asins") or [], mappings[0].get("observed_quantities") or {}):
+                    return "Bundle reporting requires verified quantities for every component; retry reporting without placing again."
+            return ""
     if observed_asins and expected_asins and not observed_asins.intersection(expected_asins):
         bundle_evidence = payload.business_bundle_expansion or {}
 
@@ -33248,6 +33287,29 @@ def chrome_completion_history_evidence_error(
                 f"{', '.join(sorted(observed_asins))} do not match this job's ASINs {', '.join(sorted(expected_asins))}."
             )
     return ""
+
+
+@app.post("/api/chrome/jobs/{group_key}/bundle-components")
+def api_chrome_bundle_components(group_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+    evidence = payload.get("evidence") or {}
+    with db() as conn:
+        ensure_chrome_job_owner(conn, group_key, clean_text(payload.get("worker_id")))
+        amazon_bundles.load_catalog(conn)
+        try:
+            parent, children = amazon_bundles.validate_evidence(evidence)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(409, str(exc))
+        rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_group_key=?", (group_key,)).fetchall())
+        if not any(normalize_asin(row.get("replacement_asin") or row.get("asin")) == parent for row in rows):
+            raise HTTPException(409, "Bundle parent is not authorized by this fulfilment job.")
+        saved = {**evidence, "components": children, "verified_at": utc_now()}
+        key = "amazon_bundle:" + parent
+        conn.execute("INSERT INTO app_settings(key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING", (key, json.dumps(saved)))
+        stored = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+        if json.loads(stored["value"])["components"] != children:
+            raise HTTPException(409, "Bundle composition conflicts with previously verified evidence; review required.")
+    amazon_bundles.CATALOG[parent] = saved
+    return {"ok": True, "parent_asin": parent, "components": children}
 
 
 @app.post("/api/chrome/jobs/{group_key}/complete")
@@ -33288,6 +33350,7 @@ def api_chrome_job_complete(group_key: str, payload: ChromeJobCompletePayload) -
             mapped_asins.add(mapped_asin)
     with db() as conn:
         ensure_chrome_job_owner(conn, group_key, payload.worker_id)
+        amazon_bundles.load_catalog(conn)
         params: list[Any] = [group_key]
         line_filter = ""
         if payload.line_ids:
@@ -36547,6 +36610,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             "Empty Amazon tracking update rejected; existing shipment data was preserved.",
         )
     with db() as conn:
+        amazon_bundles.load_catalog(conn)
         strict_rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_order_id=?", (amazon_order_id,)).fetchall())
         strict_order = any(replacement_tracking.strict_line(row) for row in strict_rows)
         if strict_order:
@@ -37488,6 +37552,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
     ordered_at = amazon_order_placed_at or utc_now()
     line_ids = sorted({int(line_id) for line_id in payload.line_ids if int(line_id or 0) > 0})
     with db() as conn:
+        amazon_bundles.load_catalog(conn)
         history = row_to_dict(conn.execute(
             "SELECT * FROM amazon_order_history_unmatched WHERE amazon_order_id=?",
             (amazon_order_id,),
@@ -37528,7 +37593,9 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         ).fetchall())
         if not rows:
             return {"ok": True, "matched": 0, "skipped": len(refs), "order_names": refs, "message": f"No unmatched pulled rows found for {', '.join(refs)}."}
-        rows, skipped_lines = safe_history_match_rows(rows, amazon_order_id, evidence_asins)
+        history_items = payload.items or parse_json_list_value(history.get("items_json"))
+        evidence_quantities = amazon_history_order_record({"items": history_items})["asin_quantities"]
+        rows, skipped_lines = safe_history_match_rows(rows, amazon_order_id, evidence_asins, evidence_quantities)
         if not rows:
             return {"ok": True, "matched": 0, "skipped": len(skipped_lines), "skipped_lines": skipped_lines,
                     "order_names": refs, "message": "No exact safe ASIN match; existing fulfilment data preserved."}

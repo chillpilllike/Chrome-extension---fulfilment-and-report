@@ -329,6 +329,10 @@ function isTrackedOrderNotFoundError(error) {
   return /Tracked Amazon order not found/i.test(String(error?.message || error || ""));
 }
 
+function isTrackingAccountIdentityMismatchError(error) {
+  return /Amazon tracking account-(?:name|type) mismatch; update refused/i.test(String(error?.message || error || ""));
+}
+
 async function logUnmatchedTrackingOrder(amazonOrderId, windowId = null, context = "tracking update") {
   const orderId = normalizeAmazonOrderId(amazonOrderId);
   if (orderId) await rememberRecentCheck(orderId, "unmatched");
@@ -1229,6 +1233,7 @@ async function manualMatchHistoryOrder(normalized, rows, windowId) {
       order_names: orderNames,
       line_ids: lineIds,
       asins: normalized.asins || [],
+      items: normalized.items || [],
       cancelled: normalized.cancelled === true,
       source_text: normalized.recipient || "",
       store_id: storeIds.length === 1 ? storeIds[0] : null,
@@ -1470,6 +1475,7 @@ async function postHistoryOrderTracking(tracking, windowId, status = "checked") 
         packages: packages.length ? packages : [{
           amazon_order_id: order.amazon_order_id,
           status_only: true,
+          asin_evidence_source: "order_inferred",
           status: order.status || "Unknown",
           promise: order.status || "",
           expected_delivery_date: order.expected_delivery_date || "",
@@ -2110,6 +2116,11 @@ async function handleOrderPackages(message, windowId, sender = {}) {
       await log(`No tracking buttons found for ${order.amazon_order_id}; saved order-page status.`, windowId);
       await advanceCurrentOrder(tracking, windowId, "checked");
     } catch (error) {
+      if (isTrackingAccountIdentityMismatchError(error)) {
+        await log(`Skipped ${order.amazon_order_id} because Amazon account identity changed while saving order status; continuing.`, windowId);
+        await advanceCurrentOrder(tracking, windowId, "failed");
+        return { ok: true, skipped: true, message: `Skipped ${order.amazon_order_id} after an Amazon account identity mismatch and continued.` };
+      }
       if (!isTrackedOrderNotFoundError(error)) throw error;
       await logUnmatchedTrackingOrder(order.amazon_order_id, windowId, "active status-only update");
       await advanceCurrentOrder(tracking, windowId, "unmatched");
@@ -2239,6 +2250,11 @@ async function handlePackageTracking(message, windowId, sender = {}) {
     await log(`Posted tracking update for ${order.amazon_order_id}.`, windowId);
     await advanceCurrentOrder(tracking, windowId, "checked");
   } catch (error) {
+    if (isTrackingAccountIdentityMismatchError(error)) {
+      await log(`Skipped ${order.amazon_order_id} because Amazon account identity changed; continuing with the next order.`, windowId);
+      await advanceCurrentOrder(tracking, windowId, "failed");
+      return { ok: true, skipped: true, message: `Skipped ${order.amazon_order_id} after an Amazon account identity mismatch and continued.` };
+    }
     if (!isTrackedOrderNotFoundError(error)) throw error;
     await logUnmatchedTrackingOrder(order.amazon_order_id, windowId, "active tracking update");
     await advanceCurrentOrder(tracking, windowId, "unmatched");
@@ -2279,6 +2295,10 @@ async function postStandalonePackageTracking(message, windowId) {
       windowId,
     );
   } catch (error) {
+    if (isTrackingAccountIdentityMismatchError(error)) {
+      await log(`Skipped standalone tracking page ${amazonOrderId} because its Amazon account identity did not match the app.`, windowId);
+      return { ok: true, ignored: true, accountMismatch: true, message: `Skipped ${amazonOrderId}; its Amazon account identity does not match this profile.` };
+    }
     if (!isTrackedOrderNotFoundError(error)) throw error;
     await logUnmatchedTrackingOrder(amazonOrderId, windowId, "standalone package page");
     return { ok: true, ignored: true, unmatched: true, message: `Skipped ${amazonOrderId}; it is not linked in the app.` };

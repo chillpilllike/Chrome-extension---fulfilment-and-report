@@ -323,6 +323,41 @@ function amazonAccountType() {
   return consumerShell ? "consumer" : "unknown";
 }
 
+async function verifiedAmazonAccountContext(timeoutMs = 8000, clearOnFailure = true) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs || 0));
+  do {
+    const amazonAccountName = amazonSignedInAccountName();
+    const amazonAccountTypeValue = amazonAccountType();
+    if (amazonAccountName && ["consumer", "business"].includes(amazonAccountTypeValue)) {
+      await send({ type: "AMAZON_ACCOUNT_CONTEXT", amazonAccountName, amazonAccountType: amazonAccountTypeValue });
+      return { amazonAccountName, amazonAccountType: amazonAccountTypeValue };
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(250);
+  } while (extensionContextAlive);
+  if (clearOnFailure) {
+    // Never leave a previously detected account identity available for a new
+    // page when Amazon has not rendered enough UI to verify this page's owner.
+    await send({ type: "AMAZON_ACCOUNT_CONTEXT", amazonAccountName: "", amazonAccountType: "unknown" });
+  }
+  return null;
+}
+
+async function requireAmazonAccountContext(amazonOrderId = "") {
+  const account = await verifiedAmazonAccountContext();
+  if (account) return account;
+  const orderId = clean(amazonOrderId);
+  const reason = "Amazon account name/type could not be verified after the page finished loading; stale account data was cleared.";
+  showPanel("Nutricity tracking", `${reason}${orderId ? ` Skipping ${orderId} safely.` : ""}`);
+  await send({
+    type: "FORCE_ADVANCE_HISTORY_ORDER",
+    amazonOrderId: orderId,
+    status: "failed",
+    reason,
+  });
+  return null;
+}
+
 function absoluteUrl(href) {
   return new URL(href, location.href).href;
 }
@@ -663,6 +698,8 @@ function extractHistoryTrackOrders() {
 async function scanOrderHistoryForTrackAll(state = null) {
   if (!isOrderHistoryPage()) return false;
   await waitForOrderHistoryReady();
+  const pageAccount = await requireAmazonAccountContext();
+  if (!pageAccount) return true;
   const tracking = state?.tracking || {};
   const unavailableMessage = amazonHistoryUnavailableMessage();
   if (unavailableMessage) {
@@ -1097,11 +1134,9 @@ async function run() {
   if (!extensionContextAlive) return;
   if (!/amazon\.com$/i.test(location.hostname)) return;
   if (!isRelevantTrackingPage()) return;
-  const signedInAccountName = amazonSignedInAccountName();
-  const signedInAccountType = typeof amazonAccountType === "function" ? amazonAccountType() : "unknown";
-  if (signedInAccountName || signedInAccountType !== "unknown") {
-    await send({ type: "AMAZON_ACCOUNT_CONTEXT", amazonAccountName: signedInAccountName, amazonAccountType: signedInAccountType });
-  }
+  // This eager read keeps the popup current when Amazon has already rendered
+  // its shell. A mandatory second read happens after page readiness below.
+  await verifiedAmazonAccountContext(0, false);
   const runSignature = location.href;
   const now = Date.now();
   if (
@@ -1143,8 +1178,10 @@ async function run() {
     await waitForTrackingPageReady();
     const data = await parseTrackingPage();
     if (!data.amazonOrderId) return;
+    const account = await requireAmazonAccountContext(data.amazonOrderId);
+    if (!account) return;
     showPanel("Nutricity tracking", `Capturing tracking for ${data.amazonOrderId}: ${data.package.status}.`);
-    const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data }, 45000);
+    const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data, ...account }, 45000);
     if (followRecoveryRedirect(response)) return;
     if (response?.ignored) {
       showPanel("Nutricity tracking", response.message || "Headless tracking mode is active; visible Amazon pages are ignored.");
@@ -1160,6 +1197,8 @@ async function run() {
     return;
   }
   await waitForPageReady();
+  const pageAccount = await requireAmazonAccountContext(activeTrackingOrderId(initialState));
+  if (!pageAccount) return;
   if (isOrderHistoryPage()) {
     const state = initialState;
     if (state?.timedOut) {
@@ -1206,7 +1245,7 @@ async function run() {
           ? `Found ${data.packages.length} package link(s) for ${data.amazonOrderId}.`
           : `Captured order details for ${data.amazonOrderId}; no package tracking link yet.`,
     );
-    const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data }, 15000);
+    const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data, ...pageAccount }, 15000);
     if (data.orderCancelled) {
       window.setTimeout(() => {
         void send({
@@ -1283,11 +1322,13 @@ if (!window.__nutricityTrackAllWatcher) {
         window.__nutricityLastOrderPageWatcherAt = Date.now();
         const data = await parseOrderDetails();
         if (data.amazonOrderId && data.orderCancelled) {
+          const account = await requireAmazonAccountContext(data.amazonOrderId);
+          if (!account) return;
           const signature = `${state.tracking.startedAt || ""}|cancelled|${data.amazonOrderId}|${location.href}`;
           if (window.__nutricityLastCancelledOrderSignature === signature) return;
           window.__nutricityLastCancelledOrderSignature = signature;
           showPanel("Nutricity tracking", `Cancelled order detected for ${data.amazonOrderId}. Moving to next order.`);
-          const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data }, 15000);
+          const response = await sendWithTimeout({ type: "ORDER_PACKAGES", ...data, ...account }, 15000);
           if (!response?.ok) {
             await send({
               type: "FORCE_ADVANCE_HISTORY_ORDER",
@@ -1319,11 +1360,13 @@ if (!window.__nutricityTrackAllWatcher) {
           const data = await parseTrackingPage();
           const activeOrderId = activeTrackingOrderId(state);
           if (!data.amazonOrderId || String(data.amazonOrderId) !== String(activeOrderId || "")) return;
+          const account = await requireAmazonAccountContext(data.amazonOrderId);
+          if (!account) return;
           const signature = `${state.tracking.startedAt || ""}|tracking|${data.amazonOrderId}|${location.href}|${state.tracking.lastActivityAt || ""}`;
           if (window.__nutricityLastTrackingRetrySignature === signature) return;
           window.__nutricityLastTrackingRetrySignature = signature;
           showPanel("Nutricity tracking", `Retrying stalled tracking page for ${data.amazonOrderId}.`);
-          const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data, retry: true }, 20000);
+          const response = await sendWithTimeout({ type: "PACKAGE_TRACKING", ...data, ...account, retry: true }, 20000);
           if (!response?.ok && response?.timedOut) {
             await send({
               type: "FORCE_ADVANCE_HISTORY_ORDER",

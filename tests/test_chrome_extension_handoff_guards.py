@@ -177,7 +177,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
         self.assertNotIn('.includes(', body)
 
     def test_manifest_version_was_bumped(self) -> None:
-        self.assertEqual(MANIFEST["version"], "0.1.197")
+        self.assertEqual(MANIFEST["version"], "0.1.198")
 
     def test_popup_can_import_and_prioritize_one_odoo_order(self) -> None:
         self.assertIn('id="odooOrderNumber"', POPUP_HTML)
@@ -839,7 +839,7 @@ class ChromeExtensionHandoffGuardTests(unittest.TestCase):
     def test_claim_reconciles_one_exact_history_order_before_chrome_checkout(self) -> None:
         self.assertIn("def exact_amazon_history_match_for_chrome_job(", APP)
         self.assertIn("order_names.issubset(recipient_refs)", APP)
-        self.assertIn("if set(actual) != set(expected):", APP)
+        self.assertIn("if set(actual) != set(comparison):", APP)
         self.assertIn("return matches[0] if len(matches) == 1 else None", APP)
         jobs_start = APP.index('@app.get("/api/chrome/jobs")')
         jobs_end = APP.index('@app.get("/api/chrome/jobs/recover-submitted")', jobs_start)

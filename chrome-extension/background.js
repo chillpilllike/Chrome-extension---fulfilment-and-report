@@ -624,6 +624,10 @@ async function syncAmazonHistoryOrder(order = {}) {
       amazon_account_name: order.amazon_account_name || "Chrome History Matcher",
       order_date: normalized.order_date || order.order_date || "",
       order_names: orderNames,
+      asins: order.asins || [],
+      items: order.items || [],
+      cancelled: order.cancelled === true,
+      amazon_account_type: order.amazon_account_type || "",
       line_ids: lineIds,
       source_text: order.source_text || normalized.recipient || "",
       store_id: order.store_id || null,
@@ -3812,6 +3816,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "REMEMBER_RECENT_AMAZON_ORDERS") return rememberRecentAmazonOrders(message.orders || []);
     if (message.type === "LOOKUP_AMAZON_HISTORY_ORDERS") return lookupAmazonHistoryOrders(message.orders || []);
     if (message.type === "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT") return lookupAmazonHistoryOdooDirect(message.orders || []);
+    if (message.type === "SAVE_BUNDLE_COMPONENTS") return api(`/api/chrome/jobs/${encodeURIComponent(message.groupKey)}/bundle-components`, { method: "POST", body: JSON.stringify({ worker_id: message.workerId, evidence: message.evidence }) });
     if (message.type === "SYNC_AMAZON_HISTORY_ORDER") return syncAmazonHistoryOrder(message.order || {});
     if (message.type === "GET_RECENT_AMAZON_ORDERS") {
       const { recentAmazonOrders } = await getSettings();

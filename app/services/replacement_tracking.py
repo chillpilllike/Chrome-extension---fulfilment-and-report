@@ -1,9 +1,10 @@
 """Exact purchase and shipment identity checks for replacement components."""
 import re
+from app.services import amazon_bundles
 
 
 def strict_line(row):
-    return bool(row.get('replacement_asin') or int(row.get('bundle_component_count') or 1) > 1)
+    return bool(amazon_bundles.line_components(row) or row.get('replacement_asin') or int(row.get('bundle_component_count') or 1) > 1)
 
 
 def asin(value):
@@ -20,7 +21,7 @@ def package_asins(package):
 def tracking_error(rows, packages):
     if not any(strict_line(row) for row in rows):
         return ''
-    expected = {asin(row.get('replacement_asin') or row.get('asin')) for row in rows}
+    expected = {value for row in rows for value in (amazon_bundles.line_components(row) or {asin(row.get('replacement_asin') or row.get('asin')): 1})}
     for package in packages:
         observed = package_asins(package)
         if not observed or not observed.intersection(expected):
@@ -57,6 +58,8 @@ def completion_error(rows, mappings):
 
 
 def delivered_quantity_complete(row, packages):
+    if amazon_bundles.line_components(row):
+        return amazon_bundles.delivered_complete(row, packages)
     expected = asin(row.get('replacement_asin') or row.get('asin'))
     quantity = float(row.get('quantity') or 1)
     total = 0.0

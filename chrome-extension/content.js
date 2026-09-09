@@ -63,6 +63,7 @@ let orderHistoryAnnotationTimer = null;
 const orderHistoryLookupCache = new Map();
 const orderHistoryOdooDirectInFlight = new Set();
 const orderHistorySyncInProgress = new Map();
+const orderHistorySyncFailures = new Map();
 const orderHistorySyncedConfirmations = new Map();
 let fulfilmentForceStopped = false;
 let runIntervalId = null;
@@ -4015,6 +4016,22 @@ async function handleFailureCleanup(activeJob) {
   showPanel("Nutricity fulfilment", result?.message || "No more queued Chrome jobs found.", null, null);
 }
 
+function productBundleEvidence(parentAsin) {
+  const root = document.querySelector("#bundleComponentDetails_feature_div");
+  if (!root) return null;
+  const rows = [...root.querySelectorAll('[id^="bundle-component-details-component-title-"]')];
+  const components = {};
+  for (const row of rows) {
+    const match = String(row.textContent || "").trim().match(/^(\d+)\s+of\b/i);
+    const link = row.querySelector('a[href*="/dp/"]');
+    const asin = String(link?.href || "").match(/\/dp\/([A-Z0-9]{10})(?:[/?]|$)/i)?.[1]?.toUpperCase();
+    if (!match || !asin || !Number(match[1]) || components[asin]) return null;
+    components[asin] = Number(match[1]);
+  }
+  if (rows.length < 2 || Object.keys(components).length !== rows.length) return null;
+  return { parent_asin: parentAsin, observed_asin: parentAsin, components, source_url: location.href, source: "bundleComponentDetails_feature_div" };
+}
+
 async function handleProduct(activeJob) {
   const item = activeJob.job.items[activeJob.itemIndex];
   if (!item) return;
@@ -4130,6 +4147,15 @@ async function handleProduct(activeJob) {
       "asin_redirect_mismatch",
     );
     return;
+  }
+  const bundleEvidence = productBundleEvidence(expectedItem.asin);
+  if (bundleEvidence) {
+    const saved = await send({ type: "SAVE_BUNDLE_COMPONENTS", groupKey: activeJob.job.group_key, workerId: activeJob.workerId, evidence: bundleEvidence });
+    if (!saved?.ok) {
+      await pauseForManualCheckout(activeJob, saved?.message || "Could not verify and save Amazon bundle components. Retry before purchasing.", "product");
+      return;
+    }
+    item.bundle_components = saved.components;
   }
   activeJob.productIdentityVerifications = {
     ...(activeJob.productIdentityVerifications || {}),
@@ -9712,12 +9738,20 @@ function renderOrderHistoryAnnotation(card, result) {
       button.disabled = true;
       button.textContent = "Syncing...";
     } else {
-      button.textContent = "Sync Amazon ID";
+      const failure = orderHistorySyncFailures.get(displayResult.orderId);
+      button.textContent = failure ? "Retry sync" : "Sync Amazon ID";
+      if (failure) {
+        const error = document.createElement("span");
+        error.className = "nutricity-order-history-warning";
+        error.textContent = failure;
+        marker.appendChild(error);
+      }
     }
     button.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
       if (orderHistorySyncInProgress.has(displayResult.orderId)) return;
+      orderHistorySyncFailures.delete(displayResult.orderId);
       orderHistorySyncInProgress.set(displayResult.orderId, Date.now());
       button.disabled = true;
       button.classList.add("is-syncing");
@@ -9747,6 +9781,11 @@ function renderOrderHistoryAnnotation(card, result) {
         button.disabled = false;
         button.textContent = "Sync failed";
         button.title = synced?.message || "Could not sync this Amazon order.";
+        orderHistorySyncFailures.set(displayResult.orderId, button.title);
+        const error = document.createElement("span");
+        error.className = "nutricity-order-history-warning";
+        error.textContent = button.title;
+        marker.appendChild(error);
       }
     });
     marker.appendChild(button);
@@ -10013,6 +10052,11 @@ function appendDirectOdooHistoryRows(container, directOdoo = [], detailsClass = 
       marker.appendChild(warning);
     } else {
       appendOrderHistoryQuantitySummary(marker, [order]);
+      if (order.bundle_components && Object.keys(order.bundle_components).length) {
+        const bundle = document.createElement("span");
+        bundle.textContent = `Verified Amazon bundle: ${Object.keys(order.bundle_components).join(", ")}`;
+        marker.appendChild(bundle);
+      }
       if (asinConflict) {
         const warning = document.createElement("span");
         warning.className = "nutricity-order-history-warning";
@@ -10204,6 +10248,11 @@ async function syncSuggestedAmazonHistoryOrder(result) {
       recipient: result.recipient || "",
       source_text: result.recipient || orderNames.join(" "),
       order_names: orderNames,
+      asins: result.asins || [],
+      items: result.items || [],
+      cancelled: result.cancelled === true,
+      amazon_account_name: amazonSignedInAccountName(),
+      amazon_account_type: amazonAccountExperience(),
       line_ids: lineIdsForSync,
       store_id: suggestions.length === 1 ? suggestions[0].store_id : null,
       replace_existing: true,
@@ -10225,6 +10274,9 @@ async function syncMatchedAmazonHistoryDate(result) {
       recipient: result.recipient || "",
       source_text: result.recipient || orderNames.join(" "),
       order_names: orderNames,
+      asins: result.asins || [],
+      items: result.items || [],
+      cancelled: result.cancelled === true,
       line_ids: lineIds,
       store_id: orders.length === 1 ? orders[0].store_id : null,
       replace_existing: true,
@@ -10436,6 +10488,13 @@ function activeJobAsins(activeJob) {
     .filter(Boolean))];
 }
 
+function historyExpectedAsins(activeJob) {
+  return [...new Set((activeJob?.job?.items || []).flatMap((item) => {
+    const children = Object.keys(item.bundle_components || {});
+    return children.length ? children : [String(item.asin || "").toUpperCase()];
+  }).filter(Boolean))];
+}
+
 function recentOrderMatchesActiveJob(order, activeJob) {
   if (order?.cancelled === true) return false;
   const orderId = String(order?.amazon_order_id || "").trim();
@@ -10462,7 +10521,8 @@ function recentOrderMatchesActiveJob(order, activeJob) {
   if (!nameMatches) return false;
   const exactOrderNameMatch = compactNames.some((name) => name.length >= 5 && compactHaystack.includes(name));
   const cachedAsins = new Set((order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean));
-  const jobAsins = activeJobAsins(activeJob);
+  const parentAsins = activeJobAsins(activeJob);
+  const jobAsins = [...cachedAsins].every((asin) => parentAsins.includes(asin)) ? parentAsins : historyExpectedAsins(activeJob);
   if (!cachedAsins.size || !jobAsins.length) return false;
   const jobAsinSet = new Set(jobAsins);
   const extraAsins = [...cachedAsins].filter((asin) => !jobAsinSet.has(asin));
@@ -10786,7 +10846,7 @@ function buildOrderMappings(activeJob, orders) {
   const singleOrder = orders.length === 1 ? orders[0] : null;
   for (const item of items) {
     const requestedAsin = String(item.asin || "").toUpperCase();
-    const itemAsins = [requestedAsin].filter(Boolean);
+    const itemAsins = [requestedAsin, ...Object.keys(item.bundle_components || {})].filter(Boolean);
     const candidates = orders.filter((candidate) => {
       const candidateAsins = (candidate.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean);
       return candidateAsins.length && itemAsins.some((asin) => candidateAsins.includes(asin));
@@ -10800,6 +10860,7 @@ function buildOrderMappings(activeJob, orders) {
     mappings.push({
       asin: requestedAsin,
       observed_asins: order.asins || [],
+      observed_quantities: Object.fromEntries((order.asins || []).map((asin) => [asin, (order.items || []).filter((part) => part.asin === asin).reduce((sum, part) => sum + Number(part.quantity || 1), 0) || 1])),
       line_ids: item.line_ids || [],
       amazon_order_id: order.amazon_order_id,
       amazon_order_url: order.amazon_order_url || orderDetailsUrl(order.amazon_order_id),
@@ -10848,11 +10909,12 @@ function businessBundleCompletionEvidence(activeJob, orders) {
 }
 
 function orderHistoryAsinIdentityCheck(activeJob, orders) {
-  const expected = new Set(activeJobAsins(activeJob));
+  let expected = new Set(activeJobAsins(activeJob));
   const observed = new Set((orders || [])
     .flatMap((order) => order?.asins || [])
     .map((asin) => String(asin || "").trim().toUpperCase())
     .filter(Boolean));
+  if ([...observed].some((asin) => !expected.has(asin))) expected = new Set(historyExpectedAsins(activeJob));
   const unexpected = [...observed].filter((asin) => !expected.has(asin));
   const missing = [...expected].filter((asin) => !observed.has(asin));
   return {
@@ -10875,6 +10937,7 @@ async function reportAmazonOrders(activeJob, orders) {
       amazon_order_id: orderId,
       amazon_order_url: order.amazon_order_url || orderDetailsUrl(orderId),
       order_date: order.order_date || "",
+      items: order.items || [],
       recipient: String(order.recipient || "").replace(/\s+/g, " ").trim(),
       asins: (order.asins || []).map((asin) => String(asin || "").toUpperCase()).filter(Boolean),
     });

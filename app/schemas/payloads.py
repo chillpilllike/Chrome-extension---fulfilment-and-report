@@ -181,6 +181,7 @@ class ManualAmazonOrderMatchPayload(BaseModel):
     store_id: Optional[int] = None
     replace_existing: bool = False
     asins: list[str] = []
+    items: list[dict[str, Any]] = []
     cancelled: bool = False
 
 
