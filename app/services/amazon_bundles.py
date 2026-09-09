@@ -1,6 +1,6 @@
 """Reviewed Amazon virtual bundles; purchase identity stays the parent ASIN.
 
-Only Amazon's explicit bundle-component section is acceptable catalog evidence.
+Evidence comes from explicit bundle components or the verified multi-pack size selector.
 Never learn this relationship from recipient names, titles, or a mismatched cart.
 Quantities are per purchased bundle. Unknown bundles remain blocked for review.
 """
@@ -10,6 +10,14 @@ import re
 from urllib.parse import urlsplit
 
 CATALOG = {
+    "B0BV67RXQH": {
+        "parent_asin": "B0BV67RXQH", "observed_asin": "B0BV67RXQH",
+        "source_url": "https://www.amazon.com/dp/B0BV67RXQH",
+        "verified_at": "2026-09-09", "source": "amazon_multipack_size_selector",
+        "selected_size": "24 Count (Pack of 2)", "single_size": "24 Count (Pack of 1)",
+        "pack_count": 2, "single_asin": "B076F324JN",
+        "components": {"B076F324JN": 2},
+    },
     "B0D51GVTKS": {
         "source_url": "https://www.amazon.com/dp/B0D51GVTKS",
         "verified_at": "2026-09-09",
@@ -23,12 +31,21 @@ def validate_evidence(evidence):
     parent = str(evidence.get('parent_asin') or '').upper()
     page = urlsplit(str(evidence.get('source_url') or ''))
     children = evidence.get('components') or {}
+    multipack = evidence.get('source') == 'amazon_multipack_size_selector'
+    if multipack:
+        selected = re.fullmatch(r'(.+?) \(Pack of ([0-9]+)\)', str(evidence.get('selected_size') or ''))
+        single = re.fullmatch(r'(.+?) \(Pack of 1\)', str(evidence.get('single_size') or ''))
+        if (not selected or not single or selected[1] != single[1]
+                or not 2 <= int(selected[2]) <= 100
+                or evidence.get('pack_count') != int(selected[2])
+                or children != {evidence.get('single_asin'): int(selected[2])}):
+            raise ValueError('Multi-pack evidence must identify the same size, its single unit, and exact pack count.')
     if (not re.fullmatch(r'[A-Z0-9]{10}', parent)
             or evidence.get('observed_asin') != parent
             or page.scheme != 'https' or page.hostname != 'www.amazon.com'
             or not re.search(r'/(?:dp|gp/product)/' + parent + r'(?:/|$)', page.path)
-            or evidence.get('source') != 'bundleComponentDetails_feature_div'
-            or not isinstance(children, dict) or not 2 <= len(children) <= 20
+            or evidence.get('source') not in {'bundleComponentDetails_feature_div', 'amazon_multipack_size_selector'}
+            or not isinstance(children, dict) or not (1 if multipack else 2) <= len(children) <= 20
             or parent in children
             or any(not re.fullmatch(r'[A-Z0-9]{10}', child) or not 0 < quantity(count) <= 100 or quantity(count) != int(quantity(count)) for child, count in children.items())):
         raise ValueError('Bundle components need exact evidence from the authorized Amazon product bundle section.')
@@ -46,6 +63,11 @@ def load_catalog(conn):
 
 def components(asin):
     return dict(CATALOG.get(str(asin or '').strip().upper(), {}).get('components', {}))
+
+
+def multipack_evidence(asin):
+    entry = CATALOG.get(str(asin or "").upper(), {})
+    return dict(entry) if entry.get("source") == "amazon_multipack_size_selector" else None
 
 
 def line_components(row):

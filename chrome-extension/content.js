@@ -1461,6 +1461,7 @@ function finalCheckoutAsinQuantityEvidence() {
   const asinNodes = [...document.querySelectorAll("[data-testid^='Item_asin_']")];
   if (!asinNodes.length) return { present: false, readable: false, quantities: {}, observed_asins: [] };
   const quantities = {};
+  const rows = [];
   const observedAsins = [];
   const seenRows = new Set();
   let readable = true;
@@ -1481,6 +1482,11 @@ function finalCheckoutAsinQuantityEvidence() {
       return;
     }
     quantities[asin] = (quantities[asin] || 0) + Number(quantity);
+    const description = node.parentElement;
+    const title = String(description?.querySelector(".lineitem-title-text")?.textContent || "").trim();
+    const priceText = String(description?.querySelector(".lineitem-price-text")?.textContent || "").trim();
+    const priceMatch = priceText.match(/^\$([0-9,]+\.[0-9]{2})$/);
+    rows.push({ asin, quantity: Number(quantity), title, price: priceMatch ? Number(priceMatch[1].replace(/,/g, "")) : null });
   });
   if (observedAsins.length !== seenRows.size) readable = false;
   return {
@@ -1488,6 +1494,7 @@ function finalCheckoutAsinQuantityEvidence() {
     readable,
     quantities,
     observed_asins: [...new Set(observedAsins)],
+    rows,
   };
 }
 
@@ -1602,6 +1609,31 @@ async function ensureFinalAuthorizedAsinIdentity(activeJob) {
       activeJob.asinIdentityError = "";
       await setActiveJob(activeJob, { reason: "verified_final_checkout_asins" });
       return true;
+    }
+    // Refresh only server-verified pack metadata for jobs surviving an extension update.
+    await loadJobMultipacks(activeJob);
+    const multipackQuantities = multipackCheckoutQuantities(activeJob, checkoutEvidence, amazonAccountExperience());
+    if (multipackQuantities) {
+      activeJob.finalCheckoutAsinVerification = {
+        group_key: activeJob.job.group_key, quantities: multipackQuantities,
+        component_rows: checkoutEvidence.rows, representation: "verified_multipack",
+        verified_at: Date.now(),
+      };
+      activeJob.asinIdentityError = "";
+      await setActiveJob(activeJob, { reason: "verified_final_checkout_multipacks" });
+      return true;
+    }
+    const needsPackCartCheck = (activeJob.job.items || []).some(item => item.multipack_evidence
+      && checkoutEvidence.observed_asins.includes(item.multipack_evidence.single_asin)
+      && (!cartVerificationMatches(activeJob) || !activeJob.cartVerification?.multipacks?.[item.asin]));
+    if (needsPackCartCheck && Number(activeJob.multipackCartRecheckCount || 0) < 1) {
+      activeJob.multipackCartRecheckCount = Number(activeJob.multipackCartRecheckCount || 0) + 1;
+      activeJob.stage = "cart";
+      activeJob.asinIdentityError = "";
+      await setActiveJob(activeJob, { allowStageRegression: true, reason: "verify_multipack_cart" });
+      showPanel("Verifying Amazon multi-pack", "Rechecking the authorized multi-pack in the cart before checkout.", null, null);
+      location.href = "https://www.amazon.com/gp/cart/view.html";
+      return false;
     }
     const quantityDetails = Object.entries(checkoutEvidence.quantities)
       .map(([asin, quantity]) => `${asin} x${quantity}`)
@@ -4016,6 +4048,86 @@ async function handleFailureCleanup(activeJob) {
   showPanel("Nutricity fulfilment", result?.message || "No more queued Chrome jobs found.", null, null);
 }
 
+function productMultipackEvidence(parentAsin) {
+  // Only Amazon's explicit homogeneous multi-pack offer and current size selector.
+  // This records contents; item.asin remains the sole Add-to-cart identity.
+  const badge = document.querySelector("#outer-packsizelabel .outer-pack-size-badge__count");
+  const count = Number(badge?.textContent?.trim());
+  if (!Number.isInteger(count) || count < 2 || count > 100
+      || !document.getElementById(`apex_price_refresh_ajax-BUNDLE-0-${parentAsin}`)) return null;
+  const rows = [...document.querySelectorAll("#inline-twister-row-size_name li[data-asin]")];
+  const selected = rows.filter(row => row.querySelector('[role="radio"][aria-checked="true"]'));
+  if (selected.length !== 1 || selected[0].getAttribute("data-asin") !== parentAsin) return null;
+  const selectedSize = selected[0].querySelector(".swatch-title-text")?.textContent?.trim() || "";
+  const match = selectedSize.match(/^(.+?) \(Pack of ([0-9]+)\)$/);
+  if (!match || Number(match[2]) !== count) return null;
+  const singleSize = `${match[1]} (Pack of 1)`;
+  const singles = rows.filter(row => row.querySelector(".swatch-title-text")?.textContent?.trim() === singleSize);
+  if (singles.length !== 1) return null;
+  const child = singles[0].getAttribute("data-asin");
+  if (!/^[A-Z0-9]{10}$/.test(child || "") || child === parentAsin) return null;
+  return { parent_asin: parentAsin, observed_asin: parentAsin,
+    source_url: location.href, source: "amazon_multipack_size_selector",
+    selected_size: selectedSize, single_size: singleSize, single_asin: child,
+    pack_count: count, components: { [child]: count } };
+}
+
+async function loadJobMultipacks(activeJob) {
+  const result = await send({ type: "LOAD_MULTIPACK_EVIDENCE", groupKey: activeJob.job.group_key, workerId: activeJob.workerId });
+  if (!result?.ok) return false;
+  for (const item of activeJob.job.items || []) {
+    const evidence = result.items?.[item.asin];
+    if (evidence?.source === "amazon_multipack_size_selector" && evidence.parent_asin === item.asin) {
+      item.multipack_evidence = evidence;
+      item.bundle_components = evidence.components;
+    }
+  }
+  return true;
+}
+
+function cartMultipackProofs(activeJob) {
+  const proofs = {};
+  for (const item of activeJob.job.items || []) {
+    if (!item.multipack_evidence) continue;
+    const rows = cartActiveItems().filter(row => cartItemAsin(row) === item.asin);
+    if (rows.length !== 1) continue;
+    const row = rows[0];
+    if (!row.querySelector('[data-csa-c-content-id="homogenous-bundle"]')) continue;
+    const title = String(row.getAttribute("data-producttitle") || "").trim();
+    const price = Number(row.getAttribute("data-price"));
+    const quantity = cartItemQuantity(row);
+    if (!title || !Number.isFinite(price) || price <= 0 || quantity !== Number(item.quantity)) continue;
+    proofs[item.asin] = { title, price, quantity };
+  }
+  return proofs;
+}
+
+function multipackCheckoutQuantities(activeJob, evidence, accountExperience) {
+  // Separate from normal exact-ASIN validation; never accept title-only aliases.
+  if (accountExperience !== "business" && accountExperience !== "consumer") return null;
+  if (!evidence.readable || !evidence.rows?.length || !cartVerificationMatches(activeJob)) return null;
+  const result = {};
+  let mapped = false;
+  for (const row of evidence.rows) {
+    const exact = (activeJob.job.items || []).filter(item => item.asin === row.asin);
+    const packs = (activeJob.job.items || []).filter(item => {
+      const pack = item.multipack_evidence;
+      const proof = activeJob.cartVerification?.multipacks?.[item.asin];
+      return pack?.source === "amazon_multipack_size_selector" && pack.parent_asin === item.asin
+        && pack.single_asin === row.asin && pack.components?.[row.asin] === pack.pack_count
+        && Number.isInteger(pack.pack_count) && pack.pack_count >= 2
+        && proof && proof.title === row.title && proof.price === row.price
+        && proof.quantity === row.quantity;
+    });
+    // Ambiguous shared child/ordinary lines must never be silently assigned.
+    if (packs.length + exact.length !== 1) return null;
+    const asin = exact.length ? row.asin : packs[0].asin;
+    if (packs.length) mapped = true;
+    result[asin] = (result[asin] || 0) + row.quantity;
+  }
+  return mapped && exactAsinQuantitiesMatch(expectedCartQuantities(activeJob), result) ? result : null;
+}
+
 function productBundleEvidence(parentAsin) {
   const root = document.querySelector("#bundleComponentDetails_feature_div");
   if (!root) return null;
@@ -4148,7 +4260,7 @@ async function handleProduct(activeJob) {
     );
     return;
   }
-  const bundleEvidence = productBundleEvidence(expectedItem.asin);
+  const bundleEvidence = productMultipackEvidence(expectedItem.asin) || productBundleEvidence(expectedItem.asin);
   if (bundleEvidence) {
     const saved = await send({ type: "SAVE_BUNDLE_COMPONENTS", groupKey: activeJob.job.group_key, workerId: activeJob.workerId, evidence: bundleEvidence });
     if (!saved?.ok) {
@@ -4156,6 +4268,7 @@ async function handleProduct(activeJob) {
       return;
     }
     item.bundle_components = saved.components;
+    item.multipack_evidence = saved.multipack_evidence || null;
   }
   activeJob.productIdentityVerifications = {
     ...(activeJob.productIdentityVerifications || {}),
@@ -4787,10 +4900,17 @@ async function handleCart(activeJob) {
     showPanel("Nutricity fulfilment", cartCheck.warning, null, null);
     await sleep(1800);
   }
+  if (cartActiveItems().some(row => row.querySelector('[data-csa-c-content-id="homogenous-bundle"]'))) {
+    if (!await loadJobMultipacks(activeJob)) {
+      await pauseForManualCheckout(activeJob, "Could not refresh verified multi-pack evidence. Retry the cart check before checkout.", "cart");
+      return;
+    }
+  }
   activeJob.cartVerification = cartCheck.exact === true
     ? {
         group_key: activeJob.job?.group_key || "",
         quantities: { ...(cartCheck.quantities || {}) },
+        multipacks: cartMultipackProofs(activeJob),
         verified_at: Date.now(),
       }
     : null;

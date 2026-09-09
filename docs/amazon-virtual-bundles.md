@@ -37,3 +37,36 @@ Amazon order `111-5640817-7945804`, parent `B0D51GVTKS`, one each of
 components and warns they may ship separately. This reviewed composition is
 seeded in the shared catalog so an already-placed order can be reconciled without
 reopening or re-placing a fulfilment job.
+
+
+## Homogeneous Amazon multi-packs (0.1.199)
+
+NC26815 exposed a different representation: the authorized replacement and cart
+ASIN B0BV67RXQH is a two-pack, but checkout uses B076F324JN in its hidden
+Item_asin field while retaining the pack title, price and quantity. Three packs
+represent six single units. This is not permission to substitute a variant.
+
+The product discovery path requires Amazon's pack-count badge, BUNDLE offer,
+selected parent ASIN, and a unique single-pack option with the identical size
+base. The server validates and persists the immutable per-pack composition.
+The cart must additionally mark that exact purchased parent as a homogeneous
+multi-pack. Final checkout accepts the component representation only with a
+fresh owner-job cart verification, exact title, pack price, pack quantity and
+an unambiguous one-to-one row match. Unknown accounts and ambiguous mixed
+parent/component purchases remain blocked. Ordinary exact-ASIN validation,
+consumer subscription choices and Business payment handling retain their own
+existing paths.
+
+A paused older job can load its server-verified pack evidence on Resume and
+return to the cart once to obtain fresh proof; no cart quantity or ASIN is
+changed by this recovery. A second failed check pauses rather than looping.
+
+History matching requires the full component quantity (six for NC26815) when
+Amazon reports component ASINs. Tracking deduplicates shipment evidence and
+requires all six verified units; pre-shipment estimates cannot count as item
+evidence. If Amazon history does not expose component quantities, reporting
+remains blocked for review rather than assuming three components means six.
+
+Validation: 245 tests, including Consumer and Business checkout matching and
+rejection cases; live read-only inspection of both product experiences and
+the Gurdev cart/checkout. No test purchase was placed.

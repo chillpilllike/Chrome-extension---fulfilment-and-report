@@ -3816,6 +3816,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "REMEMBER_RECENT_AMAZON_ORDERS") return rememberRecentAmazonOrders(message.orders || []);
     if (message.type === "LOOKUP_AMAZON_HISTORY_ORDERS") return lookupAmazonHistoryOrders(message.orders || []);
     if (message.type === "LOOKUP_AMAZON_HISTORY_ODOO_DIRECT") return lookupAmazonHistoryOdooDirect(message.orders || []);
+    if (message.type === "LOAD_MULTIPACK_EVIDENCE") return api(`/api/chrome/jobs/${encodeURIComponent(message.groupKey)}/bundle-components`, { method: "POST", body: JSON.stringify({ worker_id: message.workerId, read_only: true }) });
     if (message.type === "SAVE_BUNDLE_COMPONENTS") return api(`/api/chrome/jobs/${encodeURIComponent(message.groupKey)}/bundle-components`, { method: "POST", body: JSON.stringify({ worker_id: message.workerId, evidence: message.evidence }) });
     if (message.type === "SYNC_AMAZON_HISTORY_ORDER") return syncAmazonHistoryOrder(message.order || {});
     if (message.type === "GET_RECENT_AMAZON_ORDERS") {

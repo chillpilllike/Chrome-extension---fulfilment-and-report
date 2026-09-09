@@ -12807,6 +12807,7 @@ def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optio
             {
                 "asin": item["asin"],
                 "bundle_components": amazon_bundles.components(item["asin"]),
+                "multipack_evidence": amazon_bundles.multipack_evidence(item["asin"]),
                 "quantity": item["quantity"],
                 "requested_quantity": item.get("requested_quantity") or item["quantity"],
                 "inventory_quantity": item.get("inventory_quantity") or 0,
@@ -29931,6 +29932,8 @@ class ChromeBrowserlessSession:
         message_type = clean_text(message.get("type"))
         if self.should_stop() and message_type not in {"GET_ACTIVE_JOB", "GET_STATE", "HEARTBEAT_JOB"}:
             return {"ok": False, "stopped": True, "message": "Browserless stop requested."}
+        if message_type == "LOAD_MULTIPACK_EVIDENCE":
+            return api_chrome_bundle_components(clean_text(message.get("groupKey")), {"worker_id": self.worker_id, "read_only": True})
         if message_type == "SAVE_BUNDLE_COMPONENTS":
             return api_chrome_bundle_components(clean_text(message.get("groupKey")), {"worker_id": self.worker_id, "evidence": message.get("evidence") or {}})
         if message_type == "GET_ACTIVE_JOB":
@@ -33295,6 +33298,9 @@ def api_chrome_bundle_components(group_key: str, payload: dict[str, Any]) -> dic
     with db() as conn:
         ensure_chrome_job_owner(conn, group_key, clean_text(payload.get("worker_id")))
         amazon_bundles.load_catalog(conn)
+        if payload.get("read_only"):
+            rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_group_key=?", (group_key,)).fetchall())
+            return {"ok": True, "items": {normalize_asin(row.get("replacement_asin") or row.get("asin")): amazon_bundles.multipack_evidence(row.get("replacement_asin") or row.get("asin")) for row in rows}}
         try:
             parent, children = amazon_bundles.validate_evidence(evidence)
         except (ValueError, TypeError) as exc:
@@ -33309,7 +33315,7 @@ def api_chrome_bundle_components(group_key: str, payload: dict[str, Any]) -> dic
         if json.loads(stored["value"])["components"] != children:
             raise HTTPException(409, "Bundle composition conflicts with previously verified evidence; review required.")
     amazon_bundles.CATALOG[parent] = saved
-    return {"ok": True, "parent_asin": parent, "components": children}
+    return {"ok": True, "parent_asin": parent, "components": children, "multipack_evidence": amazon_bundles.multipack_evidence(parent)}
 
 
 @app.post("/api/chrome/jobs/{group_key}/complete")
