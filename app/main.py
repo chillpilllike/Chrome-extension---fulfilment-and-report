@@ -26520,7 +26520,7 @@ def api_inventory_asin_image(asin: str) -> Response:
 
 
 @app.get("/api/inventory/{inventory_id}/image")
-def api_inventory_image(inventory_id: int) -> Response:
+def api_inventory_image(inventory_id: int, reload: str = "") -> Response:
     with db() as conn:
         item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
         if not item:
@@ -26531,7 +26531,62 @@ def api_inventory_image(inventory_id: int) -> Response:
         image_url = amazon_product_page_image_url(item["asin"])
     if not image_url:
         raise HTTPException(404, "Inventory image not found.")
-    return fetch_remote_image_response(image_url)
+    response = fetch_remote_image_response(image_url)
+    if reload:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+@app.post("/api/inventory/{inventory_id}/refresh-image")
+def api_refresh_inventory_image(inventory_id: int) -> dict[str, Any]:
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        item_data = dict(item)
+        item_data["image_url"] = ""
+        captured = inventory_product_images([item_data], conn).get(inventory_id, {})
+
+    asin = normalize_asin(item_data.get("asin"))
+    with _PACKAGE_TRACKER_IMAGE_URL_CACHE_LOCK:
+        _PACKAGE_TRACKER_IMAGE_URL_CACHE.pop(asin, None)
+        _PACKAGE_TRACKER_IMAGE_FAILURE_CACHE.pop(asin, None)
+    with _PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE_LOCK:
+        _PACKAGE_TRACKER_CAPTURED_IMAGE_CACHE.pop(asin, None)
+
+    candidates = [
+        (amazon_product_page_image_url(asin), "amazon_page"),
+        (clean_text(captured.get("image_url")), clean_text(captured.get("image_source")) or "captured_thumbnail"),
+    ]
+    image_url = ""
+    image_source = ""
+    for candidate_url, candidate_source in candidates:
+        if not candidate_url or not is_safe_amazon_image_url(candidate_url):
+            continue
+        try:
+            fetch_remote_image_response(candidate_url)
+        except HTTPException:
+            continue
+        image_url = candidate_url
+        image_source = candidate_source
+        break
+
+    now = utc_now()
+    with db() as conn:
+        conn.execute(
+            "UPDATE inventory_items SET image_url=?, image_source=?, updated_at=? WHERE id=?",
+            (image_url, image_source, now, inventory_id),
+        )
+    fast_page_cache_clear_matching({"inventory-v2"})
+    if not image_url:
+        raise HTTPException(404, f"No working Amazon image could be loaded for stock #{inventory_id}. The broken saved image was cleared.")
+    cache_buster = uuid.uuid4().hex
+    return {
+        "ok": True,
+        "message": f"Reloaded image for stock #{inventory_id}.",
+        "image_url": f"/api/inventory/{inventory_id}/image?reload={cache_buster}",
+        "cache_buster": cache_buster,
+    }
 
 
 @app.get("/api/cancelled-orders")

@@ -98,8 +98,29 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("replacement_asin=?", source)
         self.assertIn("Customer accepted inventory alternative ASIN", source)
         self.assertIn("Alternative ASIN · customer acceptance required", FRONTEND)
-        self.assertIn("Confirm the customer accepted this alternative product", FRONTEND)
+        self.assertIn("The customer accepted this alternative product", FRONTEND)
         self.assertIn("replacement_confirmed: replacementConfirmed", FRONTEND)
+
+    def test_inventory_warnings_use_app_dialogs_not_browser_popups(self) -> None:
+        inventory_page = FRONTEND[FRONTEND.index("function InventoryPage("):FRONTEND.index("function CancelledOrdersPage(")]
+
+        self.assertNotIn("window.prompt", inventory_page)
+        self.assertNotIn("window.confirm", inventory_page)
+        self.assertIn("Attach inventory stock", inventory_page)
+        self.assertIn("Different ASIN detected", inventory_page)
+        self.assertIn("Confirm inventory sent", inventory_page)
+        self.assertIn("inventoryReplacementConfirmed", FRONTEND)
+
+    def test_inventory_images_have_a_forced_cache_busting_reload(self) -> None:
+        source = inspect.getsource(main.api_refresh_inventory_image)
+        image_source = inspect.getsource(main.api_inventory_image)
+
+        self.assertIn("amazon_product_page_image_url", source)
+        self.assertIn("fetch_remote_image_response", source)
+        self.assertIn("image_url=?, image_source=?, updated_at=?", source)
+        self.assertIn('response.headers["Cache-Control"] = "no-store, max-age=0"', image_source)
+        self.assertIn("Force reload image for stock", FRONTEND)
+        self.assertIn("cache_buster", FRONTEND)
 
     def test_inventory_matching_is_global_and_uses_effective_replacement_asin(self) -> None:
         reserve_source = inspect.getsource(main.reserve_inventory_for_line)

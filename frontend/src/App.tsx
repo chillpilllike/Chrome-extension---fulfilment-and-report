@@ -3594,6 +3594,7 @@ function App() {
   const [inventoryFulfilmentItems, setInventoryFulfilmentItems] = useState<InventoryItem[]>([])
   const [selectedInventoryId, setSelectedInventoryId] = useState<number | null>(null)
   const [inventoryExpiryConfirmed, setInventoryExpiryConfirmed] = useState(false)
+  const [inventoryReplacementConfirmed, setInventoryReplacementConfirmed] = useState(false)
   const [inventoryFulfilmentLoading, setInventoryFulfilmentLoading] = useState(false)
   const [processReplacementOpen, setProcessReplacementOpen] = useState(false)
   const [processReplacementReason, setProcessReplacementReason] = useState("lost")
@@ -4548,6 +4549,7 @@ function App() {
     setInventoryFulfilmentOpen(true)
     setInventoryFulfilmentLoading(true)
     setInventoryExpiryConfirmed(false)
+    setInventoryReplacementConfirmed(false)
     setSelectedInventoryId(null)
     try {
       const result = await api<{ items: InventoryItem[] }>("/api/inventory?page=1&per_page=100")
@@ -4577,9 +4579,7 @@ function App() {
     const orderAsin = String(line.replacement_asin || line.asin || "").trim().toUpperCase()
     const inventoryAsin = String(inventoryItem?.asin || "").trim().toUpperCase()
     const replacementConfirmed = Boolean(inventoryAsin && inventoryAsin !== orderAsin)
-    if (replacementConfirmed && !window.confirm(
-      `Replacement ASIN warning: this order currently requires ${orderAsin || "an unrecorded ASIN"}, but the selected stock is ${inventoryAsin}. Confirm the customer accepted this alternative product.`,
-    )) return
+    if (replacementConfirmed && !inventoryReplacementConfirmed) return
     setInventoryFulfilmentOpen(false)
     await runAction("Fulfill from Inventory", () =>
       api<{ ok: boolean; message: string }>(`/api/inventory/${selectedInventoryId}/attach`, {
@@ -5241,7 +5241,7 @@ function App() {
                   type="radio"
                   name="inventory-item"
                   checked={selectedInventoryId === item.id}
-                  onChange={() => setSelectedInventoryId(item.id)}
+                  onChange={() => { setSelectedInventoryId(item.id); setInventoryReplacementConfirmed(false) }}
                 />
                 <div className="min-w-0 flex-1">
                   <div className="font-medium">{item.product_name || "Untitled inventory item"}</div>
@@ -5273,9 +5273,25 @@ function App() {
               <span className="ml-2">I checked the expiry date and confirm this item is not expired.</span>
             </label>
           </div>
+          {(() => {
+            const selectedItem = inventoryFulfilmentItems.find((item) => item.id === selectedInventoryId)
+            const orderAsin = String(selectedRows[0]?.replacement_asin || selectedRows[0]?.asin || "").trim().toUpperCase()
+            const selectedAsin = String(selectedItem?.asin || "").trim().toUpperCase()
+            if (!selectedAsin || selectedAsin === orderAsin) return null
+            return (
+              <div className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950">
+                <div className="font-semibold">Customer-approved replacement required</div>
+                <p className="mt-1">Order ASIN <span className="font-mono">{orderAsin || "not recorded"}</span> will be replaced by inventory ASIN <span className="font-mono">{selectedAsin}</span>.</p>
+                <label className="mt-3 flex cursor-pointer items-center gap-2 font-medium">
+                  <Checkbox checked={inventoryReplacementConfirmed} onCheckedChange={(checked) => setInventoryReplacementConfirmed(Boolean(checked))} />
+                  <span className="ml-2">The customer accepted this alternative product.</span>
+                </label>
+              </div>
+            )
+          })()}
           <DialogFooter>
             <Button variant="outline" onClick={() => setInventoryFulfilmentOpen(false)}>Cancel</Button>
-            <Button disabled={!selectedInventoryId || !inventoryExpiryConfirmed || inventoryFulfilmentLoading || Boolean(busy)} onClick={confirmInventoryFulfilment}>
+            <Button disabled={!selectedInventoryId || !inventoryExpiryConfirmed || inventoryFulfilmentLoading || Boolean(busy) || (() => { const selectedItem = inventoryFulfilmentItems.find((item) => item.id === selectedInventoryId); const selectedAsin = String(selectedItem?.asin || "").trim().toUpperCase(); const orderAsin = String(selectedRows[0]?.replacement_asin || selectedRows[0]?.asin || "").trim().toUpperCase(); return Boolean(selectedAsin && selectedAsin !== orderAsin && !inventoryReplacementConfirmed) })()} onClick={confirmInventoryFulfilment}>
               <CheckCircle2 className="size-4" />
               Confirm Inventory Fulfilment
             </Button>
@@ -12813,6 +12829,18 @@ function InventoryPage({
   const [timeline, setTimeline] = useState<{ id: number; inventory_id: number; occurred_at: string; event_type: string; reason: string; target_order_name?: string; previous_state: InventoryItem | null; current_state: InventoryItem }[]>([])
   const [timelineLoading, setTimelineLoading] = useState(false)
   const [timelineError, setTimelineError] = useState("")
+  const [attachItem, setAttachItem] = useState<InventoryItem | null>(null)
+  const [attachOrderRef, setAttachOrderRef] = useState("")
+  const [attachExpiryConfirmed, setAttachExpiryConfirmed] = useState(false)
+  const [attachReplacementRequired, setAttachReplacementRequired] = useState(false)
+  const [attachCustomerAccepted, setAttachCustomerAccepted] = useState(false)
+  const [attachMessage, setAttachMessage] = useState("")
+  const [attachBusy, setAttachBusy] = useState(false)
+  const [sentItem, setSentItem] = useState<InventoryItem | null>(null)
+  const [sentBusy, setSentBusy] = useState(false)
+  const [imageReloading, setImageReloading] = useState<Set<number>>(new Set())
+  const [imageReloadVersions, setImageReloadVersions] = useState<Record<number, string>>({})
+  const [brokenImages, setBrokenImages] = useState<Set<number>>(new Set())
   const queues = [
     { key: "active", label: "All active stock", help: "Review stock awaiting receipt, available to use, or reserved for an order.", icon: Database },
     { key: "available", label: "Available", help: "Check expiry, then attach available stock to a matching order.", icon: PackageCheck },
@@ -12857,49 +12885,76 @@ function InventoryPage({
     }
   }
 
-  async function attachInventory(item: InventoryItem) {
-    const orderRef = window.prompt(`Attach ${item.product_name || item.asin || `inventory #${item.id}`} to which new Odoo order? Enter order name, e.g. NC12345.`)
-    if (!orderRef?.trim()) return
-    if (!window.confirm("Expiry warning: physically check the item. Confirm its expiry date has been checked and the item is not expired.")) return
-    const submitAttachment = (replacementConfirmed: boolean) => api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${item.id}/attach`, {
+  function attachInventory(item: InventoryItem) {
+    setAttachItem(item)
+    setAttachOrderRef("")
+    setAttachExpiryConfirmed(false)
+    setAttachReplacementRequired(false)
+    setAttachCustomerAccepted(false)
+    setAttachMessage("")
+  }
+
+  async function submitInventoryAttachment() {
+    if (!attachItem || !attachOrderRef.trim() || !attachExpiryConfirmed) return
+    const replacementConfirmed = attachReplacementRequired && attachCustomerAccepted
+    setAttachBusy(true)
+    setAttachMessage("")
+    const submitAttachment = (replacementConfirmed: boolean) => api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${attachItem.id}/attach`, {
         method: "POST",
-        body: JSON.stringify({ order_ref: orderRef.trim(), expiry_confirmed: true, replacement_confirmed: replacementConfirmed }),
+        body: JSON.stringify({ order_ref: attachOrderRef.trim(), expiry_confirmed: true, replacement_confirmed: replacementConfirmed }),
       })
     try {
-      const result = await submitAttachment(false)
+      const result = await submitAttachment(replacementConfirmed)
+      setAttachItem(null)
       onPage(1)
       onRows(result.items || [], result.total || 0)
-      onResult({ ok: result.ok, title: "Inventory Attached", message: result.message })
+      onResult({ ok: result.ok, title: replacementConfirmed ? "Replacement Inventory Attached" : "Inventory Attached", message: result.message })
     } catch (error) {
       const message = String(error)
-      if (message.includes("Replacement confirmation required:") && window.confirm(`${message}\n\nConfirm the customer accepted this alternative product and attach it as the replacement ASIN?`)) {
-        try {
-          const result = await submitAttachment(true)
-          onPage(1)
-          onRows(result.items || [], result.total || 0)
-          onResult({ ok: result.ok, title: "Replacement Inventory Attached", message: result.message })
-          return
-        } catch (replacementError) {
-          onResult({ ok: false, title: "Replacement Inventory Attach Failed", message: String(replacementError) })
-          return
-        }
+      if (message.includes("Replacement confirmation required:")) {
+        setAttachReplacementRequired(true)
+        setAttachCustomerAccepted(false)
       }
-      onResult({ ok: false, title: "Inventory Attach Failed", message })
+      setAttachMessage(message)
+    } finally {
+      setAttachBusy(false)
     }
   }
 
-  async function confirmInventorySent(item: InventoryItem) {
-    const target = item.reserved_odoo_order_name || `line ${item.reserved_order_line_id}`
-    if (!window.confirm(`Confirm inventory item ${item.asin} was manually sent for ${target}? This removes the used quantity from active inventory.`)) return
+  async function confirmInventorySent() {
+    if (!sentItem) return
+    setSentBusy(true)
     try {
-      const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${item.id}/confirm-sent`, {
+      const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${sentItem.id}/confirm-sent`, {
         method: "POST",
       })
+      setSentItem(null)
       onPage(1)
       onRows(result.items || [], result.total || 0)
       onResult({ ok: result.ok, title: "Inventory Sent", message: result.message })
     } catch (error) {
       onResult({ ok: false, title: "Inventory Sent Failed", message: String(error) })
+    } finally { setSentBusy(false) }
+  }
+
+  function inventoryImageSrc(item: InventoryItem) {
+    const version = imageReloadVersions[item.id]
+    if (!version) return item.image_url || ""
+    return `${item.image_url || `/api/inventory/${item.id}/image`}${(item.image_url || "").includes("?") ? "&" : "?"}reload=${encodeURIComponent(version)}`
+  }
+
+  async function reloadInventoryImage(item: InventoryItem) {
+    setImageReloading((current) => new Set(current).add(item.id))
+    setBrokenImages((current) => { const next = new Set(current); next.delete(item.id); return next })
+    try {
+      const result = await api<{ image_url: string; cache_buster: string }>(`/api/inventory/${item.id}/refresh-image`, { method: "POST" })
+      setImageReloadVersions((current) => ({ ...current, [item.id]: result.cache_buster || String(Date.now()) }))
+      onRefresh()
+    } catch (error) {
+      setBrokenImages((current) => new Set(current).add(item.id))
+      onResult({ ok: false, title: "Image Reload Failed", message: String(error) })
+    } finally {
+      setImageReloading((current) => { const next = new Set(current); next.delete(item.id); return next })
     }
   }
 
@@ -12964,17 +13019,18 @@ function InventoryPage({
               <article key={item.id} className="card inventory-stock-card">
                 <div className="card-body inventory-stock-layout">
                   <div className="inventory-product-image">
-                    {item.image_url ? (
+                    {item.image_url && !brokenImages.has(item.id) ? (
                       <button
                         type="button"
                         className="size-14 overflow-hidden rounded border bg-white p-0 transition hover:border-primary focus:outline-none focus:ring-2 focus:ring-ring"
                         title={`View larger image for ${item.asin}`}
-                        onClick={() => setImagePreview({ src: item.image_url || "", title: item.image_title || item.product_name || item.asin, asin: item.asin })}
+                        onClick={() => setImagePreview({ src: inventoryImageSrc(item), title: item.image_title || item.product_name || item.asin, asin: item.asin })}
                       >
                         <img
                           className="size-full object-contain"
-                          src={item.image_url}
+                          src={inventoryImageSrc(item)}
                           alt={item.image_title || item.product_name || item.asin}
+                          onError={() => setBrokenImages((current) => new Set(current).add(item.id))}
                         />
                       </button>
                     ) : (
@@ -12982,6 +13038,18 @@ function InventoryPage({
                         ASIN
                       </div>
                     )}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="inventory-image-reload"
+                      title={`Force reload image for stock #${item.id}`}
+                      aria-label={`Force reload image for stock #${item.id}`}
+                      disabled={imageReloading.has(item.id)}
+                      onClick={() => reloadInventoryImage(item)}
+                    >
+                      <RefreshCw className={cn("size-3.5", imageReloading.has(item.id) && "animate-spin")} />
+                    </Button>
                   </div>
                   <div className="inventory-product-info">
                     <div className="inventory-stock-badges">{item.status === "available" && ["legacy_delivery", "scanned"].includes(item.stock_confidence || "") ? <Badge className={`inventory-confidence-${item.stock_confidence}`}>{item.stock_confidence === "scanned" ? "Available · scan confirmed" : "Available · legacy delivery"}</Badge> : <InventoryStatusBadge value={item.status === "used" ? "Sent / archived" : item.status} />}<Badge variant="outline">{item.location || "Brooklyn, USA"}</Badge><span className="text-secondary">Stock #{item.id}</span></div>
@@ -13039,7 +13107,7 @@ function InventoryPage({
                       <Button variant="outline" size="sm" onClick={() => setTimelineItem(item)}><Clock className="size-4" />Movement timeline</Button>
                       {!["used", "archived", "reserved"].includes(item.status) && <Button variant="outline" size="sm" onClick={() => { setArchiveItem(item); setArchiveReason("") }}>Archive</Button>}
                       {item.status === "reserved" ? (
-                        <Button size="sm" onClick={() => confirmInventorySent(item)}>
+                        <Button size="sm" onClick={() => setSentItem(item)}>
                           <CheckCircle2 className="size-4" />
                           Confirm Sent
                         </Button>
@@ -13059,6 +13127,37 @@ function InventoryPage({
       </Card>
       </div>
     </div>
+    <Dialog open={Boolean(attachItem)} onOpenChange={(open) => { if (!open && !attachBusy) setAttachItem(null) }}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2"><Link className="size-5" />Attach inventory stock</DialogTitle>
+          <DialogDescription>{attachItem?.product_name || attachItem?.asin || `Stock #${attachItem?.id}`} · Stock #{attachItem?.id} · Qty {attachItem?.quantity}</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <div className="grid gap-1.5">
+            <Label htmlFor="inventory-attach-order">Odoo order number</Label>
+            <Input id="inventory-attach-order" autoFocus value={attachOrderRef} onChange={(event) => { setAttachOrderRef(event.target.value.toUpperCase()); setAttachReplacementRequired(false); setAttachCustomerAccepted(false); setAttachMessage("") }} placeholder="For example NC26454" />
+          </div>
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
+            <div className="flex items-start gap-2"><AlertCircle className="mt-0.5 size-5 shrink-0" /><div><div className="font-semibold">Expiry warning</div><p>Physically check the item’s expiry date. Do not fulfil the order if the item is expired.</p></div></div>
+            <label className="mt-3 flex cursor-pointer items-center gap-2 font-medium"><Checkbox checked={attachExpiryConfirmed} onCheckedChange={(checked) => setAttachExpiryConfirmed(Boolean(checked))} /><span className="ml-2">I checked the expiry date and confirm this item is not expired.</span></label>
+          </div>
+          {attachMessage ? <div className={cn("rounded-md border p-3 text-sm", attachReplacementRequired ? "border-amber-400 bg-amber-50 text-amber-950" : "border-red-300 bg-red-50 text-red-900")}><div className="font-semibold">{attachReplacementRequired ? "Different ASIN detected" : "Could not attach inventory"}</div><p className="mt-1">{attachMessage.replace(/^Error:\s*/, "")}</p></div> : null}
+          {attachReplacementRequired ? <label className="flex cursor-pointer items-start gap-2 rounded-md border p-3 text-sm font-medium"><Checkbox checked={attachCustomerAccepted} onCheckedChange={(checked) => setAttachCustomerAccepted(Boolean(checked))} /><span className="ml-2">The customer accepted this alternative product. Save the inventory ASIN as the replacement ASIN.</span></label> : null}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={attachBusy} onClick={() => setAttachItem(null)}>Cancel</Button>
+          <Button disabled={attachBusy || !attachOrderRef.trim() || !attachExpiryConfirmed || (attachReplacementRequired && !attachCustomerAccepted)} onClick={submitInventoryAttachment}>{attachBusy ? "Attaching…" : attachReplacementRequired ? "Attach as Replacement" : "Check and Attach"}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog open={Boolean(sentItem)} onOpenChange={(open) => { if (!open && !sentBusy) setSentItem(null) }}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>Confirm inventory sent</DialogTitle><DialogDescription>Confirm stock #{sentItem?.id} was manually sent for {sentItem?.reserved_odoo_order_name || `line ${sentItem?.reserved_order_line_id}`}. This removes the used quantity from active inventory while retaining its movement history.</DialogDescription></DialogHeader>
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950"><div className="flex items-start gap-2"><AlertCircle className="mt-0.5 size-5 shrink-0" /><p>Only confirm after the physical parcel has been dispatched.</p></div></div>
+        <DialogFooter><Button variant="outline" disabled={sentBusy} onClick={() => setSentItem(null)}>Cancel</Button><Button disabled={sentBusy} onClick={confirmInventorySent}>{sentBusy ? "Confirming…" : "Confirm Sent"}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
     <Dialog open={Boolean(archiveItem)} onOpenChange={(open) => { if (!open && !archiveBusy) setArchiveItem(null) }}><DialogContent><DialogHeader><DialogTitle>Archive stock #{archiveItem?.id}</DialogTitle><DialogDescription>This removes {archiveItem?.quantity} unit(s) from available stock. The record and history are retained. Reserved stock cannot be archived.</DialogDescription></DialogHeader><Label htmlFor="inventory-archive-reason">Reason for archiving</Label><Input id="inventory-archive-reason" maxLength={1000} value={archiveReason} onChange={(event) => setArchiveReason(event.target.value)} placeholder="For example: damaged, expired, or no longer expected" /><Button disabled={archiveBusy || !archiveReason.trim()} onClick={archiveInventory}>{archiveBusy ? "Archiving…" : "Move to Archived"}</Button></DialogContent></Dialog>
     <Dialog open={Boolean(timelineItem)} onOpenChange={(open) => { if (!open) setTimelineItem(null) }}><DialogContent className="epost-detail inventory-timeline-dialog"><DialogHeader><DialogTitle>Stock movement · #{timelineItem?.id}</DialogTitle><DialogDescription>{timelineItem?.product_name} · Includes the source stock and its split allocations. Earlier history is limited to saved records.</DialogDescription></DialogHeader>{timelineLoading && <p role="status">Loading movements…</p>}{timelineError && <p role="alert">{timelineError}</p>}<ol className="inventory-timeline">{timeline.map((movement) => <li key={movement.id}><div className="flex flex-wrap justify-between gap-2"><strong>{({ history_started: "History recording started", created: "Stock added", reserved: "Reserved for an order", sent: "Confirmed sent", archived: "Archived", status_changed: "Stock status changed", quantity_changed: "Quantity changed", evidence_updated: "Evidence updated" } as Record<string, string>)[movement.event_type] || movement.event_type}</strong><time>{formatDateTime(movement.occurred_at)}</time></div><div>Stock #{movement.inventory_id} · {movement.previous_state ? `${movement.previous_state.status} (${movement.previous_state.quantity}) → ` : ""}{movement.current_state.status} ({movement.current_state.quantity}){movement.current_state.reserved_order_line_id ? ` · ${movement.target_order_name || `Order line #${movement.current_state.reserved_order_line_id}`}` : ""}</div>{movement.reason && <p>{movement.reason}</p>}{movement.event_type === "history_started" && <div className="text-secondary">{movement.current_state.source_delivered_at && <div>Saved delivery date: {formatDateTime(movement.current_state.source_delivered_at)}</div>}{movement.current_state.source_received_at && <div>Saved warehouse receipt: {formatDateTime(movement.current_state.source_received_at)}</div>}</div>}</li>)}</ol>{!timelineLoading && !timelineError && !timeline.length && <p>No movement history recorded yet.</p>}</DialogContent></Dialog>
     <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
