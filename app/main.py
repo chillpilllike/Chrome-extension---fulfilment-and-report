@@ -36629,10 +36629,11 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             for row in strict_rows:
                 # A pre-shipment estimate cannot replace shipment evidence or
                 # regress a shipped/delivered bundle to an order-level status.
-                if row.get("state") != "ordered" or parse_tracking_packages(row.get("tracking_payload") or ""):
+                if row.get("state") != "ordered" or any(not part.get("status_only") for part in parse_tracking_packages(row.get("tracking_payload") or "")):
                     continue
-                conn.execute("UPDATE order_lines SET tracking_status=?, tracking_checked_at=?, last_error=NULL, updated_at=? WHERE id=?",
-                             (pending_status, utc_now(), utc_now(), row["id"]))
+                pending_packages = [dict(strip_untrusted_package_item_proof(package), status_only=True) for package in packages]
+                conn.execute("UPDATE order_lines SET tracking_status=?, tracking_payload=?, tracking_checked_at=?, last_error=NULL, updated_at=? WHERE id=?",
+                             (pending_status, tracking_payload_json_for_storage(pending_packages), utc_now(), utc_now(), row["id"]))
                 pending_bundle_updated += 1
         matching_error = "" if pending_bundle_status or payload.order_cancelled or payload_has_payment_revision(payload) else replacement_tracking.tracking_error(strict_rows, packages)
         if matching_error:

@@ -73,13 +73,17 @@ class VirtualBundleTests(unittest.TestCase):
             source = source[:source.index('    status = tracking_status_from_packages(packages)')] + '    return strict_order\n'
             namespace = dict(main.__dict__, db=lambda: conn, fast_page_cache_clear_matching=lambda *a: None, index_order_line=lambda *a: None)
             exec(source, namespace)
-            payload = main.ChromeTrackingUpdatePayload(amazon_order_id=ORDER, packages=[dict(status_only=True, status='Arriving tomorrow')])
+            payload = main.ChromeTrackingUpdatePayload(amazon_order_id=ORDER, packages=[dict(status_only=True, status='Arriving tomorrow', promise='Arriving tomorrow')])
             result = namespace['api_tracking_update_impl'](payload)
             self.assertTrue(result['ok'])
             saved = conn.execute('SELECT * FROM order_lines').fetchone()
             self.assertEqual(saved['state'], 'ordered')
             self.assertEqual(saved['tracking_status'], 'Arriving tomorrow')
-            self.assertIsNone(saved['tracking_payload'])
+            estimate = json.loads(saved['tracking_payload'])[0]
+            self.assertTrue(estimate['status_only'])
+            self.assertEqual(estimate['promise'], 'Arriving tomorrow')
+            self.assertFalse(estimate.get('asins'))
+            self.assertEqual(namespace['api_tracking_update_impl'](payload)['updated'], 1)
             self.assertIsNone(saved['last_error'])
             payload.packages[0]['status'] = 'Delivered'
             with self.assertRaises(main.HTTPException):
