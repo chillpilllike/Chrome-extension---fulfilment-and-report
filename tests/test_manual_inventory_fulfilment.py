@@ -128,6 +128,16 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn('"available_quantity":', source)
         self.assertIn("attach-preview?order_ref=", FRONTEND)
 
+    def test_reset_fulfilment_releases_reserved_inventory_for_reattachment(self) -> None:
+        source = inspect.getsource(main.api_reset_line_fulfilment)
+
+        self.assertIn("released_inventory", source)
+        self.assertIn("SET quantity=quantity+?, status='available'", source)
+        self.assertIn("archive_reason='Detached by fulfilment reset'", source)
+        self.assertIn("inventory_allocated_quantity=0", source)
+        self.assertIn("inventory_sent_quantity=0", source)
+        self.assertIn('"inventory-v2"', source)
+
     def test_inventory_warnings_use_app_dialogs_not_browser_popups(self) -> None:
         inventory_page = FRONTEND[FRONTEND.index("function InventoryPage("):FRONTEND.index("function CancelledOrdersPage(")]
 

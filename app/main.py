@@ -42628,6 +42628,49 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             for row in selected_rows
             if clean_text(row["amazon_order_id"])
         ]
+        released_inventory = 0
+        released_quantity = 0.0
+        released_inventory_ids: set[int] = set()
+        allocations = conn.execute(
+            f"""
+            SELECT * FROM inventory_items
+            WHERE reserved_order_line_id IN ({placeholders}) AND status='reserved'
+            FOR UPDATE
+            """,
+            selected_ids,
+        ).fetchall()
+        for allocation in allocations:
+            quantity = max(0.0, float(allocation.get("reserved_quantity") or allocation.get("quantity") or 0))
+            source_id = int(allocation.get("source_inventory_item_id") or 0)
+            if source_id and quantity > 0:
+                conn.execute(
+                    """
+                    UPDATE inventory_items
+                    SET quantity=quantity+?, status='available', updated_at=?
+                    WHERE id=?
+                    """,
+                    (quantity, now, source_id),
+                )
+                released_inventory_ids.add(source_id)
+            conn.execute(
+                """
+                UPDATE inventory_items
+                SET quantity=0, status='archived', reserved_order_line_id=NULL,
+                    reserved_quantity=NULL, reserved_at=NULL, archived_at=?,
+                    archive_reason='Detached by fulfilment reset',
+                    notes=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    now,
+                    append_note(allocation.get("notes"), f"Detached from {allocation.get('reserved_order_line_id')} and returned qty {quantity:g} to stock."),
+                    now,
+                    allocation["id"],
+                ),
+            )
+            released_inventory += 1
+            released_quantity += quantity
+            released_inventory_ids.add(int(allocation["id"]))
         # Resetting fulfilment must not remove replacement ASIN decisions.
         # Those fields are only changed by the manual replacement action on the orders page.
         cursor = conn.execute(
@@ -42663,6 +42706,8 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
                 cost_approved_at=NULL,
                 cost_review_loss=NULL,
                 ordered_at=NULL,
+                inventory_allocated_quantity=0,
+                inventory_sent_quantity=0,
                 updated_at=?
             WHERE store_id=?
               AND id IN ({placeholders})
@@ -42699,10 +42744,18 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
             f"SELECT * FROM order_lines WHERE store_id=? AND id IN ({placeholders})",
             [payload.store_id, *selected_ids],
         ).fetchall()
+        updated_inventory_rows = conn.execute(
+            f"SELECT * FROM inventory_items WHERE id IN ({','.join('?' for _ in released_inventory_ids)})",
+            sorted(released_inventory_ids),
+        ).fetchall() if released_inventory_ids else []
     for updated in updated_rows:
         index_order_line(updated)
+    for updated_inventory in updated_inventory_rows:
+        _TYPESENSE_INDEX_EXECUTOR.submit(
+            lambda snapshot=row_to_dict(updated_inventory) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot))
+        )
     threading.Thread(target=sync_odoo_ordered_tags_for_pairs, args=(tag_pairs,), daemon=True).start()
-    fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "shopify-fulfilment", "fulfilment-pending", "tracking-orders"})
+    fast_page_cache_clear_matching({"dashboard", "orders", "search", "chrome-jobs", "shopify-fulfilment", "fulfilment-pending", "tracking-orders", "inventory-v2"})
     data = dashboard_data(payload.store_id)
     cleanup_notes = []
     if stale_shopify_jobs:
@@ -42711,6 +42764,8 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
         cleanup_notes.append("cleared stale Shopify link/status cache")
     if stale_dispatch_packages:
         cleanup_notes.append(f"cleared {stale_dispatch_packages} stale dispatch package row{'s' if stale_dispatch_packages != 1 else ''}")
+    if released_inventory:
+        cleanup_notes.append(f"released {released_quantity:g} inventory unit{'s' if released_quantity != 1 else ''} from {released_inventory} reservation{'s' if released_inventory != 1 else ''}")
     cleanup_suffix = f" Also {'; '.join(cleanup_notes)}." if cleanup_notes else ""
     data["message"] = f"Reset {cursor.rowcount} selected line{'s' if cursor.rowcount != 1 else ''} to fresh pulled status. Replacement ASINs were preserved.{cleanup_suffix}"
     return data
