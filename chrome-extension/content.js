@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-09-09-payment-loading-v201";
+const CONTENT_SCRIPT_BUILD = "2026-09-09-cart-readiness-v202";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -2263,8 +2263,8 @@ function verifyCartQuantities(activeJob) {
     return {
       ok: false,
       exact: false,
-      identity_mismatch: true,
-      message: `${strictAsinIdentityMessage(activeJob, [], "Amazon cart")} Active cart rows were present but their ASINs could not be read.`,
+      unreadable_cart: true,
+      message: "Amazon's cart container is present, but its active item rows are not readable yet.",
       mismatches: [],
     };
   }
@@ -4623,6 +4623,22 @@ async function retryProvenMissingCartItemOnce(activeJob, itemIndex, asin, expect
   return true;
 }
 
+async function waitForReadableCart(activeJob) {
+  let check = verifyCartQuantities(activeJob);
+  if (!check.unreadable_cart) return check;
+  showPanel("Waiting for Amazon cart", "Waiting for Amazon to render the cart item identities. Cart contents will be preserved if verification remains unavailable.", null, null);
+  const settled = await waitUntil(() => {
+    const current = verifyCartQuantities(activeJob);
+    return current.unreadable_cart ? null : current;
+  }, 15000, 250);
+  if (settled) return settled;
+  activeJob.paused = true;
+  activeJob.pausedStage = activeJob.stage;
+  await setActiveJob(activeJob);
+  showPanel("Cart verification needs attention", "Amazon's cart item identities are still unreadable. The order is paused and the cart has been preserved. Click Resume to retry verification.", null, null);
+  return null;
+}
+
 async function handleCart(activeJob) {
   const nextIndex = Number(activeJob.itemIndex || 0) + 1;
   const itemCount = Array.isArray(activeJob.job?.items) ? activeJob.job.items.length : 0;
@@ -4784,7 +4800,8 @@ async function handleCart(activeJob) {
       return;
     }
   }
-  const cartCheck = verifyCartQuantities(activeJob);
+  const cartCheck = await waitForReadableCart(activeJob);
+  if (!cartCheck) return;
   if (!cartCheck.ok) {
     if (cartCheck.identity_mismatch) {
       const missingAsin = (cartCheck.missing_asins || [])[0] || "";

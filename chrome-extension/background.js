@@ -1,6 +1,6 @@
 const DEFAULT_API_BASE = "https://fulfilment.gofinch.com";
 const LOCAL_ADMIN_TOKEN_FALLBACK = "1284";
-const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-09-09-payment-loading-v201";
+const EXPECTED_CONTENT_SCRIPT_BUILD = "2026-09-09-cart-readiness-v202";
 const ACTIVE_JOB_HEARTBEAT_MS = 60 * 1000;
 const RESET_STALE_UPDATE_GUARD_MS = 10 * 60 * 1000;
 const completionLocks = new Set();
