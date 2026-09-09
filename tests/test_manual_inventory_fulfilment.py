@@ -37,7 +37,7 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("Fulfill from Inventory", FRONTEND)
         self.assertIn("setInventoryFulfilmentItems(available)", FRONTEND)
         self.assertIn("I checked the expiry date and confirm this item is not expired.", FRONTEND)
-        self.assertIn("body: JSON.stringify({ line_id: line.id, expiry_confirmed: true, replacement_confirmed: replacementConfirmed })", FRONTEND)
+        self.assertIn("replacement_quantity: replacementQuantity", FRONTEND)
 
     def test_manual_inventory_form_does_not_require_a_store(self) -> None:
         self.assertNotIn('label="Store" value={manualStoreId}', FRONTEND)
@@ -96,10 +96,37 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn('replacement_confirmed = payload.get("replacement_confirmed") is True', source)
         self.assertIn("Replacement confirmation required:", source)
         self.assertIn("replacement_asin=?", source)
-        self.assertIn("Customer accepted inventory alternative ASIN", source)
+        self.assertIn("replacement_quantity=?, quantity=?", source)
+        self.assertIn("Customer accepted inventory replacement:", source)
         self.assertIn("Alternative ASIN · customer acceptance required", FRONTEND)
         self.assertIn("The customer accepted this alternative product", FRONTEND)
         self.assertIn("replacement_confirmed: replacementConfirmed", FRONTEND)
+        self.assertIn("Current order ASIN", FRONTEND)
+        self.assertIn("Current order quantity", FRONTEND)
+        self.assertIn("Replacement ASIN", FRONTEND)
+        self.assertIn("Replacement quantity", FRONTEND)
+
+    def test_inventory_replacement_quantity_controls_shopify_completion_and_note(self) -> None:
+        attach_source = inspect.getsource(main.api_attach_inventory_item)
+        note_source = inspect.getsource(main.inventory_fulfilment_note_for_order)
+        export_source = inspect.getsource(main.shopify_replacement_export_client)
+
+        self.assertIn('replacement_quantity_raw = payload.get("replacement_quantity")', attach_source)
+        self.assertIn("quantity_needed = float(replacement_quantity_raw)", attach_source)
+        self.assertIn("inventory_only = amazon_quantity <= 0", attach_source)
+        self.assertIn("enqueue_shopify_fulfilment_for_rows", attach_source)
+        self.assertIn("Customer-approved replacement:", note_source)
+        self.assertIn("replacement_asin", note_source)
+        self.assertIn("amazon_product_page_image_url(asin)", export_source)
+
+    def test_inventory_page_previews_replacement_before_mutating_stock(self) -> None:
+        source = inspect.getsource(main.api_inventory_attachment_preview)
+
+        self.assertIn('"current_asin": current_asin', source)
+        self.assertIn('"current_quantity": current_quantity', source)
+        self.assertIn('"replacement_asin": inventory_asin', source)
+        self.assertIn('"available_quantity":', source)
+        self.assertIn("attach-preview?order_ref=", FRONTEND)
 
     def test_inventory_warnings_use_app_dialogs_not_browser_popups(self) -> None:
         inventory_page = FRONTEND[FRONTEND.index("function InventoryPage("):FRONTEND.index("function CancelledOrdersPage(")]

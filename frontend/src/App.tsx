@@ -216,6 +216,8 @@ type OrderLine = {
   bundle_component_count?: number
   replacement_asin?: string
   replacement_product_name?: string
+  original_quantity?: number
+  replacement_quantity?: number
   replacement_note?: string
   replacement_assigned_at?: string
   replacement_run_id?: string
@@ -1357,6 +1359,17 @@ type InventoryItem = {
   notes: string
   status: string
   updated_at: string
+}
+
+type InventoryAttachmentPreview = {
+  line_id: number
+  order_ref: string
+  current_asin: string
+  current_quantity: number
+  replacement_asin: string
+  replacement_quantity: number
+  available_quantity: number
+  replacement_required: boolean
 }
 
 type CancelledOrderRow = OrderLine & {
@@ -3595,6 +3608,7 @@ function App() {
   const [selectedInventoryId, setSelectedInventoryId] = useState<number | null>(null)
   const [inventoryExpiryConfirmed, setInventoryExpiryConfirmed] = useState(false)
   const [inventoryReplacementConfirmed, setInventoryReplacementConfirmed] = useState(false)
+  const [inventoryReplacementQuantity, setInventoryReplacementQuantity] = useState("")
   const [inventoryFulfilmentLoading, setInventoryFulfilmentLoading] = useState(false)
   const [processReplacementOpen, setProcessReplacementOpen] = useState(false)
   const [processReplacementReason, setProcessReplacementReason] = useState("lost")
@@ -4550,13 +4564,14 @@ function App() {
     setInventoryFulfilmentLoading(true)
     setInventoryExpiryConfirmed(false)
     setInventoryReplacementConfirmed(false)
+    setInventoryReplacementQuantity("")
     setSelectedInventoryId(null)
     try {
       const result = await api<{ items: InventoryItem[] }>("/api/inventory?page=1&per_page=100")
       const requiredQuantity = Math.max(0, Number(line.quantity || 0) - Number(line.inventory_allocated_quantity || 0))
       const lineAsin = String(line.replacement_asin || line.asin || "").trim().toUpperCase()
       const available = (result.items || [])
-        .filter((item) => item.status === "available" && Number(item.quantity || 0) >= requiredQuantity)
+        .filter((item) => item.status === "available" && Number(item.quantity || 0) > 0)
         .sort((left, right) => {
           const leftExact = !left.asin || String(left.asin).trim().toUpperCase() === lineAsin
           const rightExact = !right.asin || String(right.asin).trim().toUpperCase() === lineAsin
@@ -4576,15 +4591,17 @@ function App() {
     const line = selectedRows.length === 1 ? selectedRows[0] : null
     if (!line || !selectedInventoryId || !inventoryExpiryConfirmed) return
     const inventoryItem = inventoryFulfilmentItems.find((item) => item.id === selectedInventoryId)
-    const orderAsin = String(line.replacement_asin || line.asin || "").trim().toUpperCase()
+    const orderAsin = String(line.original_asin || line.asin || "").trim().toUpperCase()
     const inventoryAsin = String(inventoryItem?.asin || "").trim().toUpperCase()
     const replacementConfirmed = Boolean(inventoryAsin && inventoryAsin !== orderAsin)
     if (replacementConfirmed && !inventoryReplacementConfirmed) return
+    const replacementQuantity = Number(inventoryReplacementQuantity)
+    if (replacementConfirmed && (!Number.isInteger(replacementQuantity) || replacementQuantity <= 0 || replacementQuantity > Number(inventoryItem?.quantity || 0))) return
     setInventoryFulfilmentOpen(false)
     await runAction("Fulfill from Inventory", () =>
       api<{ ok: boolean; message: string }>(`/api/inventory/${selectedInventoryId}/attach`, {
         method: "POST",
-        body: JSON.stringify({ line_id: line.id, expiry_confirmed: true, replacement_confirmed: replacementConfirmed }),
+        body: JSON.stringify({ line_id: line.id, expiry_confirmed: true, replacement_confirmed: replacementConfirmed, ...(replacementConfirmed ? { replacement_quantity: replacementQuantity } : {}) }),
       }),
     )
   }
@@ -5241,14 +5258,19 @@ function App() {
                   type="radio"
                   name="inventory-item"
                   checked={selectedInventoryId === item.id}
-                  onChange={() => { setSelectedInventoryId(item.id); setInventoryReplacementConfirmed(false) }}
+                  onChange={() => {
+                    setSelectedInventoryId(item.id)
+                    setInventoryReplacementConfirmed(false)
+                    const currentQuantity = Math.max(0, Number(selectedRows[0]?.quantity || 0) - Number(selectedRows[0]?.inventory_allocated_quantity || 0))
+                    setInventoryReplacementQuantity(String(currentQuantity || 1))
+                  }}
                 />
                 <div className="min-w-0 flex-1">
                   <div className="font-medium">{item.product_name || "Untitled inventory item"}</div>
                   <div className="text-xs text-muted-foreground">
                     Qty {Number(item.quantity).toLocaleString()} · {item.asin ? `ASIN ${item.asin}` : "No ASIN (will use the order ASIN)"} · {item.location || "Brooklyn, USA"} · Inventory #{item.id}
                   </div>
-                  {item.asin && selectedRows.length === 1 && String(item.asin).trim().toUpperCase() !== String(selectedRows[0].replacement_asin || selectedRows[0].asin || "").trim().toUpperCase() ? (
+                  {item.asin && selectedRows.length === 1 && String(item.asin).trim().toUpperCase() !== String(selectedRows[0].original_asin || selectedRows[0].asin || "").trim().toUpperCase() ? (
                     <Badge variant="outline" className="mt-1 border-amber-400 text-amber-800">Alternative ASIN · customer acceptance required</Badge>
                   ) : null}
                 </div>
@@ -5275,13 +5297,20 @@ function App() {
           </div>
           {(() => {
             const selectedItem = inventoryFulfilmentItems.find((item) => item.id === selectedInventoryId)
-            const orderAsin = String(selectedRows[0]?.replacement_asin || selectedRows[0]?.asin || "").trim().toUpperCase()
+            const orderAsin = String(selectedRows[0]?.original_asin || selectedRows[0]?.asin || "").trim().toUpperCase()
             const selectedAsin = String(selectedItem?.asin || "").trim().toUpperCase()
             if (!selectedAsin || selectedAsin === orderAsin) return null
             return (
               <div className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950">
                 <div className="font-semibold">Customer-approved replacement required</div>
-                <p className="mt-1">Order ASIN <span className="font-mono">{orderAsin || "not recorded"}</span> will be replaced by inventory ASIN <span className="font-mono">{selectedAsin}</span>.</p>
+                <p className="mt-1">Record exactly what the customer accepted. This replacement ASIN, quantity and product image will be used for Shopify.</p>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-1"><Label>Current order ASIN</Label><Input readOnly value={orderAsin || "Not recorded"} className="font-mono" /></div>
+                  <div className="grid gap-1"><Label>Current order quantity</Label><Input readOnly value={Number(selectedRows[0]?.original_quantity || selectedRows[0]?.quantity || 0)} /></div>
+                  <div className="grid gap-1"><Label>Replacement ASIN</Label><Input readOnly value={selectedAsin} className="font-mono" /></div>
+                  <div className="grid gap-1"><Label htmlFor="inventory-replacement-quantity">Replacement quantity</Label><Input id="inventory-replacement-quantity" type="number" min={1} step={1} max={Number(selectedItem?.quantity || 0)} value={inventoryReplacementQuantity} onChange={(event) => setInventoryReplacementQuantity(event.target.value)} /></div>
+                </div>
+                {Number(inventoryReplacementQuantity) > Number(selectedItem?.quantity || 0) ? <p className="mt-2 font-medium text-red-700">Only {Number(selectedItem?.quantity || 0).toLocaleString()} unit(s) are available in this stock row.</p> : null}
                 <label className="mt-3 flex cursor-pointer items-center gap-2 font-medium">
                   <Checkbox checked={inventoryReplacementConfirmed} onCheckedChange={(checked) => setInventoryReplacementConfirmed(Boolean(checked))} />
                   <span className="ml-2">The customer accepted this alternative product.</span>
@@ -5291,7 +5320,7 @@ function App() {
           })()}
           <DialogFooter>
             <Button variant="outline" onClick={() => setInventoryFulfilmentOpen(false)}>Cancel</Button>
-            <Button disabled={!selectedInventoryId || !inventoryExpiryConfirmed || inventoryFulfilmentLoading || Boolean(busy) || (() => { const selectedItem = inventoryFulfilmentItems.find((item) => item.id === selectedInventoryId); const selectedAsin = String(selectedItem?.asin || "").trim().toUpperCase(); const orderAsin = String(selectedRows[0]?.replacement_asin || selectedRows[0]?.asin || "").trim().toUpperCase(); return Boolean(selectedAsin && selectedAsin !== orderAsin && !inventoryReplacementConfirmed) })()} onClick={confirmInventoryFulfilment}>
+            <Button disabled={!selectedInventoryId || !inventoryExpiryConfirmed || inventoryFulfilmentLoading || Boolean(busy) || (() => { const selectedItem = inventoryFulfilmentItems.find((item) => item.id === selectedInventoryId); const selectedAsin = String(selectedItem?.asin || "").trim().toUpperCase(); const orderAsin = String(selectedRows[0]?.original_asin || selectedRows[0]?.asin || "").trim().toUpperCase(); const isReplacement = Boolean(selectedAsin && selectedAsin !== orderAsin); const quantity = Number(inventoryReplacementQuantity); return isReplacement && (!inventoryReplacementConfirmed || !Number.isInteger(quantity) || quantity <= 0 || quantity > Number(selectedItem?.quantity || 0)) })()} onClick={confirmInventoryFulfilment}>
               <CheckCircle2 className="size-4" />
               Confirm Inventory Fulfilment
             </Button>
@@ -12834,6 +12863,8 @@ function InventoryPage({
   const [attachExpiryConfirmed, setAttachExpiryConfirmed] = useState(false)
   const [attachReplacementRequired, setAttachReplacementRequired] = useState(false)
   const [attachCustomerAccepted, setAttachCustomerAccepted] = useState(false)
+  const [attachPreview, setAttachPreview] = useState<InventoryAttachmentPreview | null>(null)
+  const [attachReplacementQuantity, setAttachReplacementQuantity] = useState("")
   const [attachMessage, setAttachMessage] = useState("")
   const [attachBusy, setAttachBusy] = useState(false)
   const [sentItem, setSentItem] = useState<InventoryItem | null>(null)
@@ -12891,24 +12922,39 @@ function InventoryPage({
     setAttachExpiryConfirmed(false)
     setAttachReplacementRequired(false)
     setAttachCustomerAccepted(false)
+    setAttachPreview(null)
+    setAttachReplacementQuantity("")
     setAttachMessage("")
   }
 
   async function submitInventoryAttachment() {
     if (!attachItem || !attachOrderRef.trim() || !attachExpiryConfirmed) return
-    const replacementConfirmed = attachReplacementRequired && attachCustomerAccepted
     setAttachBusy(true)
     setAttachMessage("")
-    const submitAttachment = (replacementConfirmed: boolean) => api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${attachItem.id}/attach`, {
-        method: "POST",
-        body: JSON.stringify({ order_ref: attachOrderRef.trim(), expiry_confirmed: true, replacement_confirmed: replacementConfirmed }),
-      })
     try {
-      const result = await submitAttachment(replacementConfirmed)
+      const preview = attachPreview || await api<InventoryAttachmentPreview>(`/api/inventory/${attachItem.id}/attach-preview?order_ref=${encodeURIComponent(attachOrderRef.trim())}`)
+      setAttachPreview(preview)
+      setAttachReplacementRequired(preview.replacement_required)
+      if (preview.replacement_required && !attachPreview) {
+        setAttachReplacementQuantity(String(preview.replacement_quantity || 1))
+        setAttachCustomerAccepted(false)
+        return
+      }
+      const replacementQuantity = Number(attachReplacementQuantity)
+      if (preview.replacement_required && (!attachCustomerAccepted || !Number.isInteger(replacementQuantity) || replacementQuantity <= 0 || replacementQuantity > preview.available_quantity)) return
+      const result = await api<{ ok: boolean; message: string; items: InventoryItem[]; total: number }>(`/api/inventory/${attachItem.id}/attach`, {
+        method: "POST",
+        body: JSON.stringify({
+          line_id: preview.line_id,
+          expiry_confirmed: true,
+          replacement_confirmed: preview.replacement_required,
+          ...(preview.replacement_required ? { replacement_quantity: replacementQuantity } : {}),
+        }),
+      })
       setAttachItem(null)
       onPage(1)
       onRows(result.items || [], result.total || 0)
-      onResult({ ok: result.ok, title: replacementConfirmed ? "Replacement Inventory Attached" : "Inventory Attached", message: result.message })
+      onResult({ ok: result.ok, title: preview.replacement_required ? "Replacement Inventory Attached" : "Inventory Attached", message: result.message })
     } catch (error) {
       const message = String(error)
       if (message.includes("Replacement confirmation required:")) {
@@ -13136,18 +13182,29 @@ function InventoryPage({
         <div className="grid gap-4">
           <div className="grid gap-1.5">
             <Label htmlFor="inventory-attach-order">Odoo order number</Label>
-            <Input id="inventory-attach-order" autoFocus value={attachOrderRef} onChange={(event) => { setAttachOrderRef(event.target.value.toUpperCase()); setAttachReplacementRequired(false); setAttachCustomerAccepted(false); setAttachMessage("") }} placeholder="For example NC26454" />
+            <Input id="inventory-attach-order" autoFocus value={attachOrderRef} onChange={(event) => { setAttachOrderRef(event.target.value.toUpperCase()); setAttachReplacementRequired(false); setAttachCustomerAccepted(false); setAttachPreview(null); setAttachReplacementQuantity(""); setAttachMessage("") }} placeholder="For example NC26454" />
           </div>
           <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
             <div className="flex items-start gap-2"><AlertCircle className="mt-0.5 size-5 shrink-0" /><div><div className="font-semibold">Expiry warning</div><p>Physically check the item’s expiry date. Do not fulfil the order if the item is expired.</p></div></div>
             <label className="mt-3 flex cursor-pointer items-center gap-2 font-medium"><Checkbox checked={attachExpiryConfirmed} onCheckedChange={(checked) => setAttachExpiryConfirmed(Boolean(checked))} /><span className="ml-2">I checked the expiry date and confirm this item is not expired.</span></label>
           </div>
           {attachMessage ? <div className={cn("rounded-md border p-3 text-sm", attachReplacementRequired ? "border-amber-400 bg-amber-50 text-amber-950" : "border-red-300 bg-red-50 text-red-900")}><div className="font-semibold">{attachReplacementRequired ? "Different ASIN detected" : "Could not attach inventory"}</div><p className="mt-1">{attachMessage.replace(/^Error:\s*/, "")}</p></div> : null}
-          {attachReplacementRequired ? <label className="flex cursor-pointer items-start gap-2 rounded-md border p-3 text-sm font-medium"><Checkbox checked={attachCustomerAccepted} onCheckedChange={(checked) => setAttachCustomerAccepted(Boolean(checked))} /><span className="ml-2">The customer accepted this alternative product. Save the inventory ASIN as the replacement ASIN.</span></label> : null}
+          {attachReplacementRequired && attachPreview ? <div className="rounded-md border border-amber-400 bg-amber-50 p-3 text-sm text-amber-950">
+            <div className="font-semibold">Customer-approved replacement</div>
+            <p className="mt-1">Confirm the accepted replacement details. Shopify will use the replacement ASIN, accepted quantity and replacement product image.</p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-1"><Label>Current order ASIN</Label><Input readOnly value={attachPreview.current_asin || "Not recorded"} className="font-mono" /></div>
+              <div className="grid gap-1"><Label>Current order quantity</Label><Input readOnly value={attachPreview.current_quantity} /></div>
+              <div className="grid gap-1"><Label>Replacement ASIN</Label><Input readOnly value={attachPreview.replacement_asin || "Not recorded"} className="font-mono" /></div>
+              <div className="grid gap-1"><Label htmlFor="inventory-attach-replacement-quantity">Replacement quantity</Label><Input id="inventory-attach-replacement-quantity" type="number" min={1} step={1} max={attachPreview.available_quantity} value={attachReplacementQuantity} onChange={(event) => setAttachReplacementQuantity(event.target.value)} /></div>
+            </div>
+            {Number(attachReplacementQuantity) > attachPreview.available_quantity ? <p className="mt-2 font-medium text-red-700">Only {attachPreview.available_quantity.toLocaleString()} unit(s) are available in stock #{attachItem?.id}.</p> : null}
+            <label className="mt-3 flex cursor-pointer items-start gap-2 font-medium"><Checkbox checked={attachCustomerAccepted} onCheckedChange={(checked) => setAttachCustomerAccepted(Boolean(checked))} /><span className="ml-2">The customer accepted replacement ASIN {attachPreview.replacement_asin} with quantity {attachReplacementQuantity || "—"}.</span></label>
+          </div> : null}
         </div>
         <DialogFooter>
           <Button variant="outline" disabled={attachBusy} onClick={() => setAttachItem(null)}>Cancel</Button>
-          <Button disabled={attachBusy || !attachOrderRef.trim() || !attachExpiryConfirmed || (attachReplacementRequired && !attachCustomerAccepted)} onClick={submitInventoryAttachment}>{attachBusy ? "Attaching…" : attachReplacementRequired ? "Attach as Replacement" : "Check and Attach"}</Button>
+          <Button disabled={attachBusy || !attachOrderRef.trim() || !attachExpiryConfirmed || (attachReplacementRequired && (!attachCustomerAccepted || !Number.isInteger(Number(attachReplacementQuantity)) || Number(attachReplacementQuantity) <= 0 || Number(attachReplacementQuantity) > Number(attachPreview?.available_quantity || 0)))} onClick={submitInventoryAttachment}>{attachBusy ? "Attaching…" : attachReplacementRequired ? "Attach as Replacement" : "Check and Attach"}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

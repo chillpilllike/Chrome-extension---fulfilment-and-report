@@ -22070,7 +22070,8 @@ def inventory_fulfilment_note_for_order(store_id: int, order_name: str) -> str:
     with db() as conn:
         rows = rows_to_dicts(conn.execute(
             """
-            SELECT asin, quantity, inventory_allocated_quantity
+            SELECT asin, original_asin, original_quantity, replacement_asin, replacement_quantity,
+                   quantity, inventory_allocated_quantity
             FROM order_lines
             WHERE store_id=? AND UPPER(odoo_order_name)=UPPER(?)
               AND COALESCE(inventory_allocated_quantity, 0) > 0
@@ -22085,7 +22086,16 @@ def inventory_fulfilment_note_for_order(store_id: int, order_name: str) -> str:
         total = max(0.0, float(row.get("quantity") or 0))
         local = min(total, max(0.0, float(row.get("inventory_allocated_quantity") or 0)))
         amazon = max(0.0, total - local)
-        detail = f"ASIN {normalize_asin(row.get('asin'))}: {local:g} from local inventory"
+        original_asin = normalize_asin(row.get("original_asin") or row.get("asin"))
+        replacement_asin = normalize_asin(row.get("replacement_asin"))
+        original_quantity = max(0.0, float(row.get("original_quantity") or row.get("quantity") or 0))
+        if replacement_asin and replacement_asin != original_asin:
+            detail = (
+                f"Customer-approved replacement: ASIN {original_asin} qty {original_quantity:g} "
+                f"→ ASIN {replacement_asin} qty {total:g}; {local:g} from local inventory"
+            )
+        else:
+            detail = f"ASIN {replacement_asin or original_asin}: {local:g} from local inventory"
         detail += f", {amazon:g} ordered from Amazon" if amazon > 0 else ", no Amazon purchase"
         details.append(detail)
     return "Inventory fulfilment audit for " + clean_text(order_name).upper() + ": " + "; ".join(details)
@@ -26745,11 +26755,58 @@ def api_create_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "message": f"Added {quantity:g} inventory unit(s) for {item_label} at {location}.", **refresh_inventory_response(store_id, 1, 100)}
 
 
+@app.get("/api/inventory/{inventory_id}/attach-preview")
+def api_inventory_attachment_preview(inventory_id: int, order_ref: str) -> dict[str, Any]:
+    order_name = clean_text(order_ref)
+    if not order_name:
+        raise HTTPException(400, "Enter the Odoo order name.")
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        if clean_text(item["status"]) != "available":
+            raise HTTPException(400, "This inventory item is not available for fulfilment.")
+        candidates = conn.execute(
+            """
+            SELECT * FROM order_lines
+            WHERE UPPER(odoo_order_name)=UPPER(?)
+              AND state NOT IN ('ordered', 'dispatched', 'delivered', 'inventory', 'ignored')
+              AND COALESCE(odoo_status_label, '') NOT IN ('cancelled', 'refunded')
+            ORDER BY id
+            """,
+            (order_name,),
+        ).fetchall()
+    if not candidates:
+        raise HTTPException(404, f"No open order line found for {order_name}.")
+    inventory_asin = normalize_asin(item["asin"])
+    exact = [row for row in candidates if not inventory_asin or effective_inventory_asin(row) == inventory_asin]
+    if exact:
+        candidates = exact
+    if len(candidates) != 1:
+        raise HTTPException(409, f"More than one open line matches {order_name}. Select the exact line on the Orders page.")
+    line = candidates[0]
+    current_asin = normalize_asin(line.get("original_asin") or line.get("asin"))
+    current_quantity = max(0.0, float(line.get("original_quantity") or line["quantity"] or 0))
+    replacement_quantity = max(0.0, float(line.get("replacement_quantity") or line["quantity"] or 0))
+    return {
+        "ok": True,
+        "line_id": int(line["id"]),
+        "order_ref": clean_text(line["odoo_order_name"]),
+        "current_asin": current_asin,
+        "current_quantity": current_quantity,
+        "replacement_asin": inventory_asin,
+        "replacement_quantity": replacement_quantity,
+        "available_quantity": max(0.0, float(item["quantity"] or 0)),
+        "replacement_required": bool(inventory_asin and inventory_asin != current_asin),
+    }
+
+
 @app.post("/api/inventory/{inventory_id}/attach")
 def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     order_ref = clean_text(payload.get("order_ref") or payload.get("odoo_order_name"))
     line_id = int(payload.get("line_id") or 0)
     replacement_confirmed = payload.get("replacement_confirmed") is True
+    replacement_quantity_raw = payload.get("replacement_quantity")
     if not order_ref and not line_id:
         raise HTTPException(400, "Select an order line or enter the Odoo order name for this inventory item.")
     if payload.get("expiry_confirmed") is not True:
@@ -26820,11 +26877,32 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
             )
         line = candidates[0]
         required_asin = effective_inventory_asin(line)
-        replacement_override = bool(inventory_asin and inventory_asin != required_asin)
+        original_order_asin = normalize_asin(line.get("original_asin") or line.get("asin"))
+        replacement_override = bool(inventory_asin and inventory_asin != original_order_asin)
+        if replacement_override and not replacement_confirmed:
+            raise HTTPException(
+                409,
+                f"Replacement confirmation required: stock #{inventory_id} has ASIN {inventory_asin}, while line {line['id']} "
+                f"originally requires {original_order_asin or required_asin}. Only continue if the customer accepted this alternative. "
+                "The inventory stock was not changed.",
+            )
         asin = inventory_asin if replacement_override else required_asin
+        current_order_quantity = float(line.get("original_quantity") or line["quantity"] or 1)
         quantity_needed = float(line["quantity"] or 1)
+        if replacement_override:
+            try:
+                quantity_needed = float(replacement_quantity_raw)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Enter the customer-approved replacement quantity.")
+            if quantity_needed <= 0 or not quantity_needed.is_integer():
+                raise HTTPException(400, "Replacement quantity must be a positive whole number.")
         quantity_available = float(item["quantity"] or 0)
         already_allocated = max(0.0, float(line.get("inventory_allocated_quantity") or 0))
+        if replacement_override and quantity_needed < already_allocated:
+            raise HTTPException(
+                400,
+                f"Replacement quantity cannot be below the {already_allocated:g} unit(s) already allocated to this line.",
+            )
         quantity_remaining = max(0.0, quantity_needed - already_allocated)
         reserved_quantity = min(quantity_available, quantity_remaining)
         if reserved_quantity <= 0:
@@ -26838,7 +26916,8 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
         amazon_quantity = max(0.0, quantity_needed - allocated_quantity)
         inventory_only = amazon_quantity <= 0
         replacement_note = (
-            f"Customer accepted inventory alternative ASIN {inventory_asin} instead of {required_asin}. "
+            f"Customer accepted inventory replacement: ASIN {original_order_asin or required_asin} qty {current_order_quantity:g} "
+            f"replaced by ASIN {inventory_asin} qty {quantity_needed:g}. "
             if replacement_override else ""
         )
         note = replacement_note + (
@@ -26853,11 +26932,15 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
                 UPDATE order_lines
                 SET original_asin=COALESCE(NULLIF(original_asin, ''), asin),
                     original_product_name=COALESCE(NULLIF(original_product_name, ''), product_name),
+                    original_quantity=COALESCE(original_quantity, quantity),
+                    replacement_quantity=?, quantity=?,
                     replacement_asin=?, replacement_product_name=?,
                     replacement_note=?, replacement_assigned_at=?, updated_at=?
                 WHERE id=?
                 """,
                 (
+                    quantity_needed,
+                    quantity_needed,
                     inventory_asin,
                     clean_text(item["product_name"]),
                     append_note(clean_text(line.get("replacement_note")), replacement_note.strip()),
