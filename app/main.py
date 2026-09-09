@@ -23447,19 +23447,13 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
                 result = super()._request(method, url, json_body, **request_options)
             except Exception as exc:
                 if uploading_image and re.search(r"image|attachment|media", str(exc), re.IGNORECASE):
-                    # Shopify may reject an otherwise valid Amazon image. Retry the same
-                    # product operation without images so an optional asset cannot block
-                    # creation of the replacement order.
-                    fallback_body = dict(json_body or {})
-                    fallback_product = dict(fallback_body.get("product") or {})
-                    fallback_product.pop("images", None)
-                    fallback_body["product"] = fallback_product
-                    print(
-                        f"Shopify replacement image skipped for "
-                        f"{current_replacement['replacement_asin']}: {exc}"
-                    )
-                    return super()._request(method, url, fallback_body, **request_options)
+                    raise ReplacementImageSyncError(current_replacement["id"], current_replacement["replacement_asin"]) from exc
                 raise
+            if uploading_image and not any(
+                clean_text(image.get("src")) and not image.get("errors")
+                for image in (result.get("product") or {}).get("images", [])
+            ):
+                raise ReplacementImageSyncError(current_replacement["id"], current_replacement["replacement_asin"])
             return result
 
     module.ShopifyClient = RateLimitedShopifyClient
@@ -23544,7 +23538,23 @@ def process_one_shopify_fulfilment_job(worker_name: str = "") -> bool:
         message=f"Syncing {job['odoo_order_name']} to Shopify {route}{worker_label}.",
     )
     try:
-        run_shopify_script_export(job)
+        # Replacement images are operationally required for warehouse matching.
+        # Retry the complete export three times so every attempt rebuilds the
+        # replacement client and fetches the Amazon image afresh. Product/order
+        # duplicate guards make a full retry safe if the prior attempt got partway.
+        for image_attempt in range(1, 4):
+            try:
+                run_shopify_script_export(job)
+                break
+            except ReplacementImageSyncError:
+                if image_attempt >= 3:
+                    raise
+                print(
+                    f"Retrying replacement image for {job['odoo_order_name']} "
+                    f"({image_attempt + 1}/3).",
+                    flush=True,
+                )
+                time.sleep(image_attempt)
         try:
             sync_shopify_status_for_order_names(
                 int(job["store_id"]),

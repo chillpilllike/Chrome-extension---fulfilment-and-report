@@ -130,10 +130,10 @@ class ReplacementExportTests(unittest.TestCase):
         self.assertEqual(lines[0]['price_total'], 80)
         self.assertAlmostEqual(lines[0]['price_unit'] * 3, 80)
 
-    def test_missing_image_does_not_block_or_use_original(self):
+    def test_missing_image_blocks_instead_of_using_original(self):
         wrapper, client, _ = self.make_client(image='')
-        line = wrapper.get_order_lines([10])[0]
-        self.assertFalse(wrapper.get_product_product(line['product_id'][0])['image_1920'])
+        with self.assertRaisesRegex(RuntimeError, 'Image sync failed'):
+            wrapper.get_order_lines([10])
         client.get_product_product.assert_not_called()
 
     def test_missing_source_blocks_export(self):

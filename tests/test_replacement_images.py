@@ -64,9 +64,9 @@ class ImageFlowTests(quantity_tests.ReplacementQuantityTests):
         self.conn.execute(schema)
         self.conn.execute('''CREATE TABLE shopify_fulfilment_jobs (id TEXT PRIMARY KEY, store_id INTEGER,
             odoo_order_name TEXT, route TEXT, status TEXT, last_error TEXT, attempts INTEGER,
-            max_attempts INTEGER, next_run_at TEXT, updated_at TEXT)''')
-        self.conn.execute('INSERT INTO shopify_fulfilment_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            ('job1', 2, 'TEST1', 'dtc', 'dead', str(ReplacementImageSyncError(1, 'B000000002')), 1, 5, '', ''))
+            max_attempts INTEGER, next_run_at TEXT, updated_at TEXT, completed_at TEXT)''')
+        self.conn.execute('INSERT INTO shopify_fulfilment_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('job1', 2, 'TEST1', 'dtc', 'dead', str(ReplacementImageSyncError(1, 'B000000002')), 1, 5, '', '', ''))
         self.conn.commit()
         self.worker = self.stack.enter_context(patch.object(main, 'start_shopify_fulfilment_worker'))
 
@@ -109,18 +109,34 @@ class ImageFlowTests(quantity_tests.ReplacementQuantityTests):
         self.assertEqual(self.conn.execute('SELECT COUNT(*) AS n FROM replacement_product_images').fetchone()['n'], 0)
         self.worker.assert_not_called()
 
-    def test_image_failure_worker_pauses_for_manual_upload(self):
+    def test_image_failure_worker_retries_three_times_then_pauses(self):
         job = self.conn.execute('SELECT * FROM shopify_fulfilment_jobs').fetchone()
         with patch.object(main, 'claim_shopify_fulfilment_job', return_value=job), \
              patch.object(main, 'shopify_fulfilment_progress', return_value={'status': 'running'}), \
              patch.object(main, 'set_shopify_fulfilment_progress'), \
              patch.object(main, 'increment_shopify_fulfilment_progress'), \
              patch.object(main, 'send_email_alert_async'), \
-             patch.object(main, 'run_shopify_script_export', side_effect=ReplacementImageSyncError(1, 'B000000002')):
+             patch.object(main.time, 'sleep'), \
+             patch.object(main, 'run_shopify_script_export', side_effect=ReplacementImageSyncError(1, 'B000000002')) as export:
             self.assertTrue(main.process_one_shopify_fulfilment_job())
         job = self.conn.execute('SELECT * FROM shopify_fulfilment_jobs').fetchone()
         self.assertEqual(job['status'], 'dead')
         self.assertEqual(image_failure_details(job['last_error']), {'line_id': 1, 'asin': 'B000000002'})
+        self.assertEqual(export.call_count, 3)
+
+    def test_image_retry_refetches_and_succeeds(self):
+        job = self.conn.execute('SELECT * FROM shopify_fulfilment_jobs').fetchone()
+        with patch.object(main, 'claim_shopify_fulfilment_job', return_value=job), \
+             patch.object(main, 'shopify_fulfilment_progress', return_value={'status': 'running'}), \
+             patch.object(main, 'set_shopify_fulfilment_progress'), \
+             patch.object(main, 'increment_shopify_fulfilment_progress'), \
+             patch.object(main, 'send_email_alert_async'), \
+             patch.object(main, 'sync_shopify_status_for_order_names'), \
+             patch.object(main.time, 'sleep'), \
+             patch.object(main, 'run_shopify_script_export', side_effect=[ReplacementImageSyncError(1, 'B000000002'), None]) as export:
+            self.assertTrue(main.process_one_shopify_fulfilment_job())
+        self.assertEqual(self.conn.execute('SELECT status FROM shopify_fulfilment_jobs').fetchone()['status'], 'completed')
+        self.assertEqual(export.call_count, 2)
 
 
 class ManualImageExportTests(unittest.TestCase):
@@ -136,14 +152,13 @@ class ManualImageExportTests(unittest.TestCase):
 
 
 class ImageRetryTests(unittest.TestCase):
-    def test_amazon_failure_does_not_block_export(self):
+    def test_missing_image_blocks_without_using_original(self):
         client = MagicMock()
         client.get_order_lines.return_value = [{'id': 10}]
         rows = [dict(id=1, source_ids=[10], quantity=1, replacement_asin='B000000002')]
         loader = MagicMock(side_effect=RuntimeError('Amazon unavailable'))
-        wrapper = ReplacementExportOdoo(client, rows, loader)
-        wrapper.get_order_lines([10])
-        self.assertFalse(wrapper.get_product_product(-1)['image_1920'])
+        with self.assertRaises(ReplacementImageSyncError):
+            ReplacementExportOdoo(client, rows, loader).get_order_lines([10])
         loader.assert_called_once_with('B000000002')
 
     def test_linked_order_retry_refreshes_image_without_creating_order(self):
@@ -169,17 +184,12 @@ class ImageRetryTests(unittest.TestCase):
 
 
 class ShopifyImageResponseTests(unittest.TestCase):
-    def run_export(self, response=None, error=None, image_error_once=False):
-        calls = []
-
+    def run_export(self, response=None, error=None):
         class Shop:
             def __init__(self, name, shop, *_args):
                 self.name, self.shop = name, shop
 
-            def _request(self, _method, _url, json_body=None, **_kwargs):
-                calls.append(json_body)
-                if image_error_once and len(calls) == 1:
-                    raise RuntimeError('HTTP 422: image attachment is invalid')
+            def _request(self, *_args, **_kwargs):
                 if error:
                     raise RuntimeError(error)
                 return response
@@ -218,19 +228,14 @@ class ShopifyImageResponseTests(unittest.TestCase):
             finally:
                 self.assertEqual(observed_update_setting, [True])
                 self.assertFalse(module.UPDATE_EXISTING_SKU_PRODUCTS)
-        return calls
 
-    def test_shopify_image_rejection_retries_without_image(self):
-        calls = self.run_export(
-            response={'product': {'id': 10, 'variants': [{'id': 20}], 'images': []}},
-            image_error_once=True,
-        )
-        self.assertEqual(len(calls), 2)
-        self.assertIn('images', calls[0]['product'])
-        self.assertNotIn('images', calls[1]['product'])
+    def test_shopify_image_rejection_becomes_upload_action(self):
+        with self.assertRaises(ReplacementImageSyncError):
+            self.run_export(error='HTTP 422: image attachment is invalid')
 
-    def test_missing_image_in_success_response_does_not_block(self):
-        self.run_export(response={'product': {'id': 10, 'images': []}})
+    def test_missing_image_in_success_response_becomes_upload_action(self):
+        with self.assertRaises(ReplacementImageSyncError):
+            self.run_export(response={'product': {'id': 10, 'images': []}})
 
     def test_image_success_and_non_image_errors_are_distinguished(self):
         self.run_export(response={'product': {'images': [{'id': 20, 'src': 'test'}]}})

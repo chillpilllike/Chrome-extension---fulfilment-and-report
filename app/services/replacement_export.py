@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from app.services.replacement_images import ReplacementImageSyncError
+
 
 class ReplacementExportOdoo:
     def __init__(self, client: Any, replacements: list[dict], image_loader: Callable[[str], str]):
@@ -51,12 +53,10 @@ class ReplacementExportOdoo:
                     if asin not in self.images:
                         self.images[asin] = self.image_loader(asin)
                     image = self.images[asin]
-                except Exception:
-                    # A product image is useful metadata, not a fulfilment prerequisite.
-                    # Amazon can temporarily withhold an image or return an unsupported
-                    # asset. Keep exporting the accepted replacement and let image repair
-                    # happen independently instead of losing the Shopify order.
-                    image = ""
+                    if not image:
+                        raise ValueError("Amazon image unavailable")
+                except Exception as exc:
+                    raise ReplacementImageSyncError(replacement["id"], asin) from exc
             product_id = -int(replacement["id"])
             title = replacement.get("replacement_product_name") or f"Replacement ASIN {asin}"
             # Virtual products keep the original Odoo product and its image untouched.
@@ -64,7 +64,7 @@ class ReplacementExportOdoo:
                 "id": product_id, "name": title, "default_code": asin,
                 "barcode": "", "product_tmpl_id": False,
                 "description": "", "description_sale": "",
-                "image_1920": image or False,
+                "image_1920": image,
             }
             line = dict(source[0])
             gross = sum(float(item.get("price_unit") or 0) * float(item.get("product_uom_qty") or 0) for item in source)
