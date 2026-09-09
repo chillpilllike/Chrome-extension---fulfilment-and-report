@@ -4568,7 +4568,6 @@ function App() {
     setSelectedInventoryId(null)
     try {
       const result = await api<{ items: InventoryItem[] }>("/api/inventory?page=1&per_page=100")
-      const requiredQuantity = Math.max(0, Number(line.quantity || 0) - Number(line.inventory_allocated_quantity || 0))
       const lineAsin = String(line.replacement_asin || line.asin || "").trim().toUpperCase()
       const available = (result.items || [])
         .filter((item) => item.status === "available" && Number(item.quantity || 0) > 0)
