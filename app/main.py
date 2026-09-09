@@ -20445,7 +20445,7 @@ def get_service_settings() -> dict[str, str]:
         rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
     for row in rows:
         if row["key"].startswith("amazon_bundle:"):
-            evidence = json.loads(row["value"])
+            evidence = amazon_bundles.decode_evidence(row["value"])
             parent, children = amazon_bundles.validate_evidence(evidence)
             amazon_bundles.CATALOG[parent] = {**evidence, "components": children}
         if row["key"] in settings:

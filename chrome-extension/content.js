@@ -1,5 +1,5 @@
 (() => {
-const CONTENT_SCRIPT_BUILD = "2026-08-30-strict-manual-order-priority-v174";
+const CONTENT_SCRIPT_BUILD = "2026-09-09-multipack-verification-v200";
 if (window.__nutricityContentLoaded === CONTENT_SCRIPT_BUILD) return;
 if (typeof window.__nutricityContentCleanup === "function") {
   try {
@@ -721,6 +721,35 @@ async function updatePanelPauseButton(panel = document.querySelector("#nutricity
   button.hidden = false;
   button.textContent = activeJob.paused ? "Resume" : "Pause";
   button.classList.toggle("is-paused", Boolean(activeJob.paused));
+  panel.querySelector(".nutricity-verify-bundle")?.remove();
+  const item = activeJob.job.items?.[activeJob.itemIndex || 0];
+  if (activeJob.paused && activeJob.stage === "product" && item
+      && currentProductAsinEvidence().asin === item.asin && productMultipackEvidence(item.asin)) {
+    const verify = document.createElement("button");
+    verify.className = "nutricity-verify-bundle";
+    verify.textContent = "Verify bundle mapping";
+    verify.addEventListener("click", verifyPausedBundleMapping);
+    panel.append(verify);
+  }
+}
+
+async function verifyPausedBundleMapping() {
+  const activeJob = await getActiveJob();
+  const item = activeJob?.job?.items?.[activeJob.itemIndex || 0];
+  if (!activeJob?.paused || activeJob.stage !== "product" || !item
+      || currentProductAsinEvidence().asin !== item.asin) return;
+  const evidence = productMultipackEvidence(item.asin);
+  if (!evidence) return;
+  try {
+    const saved = await send({ type: "SAVE_BUNDLE_COMPONENTS", groupKey: activeJob.job.group_key, workerId: activeJob.workerId, evidence });
+    if (!saved?.ok) throw new Error(saved?.message || "Bundle save failed.");
+    const loaded = await send({ type: "LOAD_MULTIPACK_EVIDENCE", groupKey: activeJob.job.group_key, workerId: activeJob.workerId });
+    const actual = loaded?.items?.[item.asin]?.components;
+    if (!loaded?.ok || !actual || !exactAsinQuantitiesMatch(evidence.components, actual)) throw new Error("Saved bundle could not be verified on reload.");
+    showPanel("Bundle mapping verified", "The server saved and reloaded the exact bundle mapping successfully. Fulfilment remains paused; Resume when ready.", null, null);
+  } catch (error) {
+    showPanel("Bundle verification failed", error.message || String(error), null, null);
+  }
 }
 
 function visible(element) {

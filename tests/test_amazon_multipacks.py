@@ -35,6 +35,8 @@ class AmazonMultipackTests(unittest.TestCase):
             self.assertEqual(result['components'], {CHILD: 2})
             saved = conn.execute('SELECT * FROM app_settings').fetchone()
             self.assertTrue(saved['updated_at'])
+            with patch.object(main, '_SERVICE_SETTINGS_CACHE', ({}, 0)):
+                self.assertIsInstance(main.get_service_settings(), dict)
             self.assertEqual(main.api_chrome_bundle_components('test-pack', payload)['components'], {CHILD: 2})
             self.assertEqual(main.api_chrome_bundle_components('test-pack', {'read_only': True})['items'][PARENT]['components'], {CHILD: 2})
         conn.close()
@@ -106,3 +108,26 @@ for(const experience of ['consumer','business']) {
 assert.equal(multipackCheckoutQuantities(make(),evidence(),'unknown'),null);
 '''
         subprocess.run(['node', '-e', script], check=True, capture_output=True, text=True)
+
+    def test_paused_verification_saves_and_reloads_without_resuming(self):
+        source = (Path(__file__).resolve().parents[1] / 'chrome-extension/content.js').read_text()
+        helper = source[source.index('async function verifyPausedBundleMapping('):source.index('function visible(')]
+        script = helper + """
+const assert=require('node:assert/strict');
+let active={paused:true,stage:'product',workerId:'worker',job:{group_key:'group',items:[{asin:'B0BV67RXQH'}]}};
+const getActiveJob=async()=>active;
+const currentProductAsinEvidence=()=>({asin:'B0BV67RXQH'});
+const productMultipackEvidence=()=>({components:{B076F324JN:2}});
+const exactAsinQuantitiesMatch=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+const calls=[]; let failed=false; let title='';
+const send=async message=>{calls.push(message.type);if(failed)throw Error('server failure');return {ok:true,items:{B0BV67RXQH:{components:{B076F324JN:2}}}}};
+const showPanel=t=>{title=t};
+(async()=>{
+ await verifyPausedBundleMapping();
+ assert.deepEqual(calls,['SAVE_BUNDLE_COMPONENTS','LOAD_MULTIPACK_EVIDENCE']);
+ assert.equal(active.paused,true);assert.equal(active.stage,'product');assert.equal(title,'Bundle mapping verified');
+ calls.length=0;active.paused=false;await verifyPausedBundleMapping();assert.equal(calls.length,0);
+ active.paused=true;failed=true;await verifyPausedBundleMapping();assert.equal(title,'Bundle verification failed');assert.equal(active.paused,true);
+})().catch(e=>{console.error(e);process.exit(1)});
+"""
+        subprocess.run(['node','-e',script],check=True,capture_output=True,text=True)
