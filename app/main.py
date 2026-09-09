@@ -23447,13 +23447,19 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
                 result = super()._request(method, url, json_body, **request_options)
             except Exception as exc:
                 if uploading_image and re.search(r"image|attachment|media", str(exc), re.IGNORECASE):
-                    raise ReplacementImageSyncError(current_replacement["id"], current_replacement["replacement_asin"]) from exc
+                    # Shopify may reject an otherwise valid Amazon image. Retry the same
+                    # product operation without images so an optional asset cannot block
+                    # creation of the replacement order.
+                    fallback_body = dict(json_body or {})
+                    fallback_product = dict(fallback_body.get("product") or {})
+                    fallback_product.pop("images", None)
+                    fallback_body["product"] = fallback_product
+                    print(
+                        f"Shopify replacement image skipped for "
+                        f"{current_replacement['replacement_asin']}: {exc}"
+                    )
+                    return super()._request(method, url, fallback_body, **request_options)
                 raise
-            if uploading_image and not any(
-                clean_text(image.get("src")) and not image.get("errors")
-                for image in (result.get("product") or {}).get("images", [])
-            ):
-                raise ReplacementImageSyncError(current_replacement["id"], current_replacement["replacement_asin"])
             return result
 
     module.ShopifyClient = RateLimitedShopifyClient

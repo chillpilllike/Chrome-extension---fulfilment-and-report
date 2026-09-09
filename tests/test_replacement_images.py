@@ -136,17 +136,15 @@ class ManualImageExportTests(unittest.TestCase):
 
 
 class ImageRetryTests(unittest.TestCase):
-    def test_new_attempt_fetches_amazon_again_after_failure(self):
+    def test_amazon_failure_does_not_block_export(self):
         client = MagicMock()
         client.get_order_lines.return_value = [{'id': 10}]
         rows = [dict(id=1, source_ids=[10], quantity=1, replacement_asin='B000000002')]
-        loader = MagicMock(side_effect=[RuntimeError('Amazon unavailable'), 'FRESH_IMAGE'])
-        with self.assertRaises(ReplacementImageSyncError):
-            ReplacementExportOdoo(client, rows, loader).get_order_lines([10])
-        retry = ReplacementExportOdoo(client, rows, loader)
-        retry.get_order_lines([10])
-        self.assertEqual(retry.get_product_product(-1)['image_1920'], 'FRESH_IMAGE')
-        self.assertEqual(loader.call_count, 2)
+        loader = MagicMock(side_effect=RuntimeError('Amazon unavailable'))
+        wrapper = ReplacementExportOdoo(client, rows, loader)
+        wrapper.get_order_lines([10])
+        self.assertFalse(wrapper.get_product_product(-1)['image_1920'])
+        loader.assert_called_once_with('B000000002')
 
     def test_linked_order_retry_refreshes_image_without_creating_order(self):
         client = MagicMock()
@@ -171,12 +169,17 @@ class ImageRetryTests(unittest.TestCase):
 
 
 class ShopifyImageResponseTests(unittest.TestCase):
-    def run_export(self, response=None, error=None):
+    def run_export(self, response=None, error=None, image_error_once=False):
+        calls = []
+
         class Shop:
             def __init__(self, name, shop, *_args):
                 self.name, self.shop = name, shop
 
-            def _request(self, *_args, **_kwargs):
+            def _request(self, _method, _url, json_body=None, **_kwargs):
+                calls.append(json_body)
+                if image_error_once and len(calls) == 1:
+                    raise RuntimeError('HTTP 422: image attachment is invalid')
                 if error:
                     raise RuntimeError(error)
                 return response
@@ -215,14 +218,19 @@ class ShopifyImageResponseTests(unittest.TestCase):
             finally:
                 self.assertEqual(observed_update_setting, [True])
                 self.assertFalse(module.UPDATE_EXISTING_SKU_PRODUCTS)
+        return calls
 
-    def test_shopify_image_rejection_becomes_upload_action(self):
-        with self.assertRaises(ReplacementImageSyncError):
-            self.run_export(error='HTTP 422: image attachment is invalid')
+    def test_shopify_image_rejection_retries_without_image(self):
+        calls = self.run_export(
+            response={'product': {'id': 10, 'variants': [{'id': 20}], 'images': []}},
+            image_error_once=True,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertIn('images', calls[0]['product'])
+        self.assertNotIn('images', calls[1]['product'])
 
-    def test_missing_image_in_success_response_becomes_upload_action(self):
-        with self.assertRaises(ReplacementImageSyncError):
-            self.run_export(response={'product': {'id': 10, 'images': []}})
+    def test_missing_image_in_success_response_does_not_block(self):
+        self.run_export(response={'product': {'id': 10, 'images': []}})
 
     def test_image_success_and_non_image_errors_are_distinguished(self):
         self.run_export(response={'product': {'images': [{'id': 20, 'src': 'test'}]}})
