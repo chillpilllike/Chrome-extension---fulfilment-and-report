@@ -11,11 +11,16 @@ PARENT = 'B0BV67RXQH'
 CHILD = 'B076F324JN'
 
 class AmazonMultipackTests(unittest.TestCase):
-    def test_bundle_save_endpoint_obeys_real_settings_constraints(self):
+    def test_bundle_save_endpoint_obeys_real_settings_constraints(self, decoded_json=False):
         import sqlite3
         from contextlib import contextmanager
         conn = sqlite3.connect(':memory:')
-        conn.row_factory = lambda cursor, values: dict(zip([col[0] for col in cursor.description], values))
+        def row_factory(cursor, values):
+            row = dict(zip([col[0] for col in cursor.description], values))
+            if decoded_json and 'value' in row:
+                row['value'] = json.loads(row['value'])
+            return row
+        conn.row_factory = row_factory
         conn.execute('CREATE TABLE app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)')
         conn.execute('CREATE TABLE order_lines(asin TEXT, replacement_asin TEXT, amazon_group_key TEXT)')
         conn.execute('INSERT INTO order_lines VALUES (?, NULL, ?)', (PARENT, 'test-pack'))
@@ -33,6 +38,9 @@ class AmazonMultipackTests(unittest.TestCase):
             self.assertEqual(main.api_chrome_bundle_components('test-pack', payload)['components'], {CHILD: 2})
             self.assertEqual(main.api_chrome_bundle_components('test-pack', {'read_only': True})['items'][PARENT]['components'], {CHILD: 2})
         conn.close()
+
+    def test_bundle_save_and_reload_accept_postgres_decoded_json(self):
+        self.test_bundle_save_endpoint_obeys_real_settings_constraints(decoded_json=True)
 
     def test_verified_pack_evidence_rejects_variant_and_count_conflicts(self):
         evidence = bundles.multipack_evidence(PARENT)

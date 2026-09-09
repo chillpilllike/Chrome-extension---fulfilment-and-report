@@ -33312,7 +33312,7 @@ def api_chrome_bundle_components(group_key: str, payload: dict[str, Any]) -> dic
         key = "amazon_bundle:" + parent
         conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING", (key, json.dumps(saved), saved["verified_at"]))
         stored = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
-        if json.loads(stored["value"])["components"] != children:
+        if amazon_bundles.decode_evidence(stored["value"])["components"] != children:
             raise HTTPException(409, "Bundle composition conflicts with previously verified evidence; review required.")
     amazon_bundles.CATALOG[parent] = saved
     return {"ok": True, "parent_asin": parent, "components": children, "multipack_evidence": amazon_bundles.multipack_evidence(parent)}

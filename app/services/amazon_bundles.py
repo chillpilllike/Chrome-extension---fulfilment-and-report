@@ -54,9 +54,17 @@ def validate_evidence(evidence):
     return parent, {child: int(count) for child, count in children.items()}
 
 
+def decode_evidence(value):
+    """PostgreSQL JSON/JSONB is already decoded; legacy text still needs parsing."""
+    evidence = value if isinstance(value, dict) else json.loads(value)
+    if not isinstance(evidence, dict):
+        raise ValueError("Bundle evidence must be a JSON object.")
+    return dict(evidence)
+
+
 def load_catalog(conn):
     for row in conn.execute("SELECT value FROM app_settings WHERE key LIKE 'amazon_bundle:%'").fetchall():
-        evidence = json.loads(row['value'])
+        evidence = decode_evidence(row['value'])
         parent, children = validate_evidence(evidence)
         CATALOG[parent] = {**evidence, 'components': children}
 
