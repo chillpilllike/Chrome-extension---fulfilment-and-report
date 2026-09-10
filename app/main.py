@@ -38333,7 +38333,7 @@ def after_order_test_recipient() -> str:
 def after_order_cutoff_date() -> str:
     # Fixed rollout floor, not a rolling 'today' filter. Settings may only
     # narrow eligibility further; old environment values cannot widen it.
-    rollout_floor = "2026-09-09"
+    rollout_floor = "2026-08-20"
     value = clean_text(get_service_settings().get("after_order_cutoff_date"))[:10]
     try:
         datetime.strptime(value, "%Y-%m-%d")

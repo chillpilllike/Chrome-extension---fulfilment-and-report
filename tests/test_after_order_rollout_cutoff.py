@@ -16,15 +16,15 @@ class RolloutCutoffTests(unittest.TestCase):
         return scope
 
     def test_floor_cannot_be_lowered(self):
-        for value in (None, "", "invalid", "2026-08-01", "2026-09-08", "2026-09-09"):
-            self.assertEqual("2026-09-09", self.helpers(value)["after_order_cutoff_date"]())
+        for value in (None, "", "invalid", "2026-08-01", "2026-08-19", "2026-08-20"):
+            self.assertEqual("2026-08-20", self.helpers(value)["after_order_cutoff_date"]())
 
     def test_later_cutoff_allowed(self):
         self.assertEqual("2026-09-10", self.helpers("2026-09-10")["after_order_cutoff_date"]())
 
     def test_order_date_boundaries(self):
         eligible = self.helpers("2026-08-01")["after_order_case_is_in_scope"]
-        for value in (None, "", "invalid", "9999-99-99", "2026-09-08 23:59:59"):
+        for value in (None, "", "invalid", "9999-99-99", "2026-08-19 23:59:59"):
             self.assertFalse(eligible({"odoo_order_date": value}))
-        for value in ("2026-09-09 00:00:00", "2026-09-10 12:00:00"):
+        for value in ("2026-08-20 00:00:00", "2026-09-10 12:00:00"):
             self.assertTrue(eligible({"odoo_order_date": value}))
