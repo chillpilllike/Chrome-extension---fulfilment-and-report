@@ -115,15 +115,16 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         panel_label, panel_value, panel_detail = "ESTIMATED DISPATCH", date, "An estimate, not a guaranteed delivery date."
     elif kind == "tracking":
         panel_label = "LATEST CARRIER UPDATE"
-        panel_value = str(context.get("latest_status") or "Shipment update")
-        panel_detail = str(context.get("latest_location") or "")
+        panel_value = "Status: " + str(context.get("latest_status") or "Not provided by carrier")
+        panel_detail = "Date and time: " + str(context.get("last_update_at") or "Not provided by carrier") + "\nLocation: " + str(context.get("latest_location") or "Not provided by carrier")
     else:
         panel_label = panel_value = panel_detail = ""
     if panel_label:
+        panel_detail_html = "<br>".join(escape(line) for line in panel_detail.split("\n"))
         panel = f'''<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eeeeee" style="margin-top:28px;background:#eeeeee;border:1px solid #dedede;border-radius:0"><tr><td style="padding:22px 24px;font-family:{FONT}">
         <p style="margin:0 0 9px;font-size:10px;line-height:16px;letter-spacing:1.3px;font-weight:600;color:#506c5e">{panel_label}</p>
         <p style="margin:0;font-size:18px;line-height:26px;font-weight:600;color:#214f3d">{escape(panel_value)}</p>
-        {f'<p style="margin:7px 0 0;font-size:13px;line-height:21px;color:#596f60">{escape(panel_detail)}</p>' if panel_detail else ''}
+        {f'<p style="margin:7px 0 0;font-size:13px;line-height:21px;color:#596f60">{panel_detail_html}</p>' if panel_detail else ''}
         </td></tr></table>'''
         detail_lines = [panel_value, panel_detail]
 

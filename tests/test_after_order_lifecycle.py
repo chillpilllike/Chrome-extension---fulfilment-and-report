@@ -106,7 +106,7 @@ class DryRunTests(unittest.TestCase):
     def test_scheduler_refreshes_but_does_not_send_in_test_mode(self):
         refreshed = Mock()
         danger = Mock(side_effect=AssertionError("Side effect in test mode"))
-        function = extract("run_after_order_automation", {"sync_after_order_cases": refreshed, "care_delivery":Mock(), "care_requests":Mock(), "after_order_email_test_mode": lambda: True, "db": danger, "send_after_order_email": danger, "execute_after_order_job": danger})
+        function = extract("run_after_order_automation", {"after_order_approval_only_live": lambda: False, "sync_after_order_cases": refreshed, "care_delivery":Mock(), "care_requests":Mock(), "after_order_email_test_mode": lambda: True, "db": danger, "send_after_order_email": danger, "execute_after_order_job": danger})
         self.assertTrue(function()["test_mode"])
         refreshed.assert_called_once()
         danger.assert_not_called()

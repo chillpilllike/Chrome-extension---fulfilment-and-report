@@ -167,7 +167,7 @@ class CompletionDB(unittest.TestCase):
         self.conn.executemany("INSERT INTO after_order_cases(id,status) VALUES(?,'needs_attention')",[(i,) for i in range(2,402)])
         self.conn.execute('CREATE TABLE after_order_execution_jobs(id INTEGER,status TEXT)');self.conn.commit()
         ticks=iter(['2026-09-06T10:00:00+00:00']*200+['2026-09-06T10:01:00+00:00']*200+['2026-09-06T10:02:00+00:00']*200)
-        scope={**self.ns,'Any':object,'sync_after_order_cases':Mock(),'clean_text':lambda v:str(v or ''),
+        scope={**self.ns,'after_order_approval_only_live':lambda:False,'Any':object,'sync_after_order_cases':Mock(),'clean_text':lambda v:str(v or ''),
             'get_service_settings':lambda:{'after_order_automation_enabled':'true','after_order_public_base_url':'https://app.example'},
             'os':SimpleNamespace(getenv=lambda *a:''),'urlparse':urlparse,'Request':lambda x:x,
             'rows_to_dicts':lambda rows:[dict(row) for row in rows],'after_order_case_by_id':lambda _:None,

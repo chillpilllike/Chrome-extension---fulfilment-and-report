@@ -7,6 +7,15 @@ from app.services.after_order_email import render_after_order_email,storefront_p
 
 
 class EmailDesignTests(unittest.TestCase):
+    def test_carrier_event_details_in_html_and_text(self):
+        self.case['context']['last_update_at'] = '2026-09-10T08:37:50'
+        _, markup, plain = self.render('tracking')
+        for value in ('Date and time: 2026-09-10T08:37:50', 'Location: Melbourne, Australia', 'Status: Arrived at local facility'):
+            self.assertIn(value, markup)
+            self.assertIn(value, plain)
+        self.case['context']['latest_location'] = ''
+        self.assertIn('Location: Not provided by carrier', self.render('tracking')[1])
+
     def test_customer_product_links_reject_backend_and_wrong_store(self):
         for url in ('https://backend.nutricityusa.com/web#id=5&model=product.product',
                     'https://nutricity.com.au/web#id=5','https://nutricity.ca/shop/product',

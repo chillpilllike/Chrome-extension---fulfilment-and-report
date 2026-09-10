@@ -39671,6 +39671,31 @@ def api_after_order_send_test_email(case_id: int, request: Request) -> dict[str,
     return send_after_order_email(case_id, request, force_test=True, template_kind=template_kind)
 
 
+@app.post("/api/after-order/cases/{case_id}/prepare-live-email")
+def api_after_order_prepare_live_email(case_id: int, request: Request) -> dict[str, Any]:
+    if after_order_email_test_mode() or not after_order_approval_only_live():
+        raise HTTPException(409, "Enable approval-only live preparation first.")
+    case = after_order_case_by_id(case_id)
+    if not case:
+        raise HTTPException(404, "After-order case not found.")
+    require_after_order_case_in_scope(case)
+    if case.get('confirmed_at') or case.get('current_decision') or case.get('status') in {'resolved', 'approved', 'execution_needs_review'}:
+        raise HTTPException(409, "This case already has a decision or requires team review.")
+    if case.get('case_type') == 'tracking':
+        context = case.get('context') or {}
+        if context.get('risk_state') != 'in_transit' and not (
+            context.get('risk_state') == 'suspected_lost' and context.get('customer_lost_email_allowed')
+        ):
+            raise HTTPException(409, "No eligible carrier movement or verified lost-package case.")
+    result = send_after_order_email(case_id, request, force_test=False)
+    # Preserve test history, but never leave owner-test drafts beside a real
+    # recipient draft where the team might approve the wrong one.
+    if result.get('status') == 'awaiting_approval':
+        with db() as conn:
+            conn.execute("UPDATE after_order_messages SET status='superseded',updated_at=? WHERE case_id=? AND test_mode=1 AND status='awaiting_approval' AND attempt_count=0", (utc_now(), case_id))
+    return result
+
+
 @app.post("/api/after-order/send-all-test-emails")
 def api_after_order_send_all_test_emails(request: Request, store_id: Optional[int] = None) -> dict[str, Any]:
     """Send the complete visual email suite to the configured test inbox."""
@@ -40331,6 +40356,7 @@ def api_after_order_settings() -> dict[str, Any]:
         "ok": True,
         "email_approval_required": True,
         "financial_approval_required": True,
+        "approval_only_live": after_order_approval_only_live(),
         "cutoff_date": after_order_cutoff_date(),
         "email_test_mode": after_order_email_test_mode(),
         "email_test_recipient": after_order_test_recipient(),
@@ -40351,6 +40377,8 @@ def after_order_automation_loop() -> None:
 
 
 def run_after_order_automation() -> dict[str, Any]:
+    if after_order_approval_only_live():
+        return {"ok": False, "message": "Approval-only live mode: background processing is disabled."}
     sync_after_order_cases()
     care_delivery.reconcile()
     care_requests.sync_delivered()
@@ -40408,6 +40436,8 @@ def api_after_order_automation_run() -> dict[str, Any]:
 
 @app.post("/api/after-order/settings/automation")
 def api_after_order_automation_settings(payload: AfterOrderTestModePayload) -> dict[str, Any]:
+    if payload.enabled and after_order_approval_only_live():
+        raise HTTPException(409, "Automation cannot be enabled during approval-only live operation.")
     if payload.enabled and not after_order_email_test_mode():
         raise HTTPException(409, "Enable automation while in test mode first and complete the readiness checks before going live.")
     set_service_settings({"after_order_automation_enabled": "true" if payload.enabled else "false"})
@@ -40424,6 +40454,24 @@ def api_after_order_test_mode(payload: AfterOrderTestModePayload) -> dict[str, A
         "email_test_mode": after_order_email_test_mode(),
         "email_test_recipient": after_order_test_recipient(),
     }
+
+
+def after_order_approval_only_live() -> bool:
+    return clean_text(get_service_settings().get('after_order_approval_only_live')) == 'true'
+
+
+@app.post("/api/after-order/settings/approval-only-live")
+def api_after_order_approval_only_live(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get('confirm_real_recipients') is not True:
+        raise HTTPException(400, "Explicitly confirm real-recipient drafts requiring individual approval.")
+    # This does not certify general launch readiness or enable financial workers.
+    # All preparation returns awaiting_approval; sending remains digest-approved.
+    set_service_settings({
+        'after_order_approval_only_live': 'true',
+        'after_order_automation_enabled': 'false',
+        'after_order_email_test_mode': 'false',
+    })
+    return api_after_order_settings()
 
 
 @app.get("/api/public/epost")
