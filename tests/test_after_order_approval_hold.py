@@ -17,17 +17,30 @@ class ApprovalHoldTests(unittest.TestCase):
 
     def test_approval_only_activation_requires_explicit_confirmation(self):
         setter = Mock()
-        fn = self.load_function('api_after_order_approval_only_live', {'set_service_settings': setter, 'api_after_order_settings': lambda: {}})
+        fn = self.load_function('api_after_order_approval_only_live', {'set_service_settings': setter, 'api_after_order_settings': lambda: {}, 'after_order_approval_only_live': lambda: True, 'clean_text': str, 'get_service_settings': lambda: {'after_order_automation_enabled':'false'}})
         for payload in ({}, {'confirm_real_recipients': 'true'}, {'confirm_real_recipients': False}):
             with self.assertRaises(HTTPException):
                 fn(payload)
         setter.assert_not_called()
         fn({'confirm_real_recipients': True})
-        settings = setter.call_args.args[0]
+        settings = setter.call_args_list[0].args[0]
         self.assertEqual('false', settings['after_order_automation_enabled'])
-        self.assertEqual('false', settings['after_order_email_test_mode'])
+        self.assertEqual({'after_order_email_test_mode':'false'}, setter.call_args.args[0])
         self.assertEqual('true', settings['after_order_approval_only_live'])
         self.assertNotIn('after_order_live_readiness_approved', settings)
+
+    def test_missing_persisted_guard_does_not_disable_test_mode(self):
+        setter = Mock()
+        fn = self.load_function('api_after_order_approval_only_live', {'set_service_settings': setter, 'after_order_approval_only_live': lambda: False})
+        with self.assertRaises(HTTPException):
+            fn({'confirm_real_recipients':True})
+        self.assertNotIn('after_order_email_test_mode', setter.call_args.args[0])
+
+    def test_guard_settings_are_registered_for_persistence(self):
+        tree = ast.parse(Path('app/core/config.py').read_text())
+        settings = next(n.value for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id=='DEFAULT_SERVICE_SETTINGS' for t in n.targets))
+        keys = {k.value for k in settings.keys if isinstance(k, ast.Constant)}
+        self.assertTrue({'after_order_approval_only_live','after_order_automation_enabled'}.issubset(keys))
 
     def test_approval_only_worker_exits_before_any_work(self):
         fn = self.load_function('run_after_order_automation', {'after_order_approval_only_live': lambda: True})

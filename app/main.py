@@ -40469,8 +40469,10 @@ def api_after_order_approval_only_live(payload: dict[str, Any]) -> dict[str, Any
     set_service_settings({
         'after_order_approval_only_live': 'true',
         'after_order_automation_enabled': 'false',
-        'after_order_email_test_mode': 'false',
     })
+    if not after_order_approval_only_live() or clean_text(get_service_settings().get('after_order_automation_enabled')) != 'false':
+        raise HTTPException(409, "Approval-only guard could not be persisted. Test mode is unchanged.")
+    set_service_settings({'after_order_email_test_mode': 'false'})
     return api_after_order_settings()
 
 
