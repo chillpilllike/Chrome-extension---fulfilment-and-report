@@ -10,14 +10,35 @@ from tests.test_inventory_history import InventoryHistoryTests
 
 
 class LegacyPolicyTests(unittest.TestCase):
-    def test_requires_enrollment_matching_purchase_and_actual_delivered_status(self):
+    def test_legacy_marker_never_bypasses_current_stock_guards(self):
         line = dict(amazon_order_id="original", odoo_status_label="cancelled", tracking_status="Delivered")
         existing = dict(legacy_delivery_order_id="original")
-        self.assertTrue(legacy_delivery_available(existing, line, {}))
+        self.assertFalse(legacy_delivery_available(existing, line, {}))
         self.assertFalse(legacy_delivery_available(None, line, {}))
         self.assertFalse(legacy_delivery_available({}, line, {}))
         for changes in [dict(amazon_order_id="replacement"), dict(odoo_status_label="sale"), dict(tracking_status="Not delivered"), dict(amazon_cancelled_at="today", amazon_cancelled_order_id="original")]:
             self.assertFalse(legacy_delivery_available(existing, {**line, **changes}, {}))
+
+    def test_reconciliation_is_limited_to_unreceived_unallocated_available_stock(self):
+        statements = []
+
+        class RecordingConnection:
+            def execute(self, statement):
+                statements.append(statement)
+
+        install_inventory_legacy(RecordingConnection())
+        reconciliation = statements[-1]
+        self.assertIn("status='archived'", reconciliation)
+        self.assertIn("i.status='available'", reconciliation)
+        self.assertIn("COALESCE(i.source_received_at, '')=''", reconciliation)
+        self.assertIn("i.reserved_order_line_id IS NULL", reconciliation)
+        self.assertIn("i.source_inventory_item_id IS NULL", reconciliation)
+
+    def test_order_refresh_contains_no_legacy_availability_bypass(self):
+        source = Path("app/main.py").read_text()
+        function = source[source.index("def ensure_inventory_for_line"):source.index("def refresh_inventory_for_order")]
+        self.assertNotIn("legacy_available", function)
+        self.assertIn('evidence["delivered"] and evidence["received_at"] and evidence["shopify_cancelled_at"]', function)
 
 
 @unittest.skipUnless(os.getenv("INVENTORY_TEST_DSN"), "isolated PostgreSQL required")
@@ -33,17 +54,29 @@ class LegacyMigrationTests(unittest.TestCase):
         self.conn.execute("CREATE UNIQUE INDEX ON inventory_items(store_id,order_line_id)")
         self.conn.execute("INSERT INTO order_lines(id,store_id,odoo_order_name,amazon_order_id,tracking_status,tracking_checked_at,odoo_status_label,quantity) VALUES (10,1,'NC21500','original','Delivered','2026-09-01','cancelled',4)")
 
-    def test_backfill_deducts_allocations_and_never_enrolls_future_records(self):
+    def test_install_never_enrolls_unscanned_records(self):
         source = self.add(order_line_id=10, amazon_order_id="original")
         self.add(status="archived", quantity=1, source_inventory_item_id=source["id"])
         install_inventory_legacy(self.conn)
         item = self.conn.execute("SELECT * FROM inventory_items WHERE id=?", (source["id"],)).fetchone()
-        self.assertEqual((item["status"], item["quantity"], item["legacy_delivery_order_id"]), ("available", 3, "original"))
+        self.assertEqual((item["status"], item["quantity"], item["legacy_delivery_order_id"]), ("incoming", 0, None))
         self.assertIsNone(item["source_received_at"])
         self.conn.execute("INSERT INTO order_lines(id,store_id,amazon_order_id,tracking_status,odoo_status_label,quantity) VALUES (11,1,'later','Delivered','cancelled',2)")
         later = self.add(order_line_id=11, amazon_order_id="later")
         install_inventory_legacy(self.conn)
         self.assertEqual(self.conn.execute("SELECT status FROM inventory_items WHERE id=?", (later["id"],)).fetchone()["status"], "incoming")
+
+    def test_previously_enrolled_unscanned_stock_is_archived_with_audit_reason(self):
+        source = self.add(order_line_id=10, amazon_order_id="original")
+        install_inventory_legacy(self.conn)
+        self.conn.execute(
+            "UPDATE inventory_items SET status='available', quantity=3, legacy_delivery_order_id='original' WHERE id=?",
+            (source["id"],),
+        )
+        install_inventory_legacy(self.conn)
+        item = self.conn.execute("SELECT * FROM inventory_items WHERE id=?", (source["id"],)).fetchone()
+        self.assertEqual((item["status"], item["quantity"]), ("archived", 3))
+        self.assertIn("no physical warehouse receipt scan", item["archive_reason"])
 
     def test_does_not_enroll_undelivered(self):
         self.conn.execute("UPDATE order_lines SET tracking_status='Not delivered'")
@@ -73,20 +106,22 @@ class LegacyMigrationTests(unittest.TestCase):
         source = self.add(order_line_id=10, amazon_order_id="original")
         self.add(status="reserved", quantity=1, source_inventory_item_id=source["id"])
         install_inventory_legacy(self.conn)
+        self.conn.execute("UPDATE inventory_items SET status='available', quantity=3, legacy_delivery_order_id='original' WHERE id=?", (source["id"],))
+        install_inventory_legacy(self.conn)
         evidence = dict(delivered=True, received_at="", received_quantity=0, shopify_cancelled_at="", tracking_id="TRACK", delivered_at="2026-09-01")
         @contextmanager
         def db():
             yield self.conn
         fn = next(n for n in ast.parse(Path('app/main.py').read_text()).body if isinstance(n, ast.FunctionDef) and n.name=='ensure_inventory_for_line')
-        ns = dict(Any=Any, Union=Union, db=db, inventory_source_evidence=lambda conn,row: evidence, legacy_delivery_available=legacy_delivery_available, utc_now=lambda: '2026-09-05')
+        ns = dict(Any=Any, Union=Union, db=db, inventory_source_evidence=lambda conn,row: evidence, utc_now=lambda: '2026-09-05')
         exec(compile(ast.Module(body=[fn],type_ignores=[]),'legacy-sync','exec'),ns)
         line = dict(self.conn.execute("SELECT * FROM order_lines WHERE id=10").fetchone())
         line.update(asin='B0F3RXG74P',product_name='Example',odoo_order_id=10,amazon_order_url='',amazon_account_name='')
         ns['ensure_inventory_for_line'](line)
         ns['ensure_inventory_for_line'](line)
         item = self.conn.execute("SELECT * FROM inventory_items WHERE id=?", (source['id'],)).fetchone()
-        self.assertEqual((item['status'],item['quantity']),('available',3))
+        self.assertEqual((item['status'],item['quantity']),('archived',3))
         evidence.update(received_at='2026-09-06',received_quantity=4)
         ns['ensure_inventory_for_line'](line)
         item = self.conn.execute("SELECT * FROM inventory_items WHERE id=?", (source['id'],)).fetchone()
-        self.assertEqual((item['status'],item['quantity'],item['source_received_at']),('available',3,'2026-09-06'))
+        self.assertEqual((item['status'],item['quantity'],item['source_received_at']),('archived',3,'2026-09-06'))
