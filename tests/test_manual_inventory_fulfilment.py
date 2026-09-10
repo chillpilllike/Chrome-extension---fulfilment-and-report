@@ -159,6 +159,18 @@ class ManualInventoryFulfilmentTests(unittest.TestCase):
         self.assertIn("Force reload image for stock", FRONTEND)
         self.assertIn("cache_buster", FRONTEND)
 
+    def test_existing_unreserved_inventory_can_be_edited_with_audited_fields(self) -> None:
+        source = inspect.getsource(main.api_update_inventory)
+
+        self.assertIn('status == "reserved"', source)
+        self.assertIn('status in {"used", "archived"}', source)
+        self.assertIn('SET asin=?, quantity=?, product_name=?, location=?, notes=?', source)
+        self.assertIn('normalize_inventory_location(payload.get("location"), required=True)', source)
+        self.assertIn('ASIN must be a valid 10-character ASIN or left blank.', source)
+        self.assertIn('Edit inventory stock #', FRONTEND)
+        self.assertIn('method: "PATCH"', FRONTEND)
+        self.assertIn('Use Archive if the item is not physically in stock.', FRONTEND)
+
     def test_inventory_matching_is_global_and_uses_effective_replacement_asin(self) -> None:
         reserve_source = inspect.getsource(main.reserve_inventory_for_line)
         attach_source = inspect.getsource(main.api_attach_inventory_item)

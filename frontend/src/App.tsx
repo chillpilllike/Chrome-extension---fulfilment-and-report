@@ -12853,6 +12853,9 @@ function InventoryPage({
   const [archiveItem, setArchiveItem] = useState<InventoryItem | null>(null)
   const [archiveReason, setArchiveReason] = useState("")
   const [archiveBusy, setArchiveBusy] = useState(false)
+  const [editItem, setEditItem] = useState<InventoryItem | null>(null)
+  const [editForm, setEditForm] = useState({ asin: "", quantity: "1", product_name: "", location: "", notes: "" })
+  const [editBusy, setEditBusy] = useState(false)
   const [timelineItem, setTimelineItem] = useState<InventoryItem | null>(null)
   const [timeline, setTimeline] = useState<{ id: number; inventory_id: number; occurred_at: string; event_type: string; reason: string; target_order_name?: string; previous_state: InventoryItem | null; current_state: InventoryItem }[]>([])
   const [timelineLoading, setTimelineLoading] = useState(false)
@@ -12898,6 +12901,33 @@ function InventoryPage({
     } catch (error) {
       onResult({ ok: false, title: "Archive failed", message: String(error) })
     } finally { setArchiveBusy(false) }
+  }
+
+  function editInventory(item: InventoryItem) {
+    setEditItem(item)
+    setEditForm({
+      asin: item.asin || "",
+      quantity: String(item.quantity || 1),
+      product_name: item.product_name || "",
+      location: item.location || "Brooklyn, USA",
+      notes: item.notes || "",
+    })
+  }
+
+  async function saveInventoryEdit() {
+    if (!editItem) return
+    setEditBusy(true)
+    try {
+      const result = await api<{ ok: boolean; message: string }>(`/api/inventory/${editItem.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ ...editForm, quantity: Number(editForm.quantity || 0) }),
+      })
+      setEditItem(null)
+      onRefresh()
+      onResult({ ok: result.ok, title: "Inventory Updated", message: result.message })
+    } catch (error) {
+      onResult({ ok: false, title: "Inventory Update Failed", message: String(error) })
+    } finally { setEditBusy(false) }
   }
 
   async function addManualInventory() {
@@ -13150,6 +13180,7 @@ function InventoryPage({
                 <footer className="card-footer inventory-stock-footer"><span>Updated {formatDateTime(item.updated_at)}</span>
                     <div className="btn-list justify-end">
                       <Button variant="outline" size="sm" onClick={() => setTimelineItem(item)}><Clock className="size-4" />Movement timeline</Button>
+                      {!['used', 'archived', 'reserved'].includes(item.status) && <Button variant="outline" size="sm" onClick={() => editInventory(item)}><Edit className="size-4" />Edit</Button>}
                       {!["used", "archived", "reserved"].includes(item.status) && <Button variant="outline" size="sm" onClick={() => { setArchiveItem(item); setArchiveReason("") }}>Archive</Button>}
                       {item.status === "reserved" ? (
                         <Button size="sm" onClick={() => setSentItem(item)}>
@@ -13215,6 +13246,19 @@ function InventoryPage({
       </DialogContent>
     </Dialog>
     <Dialog open={Boolean(archiveItem)} onOpenChange={(open) => { if (!open && !archiveBusy) setArchiveItem(null) }}><DialogContent><DialogHeader><DialogTitle>Archive stock #{archiveItem?.id}</DialogTitle><DialogDescription>This removes {archiveItem?.quantity} unit(s) from available stock. The record and history are retained. Reserved stock cannot be archived.</DialogDescription></DialogHeader><Label htmlFor="inventory-archive-reason">Reason for archiving</Label><Input id="inventory-archive-reason" maxLength={1000} value={archiveReason} onChange={(event) => setArchiveReason(event.target.value)} placeholder="For example: damaged, expired, or no longer expected" /><Button disabled={archiveBusy || !archiveReason.trim()} onClick={archiveInventory}>{archiveBusy ? "Archiving…" : "Move to Archived"}</Button></DialogContent></Dialog>
+    <Dialog open={Boolean(editItem)} onOpenChange={(open) => { if (!open && !editBusy) setEditItem(null) }}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader><DialogTitle>Edit inventory stock #{editItem?.id}</DialogTitle><DialogDescription>Update the physical stock details. Source-order evidence and movement history are preserved. Use Archive if the item is not physically in stock.</DialogDescription></DialogHeader>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-1.5 sm:col-span-2"><Label htmlFor="inventory-edit-title">Title <span className="text-destructive">*</span></Label><Input id="inventory-edit-title" value={editForm.product_name} onChange={(event) => setEditForm({ ...editForm, product_name: event.target.value })} /></div>
+          <div className="grid gap-1.5"><Label htmlFor="inventory-edit-quantity">Quantity <span className="text-destructive">*</span></Label><Input id="inventory-edit-quantity" type="number" min={0.01} step="any" value={editForm.quantity} onChange={(event) => setEditForm({ ...editForm, quantity: event.target.value })} /></div>
+          <div className="grid gap-1.5"><Label htmlFor="inventory-edit-asin">ASIN <span className="text-xs text-muted-foreground">(optional)</span></Label><Input id="inventory-edit-asin" value={editForm.asin} onChange={(event) => setEditForm({ ...editForm, asin: event.target.value.toUpperCase() })} placeholder="B0…" /></div>
+          <div className="grid gap-1.5"><Label htmlFor="inventory-edit-location">Location <span className="text-destructive">*</span></Label><select id="inventory-edit-location" className="h-9 rounded-md border border-input bg-background px-3 text-sm" value={editForm.location} onChange={(event) => setEditForm({ ...editForm, location: event.target.value })}><option value="Brooklyn, USA">Brooklyn, USA</option><option value="Werribee, Australia">Werribee, Australia</option></select></div>
+          <div className="grid gap-1.5"><Label htmlFor="inventory-edit-notes">Notes</Label><Input id="inventory-edit-notes" maxLength={4000} value={editForm.notes} onChange={(event) => setEditForm({ ...editForm, notes: event.target.value })} /></div>
+        </div>
+        <DialogFooter><Button variant="outline" disabled={editBusy} onClick={() => setEditItem(null)}>Cancel</Button><Button disabled={editBusy || !editForm.product_name.trim() || Number(editForm.quantity || 0) <= 0 || !editForm.location} onClick={saveInventoryEdit}>{editBusy ? "Saving…" : "Save Changes"}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
     <Dialog open={Boolean(timelineItem)} onOpenChange={(open) => { if (!open) setTimelineItem(null) }}><DialogContent className="epost-detail inventory-timeline-dialog"><DialogHeader><DialogTitle>Stock movement · #{timelineItem?.id}</DialogTitle><DialogDescription>{timelineItem?.product_name} · Includes the source stock and its split allocations. Earlier history is limited to saved records.</DialogDescription></DialogHeader>{timelineLoading && <p role="status">Loading movements…</p>}{timelineError && <p role="alert">{timelineError}</p>}<ol className="inventory-timeline">{timeline.map((movement) => <li key={movement.id}><div className="flex flex-wrap justify-between gap-2"><strong>{({ history_started: "History recording started", created: "Stock added", reserved: "Reserved for an order", sent: "Confirmed sent", archived: "Archived", status_changed: "Stock status changed", quantity_changed: "Quantity changed", evidence_updated: "Evidence updated" } as Record<string, string>)[movement.event_type] || movement.event_type}</strong><time>{formatDateTime(movement.occurred_at)}</time></div><div>Stock #{movement.inventory_id} · {movement.previous_state ? `${movement.previous_state.status} (${movement.previous_state.quantity}) → ` : ""}{movement.current_state.status} ({movement.current_state.quantity}){movement.current_state.reserved_order_line_id ? ` · ${movement.target_order_name || `Order line #${movement.current_state.reserved_order_line_id}`}` : ""}</div>{movement.reason && <p>{movement.reason}</p>}{movement.event_type === "history_started" && <div className="text-secondary">{movement.current_state.source_delivered_at && <div>Saved delivery date: {formatDateTime(movement.current_state.source_delivered_at)}</div>}{movement.current_state.source_received_at && <div>Saved warehouse receipt: {formatDateTime(movement.current_state.source_received_at)}</div>}</div>}</li>)}</ol>{!timelineLoading && !timelineError && !timeline.length && <p>No movement history recorded yet.</p>}</DialogContent></Dialog>
     <Dialog open={Boolean(imagePreview)} onOpenChange={(open) => !open && setImagePreview(null)}>
       <DialogContent className="max-w-3xl">

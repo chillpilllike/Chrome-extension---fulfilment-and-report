@@ -26520,6 +26520,60 @@ def api_archive_inventory(inventory_id: int, payload: dict[str, Any]) -> dict[st
     return {"ok": True, "message": "Moved to Archived. Stock details and movement history are retained."}
 
 
+@app.patch("/api/inventory/{inventory_id}")
+def api_update_inventory(inventory_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    product_name = clean_text(payload.get("product_name"))
+    if not product_name:
+        raise HTTPException(400, "Title is required.")
+    try:
+        quantity = float(payload.get("quantity"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Quantity must be greater than zero.")
+    if quantity <= 0:
+        raise HTTPException(400, "Quantity must be greater than zero. Archive stock that is no longer physically available.")
+    asin_input = clean_text(payload.get("asin")).upper()
+    asin = normalize_asin(asin_input) if asin_input else ""
+    if asin_input and not asin:
+        raise HTTPException(400, "ASIN must be a valid 10-character ASIN or left blank.")
+    location = normalize_inventory_location(payload.get("location"), required=True)
+    notes = clean_text(payload.get("notes"))
+    if len(notes) > 4000:
+        raise HTTPException(400, "Notes cannot exceed 4,000 characters.")
+    now = utc_now()
+    with db() as conn:
+        item = conn.execute("SELECT * FROM inventory_items WHERE id=? FOR UPDATE", (inventory_id,)).fetchone()
+        if not item:
+            raise HTTPException(404, "Inventory item not found.")
+        status = clean_text(item.get("status"))
+        if status == "reserved" or item.get("reserved_order_line_id"):
+            raise HTTPException(409, "Reserved stock cannot be edited. Detach it from the order first.")
+        if status in {"used", "archived"}:
+            raise HTTPException(409, "Archived stock is an audit record and cannot be edited.")
+        asin_changed = asin != normalize_asin(item.get("asin"))
+        image_url = amazon_product_page_image_url(asin) if asin_changed and asin else clean_text(item.get("image_url"))
+        image_source = "amazon_page" if image_url else ("" if asin_changed else clean_text(item.get("image_source")))
+        conn.execute(
+            """
+            UPDATE inventory_items
+            SET asin=?, quantity=?, product_name=?, location=?, notes=?,
+                image_url=?, image_source=?, updated_at=?
+            WHERE id=?
+            """,
+            (asin, quantity, product_name, location, notes, image_url, image_source, now, inventory_id),
+        )
+        updated = conn.execute("SELECT * FROM inventory_items WHERE id=?", (inventory_id,)).fetchone()
+    if updated:
+        _TYPESENSE_INDEX_EXECUTOR.submit(
+            lambda snapshot=row_to_dict(updated) or {}: _index_named_document_sync("inventory_items", inventory_search_document(snapshot))
+        )
+    fast_page_cache_clear_matching({"inventory-v2", "orders", "dashboard"})
+    return {
+        "ok": True,
+        "message": f"Updated inventory stock #{inventory_id}.",
+        "item": inventory_items_payload([updated])[0] if updated else None,
+    }
+
+
 @app.get("/api/inventory/{inventory_id}/timeline")
 def api_inventory_timeline(inventory_id: int) -> dict[str, Any]:
     with db() as conn:
