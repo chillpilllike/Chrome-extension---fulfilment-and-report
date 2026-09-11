@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { CareActivityTimeline, type CareEvent } from './CareActivityTimeline'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -8,7 +9,7 @@ type Fetcher = <T>(path: string, init?: RequestInit) => Promise<T>
 type Product = { name: string; default_code: string; original_total?: number; alternative_total?: number; difference?: number; currency: string; pricing_error?: string }
 type Offer = { line_id: number; recommendations: Product[]; selection?: { version: number; status: string; deadline_at: string; product: Product; last_error?: string; refund_status?: string; result: { quote_name?: string; email_status?: string; payment_verified?: boolean; cost_absorbed?: boolean; absorbed_amount?: number; approval_reason?: string } } }
 type Requests = { tracking_code?: string; mapping_candidates?: {id:number;product_name:string;quantity:number}[]; removals: {line_id: number; version: number; status: string; origin: string}[]; deadlines: {line_id: number; deadline_at: string; state: string; outcome: string}[]; parcel_items: {line_id: number; quantity: number}[] }
-type Event = { id: number; event_type: string; created_at: string; actor_label?: string; actor_type?: string; decision?: string; details?: Record<string, unknown> }
+type Event = CareEvent
 
 const date = (value: string) => value ? new Date(value).toLocaleString() : '—'
 
@@ -154,14 +155,7 @@ export function OrderCareTimeline({ caseId, orderNumber, request }: { caseId: nu
           }catch(error){setError(String(error))}finally{setLoading(false)}
         }}>Confirm business absorbs extra cost</Button>
       </DialogContent></Dialog>
-      <ol className="space-y-3 border-l-2 border-primary/20 pl-4">
-        {events.filter(event => JSON.stringify(event).toLowerCase().includes(filter.toLowerCase())).map(event => <li key={event.id} className="text-sm">
-          <div className="flex flex-wrap justify-between gap-2"><strong>{event.event_type.replaceAll('_',' ')}</strong><time dateTime={event.created_at}>{date(event.created_at)}</time></div>
-          <p className="text-muted-foreground">{event.actor_label || event.actor_type}{event.decision && ` · ${event.decision.replaceAll('_',' ')}`}</p>
-          <dl>{Object.entries(event.details || {}).filter(([key]) => !['signature','request_fingerprint','allowed_actions'].includes(key)).map(([key,value]) => value != null && <div key={key} className="break-words"><dt className="inline text-muted-foreground">{key.replaceAll('_',' ')}: </dt><dd className="inline">{typeof value === 'object' ? JSON.stringify(value) : String(value)}</dd></div>)}</dl>
-        </li>)}
-      </ol>
-      {!loading && !events.length && <p className="text-sm text-muted-foreground">No recorded activity yet.</p>}
+      <CareActivityTimeline events={events} filter={filter} loading={loading}/>
     </div>}
   </details>
 }
