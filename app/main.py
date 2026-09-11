@@ -38432,6 +38432,8 @@ def after_order_tracking_is_current(case: dict[str, Any]) -> bool:
 
 
 def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
+    if case.get("case_type") == "warehouse_dispatch_delay":
+        return []
     if case.get("confirmed_at") or case.get("status") == "resolved":
         return []
     if case.get("case_type") == "item_unavailable":
@@ -38877,6 +38879,7 @@ def api_after_order_cases(
         "email_test_recipient": after_order_test_recipient(),
         "cutoff_date": after_order_cutoff_date(),
         "automation_enabled": clean_text(get_service_settings().get("after_order_automation_enabled")) == "true",
+        "warehouse_dispatch_delay_enabled": clean_text(get_service_settings().get("after_order_warehouse_delay_enabled")) == "true",
     }
 
 
@@ -39219,6 +39222,11 @@ def send_after_order_email(
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
     unavailable_email = showcase_kind == "item_unavailable" or (not showcase_kind and case.get("case_type") == "item_unavailable" and template_kind != "trustpilot_review")
+    if case.get('case_type') == 'warehouse_dispatch_delay' and not (force_test or after_order_email_test_mode()):
+        try:
+            warehouse_dispatch_delay.validate(case)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
     if not (force_test or after_order_email_test_mode()) and not after_order_tracking_is_current(case):
         raise HTTPException(409, "Tracking changed or could not be verified. Refresh the case before sending.")
     if unavailable_email:
@@ -39344,6 +39352,10 @@ def send_after_order_email(
     if case.get("case_type") == "tracking" and not allowed:
         event_revision = hashlib.sha256(json.dumps({key: event_context.get(key) for key in ("latest_status", "latest_location", "last_update_at")}, sort_keys=True).encode()).hexdigest()
     idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{uuid.uuid4().hex if test_mode else event_revision}"
+    if case.get('case_type') == 'warehouse_dispatch_delay' and not test_mode:
+        if reminder_parent or template_kind or showcase_kind:
+            raise HTTPException(409, 'Dispatch-delay notices have no reminders or alternate live templates.')
+        idempotency_key = f'after-order:{case_id}:warehouse_dispatch_delay:once'
     if reminder_source:
         idempotency_key = f'after-order-reminder:{reminder_parent}:{reminder_number}'
         # Reuse the original action links, product snapshot and policy wording.
@@ -39619,6 +39631,11 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             raise HTTPException(409, reason)
         attempt = int(locked.get("attempt_count") or 0) + 1
         saved_payload = json.loads(locked['payload_json'])
+        if not locked.get('test_mode') and case.get('case_type') == 'warehouse_dispatch_delay':
+            try:
+                warehouse_dispatch_delay.validate(case)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
         if saved_payload.get('_care_reminder_parent'):
             care_reminders.validate(int(saved_payload['_care_reminder_parent']),int(saved_payload['_care_reminder_number']),case)
         if not locked.get('test_mode') and case.get('case_type') == 'item_unavailable':
@@ -40369,11 +40386,39 @@ def after_order_automation_loop() -> None:
     while True:
         time.sleep(60)
         try:
+            # This independent monitor can only prepare approval-held drafts.
+            # Broad automation and financial execution remain disabled.
+            if clean_text(get_service_settings().get('after_order_warehouse_delay_enabled')) == 'true':
+                run_warehouse_dispatch_checks()
             if clean_text(get_service_settings().get("after_order_automation_enabled")) != "true":
                 continue
             run_after_order_automation()
         except Exception as exc:
             print(f"After-order automation needs attention: {clean_error_message(exc)}", flush=True)
+
+
+def run_warehouse_dispatch_checks() -> dict[str, Any]:
+    base = clean_text(get_service_settings().get('after_order_public_base_url') or os.getenv('AFTER_ORDER_PUBLIC_BASE_URL', ''))
+    parsed = urlparse(base)
+    if parsed.scheme != 'https' or not parsed.hostname:
+        raise ValueError('Configure an HTTPS after-order public base URL before dispatch monitoring.')
+    request = Request({'type':'http','method':'POST','scheme':'https','server':(parsed.hostname,443),'path':'/','root_path':'','query_string':b'','headers':[(b'host',parsed.hostname.encode())]})
+    return warehouse_dispatch_delay.run_checks(request)
+
+
+@app.post('/api/after-order/warehouse-dispatch-delay/check')
+def api_warehouse_dispatch_delay_check():
+    return run_warehouse_dispatch_checks()
+
+
+@app.post('/api/after-order/warehouse-dispatch-delay/settings')
+def api_warehouse_dispatch_delay_settings(payload: dict[str, Any]):
+    if type(payload.get('enabled')) is not bool:
+        raise HTTPException(400, 'Provide enabled as a boolean.')
+    if payload['enabled'] and (after_order_email_test_mode() or not after_order_approval_only_live()):
+        raise HTTPException(409, 'Dispatch monitoring requires approval-only live mode.')
+    set_service_settings({'after_order_warehouse_delay_enabled': 'true' if payload['enabled'] else 'false'})
+    return {'enabled': clean_text(get_service_settings().get('after_order_warehouse_delay_enabled')) == 'true', 'email_approval_required': True}
 
 
 def run_after_order_automation() -> dict[str, Any]:
@@ -43889,6 +43934,8 @@ care_requests = CareRequests(globals())
 app.include_router(care_requests.router())
 from app.services.care_reminders import Reminders as CareReminders
 care_reminders = CareReminders(globals())
+from app.services.warehouse_dispatch_delay import Monitor as WarehouseDispatchMonitor
+warehouse_dispatch_delay = WarehouseDispatchMonitor(globals())
 
 
 from app.support.portal import create_portal_router
