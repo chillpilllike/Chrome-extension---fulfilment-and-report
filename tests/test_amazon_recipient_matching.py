@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from datetime import date
 
 from fastapi import HTTPException
@@ -451,7 +452,8 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
 
         self.assertEqual(error, "")
 
-    def test_chrome_completion_accepts_verified_business_bundle_components(self):
+    @patch("app.main.chrome_account_type_routing_enabled", return_value=True)
+    def test_chrome_completion_accepts_verified_business_bundle_components(self, _routing):
         payload = ChromeJobCompletePayload(
             amazon_order_id="111-6371926-1094608",
             amazon_recipient="Nutricity NC24348 5mg",
@@ -477,7 +479,8 @@ class AmazonRecipientMatchingTests(unittest.TestCase):
 
         self.assertEqual(error, "")
 
-    def test_chrome_completion_rejects_business_bundle_components_without_evidence(self):
+    @patch("app.main.chrome_account_type_routing_enabled", return_value=True)
+    def test_chrome_completion_rejects_business_bundle_components_without_evidence(self, _routing):
         payload = ChromeJobCompletePayload(
             amazon_order_id="111-6371926-1094608",
             amazon_recipient="Nutricity NC24348 5mg",

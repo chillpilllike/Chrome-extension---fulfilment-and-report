@@ -6536,7 +6536,9 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
         codes = dispatch_codes_from_package(package, order_id)
         if not codes:
             continue
-        matching_rows = [row for row in rows if package_matches_line(package, row)] or [row for row in rows if not replacement_tracking.strict_line(row)]
+        matching_rows = [row for row in rows if package_matches_line(package, row)]
+        if not matching_rows and not package.get("asins") and not package.get("products"):
+            matching_rows = [row for row in rows if not replacement_tracking.strict_line(row)]
         if not matching_rows:
             continue
         primary = matching_rows[0]
@@ -6645,7 +6647,9 @@ def dispatch_bulk_package_rows_for_order(order_id: str, rows: list[dict[str, Any
             codes = dispatch_codes_from_package(package, order_id)
             if not codes:
                 continue
-            matching_rows = [row for row in rows if package_matches_line(package, row)] or [row for row in rows if not replacement_tracking.strict_line(row)]
+            matching_rows = [row for row in rows if package_matches_line(package, row)]
+            if not matching_rows and not package.get("asins") and not package.get("products"):
+                matching_rows = [row for row in rows if not replacement_tracking.strict_line(row)]
             if not matching_rows:
                 continue
             primary = matching_rows[0]
@@ -6684,6 +6688,45 @@ def dispatch_bulk_package_rows_for_order(order_id: str, rows: list[dict[str, Any
         return order_id, values, package_count, ""
     except Exception as exc:
         return order_id, [], 0, str(exc)
+
+
+def save_unassigned_tracking_packages(conn: Any, order_id: str, packages: list[dict[str, Any]]) -> int:
+    """Keep extra physical shipments visible without inventing a product match."""
+    rows = rows_to_dicts(conn.execute("SELECT * FROM order_lines WHERE amazon_order_id=?", (order_id,)).fetchall())
+    scopes = {(row.get("store_id"), row.get("odoo_order_id"), row.get("odoo_order_name")) for row in rows}
+    if not rows or len(scopes) != 1 or not rows[0].get("store_id") or not rows[0].get("odoo_order_name"):
+        return 0
+    primary = rows[0]
+    now = utc_now()
+    values = []
+    for index, package in enumerate(canonical_tracking_packages(packages), 1):
+        if not replacement_tracking.package_asins(package) or any(package_matches_line(package, row) for row in rows):
+            continue
+        codes = dispatch_codes_from_package(package, order_id)
+        if not codes:
+            continue
+        code, display = codes[0]
+        existing = row_to_dict(conn.execute("SELECT * FROM amazon_dispatch_packages WHERE scan_code=? FOR UPDATE", (code,)).fetchone()) or {}
+        if existing and (clean_text(existing.get("amazon_order_id")) != order_id or
+                         (existing.get("odoo_order_name") and
+                          (existing.get("store_id"), existing.get("odoo_order_id"), existing.get("odoo_order_name")) not in scopes)):
+            continue
+        # Never erase an established line assignment when a partial scan omits it.
+        if parse_json_list_value(existing.get("order_line_ids_json")):
+            continue
+        country, country_name, _ = destination_country_from_row(primary)
+        asins, products = dispatch_package_asins_and_products(package, [])
+        values.append((code, code, display, order_id,
+                       clean_text(primary.get("amazon_order_url")) or order_line_amazon_url(order_id),
+                       primary.get("store_id"), primary.get("odoo_order_id"), primary.get("odoo_order_name"),
+                       dispatch_recipient_ref_from_rows(rows), "[]", index,
+                       tracking_package_status_text(package), tracking_package_promise_text(package),
+                       clean_text(package.get("carrier")), clean_text(package.get("tracking_url")),
+                       json.dumps(asins), json.dumps(products), country, country_name, dispatch_today_code(),
+                       dispatch_zone_from_country(country, country_name), dispatch_service_from_package(package),
+                       dispatch_priority_from_package(package), "STANDARD", "pending", now, now))
+    bulk_upsert_dispatch_package_rows(conn, values)
+    return len(values)
 
 
 def bulk_upsert_dispatch_package_rows(conn: Any, values: list[tuple[Any, ...]]) -> None:
@@ -7480,7 +7523,7 @@ def dispatch_rack_for_related_parts(package: dict[str, Any]) -> str:
     current_received = clean_text(package.get("scan_status")) in received_statuses
     if not related:
         return "today" if current_received else "later"
-    pending = [part for part in related if not part.get("received")]
+    pending = [part for part in related if not part.get("received") or part.get("item_reconciliation_required")]
     if not pending:
         return "today"
     if any(dispatch_part_expected_tomorrow(part) for part in pending):
@@ -7781,6 +7824,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
             covered_line_ids.update(int(value) for value in json.loads(part.get("order_line_ids_json") or "[]") if int(value or 0) > 0)
         except Exception:
             pass
+        part["item_reconciliation_required"] = not bool(parse_json_list_value(part.get("order_line_ids_json")))
         parts.append(part)
     for line in line_rows:
         line_id = int(line.get("id") or 0)
@@ -7792,6 +7836,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
             delivery_status = "Delivery not captured yet"
         placeholder = {
             "id": -line_id,
+            "unresolved_line_id": line_id,
             "scan_code": "",
             "display_code": "",
             "amazon_order_id": clean_text(line.get("amazon_order_id")) or clean_text(package.get("amazon_order_id")),
@@ -7824,7 +7869,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         placeholder["rack_label"] = dispatch_rack_label_for_package(placeholder)
         parts.append(placeholder)
     collapsed_parts = collapse_dispatch_related_parts(parts)[:limit]
-    pending_parts = [part for part in collapsed_parts if not part.get("received")]
+    pending_parts = [part for part in collapsed_parts if not part.get("received") or part.get("item_reconciliation_required")]
     if not pending_parts:
         order_rack = "today"
     elif any(dispatch_part_expected_tomorrow(part) for part in pending_parts):
@@ -10883,6 +10928,7 @@ def tracking_account_identity_error(
 def safe_history_match_rows(
     rows: list[dict[str, Any]], amazon_order_id: str, evidence_asins: set[str],
     evidence_quantities: Optional[dict[str, float]] = None,
+    verified_quantities: Optional[dict[str, float]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """History scans may discover a binding, never replace an existing purchase.
 
@@ -10914,9 +10960,17 @@ def safe_history_match_rows(
     for row in allowed:
         asin = normalize_asin(row.get("replacement_asin") or row.get("asin"))
         if not clean_text(row.get("amazon_order_id")) and counts.get(asin, 0) > 1:
-            skipped.append({"line_id": row["id"], "reason": "Ambiguous repeated ASIN; existing lines preserved."})
-        else:
-            unambiguous.append(row)
+            group = [item for item in rows if normalize_asin(item.get("replacement_asin") or item.get("asin")) == asin]
+            identities = {(item.get("store_id"), item.get("odoo_order_id"), item.get("odoo_order_name")) for item in group}
+            observed = (verified_quantities or {}).get(asin)
+            expected = sum(float(item.get("quantity") or 1) for item in group)
+            group_safe = (len(identities) == 1 and all(item in allowed for item in group)
+                          and bool(row.get("store_id") and row.get("odoo_order_name"))
+                          and observed is not None and abs(observed - expected) < 0.000001)
+            if not group_safe:
+                skipped.append({"line_id": row["id"], "reason": "Ambiguous repeated ASIN; verified total quantity for all same-order lines is required."})
+                continue
+        unambiguous.append(row)
     return unambiguous, skipped
 
 
@@ -15006,7 +15060,7 @@ def tracking_packages_by_line_with_one_to_one_fallback(
         else:
             unmatched_rows.append(row)
     unclaimed_packages = [package for package in packages if id(package) not in claimed_package_ids]
-    if len(unmatched_rows) == 1 and len(unclaimed_packages) == 1 and not replacement_tracking.strict_line(unmatched_rows[0]):
+    if len(unmatched_rows) == 1 and len(unclaimed_packages) == 1 and not replacement_tracking.strict_line(unmatched_rows[0]) and not unclaimed_packages[0].get("asins") and not unclaimed_packages[0].get("products"):
         mapped[int(unmatched_rows[0]["id"])] = unclaimed_packages
         unmatched_rows = []
     return mapped, unmatched_rows
@@ -34934,14 +34988,14 @@ def ensure_package_pickup_scan_history_table(conn: Any) -> None:
     )
 
 
-def package_pickup_order_readiness(conn: Any, package: dict[str, Any]) -> dict[str, Any]:
-    """Describe whether every physical package linked to this Odoo order is on hand."""
-    related_parts = dispatch_related_parts(conn, package)
-    if not related_parts:
-        related_parts = [{**package, "received": bool(clean_text(package.get("received_at")))}]
-    total = len(related_parts)
-    received = sum(1 for part in related_parts if part.get("received"))
-    pending = [part for part in related_parts if not part.get("received")]
+def package_pickup_readiness_from_parts(parts: list[dict[str, Any]], *, order_linked: bool = True) -> dict[str, Any]:
+    """Count parcels separately from order lines awaiting shipment evidence."""
+    unresolved = [part for part in parts if part.get("unresolved_line_id") or int(part.get("id") or 0) < 0]
+    physical = [part for part in parts if part not in unresolved]
+    unmapped = [part for part in physical if part.get("item_reconciliation_required")]
+    total = len(physical)
+    received = sum(1 for part in physical if part.get("received"))
+    pending = [part for part in physical if not part.get("received")]
     pending_packages = [
         {
             "shipment_id": normalize_dispatch_scan_code(part.get("canonical_scan_code") or part.get("scan_code")),
@@ -34951,15 +35005,23 @@ def package_pickup_order_readiness(conn: Any, package: dict[str, Any]) -> dict[s
         }
         for part in pending
     ]
-    ready = bool(total and received >= total)
+    ready = bool(total and received >= total and not unresolved and not unmapped and order_linked)
     if ready:
         message = f"All {total} package{'s' if total != 1 else ''} received. Full Odoo order can be shipped."
     else:
-        expected = "; ".join(dict.fromkeys(item["expected"] for item in pending_packages))
-        message = f"Hold order: {len(pending)} of {total} package{'s are' if total != 1 else ' is'} still pending"
-        if expected:
-            message += f" ({expected})"
-        message += "."
+        reasons = []
+        if pending:
+            expected = "; ".join(dict.fromkeys(item["expected"] for item in pending_packages))
+            reasons.append(f"{len(pending)} of {total} known packages still pending" + (f" ({expected})" if expected else ""))
+        if unresolved:
+            reasons.append(f"{len(unresolved)} order line(s) awaiting shipment/ASIN reconciliation; package count not yet confirmed")
+        if unmapped:
+            reasons.append(f"{len(unmapped)} package(s) contain items without an exact order-line match")
+        if not order_linked:
+            reasons.append("Odoo order not linked; full-order readiness cannot be confirmed")
+        if not reasons:
+            reasons.append("no physical packages captured yet")
+        message = "Hold order: " + "; ".join(reasons) + "."
     return {
         "ready_to_ship": ready,
         "status": "ready_to_ship" if ready else "hold",
@@ -34967,8 +35029,18 @@ def package_pickup_order_readiness(conn: Any, package: dict[str, Any]) -> dict[s
         "received_packages": received,
         "remaining_packages": len(pending),
         "pending_packages": pending_packages,
+        "unresolved_line_count": len(unresolved),
+        "unmapped_package_count": len(unmapped),
+        "package_count_confirmed": not unresolved and order_linked,
         "message": message,
     }
+
+
+def package_pickup_order_readiness(conn: Any, package: dict[str, Any]) -> dict[str, Any]:
+    related_parts = dispatch_related_parts(conn, package, limit=10000)
+    if not related_parts:
+        related_parts = [{**package, "received": bool(clean_text(package.get("received_at")))}]
+    return package_pickup_readiness_from_parts(related_parts, order_linked=bool(clean_text(package.get("odoo_order_name"))))
 
 
 def record_package_pickup_scan_event(
@@ -35057,7 +35129,7 @@ def package_pickup_scan_history_summary(events: list[dict[str, Any]]) -> dict[st
         "ready_to_ship_orders": len({
             clean_text(event.get("odoo_order_name"))
             for event in matched_events
-            if bool(event.get("order_ready")) and clean_text(event.get("odoo_order_name"))
+            if bool((event.get("current_order_readiness") or {}).get("ready_to_ship", event.get("order_ready"))) and clean_text(event.get("odoo_order_name"))
         }),
     }
 
@@ -35067,32 +35139,10 @@ def package_pickup_historical_readiness(
     received_package_ids: set[int],
 ) -> dict[str, Any]:
     """Rebuild a scan-time readiness snapshot from canonical physical packages."""
-    total = len(parts)
-    received = sum(1 for part in parts if int(part.get("id") or 0) in received_package_ids)
-    received = min(received, total)
-    pending = [part for part in parts if int(part.get("id") or 0) not in received_package_ids]
-    pending_packages = [
-        {
-            "shipment_id": normalize_dispatch_scan_code(part.get("canonical_scan_code") or part.get("scan_code")),
-            "amazon_order_id": clean_text(part.get("amazon_order_id")),
-            "recipient_ref": clean_text(part.get("recipient_ref")),
-            "expected": clean_text(part.get("delivery_label") or part.get("package_status") or part.get("promise")) or "Delivery date not captured",
-        }
-        for part in pending
-    ]
-    ready = bool(total and received >= total)
-    if ready:
-        message = f"All {total} package{'s' if total != 1 else ''} received. Full Odoo order can be shipped."
-    else:
-        message = f"Hold order: {len(pending)} of {total} package{'s are' if total != 1 else ' is'} still pending."
-    return {
-        "ready_to_ship": ready,
-        "total_packages": total,
-        "received_packages": received,
-        "remaining_packages": len(pending),
-        "pending_packages": pending_packages,
-        "message": message,
-    }
+    return package_pickup_readiness_from_parts([
+        {**part, "received": int(part.get("id") or 0) in received_package_ids}
+        for part in parts
+    ])
 
 
 def repair_package_pickup_scan_history(conn: Any) -> dict[str, Any]:
@@ -35267,6 +35317,64 @@ def reconcile_package_pickup_scans(conn: Any) -> int:
     return resolved
 
 
+def reconcile_linked_pickup_scan_events(conn: Any) -> int:
+    """Attach orphan scan labels after the same physical package gains an order.
+
+    This is metadata repair only: never fabricate a scan or increment counts.
+    Undo records, existing order assignments and physical timestamps survive.
+    """
+    events = rows_to_dicts(conn.execute("""
+        SELECT e.id, e.scan_code, e.amazon_order_id, e.store_id, e.package_id,
+               p.store_id AS linked_store_id, p.odoo_order_name AS linked_order_name,
+               p.amazon_order_id AS linked_amazon_order_id, p.recipient_ref AS linked_recipient,
+               p.scan_code AS package_scan_code, p.canonical_scan_code
+        FROM package_pickup_scan_events e
+        JOIN amazon_dispatch_packages p ON p.id=e.package_id
+        WHERE e.matched=1 AND e.undone_at IS NULL
+          AND COALESCE(e.odoo_order_name, '')=''
+          AND COALESCE(p.odoo_order_name, '')!=''
+        ORDER BY e.id LIMIT 500
+        FOR UPDATE OF e SKIP LOCKED
+    """).fetchall())
+    repaired = 0
+    for event in events:
+        if int(event.get("store_id") or 0) not in (0, int(event.get("linked_store_id") or 0)):
+            continue
+        if clean_text(event.get("amazon_order_id")) != clean_text(event.get("linked_amazon_order_id")):
+            continue
+        code = normalize_dispatch_scan_code(event.get("scan_code"))
+        if not dispatch_scan_code_is_physical(code) or code not in {
+            normalize_dispatch_scan_code(event.get("package_scan_code")),
+            normalize_dispatch_scan_code(event.get("canonical_scan_code")),
+        }:
+            continue
+        conn.execute("""
+            UPDATE package_pickup_scan_events SET store_id=?, odoo_order_name=?, recipient_ref=?,
+                original_result_status=COALESCE(original_result_status, result_status),
+                original_message=COALESCE(original_message, message), reconciled_at=?,
+                message=?
+            WHERE id=? AND undone_at IS NULL AND COALESCE(odoo_order_name, '')=''
+        """, (event["linked_store_id"], event["linked_order_name"], event["linked_recipient"], utc_now(),
+              f"{event['linked_order_name']} linked after tracking refresh. Original physical scan retained.", event["id"]))
+        repaired += 1
+    return repaired
+
+
+def pickup_history_current_readiness(conn: Any, events: list[dict[str, Any]]) -> None:
+    """Show current readiness alongside immutable scan-time evidence."""
+    cache = {}
+    for event in events:
+        if not event.get("matched") or event.get("undone_at") or not event.get("package_id"):
+            continue
+        package = row_to_dict(conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (event["package_id"],)).fetchone())
+        if not package:
+            continue
+        key = (package.get("store_id"), package.get("odoo_order_id") or package.get("odoo_order_name") or package.get("id"))
+        if key not in cache:
+            cache[key] = package_pickup_order_readiness(conn, package)
+        event["current_order_readiness"] = cache[key]
+
+
 def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
     raw_date = clean_text(scan_date)
     if raw_date:
@@ -35288,6 +35396,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
     with db() as conn:
         ensure_package_pickup_scan_history_table(conn)
         reconcile_package_pickup_scans(conn)
+        reconcile_linked_pickup_scan_events(conn)
         events = rows_to_dicts(conn.execute(
             f"""
             SELECT id, store_id, package_id, scan_code, result_status, matched, duplicate,
@@ -35302,6 +35411,7 @@ def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str =
             """,
             params,
         ).fetchall())
+        pickup_history_current_readiness(conn, events)
         date_params: list[Any] = []
         date_store_sql = ""
         if store_id is not None:
@@ -37633,6 +37743,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                 clean_text(payload.amazon_order_url) or order_line_amazon_url(amazon_order_id),
                 downstream_packages,
             )
+            save_unassigned_tracking_packages(conn, amazon_order_id, downstream_packages)
             mark_history_tracking_order_status(
                 conn,
                 amazon_order_id,
@@ -37882,7 +37993,18 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
             return {"ok": True, "matched": 0, "skipped": len(refs), "order_names": refs, "message": f"No unmatched pulled rows found for {', '.join(refs)}."}
         history_items = payload.items or parse_json_list_value(history.get("items_json"))
         evidence_quantities = amazon_history_order_record({"items": history_items})["asin_quantities"]
-        rows, skipped_lines = safe_history_match_rows(rows, amazon_order_id, evidence_asins, evidence_quantities)
+        verified_quantities = {}
+        for item in history_items:
+            if not isinstance(item, dict) or item.get("quantity_verified") is not True:
+                continue
+            product_asin = normalize_asin(item.get("asin"))
+            try:
+                quantity = float(item.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            if product_asin and quantity > 0:
+                verified_quantities[product_asin] = verified_quantities.get(product_asin, 0) + quantity
+        rows, skipped_lines = safe_history_match_rows(rows, amazon_order_id, evidence_asins, evidence_quantities, verified_quantities)
         if not rows:
             return {"ok": True, "matched": 0, "skipped": len(skipped_lines), "skipped_lines": skipped_lines,
                     "order_names": refs, "message": "No exact safe ASIN match; existing fulfilment data preserved."}

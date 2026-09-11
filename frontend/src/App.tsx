@@ -709,6 +709,7 @@ type PackagePickupScanResponse = {
 }
 
 type PackagePickupScanHistoryEvent = {
+  current_order_readiness?: PackagePickupOrderReadiness
   reconciled_at?: string
   original_result_status?: string
   original_message?: string
@@ -775,6 +776,7 @@ function groupPackagePickupScanHistoryEvents(events: PackagePickupScanHistoryEve
 
 function PackagePickupScanHistoryGroupCard({ group }: { group: PackagePickupScanHistoryGroup }) {
   const entry = group.latest
+  const readiness = entry.current_order_readiness
   const activeEvents = group.events.filter((item) => !item.undone_at)
   const matched = activeEvents.some((item) => Boolean(item.matched))
   const duplicate = activeEvents.length > 0 && activeEvents.every((item) => Boolean(item.duplicate))
@@ -789,7 +791,7 @@ function PackagePickupScanHistoryGroupCard({ group }: { group: PackagePickupScan
         </div>
         {entry.amazon_order_id ? <small><b>Amazon order</b> {entry.amazon_order_id}</small> : null}
         {entry.recipient_ref ? <small><b>Recipient</b> {entry.recipient_ref}</small> : null}
-        {matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>{entry.order_received_packages}/{entry.order_total_packages} packages received.</b> {entry.order_readiness_message}</small> : null}
+        {matched && readiness ? <small className={readiness.ready_to_ship ? "is-ready" : "is-hold"}><b>Now: {readiness.received_packages}/{readiness.total_packages} known packages received.</b> {readiness.message}</small> : matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>At scan time: {entry.order_received_packages}/{entry.order_total_packages} packages recorded.</b> {entry.order_readiness_message}</small> : null}
         <div className="pickup-history-scans">
           {group.events.map((scan) => {
             const scanMatched = Boolean(scan.matched)

@@ -22,10 +22,15 @@ def tracking_error(rows, packages):
     if not any(strict_line(row) for row in rows):
         return ''
     expected = {value for row in rows for value in (amazon_bundles.line_components(row) or {asin(row.get('replacement_asin') or row.get('asin')): 1})}
-    for package in packages:
-        observed = package_asins(package)
-        if not observed or not observed.intersection(expected):
-            return 'Replacement tracking needs an exact shipment ASIN match. Re-scan the Amazon order details and its package; existing order IDs and tracking were preserved.'
+    observed_packages = [package_asins(package) for package in packages]
+    # Amazon orders can contain additional, separately shipped products. Those
+    # exact but unrelated packages must not veto a proven replacement shipment.
+    # Unreadable/inferred evidence still fails closed, as does a wholly unrelated
+    # update. Assignment remains per line, never per Amazon order.
+    if any(not observed for observed in observed_packages) or not any(
+        observed.intersection(expected) for observed in observed_packages
+    ):
+        return 'Replacement tracking needs an exact shipment ASIN match. Re-scan the Amazon order details and its package; existing order IDs and tracking were preserved.'
     return ''
 
 

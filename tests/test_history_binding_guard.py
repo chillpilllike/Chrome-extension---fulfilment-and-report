@@ -54,6 +54,7 @@ class HistoryBindingGuardTests(unittest.TestCase):
         raw.row_factory = sqlite3.Row
         self.addCleanup(raw.close)
         raw.executescript("""
+            CREATE TABLE app_settings (key TEXT, value TEXT);
             CREATE TABLE amazon_order_history_unmatched (amazon_order_id TEXT,asins_json TEXT,status TEXT,amazon_account_name TEXT,amazon_account_type TEXT);
             CREATE TABLE order_lines (id INTEGER,store_id INTEGER,odoo_order_id INTEGER,odoo_order_name TEXT,
                 asin TEXT,amazon_order_id TEXT,amazon_order_url TEXT,amazon_account_name TEXT,amazon_account_type TEXT,order_engine TEXT,
