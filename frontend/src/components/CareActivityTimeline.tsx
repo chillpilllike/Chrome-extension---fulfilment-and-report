@@ -7,7 +7,7 @@ const hiddenFields = new Set(['signature', 'request_fingerprint', 'allowed_actio
 
 function appearance(type: string) {
   if (/fail|error|block|bounce|complaint/.test(type)) return { Icon: IconAlertTriangle, tone: 'red' }
-  if (/awaiting|needs_approval|review|pending/.test(type)) return { Icon: IconClock, tone: 'yellow' }
+  if (/(^|_)(awaiting|needs_approval|review|pending)(_|$)/.test(type)) return { Icon: IconClock, tone: 'yellow' }
   if (/customer|selection|decision/.test(type)) return { Icon: IconUserCheck, tone: 'purple' }
   if (/email|notification/.test(type)) return { Icon: IconMail, tone: 'blue' }
   if (/approved|confirmed|completed|delivered/.test(type)) return { Icon: IconCheck, tone: 'green' }
