@@ -703,7 +703,7 @@ function physicalTrackingId(value) {
   const normalized = text.toUpperCase().replace(/[^A-Z0-9-]/g, "");
   if (/^TBA[A-Z0-9]+$/.test(normalized)) return normalized;
   if (/^1Z[A-Z0-9]{12,24}$/.test(normalized)) return normalized;
-  if (/^SG\d{10,24}$/.test(normalized)) return normalized;
+  if (/^(?:SG|ZS)\d{10,24}$/.test(normalized)) return normalized;
   if (/^D\d{10,24}$/.test(normalized)) return normalized;
   if (/^\d{12,30}$/.test(normalized)) return normalized;
   return "";

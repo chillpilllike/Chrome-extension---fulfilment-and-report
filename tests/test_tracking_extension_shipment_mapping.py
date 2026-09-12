@@ -20,7 +20,7 @@ class TrackingExtensionShipmentMappingTests(unittest.TestCase):
         self.assertLess(helper.index("if (shipmentGrid) return shipmentGrid;"), helper.index("if (shipmentComponent) return shipmentComponent;"))
 
     def test_tracking_extension_version_was_bumped(self):
-        self.assertEqual(MANIFEST["version"], "0.1.76")
+        self.assertEqual(MANIFEST["version"], "0.1.77")
 
     def test_account_identity_is_reverified_after_amazon_page_readiness(self):
         ready_index = CONTENT.index("await waitForTrackingPageReady();")

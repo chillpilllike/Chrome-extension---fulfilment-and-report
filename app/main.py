@@ -5040,7 +5040,7 @@ def dispatch_scan_code_is_physical(value: Any) -> bool:
         return True
     if re.fullmatch(r"1Z[A-Z0-9]{12,24}", code):
         return True
-    if re.fullmatch(r"SG\d{10,24}", code):
+    if re.fullmatch(r"(?:SG|ZS)\d{10,24}", code):
         return True
     if re.fullmatch(r"D\d{10,24}", code):
         return True
@@ -5059,7 +5059,7 @@ def dispatch_barcode_kind(value: Any) -> str:
         return "amazon_tracking"
     if re.fullmatch(r"1Z[A-Z0-9]{12,24}", code):
         return "ups_tracking"
-    if re.fullmatch(r"(?:SG|D)\d{10,24}", code) or re.fullmatch(r"\d{12,30}", code):
+    if re.fullmatch(r"(?:SG|ZS|D)\d{10,24}", code) or re.fullmatch(r"\d{12,30}", code):
         return "carrier_tracking"
     if re.fullmatch(r"\d{3}-\d{7}-\d{7}", raw):
         return "amazon_order_id"
@@ -5076,8 +5076,8 @@ DISPATCH_PHYSICAL_SCAN_SQL = """
     OR canonical_scan_code ~ '^TBA[A-Z0-9]+$'
     OR scan_code ~ '^1Z[A-Z0-9]{12,24}$'
     OR canonical_scan_code ~ '^1Z[A-Z0-9]{12,24}$'
-    OR scan_code ~ '^SG[0-9]{10,24}$'
-    OR canonical_scan_code ~ '^SG[0-9]{10,24}$'
+    OR scan_code ~ '^(SG|ZS)[0-9]{10,24}$'
+    OR canonical_scan_code ~ '^(SG|ZS)[0-9]{10,24}$'
     OR scan_code ~ '^D[0-9]{10,24}$'
     OR canonical_scan_code ~ '^D[0-9]{10,24}$'
     OR scan_code ~ '^[0-9]{12,30}$'
@@ -5089,7 +5089,7 @@ DISPATCH_PHYSICAL_PRIMARY_SCAN_SQL = """
 (
     scan_code ~ '^TBA[A-Z0-9]+$'
     OR scan_code ~ '^1Z[A-Z0-9]{12,24}$'
-    OR scan_code ~ '^SG[0-9]{10,24}$'
+    OR scan_code ~ '^(SG|ZS)[0-9]{10,24}$'
     OR scan_code ~ '^D[0-9]{10,24}$'
     OR scan_code ~ '^[0-9]{12,30}$'
 )
@@ -5101,7 +5101,7 @@ def package_tracking_id_is_physical(value: Any) -> bool:
     return bool(
         re.fullmatch(r"TBA[A-Z0-9]+", code)
         or re.fullmatch(r"1Z[A-Z0-9]{12,24}", code)
-        or re.fullmatch(r"SG\d{10,24}", code)
+        or re.fullmatch(r"(?:SG|ZS)\d{10,24}", code)
         or re.fullmatch(r"D\d{10,24}", code)
         or re.fullmatch(r"\d{12,30}", code)
     )
@@ -5455,6 +5455,8 @@ def merge_tracking_shipment_snapshots(existing: dict[str, Any], incoming: dict[s
     for key, value in primary.items():
         if value not in (None, "", [], {}):
             merged[key] = value
+    if primary.get("status") and not primary.get("order_status"):
+        merged["order_status"] = primary["status"]
     merged_products = merge_amazon_product_snapshots(existing.get("products") or [], incoming.get("products") or [])
     if merged_products:
         merged["products"] = merged_products
@@ -5917,8 +5919,33 @@ def tracking_package_promise_text(package: dict[str, Any]) -> str:
     return clean_text(package.get("promise") or package.get("expected_delivery_display") or package.get("expected_delivery_date"))
 
 
+def tracking_package_explicit_delay(package: dict[str, Any]) -> bool:
+    # Read status fields only: recommendations, carrier text and old events are
+    # not current delivery assertions. Older extensions saved "delivered" from
+    # promise prose while retaining Amazon's explicit delay in order_status.
+    return any(re.search(
+        r"\b(taking longer than expected|running late|additional delay|will be delivered|not yet delivered|not delivered)\b",
+        clean_text(package.get(key)), re.IGNORECASE,
+    ) for key in ("status", "order_status", "delivery_status"))
+
+
+def tracking_can_correct_false_delivery(row: Any, incoming: list[dict[str, Any]]) -> bool:
+    previous = parse_tracking_packages(row.get("tracking_payload") or "")
+    return bool(previous) and all(
+        tracking_package_explicit_delay(p) and not tracking_package_delivered(p)
+        for p in previous
+    ) and all(
+        any(tracking_package_shipment_key(p)
+            and tracking_package_shipment_key(p) == tracking_package_shipment_key(n)
+            and package_matches_line(n, row) for n in incoming)
+        for p in previous
+    )
+
+
 def tracking_package_delivered(package: dict[str, Any]) -> bool:
     if not isinstance(package, dict):
+        return False
+    if tracking_package_explicit_delay(package):
         return False
     status_text = clean_text(package.get("status") or package.get("order_status") or package.get("delivery_status") or package.get("promise"))
     if re.search(r"\b(arriving|out for delivery|not yet delivered|delivery attempted|running late|delayed|in transit)\b", status_text, re.IGNORECASE):
@@ -6005,7 +6032,7 @@ def tracking_package_active_pending(package: dict[str, Any]) -> str:
         return clean_text(package.get("status") or package.get("delivery_status") or package.get("promise")) or "Delivery attempted"
     if "arriving" in lowered:
         return clean_text(package.get("promise") or package.get("status")) or "Arriving"
-    if "delayed" in lowered or "running late" in lowered:
+    if tracking_package_explicit_delay(package) or "delayed" in lowered or "running late" in lowered:
         return "Delayed"
     if "in transit" in lowered or "shipped" in lowered:
         return "Shipped"
@@ -37707,7 +37734,8 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
             if replacement_tracking.strict_line(row) and line_delivered and not replacement_tracking.delivered_quantity_complete(row, line_packages):
                 line_delivered = False
                 line_status = "ASIN quantity verification pending"
-            if order_line_currently_delivered(row) and not line_delivered:
+            false_delivery = tracking_can_correct_false_delivery(row, line_packages)
+            if order_line_currently_delivered(row) and not line_delivered and not false_delivery:
                 continue
             conn.execute(
                 """
@@ -37716,7 +37744,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     tracking_status=?,
                     tracking_payload=?,
                     tracking_checked_at=?,
-                    state=CASE WHEN ? THEN 'delivered' ELSE state END,
+                    state=CASE WHEN ? THEN 'delivered' WHEN ? AND state='delivered' THEN 'ordered' ELSE state END,
                     last_error=NULL,
                     updated_at=?
                 WHERE id=?
@@ -37727,6 +37755,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                     tracking_payload_json_for_storage(line_packages),
                     utc_now(),
                     bool(line_delivered),
+                    bool(false_delivery),
                     utc_now(),
                     row["id"],
                 ),

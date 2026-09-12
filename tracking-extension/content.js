@@ -130,7 +130,7 @@ function physicalTrackingId(text) {
   const value = clean(text).toUpperCase().replace(/[^A-Z0-9-]/g, "");
   if (/^TBA[A-Z0-9]+$/.test(value)) return value;
   if (/^1Z[A-Z0-9]{12,24}$/.test(value)) return value;
-  if (/^SG\d{10,24}$/.test(value)) return value;
+  if (/^(?:SG|ZS)\d{10,24}$/.test(value)) return value;
   if (/^D\d{10,24}$/.test(value)) return value;
   if (/^\d{12,30}$/.test(value)) return value;
   return "";
@@ -144,7 +144,7 @@ function trackingIdFromText(text) {
     /\b(?:USPS|UPS|FedEx|Amazon)\s+(?:tracking\s+)?(?:ID|number|#)\s*:?\s*([A-Z0-9-]{10,40})\b/i,
     /\b(TBA[A-Z0-9]{8,30})\b/i,
     /\b(1Z[A-Z0-9]{12,24})\b/i,
-    /\b(SG\d{10,24})\b/i,
+    /\b((?:SG|ZS)\d{10,24})\b/i,
     /\b(D\d{10,24})\b/i,
     /\b(\d{12,30})\b/,
   ];
@@ -844,6 +844,7 @@ function productItemsFrom(root, limit = 50) {
   function addFromBox(box) {
     if (!box || blockedProductCandidate(box)) return;
     const link =
+      (box.matches("a[href*='/gp/product/']") ? box : null) ||
       box.querySelector("[data-component='itemTitle'] a[href*='/dp/'], [data-component='itemTitle'] a[href*='/gp/product/']") ||
       box.querySelector("a[href*='/dp/'], a[href*='/gp/product/']");
     if (!link || blockedProductCandidate(link)) return;
@@ -861,13 +862,13 @@ function productItemsFrom(root, limit = 50) {
     ) : "";
     if (!title || !imageUrl) return;
     const boxAsins = new Set(
-      [...box.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]
+      [ ...(box.matches("a[href*='/gp/product/']") ? [box] : []), ...box.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")]
         .map((candidate) => String(candidate.getAttribute("href") || "").match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i)?.[1]?.toUpperCase() || "")
         .filter(Boolean),
     );
     const quantityIsolated = boxAsins.size === 1 && boxAsins.has(asin);
     const quantityNode = quantityIsolated
-      ? (box.matches("[data-quantity]") ? box : box.querySelector(".od-item-view-qty, .itemQuantity, [data-quantity]"))
+      ? (box.matches("[data-quantity]") ? box : box.querySelector(".od-item-view-qty, .itemQuantity, .itemImages-quantityLabel, [data-quantity]"))
       : null;
     const quantityValue = quantityNode?.getAttribute?.("data-quantity") || quantityNode?.textContent || "";
     const explicitQuantity = String(quantityValue).match(/\d+/)?.[0];
@@ -893,7 +894,7 @@ function productItemsFrom(root, limit = 50) {
   if (products.length < Number(limit || 50)) {
     const links = [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")].slice(0, Math.max(1, Number(limit || 50)) * 4);
     for (const link of links) {
-      const box = link.closest("[data-component='purchasedItems'], [data-component='item'], .od-item, .a-fixed-left-grid");
+      const box = link.closest("[data-component='purchasedItems'], [data-component='item'], .od-item, .a-fixed-left-grid, .itemImages-inline a");
       if (!box || !root.contains(box) || blockedProductCandidate(box)) continue;
       addFromBox(box);
       if (products.length >= Number(limit || 50)) break;
@@ -987,20 +988,22 @@ async function parseOrderDetails() {
 function parseCarrierAndTrackingId() {
   const deliveryCard = document.querySelector(".delivery-card, .pt-delivery-card-wrapper") || document.body;
   const carrier =
-    clean(deliveryCard.querySelector("h3")?.textContent) ||
-    clean(document.querySelector(".tracking-event-carrier-header h2")?.textContent);
+    clean(document.querySelector(".tracking-event-carrier-header h2")?.textContent) ||
+    clean(deliveryCard.querySelector("h3")?.textContent);
   const trackingText =
     clean(document.querySelector(".pt-delivery-card-trackingId")?.textContent) ||
     clean(document.querySelector(".tracking-event-trackingId-text h4")?.textContent);
   const trackingMatch = trackingText.match(/Tracking ID:\s*(.+)$/i);
   const trackingId = trackingIdFromText(trackingMatch ? trackingMatch[1] : trackingText)
     || trackingIdFromText(document.body?.innerText || "");
-  return { carrier, tracking_id: trackingId };
+  return { carrier: /sorry|delay|expected|will be/i.test(carrier) ? "" : carrier, tracking_id: trackingId };
 }
 
 function parseStatus() {
+  const primaryStatus = clean(document.querySelector("#primaryStatus")?.textContent);
+  if (primaryStatus) return primaryStatus;
   const pageText = clean(document.body?.innerText || "");
-  const headlineMatch = pageText.match(/\b(Now expected by\s+\w+\s+\d{1,2}|Was expected\s+\w+\s+\d{1,2}|Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|Out for delivery|Delivery attempted(?:\s+\w+\s+\d{1,2})?|Delivered(?:\s+\w+\s+\d{1,2})?|Shipped|Delayed|Running late)\b/i);
+  const headlineMatch = pageText.match(/\b(Now expected by\s+\w+\s+\d{1,2}|Was expected\s+\w+\s+\d{1,2}|Arriving\s+(?:today|tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)|Out for delivery|Delivery attempted(?:\s+\w+\s+\d{1,2})?|Delivered(?:\s+\w+\s+\d{1,2})?|Your delivery is taking longer than expected|Shipped|Delayed|Running late)\b/i);
   const headline = headlineMatch ? clean(headlineMatch[1]) : "";
   const selectedStatus = (
     clean(document.querySelector(".pt-status-main-status")?.textContent) ||
@@ -1069,7 +1072,7 @@ async function openTrackingEvents() {
 
 function shouldOpenTrackingEvents(status, carrierInfo = {}) {
   if (clean(carrierInfo.tracking_id) || clean(carrierInfo.carrier)) return true;
-  return /shipped|transit|out for delivery|delivered|delayed|attempted|carrier|tracking/i.test(status || "");
+  return /shipped|transit|out for delivery|delivered|delayed|running late|taking longer than expected|attempted|carrier|tracking/i.test(status || "");
 }
 
 function parseOtpFromTrackingPage() {
@@ -1104,7 +1107,7 @@ async function parseTrackingPage() {
   const carrierInfo = parseCarrierAndTrackingId();
   const status = parseStatus();
   const otp = parseOtpFromTrackingPage();
-  const deliveryCard = document.querySelector(".delivery-card, .pt-delivery-card-wrapper, #primaryStatus, #tracking-events-container") || document.body;
+  const deliveryCard = document.querySelector("#itemImagesCarousel-container") || document.querySelector(".delivery-card, .pt-delivery-card-wrapper") || document.body;
   const trackingProducts = productItemsFrom(deliveryCard);
   const products = trackingProducts;
   const hasTrackingIdentity = Boolean(clean(carrierInfo.carrier) || clean(carrierInfo.tracking_id));
