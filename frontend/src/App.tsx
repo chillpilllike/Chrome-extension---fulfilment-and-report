@@ -7149,14 +7149,14 @@ function PackagePickupPage({
     }
   }
 
-  async function load() {
-    setLoading(true)
+  async function load(statusOnly = false) {
+    if (!statusOnly) setLoading(true)
     try {
       const query = new URLSearchParams({ date_from: dateFrom, date_to: dateTo })
       if (storeId) query.set("store_id", storeId)
       const result = await api<PackagePickupData>(`/api/package-pickups?${query.toString()}`)
       setData(result)
-      setDrafts(Object.fromEntries(result.cards.map((card) => [
+      if (!statusOnly) setDrafts(Object.fromEntries(result.cards.map((card) => [
         card.pickup_date,
         {
           amazon: String(card.amazon_picked_up),
@@ -7165,9 +7165,9 @@ function PackagePickupPage({
         },
       ])))
     } catch (error) {
-      onResult({ ok: false, title: "Package Pickup Check", message: String(error) })
+      if (!statusOnly) onResult({ ok: false, title: "Package Pickup Check", message: String(error) })
     } finally {
-      setLoading(false)
+      if (!statusOnly) setLoading(false)
     }
   }
 
@@ -7206,6 +7206,16 @@ function PackagePickupPage({
     // Refresh automatically when returning from Amazon after a tracking capture.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storeId, dateFrom, dateTo, pickupHistoryDate])
+
+  useEffect(() => {
+    // Background Shopify refreshes must become visible without overwriting
+    // pickup-count drafts or interrupting an active scan.
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && !pickupScannerOpen) void load(true)
+    }, 30000)
+    return () => window.clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeId, dateFrom, dateTo, pickupScannerOpen])
 
   function stopPickupScannerStream() {
     pickupScannerControlsRef.current?.stop()

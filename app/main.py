@@ -22426,7 +22426,7 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
               AND odoo_order_name = ANY(?::text[])
             ORDER BY store_id, odoo_order_name,
                      CASE WHEN COALESCE(cancelled_at, '') = '' THEN 0 ELSE 1 END,
-                     CASE WHEN fulfillment_status ILIKE '%FULFILLED%' THEN 0 ELSE 1 END,
+                     CASE WHEN UPPER(COALESCE(fulfillment_status, '')) IN ('FULFILLED', 'SUCCESS') THEN 0 ELSE 1 END,
                      synced_at DESC
             """,
             (store_ids, order_names),
@@ -22459,7 +22459,7 @@ def attach_shopify_status_to_rows(rows: list[dict[str, Any]], conn: Optional[Any
     return rows
 
 
-def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait: bool = False) -> int:
+def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait: bool = False, max_age_seconds: int = 1800) -> int:
     groups: dict[int, set[str]] = {}
     now = datetime.now(timezone.utc)
     for row in rows:
@@ -22469,7 +22469,7 @@ def refresh_missing_shopify_status_for_rows(rows: list[dict[str, Any]], *, wait:
         synced_at = parse_iso_date(synced_at_text)
         stale_status = bool(
             synced_at
-            and (now - synced_at).total_seconds() >= 1800
+            and (now - synced_at).total_seconds() >= max_age_seconds
             and not cancelled_at
             and (
                 not status_text
@@ -22678,28 +22678,35 @@ PACKAGE_TRACKER_SHOPIFY_SYNC_INTERVAL_SECONDS = 3 * 60 * 60
 _PACKAGE_TRACKER_SHOPIFY_SYNC_LOCK = threading.Lock()
 
 
-def sync_package_tracker_shopify_statuses() -> None:
+def sync_package_tracker_shopify_statuses(*, force: bool = False) -> None:
     if not _PACKAGE_TRACKER_SHOPIFY_SYNC_LOCK.acquire(blocking=False):
         return
     started_at = utc_now()
     try:
         set_setting("package_tracker_shopify_sync_status", "running")
         set_setting("package_tracker_shopify_sync_started_at", started_at)
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=PACKAGE_TRACKER_SHOPIFY_SYNC_INTERVAL_SECONDS)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=0 if force else PACKAGE_TRACKER_SHOPIFY_SYNC_INTERVAL_SECONDS)).isoformat()
         recent_order_cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
         with db() as conn:
             rows = rows_to_dicts(conn.execute(
                 """
                 WITH cached AS (
                     SELECT store_id, UPPER(odoo_order_name) AS odoo_order_name, MAX(synced_at) AS synced_at,
-                           BOOL_OR(LOWER(COALESCE(fulfillment_status, '')) IN ('fulfilled', 'success')) AS is_fulfilled
+                           BOOL_OR(COALESCE(cancelled_at, '') = '' AND LOWER(COALESCE(fulfillment_status, '')) IN ('fulfilled', 'success')) AS is_fulfilled
                     FROM shopify_order_status_cache
                     GROUP BY store_id, UPPER(odoo_order_name)
                 ), tracker_orders AS (
                     SELECT l.store_id, UPPER(l.odoo_order_name) AS odoo_order_name, MAX(l.updated_at) AS updated_at
                     FROM order_lines l
-                    WHERE COALESCE(l.amazon_order_id, '') != '' AND COALESCE(l.odoo_order_name, '') != ''
-                      AND COALESCE(l.odoo_order_date, '') >= ?
+                    WHERE COALESCE(l.odoo_order_name, '') != ''
+                      AND ((COALESCE(l.amazon_order_id, '') != '' AND COALESCE(l.odoo_order_date, '') >= ?)
+                           OR EXISTS (SELECT 1 FROM amazon_dispatch_packages p
+                                      WHERE p.store_id=l.store_id AND UPPER(p.odoo_order_name)=UPPER(l.odoo_order_name))
+                           OR EXISTS (SELECT 1 FROM package_pickup_manual_amazon p
+                                      WHERE p.store_id=l.store_id AND UPPER(p.odoo_order_name)=UPPER(l.odoo_order_name))
+                           OR EXISTS (SELECT 1 FROM package_pickup_non_amazon p
+                                      JOIN package_pickup_checks c ON c.id=p.check_id
+                                      WHERE c.store_id IN (0, l.store_id) AND UPPER(p.order_number)=UPPER(l.odoo_order_name)))
                     GROUP BY l.store_id, UPPER(l.odoo_order_name)
                 )
                 SELECT tracker_orders.store_id, tracker_orders.odoo_order_name
@@ -25629,7 +25636,7 @@ def fast_exact_order_reference_search(
                   AND UPPER(shopify_order_status_cache.odoo_order_name)=UPPER(filtered_order_lines.odoo_order_name)
                 ORDER BY
                   CASE WHEN COALESCE(cancelled_at, '') = '' THEN 0 ELSE 1 END,
-                  CASE WHEN fulfillment_status ILIKE '%FULFILLED%' THEN 0 ELSE 1 END,
+                  CASE WHEN UPPER(COALESCE(fulfillment_status, '')) IN ('FULFILLED', 'SUCCESS') THEN 0 ELSE 1 END,
                   synced_at DESC
                 LIMIT 1
             ) AS shopify_status ON TRUE
@@ -34350,10 +34357,12 @@ def package_pickup_delivery_timestamp(
 def package_pickup_shopify_statuses(conn: Any) -> dict[tuple[int, str], dict[str, Any]]:
     rows = rows_to_dicts(conn.execute(
         """
-        SELECT store_id, odoo_order_name, fulfillment_status, cancelled_at, synced_at
+        SELECT store_id, odoo_order_name, fulfillment_status, fulfillment_at, cancelled_at, synced_at
         FROM shopify_order_status_cache
         WHERE COALESCE(odoo_order_name, '') != ''
-        ORDER BY synced_at DESC
+        ORDER BY CASE WHEN COALESCE(cancelled_at, '') = '' THEN 0 ELSE 1 END,
+                 CASE WHEN UPPER(COALESCE(fulfillment_status, '')) IN ('FULFILLED', 'SUCCESS') THEN 0 ELSE 1 END,
+                 synced_at DESC
         """
     ).fetchall())
     result: dict[tuple[int, str], dict[str, Any]] = {}
@@ -34826,6 +34835,21 @@ def package_pickup_data(
         card["unreported_amazon"] = max(0, int(card["amazon_picked_up"]) - len(card["amazon_packages"]))
         card["physical_total"] = int(card["amazon_picked_up"]) + int(card["non_amazon_picked_up"])
         card["shopify_fulfilled"] = sum(1 for row in [*card["amazon_packages"], *card["manual_amazon_packages"], *card["non_amazon_packages"]] if row["shopify_fulfilled"])
+    # A pickup can be months after its original order date. Refresh the actual
+    # displayed orders, including manual entries, independently of order age.
+    refresh_rows = {}
+    for card in card_rows:
+        for row in [*card["amazon_packages"], *card["manual_amazon_packages"], *card["non_amazon_packages"]]:
+            key = (int(row.get("store_id") or 0), clean_text(row.get("odoo_order_name")).upper())
+            status = shopify_statuses.get(key, {})
+            refresh_rows[key] = {
+                "store_id": key[0], "odoo_order_name": key[1],
+                "shopify_synced_at": status.get("synced_at"),
+                "shopify_fulfillment_status": status.get("fulfillment_status"),
+                "shopify_fulfillment_at": status.get("fulfillment_at"),
+                "shopify_cancelled_at": status.get("cancelled_at"),
+            }
+    refresh_missing_shopify_status_for_rows(list(refresh_rows.values()), max_age_seconds=300)
     summary = {
         "amazon_reported_delivered": sum(card["amazon_reported_delivered"] for card in card_rows),
         "amazon_picked_up": sum(int(card["amazon_picked_up"]) for card in card_rows),
@@ -34843,6 +34867,21 @@ def package_pickup_data(
         "summary": summary,
         "cards": card_rows,
     }
+
+
+@app.post("/api/package-pickups/status-refresh")
+def api_package_pickup_status_refresh() -> dict[str, Any]:
+    """Refresh Shopify evidence for historical pickup orders without changing fulfilments."""
+    if _PACKAGE_TRACKER_SHOPIFY_SYNC_LOCK.locked():
+        return {"ok": True, "message": "Shopify status reconciliation is already running."}
+    threading.Thread(target=sync_package_tracker_shopify_statuses, kwargs={"force": True}, daemon=True).start()
+    return {"ok": True, "message": "Shopify status reconciliation started."}
+
+
+@app.get("/api/package-pickups/status-refresh")
+def api_package_pickup_status_refresh_progress() -> dict[str, Any]:
+    return {key: get_setting("package_tracker_shopify_sync_" + key, "")
+            for key in ("status", "progress", "error", "started_at", "last_run_at")}
 
 
 @app.get("/api/package-pickups")
