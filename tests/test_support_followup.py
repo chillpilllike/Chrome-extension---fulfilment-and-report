@@ -55,6 +55,7 @@ CREATE TABLE after_order_action_links(case_id INTEGER,token_hash TEXT,invalidate
    try:yield Conn();self.c.commit()
    except:self.c.rollback();raise
   self.db=db
+  fake.db=db;fake.require_after_order_case_in_scope=lambda _:None;fake.hydrate_after_order_recipient_and_domain=lambda x,**kw:x;fake.after_order_sender=lambda _: ("support@secretgreen.com.au","secretgreen.com.au")
  def run_resend(self):
   from app.support.followup import resend_action_email
   return resend_action_email(self.db,8,1,{'id':4},'test@example.com','conversation',1)
@@ -84,3 +85,20 @@ CREATE TABLE after_order_action_links(case_id INTEGER,token_hash TEXT,invalidate
   with self.assertRaises(HTTPException):self.run_resend()
   self.c.execute("UPDATE after_order_messages SET test_mode=0,recipient='other@example.com'")
   with self.assertRaises(HTTPException):self.run_resend()
+ def test_same_email_in_another_chat_is_deduplicated(self):
+  from unittest.mock import patch,Mock
+  from app.support.followup import resend_action_email
+  provider=Mock();provider.send.return_value={'id':'provider-id'}
+  with patch('app.services.after_order.create_email_provider',return_value=provider):
+   self.run_resend()
+   result=resend_action_email(self.db,8,1,{'id':4},'test@example.com','second-conversation',1)
+   self.assertTrue(result['already_sent']);self.assertEqual(1,provider.send.call_count)
+ def test_missing_provider_id_stays_uncertain(self):
+  from unittest.mock import patch,Mock
+  from fastapi import HTTPException
+  provider=Mock();provider.send.return_value={}
+  with patch('app.services.after_order.create_email_provider',return_value=provider):
+   with self.assertRaises(HTTPException):self.run_resend()
+   with self.assertRaises(HTTPException):self.run_resend()
+   self.assertEqual(1,provider.send.call_count)
+  self.assertEqual('delivery_unknown',self.c.execute('SELECT status FROM after_order_messages ORDER BY id DESC LIMIT 1').fetchone()[0])

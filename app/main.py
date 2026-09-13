@@ -814,6 +814,8 @@ def request_requires_public_access(request: Request) -> bool:
     # lookup, never the surrounding order/tracking APIs or write methods.
     if request.method in {"GET", "HEAD"} and re.fullmatch(r"/api/public/asin-image/[A-Za-z0-9]{10}", path):
         return False
+    if request.method == 'POST' and re.fullmatch(r'/api/public/support-post-order/\d+/\d+/\d+/(status|resend)', path):
+        return False  # Native tool authenticates its scoped key and verified conversation.
     # The Odoo bridge authenticates its own shared key and website host in
     # both handlers. It must not require a customer's public-access session.
     if request.method in {"GET", "POST"} and re.fullmatch(
@@ -44286,6 +44288,8 @@ warehouse_dispatch_delay = WarehouseDispatchMonitor(globals())
 from app.support.portal import create_portal_router
 from app.support.routes import create_router as create_support_router
 app.include_router(create_portal_router(db=db, get_store=get_store, client_factory=OdooClient))
+from app.support.post_order_chat import create_router as create_post_order_chat_router
+app.include_router(create_post_order_chat_router(db,get_store,OdooClient))
 app.include_router(create_support_router(db=db, get_store=get_store, list_stores=list_stores,
                                        client_factory=OdooClient, admin_token=effective_admin_access_token))
 
