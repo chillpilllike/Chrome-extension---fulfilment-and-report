@@ -38725,6 +38725,22 @@ def after_order_tracking_is_current(case: dict[str, Any]) -> bool:
     return risk.state == (case.get("context") or {}).get("risk_state")
 
 
+def delivery_checkin_case(case: dict[str, Any], *, enforce_delay: bool = False) -> dict[str, Any]:
+    from app.services.delivery_checkin import delivery_details, require_due
+    with db() as conn:
+        row = conn.execute('SELECT events_json,status FROM epost_global_tracking WHERE store_id=? AND tracking_code=?',
+            (case['store_id'],case.get('tracking_code') or '')).fetchone()
+    details = delivery_details(after_order_json_list(row['events_json']) if row else [])
+    if enforce_delay:
+        if not row or tracking_risk(after_order_json_list(row['events_json']),status=clean_text(row['status'])).state != 'delivered':
+            raise HTTPException(409,'Carrier delivery is no longer confirmed. Check current tracking.')
+        try:
+            require_due(details)
+        except ValueError as exc:
+            raise HTTPException(409,str(exc)) from exc
+    return {**case,'context':{**(case.get('context') or {}),**details}}
+
+
 def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
     if case.get("case_type") == "warehouse_dispatch_delay":
         return []
@@ -39540,6 +39556,9 @@ def send_after_order_email(
                 record_after_order_event(conn, case_id, "unavailable_email_blocked", actor_type="system", details={"reason": review["reason"]})
             raise HTTPException(409, review["reason"])
     case = hydrate_after_order_recipient_and_domain(case, strict=not (force_test or after_order_email_test_mode()))
+    delivery_checkin = showcase_kind == 'delivery_confirmation' or (not showcase_kind and not template_kind and case.get('case_type') == 'delivery_confirmation')
+    if delivery_checkin:
+        case = delivery_checkin_case(case,enforce_delay=not (force_test or after_order_email_test_mode()))
     reminder_source = None
     if reminder_parent:
         try:
@@ -39628,6 +39647,9 @@ def send_after_order_email(
             )
         if branded_tracking_url:
             email_case["context"]["tracking_url"] = branded_tracking_url
+        if delivery_checkin:
+            # The order's branded portal link, never the internal app URL.
+            email_case['context']['tracking_url'] = action_url
         from app.services.after_order_email_images import with_email_images
         email_case = with_email_images(email_case, after_order_absolute_url(request, "/"))
         subject, html_body, text_body = after_order_email_content(
@@ -39935,6 +39957,8 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             raise HTTPException(409, reason)
         attempt = int(locked.get("attempt_count") or 0) + 1
         saved_payload = json.loads(locked['payload_json'])
+        if not locked.get('test_mode') and locked.get('template_kind') == 'delivery_confirmation':
+            delivery_checkin_case(case,enforce_delay=True)
         if not locked.get('test_mode') and case.get('case_type') == 'warehouse_dispatch_delay':
             try:
                 warehouse_dispatch_delay.validate(case)

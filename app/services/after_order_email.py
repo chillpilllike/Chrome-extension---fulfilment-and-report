@@ -114,6 +114,10 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     if kind == "expected_dispatch":
         date = str(context.get("expected_dispatch_date") or "We’ll keep you updated")
         panel_label, panel_value, panel_detail = "ESTIMATED DISPATCH", date, "An estimate, not a guaranteed delivery date."
+    elif kind == "delivery_confirmation":
+        panel_label = "CARRIER DELIVERY DETAILS"
+        panel_value = "Delivered: " + str(context.get("delivery_datetime") or "Not provided by carrier")
+        panel_detail = "Location: " + str(context.get("delivery_location") or "Not provided by carrier") + "\nPostal code: " + str(context.get("delivery_postal_code") or "Not provided by carrier")
     elif kind == "tracking":
         panel_label = "LATEST CARRIER UPDATE"
         panel_value = "Status: " + str(context.get("latest_status") or "Not provided by carrier")
@@ -151,6 +155,9 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
             destructive = action in {"refund", "cancel_order", "cancel_affected_item"}
             buttons.append(button(label, url, primary=index == 0 and not destructive, destructive=destructive))
             plain_actions.append(f"{label}: {url}")
+    if kind == 'delivery_confirmation' and safe_url(context.get('tracking_url')):
+        buttons.append(button('Track all details', context['tracking_url'], primary=False))
+        plain_actions.append('Track all details: ' + context['tracking_url'])
     action_html = f'''<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:30px"><tr><td style="border-top:1px solid #edf0ec;padding-top:26px;font-family:{FONT}">
       <h2 style="margin:0 0 8px;font-size:15px;line-height:23px;font-weight:600;color:#26392f">{action_heading}</h2>
       <p style="margin:0 0 20px;font-size:13px;line-height:22px;color:#6a766e">{note}</p>
