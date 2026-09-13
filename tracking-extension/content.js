@@ -868,7 +868,7 @@ function productItemsFrom(root, limit = 50) {
     );
     const quantityIsolated = boxAsins.size === 1 && boxAsins.has(asin);
     const quantityNode = quantityIsolated
-      ? (box.matches("[data-quantity]") ? box : box.querySelector(".od-item-view-qty, .itemQuantity, .itemImages-quantityLabel, [data-quantity]"))
+      ? (box.matches("[data-quantity]") ? box : box.querySelector(".od-item-view-qty, .itemQuantity, .itemImages-quantityLabel, .images-quantity-label, [data-quantity]"))
       : null;
     const quantityValue = quantityNode?.getAttribute?.("data-quantity") || quantityNode?.textContent || "";
     const explicitQuantity = String(quantityValue).match(/\d+/)?.[0];
@@ -894,7 +894,7 @@ function productItemsFrom(root, limit = 50) {
   if (products.length < Number(limit || 50)) {
     const links = [...root.querySelectorAll("a[href*='/dp/'], a[href*='/gp/product/']")].slice(0, Math.max(1, Number(limit || 50)) * 4);
     for (const link of links) {
-      const box = link.closest("[data-component='purchasedItems'], [data-component='item'], .od-item, .a-fixed-left-grid, .itemImages-inline a");
+      const box = link.closest("[data-component='purchasedItems'], [data-component='item'], .od-item, .a-fixed-left-grid, .itemImages-inline a, #promise-card-asin-image-carousel a.image-wrapper");
       if (!box || !root.contains(box) || blockedProductCandidate(box)) continue;
       addFromBox(box);
       if (products.length >= Number(limit || 50)) break;
@@ -1107,7 +1107,7 @@ async function parseTrackingPage() {
   const carrierInfo = parseCarrierAndTrackingId();
   const status = parseStatus();
   const otp = parseOtpFromTrackingPage();
-  const deliveryCard = document.querySelector("#itemImagesCarousel-container") || document.querySelector(".delivery-card, .pt-delivery-card-wrapper") || document.body;
+  const deliveryCard = document.querySelector("#itemImagesCarousel-container, #promise-card-asin-image-carousel") || document.querySelector(".delivery-card, .pt-delivery-card-wrapper") || document.body;
   const trackingProducts = productItemsFrom(deliveryCard);
   const products = trackingProducts;
   const hasTrackingIdentity = Boolean(clean(carrierInfo.carrier) || clean(carrierInfo.tracking_id));

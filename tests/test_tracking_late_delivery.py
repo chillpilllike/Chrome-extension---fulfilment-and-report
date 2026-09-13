@@ -68,4 +68,6 @@ assert.equal(products[0].asin,'B0HF4PVTC7');
 assert.equal(products[0].quantity,2);
 assert.equal(products[0].quantity_verified,true);
 """
-        subprocess.run(['node','-e',script],check=True,capture_output=True,text=True)
+        self.assertIn('#itemImagesCarousel-container, #promise-card-asin-image-carousel', source)
+        for variant in [script, script.replace('.itemImages-inline a', '#promise-card-asin-image-carousel a.image-wrapper').replace('.itemImages-quantityLabel', '.images-quantity-label')]:
+            subprocess.run(['node','-e',variant],check=True,capture_output=True,text=True)
