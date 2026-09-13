@@ -384,7 +384,7 @@ def create_portal_router(*, db, get_store, client_factory):
     def resend_choice(payload:ResendRequest,request:Request):
         uuid,email,order=verified_link(request)
         from app.support.followup import resend_action_email
-        return resend_action_email(db,STORE,WEBSITE,order,email,uuid,payload.message_id)
+        raise HTTPException(409,'Use the current post-order resend tool with a customer-approved offer.')
 
     @router.post(PREFIX+'/tools/contact-details')
     def contact_details(request:Request):
