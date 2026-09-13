@@ -42,12 +42,12 @@ export function LineAlternativeButton({ lineId, name, request }: { lineId: numbe
     } catch (error) { setMessage(String(error)) } finally { setBusy(false) }
   }
   return <>
-    <Button size="sm" variant="outline" className="h-auto min-h-8 w-full min-w-0 max-w-full whitespace-normal break-words px-2 py-1 text-left text-xs leading-tight" onClick={() => setOpen(true)}>Review alternatives</Button>
+    <Button size="sm" variant="outline" style={{ whiteSpace: 'normal', overflowWrap: 'anywhere', width: '100%', maxWidth: '100%', minWidth: 0, height: 'auto' }} className="min-h-8 px-2 py-1 text-left text-xs leading-tight" onClick={() => setOpen(true)}>Review alternatives</Button>
     <Dialog open={open} onOpenChange={setOpen}><DialogContent>
       <DialogHeader><DialogTitle>Alternatives for this line</DialogTitle><DialogDescription>{name} · line {lineId}</DialogDescription></DialogHeader>
       <label className="text-sm font-medium" htmlFor={`alternative-refs-${lineId}`}>Odoo Internal References, in recommendation order</label>
       <textarea id={`alternative-refs-${lineId}`} className="min-h-32 w-full rounded-md border p-3 text-sm" value={references} onChange={event => setReferences(event.target.value)} placeholder="One reference per line" disabled={busy || !caseId}/>
-      <p className="text-sm text-muted-foreground">Exact references are matched on this order’s store. After every affected line has recommendations, an email is prepared in the approval queue. It is not sent until the team approves it.</p>
+      <p className="text-sm text-muted-foreground">Exact references are matched on this order’s store. After every affected line has recommendations or is marked No alternatives available, an email is prepared in the approval queue. It is not sent until the team approves it.</p>
       <label className="flex items-start gap-2 text-sm"><Checkbox checked={checked} onCheckedChange={value => setChecked(value === true)}/>I checked third-party and manual fulfilment; this item still needs a customer choice.</label>
       <Button disabled={busy || !checked || !references.trim() || !caseId} onClick={() => void save()}>{busy ? 'Checking…' : 'Save alternatives & prepare email'}</Button>
       <Button variant="outline" disabled={busy || !checked || !caseId} onClick={() => void save(true)}>No alternatives available</Button>
