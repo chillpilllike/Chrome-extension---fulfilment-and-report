@@ -11,3 +11,9 @@ Resends share a rolling one-hour cooldown across conversations and copies of the
 Validation: 11 consent/scope tests, 10 follow-up tests, 7 journey tests and 185 existing after-order tests passed. Tests use synthetic records and mocked mail delivery. No customer email was sent in this release's tests.
 
 Production preflight: after_order_email_test_mode=true; automation=false; live readiness approval unset. Do not describe customer resending or unattended original sends as live until the post-order workflow passes its own go-live requirements. This release does not silently change those settings.
+
+## Deployment verification
+
+Production application release 7c674d9 deployed successfully (Coolify jluj8y2lxwbwxuw5eolh6xac); /health returned 200 and the new unauthenticated route returned 403. All eight configured order assistants now have status/resend tools (39–54) and the new instructions, verified by API readback. All eight routes rejected unverified headers even with a valid scoped tool key. Final dedicated tests: 7 consent, scope and status tests, 10 follow-up tests, 7 journey tests, 185 after-order tests. An unreviewed item and test email are explicitly covered by the status test.
+
+No real resend was attempted: the live post-order system remains in test mode with automation disabled. No new Nutricity assistants were created; this rollout updates the eight existing configured order assistants only. Other widgets without an order assistant require the separate assistant/OTP rollout. Existing original-send review/approval and financial execution rules remain in effect.
