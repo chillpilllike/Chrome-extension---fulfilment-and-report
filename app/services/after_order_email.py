@@ -43,6 +43,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     if kind == "tracking" and context.get("risk_state") == "suspected_lost":
         kind = "package_lost"
     content = {
+        "new_order_welcome": ("THANK YOU", "Thank you for your order!", "Thank you for your order", "We’ve received your order and will begin processing it soon. We’re here to help whenever you need us.", "Here to help", "Keep your order number handy when contacting us so we can help you more quickly."),
         "warehouse_dispatch_delay": ("DISPATCH UPDATE", "An update on your dispatch.", "Your dispatch is taking longer than expected", "Your order’s dispatch has hit a hurdle, and our team has been notified. We expect to dispatch it within the next 24–48 hours.", "No action needed", "You don’t need to take any action. Our team is working to get your order on its way."),
         "item_unavailable": ("YOUR ORDER", "Let’s find your next best option.", "An item needs your choice", "Our team has prepared alternatives for an unavailable item in your order. Review the affected item below and choose how you’d like to continue.", "Choose what works for you", "You can change an alternative for 24 hours from your first selection. After that, a higher-priced choice requires payment of the difference; a cheaper choice is reviewed for a difference refund. If you remove an item, any amount charged for it will be refunded after our team reviews and confirms your request."),
         "expected_dispatch": ("DISPATCH UPDATE", "A quick update on your order.", "Your expected dispatch date", "Your order has a later expected dispatch date. Please let us know if you’d like to proceed or cancel.", "How would you like to continue?", "If we don’t hear from you, we’ll continue processing your order."),
@@ -120,6 +121,26 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
 
     panel = ""
     detail_lines = []
+    if kind == 'new_order_welcome':
+        domain = str(case.get('sender_domain') or '').strip().lower()
+        parsed_domain = urlsplit('https://' + domain)
+        if not domain or parsed_domain.hostname != domain or parsed_domain.path or parsed_domain.username or parsed_domain.port:
+            raise ValueError('A verified storefront domain is required for the welcome email.')
+        base = 'https://' + domain
+        sections = [
+            ('✉', 'Need help with your order?', 'Contact us by email, through our website contact form, or via chat on our website.'),
+            ('◷', 'Friday and weekend enquiries', 'If you email us on Friday or over the weekend, our team will return on Monday during business hours to review and reply. If Monday is a public holiday, please allow until the next business day.'),
+            ('▣', 'After your package is dispatched', 'We work with our courier partners to resolve delivery questions. Their investigations can take 48 hours or longer. Thank you for your patience—we’ll follow up and keep you informed.'),
+            ('✓', 'Support after your purchase', 'We’re here to help with order queries. Returns, refunds and replacements are available in accordance with our store policies.'),
+        ]
+        panel = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:28px">'
+        for icon, title, body in sections:
+            panel += f'<tr><td valign="top" width="30" style="padding:0 8px 24px 0;color:#28594a;font-size:21px" aria-hidden="true">{icon}</td><td style="padding:0 0 24px;font-size:14px;line-height:24px"><strong>{escape(title)}</strong><p style="margin:8px 0 0;color:#637167">{escape(body)}</p></td></tr>'
+            detail_lines.append(title + '\n' + body)
+        panel += '</table>'
+        contact_url = base + '/contactus'
+        panel += f'<p style="font-size:14px;line-height:28px;margin:0 0 24px"><a href="mailto:support@{escape(domain, quote=True)}" style="color:#28594a;text-decoration:underline">Email our team</a><br><a href="{escape(contact_url, quote=True)}" style="color:#28594a;text-decoration:underline">Contact form</a><br><a href="{escape(base, quote=True)}" style="color:#28594a;text-decoration:underline">Visit our website for chat</a></p>'
+        detail_lines += ['Email: support@' + domain, 'Contact form: ' + contact_url, 'Website chat: ' + base]
     if kind == "expected_dispatch":
         date = str(context.get("expected_dispatch_date") or "We’ll keep you updated")
         panel_label, panel_value, panel_detail = "ESTIMATED DISPATCH", date, "An estimate, not a guaranteed delivery date."

@@ -39557,6 +39557,8 @@ def send_after_order_email(
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
     unavailable_email = showcase_kind == "item_unavailable" or (not showcase_kind and case.get("case_type") == "item_unavailable" and template_kind != "trustpilot_review")
+    if case.get('case_type') == 'new_order_welcome' and not force_test:
+        welcome_emails.validate(case)
     if case.get('case_type') == 'warehouse_dispatch_delay' and not (force_test or after_order_email_test_mode()):
         try:
             warehouse_dispatch_delay.validate(case)
@@ -39590,6 +39592,7 @@ def send_after_order_email(
         "package_movement": [],
         "trustpilot_review": [],
         "alternative_payment": [],
+        "new_order_welcome": [],
     }
     allowed = showcase_actions.get(showcase_kind, after_order_allowed_actions(case) if not template_kind else [])
     if unavailable_email and 'offer_alternatives' not in after_order_allowed_actions(case):
@@ -39640,6 +39643,9 @@ def send_after_order_email(
         email_case['context']['three_day_policy_enabled'] = test_mode or clean_text(get_service_settings().get('after_order_completion_enabled')) == 'true'
         effective_template_kind = template_kind
         if showcase_kind:
+            if showcase_kind == 'new_order_welcome':
+                email_case['case_type'] = 'new_order_welcome'
+                effective_template_kind = 'new_order_welcome'
             if showcase_kind == "expected_dispatch":
                 email_case["case_type"] = "expected_dispatch"
             elif showcase_kind == "item_unavailable":
@@ -39695,6 +39701,8 @@ def send_after_order_email(
     if case.get("case_type") == "tracking" and not allowed:
         event_revision = hashlib.sha256(json.dumps({key: event_context.get(key) for key in ("latest_status", "latest_location", "last_update_at")}, sort_keys=True).encode()).hexdigest()
     idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{uuid.uuid4().hex if test_mode else event_revision}"
+    if case.get('case_type') == 'new_order_welcome' and not force_test:
+        idempotency_key = f'after-order:{case_id}:new_order_welcome:once'
     if case.get('case_type') == 'warehouse_dispatch_delay' and not test_mode:
         if reminder_parent or template_kind or showcase_kind:
             raise HTTPException(409, 'Dispatch-delay notices have no reminders or alternate live templates.')
@@ -39766,6 +39774,13 @@ def send_after_order_email(
                 return {"ok": True, "message": "This notification was already sent or reserved; no duplicate was sent.", "deduplicated": True}
             conn.execute("UPDATE after_order_messages SET attempt_count=0 WHERE id=?", (reservation["id"],))
             record_after_order_event(conn, case_id, "email_awaiting_team_approval", details={"message_id": reservation["id"], "test_mode": test_mode})
+        from app.services.welcome_email import permitted
+        candidate = {'provider':provider_name,'status':'awaiting_approval','attempt_count':0,
+                     'test_mode':test_mode,'recipient':recipient,'payload_json':json.dumps(message_payload),
+                     'template_kind':showcase_kind or template_kind or case.get('case_type')}
+        if permitted(candidate, test_mode=after_order_email_test_mode()):
+            result = retry_after_order_email(reservation['id'], request, policy_exception=True)
+            return {**result, 'message_id':reservation['id'],'recipient':recipient}
         return {"ok": True, "status": "awaiting_approval", "message_id": reservation["id"],
                 "message": "Email prepared for team approval. Nothing has been sent.", "recipient": recipient}
         if not test_mode and after_order_email_test_mode():
@@ -39901,6 +39916,11 @@ def api_after_order_email_retry(message_id: int, request: Request) -> dict[str, 
     return retry_after_order_email(message_id, request)
 
 
+@app.post('/api/after-order/cases/{case_id}/welcome-test')
+def api_after_order_welcome_test(case_id: int, request: Request):
+    return send_after_order_email(case_id, request, force_test=True, showcase_kind='new_order_welcome')
+
+
 @app.post("/api/after-order/emails/{message_id}/approve-send")
 def api_after_order_approve_email(message_id: int, payload: dict[str, str], request: Request) -> dict[str, Any]:
     digest = clean_text(payload.get("approval_digest"))
@@ -39910,10 +39930,10 @@ def api_after_order_approve_email(message_id: int, payload: dict[str, str], requ
 
 
 
-def retry_after_order_email(message_id: int, request: Request, *, automatic: bool = False, approval_digest: str = "") -> dict[str, Any]:
+def retry_after_order_email(message_id: int, request: Request, *, automatic: bool = False, approval_digest: str = "", policy_exception: bool = False) -> dict[str, Any]:
     # Approval-only rollout: each individual send attempt requires a fresh
     # authenticated team action. Workers and legacy retry routes cannot send.
-    if automatic or not approval_digest:
+    if automatic or (not approval_digest and not policy_exception):
         raise HTTPException(409, "Team approval is required for each email attempt. Review it in Email log.")
     from app.services.email_log import automatic_retry_reason
     with db() as conn:
@@ -39921,6 +39941,11 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    if policy_exception:
+        from app.services.welcome_email import permitted
+        if not permitted(original, test_mode=after_order_email_test_mode()):
+            raise HTTPException(409, 'This email requires individual team approval.')
+        approval_digest = hashlib.sha256(str(original.get('payload_json') or '').encode()).hexdigest()
     if original.get('status') not in {'awaiting_approval', 'failed'} or original.get('provider') not in {'resend','odoo'}:
         raise HTTPException(409, 'This email cannot be approved. Check its current state.')
     if hashlib.sha256(str(original.get('payload_json') or '').encode()).hexdigest() != approval_digest:
@@ -39963,6 +39988,13 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     with db() as conn:
         locked = conn.execute("SELECT * FROM after_order_messages WHERE id=? FOR UPDATE", (message_id,)).fetchone()
         locked = row_to_dict(locked)
+        if policy_exception:
+            if not permitted(locked, test_mode=after_order_email_test_mode()):
+                raise HTTPException(409, 'Automatic email exception is no longer eligible.')
+            if not locked.get('test_mode'):
+                if case.get('case_type') != 'new_order_welcome':
+                    raise HTTPException(409, 'Automatic live email is limited to new-order welcome cases.')
+                welcome_emails.validate(case)
         if locked.get('status') not in {'awaiting_approval', 'failed'} or hashlib.sha256(str(locked.get('payload_json') or '').encode()).hexdigest() != approval_digest:
             raise HTTPException(409, 'Email already processed or changed; approval was not applied.')
         if automatic:
@@ -39996,7 +40028,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         conn.execute("UPDATE after_order_messages SET status='retrying',attempt_count=?,last_error=NULL,updated_at=? WHERE id=?", (attempt, now, message_id))
         conn.execute("INSERT INTO after_order_email_attempts (message_id,attempt_number,status,created_at,updated_at) VALUES (?,?,'retrying',?,?)", (message_id, attempt, now, now))
         record_after_order_event(conn, case["id"], "email_retry_started", actor_type="system" if automatic else "team", details={"message_id": message_id, "attempt": attempt, "automatic": automatic})
-        record_after_order_event(conn, case["id"], "email_send_approved", actor_type="team", details={"message_id": message_id, "attempt": attempt, "approval_digest": approval_digest})
+        record_after_order_event(conn, case["id"], "email_policy_authorized" if policy_exception else "email_send_approved", actor_type="system" if policy_exception else "team", details={"message_id": message_id, "attempt": attempt, "approval_digest": approval_digest, 'policy_exception':policy_exception})
     error = ""
     provider_id = ""
     try:
@@ -40087,6 +40119,7 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
     for row in rows:
         by_type.setdefault(clean_text(row.get("case_type")), int(row["id"]))
     suite = [
+        ("new_order_welcome", first_id),
         ("expected_dispatch", first_id),
         ("item_unavailable", by_type.get("item_unavailable", first_id)),
         ("delivery_confirmation", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
@@ -40106,12 +40139,12 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
                 continue
         try:
             result = send_after_order_email(case_id, request, force_test=True, showcase_kind=kind)
-            results.append({"template": kind, "case_id": case_id, "recipient": result.get("recipient")})
+            results.append({"template": kind, "case_id": case_id, "recipient": result.get("recipient"), 'status':result.get('status'), 'reason':result.get('message')})
         except Exception as exc:
             results.append({'template':kind,'case_id':case_id,'status':'failed','reason':clean_error_message(exc)})
             with db() as conn:
                 record_after_order_event(conn,case_id,'test_suite_template_failed',actor_type='team',details={'template':kind,'error':clean_error_message(exc),'test_mode':True})
-    sent_count = sum(1 for result in results if result.get("recipient"))
+    sent_count = sum(1 for result in results if result.get("status") == 'sent_test')
     failed_count = sum(result.get('status')=='failed' for result in results)
     return {
         "ok": failed_count == 0,
@@ -40731,6 +40764,7 @@ def after_order_automation_loop() -> None:
     while True:
         time.sleep(60)
         try:
+            run_welcome_email_checks()
             # This independent monitor can only prepare approval-held drafts.
             # Broad automation and financial execution remain disabled.
             if clean_text(get_service_settings().get('after_order_warehouse_delay_enabled')) == 'true':
@@ -40740,6 +40774,15 @@ def after_order_automation_loop() -> None:
             run_after_order_automation()
         except Exception as exc:
             print(f"After-order automation needs attention: {clean_error_message(exc)}", flush=True)
+
+
+def run_welcome_email_checks():
+    base = clean_text(get_service_settings().get('after_order_public_base_url') or os.getenv('AFTER_ORDER_PUBLIC_BASE_URL', ''))
+    parsed = urlparse(base)
+    if parsed.scheme != 'https' or not parsed.hostname:
+        return
+    request = Request({'type':'http','method':'POST','scheme':'https','server':(parsed.hostname,443),'path':'/','root_path':'','query_string':b'','headers':[(b'host',parsed.hostname.encode())]})
+    return welcome_emails.run_checks(request)
 
 
 def run_warehouse_dispatch_checks() -> dict[str, Any]:
@@ -44281,6 +44324,8 @@ from app.services.care_reminders import Reminders as CareReminders
 care_reminders = CareReminders(globals())
 from app.services.warehouse_dispatch_delay import Monitor as WarehouseDispatchMonitor
 warehouse_dispatch_delay = WarehouseDispatchMonitor(globals())
+from app.services.welcome_email import Monitor as WelcomeEmailMonitor
+welcome_emails = WelcomeEmailMonitor(globals())
 
 
 from app.support.portal import create_portal_router
