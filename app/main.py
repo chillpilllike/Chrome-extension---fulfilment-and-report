@@ -17912,6 +17912,8 @@ def fetch_epg_tracking_snapshot(tracking_code: str) -> dict[str, Any]:
     )
     response.raise_for_status()
     details = extract_epg_final_mile_details(response.text)
+    from app.services.delivery_checkin import parcel_destination
+    details.update(parcel_destination(response.text))
     events = extract_epg_tracking_events(response.text)
     latest = events[0] if events else {}
     return {
@@ -38726,11 +38728,18 @@ def after_order_tracking_is_current(case: dict[str, Any]) -> bool:
 
 
 def delivery_checkin_case(case: dict[str, Any], *, enforce_delay: bool = False) -> dict[str, Any]:
-    from app.services.delivery_checkin import delivery_details, require_due
+    from app.services.delivery_checkin import delivery_details, require_due, destination_postal_code
     with db() as conn:
-        row = conn.execute('SELECT events_json,status FROM epost_global_tracking WHERE store_id=? AND tracking_code=?',
+        row = conn.execute('SELECT events_json,status,destination FROM epost_global_tracking WHERE store_id=? AND tracking_code=?',
             (case['store_id'],case.get('tracking_code') or '')).fetchone()
     details = delivery_details(after_order_json_list(row['events_json']) if row else [])
+    postal = destination_postal_code(row['destination']) if row else ''
+    if not postal and case.get('tracking_code'):
+        try:
+            postal = fetch_epg_tracking_snapshot(case['tracking_code']).get('destination_postal_code','')
+        except Exception:
+            pass  # Never substitute an event/location postcode or guess one.
+    details['delivery_postal_code'] = postal or 'Not provided by carrier'
     if enforce_delay:
         if not row or tracking_risk(after_order_json_list(row['events_json']),status=clean_text(row['status'])).state != 'delivered':
             raise HTTPException(409,'Carrier delivery is no longer confirmed. Check current tracking.')

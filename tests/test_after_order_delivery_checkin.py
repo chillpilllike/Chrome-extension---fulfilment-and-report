@@ -1,10 +1,19 @@
 import unittest
 from datetime import datetime, timedelta, timezone
-from app.services.delivery_checkin import carrier_moment, delivery_details, require_due
+from app.services.delivery_checkin import carrier_moment, delivery_details, require_due, parcel_destination, destination_postal_code
 from app.services.after_order_email import render_after_order_email
 
 
 class DeliveryCheckinTests(unittest.TestCase):
+    def test_parcel_destination_field_not_other_numbers(self):
+        markup='''<p class="ParcelDetails-header">AWB Number</p><p class="ParcelDetails-Body">12345678</p>
+        <p class="ParcelDetails-header">Destination Country, Zip Code</p>
+        <p class="ParcelDetails-Body">AUSTRALIA <span>, 2540</span></p>'''
+        self.assertEqual(parcel_destination(markup),{'destination':'AUSTRALIA, 2540','destination_postal_code':'2540'})
+        self.assertEqual(parcel_destination('<p class="ParcelDetails-Body">AUSTRALIA, 2540</p>'),{})
+        self.assertEqual(destination_postal_code('UNITED STATES, 00501'),'00501')
+        self.assertEqual(destination_postal_code('CANADA, K1A 0B1'),'K1A 0B1')
+        self.assertEqual(destination_postal_code('AUSTRALIA'),'')
     def test_explicit_timezone_exact_boundary(self):
         details=delivery_details([{'status':'Delivered','date':'2026-09-13T10:00:00+10:00'}])
         due=datetime(2026,9,14,0,0,tzinfo=timezone.utc)

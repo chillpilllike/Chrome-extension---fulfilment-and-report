@@ -1,6 +1,23 @@
 """Carrier evidence and conservative 24-hour check-in eligibility."""
 import re
+from html import unescape
 from datetime import datetime, timedelta, timezone
+
+
+def destination_postal_code(destination):
+    parts=str(destination or '').rsplit(',',1)
+    value=' '.join(parts[-1].split()) if len(parts)==2 else ''
+    return value if re.fullmatch(r'(?=.*\d)[A-Za-z0-9 -]{2,12}',value) else ''
+
+
+def parcel_destination(markup):
+    # Scope to the labelled destination paragraph, not AWB or final-mile data.
+    match=re.search(r'<p\b[^>]*class=["\'][^"\']*ParcelDetails-header[^"\']*["\'][^>]*>\s*Destination\s+Country,\s*Zip\s+Code\s*</p>\s*<p\b[^>]*class=["\'][^"\']*ParcelDetails-Body[^"\']*["\'][^>]*>(.*?)</p>',str(markup or ''),re.I|re.S)
+    if not match:
+        return {}
+    destination=' '.join(unescape(re.sub('<[^>]+>',' ',match.group(1))).split())
+    destination=re.sub(r'\s*,\s*',', ',destination)
+    return {'destination':destination,'destination_postal_code':destination_postal_code(destination)}
 
 
 def carrier_moment(value):

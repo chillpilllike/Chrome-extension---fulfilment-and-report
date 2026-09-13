@@ -117,7 +117,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     elif kind == "delivery_confirmation":
         panel_label = "CARRIER DELIVERY DETAILS"
         panel_value = "Delivered: " + str(context.get("delivery_datetime") or "Not provided by carrier")
-        panel_detail = "Location: " + str(context.get("delivery_location") or "Not provided by carrier") + "\nPostal code: " + str(context.get("delivery_postal_code") or "Not provided by carrier")
+        panel_detail = "Location: " + str(context.get("delivery_location") or "Not provided by carrier") + "\nDestination postal code: " + str(context.get("delivery_postal_code") or "Not provided by carrier")
     elif kind == "tracking":
         panel_label = "LATEST CARRIER UPDATE"
         panel_value = "Status: " + str(context.get("latest_status") or "Not provided by carrier")
