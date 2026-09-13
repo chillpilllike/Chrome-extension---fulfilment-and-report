@@ -7,6 +7,7 @@ import "./after-care-workspace.css"
 const queues = [
   ["open", "All open cases", "Active cases", "Review customer requests, sourcing issues and shipment follow-up."],
   ["needs_confirmation", "Confirm decisions", "Customer requests", "Check the latest customer choice before confirming. Approval is not proof of a completed refund or replacement."],
+  ["refund_requests", "Refund requests", "Refund review", "Review customer refunds, item-removal refunds and replacement price differences awaiting review or completion. This filter does not approve or issue refunds."],
   ["needs_attention", "Needs attention", "Sourcing & exceptions", "Check fulfilment options and resolve blockers before contacting the customer."],
   ["approved_pending_execution", "Execution pending", "Approved follow-up", "Review execution progress and errors for decisions already confirmed by your team."],
   ["tracking", "Tracking follow-up", "Shipment monitoring", "Review carrier evidence. Missing first scans alone do not mean a package is lost."],
@@ -22,8 +23,9 @@ export function AfterCareWorkspace({ status, summary, loading, total, query, onQ
   automationEnabled: boolean; cutoffDate: string; tools: ReactNode; children: ReactNode;
 }) {
   const current = queues.find(queue => queue[0] === status) || queues[0]
-  const count = (key: string) => key === "all" ? Object.values(summary).reduce((sum, n) => sum + n, 0)
-    : key === "open" ? Object.entries(summary).reduce((sum, [state, n]) => sum + (["approved", "resolved"].includes(state) ? 0 : n), 0)
+  const statusTotals = Object.entries(summary).filter(([key]) => key !== "refund_requests")
+  const count = (key: string) => key === "all" ? statusTotals.reduce((sum, [, n]) => sum + n, 0)
+    : key === "open" ? statusTotals.reduce((sum, [state, n]) => sum + (["approved", "resolved"].includes(state) ? 0 : n), 0)
     : summary[key] || 0
   return <div className="epost-workspace care-workspace">
     <header className="epost-heading">
@@ -34,8 +36,8 @@ export function AfterCareWorkspace({ status, summary, loading, total, query, onQ
     <div className="epost-layout">
       <aside className="epost-queues" aria-label="After-order work queues">
         <div className="epost-queue-title">Work queues <span>Store totals</span></div>
-        {queues.map(([key, label], index) => <div key={key}>
-          {index === 4 && <div className="epost-queue-divider">Monitor & history</div>}
+        {queues.map(([key, label]) => <div key={key}>
+          {key === "tracking" && <div className="epost-queue-divider">Monitor & history</div>}
           <button type="button" className={`epost-queue ${status === key ? "is-active" : ""}`} aria-pressed={status === key} disabled={loading} onClick={() => onQueue(key)}><span>{label}</span><strong>{loading ? "—" : count(key).toLocaleString()}</strong></button>
         </div>)}
         <div className="epost-related"><h3>Related work</h3><a href="/epost">ePost Global tracking ↗</a><a href="/email-log">Email log & retries ↗</a><a href="/package-tracker">Track all packages ↗</a></div>
