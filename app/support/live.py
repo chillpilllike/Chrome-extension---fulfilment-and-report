@@ -20,13 +20,13 @@ def objects(value):
     except (ValueError,TypeError):return []
 
 
-def order_evidence(conn, store, order, now=None):
+def order_evidence(conn, store, order, now=None, website=None):
     now=now or datetime.now(timezone.utc)
     stale=Evidence(observed_at=datetime.min.replace(tzinfo=timezone.utc))
     # Read all required items, including unsourced ones. Filtering only tracked rows can overpromise.
     rows=[dict(r) for r in conn.execute('SELECT * FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id LIMIT 501',(store,order['id'])).fetchall()]
     if not rows or len(rows)>500 or order.get('items_truncated'):return stale
-    outbound=[dict(r) for r in conn.execute('SELECT status,events_json,last_checked_at FROM epost_global_tracking WHERE store_id=? AND odoo_order_id=? AND archived_at IS NULL LIMIT 501',(store,order['id'])).fetchall()]
+    outbound=[dict(r) for r in conn.execute('SELECT status,events_json,last_checked_at FROM epost_global_tracking WHERE store_id=? AND odoo_order_id=? AND archived_at IS NULL AND (? IS NULL OR website_id=? OR website_id IS NULL) LIMIT 501',(store,order['id'],website,website)).fetchall()]
     for shipment in outbound:
         if timedelta(0)<=now-stamp(shipment.get('last_checked_at'))<=timedelta(minutes=5):
             risk=tracking_risk(objects(shipment.get('events_json')),status=shipment.get('status') or '',now=now)

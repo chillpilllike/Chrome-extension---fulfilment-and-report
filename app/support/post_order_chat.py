@@ -14,7 +14,7 @@ import requests
 from app.support.journey import email_history, public_text
 
 PREFIX = '/api/public/support-post-order'
-RULES = ('Use current facts only. Sent means provider acceptance; delivered means recipient mail server acceptance. '
+RULES = ('Use dispatch.reply and dispatch.estimated_dispatch for dispatch questions. Never recalculate a date or use an old email/case date if dispatch.estimated_dispatch is absent. The date is an estimate, never a guarantee. Do not reveal the source, supplier, inbound dates or internal handling calculation. Use current facts only. Sent means provider acceptance; delivered means recipient mail server acceptance. '
          'No click is NOT no reply. No recorded selection means only no selection recorded in post-order care. '
          'Never say the customer ignored/read an email. If they replied elsewhere, acknowledge this and offer team review. '
          'Do not expose internal identifiers, supplier data, sourcing, costs, or raw email bodies. '
@@ -79,6 +79,19 @@ def list_messages(uuid):
     value=native('/conversations/'+uuid+'/messages')
     return value.get('results',[]) if isinstance(value,dict) else value
 
+def dispatch_update(db,client,store,website,order):
+    """Only derived public status leaves this boundary; source rows remain internal."""
+    from app.support.live import order_evidence
+    from app.support.policy import Evidence,public_status
+    try:
+        fields=client.existing_fields('sale.order.line',['id','product_id','display_type','is_delivery','product_uom_qty'])
+        items=client.search_read('sale.order.line',[('order_id','=',order['id'])],fields,limit=501)
+        detail=dict(order,items=items[:500],items_truncated=len(items)>500)
+        with db() as conn:evidence=order_evidence(conn,store,detail,website=website)
+        return public_status(order['state'],evidence)
+    except Exception:
+        return public_status(order['state'],Evidence(observed_at=datetime.min.replace(tzinfo=timezone.utc)))
+
 class Resend(BaseModel):
     offer_token:str=Field(min_length=40,max_length=3000)
 
@@ -106,6 +119,7 @@ def create_router(db,get_store,client_factory):
     @router.post(PREFIX+'/{store}/{website}/{inbox}/status')
     def status(request:Request,store:int,website:int,inbox:int):
         scope,order=identity(request,store,website,inbox)
+        dispatch=dispatch_update(db,client_factory(get_store(store)),store,website,order)
         from app import main as app
         from app.support.followup import resend_eligibility
         with db() as conn:
@@ -123,7 +137,7 @@ def create_router(db,get_store,client_factory):
             entry={'topic':case['case_type'],'customer_details_available':publish,'current':current,'selection_recorded':bool(case.get('current_decision')),'team_confirmed':bool(case.get('confirmed_at'))}
             if publish:
                 entry['affected_items']=[{'name':public_text(x.get('product_name')),'quantity':x.get('quantity')} for x in case.get('affected_items',[]) if public_text(x.get('product_name'))]
-                entry['estimated_dispatch']=(case.get('context') or {}).get('expected_dispatch_date')
+                entry['estimated_dispatch']=dispatch.get('estimated_dispatch')
                 entry['available_choices']=app.after_order_allowed_actions(case)
             cases.append(entry)
             if candidate is None:
@@ -137,7 +151,7 @@ def create_router(db,get_store,client_factory):
             incoming=[m for m in list_messages(scope['uuid']) if m.get('type')=='incoming' and not m.get('private')]
             if incoming:candidate['offer_token']=issue_offer(scope,candidate.pop('message_id'),max(int(m['id']) for m in incoming))
             else:candidate=None
-        return {'order_reference':public_text(order['name']),'order_status':{'sale':'confirmed','done':'confirmed','draft':'not_confirmed','sent':'not_confirmed','cancel':'cancelled'}.get(order['state'],'needs_review'),'post_order':cases,'email_history':history,'resend_offer':candidate,'instruction':RULES}
+        return {'order_reference':public_text(order['name']),'order_status':{'sale':'confirmed','done':'confirmed','draft':'not_confirmed','sent':'not_confirmed','cancel':'cancelled'}.get(order['state'],'needs_review'),'dispatch':dispatch,'post_order':cases,'email_history':history,'resend_offer':candidate,'instruction':RULES}
 
     @router.post(PREFIX+'/{store}/{website}/{inbox}/resend')
     def resend(payload:Resend,request:Request,store:int,website:int,inbox:int):
