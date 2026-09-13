@@ -31,17 +31,18 @@ export function LineAlternativeButton({ lineId, name, request }: { lineId: numbe
     }).catch(error => current && setMessage(String(error))).finally(() => current && setBusy(false))
     return () => { current = false }
   }, [open, lineId, request])
-  async function save() {
+  async function save(noAlternatives = false) {
+    if(noAlternatives && !window.confirm('Confirm no suitable alternatives are available for this line after sourcing review. An email will be prepared only when all affected lines are reviewed; it will still require send approval.')) return
     setBusy(true); setMessage('')
     try {
       const result = await request<{message: string}>(`/api/after-order/cases/${caseId}/lines/${lineId}/alternatives`, {
-        method: 'POST', body: JSON.stringify({references: references.split(/[\n,]+/).map(v => v.trim()).filter(Boolean), sourcing_checked: checked}),
+        method: 'POST', body: JSON.stringify({references: noAlternatives ? [] : references.split(/[\n,]+/).map(v => v.trim()).filter(Boolean), sourcing_checked: checked, no_alternatives: noAlternatives}),
       })
       setMessage(result.message)
     } catch (error) { setMessage(String(error)) } finally { setBusy(false) }
   }
   return <>
-    <Button size="sm" variant="outline" onClick={() => setOpen(true)}>Choose customer alternatives</Button>
+    <Button size="sm" variant="outline" className="h-auto min-h-8 w-full min-w-0 max-w-full whitespace-normal break-words px-2 py-1 text-left text-xs leading-tight" onClick={() => setOpen(true)}>Review alternatives</Button>
     <Dialog open={open} onOpenChange={setOpen}><DialogContent>
       <DialogHeader><DialogTitle>Alternatives for this line</DialogTitle><DialogDescription>{name} · line {lineId}</DialogDescription></DialogHeader>
       <label className="text-sm font-medium" htmlFor={`alternative-refs-${lineId}`}>Odoo Internal References, in recommendation order</label>
@@ -49,6 +50,7 @@ export function LineAlternativeButton({ lineId, name, request }: { lineId: numbe
       <p className="text-sm text-muted-foreground">Exact references are matched on this order’s store. After every affected line has recommendations, an email is prepared in the approval queue. It is not sent until the team approves it.</p>
       <label className="flex items-start gap-2 text-sm"><Checkbox checked={checked} onCheckedChange={value => setChecked(value === true)}/>I checked third-party and manual fulfilment; this item still needs a customer choice.</label>
       <Button disabled={busy || !checked || !references.trim() || !caseId} onClick={() => void save()}>{busy ? 'Checking…' : 'Save alternatives & prepare email'}</Button>
+      <Button variant="outline" disabled={busy || !checked || !caseId} onClick={() => void save(true)}>No alternatives available</Button>
       {message && <p role="status" className="text-sm whitespace-pre-wrap">{message}</p>}
     </DialogContent></Dialog>
   </>

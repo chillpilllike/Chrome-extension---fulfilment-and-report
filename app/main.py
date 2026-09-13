@@ -38760,6 +38760,9 @@ def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
         if review["blocked"] or (not after_order_email_test_mode() and not review["approved"]):
             return []
         actions = after_order_filter_removal(case, ["exclude_item_and_proceed", "offer_alternatives", "cancel_order"])
+        no_alternatives = alternative_workflow.unavailable_without_alternatives(case)
+        if no_alternatives and {int(item['line_id']) for item in case.get('affected_items') or []}.issubset(no_alternatives):
+            actions = [action for action in actions if action != 'offer_alternatives']
         if len(case.get('affected_items') or []) > 1 or after_order_removal_allowed(case):
             actions.append('remove_line')
         return actions
@@ -39416,6 +39419,9 @@ def after_order_email_content(
         pass
 
     if (template_kind or case.get('case_type')) == 'item_unavailable':
+        no_alternatives = alternative_workflow.unavailable_without_alternatives(case)
+        case = {**case,'context':{**(case.get('context') or {}),'no_alternative_line_ids':sorted(no_alternatives)},
+                'affected_items':[{**item,'no_alternatives':int(item['line_id']) in no_alternatives} for item in case.get('affected_items') or []]}
         offers = [offer for offer in alternative_workflow.rows(case['id'])
                   if offer['issue_fingerprint'] == request_fingerprint(case)]
         case = with_email_recommendations(case, offers, action_url)
@@ -39586,6 +39592,8 @@ def send_after_order_email(
         "alternative_payment": [],
     }
     allowed = showcase_actions.get(showcase_kind, after_order_allowed_actions(case) if not template_kind else [])
+    if unavailable_email and 'offer_alternatives' not in after_order_allowed_actions(case):
+        allowed = [action for action in allowed if action != 'offer_alternatives']
     allowed = after_order_filter_removal(case, allowed)
     action_url = ""
     branded_tracking_url = ""

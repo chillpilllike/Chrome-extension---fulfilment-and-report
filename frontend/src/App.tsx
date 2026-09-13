@@ -5022,7 +5022,7 @@ function App() {
         return row.store_name ? <Badge variant="outline">{row.store_name}</Badge> : <span className="text-muted-foreground">-</span>
       case "odoo_order":
         return (
-          <div className="grid justify-items-start gap-1">
+          <div className="grid min-w-0 w-full max-w-full justify-items-start gap-1">
             <OdooOrderRef name={row.odoo_order_name} url={row.odoo_order_url} linkClassName={row.state === "missing" ? "text-destructive" : ""} />
             {row.state === "missing" && !row.amazon_order_id && <LineAlternativeButton lineId={row.id} name={row.product_name || "Order item"} request={api}/>}
             {row.replacement_run_id ? (

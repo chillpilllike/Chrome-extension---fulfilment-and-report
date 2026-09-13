@@ -52,6 +52,11 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         "tracking": ("ON ITS WAY", "A little closer to your door.", "Your package has moved", "There’s a new update on your package. You can find the latest details below.", "Follow your delivery", "See the full tracking history and the latest carrier updates."),
     }
     eyebrow, heading, subject_text, intro, action_heading, note = content.get(kind, content["tracking"])
+    no_alternatives = kind == 'item_unavailable' and bool(context.get('no_alternative_line_ids')) and 'offer_alternatives' not in actions
+    if no_alternatives:
+        heading = 'An item in your order is unavailable.'
+        intro = 'Our team checked sourcing options but could not find suitable alternatives for the unavailable item or items below. Please choose how you would like to continue.'
+        note = 'Our team will review your choice before making changes or processing any refund.'
     if kind == "item_unavailable" and context.get('three_day_policy_enabled'):
         # Filtered actions, not row count: quantities/shipping/duplicate ASINs
         # do not establish that another fulfilable product will remain.
@@ -72,6 +77,8 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
             "a cheaper choice is reviewed for a difference refund. "
             "If you choose to remove an item, any amount paid for it is subject to our team's refund review and approval."
         )
+    if no_alternatives and context.get('three_day_policy_enabled'):
+        note = 'Please choose an option within 3 days of this notification. ' + outcome
     subject = f"{order} — {subject_text}"
     preheader = f"{subject_text} for {order}. {intro}"
     logo_url = safe_url(context.get("website_logo_url"))
@@ -81,6 +88,8 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     plain_items = []
     for item in case.get("affected_items") or []:
         name = str(item.get("product_name") or "Order item")
+        if item.get('no_alternatives'):
+            name += ' — No suitable alternatives available'
         quantity = str(item.get("quantity") or 1)
         if quantity.endswith(".0"):
             quantity = quantity[:-2]

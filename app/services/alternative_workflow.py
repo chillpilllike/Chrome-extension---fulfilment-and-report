@@ -17,6 +17,11 @@ from app.services.alternative_selection import moment, price_fingerprint, resolv
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS after_order_no_alternatives (
+ case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
+ line_id INTEGER NOT NULL, issue_fingerprint TEXT NOT NULL,
+ PRIMARY KEY(case_id,line_id)
+);
 CREATE TABLE IF NOT EXISTS after_order_line_offers (
     case_id INTEGER NOT NULL REFERENCES after_order_cases(id) ON DELETE CASCADE,
     line_id INTEGER NOT NULL REFERENCES order_lines(id) ON DELETE CASCADE,
@@ -59,8 +64,9 @@ ON after_order_line_activity(store_id,odoo_order_id,created_at);
 
 
 class Recommendations(BaseModel):
-    references: list[str] = Field(min_length=1, max_length=12)
+    references: list[str] = Field(default_factory=list, max_length=12)
     sourcing_checked: bool = False
+    no_alternatives: bool = False
 
 
 class RefundApproval(BaseModel):
@@ -127,6 +133,7 @@ class Workflow:
         test_mode = r.after_order_email_test_mode() if test_mode is None else test_mode
         with r.db() as conn:
             offers = [dict(row) for row in conn.execute('SELECT * FROM after_order_line_offers WHERE case_id=? ORDER BY line_id', (case_id,)).fetchall()]
+            unavailable = {row['line_id']:row['issue_fingerprint'] for row in conn.execute('SELECT line_id,issue_fingerprint FROM after_order_no_alternatives WHERE case_id=?',(case_id,)).fetchall()}
             selections = {row['line_id']: dict(row) for row in conn.execute(
                 'SELECT * FROM after_order_line_selections WHERE case_id=? AND test_mode=?', (case_id, int(test_mode))).fetchall()}
         result = []
@@ -138,7 +145,8 @@ class Workflow:
                 selection['product'] = json.loads(selection.pop('product_json'))
                 selection['result'] = json.loads(selection.pop('result_json'))
                 selection['locked'] = selection['status'] != 'choosing' or moment(selection['deadline_at']) <= datetime.now(timezone.utc)
-            result.append({**offer, 'recommendations': json.loads(offer['recommendations_json']), 'selection': selection})
+            recommendations = json.loads(offer['recommendations_json'])
+            result.append({**offer, 'recommendations': recommendations, 'no_alternatives': unavailable.get(offer['line_id'])==offer['issue_fingerprint'], 'selection': selection})
         return result
 
     def product(self, case, line, template_id=0, reference=''):
@@ -156,7 +164,9 @@ class Workflow:
         if not payload.sourcing_checked:
             raise HTTPException(400, 'Confirm that third-party and manual sourcing have been checked.')
         references = list(dict.fromkeys(ref.strip() for ref in payload.references if ref.strip()))
-        if not references:
+        if payload.no_alternatives and references:
+            raise HTTPException(400, 'Choose either alternatives or no alternatives, not both.')
+        if not references and not payload.no_alternatives:
             raise HTTPException(400, 'Enter at least one exact Odoo Internal Reference.')
         products = [self.product(case, line, reference=ref) for ref in references]
         if len({p['product_tmpl_id'] for p in products}) != len(products):
@@ -168,7 +178,15 @@ class Workflow:
                     (case_id, line_id, int(r.after_order_email_test_mode()))).fetchone():
                 raise HTTPException(409, 'A customer has already selected for this line. Recommendations cannot be changed during processing.')
             fresh, _ = self.case_line(case_id, line_id)
+            if fresh.get('confirmed_at') or fresh.get('status') == 'resolved':
+                raise HTTPException(409, 'This request has already been confirmed or resolved.')
+            if conn.execute("SELECT 1 FROM after_order_line_removals WHERE case_id=? AND line_id=? AND test_mode=? AND status!='withdrawn'",(case_id,line_id,int(r.after_order_email_test_mode()))).fetchone():
+                raise HTTPException(409, 'This line already has a removal request. Review it before changing sourcing.')
             fingerprint = r.request_fingerprint(fresh)
+            if payload.no_alternatives:
+                conn.execute('INSERT INTO after_order_no_alternatives(case_id,line_id,issue_fingerprint) VALUES(?,?,?) ON CONFLICT(case_id,line_id) DO UPDATE SET issue_fingerprint=excluded.issue_fingerprint',(case_id,line_id,fingerprint))
+            else:
+                conn.execute('DELETE FROM after_order_no_alternatives WHERE case_id=? AND line_id=?',(case_id,line_id))
             conn.execute('''INSERT INTO after_order_line_offers
                 (case_id,line_id,recommendations_json,issue_fingerprint,published_at) VALUES(?,?,?,?,?)
                 ON CONFLICT(case_id,line_id) DO UPDATE SET recommendations_json=excluded.recommendations_json,
@@ -177,23 +195,28 @@ class Workflow:
             review = r.after_order_unavailable_review(fresh)
             r.record_after_order_event(conn, case_id, 'unavailable_sourcing_review_approved', actor_type='team',
                 actor_label='Team selected alternatives after sourcing review', details={'signature': review['signature']})
-            self.event(conn, case, 'line_alternatives_published', line_id, actor='team', products=[{'reference': p['default_code'], 'name': p['name']} for p in products])
+            self.event(conn, case, 'line_no_alternatives_available' if payload.no_alternatives else 'line_alternatives_published', line_id, actor='team', products=[{'reference': p['default_code'], 'name': p['name']} for p in products])
         # No email until every currently affected line has a prepared recommendation.
         if not self.ready(case):
-            return {'ok': True, 'message': 'Alternatives saved. Prepare the remaining affected lines before the customer is notified.'}
+            return {'ok': True, 'message': 'Sourcing decision saved. Add alternatives or mark no alternatives for the remaining affected lines before preparing the email.'}
         result = r.send_after_order_email(case_id, request)
         return {'ok': True, 'message': result.get('message') or 'Alternatives saved and notification submitted.', 'email': result}
 
     def ready(self, case):
         rows = self.rows(case['id'])
         current = self.r.request_fingerprint(case)
-        ready = {row['line_id'] for row in rows if row['issue_fingerprint'] == current and row['recommendations']}
+        ready = {row['line_id'] for row in rows if row['issue_fingerprint'] == current and (row['recommendations'] or row.get('no_alternatives'))}
         affected = {int(i['line_id']) for i in case['affected_items']}
         return bool(affected and affected.issubset(ready))
 
     def notification_revision(self, case):
-        return hashlib.sha256(json.dumps([{'line_id':row['line_id'], 'recommendations':row['recommendations']}
+        return hashlib.sha256(json.dumps([{'line_id':row['line_id'], 'recommendations':row['recommendations'], 'no_alternatives':bool(row.get('no_alternatives'))}
             for row in self.rows(case['id'])],sort_keys=True).encode()).hexdigest()
+
+    def unavailable_without_alternatives(self, case):
+        fingerprint = self.r.request_fingerprint(case)
+        return {int(row['line_id']) for row in self.rows(case['id'])
+                if row['issue_fingerprint']==fingerprint and row.get('no_alternatives')}
 
     def log_quote_email(self, conn, case, line_id, result):
         mail = result.get('mail') or {}
@@ -268,6 +291,8 @@ class Workflow:
         test_mode = bool(link.get('test_mode')) or r.after_order_email_test_mode()
         if not self.ready(case):
             raise HTTPException(409, 'Our team is preparing the current alternatives.')
+        if line_id in self.unavailable_without_alternatives(case):
+            raise HTTPException(409, 'No alternatives are currently available for this item. Please choose removal or cancellation.')
         recommended = [p for offer in self.rows(case['id'],test_mode) if offer['line_id'] == line_id
                        for p in offer['recommendations'] if p['product_tmpl_id'] == template_id]
         product = self.product(case, line, reference=recommended[0]['default_code']) if recommended else self.product(case,line,template_id=template_id)
@@ -282,6 +307,8 @@ class Workflow:
             if not fresh_link or fresh_link['invalidated_at']:
                 raise HTTPException(410, 'This link has expired.')
             fresh, _ = self.case_line(case['id'], line_id)
+            if line_id in self.unavailable_without_alternatives(fresh):
+                raise HTTPException(409, 'Sourcing changed: no alternatives are available for this line.')
             if r.request_fingerprint(fresh) != r.request_fingerprint(case):
                 raise HTTPException(409, 'This order changed. Reload before choosing.')
             prior = conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=?',
