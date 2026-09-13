@@ -6,7 +6,7 @@ path to the non-secret multisite-widgets.json mapping for additional configured 
 import os,sys
 from pathlib import Path
 from app.support.post_order_chat import scope_key
-import urllib.request,json,uuid
+import requests,json,uuid
 h={'Authorization':'token '+os.environ['SUPPORT_LIBREDESK_API_KEY']+':'+os.environ['SUPPORT_LIBREDESK_API_SECRET']}
 # An explicit inventory is required; never guess a website's linked email inbox.
 if len(sys.argv)<2:raise SystemExit('Supply the verified multisite-widgets.json inventory path.')
@@ -22,7 +22,9 @@ def api(method,path,data=None,form=False):
   boundary='postorder'+uuid.uuid4().hex
   body=('--'+boundary+'\r\nContent-Disposition: form-data; name="data"\r\n\r\n'+json.dumps(data)+'\r\n--'+boundary+'--\r\n').encode();headers['Content-Type']='multipart/form-data; boundary='+boundary
  elif data is not None:body=json.dumps(data).encode();headers['Content-Type']='application/json'
- with urllib.request.urlopen(urllib.request.Request(base+path,data=body,headers=headers,method=method),timeout=30) as r:return json.load(r)['data']
+ r=requests.request(method,base+path,data=body,headers=headers,timeout=35)
+ if not r.ok:raise RuntimeError('LibreDesk HTTP '+str(r.status_code))
+ return r.json()['data']
 boxes={x['id']:x for x in api('GET','/inboxes')};tools=api('GET','/ai/tools');byid={x['id']:x for x in tools};byname={x['name']:x for x in tools}
 result=[]
 for brief in api('GET','/ai/assistants'):
@@ -56,5 +58,6 @@ for brief in api('GET','/ai/assistants'):
  check=api('GET','/ai/assistants/'+str(a['id']))
  checked=check.get('tool_ids') or [x['id'] if isinstance(x,dict) else x for x in check.get('tools',[])]
  assert set(added)<=set(checked) and marker in check['instructions']
+ print('Configured',inbox,flush=True)
  result.append({'assistant_id':a['id'],'inbox_id':inbox,'store_id':row['store_id'],'website_id':row['website_id'],'tool_ids':added})
 print(json.dumps(result))

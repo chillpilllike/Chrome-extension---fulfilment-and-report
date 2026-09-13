@@ -1,0 +1,469 @@
+{
+  "verified_active_websites": 58,
+  "websites": [
+    {
+      "inbox_id": 92,
+      "assistant_id": 10,
+      "routing_rule_ids": [
+        14
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 93,
+      "assistant_id": 9,
+      "routing_rule_ids": [
+        12
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 94,
+      "assistant_id": 11,
+      "routing_rule_ids": [
+        13
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 95,
+      "assistant_id": 13,
+      "routing_rule_ids": [
+        15
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 96,
+      "assistant_id": 12,
+      "routing_rule_ids": [
+        16
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 97,
+      "assistant_id": 14,
+      "routing_rule_ids": [
+        17
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 98,
+      "assistant_id": 15,
+      "routing_rule_ids": [
+        18
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 99,
+      "assistant_id": 16,
+      "routing_rule_ids": [
+        19
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 100,
+      "assistant_id": 17,
+      "routing_rule_ids": [
+        20
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 101,
+      "assistant_id": 18,
+      "routing_rule_ids": [
+        21
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 102,
+      "assistant_id": 19,
+      "routing_rule_ids": [
+        22
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 103,
+      "assistant_id": 20,
+      "routing_rule_ids": [
+        23
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 104,
+      "assistant_id": 21,
+      "routing_rule_ids": [
+        24
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 106,
+      "assistant_id": 22,
+      "routing_rule_ids": [
+        25
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 108,
+      "assistant_id": 23,
+      "routing_rule_ids": [
+        26
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 109,
+      "assistant_id": 24,
+      "routing_rule_ids": [
+        27
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 110,
+      "assistant_id": 25,
+      "routing_rule_ids": [
+        28
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 113,
+      "assistant_id": 26,
+      "routing_rule_ids": [
+        29
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 114,
+      "assistant_id": 27,
+      "routing_rule_ids": [
+        31
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 115,
+      "assistant_id": 28,
+      "routing_rule_ids": [
+        30
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 122,
+      "assistant_id": 29,
+      "routing_rule_ids": [
+        32
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 124,
+      "assistant_id": 30,
+      "routing_rule_ids": [
+        33
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 125,
+      "assistant_id": 31,
+      "routing_rule_ids": [
+        34
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 126,
+      "assistant_id": 32,
+      "routing_rule_ids": [
+        35
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 127,
+      "assistant_id": 33,
+      "routing_rule_ids": [
+        36
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 128,
+      "assistant_id": 34,
+      "routing_rule_ids": [
+        37
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 130,
+      "assistant_id": 35,
+      "routing_rule_ids": [
+        38
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 132,
+      "assistant_id": 36,
+      "routing_rule_ids": [
+        39
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 133,
+      "assistant_id": 37,
+      "routing_rule_ids": [
+        40
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 134,
+      "assistant_id": 38,
+      "routing_rule_ids": [
+        41
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 136,
+      "assistant_id": 39,
+      "routing_rule_ids": [
+        42
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 137,
+      "assistant_id": 40,
+      "routing_rule_ids": [
+        43
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 139,
+      "assistant_id": 41,
+      "routing_rule_ids": [
+        44
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 140,
+      "assistant_id": 42,
+      "routing_rule_ids": [
+        46
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 141,
+      "assistant_id": 43,
+      "routing_rule_ids": [
+        45
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 144,
+      "assistant_id": 44,
+      "routing_rule_ids": [
+        47
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 145,
+      "assistant_id": 45,
+      "routing_rule_ids": [
+        48
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 146,
+      "assistant_id": 46,
+      "routing_rule_ids": [
+        49
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 148,
+      "assistant_id": 47,
+      "routing_rule_ids": [
+        50
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 149,
+      "assistant_id": 50,
+      "routing_rule_ids": [
+        51
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 150,
+      "assistant_id": 49,
+      "routing_rule_ids": [
+        52
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 151,
+      "assistant_id": 48,
+      "routing_rule_ids": [
+        53
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 153,
+      "assistant_id": 52,
+      "routing_rule_ids": [
+        54
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 154,
+      "assistant_id": 51,
+      "routing_rule_ids": [
+        55
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 155,
+      "assistant_id": 53,
+      "routing_rule_ids": [
+        56
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 156,
+      "assistant_id": 54,
+      "routing_rule_ids": [
+        57
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 157,
+      "assistant_id": 55,
+      "routing_rule_ids": [
+        58
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 162,
+      "assistant_id": 56,
+      "routing_rule_ids": [
+        59
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 163,
+      "assistant_id": 57,
+      "routing_rule_ids": [
+        60
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 164,
+      "assistant_id": 58,
+      "routing_rule_ids": [
+        61
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 1,
+      "assistant_id": 1,
+      "routing_rule_ids": [
+        1
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 165,
+      "assistant_id": 2,
+      "routing_rule_ids": [
+        5
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 166,
+      "assistant_id": 3,
+      "routing_rule_ids": [
+        6
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 167,
+      "assistant_id": 4,
+      "routing_rule_ids": [
+        7
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 168,
+      "assistant_id": 5,
+      "routing_rule_ids": [
+        8
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 169,
+      "assistant_id": 6,
+      "routing_rule_ids": [
+        9
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 170,
+      "assistant_id": 7,
+      "routing_rule_ids": [
+        10
+      ],
+      "unverified_blocked": true
+    },
+    {
+      "inbox_id": 171,
+      "assistant_id": 8,
+      "routing_rule_ids": [
+        11
+      ],
+      "unverified_blocked": true
+    }
+  ]
+}
