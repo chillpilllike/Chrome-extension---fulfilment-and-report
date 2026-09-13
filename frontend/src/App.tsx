@@ -628,7 +628,7 @@ type DispatchStatusSummary = {
 }
 
 type PackagePickupRow = {
-  source_type: "amazon" | "manual_amazon" | "count_amazon" | "non_amazon"
+  source_type: "amazon" | "manual_amazon" | "count_amazon" | "non_amazon" | "third_party"
   source_id: number
   store_id: number
   odoo_order_name: string
@@ -3121,6 +3121,62 @@ function UiCopyDialog({
   )
 }
 
+type ThirdPartyPackage = { id: number; scan_code: string; tracking_url: string; order_line_ids_json: string; received_at?: string }
+
+function ThirdPartyTrackingDialog({ lines, onClose, onSaved }: { lines: OrderLine[]; onClose: () => void; onSaved: (message: string) => void }) {
+  const [packages, setPackages] = useState<ThirdPartyPackage[]>([])
+  const [trackingId, setTrackingId] = useState("")
+  const [trackingUrl, setTrackingUrl] = useState("")
+  const [editing, setEditing] = useState<ThirdPartyPackage | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState("")
+  const first = lines[0]
+  useEffect(() => {
+    if (!first) return
+    let active = true
+    setTrackingId(""); setTrackingUrl(""); setEditing(null); setPackages([]); setError(""); setLoading(true)
+    api<{ packages: ThirdPartyPackage[] }>(`/api/lines/third-party-tracking?store_id=${first.store_id}&line_ids=${lines.map(line => line.id).join(",")}`)
+      .then(result => { if (active) setPackages(result.packages) })
+      .catch(err => { if (active) setError(String(err)) })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [lines])
+  async function save() {
+    if (!first) return
+    setBusy(true); setError("")
+    try {
+      const result = await api<{message: string}>("/api/lines/third-party-tracking", {method: "POST", body: JSON.stringify({
+        store_id: first.store_id, line_ids: editing ? JSON.parse(editing.order_line_ids_json) : lines.map(line => line.id),
+        package_id: editing?.id, tracking_id: trackingId, tracking_url: trackingUrl,
+      })})
+      onSaved(result.message)
+    } catch (err) { setError(String(err)) } finally { setBusy(false) }
+  }
+  return <Dialog open={Boolean(first)} onOpenChange={open => { if (!open && !busy) onClose() }}>
+    <DialogContent className="sm:max-w-xl">
+      <DialogHeader><DialogTitle>Third-party tracking · {first?.odoo_order_name}</DialogTitle>
+        <DialogDescription>Add tracking when the supplier dispatches. The dispatch team's scan will match this package to the order, including earlier unmatched scans.</DialogDescription></DialogHeader>
+      <div className="grid gap-4">
+        <p className="text-sm">{lines.length} selected line(s) · Supplier reference: {first?.amazon_order_id}</p>
+        {loading ? <p>Loading assigned packages…</p> : packages.length > 0 && <div className="grid gap-2">
+          <strong className="text-sm">Assigned packages</strong>
+          {packages.map(pkg => <div key={pkg.id} className="flex items-center justify-between gap-3 rounded border p-2 text-sm">
+            <span>{pkg.tracking_url ? <a href={pkg.tracking_url} target="_blank" rel="noreferrer" className="underline">{pkg.scan_code}</a> : pkg.scan_code}<small className="block text-muted-foreground">{pkg.received_at ? "Received" : "Awaiting receipt"}</small></span>
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => { setEditing(pkg); setTrackingId(pkg.scan_code); setTrackingUrl(pkg.tracking_url || "") }}>Edit</Button>
+          </div>)}
+        </div>}
+        <TextField label="Tracking ID" value={trackingId} onChange={setTrackingId} />
+        <TextField label="Tracking URL (optional)" value={trackingUrl} onChange={setTrackingUrl} />
+        <p className="text-xs text-muted-foreground">One tracking ID per package. Add another package separately for split shipments. Saving tracking does not mark the package received.</p>
+        {editing && <Button variant="outline" disabled={busy} onClick={() => { setEditing(null); setTrackingId(""); setTrackingUrl("") }}>Add a different package</Button>}
+        {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+      </div>
+      <DialogFooter><Button variant="outline" disabled={busy} onClick={onClose}>Cancel</Button><Button disabled={busy || loading || !trackingId.trim()} onClick={() => void save()}>{busy ? "Saving…" : editing ? "Update tracking" : "Assign tracking"}</Button></DialogFooter>
+    </DialogContent>
+  </Dialog>
+}
+
 function ManualFulfilmentDialog({
   open,
   selectedCount,
@@ -3605,6 +3661,7 @@ function App() {
   const [editingSpaid, setEditingSpaid] = useState<OrderLine | null>(null)
   const [editingReplacement, setEditingReplacement] = useState<OrderLine | null>(null)
   const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
+  const [thirdPartyTrackingLines, setThirdPartyTrackingLines] = useState<OrderLine[]>([])
   const [inventoryFulfilmentOpen, setInventoryFulfilmentOpen] = useState(false)
   const [inventoryFulfilmentItems, setInventoryFulfilmentItems] = useState<InventoryItem[]>([])
   const [selectedInventoryId, setSelectedInventoryId] = useState<number | null>(null)
@@ -5074,7 +5131,7 @@ function App() {
       case "amazon_account":
         return row.amazon_account_name
       case "tracking":
-        return row.tracking_status
+        return row.order_engine === "third_party" ? <div className="grid gap-1"><span>{row.tracking_status}</span><Button size="sm" variant="outline" onClick={() => setThirdPartyTrackingLines([row])}>Assign tracking</Button></div> : row.tracking_status
       case "cancelled_earlier":
         return row.amazon_cancelled_at ? <Badge className="bg-red-100 text-red-700 hover:bg-red-100">Yes</Badge> : <Badge variant="outline">No</Badge>
       case "amazon_order":
@@ -5221,6 +5278,11 @@ function App() {
         onClose={() => setEditingCopyKey(null)}
         onSave={(value) => editingCopyKey ? saveUiCopy(editingCopyKey, value) : Promise.resolve()}
       />
+      <ThirdPartyTrackingDialog lines={thirdPartyTrackingLines} onClose={() => setThirdPartyTrackingLines([])} onSaved={message => {
+        setThirdPartyTrackingLines([])
+        setModal({ok: true, title: "Third-party tracking saved", message})
+        void refreshCurrentOrdersPage()
+      }} />
       <ManualFulfilmentDialog
         open={manualFulfilmentOpen}
         selectedCount={selected.length}
@@ -5943,6 +6005,7 @@ function App() {
                       <CheckCircle2 className="size-4" />
                       Manually Fulfilled
                     </Button>
+                    <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy) || !selectedRows.length || selectedRows.some(row => row.order_engine !== "third_party") || new Set(selectedRows.map(row => row.odoo_order_id)).size !== 1} onClick={() => setThirdPartyTrackingLines(selectedRows)}>Assign third-party tracking</Button>
 	                    <Button
 	                      variant="outline"
 	                      disabled={!canRunSelectedStoreAction || selected.length !== 1 || Boolean(busy)}
@@ -7161,7 +7224,7 @@ function PackagePickupPage({
         {
           amazon: String(card.amazon_picked_up),
           nonAmazon: String(card.non_amazon_picked_up),
-          orderNumbers: card.non_amazon_packages.map((row) => row.odoo_order_name).filter(Boolean).join("\n"),
+          orderNumbers: card.non_amazon_packages.filter(row => row.source_type !== "third_party").map((row) => row.odoo_order_name).filter(Boolean).join("\n"),
         },
       ])))
     } catch (error) {
@@ -7265,10 +7328,8 @@ function PackagePickupPage({
   async function processPickupScan(rawCode: string, manualEntry = false) {
     const code = rawCode.trim()
     if (!code) return
-    if (!manualEntry && !isPhysicalDispatchBarcode(code)) {
-      setPickupScanFeedback("error", "Non-tracking label ignored. Scan the long barcode beside the printed TBA tracking number.")
-      return
-    }
+    // The API also recognizes exact third-party tracking assignments whose
+    // carrier formats are outside the Amazon barcode list.
     setPickupScannerStatus(`Checking ${code}…`)
     try {
       const result = await api<PackagePickupScanResponse>("/api/package-pickups/scan", {
@@ -8183,7 +8244,7 @@ function PackagePickupPage({
                           ) : row.source_type !== "non_amazon" ? <span className="text-muted-foreground">Not captured</span> : "—"}
                         </span>
                         <span data-label="Delivery / scan times" className="pickup-package-times">
-                          <small>Amazon delivered · {row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true }) || "Not recorded"}</small>
+                          <small>{row.source_type === "third_party" ? "Receipt / expected" : "Amazon delivered"} · {row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true }) || "Not recorded"}</small>
                           {row.pickup_scanned_at ? <small className="is-scanned">Pickup scanned · {formatDateTime(row.pickup_scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small> : <small className="is-pending">Pickup scan pending</small>}
                         </span>
                         <span data-label="Type"><span className={`pickup-type ${row.source_type}`}>{row.package_type}</span></span>

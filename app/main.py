@@ -55,6 +55,7 @@ from app.core.time import utc_now
 from app.db.session import db
 from app.db import session as db_session
 from app import redis_support
+from app.schemas.payloads import ThirdPartyTrackingPayload
 from app.schemas import (
     AddressPayload,
     AdminSettingsPayload,
@@ -2080,6 +2081,8 @@ def init_db() -> None:
             if column not in existing_pickup_scan_cols:
                 conn.execute(ddl)
         existing_dispatch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(amazon_dispatch_packages)").fetchall()}
+        if "source_type" not in existing_dispatch_cols:
+            conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN source_type TEXT NOT NULL DEFAULT 'amazon'")
         if "canonical_scan_code" not in existing_dispatch_cols:
             conn.execute("ALTER TABLE amazon_dispatch_packages ADD COLUMN canonical_scan_code TEXT")
         if "recipient_ref" not in existing_dispatch_cols:
@@ -34444,9 +34447,9 @@ def package_pickup_data(
             f"""
             SELECT packages.*
             FROM amazon_dispatch_packages packages
-            WHERE LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) ~ '(^|[^a-z])delivered([^a-z]|$)'
+            WHERE (packages.source_type='third_party' OR (LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) ~ '(^|[^a-z])delivered([^a-z]|$)'
               AND LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) NOT LIKE '%not delivered%'
-              AND LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) NOT LIKE '%cancel%'
+              AND LOWER(COALESCE(packages.package_status, '') || ' ' || COALESCE(packages.promise, '')) NOT LIKE '%cancel%'))
               {store_sql}
             ORDER BY packages.updated_at DESC
             LIMIT 10000
@@ -34661,7 +34664,7 @@ def package_pickup_data(
 
     pickup_delivery_snapshots: list[tuple[str, int]] = []
     for package in packages:
-        if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
+        if not third_party_package(package) and package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
             continue
         line_matches = lines_by_amazon.get((int(package.get("store_id") or 0), clean_text(package.get("amazon_order_id"))), [])
         primary_line = next((line for line in line_matches if clean_text(line.get("odoo_order_name")).upper() == clean_text(package.get("odoo_order_name")).upper()), None)
@@ -34669,7 +34672,7 @@ def package_pickup_data(
         tracking_id = next((
             normalize_dispatch_scan_code(value)
             for value in (package.get("canonical_scan_code"), package.get("scan_code"), package.get("display_code"))
-            if package_tracking_id_is_physical(value)
+            if third_party_package(package) or package_tracking_id_is_physical(value)
         ), "")
         matched_tracking_part: dict[str, Any] = {}
         matched_tracking_checked_at = ""
@@ -34696,9 +34699,11 @@ def package_pickup_data(
             matched_tracking_checked_at or clean_text(primary_line.get("tracking_checked_at")) or clean_text(package.get("updated_at")),
         )
         delivered_at = package_pickup_delivery_timestamp(package, delivery_info, primary_line)
+        if third_party_package(package):
+            delivered_at = clean_text(package.get("pickup_scanned_at") or package.get("received_at") or package.get("promise") or package.get("created_at"))
         delivered_display = clean_text(delivery_info.get("amazon_delivered_display"))
         package_id = int(package.get("id") or 0)
-        if delivered_at and not clean_text(package.get("pickup_delivered_at")):
+        if delivered_at and not third_party_package(package) and not clean_text(package.get("pickup_delivered_at")):
             pickup_delivery_snapshots.append((delivered_at, package_id))
         delivery_date = package_pickup_business_date(delivered_at, delivered_display)
         scanned_at = clean_text(package.get("pickup_scanned_at"))
@@ -34719,8 +34724,8 @@ def package_pickup_data(
         carrier = clean_text(package.get("carrier") or matched_tracking_part.get("carrier") or matched_tracking_part.get("carrier_name"))
         if len(carrier) > 40 or re.search(r"\b(sorry|delivery|delivered|package|estimate|notify|updates?)\b", carrier, re.IGNORECASE):
             carrier = "Amazon"
-        ensure_card(pickup_date)["amazon_packages"].append({
-            "source_type": "amazon",
+        ensure_card(pickup_date)["non_amazon_packages" if third_party_package(package) else "amazon_packages"].append({
+            "source_type": "third_party" if third_party_package(package) else "amazon",
             "source_id": package_id,
             "store_id": int(package.get("store_id") or 0),
             "odoo_order_name": order_name,
@@ -34728,8 +34733,8 @@ def package_pickup_data(
             "amazon_order_url": clean_text(package.get("amazon_order_url") or primary_line.get("amazon_order_url")),
             "tracking_id": tracking_id,
             "tracking_url": clean_text(package.get("tracking_url") or matched_tracking_part.get("tracking_url") or matched_tracking_part.get("trackingUrl")),
-            "carrier": carrier or "Amazon",
-            "delivery_status": clean_text(package.get("package_status") or package.get("promise") or matched_tracking_part.get("status")) or "Delivered",
+            "carrier": carrier or ("Third party" if third_party_package(package) else "Amazon"),
+            "delivery_status": "Received" if third_party_package(package) and received else clean_text(package.get("package_status") or package.get("promise") or matched_tracking_part.get("status")) or "Delivered",
             "delivered_at": delivered_at,
             "delivered_display": delivered_display,
             "delivery_date": delivery_date,
@@ -34738,7 +34743,7 @@ def package_pickup_data(
             "pickup_scanned_code": clean_text(package.get("pickup_scanned_code")),
             "pickup_scan_count": int(package.get("pickup_scan_count") or 0),
             "pickup_card_date": pickup_date,
-            "package_type": "Amazon",
+            "package_type": "Third party" if third_party_package(package) else "Amazon",
             "shopify_status": clean_text(status.get("fulfillment_status")) or "Pending",
             "shopify_fulfilled": fulfilled,
             "received": received,
@@ -34853,6 +34858,7 @@ def package_pickup_data(
         card["amazon_reported_delivered"] = len(card["amazon_packages"])
         card["reported_delivered"] = len(card["amazon_packages"])
         scanned_received = sum(1 for row in card["amazon_packages"] if clean_text(row.get("pickup_scanned_at")))
+        card["non_amazon_picked_up"] = max(int(card["non_amazon_picked_up"]), sum(1 for row in card["non_amazon_packages"] if clean_text(row.get("pickup_scanned_at"))))
         card["amazon_scanned"] = scanned_received
         card["amazon_picked_up"] = max(int(card["amazon_picked_up"]), scanned_received)
         card["missing_amazon"] = sum(
@@ -34989,7 +34995,7 @@ def package_pickup_manual_scan_matches(conn: Any, entered_value: str, store_id: 
             row.get("canonical_scan_code"), row.get("scan_code"), row.get("last_scanned_code"),
             *dispatch_scanned_codes(row),
         ]
-        if any(package_tracking_id_is_physical(value) and package_pickup_tracking_matches(entered, value) for value in tracking_values):
+        if any((third_party_package(row) or package_tracking_id_is_physical(value)) and package_pickup_tracking_matches(entered, value) for value in tracking_values):
             matches.append(row)
     return matches
 
@@ -35285,7 +35291,17 @@ def repair_package_pickup_scan_history(conn: Any) -> dict[str, Any]:
     }
 
 
-def reconcile_package_pickup_scans(conn: Any) -> int:
+def change_package_pickup_count(conn: Any, package: dict[str, Any], scan_date: str, delta: int, now: str) -> None:
+    column = "non_amazon_picked_up" if third_party_package(package) else "amazon_picked_up"
+    conn.execute(f"""INSERT INTO package_pickup_checks
+        (store_id, pickup_date, amazon_picked_up, non_amazon_picked_up, created_at, updated_at)
+        VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(store_id, pickup_date) DO NOTHING""",
+        (package["store_id"], scan_date, now, now))
+    conn.execute(f"UPDATE package_pickup_checks SET {column}=GREATEST(0, {column}+?), updated_at=? WHERE store_id=? AND pickup_date=?",
+                 (delta, now, package["store_id"], scan_date))
+
+
+def reconcile_package_pickup_scans(conn: Any, only_scan_code: str = "") -> int:
     """Resolve saved physical scans once exact delivered package data arrives.
 
     Retain the physical timestamp and original failure. Lock both the event and
@@ -35296,15 +35312,14 @@ def reconcile_package_pickup_scans(conn: Any) -> int:
         SELECT * FROM package_pickup_scan_events
         WHERE matched=0 AND undone_at IS NULL
           AND result_status IN ('not_found', 'not_delivered')
+          AND (?='' OR scan_code=?)
         ORDER BY scanned_at, id LIMIT 500
         FOR UPDATE SKIP LOCKED
-    """).fetchall())
+    """, (only_scan_code, only_scan_code)).fetchall())
     resolved = 0
     now = utc_now()
     for event in events:
         code = normalize_dispatch_scan_code(event.get("scan_code"))
-        if not dispatch_scan_code_is_physical(code):
-            continue
         matches = package_pickup_strict_scan_matches(conn, code, int(event.get("store_id") or 0) or None)
         if len(matches) != 1:
             continue
@@ -35316,7 +35331,7 @@ def reconcile_package_pickup_scans(conn: Any) -> int:
         ).fetchone()) or {}
         if not package or not clean_text(package.get("odoo_order_name")):
             continue
-        if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
+        if not third_party_package(package) and package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
             continue
         if amazon_order_has_open_payment_failure(conn, package.get("amazon_order_id")):
             continue
@@ -35330,7 +35345,9 @@ def reconcile_package_pickup_scans(conn: Any) -> int:
         # Do not attach an old scan to a parcel Amazon reports delivered on a
         # later calendar day. Unknown delivery dates also need more evidence.
         delivery_date = clean_text(delivered_at)[:10]
-        if not scan_date or not delivery_date or delivery_date > scan_date:
+        if third_party_package(package):
+            delivered_at = scanned_at
+        elif not scan_date or not delivery_date or delivery_date > scan_date:
             continue
         existing = row_to_dict(conn.execute(
             "SELECT * FROM package_pickup_delivery_records WHERE package_id=?", (package["id"],)
@@ -35352,13 +35369,8 @@ def reconcile_package_pickup_scans(conn: Any) -> int:
                     not_received_at=NULL, updated_at=? WHERE id=?
             """, (scanned_at, now, package["id"]))
             package["received_at"] = package.get("received_at") or scanned_at
-            conn.execute("""
-                INSERT INTO package_pickup_checks
-                    (store_id, pickup_date, amazon_picked_up, non_amazon_picked_up, created_at, updated_at)
-                VALUES (?, ?, 1, 0, ?, ?)
-                ON CONFLICT(store_id, pickup_date) DO UPDATE SET
-                    amazon_picked_up=package_pickup_checks.amazon_picked_up+1, updated_at=excluded.updated_at
-            """, (package["store_id"], scan_date, now, now))
+            change_package_pickup_count(conn, package, scan_date, 1, now)
+
         readiness = package_pickup_order_readiness(conn, package)
         message = f"{package['odoo_order_name']} matched after tracking refresh. Original physical scan time retained."
         if duplicate:
@@ -35600,14 +35612,8 @@ def reset_package_pickup_scan_event(conn: Any, event: dict[str, Any], reset_at: 
         (reset_at, package_id, first_scanned_at),
     )
     store_id = int(event.get("store_id") or 0)
-    conn.execute(
-        """
-        UPDATE package_pickup_checks
-        SET amazon_picked_up=CASE WHEN amazon_picked_up>0 THEN amazon_picked_up-1 ELSE 0 END, updated_at=?
-        WHERE store_id=? AND pickup_date=?
-        """,
-        (reset_at, store_id, scan_date),
-    )
+    count_package = row_to_dict(conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (package_id,)).fetchone()) or {"store_id": store_id}
+    change_package_pickup_count(conn, count_package, scan_date, -1, reset_at)
     conn.execute(
         "UPDATE package_pickup_scan_events SET undone_at=?, undone_reason=? WHERE package_id=? AND undone_at IS NULL AND scanned_at>=? AND scanned_at<?",
         (reset_at, reason, package_id, event.get("day_start_utc"), event.get("day_end_utc")),
@@ -35683,7 +35689,11 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
     if not scan_code:
         raise HTTPException(400, "scan_code is required")
     barcode_kind = dispatch_barcode_kind(query_text)
+    assigned_third_party = False
     if not payload.manual_entry and not dispatch_scan_code_is_physical(query_text):
+        with db() as conn:
+            assigned_third_party = any(third_party_package(p) for p in package_pickup_strict_scan_matches(conn, scan_code, payload.store_id))
+    if not payload.manual_entry and not dispatch_scan_code_is_physical(query_text) and not assigned_third_party:
         return {
             "ok": True,
             "matched": False,
@@ -35733,7 +35743,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             message = (
                 f"No expected package has a tracking ID ending in {scan_code}. Enter more characters or check the printed tracking ID."
                 if payload.manual_entry
-                else f"Barcode {query_text} is not linked to an expected Amazon package."
+                else f"Barcode {query_text} is not linked to an expected package. Assign third-party tracking in Orders, or refresh Amazon tracking."
             )
             event_id = record_package_pickup_scan_event(
                 conn, scan_code=scan_code, result_status="manual_not_found" if payload.manual_entry else "not_found", matched=False,
@@ -35750,7 +35760,7 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
         package = row_to_dict(conn.execute(
             "SELECT * FROM amazon_dispatch_packages WHERE id=? FOR UPDATE", (matches[0]["id"],)
         ).fetchone()) or matches[0]
-        if package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
+        if not third_party_package(package) and package_tracker_delivery_kind(package.get("package_status"), package.get("promise")) != "delivered":
             message = (
                 f"Matched {clean_text(package.get('odoo_order_name')) or 'the package'}, but the saved Amazon status is not delivered. "
                 "Refresh its Amazon tracking page; this saved scan will be matched automatically once delivery is confirmed."
@@ -35782,6 +35792,8 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
             package.get("promise"),
             package.get("updated_at"),
         ) or clean_text(package.get("updated_at")) or now
+        if third_party_package(package):
+            delivered_at = first_scanned_at
         merged_codes = clean_text(package.get("scanned_codes_json")) or "[]"
         if not duplicate:
             conn.execute(
@@ -35819,17 +35831,8 @@ def api_package_pickup_scan(payload: PackagePickupScanPayload) -> dict[str, Any]
         scan_date = package_pickup_business_date(first_scanned_at)
         if not duplicate and scan_date:
             package_store_id = int(package.get("store_id") or 0)
-            conn.execute(
-                """
-                INSERT INTO package_pickup_checks
-                    (store_id, pickup_date, amazon_picked_up, non_amazon_picked_up, created_at, updated_at)
-                VALUES (?, ?, 1, 0, ?, ?)
-                ON CONFLICT(store_id, pickup_date) DO UPDATE SET
-                    amazon_picked_up=package_pickup_checks.amazon_picked_up+1,
-                    updated_at=excluded.updated_at
-                """,
-                (package_store_id, scan_date, now, now),
-            )
+            change_package_pickup_count(conn, package, scan_date, 1, now)
+
         canonical = normalize_dispatch_scan_code(package.get("canonical_scan_code") or package.get("scan_code"))
         result = {
             "id": package_id,
@@ -35899,6 +35902,12 @@ def api_package_pickup_counts(payload: PackagePickupCountPayload) -> dict[str, A
     order_numbers = [clean_text(value) for value in payload.non_amazon_order_numbers]
     now = utc_now()
     with db() as conn:
+        tracked = rows_to_dicts(conn.execute("""SELECT r.scanned_at FROM package_pickup_delivery_records r
+            JOIN amazon_dispatch_packages p ON p.id=r.package_id
+            WHERE p.source_type='third_party' AND COALESCE(r.scanned_at, '') != '' AND (?=0 OR p.store_id=?)""", (store_id, store_id)).fetchall())
+        tracked_count = sum(1 for row in tracked if package_pickup_business_date(row["scanned_at"]) == payload.pickup_date)
+        non_amazon_total = max(payload.non_amazon_picked_up, tracked_count)
+        manual_non_amazon_total = non_amazon_total - tracked_count
         conn.execute(
             """
             INSERT INTO package_pickup_checks
@@ -35909,14 +35918,14 @@ def api_package_pickup_counts(payload: PackagePickupCountPayload) -> dict[str, A
                 non_amazon_picked_up=excluded.non_amazon_picked_up,
                 updated_at=excluded.updated_at
             """,
-            (store_id, payload.pickup_date, payload.amazon_picked_up, payload.non_amazon_picked_up, now, now),
+            (store_id, payload.pickup_date, payload.amazon_picked_up, non_amazon_total, now, now),
         )
         check = conn.execute(
             "SELECT id FROM package_pickup_checks WHERE store_id=? AND pickup_date=?",
             (store_id, payload.pickup_date),
         ).fetchone()
         check_id = int(check["id"])
-        for package_number, position, default_order_number in package_pickup_placeholder_rows("non_amazon", payload.non_amazon_picked_up):
+        for package_number, position, default_order_number in package_pickup_placeholder_rows("non_amazon", manual_non_amazon_total):
             order_number = order_numbers[package_number - 1] if package_number <= len(order_numbers) else default_order_number
             conn.execute(
                 """
@@ -35933,7 +35942,7 @@ def api_package_pickup_counts(payload: PackagePickupCountPayload) -> dict[str, A
             )
         conn.execute(
             "DELETE FROM package_pickup_non_amazon WHERE check_id=? AND package_type='non_amazon' AND position>?",
-            (check_id, payload.non_amazon_picked_up),
+            (check_id, manual_non_amazon_total),
         )
         for package_number, position, default_order_number in package_pickup_placeholder_rows("amazon", payload.amazon_unreported_count):
             conn.execute(
@@ -36100,7 +36109,7 @@ def api_package_pickup_manual_amazon(payload: PackagePickupManualAmazonPayload) 
 @app.post("/api/package-pickups/received")
 def api_package_pickup_received(payload: PackagePickupReceivedPayload) -> dict[str, Any]:
     source_type = clean_text(payload.source_type).lower()
-    if source_type not in {"amazon", "manual_amazon", "count_amazon", "non_amazon"}:
+    if source_type not in {"amazon", "third_party", "manual_amazon", "count_amazon", "non_amazon"}:
         raise HTTPException(400, "Unknown pickup package type.")
     confirmation_status = normalize_package_pickup_confirmation_status(payload.status, payload.received)
     if not confirmation_status:
@@ -36111,7 +36120,7 @@ def api_package_pickup_received(payload: PackagePickupReceivedPayload) -> dict[s
     inventory_refresh_target: tuple[int, str] | None = None
     with db() as conn:
         shopify_statuses = package_pickup_shopify_statuses(conn)
-        if source_type == "amazon":
+        if source_type in {"amazon", "third_party"}:
             row = conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=?", (payload.source_id,)).fetchone()
             if not row:
                 raise HTTPException(404, "Amazon package was not found.")
@@ -38219,6 +38228,101 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         "amazon_order_id": amazon_order_id,
         "message": f"Matched Amazon order {amazon_order_id} to {len(rows)} line(s): {', '.join(matched_refs)}.",
     }
+
+
+def third_party_package(package: dict[str, Any]) -> bool:
+    return clean_text(package.get("source_type")) == "third_party"
+
+
+def validate_third_party_tracking_input(tracking_id: str, tracking_url: str) -> tuple[str, str]:
+    raw = clean_text(tracking_id)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 -]{5,79}", raw) or not re.search(r"\d", raw):
+        raise HTTPException(400, "Enter the complete carrier tracking ID, not a URL or order reference.")
+    code = normalize_dispatch_scan_code(raw)
+    if re.fullmatch(r"\d{3}-\d{7}-\d{7}", code):
+        raise HTTPException(400, "Enter the carrier tracking ID, not an Amazon order ID.")
+    url = clean_text(tracking_url)
+    parsed = urlsplit(url)
+    if url and (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password):
+        raise HTTPException(400, "Tracking URL must be an http or https link without login credentials.")
+    return code, url
+
+
+def third_party_tracking_lines(conn: Any, store_id: int, line_ids: list[int]) -> list[dict[str, Any]]:
+    ids = sorted(set(int(value) for value in line_ids if int(value) > 0))
+    if not ids:
+        raise HTTPException(400, "Select third-party fulfilled lines from one order.")
+    rows = rows_to_dicts(conn.execute(
+        "SELECT * FROM order_lines WHERE store_id=? AND id IN (" + ",".join("?" for _ in ids) + ") ORDER BY id FOR UPDATE",
+        [store_id, *ids],
+    ).fetchall())
+    if len(rows) != len(ids) or any(row.get("order_engine") != "third_party" for row in rows):
+        raise HTTPException(400, "Tracking can only be assigned to third-party fulfilled lines in the selected store.")
+    if len({row["odoo_order_id"] for row in rows}) != 1:
+        raise HTTPException(400, "Select lines from one order. Assign each order's package separately.")
+    return rows
+
+
+@app.get("/api/lines/third-party-tracking")
+def api_third_party_tracking_list(store_id: int, line_ids: str) -> dict[str, Any]:
+    try:
+        ids = [int(value) for value in line_ids.split(",")]
+    except ValueError:
+        raise HTTPException(400, "Invalid line IDs.")
+    with db() as conn:
+        rows = third_party_tracking_lines(conn, store_id, ids)
+        packages = rows_to_dicts(conn.execute(
+            "SELECT * FROM amazon_dispatch_packages WHERE store_id=? AND odoo_order_id=? AND source_type='third_party' ORDER BY id",
+            (store_id, rows[0]["odoo_order_id"]),
+        ).fetchall())
+    return {"ok": True, "order_name": rows[0]["odoo_order_name"], "packages": packages}
+
+
+@app.post("/api/lines/third-party-tracking")
+def api_assign_third_party_tracking(payload: ThirdPartyTrackingPayload) -> dict[str, Any]:
+    code, url = validate_third_party_tracking_input(payload.tracking_id, payload.tracking_url)
+    now = utc_now()
+    with db() as conn:
+        # Serialize competing assignments of one physical tracking number.
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", ("third-party-tracking:" + code,))
+        rows = third_party_tracking_lines(conn, payload.store_id, payload.line_ids)
+        first = rows[0]
+        ids = sorted(int(row["id"]) for row in rows)
+        existing = row_to_dict(conn.execute("SELECT * FROM amazon_dispatch_packages WHERE id=? FOR UPDATE", (payload.package_id,)).fetchone()) if payload.package_id else None
+        if payload.package_id and not existing:
+            raise HTTPException(404, "Assigned package was not found.")
+        matches = package_pickup_strict_scan_matches(conn, code)
+        if not existing and len(matches) == 1:
+            existing = matches[0]
+        if existing and (not third_party_package(existing) or existing.get("store_id") != payload.store_id or existing.get("odoo_order_id") != first["odoo_order_id"]):
+            raise HTTPException(409, "This tracking ID belongs to another package or order. Nothing was changed.")
+        if payload.package_id and not existing:
+            raise HTTPException(404, "Assigned package was not found.")
+        if any(not existing or match["id"] != existing["id"] for match in matches):
+            raise HTTPException(409, "This tracking ID is already assigned to another package. Nothing was changed.")
+        if existing and not payload.package_id and ids != sorted(parse_json_list_value(existing.get("order_line_ids_json"))):
+            raise HTTPException(409, "This tracking ID is already assigned to other lines in this order. Use Edit on the existing package.")
+        if existing and (existing.get("received_at") or existing.get("last_scanned_at")) and (
+            code != existing["scan_code"] or ids != sorted(parse_json_list_value(existing.get("order_line_ids_json")))):
+            raise HTTPException(409, "A received package cannot be moved to another tracking ID or set of lines. Its tracking URL can still be updated.")
+        products = [{"asin": clean_text(row.get("replacement_asin") or row.get("asin")), "title": row.get("product_name"), "quantity": row.get("quantity")} for row in rows]
+        if existing:
+            package_id = int(existing["id"])
+            conn.execute("""UPDATE amazon_dispatch_packages SET scan_code=?, canonical_scan_code=?, display_code=?,
+                tracking_url=?, order_line_ids_json=?, asins_json=?, products_json=?, updated_at=? WHERE id=?""",
+                (code, code, code, url, json.dumps(ids), json.dumps([p["asin"] for p in products if p["asin"]]), json.dumps(products), now, package_id))
+        else:
+            package_id = int(conn.execute("""INSERT INTO amazon_dispatch_packages
+                (scan_code, canonical_scan_code, display_code, amazon_order_id, store_id, odoo_order_id, odoo_order_name,
+                 recipient_ref, order_line_ids_json, package_status, promise, tracking_url, asins_json, products_json,
+                 source_type, created_at, updated_at)
+                VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 'Awaiting receipt', ?, ?, ?, ?, 'third_party', ?, ?) RETURNING id""",
+                (code, code, code, payload.store_id, first["odoo_order_id"], first["odoo_order_name"], first["odoo_order_name"], json.dumps(ids),
+                 clean_text(first.get("manual_estimated_delivery_at")), url, json.dumps([p["asin"] for p in products if p["asin"]]), json.dumps(products), now, now)).fetchone()["id"])
+        reconciled = reconcile_package_pickup_scans(conn, only_scan_code=code)
+    fast_page_cache_clear_matching({"package-pickups", "dispatch-related-parts", "dispatch-sorting-summary", "dispatch-sorting-summary-base", "dispatch-status", "dispatch-status-summary", "orders"})
+    return {"ok": True, "package_id": package_id, "reconciled_scans": reconciled,
+            "message": f"Tracking {code} assigned to {first['odoo_order_name']}." + (f" Matched {reconciled} earlier scan(s), keeping their original dates." if reconciled else " Ready for the dispatch team's receipt scan.")}
 
 
 @app.post("/api/lines/manual-fulfilment")

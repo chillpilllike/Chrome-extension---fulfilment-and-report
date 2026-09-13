@@ -195,6 +195,14 @@ class ManualFulfilmentPayload(BaseModel):
     estimated_delivery_at: str = ""
 
 
+class ThirdPartyTrackingPayload(BaseModel):
+    store_id: int
+    line_ids: list[int] = Field(default_factory=list)
+    tracking_id: str
+    tracking_url: str = ""
+    package_id: Optional[int] = None
+
+
 class PackagePickupCountPayload(BaseModel):
     store_id: Optional[int] = None
     pickup_date: str
