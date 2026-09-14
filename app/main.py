@@ -34589,6 +34589,74 @@ def package_pickup_placeholder_rows(package_type: str, count: int) -> list[tuple
     ]
 
 
+def package_pickup_order_complete(packages: list[dict[str, Any]], lines: list[dict[str, Any]]) -> bool:
+    """Require all active order items to have delivered, physically scanned parcels."""
+    active_lines = {int(line["id"]) for line in lines
+                    if clean_text(line.get("state")).lower() not in {"cancelled", "canceled", "cancel"}}
+    if not active_lines:
+        return False
+    parts = collapse_dispatch_related_parts([
+        package for package in packages
+        if "cancel" not in clean_text(package.get("package_status")).lower()
+    ])
+    if not parts:
+        return False
+    covered = set()
+    for part in parts:
+        if not clean_text(part.get("pickup_scanned_at")) or clean_text(part.get("not_received_at")):
+            return False
+        if not third_party_package(part) and package_tracker_delivery_kind(part.get("package_status"), part.get("promise")) != "delivered":
+            return False
+        try:
+            line_ids = {int(value) for value in json.loads(part.get("order_line_ids_json") or "[]")}
+        except (ValueError, TypeError):
+            return False
+        # An unmapped parcel cannot prove that this order is complete.
+        if not line_ids or not line_ids.intersection(active_lines):
+            return False
+        covered.update(line_ids)
+    return active_lines.issubset(covered)
+
+
+def annotate_pickup_complete_orders(conn: Any, cards: list[dict[str, Any]]) -> None:
+    candidates = {}
+    for card in cards:
+        for row in card["amazon_packages"]:
+            row["order_ready_for_shopify"] = False
+            key = (int(row.get("store_id") or 0), clean_text(row.get("odoo_order_name")).upper())
+            if key[0] and key[1] and row.get("pickup_scanned_at") and not row.get("shopify_fulfilled"):
+                candidates.setdefault(key, []).append(row)
+    keys = list(candidates)
+    # Fetch complete orders independently of card dates and display limits.
+    for offset in range(0, len(keys), 200):
+        batch = keys[offset:offset + 200]
+        values = ",".join("(?,?)" for _ in batch)
+        params = [value for key in batch for value in key]
+        packages = rows_to_dicts(conn.execute(f"""
+            WITH wanted(store_id,order_name) AS (VALUES {values})
+            SELECT p.*,r.scanned_at AS pickup_scanned_at
+            FROM amazon_dispatch_packages p JOIN wanted w
+              ON p.store_id=w.store_id AND UPPER(p.odoo_order_name)=w.order_name
+            LEFT JOIN package_pickup_delivery_records r ON r.package_id=p.id
+            """, params).fetchall())
+        lines = rows_to_dicts(conn.execute(f"""
+            WITH wanted(store_id,order_name) AS (VALUES {values})
+            SELECT l.id,l.store_id,l.odoo_order_name,l.state
+            FROM order_lines l JOIN wanted w
+              ON l.store_id=w.store_id AND UPPER(l.odoo_order_name)=w.order_name
+            """, params).fetchall())
+        packages_by_order = {}
+        lines_by_order = {}
+        for rows, grouped in [(packages, packages_by_order), (lines, lines_by_order)]:
+            for row in rows:
+                key = (int(row["store_id"]), clean_text(row["odoo_order_name"]).upper())
+                grouped.setdefault(key, []).append(row)
+        for key in batch:
+            complete = package_pickup_order_complete(packages_by_order.get(key, []), lines_by_order.get(key, []))
+            for row in candidates[key]:
+                row["order_ready_for_shopify"] = complete
+
+
 def package_pickup_data(
     store_id: Optional[int] = None,
     date_from: str = "",
@@ -35031,6 +35099,8 @@ def package_pickup_data(
         card["unreported_amazon"] = max(0, int(card["amazon_picked_up"]) - len(card["amazon_packages"]))
         card["physical_total"] = int(card["amazon_picked_up"]) + int(card["non_amazon_picked_up"])
         card["shopify_fulfilled"] = sum(1 for row in [*card["amazon_packages"], *card["manual_amazon_packages"], *card["non_amazon_packages"]] if row["shopify_fulfilled"])
+    with db() as conn:
+        annotate_pickup_complete_orders(conn, card_rows)
     # A pickup can be months after its original order date. Refresh the actual
     # displayed orders, including manual entries, independently of order age.
     refresh_rows = {}

@@ -658,6 +658,7 @@ type PackagePickupRow = {
   pickup_last_scanned_at?: string
   pickup_scanned_code?: string
   pickup_scan_count?: number
+  order_ready_for_shopify?: boolean
 }
 
 type PackagePickupScanPackage = {
@@ -7125,7 +7126,7 @@ function PackagePickupPage({
   const [loading, setLoading] = useState(true)
   const [searchField, setSearchField] = useState("all")
   const [exactSearch, setExactSearch] = useState("")
-  const [packageView, setPackageView] = useState<"all" | "amazon_unfulfilled">("all")
+  const [packageView, setPackageView] = useState<"all" | "amazon_unfulfilled" | "ready_unfulfilled">("all")
   const [showPackageSearch, setShowPackageSearch] = useState(true)
   const [savingDate, setSavingDate] = useState("")
   const [receivingId, setReceivingId] = useState("")
@@ -7758,6 +7759,8 @@ function PackagePickupPage({
     return odooOrder === normalizedExactSearch || amazonOrder === normalizedExactSearch || trackingId === normalizedTrackingSearch
   }
   function rowMatchesPackageView(row: PackagePickupRow) {
+    if (packageView === "ready_unfulfilled") return row.source_type === "amazon" && !row.shopify_fulfilled && Boolean(row.order_ready_for_shopify)
+
     if (packageView === "amazon_unfulfilled") {
       return row.source_type === "amazon" && !row.shopify_fulfilled
     }
@@ -7808,9 +7811,10 @@ function PackagePickupPage({
   return (
     <div className="pickup-page grid gap-4">
       <TeamWorkspaceHeader title="Package pickup check" description="Record physical receipt, reconcile delivery-date counts, then check whether every package for an order is ready. Amazon delivery is not the same as team pickup." current="package-pickups" />
-      <TeamQueues value={packageView} onChange={(value) => setPackageView(value as "all" | "amazon_unfulfilled")} queues={[
+      <TeamQueues value={packageView} onChange={(value) => setPackageView(value as "all" | "amazon_unfulfilled" | "ready_unfulfilled")} queues={[
         { value: "all", label: "Receive & reconcile", hint: "All packages in the selected date range" },
         { value: "amazon_unfulfilled", label: "Review Shopify pending", hint: "Amazon delivered · not Shopify fulfilled" },
+        { value: "ready_unfulfilled", label: "Ready for Shopify fulfilment", hint: "Entire order delivered & scanned · Shopify unfulfilled" },
       ]} />
       <Dialog open={pickupScannerOpen} onOpenChange={(open) => !open && closePickupScanner(true)}>
         <DialogContent className="pickup-scanner-dialog max-w-2xl p-0">
@@ -8104,9 +8108,10 @@ function PackagePickupPage({
             </SelectField>
             <TextField label="From Amazon delivery date" type="date" value={dateFrom} onChange={setDateFrom} />
             <TextField label="To Amazon delivery date" type="date" value={dateTo} onChange={setDateTo} />
-            <SelectField label="Package view" value={packageView} onChange={(value) => setPackageView(value as "all" | "amazon_unfulfilled")}>
+            <SelectField label="Package view" value={packageView} onChange={(value) => setPackageView(value as "all" | "amazon_unfulfilled" | "ready_unfulfilled")}>
               <option value="all">All packages</option>
               <option value="amazon_unfulfilled">Amazon delivered · Shopify unfulfilled</option>
+              <option value="ready_unfulfilled">All order packages delivered & scanned · Shopify unfulfilled</option>
             </SelectField>
           </div>
           </section>
@@ -8150,6 +8155,7 @@ function PackagePickupPage({
             </div>
           )}
           <div className="pickup-result-count"><PackageCheck className="size-4" /><span><strong>{visiblePackageCount.toLocaleString()}</strong> matching packages <span className="pickup-result-divider">·</span> <strong>{visibleCards.length.toLocaleString()}</strong> date cards</span>{normalizedExactSearch && <span className="pickup-search-applied">Search: {exactSearch}</span>}</div>
+          {packageView === "ready_unfulfilled" && <div className="pickup-active-filter"><span>Only complete Odoo orders: every package delivered and scanned, with Shopify fulfilment still pending. Checks include packages outside this date range.</span><button type="button" onClick={() => setPackageView("all")}>Clear filter</button></div>}
           {packageView === "amazon_unfulfilled" && (
             <div className="pickup-active-filter">
               <span><strong>{visiblePackageCount}</strong> Amazon-delivered package{visiblePackageCount === 1 ? "" : "s"} not fulfilled in Shopify</span>
