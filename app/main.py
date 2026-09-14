@@ -34605,8 +34605,10 @@ def package_pickup_order_complete(packages: list[dict[str, Any]], lines: list[di
     for part in parts:
         if not clean_text(part.get("pickup_scanned_at")) or clean_text(part.get("not_received_at")):
             return False
-        if not third_party_package(part) and package_tracker_delivery_kind(part.get("package_status"), part.get("promise")) != "delivered":
-            return False
+        if not third_party_package(part):
+            delivery_status = f"{clean_text(part.get('package_status'))} {clean_text(part.get('promise'))}"
+            if package_tracker_delivery_kind(part.get("package_status"), part.get("promise")) != "delivered" or not tracking_package_delivered({"status": delivery_status}):
+                return False
         try:
             line_ids = {int(value) for value in json.loads(part.get("order_line_ids_json") or "[]")}
         except (ValueError, TypeError):

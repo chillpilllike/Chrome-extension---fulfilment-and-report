@@ -18,6 +18,9 @@ class ReadyViewTests(unittest.TestCase):
     def test_one_or_two_undelivered_exclude_whole_order(self):
         for count in [1,2]:
             self.assertFalse(self.complete([package(1)]+[package(i+2,status='Running late') for i in range(count)]))
+    def test_future_or_delayed_delivery_prose_is_not_delivered(self):
+        for text in ["Will be delivered tomorrow", "Running late — will be delivered soon", "Not yet delivered"]:
+            self.assertFalse(self.complete([package(status=text)]))
     def test_delivery_alone_is_not_a_scan(self):
         self.assertFalse(self.complete([package(1),package(2,scanned='')]))
     def test_untracked_order_line_blocks(self):
