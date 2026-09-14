@@ -1,3 +1,4 @@
+import { ShopifyTitleReview } from "./components/ShopifyTitleReview"
 import { SupportWorkspace } from "@/components/SupportWorkspace"
 import { Fragment, useEffect, useMemo, useRef, useState } from "react"
 import type { DragEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
@@ -15884,6 +15885,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
         <h2 className="page-title">Shopify Fulfilment</h2>
         <p className="text-sm text-muted-foreground">Amazon-ordered Odoo orders are routed to DTB for selected countries and DTC for all other countries, then processed one job at a time.</p>
       </section>
+      <ShopifyTitleReview storeId={storeId} api={api} />
       <Card>
         <CardHeader>
           <CardTitle>Queue Controls</CardTitle>
@@ -16266,6 +16268,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
             >
               <option value="attention">Needs attention</option>
               <option value="all">All jobs</option>
+              <option value="pending_review">Pending title approval</option>
               <option value="amazon_placed">Amazon placed</option>
               <option value="queued">Queued</option>
               <option value="running">Running</option>

@@ -1958,6 +1958,10 @@ def ensure_product_variant_for_line(odoo: OdooClient, shop: ShopifyClient, state
             continue
         cached_vid, cached_pid = state.get_variant_for_sku(shop.name, candidate)
         if cached_vid:
+            if getattr(rename_manager, "require_reviewed_title", False) and not cached_pid:
+                verified_vid, cached_pid = shop.find_variant_by_sku(candidate)
+                if not cached_pid or int(verified_vid or 0) != int(cached_vid):
+                    raise RuntimeError("Cached Shopify product changed; repair the product mapping before exporting approved titles.")
             if UPDATE_EXISTING_SKU_PRODUCTS and cached_pid:
                 shop.update_product(int(cached_pid), title=title, body_html=body_html, image_b64=img_b64)
             if override_prices_for_order:

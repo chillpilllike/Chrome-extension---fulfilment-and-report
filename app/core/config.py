@@ -1,4 +1,5 @@
 from __future__ import annotations
+from app.services.shopify_title_review import DEFAULT_KEYWORDS as SHOPIFY_TITLE_DEFAULT_KEYWORDS
 
 import os
 from pathlib import Path
@@ -102,6 +103,9 @@ DEFAULT_SERVICE_SETTINGS = {
     "shopify_dtb_country_codes": os.getenv("SHOPIFY_DTB_COUNTRY_CODES", ""),
     "amazon_order_date_guard_enabled": os.getenv("AMAZON_ORDER_DATE_GUARD_ENABLED", "true"),
     "shopify_fulfilled_order_guard_enabled": os.getenv("SHOPIFY_FULFILLED_ORDER_GUARD_ENABLED", "false"),
+    "shopify_title_remove_keywords": SHOPIFY_TITLE_DEFAULT_KEYWORDS,
+    "shopify_clean_titles_enabled": "false",
+    "shopify_title_approval_enabled": "false",
     "shopify_product_rename_enabled": os.getenv("SHOPIFY_PRODUCT_RENAME_ENABLED", "true"),
     "shopify_generic_product_name": os.getenv("SHOPIFY_GENERIC_PRODUCT_NAME", "Generic Product"),
     "shopify_job_max_attempts": os.getenv("SHOPIFY_JOB_MAX_ATTEMPTS", "5"),

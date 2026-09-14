@@ -1806,6 +1806,16 @@ def init_db() -> None:
                 UNIQUE(store_id, odoo_order_name, route)
             );
 
+            CREATE TABLE IF NOT EXISTS shopify_title_reviews (
+                job_id TEXT PRIMARY KEY REFERENCES shopify_fulfilment_jobs(id) ON DELETE CASCADE,
+                fingerprint TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                revision INTEGER NOT NULL DEFAULT 1,
+                approved_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS shopify_tracking_jobs (
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL DEFAULT 'queued',
@@ -21623,7 +21633,7 @@ def enqueue_shopify_fulfilment_for_rows(rows: list[dict[str, Any]]) -> int:
                 VALUES (?, ?, ?, ?, ?, 'amazon_placed', 0, ?, '', ?, ?, ?, ?)
                 ON CONFLICT(store_id, odoo_order_name, route) DO UPDATE SET
                   status=CASE
-                    WHEN shopify_fulfilment_jobs.status='completed' THEN shopify_fulfilment_jobs.status
+                    WHEN shopify_fulfilment_jobs.status IN ('completed', 'running', 'pending_review') THEN shopify_fulfilment_jobs.status
                     ELSE 'amazon_placed'
                   END,
                   next_run_at=CASE
@@ -21738,6 +21748,8 @@ def reconcile_missing_shopify_pushes(limit: int = 1000, start_worker: bool = Tru
         stale_cutoff = stale_cutoff_dt.isoformat()
         recoverable = []
         for row in candidates:
+            if clean_text(row.get("job_status")) == "pending_review":
+                continue
             if clean_text(row.get("job_status")) != "running":
                 recoverable.append(row)
                 continue
@@ -23496,7 +23508,132 @@ def sync_existing_shopify_replacement_images(module: Any, odoo: Any, shop: Any, 
 
 
 
+def resolve_shopify_title_review(job: dict[str, Any], snapshot: dict[str, Any], settings: dict[str, str]) -> dict[str, Any]:
+    from app.services import shopify_title_review as review
+    needs_review = review.enabled(settings, "shopify_title_approval_enabled")
+    keywords = settings.get("shopify_title_remove_keywords", review.DEFAULT_KEYWORDS)
+    validation_error = ""
+    try:
+        review.validate_items(snapshot["items"], snapshot["clean"], keywords)
+    except ValueError as exc:
+        validation_error = str(exc)
+    with db() as conn:
+        conn.execute("SELECT id FROM shopify_fulfilment_jobs WHERE id=? FOR UPDATE", (job["id"],)).fetchone()
+        saved = conn.execute("SELECT * FROM shopify_title_reviews WHERE job_id=?", (job["id"],)).fetchone()
+        if saved and saved["fingerprint"] == snapshot["fingerprint"]:
+            if saved["status"] == "approved":
+                approved = json.loads(saved["snapshot_json"])
+                review.validate_items(approved["items"], approved["clean"], keywords)
+                return approved
+            hold = True
+        else:
+            hold = needs_review or bool(saved) or bool(validation_error)
+            if hold:
+                conn.execute("""INSERT INTO shopify_title_reviews(job_id,fingerprint,snapshot_json,status,updated_at)
+                    VALUES (?,?,?,'pending',?) ON CONFLICT(job_id) DO UPDATE SET
+                    fingerprint=excluded.fingerprint,snapshot_json=excluded.snapshot_json,status='pending',
+                    revision=shopify_title_reviews.revision+1,approved_at=NULL,updated_at=excluded.updated_at""",
+                    (job["id"], snapshot["fingerprint"], json.dumps(snapshot), utc_now()))
+    if hold:
+        raise review.ReviewRequired(validation_error or "Review and approve the prepared product titles before sending this order to Shopify.")
+    return snapshot
+
+
+@app.get("/api/shopify/fulfilment/title-settings")
+def api_shopify_title_settings() -> dict[str, Any]:
+    from app.services import shopify_title_review as review
+    settings = get_service_settings()
+    return {"clean_titles": review.enabled(settings, "shopify_clean_titles_enabled"),
+            "require_approval": review.enabled(settings, "shopify_title_approval_enabled"),
+            "remove_keywords": settings.get("shopify_title_remove_keywords", review.DEFAULT_KEYWORDS)}
+
+
+@app.post("/api/shopify/fulfilment/title-settings")
+def api_save_shopify_title_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    global _SERVICE_SETTINGS_CACHE
+    if not isinstance(payload.get("clean_titles"), bool) or not isinstance(payload.get("require_approval"), bool):
+        raise HTTPException(status_code=400, detail="Both toggle values must be true or false.")
+    keywords = payload.get("remove_keywords", "")
+    if not isinstance(keywords, str) or len(keywords) > 100000:
+        raise HTTPException(status_code=400, detail="Keyword list must be text under 100,000 characters.")
+    values = {"shopify_clean_titles_enabled": str(payload["clean_titles"]).lower(),
+              "shopify_title_approval_enabled": str(payload["require_approval"]).lower(),
+              "shopify_title_remove_keywords": keywords.strip()}
+    with db() as conn:
+        for key, value in values.items():
+            conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, app_setting_storage_value(value), utc_now()))
+    with _SERVICE_SETTINGS_CACHE_LOCK:
+        _SERVICE_SETTINGS_CACHE = ({}, 0.0)
+    return {"ok": True, **api_shopify_title_settings()}
+
+
+@app.get("/api/shopify/fulfilment/title-reviews")
+def api_shopify_title_reviews(store_id: Optional[int] = None, page: int = 1) -> dict[str, Any]:
+    page = max(1, page)
+    with db() as conn:
+        where = "r.status='pending' AND j.status='pending_review' AND (? IS NULL OR j.store_id=?)"
+        total = conn.execute(f"SELECT COUNT(*) AS n FROM shopify_title_reviews r JOIN shopify_fulfilment_jobs j ON j.id=r.job_id WHERE {where}", (store_id, store_id)).fetchone()["n"]
+        rows = conn.execute(f"""SELECT r.*,j.odoo_order_name,j.route,j.store_id,j.last_error FROM shopify_title_reviews r
+            JOIN shopify_fulfilment_jobs j ON j.id=r.job_id WHERE {where}
+            ORDER BY j.created_at ASC LIMIT 25 OFFSET ?""", (store_id, store_id, (page-1)*25)).fetchall()
+    return {"total": total, "page": page, "reviews": [{**dict(row), "snapshot": json.loads(row["snapshot_json"]), "snapshot_json": None} for row in rows]}
+
+
+@app.post("/api/shopify/fulfilment/title-reviews/{job_id}/refresh")
+def api_refresh_shopify_title_review(job_id: str) -> dict[str, Any]:
+    with db() as conn:
+        job = conn.execute("SELECT * FROM shopify_fulfilment_jobs WHERE id=? FOR UPDATE", (job_id,)).fetchone()
+        if not job or job["status"] != "pending_review":
+            raise HTTPException(status_code=409, detail="Only a pending title review can be refreshed.")
+        conn.execute("UPDATE shopify_fulfilment_jobs SET status='queued',attempts=0,next_run_at=?,last_error='',updated_at=? WHERE id=?", (utc_now(), utc_now(), job_id))
+    start_shopify_fulfilment_worker()
+    return {"ok": True, "message": "Refreshing Odoo product data. The order will return for title approval."}
+
+
+@app.post("/api/shopify/fulfilment/title-reviews/{job_id}/approve")
+def api_approve_shopify_titles(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from app.services import shopify_title_review as review
+    settings = get_service_settings()
+    with db() as conn:
+        job = conn.execute("SELECT * FROM shopify_fulfilment_jobs WHERE id=? FOR UPDATE", (job_id,)).fetchone()
+        saved = conn.execute("SELECT * FROM shopify_title_reviews WHERE job_id=? FOR UPDATE", (job_id,)).fetchone()
+        if not job or not saved:
+            raise HTTPException(status_code=404, detail="Title review not found.")
+        if job["status"] != "pending_review" or saved["status"] != "pending" or payload.get("revision") != saved["revision"]:
+            raise HTTPException(status_code=409, detail="This review has changed or was already approved. Refresh the queue.")
+        snapshot = json.loads(saved["snapshot_json"])
+        titles = payload.get("titles")
+        if not isinstance(titles, dict) or set(titles) != {item["key"] for item in snapshot["items"]} or any(not isinstance(v, str) for v in titles.values()):
+            raise HTTPException(status_code=400, detail="Provide one prepared title for every reviewed line.")
+        for item in snapshot["items"]:
+            item["prepared_title"] = titles[item["key"]].strip()
+        try:
+            review.validate_items(snapshot["items"], snapshot["clean"], settings.get("shopify_title_remove_keywords", review.DEFAULT_KEYWORDS))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conn.execute("UPDATE shopify_title_reviews SET snapshot_json=?,status='approved',approved_at=?,updated_at=? WHERE job_id=?", (json.dumps(snapshot), utc_now(), utc_now(), job_id))
+        conn.execute("UPDATE shopify_fulfilment_jobs SET status='queued',attempts=0,next_run_at=?,last_error='',updated_at=? WHERE id=?", (utc_now(), utc_now(), job_id))
+    start_shopify_fulfilment_worker()
+    return {"ok": True, "message": "Titles approved. The order is queued for Shopify export."}
+
+
 def run_shopify_script_export(job: dict[str, Any]) -> None:
+    # Product titles are shared catalog data. Keep title updates and order creation
+    # together across processes so another reviewed order cannot overwrite them mid-export.
+    from app.services import shopify_title_review as review
+    settings = get_service_settings()
+    has_review = False
+    if job.get("id"):
+        with db() as conn:
+            has_review = bool(conn.execute("SELECT job_id FROM shopify_title_reviews WHERE job_id=?", (job["id"],)).fetchone())
+    if has_review or review.enabled(settings, "shopify_clean_titles_enabled") or review.enabled(settings, "shopify_title_approval_enabled"):
+        with db() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", ("shopify-title-export:" + str(job["route"]),))
+            return run_shopify_script_export_impl(job)
+    return run_shopify_script_export_impl(job)
+
+
+def run_shopify_script_export_impl(job: dict[str, Any]) -> None:
     settings = get_service_settings()
     store = get_store(int(job["store_id"]))
     route = clean_text(job["route"]).lower()
@@ -23575,6 +23712,16 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
     odoo = module.OdooClient(store.odoo_url, store.odoo_db, store.odoo_user, store.odoo_password)
     odoo.connect()
     odoo = shopify_replacement_export_client(odoo, int(job["store_id"]), str(job["odoo_order_name"]))
+    from app.services import shopify_title_review as title_review
+    review = None
+    if job.get("id"):
+        with db() as conn:
+            review = conn.execute("SELECT * FROM shopify_title_reviews WHERE job_id=?", (job["id"],)).fetchone()
+    if review or title_review.enabled(settings, "shopify_clean_titles_enabled") or title_review.enabled(settings, "shopify_title_approval_enabled"):
+        odoo = title_review.FrozenOdoo(odoo)
+        snapshot = title_review.prepare(module, odoo, str(job["odoo_order_name"]), settings, rename_manager)
+        snapshot = resolve_shopify_title_review(job, snapshot, settings)
+        title_review.install_prepared_export(module, snapshot)
     shops = []
     for dest in module.DESTS:
         token = module.get_shopify_access_token(dest, state)
@@ -23604,6 +23751,9 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
             inventory_note = inventory_fulfilment_note_for_order(int(job["store_id"]), str(job["odoo_order_name"]))
             if inventory_note:
                 append_shopify_inventory_note(shop, synced_order, inventory_note)
+
+
+from app.services.shopify_title_review import ReviewRequired as ShopifyTitleReviewRequired
 
 
 def process_one_shopify_fulfilment_job(worker_name: str = "") -> bool:
@@ -23663,6 +23813,10 @@ def process_one_shopify_fulfilment_job(worker_name: str = "") -> bool:
             message=f"Synced {job['odoo_order_name']} to Shopify.",
             error="",
         )
+    except ShopifyTitleReviewRequired as exc:
+        with db() as conn:
+            conn.execute("UPDATE shopify_fulfilment_jobs SET status='pending_review', attempts=GREATEST(0, attempts-1), last_error=?, locked_at=NULL, updated_at=? WHERE id=?", (str(exc), utc_now(), job["id"]))
+        increment_shopify_fulfilment_progress(message=f"{job['odoo_order_name']} is pending title approval.", error="")
     except Exception as exc:
         retry_delay = min(3600, 60 * max(1, int(job["attempts"] or 1)))
         next_run = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
@@ -29785,6 +29939,11 @@ def api_shopify_fulfilment_repush(job_id: str) -> dict[str, Any]:
                 completed_at=utc_now(),
                 message=f"Repushed {job['odoo_order_name']} to Shopify.",
             )
+            return {"ok": True, "message": progress["message"], "progress": progress}
+        except ShopifyTitleReviewRequired as exc:
+            with db() as conn:
+                conn.execute("UPDATE shopify_fulfilment_jobs SET status='pending_review',attempts=GREATEST(0,attempts-1),last_error=?,locked_at=NULL,updated_at=? WHERE id=?", (str(exc),utc_now(),job_id))
+            progress = set_shopify_fulfilment_progress(status="completed", processed=1, message=f"{job['odoo_order_name']} is pending title approval.", error="")
             return {"ok": True, "message": progress["message"], "progress": progress}
         except Exception as exc:
             with db() as conn:
