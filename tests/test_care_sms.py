@@ -61,9 +61,23 @@ class SMSTests(unittest.TestCase):
             with self.assertRaises(ValueError): validate_target(row,mode)
 
     def test_links_stay_on_order_website(self):
-        markup = '<a href="https://backend.example/my/orders/1">bad</a><a href="https://shop.example/my/orders/123?x=y">good</a>'
-        self.assertEqual('https://shop.example/my/orders/123?x=y',order_link(markup,'shop.example'))
-        self.assertEqual('https://shop.example/my/orders',order_link('<a href="https://shop.example.evil/my/orders/1">x</a>','shop.example'))
+        self.assertEqual('https://shop.example/my/orders/123',order_link('shop.example',123))
+        for domain, oid in [('shop.example',None),('shop.example',0),('shop.example','123/other'),
+                            ('shop.example',True),('https://shop.example',123),('shop.example@evil.test',123),
+                            ('shop..example',123),('shop.example:443',123)]:
+            with self.assertRaises(ValueError): order_link(domain,oid)
+
+    def test_prepared_links_use_case_order_not_email_links(self):
+        self.conn.execute('UPDATE after_order_messages SET html_preview=?',
+                          ('<a href="https://backend.example/my/orders/999">wrong</a>',))
+        self.assertTrue(self.sms.prepare(1)['body'].endswith('https://shop.example/my/orders/123'))
+
+    @patch('app.services.care_sms.deliver')
+    def test_old_general_order_link_cannot_be_sent(self, send):
+        row=self.sms.prepare(1)
+        self.conn.execute('UPDATE after_order_sms SET body=?',('Test https://shop.example/my/orders',))
+        with self.assertRaises(ValueError): self.sms.send(row['id'],approval=digest(self.row()))
+        send.assert_not_called()
 
     def test_config_rejects_secrets_and_bad_types(self):
         for mapping in ({'1:2':{'twilio':{'auth_token':'secret'}}},{'x':{}},{'1:2':{'transactional_sms_enabled':'false'}},

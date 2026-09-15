@@ -4,8 +4,6 @@ import json
 import os
 import re
 from datetime import datetime, timezone, timedelta
-from html.parser import HTMLParser
-from urllib.parse import urlsplit
 
 import requests
 from fastapi import APIRouter, HTTPException
@@ -62,22 +60,17 @@ def validate_target(row, current_test):
     number(row['recipient'])
 
 
-class Links(HTMLParser):
-    def __init__(self):
-        super().__init__(); self.links = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag == 'a':
-            self.links.append(dict(attrs).get('href', ''))
-
-
-def order_link(markup, domain):
-    parser = Links(); parser.feed(markup or '')
-    for link in parser.links:
-        p = urlsplit(link)
-        if p.scheme == 'https' and p.hostname == domain and not p.username and not p.password and p.path.startswith('/my/orders/'):
-            return link
-    return 'https://' + domain + '/my/orders'
+def order_link(domain, order_id):
+    # Use verified case identity, never the first link in an email (which may
+    # be an action URL, another order, or an admin/fulfilment-app URL).
+    if not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}', str(domain or '')) or any(
+            not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', label) for label in domain.split('.')):
+        raise ValueError('A verified website domain is required for the SMS order link.')
+    if isinstance(order_id, bool) or not re.fullmatch(r'[1-9][0-9]*', str(order_id or '')):
+        raise ValueError('A valid Odoo order ID is required for the SMS order link.')
+    # Standard portal authentication is retained. Never bypass ownership checks
+    # or put expiring action credentials into a generic SMS link.
+    return f'https://{domain}/my/orders/{order_id}'
 
 
 def render(kind, order, brand, link):
@@ -228,7 +221,7 @@ class SMS:
         if not email['test_mode'] and not site.get('transactional_sms_enabled'):
             raise ValueError('Enable transactional SMS for this website after reviewing customer consent and destination requirements.')
         to = recipient(None if email['test_mode'] else self.phone(case),bool(email['test_mode']))
-        link = order_link(email['html_preview'],domain)
+        link = order_link(domain,case.get('odoo_order_id'))
         brand = (case.get('context') or {}).get('website_name') or case.get('store_name') or domain
         values = {'order':case['odoo_order_name'],'brand':brand,'url':link}
         body = render(kind,values['order'],brand,link)
@@ -309,6 +302,10 @@ class SMS:
             elif digest(row) != approval:
                 raise ValueError('Review the current SMS preview before approving.')
             case = r.after_order_case_by_id(row['case_id']); r.require_after_order_case_in_scope(case)
+            expected_link = order_link(snapshot['domain'], case.get('odoo_order_id'))
+            urls = re.findall(r'https?://[^\s<>"\']+', row['body'])
+            if expected_link not in urls or any(url != expected_link for url in urls):
+                raise ValueError('SMS contains an outdated or incorrect order link. Prepare a new notification; do not resend this preview.')
             if snapshot['kind'] in {'tracking', 'package_movement'}:
                 if (case.get('context') or {}).get('risk_state') != 'in_transit':
                     raise ValueError('A current in-transit event is required for movement SMS.')
