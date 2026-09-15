@@ -13,6 +13,7 @@ class TestPickupAutoReconciliation(unittest.TestCase):
         self.enterContext = stack.enter_context
         raw = sqlite3.connect(":memory:")
         raw.row_factory = sqlite3.Row
+        raw.create_function("GREATEST", 2, max)
 
         class Connection:
             def execute(self, sql, params=()):

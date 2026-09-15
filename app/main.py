@@ -7736,6 +7736,14 @@ def merge_dispatch_shipment_rows(existing: dict[str, Any], incoming: dict[str, A
 
 
 def collapse_dispatch_related_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # An item-only pre-shipment URL can later acquire a shipment id and tracking
+    # number. Collapse that exact alias before counting physical packages.
+    aliases = dict(dispatch_shipment_alias_pairs(parts))
+    by_id = {int(part.get("id") or 0): dict(part) for part in parts}
+    for alias_id, target_id in aliases.items():
+        by_id[target_id] = merge_dispatch_shipment_rows(by_id[target_id], by_id[alias_id])
+    parts = [by_id[int(part.get("id") or 0)] if int(part.get("id") or 0) in by_id else part
+             for part in parts if int(part.get("id") or 0) not in aliases] if aliases else parts
     grouped: dict[str, dict[str, Any]] = {}
     for part in parts:
         key = dispatch_order_shipment_key(part) or dispatch_physical_package_key(part)
@@ -7772,6 +7780,40 @@ def dispatch_shipment_alias_pairs(rows: list[dict[str, Any]]) -> list[tuple[int,
             alias_id = int(row.get("id") or 0)
             if alias_id and alias_id != target_id and not package_tracking_id_is_physical(row.get("canonical_scan_code") or row.get("scan_code")):
                 pairs.append((alias_id, target_id))
+    def item_scope(row: dict[str, Any]) -> tuple[Any, ...]:
+        try:
+            query = parse_qs(urlparse(clean_text(row.get("tracking_url"))).query)
+        except ValueError:
+            return ()
+        item = clean_text(row.get("item_id") or row.get("itemId") or (query.get("itemId") or query.get("itemid") or [""])[0])
+        return (int(row.get("store_id") or 0), clean_text(row.get("amazon_order_id")),
+                str(row.get("odoo_order_id") or clean_text(row.get("odoo_order_name")).upper()), item) if item and clean_text(row.get("amazon_order_id")) else ()
+
+    # Do not infer shipment identity from ASIN or packageIndex alone. Item ids
+    # qualify only when exactly one physical parcel exists in the same order.
+    already = {alias for alias, _ in pairs}
+    for row in rows:
+        alias_id = int(row.get("id") or 0)
+        if not alias_id or alias_id in already or not tracking_package_shipment_key(row).startswith("item:"):
+            continue
+        if package_tracking_id_is_physical(row.get("canonical_scan_code") or row.get("scan_code")):
+            continue
+        scope = item_scope(row)
+        candidates = [p for p in rows if scope and item_scope(p) == scope
+                      and package_tracking_id_is_physical(p.get("canonical_scan_code") or p.get("scan_code"))]
+        if len(candidates) != 1:
+            continue
+        target = candidates[0]
+        asins = set(parse_json_list_value(row.get("asins_json")))
+        lines = set(parse_json_list_value(row.get("order_line_ids_json")))
+        if not asins or asins != set(parse_json_list_value(target.get("asins_json"))):
+            continue
+        if not lines or lines != set(parse_json_list_value(target.get("order_line_ids_json"))):
+            continue
+        target_id = int(target.get("id") or 0)
+        if target_id and target_id != alias_id:
+            pairs.append((alias_id, target_id))
+
     return pairs
 
 
@@ -35358,7 +35400,7 @@ def package_pickup_readiness_from_parts(parts: list[dict[str, Any]], *, order_li
         reasons = []
         if pending:
             expected = "; ".join(dict.fromkeys(item["expected"] for item in pending_packages))
-            reasons.append(f"{len(pending)} of {total} known packages still pending" + (f" ({expected})" if expected else ""))
+            reasons.append(f"{len(pending)} of {total} known packages not yet scanned/received by the team" + (f" ({expected})" if expected else ""))
         if unresolved:
             reasons.append(f"{len(unresolved)} order line(s) awaiting shipment/ASIN reconciliation; package count not yet confirmed")
         if unmapped:
