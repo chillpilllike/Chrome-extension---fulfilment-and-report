@@ -44,6 +44,20 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result['items'][0]['prepared_title'], title)
         self.assertEqual(review.prepared_title(title), 'one two three four five six')
 
+    def test_manual_punctuation_survives_approval_and_export_validation(self):
+        self.hold()
+        title = 'Dietary Supplement Black Seed Non-GMO, Gluten-Free'
+        self.approve(title)
+        result = main.resolve_shopify_title_review(self.job, self.snapshot, self.settings)
+        self.assertEqual(result['items'][0]['prepared_title'], title)
+        review.validate_items([dict(result['items'][0], brands=['PURELYNUTRIENT'])], True, 'dieta')
+
+    def test_punctuation_does_not_bypass_exclusions(self):
+        self.hold()
+        for title in ['Red, secret box', '(Acme) Red Box', 'Red - dim box']:
+            with self.assertRaises(main.HTTPException):
+                self.approve(title)
+
     def test_manual_title_still_respects_character_limit(self):
         self.hold()
         with self.assertRaises(main.HTTPException):

@@ -18,7 +18,7 @@ def normalize(value):
     return unicodedata.normalize('NFKC', str(value or '')).strip()
 
 
-def clean_title(title, brands=(), keywords='', max_words=6):
+def remove_excluded_phrases(title, brands=(), keywords=''):
     title = normalize(title)
     phrases = sorted({normalize(x) for x in [*brands, *keywords.splitlines()] if normalize(x)}, key=len, reverse=True)
     for phrase in phrases:
@@ -26,6 +26,11 @@ def clean_title(title, brands=(), keywords='', max_words=6):
         parts = re.split(r'[\s-]+', phrase)
         pattern = r'(?<!\w)' + r'[\s-]+'.join(re.escape(p) for p in parts) + r'(?!\w)'
         title = re.sub(pattern, ' ', title, flags=re.I)
+    return title
+
+
+def clean_title(title, brands=(), keywords='', max_words=6):
+    title = remove_excluded_phrases(title, brands, keywords)
     title = re.sub(r'[^\w\s%+./-]', ' ', title)
     words = [word.strip('-/.+') for word in title.split()]
     words = ' '.join(word for word in words if word).split()
@@ -176,7 +181,7 @@ def validate_items(items, clean, keywords):
         if clean:
             if not item.get('sku'):
                 raise ValueError('A product is missing its Odoo Internal Reference and has no unambiguous original ASIN. Add the original ASIN to its Odoo internal notes or set its Internal Reference, then refresh the review.')
-            if title != ' '.join(clean_title(title, item.get('brands') or [], keywords, max_words=None)):
+            if title != remove_excluded_phrases(title, item.get('brands') or [], keywords):
                 raise ValueError('Prepared titles must exclude the brand and removal keywords.')
         sku = item.get('sku')
         if sku and sku in titles_by_sku and titles_by_sku[sku] != title:
