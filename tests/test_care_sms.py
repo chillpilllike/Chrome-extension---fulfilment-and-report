@@ -13,10 +13,10 @@ class SMSTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(':memory:')
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript('''CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY);
+        self.conn.executescript('''CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY,store_id INTEGER,website_id INTEGER,tracking_code TEXT);
           CREATE TABLE after_order_messages(id INTEGER PRIMARY KEY,case_id INTEGER,template_kind TEXT,status TEXT,
           test_mode INTEGER,html_preview TEXT);
-          INSERT INTO after_order_cases VALUES(1);
+          INSERT INTO after_order_cases VALUES(1,1,2,'EPG123');
           INSERT INTO after_order_messages VALUES(1,1,'item_unavailable','awaiting_approval',1,'');''')
         self.conn.executescript(SCHEMA)
         conn = self.conn
@@ -165,15 +165,40 @@ class SMSTests(unittest.TestCase):
         self.sms.companion(1)
 
     @patch('app.services.care_sms.deliver',return_value=('1','accepted'))
-    def test_live_welcome_validates_order_and_can_use_resolved_welcome_case(self, send):
+    def test_live_welcome_is_excluded(self, send):
         self.ns['after_order_email_test_mode']=lambda:False
         self.ns['welcome_emails']=Mock()
         self.conn.execute("UPDATE after_order_messages SET test_mode=0,template_kind='new_order_welcome',status='sent'")
         self.case.update(case_type='new_order_welcome',status='resolved')
         self.sms.phone=Mock(return_value='+14155552671')
         self.sms.companion(1)
-        self.ns['welcome_emails'].validate.assert_called_once()
-        send.assert_called_once()
+        self.ns['welcome_emails'].validate.assert_not_called()
+        send.assert_not_called()
+        self.assertIsNone(self.sms.prepare(1))
+
+    def test_movement_once_per_parcel_and_mode(self):
+        self.case.update(tracking_code='EPG123',context={'risk_state':'in_transit'})
+        self.conn.execute("UPDATE after_order_messages SET template_kind='package_movement'")
+        first=self.sms.prepare(1)
+        self.assertIsNotNone(first)
+        self.conn.execute("INSERT INTO after_order_messages VALUES(2,1,'tracking','awaiting_approval',1,'')")
+        self.assertIsNone(self.sms.prepare(2))
+        self.assertEqual(first['id'],self.sms.prepare(1)['id'])
+        self.case['tracking_code']='EPG456'
+        self.assertIsNotNone(self.sms.prepare(2))
+
+    @patch('app.services.care_sms.deliver')
+    def test_previously_queued_welcome_is_blocked(self, send):
+        row=self.sms.prepare(1)
+        self.conn.execute("UPDATE after_order_messages SET template_kind='new_order_welcome'")
+        with self.assertRaises(ValueError): self.sms.send(row['id'],approval=digest(row))
+        send.assert_not_called()
+
+    def test_reminder_and_lost_sms_excluded(self):
+        from app.services.care_sms import eligible
+        self.assertFalse(eligible({'template_kind':'package_lost'}))
+        self.assertFalse(eligible({'template_kind':'item_unavailable','payload_json':'{"_care_reminder_parent":1}'}))
+        self.assertTrue(eligible({'template_kind':'refund_completed'}))
 
     @patch('app.services.care_sms.deliver')
     def test_expired_sourcing_approval_blocks_send(self, send):

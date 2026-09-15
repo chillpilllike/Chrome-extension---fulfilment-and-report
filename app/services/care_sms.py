@@ -13,8 +13,9 @@ from app.services.alternative_workflow import Runtime
 
 TEST_NUMBER = '+19296526393'
 PROVIDERS = {'odoo', 'msg91', 'twilio'}
-KINDS = {'new_order_welcome', 'expected_dispatch', 'item_unavailable', 'delivery_confirmation',
-         'package_lost', 'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment'}
+KINDS = {'expected_dispatch', 'item_unavailable', 'no_alternatives', 'delivery_confirmation',
+         'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment',
+         'price_difference', 'refund_request_received', 'refund_completed'}
 SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
  id INTEGER PRIMARY KEY AUTOINCREMENT, email_id INTEGER NOT NULL UNIQUE REFERENCES after_order_messages(id),
  case_id INTEGER NOT NULL REFERENCES after_order_cases(id), provider TEXT NOT NULL,
@@ -22,7 +23,23 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
  snapshot_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'awaiting_approval',
  attempts INTEGER NOT NULL DEFAULT 0, provider_id TEXT, last_error TEXT,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS after_order_sms_first_movement (
+ parcel_key TEXT PRIMARY KEY, email_id INTEGER NOT NULL REFERENCES after_order_messages(id),
+ created_at TEXT NOT NULL
 );'''
+
+
+def eligible(email):
+    payload = json.loads(email.get('payload_json') or '{}')
+    return email.get('template_kind') in KINDS and not payload.get('_care_reminder_parent')
+
+
+def movement_key(case, test_mode):
+    code = str(case.get('tracking_code') or '').strip().upper()
+    if not code:
+        raise ValueError('A verified parcel tracking code is required for the one-time movement SMS.')
+    return json.dumps([case['store_id'], case['website_id'], code, bool(test_mode)])
 
 
 def number(value):
@@ -65,13 +82,15 @@ def order_link(markup, domain):
 
 def render(kind, order, brand, link):
     summaries = {
-        'new_order_welcome':'Thank you for your order. We will begin processing it soon.',
         'expected_dispatch':'There is an update to your expected dispatch date.',
         'item_unavailable':'An item in your order needs your choice.',
+        'no_alternatives':'An item is unavailable and no alternatives were found. Please choose how to proceed.',
         'delivery_confirmation':'The carrier marked your parcel delivered. Please confirm receipt.',
-        'package_lost':'Your parcel needs attention. Please review your options.',
         'warehouse_dispatch_delay':'Dispatch is delayed. Our team is working on it. No action needed.',
         'alternative_payment':'Please review the payment details for your selected alternative.',
+        'price_difference':'Please review the payment details for your selected alternative.',
+        'refund_request_received':'Your refund request is under review. Please allow 24-48 hours for a response.',
+        'refund_completed':'Your refund has been processed. Your payment provider determines when the credit appears.',
     }
     return f'{brand}: Order {order}. {summaries.get(kind, "Your parcel has a tracking update.")} {link}'
 
@@ -185,10 +204,10 @@ class SMS:
         with r.db() as conn:
             email = conn.execute('SELECT * FROM after_order_messages WHERE id=?',(email_id,)).fetchone()
             existing = conn.execute('SELECT * FROM after_order_sms WHERE email_id=?',(email_id,)).fetchone()
+        if not email or not eligible(dict(email)):
+            return None  # Welcome, reminders, lost-package and marketing SMS are excluded.
         if existing:
             return dict(existing)
-        if not email or email['template_kind'] not in KINDS:
-            return None  # Marketing/review invitations and dispatch confirmations are excluded.
         email = dict(email); case = r.after_order_case_by_id(email['case_id'])
         r.require_after_order_case_in_scope(case)
         case = r.hydrate_after_order_recipient_and_domain(case,strict=not email['test_mode'])
@@ -198,6 +217,12 @@ class SMS:
         if not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}',domain):
             raise ValueError('Verified website domain is required for SMS.')
         kind = email['template_kind']; provider = config['provider']
+        if kind in {'tracking','package_movement'} and (case.get('context') or {}).get('risk_state') != 'in_transit':
+            return None
+        if kind == 'item_unavailable':
+            affected = {int(item['line_id']) for item in case.get('affected_items', [])}
+            if affected and affected.issubset(r.alternative_workflow.unavailable_without_alternatives(case)):
+                kind = 'no_alternatives'
         site = config['mappings'].get(f"{case['store_id']}:{case['website_id']}",{})
         mapping = dict(site.get(provider) or {})
         if not email['test_mode'] and not site.get('transactional_sms_enabled'):
@@ -222,6 +247,9 @@ class SMS:
         snapshot = {'mapping':mapping,'request_fingerprint':r.request_fingerprint(case),'domain':domain,'kind':kind,
                     'email_created_at':email.get('created_at')}
         with r.db() as conn:
+            if kind in {'tracking', 'package_movement'}:
+                if not self.reserve_movement(conn, case, email):
+                    return None
             conn.execute('''INSERT INTO after_order_sms(email_id,case_id,provider,recipient,test_mode,body,snapshot_json,created_at,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(email_id) DO NOTHING''',
                 (email_id,case['id'],provider,to,email['test_mode'],body,json.dumps(snapshot),r.utc_now(),r.utc_now()))
@@ -233,9 +261,7 @@ class SMS:
         try:
             row = self.prepare(email_id)
             if row and row['status'] == 'awaiting_approval':
-                with self.r.db() as conn:
-                    email = dict(conn.execute('SELECT * FROM after_order_messages WHERE id=?',(email_id,)).fetchone())
-                if row['test_mode'] or (email['template_kind']=='new_order_welcome' and email['status'] in {'sent','delivered'}):
+                if row['test_mode']:
                     self.send(row['id'],automatic=True)
         except Exception:
             # A companion must never change the outcome of the independent email.
@@ -247,6 +273,21 @@ class SMS:
             except Exception:
                 pass
 
+    def reserve_movement(self, conn, case, email):
+        # Unique reservation survives retries, provider changes and concurrent workers.
+        key = movement_key(case, email['test_mode'])
+        prior = conn.execute('''SELECT s.email_id,s.snapshot_json FROM after_order_sms s
+            JOIN after_order_cases c ON c.id=s.case_id
+            WHERE c.store_id=? AND c.website_id=? AND UPPER(TRIM(c.tracking_code))=?
+              AND s.test_mode=? AND s.attempts>0 AND s.email_id<>?''',
+            (case['store_id'],case['website_id'],str(case['tracking_code']).strip().upper(),email['test_mode'],email['id'])).fetchall()
+        if any(json.loads(row['snapshot_json']).get('kind') in {'tracking','package_movement'} for row in prior):
+            return False  # Includes pre-policy sends and uncertain attempts.
+        conn.execute('''INSERT INTO after_order_sms_first_movement(parcel_key,email_id,created_at)
+            VALUES(?,?,?) ON CONFLICT(parcel_key) DO NOTHING''', (key,email['id'],self.r.utc_now()))
+        owner = conn.execute('SELECT email_id FROM after_order_sms_first_movement WHERE parcel_key=?', (key,)).fetchone()
+        return owner['email_id'] == email['id']
+
     def send(self, sms_id, approval='', automatic=False):
         r = self.r
         with r.db() as conn:
@@ -254,18 +295,25 @@ class SMS:
             if not raw:
                 raise ValueError('SMS not found.')
             row = dict(raw); snapshot = json.loads(row['snapshot_json'])
+            email = conn.execute('SELECT * FROM after_order_messages WHERE id=?',(row['email_id'],)).fetchone()
+            if not email or not eligible(dict(email)) or snapshot['kind'] not in KINDS:
+                raise ValueError('This notification is excluded from SMS by the current cost-control policy.')
             if not self.config()['enabled']:
                 raise ValueError('SMS sending is disabled.')
             validate_target(row,r.after_order_email_test_mode())
             if row['status'] not in {'awaiting_approval','failed'} or row['attempts'] >= 3:
                 raise ValueError('SMS already attempted or uncertain. Check provider logs; do not resend.')
             if automatic:
-                email = conn.execute('SELECT template_kind,status FROM after_order_messages WHERE id=?',(row['email_id'],)).fetchone()
-                if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and not (email['template_kind']=='new_order_welcome' and email['status'] in {'sent','delivered'})):
+                if row['attempts'] or row['status'] != 'awaiting_approval' or not row['test_mode']:
                     raise ValueError('This SMS needs individual approval.')
             elif digest(row) != approval:
                 raise ValueError('Review the current SMS preview before approving.')
             case = r.after_order_case_by_id(row['case_id']); r.require_after_order_case_in_scope(case)
+            if snapshot['kind'] in {'tracking', 'package_movement'}:
+                if (case.get('context') or {}).get('risk_state') != 'in_transit':
+                    raise ValueError('A current in-transit event is required for movement SMS.')
+                if not self.reserve_movement(conn, case, dict(email)):
+                    raise ValueError('The first movement SMS is already reserved for this parcel. Later movement texts are blocked.')
             if not row['test_mode']:
                 case = r.hydrate_after_order_recipient_and_domain(case, strict=True)
                 created = datetime.fromisoformat((snapshot.get('email_created_at') or row['created_at']).replace('Z', '+00:00'))
@@ -276,15 +324,16 @@ class SMS:
                 site = self.config()['mappings'].get(f"{case['store_id']}:{case['website_id']}", {})
                 if not site.get('transactional_sms_enabled'):
                     raise ValueError('Customer SMS has been disabled for this website.')
-                welcome = snapshot['kind'] == 'new_order_welcome'
+                financial = snapshot['kind'] in {'price_difference','alternative_payment','refund_request_received','refund_completed'}
                 if (self.phone(case) != row['recipient'] or r.request_fingerprint(case) != snapshot['request_fingerprint']
-                        or case.get('sender_domain') != snapshot['domain'] or case.get('confirmed_at') or case.get('current_decision')
-                        or (case.get('status') == 'resolved' and not welcome) or not r.after_order_tracking_is_current(case)):
+                        or case.get('sender_domain') != snapshot['domain']
+                        or (not financial and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
+                        or not r.after_order_tracking_is_current(case)):
                     raise ValueError('Order/recipient changed; SMS approval is blocked.')
-                if welcome:
-                    if case.get('case_type') != 'new_order_welcome':
-                        raise ValueError('Welcome SMS requires a newly confirmed order.')
-                    r.welcome_emails.validate(case)
+                if financial:
+                    # Financial source messages need their own verified event/amount adapter.
+                    # Do not infer a payment or completed refund from a button click.
+                    raise ValueError('Financial SMS is held until its verified payment/refund event adapter is connected.')
                 if snapshot['kind'] == 'warehouse_dispatch_delay':
                     r.warehouse_dispatch_delay.validate(case)
                 if snapshot['kind'] in {'tracking', 'package_movement'} and r.after_order_tracking_updates_opted_out(case, case.get('customer_email') or ''):
@@ -293,7 +342,7 @@ class SMS:
                 payload = json.loads(dict(email).get('payload_json') or '{}')
                 if payload.get('_care_reminder_parent'):
                     r.care_reminders.validate(int(payload['_care_reminder_parent']), int(payload['_care_reminder_number']), case)
-                if snapshot['kind'] == 'item_unavailable':
+                if snapshot['kind'] in {'item_unavailable', 'no_alternatives'}:
                     review = r.after_order_unavailable_review(case, for_send=True)
                     if review['blocked'] or not review['approved'] or not r.alternative_workflow.ready(case):
                         raise ValueError('Sourcing review is incomplete or expired.')
@@ -358,6 +407,7 @@ class SMS:
         @router.get('/settings')
         def settings():
             return {**self.config(),'test_number':TEST_NUMBER,'test_mode':self.r.after_order_email_test_mode(),
+                    'policy':'selected-events-first-movement-v1',
                     'credentials':{'odoo':True,'twilio':bool(os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN')),'msg91':bool(os.getenv('MSG91_AUTH_KEY'))}}
 
         @router.post('/settings')

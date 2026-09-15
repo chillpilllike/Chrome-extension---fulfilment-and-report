@@ -3,7 +3,15 @@
 SMS is disabled by default. Settings → Customer SMS selects Odoo, MSG91 or Twilio.
 Existing Odoo dispatch automations are unchanged; this outbox does not send dispatch confirmations or review/marketing invitations.
 
-Each eligible email reserves at most one companion SMS. Email Log → open email → Companion SMS shows the exact text, recipient, provider, attempt count and status. Approving SMS never resends the email. Test preparation automatically attempts the initial SMS to **+19296526393 only**. Live messages need individual approval, except new-order welcome after email acceptance. Switching to test mode blocks pending customer SMS. Previously queued test messages addressed to another number are blocked, not silently redirected.
+Each eligible email reserves at most one companion SMS. Email Log → open email → Companion SMS shows the exact text, recipient, provider, attempt count and status. Approving SMS never resends the email. Test preparation automatically attempts the initial SMS to **+19296526393 only**. All live SMS need individual approval. Switching to test mode blocks pending customer SMS. Previously queued test messages addressed to another number are blocked, not silently redirected.
+
+## Cost-control policy
+
+Only expected dispatch delay, dispatch hurdle, unavailable item (with or without alternatives), first parcel movement, delivery confirmation, additional payment, refund request received and refund completed are allowed categories. Welcome, reminders, lost-package and marketing SMS are excluded, including previously queued messages at send time. Email behavior is unchanged.
+
+First movement is reserved once per store, website, tracking number and test/live mode, regardless of provider. Later movement messages cannot reserve or send another SMS. A failed or uncertain first message keeps its reservation; only its own safe retry can be approved, never a later update. Separate parcels may each receive one movement SMS.
+
+Additional-payment and refund kinds currently have preview text only: live sending is held until verified financial event adapters are connected. No financial completion is inferred from a customer choice or team approval. Do not describe those categories as operational yet.
 
 ## Configuration
 
