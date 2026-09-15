@@ -36,6 +36,19 @@ class ReviewTests(unittest.TestCase):
         self.conn.execute("UPDATE shopify_fulfilment_jobs SET status='pending_review'")
     def approve(self,title='Blue Box',revision=1):
         return main.api_approve_shopify_titles('job',{'revision':revision,'titles':{'1:10':title}})
+    def test_manual_long_title_survives_approval_and_worker_validation(self):
+        self.hold()
+        title = 'one two three four five six seven eight'
+        self.approve(title)
+        result = main.resolve_shopify_title_review(self.job, self.snapshot, self.settings)
+        self.assertEqual(result['items'][0]['prepared_title'], title)
+        self.assertEqual(review.prepared_title(title), 'one two three four five six')
+
+    def test_manual_title_still_respects_character_limit(self):
+        self.hold()
+        with self.assertRaises(main.HTTPException):
+            self.approve('x' * 256)
+
     def test_cleaning_boundaries_variants_and_six_words(self):
         self.assertEqual(review.prepared_title('ACME DIM dimensional red secret blue green yellow pink orange extra',['Acme'],'dim\nsecret'),'dimensional red blue green yellow pink')
         self.assertEqual(review.prepared_title('Acme ghost-legend red box',['Acme'],'ghost legend'),'red box')
@@ -67,7 +80,7 @@ class ReviewTests(unittest.TestCase):
         self.hold()
     def test_invalid_edits_do_not_approve(self):
         self.hold()
-        for title in ['', 'Acme box', 'secret box', 'one two three four five six seven']:
+        for title in ['', 'Acme box', 'secret box']:
             with self.assertRaises(main.HTTPException):self.approve(title)
         self.assertEqual(self.conn.execute('SELECT status FROM shopify_title_reviews').fetchone()['status'],'pending')
     def test_export_install_uses_reviewed_title_sku_for_existing_variants(self):
