@@ -11,7 +11,7 @@ import requests
 from fastapi import APIRouter, HTTPException
 from app.services.alternative_workflow import Runtime
 
-TEST_NUMBER = '+918800128087'
+TEST_NUMBER = '+19296526393'
 PROVIDERS = {'odoo', 'msg91', 'twilio'}
 KINDS = {'new_order_welcome', 'expected_dispatch', 'item_unavailable', 'delivery_confirmation',
          'package_lost', 'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment'}

@@ -3,7 +3,7 @@
 SMS is disabled by default. Settings → Customer SMS selects Odoo, MSG91 or Twilio.
 Existing Odoo dispatch automations are unchanged; this outbox does not send dispatch confirmations or review/marketing invitations.
 
-Each eligible email reserves at most one companion SMS. Email Log → open email → Companion SMS shows the exact text, recipient, provider, attempt count and status. Approving SMS never resends the email. Test preparation automatically attempts the initial SMS to **+918800128087 only**. Live messages need individual approval, except new-order welcome after email acceptance. Switching to test mode blocks pending customer SMS.
+Each eligible email reserves at most one companion SMS. Email Log → open email → Companion SMS shows the exact text, recipient, provider, attempt count and status. Approving SMS never resends the email. Test preparation automatically attempts the initial SMS to **+19296526393 only**. Live messages need individual approval, except new-order welcome after email acceptance. Switching to test mode blocks pending customer SMS. Previously queued test messages addressed to another number are blocked, not silently redirected.
 
 ## Configuration
 

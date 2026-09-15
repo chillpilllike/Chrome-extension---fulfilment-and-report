@@ -53,7 +53,10 @@ class SMSTests(unittest.TestCase):
         self.assertEqual(TEST_NUMBER,recipient('customer',True))
 
     def test_hard_test_guard(self):
+        self.assertEqual('+19296526393', TEST_NUMBER)
+        validate_target({'test_mode':1,'recipient':TEST_NUMBER},True)
         for row, mode in (({'test_mode':1,'recipient':'+14155552671'},False),
+                          ({'test_mode':1,'recipient':'+918800128087'},True),
                           ({'test_mode':0,'recipient':'+14155552671'},True)):
             with self.assertRaises(ValueError): validate_target(row,mode)
 
@@ -153,7 +156,7 @@ class SMSTests(unittest.TestCase):
     @patch('app.services.care_sms.requests.post')
     def test_msg91_requires_dlt_for_india(self, post):
         with self.assertRaises(Rejected):
-            deliver({'provider':'msg91','recipient':TEST_NUMBER,'body':'Test'},{'sender':'HEADER','template_id':'id'})
+            deliver({'provider':'msg91','recipient':'+918800128087','body':'Test'},{'sender':'HEADER','template_id':'id'})
         post.assert_not_called()
 
     def test_companion_failure_does_not_escape_to_email(self):
@@ -199,7 +202,7 @@ class SMSTests(unittest.TestCase):
         result=deliver({'provider':'msg91','recipient':TEST_NUMBER,'body':'Test'},
                        {'sender':'HEADER','template_id':'approved','dlt_template_id':'123','variables':{'order':'NC123'}})
         self.assertEqual(('request-id','accepted'),result)
-        self.assertEqual('918800128087',post.call_args.kwargs['json']['recipients'][0]['mobiles'])
+        self.assertEqual('19296526393',post.call_args.kwargs['json']['recipients'][0]['mobiles'])
 
 
 if __name__ == '__main__':
