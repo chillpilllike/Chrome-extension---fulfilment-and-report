@@ -23590,6 +23590,38 @@ def api_refresh_shopify_title_review(job_id: str) -> dict[str, Any]:
     return {"ok": True, "message": "Refreshing Odoo product data. The order will return for title approval."}
 
 
+def shopify_title_source_asins(job: dict[str, Any]) -> dict[int, set[str]]:
+    # Replacement rows can replace the local asin column; they are not evidence
+    # for the original Odoo product's identity.
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM order_lines WHERE store_id=? AND odoo_order_name=?", (job["store_id"], job["odoo_order_name"])).fetchall()
+    result: dict[int, set[str]] = {}
+    for row in rows:
+        if clean_text(row.get("replacement_asin")) or clean_text(row.get("replacement_run_id")):
+            continue
+        asin = normalize_asin(row.get("asin"))
+        if asin:
+            for line_id in source_odoo_line_ids(row):
+                result.setdefault(line_id, set()).add(asin)
+    return result
+
+
+def repair_shopify_review_references(job: dict[str, Any], snapshot: dict[str, Any], settings: dict[str, str]) -> dict[str, Any]:
+    from app.services import shopify_title_review as review
+    store = get_store(int(job["store_id"]))
+    route = str(job["route"]).lower()
+    module = load_external_script(settings["shopify_dtb_script_path"] if route == "dtb" else settings["shopify_dtc_script_path"], f"shopify_reference_{uuid.uuid4().hex}")
+    client = module.OdooClient(store.odoo_url, store.odoo_db, store.odoo_user, store.odoo_password)
+    client.connect()
+    client = shopify_replacement_export_client(client, int(job["store_id"]), str(job["odoo_order_name"]))
+    frozen = review.FrozenOdoo(client)
+    rename = shopify_product_rename_manager(module, settings)
+    before = review.prepare(module, frozen, str(job["odoo_order_name"]), settings, rename, repair_references=False, fingerprint_skus={item["key"]: "" for item in snapshot["items"] if not item.get("sku")})
+    if before["fingerprint"] != snapshot["fingerprint"]:
+        raise ValueError("Odoo product data changed. Refresh the review before approving the titles.")
+    return review.prepare(module, frozen, str(job["odoo_order_name"]), settings, rename, source_asins=shopify_title_source_asins(job))
+
+
 @app.post("/api/shopify/fulfilment/title-reviews/{job_id}/approve")
 def api_approve_shopify_titles(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     from app.services import shopify_title_review as review
@@ -23605,13 +23637,18 @@ def api_approve_shopify_titles(job_id: str, payload: dict[str, Any]) -> dict[str
         titles = payload.get("titles")
         if not isinstance(titles, dict) or set(titles) != {item["key"] for item in snapshot["items"]} or any(not isinstance(v, str) for v in titles.values()):
             raise HTTPException(status_code=400, detail="Provide one prepared title for every reviewed line.")
+        try:
+            if snapshot.get("clean") and any(not item.get("sku") for item in snapshot["items"]):
+                snapshot = repair_shopify_review_references(dict(job), snapshot, settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         for item in snapshot["items"]:
             item["prepared_title"] = titles[item["key"]].strip()
         try:
             review.validate_items(snapshot["items"], snapshot["clean"], settings.get("shopify_title_remove_keywords", review.DEFAULT_KEYWORDS))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        conn.execute("UPDATE shopify_title_reviews SET snapshot_json=?,status='approved',approved_at=?,updated_at=? WHERE job_id=?", (json.dumps(snapshot), utc_now(), utc_now(), job_id))
+        conn.execute("UPDATE shopify_title_reviews SET fingerprint=?,snapshot_json=?,status='approved',approved_at=?,updated_at=? WHERE job_id=?", (snapshot["fingerprint"], json.dumps(snapshot), utc_now(), utc_now(), job_id))
         conn.execute("UPDATE shopify_fulfilment_jobs SET status='queued',attempts=0,next_run_at=?,last_error='',updated_at=? WHERE id=?", (utc_now(), utc_now(), job_id))
     start_shopify_fulfilment_worker()
     return {"ok": True, "message": "Titles approved. The order is queued for Shopify export."}
@@ -23719,7 +23756,7 @@ def run_shopify_script_export_impl(job: dict[str, Any]) -> None:
             review = conn.execute("SELECT * FROM shopify_title_reviews WHERE job_id=?", (job["id"],)).fetchone()
     if review or title_review.enabled(settings, "shopify_clean_titles_enabled") or title_review.enabled(settings, "shopify_title_approval_enabled"):
         odoo = title_review.FrozenOdoo(odoo)
-        snapshot = title_review.prepare(module, odoo, str(job["odoo_order_name"]), settings, rename_manager)
+        snapshot = title_review.prepare(module, odoo, str(job["odoo_order_name"]), settings, rename_manager, source_asins=shopify_title_source_asins(job))
         snapshot = resolve_shopify_title_review(job, snapshot, settings)
         title_review.install_prepared_export(module, snapshot)
     shops = []

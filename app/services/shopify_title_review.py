@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from app.services.asin import normalize_asin, encode_asin, strip_html
 from pathlib import Path
 
 DEFAULT_KEYWORDS = Path(__file__).with_name('shopify_title_keywords.txt').read_text().strip()
@@ -77,7 +78,48 @@ def line_key(line):
     return f"{line['id']}:{ref[0]}"
 
 
-def prepare(module, odoo, order_name, settings, rename_manager):
+def reference_asins(product):
+    """Accept a standalone ASIN or an explicit ASIN label, never arbitrary title tokens."""
+    candidates = set()
+    for field in ('description', 'description_sale'):
+        text = strip_html(product.get(field) or '').strip()
+        if normalize_asin(text):
+            candidates.add(normalize_asin(text))
+        for value in re.findall(r'\b(?:Amazon\s+)?ASIN\s*[:=]\s*([A-Z0-9]{10})\b', text, re.I):
+            if normalize_asin(value):
+                candidates.add(normalize_asin(value))
+    return candidates
+
+
+def ensure_internal_reference(odoo, product, candidates=()):
+    """Persist the original product's encoded ASIN before using it as a destination SKU."""
+    existing = normalize(product.get('default_code'))
+    if existing:
+        return existing
+    product_id = int(product.get('id') or 0)
+    if product_id <= 0:
+        return ''
+    # Read fresh source evidence and recheck the reference immediately before writing.
+    fresh = odoo.read('product.product', [product_id], ['default_code', 'description', 'description_sale'])
+    if not fresh:
+        return ''
+    existing = normalize(fresh[0].get('default_code'))
+    if existing:
+        product['default_code'] = existing
+        return existing
+    asins = reference_asins(fresh[0]) | {normalize_asin(a) for a in candidates if normalize_asin(a)}
+    if len(asins) != 1:
+        return ''
+    encoded = encode_asin(next(iter(asins)))
+    odoo._exec('product.product', 'write', [[product_id], {'default_code': encoded}])
+    verified = odoo.read('product.product', [product_id], ['default_code'])
+    if not verified or normalize(verified[0].get('default_code')) != encoded:
+        raise ValueError('The generated Internal Reference could not be verified in Odoo. Refresh the review and retry.')
+    product['default_code'] = encoded
+    return encoded
+
+
+def prepare(module, odoo, order_name, settings, rename_manager, *, repair_references=True, source_asins=None, fingerprint_skus=None):
     order = odoo.get_order_by_number(order_name)
     if not order:
         raise ValueError(f'Odoo order not found: {order_name}')
@@ -104,6 +146,8 @@ def prepare(module, odoo, order_name, settings, rename_manager):
             if source and source[0].get('product_id'):
                 brand_product = raw_client.get_product_product(int(source[0]['product_id'][0])) or {}
                 sku = normalize(brand_product.get('default_code'))
+        if clean and not sku and repair_references:
+            sku = ensure_internal_reference(odoo, brand_product, (source_asins or {}).get(int(line['id']), ()))
         brand_key = str(brand_product.get('product_tmpl_id'))
         if brand_key not in brands_cache:
             brands_cache[brand_key] = product_brands(odoo, brand_product) if clean else []
@@ -114,7 +158,8 @@ def prepare(module, odoo, order_name, settings, rename_manager):
                           prepared_title=dest_title, sku=dest_sku or '', brands=brands,
                           quantity=line.get('product_uom_qty'), price_unit=line.get('price_unit'),
                           price_total=line.get('price_total'), discount=line.get('discount')))
-    source = dict(items=items, clean=clean, keywords=keywords if clean else '', order=order)
+    fingerprint_items = [dict(item, sku=fingerprint_skus.get(item['key'], item['sku'])) for item in items] if fingerprint_skus else items
+    source = dict(items=fingerprint_items, clean=clean, keywords=keywords if clean else '', order=order)
     fingerprint = hashlib.sha256(json.dumps(source, sort_keys=True, default=str).encode()).hexdigest()
     return dict(items=items, fingerprint=fingerprint, clean=clean)
 
@@ -129,7 +174,7 @@ def validate_items(items, clean, keywords):
             raise ValueError('Every product needs a prepared title. Edit the empty titles before approval.')
         if clean:
             if not item.get('sku'):
-                raise ValueError('A product is missing its Odoo Internal Reference. Add it in Odoo and refresh the review.')
+                raise ValueError('A product is missing its Odoo Internal Reference and has no unambiguous original ASIN. Add the original ASIN to its Odoo internal notes or set its Internal Reference, then refresh the review.')
             if title != prepared_title(title, item.get('brands') or [], keywords):
                 raise ValueError('Prepared titles must have at most six words and exclude the brand and removal keywords.')
         sku = item.get('sku')
