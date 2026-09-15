@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import { SmsPreview } from './SmsSettings'
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
@@ -140,6 +141,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
       {detail && <><Status row={detail.row} /><dl><dt>Order / store</dt><dd>{detail.row.odoo_order_name} · {detail.row.store_name}</dd><dt>Recipient</dt><dd>{detail.row.recipient}</dd><dt>Sender</dt><dd>{detail.row.sender}</dd><dt>Provider message ID</dt><dd>{detail.row.provider_message_id || "No acceptance ID recorded"}</dd><dt>Mode</dt><dd>{detail.row.test_mode ? "Test" : "Live"}</dd></dl>
         <section><h3>Send attempts</h3>{!detail.attempts.length && <p>Detailed attempt history is unavailable for this older record. Its saved status is shown above.</p>}<ol className="email-attempts">{detail.attempts.map(attempt => <li key={attempt.attempt_number}><strong>Attempt {attempt.attempt_number} · {attempt.status.replaceAll("_", " ")}</strong><small>{formatDate(attempt.created_at)} → {formatDate(attempt.updated_at)}</small>{attempt.error && <p className="email-log-error">{attempt.error}</p>}</li>)}</ol>
           {detail.row.can_approve ? <Button disabled={retryId !== null} onClick={() => { setDetailId(null); setRetryTarget(detail.row) }}>Approve sending this email</Button> : <p>{detail.row.retry_block_reason}</p>}</section>
+        <SmsPreview key={detail.row.id} api={api} emailId={detail.row.id} />
         <section><h3>Email preview</h3>{preview ? <iframe title="Saved email preview" sandbox="" referrerPolicy="no-referrer" srcDoc={preview} className="email-preview-frame" tabIndex={-1} /> : <p>No HTML preview was saved.</p>}</section></>}
     </DialogContent></Dialog>
     <Dialog open={retryTarget !== null} onOpenChange={open => { if (!open && retryId === null) setRetryTarget(null) }}><DialogContent><DialogHeader><DialogTitle>Approve this email attempt?</DialogTitle><DialogDescription>This approval sends the exact saved email to the recipient below, only if current order and safety checks still pass. Failures require another approval.</DialogDescription></DialogHeader>

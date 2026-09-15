@@ -1,4 +1,5 @@
 import { ShopifyTitleReview } from "./components/ShopifyTitleReview"
+import { SmsSettings } from './components/SmsSettings'
 import { SupportWorkspace } from "@/components/SupportWorkspace"
 import { Fragment, useEffect, useMemo, useRef, useState } from "react"
 import type { DragEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react"
@@ -17179,6 +17180,7 @@ function SettingsPage({
         <h2 className="page-title">Settings</h2>
         <p className="text-sm text-muted-foreground">Configure stores, fulfilment addresses, Amazon accounts, service connections, backups, and punchout URLs.</p>
       </section>
+      <SmsSettings api={api} />
 
       <Card>
         <CardHeader>

@@ -78,6 +78,7 @@ class LogHandlersTests(unittest.TestCase):
         self.provider = Mock(send=Mock(return_value={"id":"provider-demo"}))
         self.scope = {"hashlib":hashlib,"Any":Any,"Optional":Optional,"Request":object,"db":db,"json":json,"requests":requests,
             "care_delivery":Mock(suppressed=Mock(return_value='')),
+            "care_sms":Mock(),
             "datetime":datetime,"timedelta":timedelta,"timezone":timezone,"HTTPException":HTTPError,
             "row_to_dict":lambda row: dict(row) if row else None,"rows_to_dicts":lambda rows:[dict(row) for row in rows],
             "after_order_email_test_mode":lambda:True,"after_order_test_recipient":lambda:"test@example.test",

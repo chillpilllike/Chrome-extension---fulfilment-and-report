@@ -2272,6 +2272,8 @@ def init_db() -> None:
         conn.executescript(request_schema)
         from app.services.care_reminders import SCHEMA as reminder_schema
         conn.executescript(reminder_schema)
+        from app.services.care_sms import SCHEMA as sms_schema
+        conn.executescript(sms_schema)
         ensure_performance_indexes(conn)
         conn.execute("UPDATE order_lines SET pulled_at = COALESCE(NULLIF(pulled_at, ''), created_at)")
         conn.execute(
@@ -40048,6 +40050,7 @@ def send_after_order_email(
         candidate = {'provider':provider_name,'status':'awaiting_approval','attempt_count':0,
                      'test_mode':test_mode,'recipient':recipient,'payload_json':json.dumps(message_payload),
                      'template_kind':showcase_kind or template_kind or case.get('case_type')}
+        care_sms.companion(reservation['id'])
         if permitted(candidate, test_mode=after_order_email_test_mode()):
             result = retry_after_order_email(reservation['id'], request, policy_exception=True)
             return {**result, 'message_id':reservation['id'],'recipient':recipient}
@@ -40317,6 +40320,8 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         conn.execute("UPDATE after_order_messages SET status=?,last_error=?,provider_message_id=?,updated_at=? WHERE id=?", (outcome, error or None, provider_id or None, utc_now(), message_id))
         conn.execute("UPDATE after_order_email_attempts SET status=?,error=?,provider_message_id=?,updated_at=? WHERE message_id=? AND attempt_number=?", (outcome, error or None, provider_id or None, utc_now(), message_id, attempt))
         record_after_order_event(conn, case["id"], "email_retry_finished", actor_type="system" if automatic else "team", details={"message_id": message_id, "attempt": attempt, "status": outcome, "error": error, "automatic": automatic})
+    if outcome in {'sent','sent_test'}:
+        care_sms.companion(message_id)
     return {"ok": outcome in {"sent", "sent_test"}, "status": outcome, "message": f"Retry accepted by the provider for {locked['recipient']}." if not error else error}
 
 
@@ -44596,6 +44601,9 @@ from app.services.warehouse_dispatch_delay import Monitor as WarehouseDispatchMo
 warehouse_dispatch_delay = WarehouseDispatchMonitor(globals())
 from app.services.welcome_email import Monitor as WelcomeEmailMonitor
 welcome_emails = WelcomeEmailMonitor(globals())
+from app.services.care_sms import SMS as CareSMS
+care_sms = CareSMS(globals())
+app.include_router(care_sms.router())
 
 
 from app.support.portal import create_portal_router
