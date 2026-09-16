@@ -94,6 +94,28 @@ class WorkflowTests(unittest.TestCase):
   self.svc.rpc=Mock(return_value=SNAP)
   self.c.execute('INSERT INTO relay_payments(store_id,request_id,snapshot_json,pay_token,created_at,updated_at) VALUES(1,?,?,?,?,?)',('req-1',json.dumps(SNAP),'token','now','now'));self.c.commit()
  def tearDown(self):self.c.close()
+ def approve_alias(self):
+  self.svc.approve_customer_alias(1,{**SNAP,'customer_name':'Amit','relay_invoice_id':CAPTURE['relay_invoice_id']})
+ def test_approved_alias_binds_only_exact_order_invoice_email_and_amount(self):
+  self.approve_alias()
+  self.svc.capture({**CAPTURE,'customer_name':'A Amit'})
+  self.assertEqual('ready',self.c.execute('SELECT status FROM relay_payments').fetchone()[0])
+  audit=self.c.execute('SELECT * FROM relay_customer_aliases').fetchone()
+  self.assertEqual('Amit',audit['customer_name']);self.assertTrue(audit['approved_at'])
+ def test_alias_never_relaxes_email_amount_order_or_invoice(self):
+  self.approve_alias()
+  for change in ({'customer_email':'other@example.test'},{'amount_cents':1},{'order_number':'OTHER'},{'relay_invoice_id':'other-id'},{'customer_name':'Someone else'}):
+   with self.subTest(change=change),self.assertRaises(ValueError):
+    self.svc.capture({**CAPTURE,'customer_name':'Amit',**change})
+  self.svc.rpc.assert_not_called()
+ def test_alias_requires_current_identity_and_cannot_be_added_after_binding(self):
+  with self.assertRaises(ValueError):self.svc.approve_customer_alias(1,{**SNAP,'order_number':'OTHER','customer_name':'Amit','relay_invoice_id':CAPTURE['relay_invoice_id']})
+  self.svc.capture(CAPTURE)
+  with self.assertRaises(ValueError):self.approve_alias()
+ def test_alias_invalidated_by_current_source_change(self):
+  self.approve_alias();self.svc.current=lambda row:{**SNAP,'source_hash':'changed'}
+  with self.assertRaises(ValueError):self.svc.capture({**CAPTURE,'customer_name':'Amit'})
+  self.svc.rpc.assert_not_called()
  def test_duplicate_upload_one_email_and_binding(self):
   self.svc.capture(CAPTURE);self.svc.capture(CAPTURE)
   self.assertEqual(1,self.c.execute('SELECT COUNT(*) FROM relay_email_outbox').fetchone()[0])

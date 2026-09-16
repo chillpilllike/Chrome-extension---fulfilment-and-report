@@ -57,6 +57,43 @@ class RelayPayments:
                 provider_id TEXT, payload_json TEXT, error TEXT, attempted_at TEXT,
                 created_at TEXT NOT NULL, UNIQUE(payment_id,kind))''')
 
+            c.execute('''CREATE TABLE IF NOT EXISTS relay_customer_aliases (
+                payment_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, source_hash TEXT NOT NULL,
+                relay_invoice_id TEXT NOT NULL UNIQUE, customer_name TEXT NOT NULL, approved_at TEXT NOT NULL)''')
+
+    def approve_customer_alias(self, payment_id, payload):
+        name = str(payload.get('customer_name', '')).strip()
+        invoice_id = str(payload.get('relay_invoice_id', '')).strip()
+        import re
+        if not name or len(name) > 200 or not re.fullmatch(r'[A-Za-z0-9_-]{5,100}', invoice_id):
+            raise ValueError('Enter the exact Relay customer name and invoice ID')
+        with self.db() as c:
+            row = c.execute('SELECT * FROM relay_payments WHERE id=?', (payment_id,)).fetchone()
+        if not row or row['status'] != 'waiting_link' or row['payment_link']:
+            raise ValueError('Only an unlinked payment request can receive a customer-name mapping')
+        snap = self.current(row)
+        for key in ('request_id', 'order_number', 'customer_email', 'amount_cents'):
+            if payload.get(key) != snap.get(key):
+                raise ValueError('Order identity changed; reload before approving')
+        if snap.get('state') != 'pending' or snap.get('initiated_at'):
+            raise ValueError('Payment is no longer awaiting a link')
+        with self.db() as c:
+            c.execute('''INSERT INTO relay_customer_aliases
+                (payment_id,request_id,source_hash,relay_invoice_id,customer_name,approved_at)
+                VALUES (?,?,?,?,?,?)''',
+                (payment_id,snap['request_id'],snap['source_hash'],invoice_id,name,now()))
+        return {'ok': True}
+
+    def match_customer_capture(self, row, snapshot, capture):
+        with self.db() as c:
+            alias = c.execute('SELECT * FROM relay_customer_aliases WHERE payment_id=?', (row['id'],)).fetchone()
+        if alias:
+            if (alias['request_id'] != snapshot['request_id'] or alias['source_hash'] != snapshot['source_hash']
+                    or alias['relay_invoice_id'] != capture.get('relay_invoice_id')):
+                raise ValueError('Approved contact mapping does not match this invoice')
+            snapshot = {**snapshot, 'customer_name': alias['customer_name']}
+        return match_capture(snapshot, capture)
+
     def client(self, store_id):
         return self.client_factory(self.get_store(int(store_id)))
 
@@ -145,7 +182,7 @@ class RelayPayments:
             rows = c.execute("SELECT * FROM relay_payments WHERE status IN ('waiting_link','ready','email_sent')").fetchall()
         for row in rows:
             try:
-                match_capture(json.loads(row['snapshot_json']), capture)
+                self.match_customer_capture(row, json.loads(row['snapshot_json']), capture)
                 matches.append(row)
             except ValueError:
                 pass
@@ -154,7 +191,7 @@ class RelayPayments:
         row = matches[0]
         if row['store_id'] not in self.settings()['store_ids']:
             raise ValueError('Store is not enabled')
-        match_capture(self.current(row), capture)
+        self.match_customer_capture(row, self.current(row), capture)
         return row
 
     def capture(self, capture):
@@ -445,17 +482,26 @@ class RelayPayments:
                 return self.capture(payload)
             except ValueError as exc:
                 raise HTTPException(409,str(exc)) from None
+        @r.post('/payments/{payment_id}/customer-alias')
+        def customer_alias(request:Request,payment_id:int,payload:dict):
+            staff(request);self.ensure()
+            try:
+                return self.approve_customer_alias(payment_id,payload)
+            except ValueError as exc:
+                raise HTTPException(409,str(exc)) from None
         @r.get('/payments')
         def payments(request:Request,store_id:int=0):
             staff(request);self.ensure()
             with self.db() as c:
                 rows=c.execute('SELECT * FROM relay_payments WHERE (?=0 OR store_id=?) ORDER BY id DESC LIMIT 200',(store_id,store_id)).fetchall()
                 outbox=c.execute('SELECT payment_id,kind,state,error FROM relay_email_outbox').fetchall()
+                aliases=c.execute('SELECT * FROM relay_customer_aliases').fetchall()
                 receipts=c.execute("SELECT email_id,status,reason,created_at FROM relay_receipts WHERE status='review' ORDER BY created_at DESC LIMIT 30").fetchall()
             result=[]
             for row in rows:
                 item=dict(row);item.pop('pay_token',None);item.pop('capture_json',None)
                 item['snapshot']=json.loads(item.pop('snapshot_json'));item['snapshot'].pop('portal_url',None)
+                item['customer_alias']=next((dict(a) for a in aliases if a['payment_id']==row['id']),None)
                 item['emails']=[dict(mail) for mail in outbox if mail['payment_id']==row['id']]
                 result.append(item)
             return {'rows':result,'receipts':receipts}
