@@ -90,12 +90,15 @@ class RelayPayments:
         store = self.get_store(int(sid))
         client = self.client(sid)
         website_id = getattr(store, 'website_id', None)
-        if not website_id:
-            sites=client.execute('website','search_read',[[]],{'fields':['id'],'limit':2})
-            if len(sites)!=1:
-                raise ValueError('Multiple Odoo websites: configure an explicit website ID for this store')
-            website_id=sites[0]['id']
-        website_id=int(website_id)
+        if website_id:
+            website_ids = [int(website_id)]
+        else:
+            sites = client.execute('website', 'search_read', [[]], {'fields': ['id']})
+            website_ids = sorted({int(site['id']) for site in sites})
+        for scoped_id in website_ids:
+            self.sync_website(sid, client, scoped_id)
+
+    def sync_website(self, sid, client, website_id):
         offset = 0
         while True:
             batch = client.execute('payment.transaction', 'relay_bridge_pending', [website_id, offset])

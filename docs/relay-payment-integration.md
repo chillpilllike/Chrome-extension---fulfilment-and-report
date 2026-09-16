@@ -6,7 +6,7 @@ Odoo exports a frozen USD invoice to QuickBooks. A minute worker imports pending
 
 A forwarded Relay payment-initiation notice is matched by the bound Relay payment token and exact USD amount. Odoo confirms the sale using its normal stock/order hooks while leaving the payment transaction pending settlement. The app sends the confirmation only after Odoo acknowledges initiation. Duplicate receipts, captures and lost RPC acknowledgements are idempotent. Generic tracking-email sends/retries are excluded from Relay cases.
 
-Forwarder default: am-it@outlook.com. Receiving default: relay-payments@taloofalut.resend.app. Both are editable under After-order care > Relay invoice payments. Select stores by name. If a database has one website it is verified automatically; databases with multiple websites need an explicit website ID in store settings.
+Forwarder default: am-it@outlook.com. Receiving default: relay-payments@taloofalut.resend.app. Both are editable under After-order care > Relay invoice payments. Select stores by name. Selected stores include all accessible Odoo websites when the store website ID is blank. An explicit website ID restricts sync to that website. Every returned order must match its requested website, and its database, website, customer, and amount are frozen and rechecked.
 
 ## Activation
 

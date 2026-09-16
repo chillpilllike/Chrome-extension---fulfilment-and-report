@@ -104,11 +104,18 @@ class SyncScopeTests(WorkflowTests):
   self.svc.sync()
   self.assertEqual(('payment.transaction','relay_bridge_pending',[1,0]),client.execute.call_args.args)
   self.assertEqual(1,self.c.execute("SELECT COUNT(*) FROM after_order_cases WHERE case_type='relay_payment'").fetchone()[0])
- def test_multiple_websites_never_guesses(self):
+ def test_multiple_websites_are_each_scoped(self):
   self.svc.get_store=lambda _:types.SimpleNamespace(website_id=None)
-  client=Mock();client.execute.return_value=[{'id':1},{'id':2}];self.svc.client=lambda _:client
-  with self.assertRaises(ValueError):self.svc.sync()
-  self.assertEqual(1,client.execute.call_count)
+  client=Mock();client.execute.side_effect=[[{'id':1},{'id':2}],{'records':[], 'more':False},{'records':[{**SNAP,'request_id':'site-two','website_id':2,'order_id':23}], 'more':False}]
+  self.svc.client=lambda _:client
+  self.svc.sync()
+  self.assertEqual([('payment.transaction','relay_bridge_pending',[1,0]),('payment.transaction','relay_bridge_pending',[2,0])],[call.args for call in client.execute.call_args_list[1:]])
+  self.assertEqual(2,self.c.execute("SELECT website_id FROM after_order_cases").fetchone()[0])
+ def test_explicit_website_does_not_enumerate_other_websites(self):
+  self.svc.get_store=lambda _:types.SimpleNamespace(website_id=9)
+  client=Mock();client.execute.return_value={'records':[], 'more':False};self.svc.client=lambda _:client
+  self.svc.sync()
+  client.execute.assert_called_once_with('payment.transaction','relay_bridge_pending',[9,0])
  def test_snapshot_wrong_website_rejected(self):
   self.svc.get_store=lambda _:types.SimpleNamespace(website_id=1)
   client=Mock();client.execute.return_value={'records':[{**SNAP,'website_id':2}],'more':False};self.svc.client=lambda _:client
