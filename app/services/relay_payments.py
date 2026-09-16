@@ -194,6 +194,28 @@ class RelayPayments:
         self.match_customer_capture(row, self.current(row), capture)
         return row
 
+    def contact(self, capture):
+        # Resolve before disclosing contact data; never match on amount/name alone.
+        row = self.resolve(capture)
+        snap = self.current(row)
+        client = self.client(row['store_id'])
+        orders = client.execute('sale.order', 'read', [[snap['order_id']]], {'fields': ['partner_invoice_id']})
+        if len(orders) != 1 or not orders[0].get('partner_invoice_id'):
+            raise ValueError('Billing contact is unavailable')
+        partners = client.execute('res.partner', 'read', [[orders[0]['partner_invoice_id'][0]]],
+                                  {'fields': ['email', 'phone', 'mobile', 'country_id']})
+        if len(partners) != 1 or not partners[0].get('country_id'):
+            raise ValueError('Billing country is unavailable')
+        countries = client.execute('res.country', 'read', [[partners[0]['country_id'][0]]],
+                                   {'fields': ['code', 'name']})
+        if len(countries) != 1:
+            raise ValueError('Billing country is unavailable')
+        from .relay_contact import contact_details
+        result = contact_details(partners[0], countries[0], snap['customer_email'])
+        self.match_customer_capture(row, self.current(row), capture)
+        return {'ok': True, 'invoice_number': snap['invoice_number'],
+                'relay_invoice_id': capture['relay_invoice_id'], 'contact': result}
+
     def capture(self, capture):
         row = self.resolve(capture)
         link = capture.get('payment_link', '')
@@ -478,6 +500,13 @@ class RelayPayments:
             try:
                 row=self.resolve(payload)
                 return {'ok':True,'payment_id':row['id']}
+            except ValueError as exc:
+                raise HTTPException(409,str(exc)) from None
+        @r.post('/extension/contact')
+        def contact(request:Request,payload:dict):
+            extension(request)
+            try:
+                return self.contact(payload)
             except ValueError as exc:
                 raise HTTPException(409,str(exc)) from None
         @r.post('/extension/capture')

@@ -301,3 +301,18 @@ class EmailOutboxTests(unittest.TestCase):
   self.assertEqual('queued',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
 
 if __name__=='__main__':unittest.main()
+
+class ContactLookupTests(WorkflowTests):
+ def test_contact_requires_exact_match_before_reading_partner(self):
+  client=Mock();self.svc.client=lambda _:client
+  with self.assertRaises(ValueError):self.svc.contact({**CAPTURE,'customer_email':'wrong@example.test'})
+  client.execute.assert_not_called()
+ def test_contact_reads_only_matched_order_billing_partner(self):
+  self.svc.current=lambda row:{**SNAP,'order_id':123}
+  client=Mock();self.svc.client=lambda _:client
+  client.execute.side_effect=[[{'partner_invoice_id':[42,'Customer']}],[{'email':SNAP['customer_email'],'phone':'0479 046 169','country_id':[13,'Australia']}],[{'code':'AU','name':'Australia'}]]
+  result=self.svc.contact(CAPTURE)
+  self.assertEqual(result['contact']['national_number'],'479046169')
+  self.assertEqual(result['invoice_number'],SNAP['invoice_number'])
+  self.assertEqual(client.execute.call_args_list[0].args[2],[[123]])
+  self.assertEqual(client.execute.call_args_list[1].args[2],[[42]])

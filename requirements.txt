@@ -12,3 +12,5 @@ redis==5.0.7
 
 cryptography==46.0.5
 Pillow==11.3.0
+
+phonenumbers==9.0.22
