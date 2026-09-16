@@ -84,7 +84,7 @@ class Adapter:
 
 class WorkflowTests(unittest.TestCase):
  def setUp(self):
-  self.c=sqlite3.connect(':memory:');self.c.row_factory=sqlite3.Row
+  self.c=sqlite3.connect(':memory:',check_same_thread=False);self.c.row_factory=sqlite3.Row
   @contextmanager
   def db():
    try:yield Adapter(self.c);self.c.commit()
@@ -275,6 +275,26 @@ class EmailOutboxTests(unittest.TestCase):
   self.assertIn('Bank settlement is still processing',mail['html'])
   self.assertNotIn('Pay USD',mail['html'])
   self.assertIn('/web/image/website/1/logo',mail['html'])
+ def test_manual_branded_resend_preserves_original_and_is_idempotent(self):
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  response=Mock();response.json.return_value={'id':'original'}
+  with patch.dict('os.environ',{'RESEND_API_KEY':'fake'}),patch('relay_bridge_test.relay_payments.requests.post',return_value=response) as post:
+   self.svc.emails()
+   original=self.c.execute('SELECT payload_json FROM relay_email_outbox').fetchone()[0]
+   app=FastAPI();app.include_router(self.svc.router());client=TestClient(app)
+   for _ in range(2):self.assertEqual(200,client.post('/api/relay/payments/1/resend-branded').status_code)
+   self.svc.emails();self.svc.emails()
+   self.assertEqual(2,post.call_count)
+   self.assertNotEqual(post.call_args_list[0].kwargs['headers']['Idempotency-Key'],post.call_args_list[1].kwargs['headers']['Idempotency-Key'])
+   self.assertEqual(original,self.c.execute("SELECT payload_json FROM relay_email_outbox WHERE kind='request'").fetchone()[0])
+   self.assertIn('Your invoice is ready',post.call_args.kwargs['json']['html'])
+ def test_manual_branded_resend_rejects_paid_order(self):
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  self.svc.current=lambda row:dict(SNAP,initiated_at='now',state='done')
+  app=FastAPI();app.include_router(self.svc.router())
+  self.assertEqual(409,TestClient(app).post('/api/relay/payments/1/resend-branded').status_code)
  def test_missing_key_retains_queued_email(self):
   from unittest.mock import patch
   with patch.dict('os.environ',{},clear=True),self.assertRaises(ValueError):self.svc.emails()

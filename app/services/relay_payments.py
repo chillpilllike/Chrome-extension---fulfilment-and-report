@@ -302,6 +302,7 @@ class RelayPayments:
                     c.execute('UPDATE relay_payments SET last_error=? WHERE id=?', ('Receipt confirmation temporarily unavailable',payment['id']))
 
     def email_payload(self, row, kind):
+        kind = 'request' if kind == 'request_branded_v1' else kind
         snap = self.current(row)
         if kind == 'request' and (snap.get('initiated_at') or snap['state'] != 'pending'):
             raise ValueError('Payment is no longer awaiting customer action')
@@ -391,7 +392,7 @@ class RelayPayments:
                 c.execute('UPDATE relay_email_outbox SET state=?,provider_id=?,error=? WHERE id=?',(status,provider_id,error,job['id']))
                 c.execute('UPDATE after_order_messages SET status=?,provider_message_id=?,last_error=?,updated_at=? WHERE id=?',(status,provider_id,error,now(),message['id']))
                 c.execute('UPDATE after_order_email_attempts SET status=?,provider_message_id=?,error=?,updated_at=? WHERE message_id=? AND attempt_number=?',(status,provider_id,error,now(),message['id'],attempt))
-                if status=='sent' and job['kind']=='request':
+                if status=='sent' and job['kind'] in ('request','request_branded_v1'):
                     c.execute("UPDATE relay_payments SET status='email_sent' WHERE id=? AND status='ready'",(row['id'],))
 
     def cycle(self):
@@ -486,6 +487,20 @@ class RelayPayments:
                 return self.capture(payload)
             except ValueError as exc:
                 raise HTTPException(409,str(exc)) from None
+        @r.post('/payments/{payment_id}/resend-branded')
+        def resend_branded(request:Request,payment_id:int):
+            staff(request);self.ensure()
+            with self.db() as c:
+                row=c.execute('SELECT * FROM relay_payments WHERE id=?',(payment_id,)).fetchone()
+            if not row or not row['payment_link']:
+                raise HTTPException(409,'A matched payment link is required')
+            try:
+                self.email_payload(row,'request')  # Revalidate current recipient and unpaid order.
+            except ValueError as exc:
+                raise HTTPException(409,str(exc)) from None
+            with self.db() as c:
+                c.execute("INSERT INTO relay_email_outbox(payment_id,kind,created_at) VALUES (?,'request_branded_v1',?) ON CONFLICT(payment_id,kind) DO NOTHING",(payment_id,now()))
+            return {'ok':True,'message':'Branded payment email queued. Repeated clicks do not send duplicates.'}
         @r.post('/payments/{payment_id}/customer-alias')
         def customer_alias(request:Request,payment_id:int,payload:dict):
             staff(request);self.ensure()
