@@ -14,10 +14,11 @@ class TestPickupAutoReconciliation(unittest.TestCase):
         raw = sqlite3.connect(":memory:")
         raw.row_factory = sqlite3.Row
         raw.create_function("GREATEST", 2, max)
+        raw.create_function("LEAST", 2, min)
 
         class Connection:
             def execute(self, sql, params=()):
-                return raw.execute(sql.replace("FOR UPDATE SKIP LOCKED", "").replace("FOR UPDATE", "").replace("ADD COLUMN IF NOT EXISTS", "ADD COLUMN"), params)
+                return raw.execute(sql.replace("FOR UPDATE OF e SKIP LOCKED", "").replace("FOR UPDATE SKIP LOCKED", "").replace("FOR UPDATE", "").replace("ADD COLUMN IF NOT EXISTS", "ADD COLUMN"), params)
 
         self.conn = Connection()
         self.addCleanup(raw.close)

@@ -714,6 +714,8 @@ type PackagePickupScanResponse = {
 }
 
 type PackagePickupScanHistoryEvent = {
+  shopify_fulfilled?: boolean
+  shopify_fulfilled_at?: string
   current_order_readiness?: PackagePickupOrderReadiness
   reconciled_at?: string
   original_result_status?: string
@@ -796,7 +798,7 @@ function PackagePickupScanHistoryGroupCard({ group }: { group: PackagePickupScan
         </div>
         {entry.amazon_order_id ? <small><b>Amazon order</b> {entry.amazon_order_id}</small> : null}
         {entry.recipient_ref ? <small><b>Recipient</b> {entry.recipient_ref}</small> : null}
-        {matched && readiness ? <small className={readiness.ready_to_ship ? "is-ready" : "is-hold"}><b>Now: {readiness.received_packages}/{readiness.total_packages} known packages received.</b> {readiness.message}</small> : matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>At scan time: {entry.order_received_packages}/{entry.order_total_packages} packages recorded.</b> {entry.order_readiness_message}</small> : null}
+        {matched && entry.shopify_fulfilled ? <small className="is-ready"><b>Already fulfilled in Shopify.</b> {readiness ? `Warehouse scan records: ${readiness.received_packages}/${readiness.total_packages} packages received.${readiness.ready_to_ship ? "" : " Historical scan evidence needs reconciliation; do not fulfil again."}` : ""}</small> : matched && readiness ? <small className={readiness.ready_to_ship ? "is-ready" : "is-hold"}><b>Now: {readiness.received_packages}/{readiness.total_packages} known packages received.</b> {readiness.message}</small> : matched && entry.order_total_packages ? <small className={Boolean(entry.order_ready) ? "is-ready" : "is-hold"}><b>At scan time: {entry.order_received_packages}/{entry.order_total_packages} packages recorded.</b> {entry.order_readiness_message}</small> : null}
         <div className="pickup-history-scans">
           {group.events.map((scan) => {
             const scanMatched = Boolean(scan.matched)

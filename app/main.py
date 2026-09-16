@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sys
 from app.services import amazon_purchase_allocations as purchase_allocations
+from app.services import pickup_evidence_repair
 
 from app.services.inventory_history import install_inventory_history, inventory_filter
 from app.services.inventory_labels import annotate_inventory_labels
@@ -5510,7 +5511,8 @@ def canonical_tracking_packages(packages: list[dict[str, Any]]) -> list[dict[str
             canonical.append(package)
             continue
         canonical[position] = merge_tracking_shipment_snapshots(canonical[position], package)
-    return canonical
+    shadows = {source for source, _ in pickup_evidence_repair.single_unit_shadow_pairs(sys.modules[__name__], canonical)}
+    return [package for index, package in enumerate(canonical) if index not in shadows]
 
 
 def dispatch_physical_package_key(row: dict[str, Any]) -> str:
@@ -6299,6 +6301,7 @@ def update_history_matched_order_from_tracking(conn: Any, amazon_order_id: str, 
         if replacement_tracking.strict_line(row):
             previous = [p for p in parse_tracking_packages(row.get("tracking_payload") or "") if package_matches_line(p, row)]
             line_packages = merge_replacement_tracking_packages([*previous, *line_packages])
+        line_packages = canonical_tracking_packages(line_packages)
         row_status = tracking_status_from_packages(line_packages)
         row_delivered = row_status == "Delivered" and all(tracking_package_delivered(p) for p in line_packages)
         if replacement_tracking.strict_line(row) and row_delivered and not replacement_tracking.delivered_quantity_complete(row, line_packages):
@@ -7832,7 +7835,8 @@ def collapse_dispatch_shipment_alias_rows(conn: Any, amazon_order_id: str) -> in
         (clean_text(amazon_order_id),),
     ).fetchall())
     removed = 0
-    for alias_id, target_id in dispatch_shipment_alias_pairs(rows):
+    pairs = dispatch_shipment_alias_pairs(rows) + pickup_evidence_repair.dispatch_shadow_pairs(sys.modules[__name__], conn, rows)
+    for alias_id, target_id in dict.fromkeys(pairs):
         alias = next((row for row in rows if int(row.get("id") or 0) == alias_id), {})
         if clean_text(alias.get("received_at")) or clean_text(alias.get("placed_at")) or int(alias.get("scan_count") or 0) > 0:
             continue
@@ -7905,7 +7909,8 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         ).fetchall())
     parts: list[dict[str, Any]] = []
     covered_line_ids: set[int] = set()
-    for row in dedupe_dispatch_package_rows(rows):
+    shadows = {source for source, _ in pickup_evidence_repair.dispatch_shadow_pairs(sys.modules[__name__], conn, rows)}
+    for row in dedupe_dispatch_package_rows([r for r in rows if r["id"] not in shadows]):
         part = dispatch_package_payload(conn, row, include_related=False)
         if current_package_key and dispatch_physical_package_key(part) == current_package_key:
             part["id"] = package.get("id")
@@ -35654,6 +35659,7 @@ def reconcile_package_pickup_scans(conn: Any, only_scan_code: str = "") -> int:
     package so concurrent refreshes/scanners cannot count a parcel twice.
     """
     ensure_package_pickup_scan_history_table(conn)
+    pickup_evidence_repair.repair_orphan_scans(sys.modules[__name__], conn)
     events = rows_to_dicts(conn.execute("""
         SELECT * FROM package_pickup_scan_events
         WHERE matched=0 AND undone_at IS NULL
@@ -35787,6 +35793,7 @@ def reconcile_linked_pickup_scan_events(conn: Any) -> int:
 def pickup_history_current_readiness(conn: Any, events: list[dict[str, Any]]) -> None:
     """Show current readiness alongside immutable scan-time evidence."""
     cache = {}
+    statuses = package_pickup_shopify_statuses(conn)
     for event in events:
         if not event.get("matched") or event.get("undone_at") or not event.get("package_id"):
             continue
@@ -35797,6 +35804,9 @@ def pickup_history_current_readiness(conn: Any, events: list[dict[str, Any]]) ->
         if key not in cache:
             cache[key] = package_pickup_order_readiness(conn, package)
         event["current_order_readiness"] = cache[key]
+        shopify = statuses.get((int(package.get("store_id") or 0), clean_text(package.get("odoo_order_name")).upper()), {})
+        event["shopify_fulfilled"] = not shopify.get("cancelled_at") and clean_text(shopify.get("fulfillment_status")).upper() in {"FULFILLED", "SUCCESS"}
+        event["shopify_fulfilled_at"] = shopify.get("fulfillment_at") or ""
 
 
 def package_pickup_scan_history(store_id: Optional[int] = None, scan_date: str = "") -> dict[str, Any]:
@@ -38087,6 +38097,7 @@ def api_tracking_update_impl(payload: ChromeTrackingUpdatePayload) -> dict[str, 
                         row["id"],
                     ),
                 )
+            line_packages = canonical_tracking_packages(line_packages)
             line_status = tracking_status_from_packages(line_packages)
             line_delivered = line_status == "Delivered" and line_packages and all(
                 tracking_package_delivered(package) for package in line_packages if isinstance(package, dict)
