@@ -1002,7 +1002,7 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     token = effective_admin_access_token()
     path = request.url.path
     # These routes implement their own narrow credential/token validation.
-    if ((request.method == 'POST' and path in {'/api/relay/extension/resolve', '/api/relay/extension/capture'})
+    if ((request.method == 'POST' and path in {'/api/relay/extension/check', '/api/relay/extension/resolve', '/api/relay/extension/capture'})
             or (request.method == 'GET' and re.fullmatch(r'/api/relay/pay/[A-Za-z0-9_-]{40,80}', path))):
         return await call_next(request)
     if request.method == "OPTIONS":

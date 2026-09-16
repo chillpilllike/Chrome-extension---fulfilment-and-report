@@ -180,6 +180,19 @@ class RouterTests(WorkflowTests):
   self.assertEqual(401,client.get('/api/relay/settings',headers={'X-Relay-Token':'anything'}).status_code)
   self.assertEqual(401,client.post('/api/relay/extension/capture',json=CAPTURE).status_code)
 
+ def test_connection_check_authenticates_without_enabling_or_mutating(self):
+  import hashlib
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  self.svc.get_settings=lambda:{'relay_extension_token_hash':hashlib.sha256(b'valid-token').hexdigest()}
+  self.svc.set_settings=Mock()
+  app=FastAPI();app.include_router(self.svc.router());client=TestClient(app)
+  self.assertEqual(401,client.post('/api/relay/extension/check',headers={'X-Relay-Token':'wrong'}).status_code)
+  response=client.post('/api/relay/extension/check',headers={'X-Relay-Token':'valid-token'})
+  self.assertEqual(200,response.status_code);self.assertEqual('relay-payment-bridge',response.json()['service'])
+  self.assertFalse(response.json()['enabled']);self.assertTrue(response.json()['test_mode'])
+  self.svc.set_settings.assert_not_called();self.svc.rpc.assert_not_called()
+
 class EmailOutboxTests(unittest.TestCase):
  tearDown=WorkflowTests.tearDown
  def setUp(self):

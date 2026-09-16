@@ -385,12 +385,12 @@ class RelayPayments:
         def staff(request):
             if not self.staff_check(request):
                 raise HTTPException(401,'Staff authentication required')
-        def extension(request):
+        def extension(request, require_enabled=True):
             expected=self.get_settings().get('relay_extension_token_hash','')
             supplied=request.headers.get('X-Relay-Token','')
             if not expected or not hmac.compare_digest(expected,hashlib.sha256(supplied.encode()).hexdigest()):
                 raise HTTPException(401,'Relay extension authentication required')
-            if not self.settings()['enabled']:
+            if require_enabled and not self.settings()['enabled']:
                 raise HTTPException(409,'Relay integration is disabled')
         @r.get('/settings')
         def settings(request:Request):
@@ -424,6 +424,12 @@ class RelayPayments:
             staff(request);value=secrets.token_urlsafe(32)
             self.set_settings({'relay_extension_token_hash':hashlib.sha256(value.encode()).hexdigest()})
             return {'token':value}
+        @r.post('/extension/check')
+        def check_connection(request:Request):
+            extension(request, require_enabled=False)
+            settings=self.settings()
+            return {'ok':True,'service':'relay-payment-bridge','enabled':settings['enabled'],
+                    'test_mode':bool(settings['test_mode'] or self.email_test_mode())}
         @r.post('/extension/resolve')
         def resolve(request:Request,payload:dict):
             extension(request)
