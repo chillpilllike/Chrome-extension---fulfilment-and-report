@@ -215,6 +215,33 @@ class RouterTests(WorkflowTests):
   self.assertFalse(response.json()['enabled']);self.assertTrue(response.json()['test_mode'])
   self.svc.set_settings.assert_not_called();self.svc.rpc.assert_not_called()
 
+class ContactMiddlewareTests(WorkflowTests):
+ def test_contact_uses_extension_token_through_production_middleware(self):
+  import ast, hashlib, re
+  from pathlib import Path
+  from fastapi import FastAPI, Request, Response
+  from fastapi.testclient import TestClient
+  from typing import Any
+  tree=ast.parse((Path(__file__).parents[1]/'app/main.py').read_text())
+  fn=next(n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name=='admin_access_middleware')
+  fn.decorator_list=[]
+  scope=dict(Request=Request,Response=Response,Any=Any,re=re,json=json,
+             effective_admin_access_token=lambda:'staff-secret',
+             request_requires_public_access=lambda request:True,
+             request_has_public_access=lambda request:False)
+  exec(compile(ast.Module(body=[fn],type_ignores=[]),'production-middleware','exec'),scope)
+  self.svc.get_settings=lambda:{'relay_extension_token_hash':hashlib.sha256(b'valid-token').hexdigest(),'relay_payment_settings':json.dumps({'enabled':True})}
+  self.svc.contact=Mock(return_value={'ok':True})
+  app=FastAPI();app.middleware('http')(scope['admin_access_middleware']);app.include_router(self.svc.router())
+  client=TestClient(app)
+  for headers in ({},{'X-Relay-Token':'wrong'}):
+   self.assertEqual(401,client.post('/api/relay/extension/contact',json=CAPTURE,headers=headers).status_code)
+  self.svc.contact.assert_not_called()
+  response=client.post('/api/relay/extension/contact',json=CAPTURE,headers={'X-Relay-Token':'valid-token'})
+  self.assertEqual(200,response.status_code);self.svc.contact.assert_called_once()
+  self.assertEqual(401,client.get('/api/relay/extension/contact',headers={'X-Relay-Token':'valid-token'}).status_code)
+  self.assertEqual(401,client.get('/api/relay/settings',headers={'X-Relay-Token':'valid-token'}).status_code)
+
 class EmailOutboxTests(unittest.TestCase):
  tearDown=WorkflowTests.tearDown
  def setUp(self):
