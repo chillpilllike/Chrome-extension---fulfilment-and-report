@@ -44,6 +44,7 @@ import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { AfterCareWorkspace } from "@/components/AfterCareWorkspace"
 import { LineAlternativeButton, OrderCareTimeline } from "@/components/LineAlternatives"
+import { RelayPayments } from "@/components/RelayPayments"
 import { EmailLogWorkspace } from "@/components/EmailLogWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
 import "@/components/after-care-workspace.css"
@@ -6367,7 +6368,7 @@ function App() {
           />
         )}
         {page === "after-order-care" && (
-          <AfterOrderCarePage storeId={storeId} onResult={setModal} initialQuery={afterOrderInitialQuery} />
+          <><RelayPayments stores={stores} storeId={storeId} api={api} /><AfterOrderCarePage storeId={storeId} onResult={setModal} initialQuery={afterOrderInitialQuery} /></>
         )}
         {page === "support" && <SupportWorkspace api={api} />}
         {page === "email-log" && <EmailLogWorkspace storeId={storeId} api={api} onResult={setModal} onNavigate={(target, order) => { setAfterOrderInitialQuery(order || ""); setPage(target) }} />}

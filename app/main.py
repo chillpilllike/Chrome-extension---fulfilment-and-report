@@ -1001,6 +1001,10 @@ def database_unavailable_response(request: Request, update_cooldown: bool = True
 async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     token = effective_admin_access_token()
     path = request.url.path
+    # These routes implement their own narrow credential/token validation.
+    if ((request.method == 'POST' and path in {'/api/relay/extension/resolve', '/api/relay/extension/capture'})
+            or (request.method == 'GET' and re.fullmatch(r'/api/relay/pay/[A-Za-z0-9_-]{40,80}', path))):
+        return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
     if request_requires_public_access(request) and not request_has_public_access(request):
@@ -26214,6 +26218,7 @@ def startup() -> None:
                 threading.Thread(target=odoo_chatter_outbox_schedule_loop, daemon=True).start()
                 threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
+                threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
                 if should_reindex_typesense:
                     threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
                 threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
@@ -39953,6 +39958,8 @@ def send_after_order_email(
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
+    if case.get("case_type") == "relay_payment":
+        raise HTTPException(409, "Relay payment emails use their verified payment outbox.")
     unavailable_email = showcase_kind == "item_unavailable" or (not showcase_kind and case.get("case_type") == "item_unavailable" and template_kind != "trustpilot_review")
     if case.get('case_type') == 'new_order_welcome' and not force_test:
         welcome_emails.validate(case)
@@ -40339,6 +40346,8 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    if str(original.get("template_kind") or "").startswith("relay_"):
+        raise HTTPException(409, "Relay retries use the payment worker and its original idempotency key.")
     if policy_exception:
         from app.services.welcome_email import permitted
         if not permitted(original, test_mode=after_order_email_test_mode()):
@@ -41243,7 +41252,7 @@ def run_after_order_automation() -> dict[str, Any]:
         if after_order_email_test_mode():
             break
         case = after_order_case_by_id(int(row["id"]))
-        if not case or not after_order_case_is_in_scope(case) or case.get("current_decision"):
+        if not case or case.get("case_type") == "relay_payment" or not after_order_case_is_in_scope(case) or case.get("current_decision"):
             continue
         context = case.get("context") or {}
         if case.get("case_type") == "tracking" and context.get("risk_state") not in {"in_transit", "suspected_lost"}:
@@ -44731,6 +44740,13 @@ from app.services.care_sms import SMS as CareSMS
 care_sms = CareSMS(globals())
 app.include_router(care_sms.router())
 
+
+from app.services.relay_payments import RelayPayments
+relay_payments = RelayPayments(db=db, get_store=get_store, client_factory=OdooClient,
+    get_settings=get_service_settings, set_settings=set_service_settings,
+    staff_check=lambda request: bool(effective_admin_access_token()) and request_has_admin_access(request),
+    email_test_mode=after_order_email_test_mode)
+app.include_router(relay_payments.router())
 
 from app.support.portal import create_portal_router
 from app.support.routes import create_router as create_support_router

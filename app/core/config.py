@@ -153,6 +153,8 @@ DEFAULT_SERVICE_SETTINGS = {
     "after_order_website_portal_enabled": os.getenv("AFTER_ORDER_WEBSITE_PORTAL_ENABLED", "false"),
 }
 
+DEFAULT_SERVICE_SETTINGS.update({key: '' for key in ('relay_payment_settings', 'relay_extension_token_hash', 'relay_receiving_cursor', 'relay_sync_last_ok', 'relay_sync_error', 'relay_refresh_last_ok', 'relay_refresh_error', 'relay_receiving_last_ok', 'relay_receiving_error', 'relay_confirmation_last_ok', 'relay_confirmation_error', 'relay_email_last_ok', 'relay_email_error')})
+
 
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
