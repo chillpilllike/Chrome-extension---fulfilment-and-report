@@ -24080,7 +24080,7 @@ def shopify_fulfilment_attention_reason(row: dict[str, Any]) -> str:
     return ""
 
 
-def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str = "all", store_id: Optional[int] = None) -> tuple[list[dict[str, Any]], int, int, int]:
+def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str = "all", store_id: Optional[int] = None, search: str = "") -> tuple[list[dict[str, Any]], int, int, int]:
     page, per_page, offset = pagination_bounds(page, per_page)
     status_filter = clean_text(status).lower() or "all"
     params: list[Any] = []
@@ -24093,6 +24093,20 @@ def list_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str
     elif status_filter != "all":
         where_parts.append("shopify_fulfilment_jobs.status=?")
         params.append(status_filter)
+    search_term = clean_text(search).lstrip("#").strip()
+    if search_term:
+        # Treat wildcard characters as literal order-reference characters.
+        pattern = "%" + search_term.lower().replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+        search_columns = (
+            "shopify_fulfilment_jobs.odoo_order_name",
+            "shopify_export_order_map.dest_order_id",
+            "shopify_order_status_cache.shopify_order_name",
+        )
+        where_parts.append("(" + " OR ".join(
+            f"LOWER(COALESCE(CAST({column} AS TEXT), '')) LIKE ? ESCAPE '!'"
+            for column in search_columns
+        ) + ")")
+        params.extend([pattern] * len(search_columns))
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     with db() as conn:
         total = int(conn.execute(
@@ -29589,8 +29603,8 @@ def api_place_recent_chrome(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/api/shopify/fulfilment/jobs")
-def api_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str = "all", store_id: Optional[int] = None) -> dict[str, Any]:
-    rows, total, page, per_page = list_shopify_fulfilment_jobs(page, per_page, status=status, store_id=store_id)
+def api_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str = "all", store_id: Optional[int] = None, search: str = "") -> dict[str, Any]:
+    rows, total, page, per_page = list_shopify_fulfilment_jobs(page, per_page, status=status, store_id=store_id, search=search)
     oauth_status = shopify_oauth_route_status()
     status_counts = shopify_fulfilment_job_status_counts()
     return {
@@ -29607,9 +29621,9 @@ def api_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str 
 
 
 @app.post("/api/shopify/fulfilment/jobs/clear-completed")
-def api_clear_completed_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str = "all", store_id: Optional[int] = None) -> dict[str, Any]:
+def api_clear_completed_shopify_fulfilment_jobs(page: int = 1, per_page: int = 100, status: str = "all", store_id: Optional[int] = None, search: str = "") -> dict[str, Any]:
     cleared = clear_completed_shopify_fulfilment_jobs()
-    rows, total, page, per_page = list_shopify_fulfilment_jobs(page, per_page, status=status, store_id=store_id)
+    rows, total, page, per_page = list_shopify_fulfilment_jobs(page, per_page, status=status, store_id=store_id, search=search)
     status_counts = shopify_fulfilment_job_status_counts()
     return {
         "ok": True,

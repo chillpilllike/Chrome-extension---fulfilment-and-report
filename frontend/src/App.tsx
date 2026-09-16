@@ -15498,6 +15498,9 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [jobStatusFilter, setJobStatusFilter] = useState("all")
+  const [jobSearchInput, setJobSearchInput] = useState("")
+  const [jobSearch, setJobSearch] = useState("")
+  const jobLoadVersion = useRef(0)
   const [jobStatusCounts, setJobStatusCounts] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState("")
   const pageRef = useRef(page)
@@ -15540,14 +15543,17 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   }, [page])
 
   async function load(nextPage = page) {
+    const version = ++jobLoadVersion.current
     const requestedPage = nextPage
     const query = new URLSearchParams({
       page: String(nextPage),
       per_page: String(PAGE_SIZE),
       status: jobStatusFilter,
+      search: jobSearch,
     })
     if (storeId) query.set("store_id", storeId)
     const result = await api<{ jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; oauth_missing?: ShopifyOAuthMissing[]; oauth_status?: ShopifyOAuthMissing[]; progress?: ShopifyFulfilmentProgress; page?: number; total: number }>(`/api/shopify/fulfilment/jobs?${query.toString()}`)
+    if (version !== jobLoadVersion.current) return
     const resultPage = result.page || requestedPage
     if (requestedPage !== pageRef.current && resultPage !== pageRef.current) return
     setJobs(result.jobs || [])
@@ -15645,8 +15651,11 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
   useEffect(() => {
     load(page).catch((error) => onResult({ ok: false, title: "Shopify Fulfilment", message: String(error) }))
     const timer = window.setInterval(() => load(page).catch(() => undefined), 5000)
-    return () => window.clearInterval(timer)
-  }, [page, storeId, jobStatusFilter])
+    return () => {
+      window.clearInterval(timer)
+      jobLoadVersion.current += 1
+    }
+  }, [page, storeId, jobStatusFilter, jobSearch])
   useEffect(() => {
     loadDuplicates().catch(() => undefined)
     const timer = window.setInterval(() => loadDuplicates().catch(() => undefined), 5000)
@@ -15784,6 +15793,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
         page: String(pageRef.current),
         per_page: String(PAGE_SIZE),
         status: jobStatusFilter,
+        search: jobSearch,
       })
       if (storeId) query.set("store_id", storeId)
       const result = await api<{ ok: boolean; message: string; jobs: ShopifyFulfilmentJob[]; status_counts?: Record<string, number>; page?: number; total: number }>(`/api/shopify/fulfilment/jobs/clear-completed?${query.toString()}`, { method: "POST" })
@@ -16273,6 +16283,26 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
             </CardDescription>
           </div>
           <div className="flex flex-wrap items-end gap-3">
+            <form className="flex flex-wrap items-end gap-2" onSubmit={(event) => {
+              event.preventDefault()
+              jobLoadVersion.current += 1
+              setJobSearch(jobSearchInput.trim())
+              pageRef.current = 1
+              setPage(1)
+            }}>
+              <div className="grid gap-1.5">
+                <Label htmlFor="shopify-job-search">Search orders</Label>
+                <Input id="shopify-job-search" type="search" value={jobSearchInput} onChange={(event) => setJobSearchInput(event.target.value)} placeholder="Order number or Shopify ref" className="w-[280px] max-w-full" />
+              </div>
+              <Button type="submit">Search</Button>
+              {(jobSearchInput || jobSearch) && <Button type="button" variant="outline" onClick={() => {
+                jobLoadVersion.current += 1
+                setJobSearchInput("")
+                setJobSearch("")
+                pageRef.current = 1
+                setPage(1)
+              }}>Clear</Button>}
+            </form>
             <SelectField
               className="w-[230px]"
               label="Job View"
@@ -16378,7 +16408,7 @@ function ShopifyFulfilmentPage({ storeId, onResult }: { storeId: string; onResul
                   </TableCell>
                 </TableRow>
               ))}
-              {!jobs.length && <TableRow><TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No Shopify fulfilment jobs yet.</TableCell></TableRow>}
+              {!jobs.length && <TableRow><TableCell colSpan={9} className="py-8 text-center text-muted-foreground">{jobSearch ? "No jobs match this order number or Shopify reference in the current filters." : "No Shopify fulfilment jobs yet."}</TableCell></TableRow>}
             </TableBody>
           </Table>
         </CardContent>
