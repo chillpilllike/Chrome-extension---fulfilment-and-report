@@ -23609,14 +23609,36 @@ def api_save_shopify_title_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/api/shopify/fulfilment/title-reviews")
-def api_shopify_title_reviews(store_id: Optional[int] = None, page: int = 1) -> dict[str, Any]:
+def api_shopify_title_reviews(store_id: Optional[int] = None, page: int = 1, search: str = "") -> dict[str, Any]:
     page = max(1, page)
+    where = "r.status='pending' AND j.status='pending_review'"
+    params: list[Any] = []
+    if store_id is not None:
+        where += " AND j.store_id=?"
+        params.append(store_id)
+    search_term = clean_text(search).lstrip("#").strip()
+    if search_term:
+        pattern = "%" + search_term.lower().replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+        where += """ AND (
+            LOWER(j.odoo_order_name) LIKE ? ESCAPE '!'
+            OR EXISTS (
+                SELECT 1 FROM shopify_export_order_map m JOIN stores s ON s.id=j.store_id
+                WHERE m.state_scope=j.route AND m.src_order_key=(s.odoo_db || ':' || j.odoo_order_name)
+                AND LOWER(CAST(m.dest_order_id AS TEXT)) LIKE ? ESCAPE '!'
+            )
+            OR EXISTS (
+                SELECT 1 FROM shopify_order_status_cache c
+                WHERE c.store_id=j.store_id AND c.route=j.route
+                AND UPPER(c.odoo_order_name)=UPPER(j.odoo_order_name)
+                AND LOWER(c.shopify_order_name) LIKE ? ESCAPE '!'
+            )
+        )"""
+        params.extend([pattern] * 3)
     with db() as conn:
-        where = "r.status='pending' AND j.status='pending_review' AND (? IS NULL OR j.store_id=?)"
-        total = conn.execute(f"SELECT COUNT(*) AS n FROM shopify_title_reviews r JOIN shopify_fulfilment_jobs j ON j.id=r.job_id WHERE {where}", (store_id, store_id)).fetchone()["n"]
+        total = conn.execute(f"SELECT COUNT(*) AS n FROM shopify_title_reviews r JOIN shopify_fulfilment_jobs j ON j.id=r.job_id WHERE {where}", params).fetchone()["n"]
         rows = conn.execute(f"""SELECT r.*,j.odoo_order_name,j.route,j.store_id,j.last_error FROM shopify_title_reviews r
             JOIN shopify_fulfilment_jobs j ON j.id=r.job_id WHERE {where}
-            ORDER BY j.created_at ASC LIMIT 25 OFFSET ?""", (store_id, store_id, (page-1)*25)).fetchall()
+            ORDER BY j.created_at ASC LIMIT 25 OFFSET ?""", [*params, (page-1)*25]).fetchall()
     return {"total": total, "page": page, "reviews": [{**dict(row), "snapshot": json.loads(row["snapshot_json"]), "snapshot_json": None} for row in rows]}
 
 

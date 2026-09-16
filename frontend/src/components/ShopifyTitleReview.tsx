@@ -18,16 +18,18 @@ export function ShopifyTitleReview({ storeId, api }: Props) {
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [tick, setTick] = useState(0)
+  const [searchInput, setSearchInput] = useState('')
+  const [search, setSearch] = useState('')
   useEffect(() => { api<Rules>('/api/shopify/fulfilment/title-settings').then(setRules).catch(e => setError(String(e))) }, [])
   useEffect(() => { setPage(1); setDrafts({}); setReviews([]) }, [storeId])
   useEffect(() => {
     const controller = new AbortController()
-    const query = new URLSearchParams({ page: String(page) })
+    const query = new URLSearchParams({ page: String(page), search })
     if (storeId) query.set('store_id', storeId)
     api<{ reviews: Review[]; total: number }>(`/api/shopify/fulfilment/title-reviews?${query}`, { signal: controller.signal })
-      .then(result => { setReviews(result.reviews); setTotal(result.total) }).catch(e => { if (!controller.signal.aborted) setError(String(e)) })
+      .then(result => { if (!controller.signal.aborted) { setReviews(result.reviews); setTotal(result.total) } }).catch(e => { if (!controller.signal.aborted) setError(String(e)) })
     return () => controller.abort()
-  }, [storeId, page, tick])
+  }, [storeId, page, tick, search])
   useEffect(() => { const timer = window.setInterval(() => setTick(t => t + 1), 15000); return () => window.clearInterval(timer) }, [])
   async function save() {
     setBusy('settings'); setError(''); setMessage('')
@@ -68,6 +70,18 @@ export function ShopifyTitleReview({ storeId, api }: Props) {
       {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
       {message && <p role="status" className="text-sm text-green-700">{message}</p>}
       <div className="flex items-center justify-between"><h3 className="font-semibold">Pending title approval ({total})</h3><Button variant="outline" onClick={() => setTick(t => t + 1)}>Refresh queue</Button></div>
+      <form className="flex flex-wrap items-end gap-2" onSubmit={event => {
+        event.preventDefault(); setSearch(searchInput.trim()); setPage(1); setTick(t => t + 1)
+      }}>
+        <label className="grid gap-1 text-sm" htmlFor="shopify-title-search">Search title approvals
+          <Input id="shopify-title-search" type="search" value={searchInput} onChange={event => setSearchInput(event.target.value)} placeholder="Order number or Shopify ref" className="w-[280px] max-w-full" />
+        </label>
+        <Button type="submit">Search titles</Button>
+        {(searchInput || search) && <Button type="button" variant="outline" onClick={() => {
+          setSearchInput(''); setSearch(''); setPage(1); setTick(t => t + 1)
+        }}>Clear search</Button>}
+      </form>
+      <p className="text-xs text-muted-foreground">Search orders awaiting title approval. Shopify references are searchable when already linked.</p>
       {reviews.map(review => {
         const key = `${review.job_id}:${review.revision}`
         return <div key={key} className="form-fieldset grid gap-3">
@@ -82,7 +96,7 @@ export function ShopifyTitleReview({ storeId, api }: Props) {
           <p className="text-xs text-muted-foreground">{review.last_error}</p><div className="flex justify-end gap-2"><Button variant="outline" disabled={!!busy} onClick={() => refreshSource(review)}>Refresh from Odoo</Button><Button onClick={() => approve(review)} disabled={!!busy}>{busy === review.job_id ? 'Approving…' : `Approve & send to ${review.route.toUpperCase()}`}</Button></div>
         </div>
       })}
-      {!reviews.length && <p className="text-sm text-muted-foreground">No orders awaiting title approval. Eligible orders appear here after preparation.</p>}
+      {!reviews.length && <p className="text-sm text-muted-foreground">{search ? "No pending title approvals match this order number or Shopify reference in the selected store." : "No orders awaiting title approval. Eligible orders appear here after preparation."}</p>}
       {total > 25 && <div className="flex items-center gap-3"><Button variant="outline" disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Previous</Button><span>Page {page} of {Math.ceil(total / 25)}</span><Button variant="outline" disabled={page * 25 >= total} onClick={() => setPage(p => p + 1)}>Next</Button></div>}
     </CardContent>
   </Card>
