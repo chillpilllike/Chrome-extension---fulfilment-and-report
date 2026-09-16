@@ -59,7 +59,7 @@ def match_capture(snapshot, capture):
     return True
 
 
-def parse_receipt(message, settings):
+def parse_receipt(message, settings, resolve_tracking=None):
     """Authenticate the actual forwarder, never a From: line quoted in the body.
 
     Receiving API access authenticates transport from Resend, not email authorship.
@@ -117,6 +117,27 @@ def parse_receipt(message, settings):
     amounts = {cents(v.replace(',', '')) for v in re.findall(r'(?:USD\s*|\$)\s*([0-9]+(?:,[0-9]{3})*\.[0-9]{2})(?!\d)', transaction)}
     # Links may be attributes in HTML, so extract URLs before removing markup.
     keys = {payment_key(v.rstrip('.,)>')) for v in re.findall(r'https://relay\.cash/[^\s<>"\']+', raw)} - {''}
+    if not keys and resolve_tracking:
+        # Outlook forwarding can replace the direct text URL with Relay's click
+        # tracker. Only resolve the receipt CTA, after receiver authentication.
+        from html.parser import HTMLParser
+        class ReceiptLinks(HTMLParser):
+            def __init__(self):
+                super().__init__(); self.href = ''; self.label = []; self.links = set()
+            def handle_starttag(self, tag, attrs):
+                if tag == 'a':
+                    self.href = dict(attrs).get('href', ''); self.label = []
+            def handle_data(self, data):
+                if self.href: self.label.append(data)
+            def handle_endtag(self, tag):
+                if tag == 'a':
+                    if normalized(' '.join(self.label)) == 'view details in relay':
+                        self.links.add(self.href)
+                    self.href = ''; self.label = []
+        parser = ReceiptLinks(); parser.feed(markup)
+        if len(parser.links) == 1:
+            key = payment_key(resolve_tracking(parser.links.pop()))
+            if key: keys.add(key)
     if len(amounts) != 1 or len(keys) != 1:
         raise ValueError('Receipt must contain exactly one payment link and amount')
     return {'amount_cents': amounts.pop(), 'payment_key': keys.pop(), 'kind': 'initiated',

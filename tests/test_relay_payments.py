@@ -6,7 +6,7 @@ import types
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT=Path(__file__).resolve().parents[1]
 pkg=types.ModuleType('relay_bridge_test');pkg.__path__=[str(ROOT/'app/services')];sys.modules['relay_bridge_test']=pkg
@@ -45,6 +45,37 @@ class PolicyTests(unittest.TestCase):
  def test_ambiguous_amount_and_link(self):
   for extra in (' $55.00',' https://relay.cash/pay/other'):
    with self.assertRaises(ValueError):parse_receipt({**self.message(),'text':self.message()['text'].replace(' This payment request',extra+' This payment request')},{**DEFAULTS,'authserv_ids':'receiver.test'})
+
+class TrackingReceiptTests(PolicyTests):
+ def forwarded(self):
+  msg=self.message();msg['text']=msg['text'].replace('https://relay.cash/pay/test-token/receipt','')
+  msg['html']='<a href="https://links.relayfi.com/s/c/sample">View details in Relay</a>'
+  return msg
+ def test_outlook_forwarded_tracking_receipt(self):
+  resolver=Mock(return_value='https://relay.cash/pay/test-token/receipt')
+  evidence=parse_receipt(self.forwarded(),{**DEFAULTS,'authserv_ids':'receiver.test'},resolver)
+  self.assertEqual(2607,evidence['amount_cents']);self.assertEqual('test-token',evidence['payment_key'])
+  resolver.assert_called_once_with('https://links.relayfi.com/s/c/sample')
+ def test_unverified_sender_never_resolves(self):
+  resolver=Mock()
+  with self.assertRaises(ValueError):parse_receipt(self.forwarded(),DEFAULTS,resolver)
+  resolver.assert_not_called()
+ def test_multiple_receipt_buttons_are_held(self):
+  msg=self.forwarded();msg['html']+='<a href="https://links.relayfi.com/s/c/other">View details in Relay</a>'
+  resolver=Mock()
+  with self.assertRaises(ValueError):parse_receipt(msg,{**DEFAULTS,'authserv_ids':'receiver.test'},resolver)
+  resolver.assert_not_called()
+ def test_tracking_redirect_never_fetches_payment_page(self):
+  response=Mock(status_code=302,headers={'Location':'https://relay.cash/pay/test-token/receipt'})
+  with patch('relay_bridge_test.relay_payments.requests.get',return_value=response) as get:
+   self.assertEqual('https://relay.cash/pay/test-token/receipt',RelayPayments.resolve_receipt_tracking('https://links.relayfi.com/s/c/sample'))
+   get.assert_called_once();self.assertFalse(get.call_args.kwargs['allow_redirects'])
+ def test_tracking_redirect_private_or_other_hosts_blocked(self):
+  for target in ('http://127.0.0.1/','https://evil.test/','https://links.relayfi.com.evil.test/s/c/a','https://links.relayfi.com:443/s/c/a'):
+   response=Mock(status_code=302,headers={'Location':target})
+   with patch('relay_bridge_test.relay_payments.requests.get',return_value=response) as get:
+    with self.assertRaises(ValueError):RelayPayments.resolve_receipt_tracking('https://links.relayfi.com/s/c/sample')
+    get.assert_called_once()
 
 class Adapter:
  def __init__(self,c):self.c=c

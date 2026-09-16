@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from html import escape
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urljoin
 
 import requests
 from fastapi import APIRouter, HTTPException, Request
@@ -184,6 +184,27 @@ class RelayPayments:
         response.raise_for_status()
         return response.json()
 
+    @staticmethod
+    def resolve_receipt_tracking(url):
+        # Never attach Resend/Odoo credentials, follow arbitrary redirects, or
+        # fetch a payment page. Only Relay's known click endpoint is requested.
+        for _ in range(4):
+            if payment_key(url):
+                return url
+            parsed = urlsplit(url)
+            if parsed.scheme != 'https' or parsed.netloc != 'links.relayfi.com' or not parsed.path.startswith('/s/c/'):
+                raise ValueError('Receipt tracking destination is not allowed')
+            response = requests.get(url, allow_redirects=False, timeout=15, stream=True)
+            try:
+                if response.status_code not in (301, 302, 303, 307, 308):
+                    raise ValueError('Receipt tracking link did not redirect to a payment receipt')
+                url = urljoin(url, response.headers.get('Location', ''))
+            finally:
+                response.close()
+        if payment_key(url):
+            return url
+        raise ValueError('Receipt tracking redirect limit reached')
+
     def receive(self):
         # Persistent pagination prevents bursts/backlogs exceeding 100 messages from starving.
         cursor = self.get_settings().get('relay_receiving_cursor') or ''
@@ -200,7 +221,7 @@ class RelayPayments:
                 continue
             full = self.resend_api('/emails/receiving/'+quote(email_id,safe=''))
             try:
-                evidence = parse_receipt(full,self.settings())
+                evidence = parse_receipt(full,self.settings(),self.resolve_receipt_tracking)
                 with self.db() as c:
                     duplicate=c.execute('SELECT email_id FROM relay_receipts WHERE digest=? AND email_id!=?',(evidence['digest'],email_id)).fetchone()
                     if duplicate:
