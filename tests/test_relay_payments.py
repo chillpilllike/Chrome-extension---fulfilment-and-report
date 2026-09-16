@@ -99,10 +99,11 @@ class SyncScopeTests(WorkflowTests):
   self.c.execute("CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY,case_key TEXT UNIQUE,store_id INTEGER,website_id INTEGER,odoo_order_id INTEGER,odoo_order_name TEXT,case_type TEXT,status TEXT,severity TEXT,title TEXT,customer_email TEXT,affected_items_json TEXT,context_json TEXT,created_at TEXT,updated_at TEXT)")
  def test_real_store_object_and_single_website_inference(self):
   self.svc.get_store=lambda _:types.SimpleNamespace(website_id=None)
-  client=Mock();client.execute.side_effect=[[{'id':1}],{'records':[{**SNAP,'order_id':22}], 'more':False}]
+  client=Mock();client.execute.side_effect=[[{'id':1}],{'records':[{**SNAP,'request_id':'req-new','order_id':22}], 'more':False}]
   self.svc.client=lambda _:client
   self.svc.sync()
   self.assertEqual(('payment.transaction','relay_bridge_pending',[1,0]),client.execute.call_args.args)
+  self.assertEqual(1,self.c.execute("SELECT COUNT(*) FROM after_order_cases WHERE case_type='relay_payment'").fetchone()[0])
  def test_multiple_websites_never_guesses(self):
   self.svc.get_store=lambda _:types.SimpleNamespace(website_id=None)
   client=Mock();client.execute.return_value=[{'id':1},{'id':2}];self.svc.client=lambda _:client
