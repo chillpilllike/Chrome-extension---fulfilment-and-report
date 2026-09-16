@@ -213,6 +213,19 @@ class EmailOutboxTests(unittest.TestCase):
    self.assertEqual(post.call_args_list[0],post.call_args_list[1])
   self.assertEqual('sent',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
   self.assertEqual(2,self.c.execute('SELECT COUNT(*) FROM after_order_email_attempts').fetchone()[0])
+ def test_relay_live_mode_is_independent_of_other_after_order_emails(self):
+  from unittest.mock import patch
+  self.svc.email_test_mode=lambda:True
+  response=Mock();response.json.return_value={'id':'resend-relay'}
+  with patch.dict('os.environ',{'RESEND_API_KEY':'fake'}),patch('relay_bridge_test.relay_payments.requests.post',return_value=response) as post:
+   self.svc.emails();self.assertEqual(1,post.call_count)
+  self.assertEqual('sent',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
+ def test_relay_test_mode_still_holds_delivery(self):
+  from unittest.mock import patch
+  self.svc.settings=lambda:{**DEFAULTS,'test_mode':True}
+  with patch('relay_bridge_test.relay_payments.requests.post') as post:
+   self.svc.emails();post.assert_not_called()
+  self.assertEqual('queued',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
  def test_expired_idempotency_window_never_sends(self):
   from unittest.mock import patch
   self.c.execute("UPDATE relay_email_outbox SET state='retry',attempted_at='2020-01-01T00:00:00+00:00'")

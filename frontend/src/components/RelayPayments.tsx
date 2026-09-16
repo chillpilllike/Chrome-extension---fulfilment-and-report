@@ -20,7 +20,7 @@ export function RelayPayments({stores,storeId,api}:Props){
  <label>Resend receiving address<Input value={settings.receiving_address} onChange={e=>setSettings({...settings,receiving_address:e.target.value})}/></label>
  <label>Trusted forwarding mailboxes, one per line<textarea className="form-control" value={settings.forwarders} onChange={e=>setSettings({...settings,forwarders:e.target.value})}/></label>
  <label>Verified receiving gateway authserv IDs, one per line<textarea className="form-control" value={settings.authserv_ids} onChange={e=>setSettings({...settings,authserv_ids:e.target.value})}/></label>
- <p>Gateway IDs must come from a verified Resend receipt header. A sender address alone is not proof of payment. The app’s global email test mode also holds live delivery.</p>
+ <p>Gateway IDs must come from a verified Resend receipt header. A sender address alone is not proof of payment. Relay’s test mode controls these payment emails and order confirmations independently of other after-order emails.</p>
  <Button onClick={save}>Save settings</Button><Button variant="outline" onClick={async()=>{try{const r=await api<{token:string}>('/api/relay/extension-token',{method:'POST'});setToken(r.token)}catch(e){setError(String(e))}}}>Generate / replace extension upload token</Button>
  {token&&<label>Copy into the Relay extension (shown once)<Input readOnly value={token}/></label>}
  {Object.entries(settings.worker_status||{}).filter(([,v])=>v).map(([k,v])=><p key={k}>{k.replaceAll('_',' ')}: {v}</p>)}

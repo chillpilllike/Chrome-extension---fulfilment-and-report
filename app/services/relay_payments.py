@@ -285,7 +285,7 @@ class RelayPayments:
                 'text':title+'\n'+intro+'\n'+'\n'.join(str(i['quantity'])+' × '+str(i['name'])+' — '+str(i['total'])+' '+snap['original_currency'] for i in snap['items'])+'\nOrder total: '+snap['original_currency']+' '+snap['original_total']+'\nUSD payable: '+format(snap['amount_cents']/100,'.2f')+('' if kind=='received' else '\nPay: '+pay_url)}
 
     def emails(self):
-        if self.settings()['test_mode'] or self.email_test_mode():
+        if self.settings()['test_mode']:
             return
         if not os.getenv('RESEND_API_KEY'):
             raise ValueError('Resend sending API key is not configured')
@@ -334,7 +334,7 @@ class RelayPayments:
                 c.execute('UPDATE relay_email_outbox SET message_id=? WHERE id=?',(message['id'],job['id']))
             provider_id = None
             try:
-                if self.settings()['test_mode'] or self.email_test_mode():
+                if self.settings()['test_mode']:
                     raise ValueError('Test mode enabled before delivery')
                 response = requests.post('https://api.resend.com/emails',headers={'Authorization':'Bearer '+os.environ['RESEND_API_KEY'],'Idempotency-Key':key},json=payload,timeout=20)
                 response.raise_for_status()
@@ -364,7 +364,7 @@ class RelayPayments:
                 return
             for name, action in [('sync',self.sync),('refresh',self.refresh_bound),('receiving',self.receive),('confirmation',self.confirmations),('email',self.emails)]:
                 try:
-                    if name=='confirmation' and (self.settings()['test_mode'] or self.email_test_mode()):
+                    if name=='confirmation' and (self.settings()['test_mode']):
                         continue
                     action()
                     self.set_settings({'relay_'+name+'_last_ok':now(),'relay_'+name+'_error':''})
@@ -429,7 +429,7 @@ class RelayPayments:
             extension(request, require_enabled=False)
             settings=self.settings()
             return {'ok':True,'service':'relay-payment-bridge','enabled':settings['enabled'],
-                    'test_mode':bool(settings['test_mode'] or self.email_test_mode())}
+                    'test_mode':bool(settings['test_mode'])}
         @r.post('/extension/resolve')
         def resolve(request:Request,payload:dict):
             extension(request)

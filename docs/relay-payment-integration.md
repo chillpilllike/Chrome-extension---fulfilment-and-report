@@ -16,7 +16,7 @@ Forwarder default: am-it@outlook.com. Receiving default: relay-payments@taloofal
 4. Verify a genuine message actually delivered through Outlook to Resend. Configure ONLY the receiver-generated Authentication-Results authserv ID after establishing header provenance. Original Outlook headers pasted into chat do not validate Resend's forwarding path. Unknown/unauthenticated templates go to review; correcting settings and Recheck receipt retries them.
 5. Resend runtime requires RESEND_API_KEY for sending and receiving permission on RESEND_RECEIVING_API_KEY (falling back to RESEND_API_KEY). Verified sending domains must cover notifications@ each selected website. The existing production API key was successfully checked against the receiving list API; no matching forwarded message was present in its latest 100 at verification time.
 6. Generate the dedicated extension upload token in the app. Update the existing installed extension to 1.1.0 without clearing storage, configure app origin/token, grant that exact origin, enable Copy payment link only. Test one matching order without releasing email/confirmation holds.
-7. Verify identity, amount, recorded link, receipt and email preview/content, then release Relay test mode and the app's global email test mode as appropriate. The extension's session must be signed in and the PC awake. A logged-out Relay tab cannot be fixed by refreshing.
+7. Verify identity, amount, recorded link, receipt and email preview/content, then release Relay test mode and the app's Relay test mode as appropriate. The extension's session must be signed in and the PC awake. A logged-out Relay tab cannot be fixed by refreshing.
 
 ## Recovery and limits
 
