@@ -25,12 +25,24 @@ class ManualOdooOrderPaymentEligibilityTests(unittest.TestCase):
 
         self.assertEqual(manual_pull_order_ineligible_reason(self.order, [], transactions), "")
 
-    def test_partial_authorization_remains_blocked(self) -> None:
+    def test_partial_authorization_does_not_block_confirmed_order(self) -> None:
         transactions = [{"state": "authorized", "amount": 20.0, "currency_id": [143, "GBP"]}]
 
         reason = manual_pull_order_ineligible_reason(self.order, [], transactions)
 
-        self.assertIn("no paid invoice or full authorized payment", reason)
+        self.assertEqual(reason, "")
+
+    def test_confirmed_order_without_invoice_or_payment_is_eligible(self) -> None:
+        for state in ("sale", "done"):
+            with self.subTest(state=state):
+                self.assertEqual(manual_pull_order_ineligible_reason({**self.order, "state": state}, []), "")
+
+    def test_unconfirmed_orders_remain_blocked_even_with_payment(self) -> None:
+        transactions = [{"state": "done", "amount": 43.54, "currency_id": [143, "GBP"]}]
+        for state in ("draft", "sent", "cancel", ""):
+            with self.subTest(state=state):
+                reason = manual_pull_order_ineligible_reason({**self.order, "state": state}, [], transactions)
+                self.assertIn("not confirmed yet", reason)
 
     def test_pending_or_wrong_currency_transaction_remains_blocked(self) -> None:
         transactions = [
@@ -39,6 +51,7 @@ class ManualOdooOrderPaymentEligibilityTests(unittest.TestCase):
         ]
 
         self.assertFalse(order_has_authorized_customer_transaction(self.order, transactions))
+        self.assertEqual(manual_pull_order_ineligible_reason(self.order, [], transactions), "")
 
 
 if __name__ == "__main__":
