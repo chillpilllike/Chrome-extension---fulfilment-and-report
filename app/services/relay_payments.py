@@ -77,39 +77,49 @@ class RelayPayments:
         return fresh
 
     def sync(self):
+        failed=[]
         for sid in self.settings()['store_ids']:
-            store = self.get_store(int(sid))
-            client = self.client(sid)
-            website_id = getattr(store, 'website_id', None)
-            if not website_id:
-                sites=client.execute('website','search_read',[[]],{'fields':['id'],'limit':2})
-                if len(sites)!=1:
-                    raise ValueError('Multiple Odoo websites: configure an explicit website ID for this store')
-                website_id=sites[0]['id']
-            website_id=int(website_id)
-            offset = 0
-            while True:
-                batch = client.execute('payment.transaction', 'relay_bridge_pending', [website_id, offset])
-                for snap in batch['records']:
-                    if snap['website_id'] != website_id:
-                        raise ValueError('Odoo website scope mismatch')
-                    with self.db() as c:
-                        found = c.execute('SELECT * FROM relay_payments WHERE request_id=?', (snap['request_id'],)).fetchone()
-                        if found:
-                            continue  # Never overwrite the original matching evidence.
-                        stamp = now()
-                        case = c.execute('''INSERT INTO after_order_cases
-                            (case_key,store_id,website_id,odoo_order_id,odoo_order_name,case_type,status,severity,title,customer_email,affected_items_json,context_json,created_at,updated_at)
-                            VALUES (?,?,?,?,?,'relay_payment','needs_attention','medium','Relay payment request',?,?,?, ?,?)
-                            ON CONFLICT(case_key) DO UPDATE SET updated_at=excluded.updated_at RETURNING id''',
-                            ('relay:'+snap['request_id'], sid, snap['website_id'], snap['order_id'], snap['order_number'], snap['customer_email'],
-                             json.dumps(snap['items']), json.dumps({'website_name':snap['website_name'], 'payment_request':snap['request_id']}),stamp,stamp)).fetchone()
-                        c.execute('''INSERT INTO relay_payments (store_id,request_id,case_id,snapshot_json,pay_token,created_at,updated_at)
-                            VALUES (?,?,?,?,?,?,?) ON CONFLICT(request_id) DO NOTHING''',
-                            (sid,snap['request_id'],case['id'],json.dumps(snap),secrets.token_urlsafe(32),stamp,stamp))
-                if not batch['more']:
-                    break
-                offset += 100
+            try:
+                self.sync_store(sid)
+            except Exception:
+                failed.append(str(sid))
+        if failed:
+            raise ValueError('Relay sync needs attention for stores: '+','.join(failed))
+
+    def sync_store(self, sid):
+        store = self.get_store(int(sid))
+        client = self.client(sid)
+        website_id = getattr(store, 'website_id', None)
+        if not website_id:
+            sites=client.execute('website','search_read',[[]],{'fields':['id'],'limit':2})
+            if len(sites)!=1:
+                raise ValueError('Multiple Odoo websites: configure an explicit website ID for this store')
+            website_id=sites[0]['id']
+        website_id=int(website_id)
+        offset = 0
+        while True:
+            batch = client.execute('payment.transaction', 'relay_bridge_pending', [website_id, offset])
+            for snap in batch['records']:
+                if snap['website_id'] != website_id:
+                    raise ValueError('Odoo website scope mismatch')
+                with self.db() as c:
+                    found = c.execute('SELECT * FROM relay_payments WHERE request_id=?', (snap['request_id'],)).fetchone()
+                    if found:
+                        continue  # Never overwrite the original matching evidence.
+                    stamp = now()
+                    case = c.execute('''INSERT INTO after_order_cases
+                        (case_key,store_id,website_id,odoo_order_id,odoo_order_name,case_type,status,severity,title,customer_email,affected_items_json,context_json,created_at,updated_at)
+                        VALUES (?,?,?,?,?,'relay_payment','needs_attention','medium','Relay payment request',?,?,?, ?,?)
+                        ON CONFLICT(case_key) DO UPDATE SET updated_at=excluded.updated_at RETURNING id''',
+                        ('relay:'+snap['request_id'], sid, snap['website_id'], snap['order_id'], snap['order_number'], snap['customer_email'],
+                         json.dumps(snap['items']), json.dumps({'website_name':snap['website_name'], 'payment_request':snap['request_id']}),stamp,stamp)).fetchone()
+                    c.execute('''INSERT INTO relay_payments (store_id,request_id,case_id,snapshot_json,pay_token,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?) ON CONFLICT(request_id) DO NOTHING''',
+                        (sid,snap['request_id'],case['id'],json.dumps(snap),secrets.token_urlsafe(32),stamp,stamp))
+            if not batch['more']:
+                break
+            offset += 100
+
 
     def refresh_bound(self):
         with self.db() as c:
