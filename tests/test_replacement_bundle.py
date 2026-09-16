@@ -19,6 +19,7 @@ class BundleTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(':memory:', factory=TestConnection)
         self.conn.row_factory = lambda cursor, row: dict(zip([c[0] for c in cursor.description], row))
+        self.conn.execute('CREATE TABLE amazon_purchase_allocations (id INTEGER,line_id INTEGER)')
         self.conn.execute('PRAGMA foreign_keys=ON')
         self.conn.execute('CREATE TABLE stores (id INTEGER PRIMARY KEY)')
         self.conn.execute('INSERT INTO stores VALUES (2)')

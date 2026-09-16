@@ -1,4 +1,6 @@
 from __future__ import annotations
+import sys
+from app.services import amazon_purchase_allocations as purchase_allocations
 
 from app.services.inventory_history import install_inventory_history, inventory_filter
 from app.services.inventory_labels import annotate_inventory_labels
@@ -2471,6 +2473,8 @@ def init_db() -> None:
                 ),
             )
 
+        purchase_allocations.ensure_schema(conn)
+
 
 @dataclass
 class Store:
@@ -3808,7 +3812,7 @@ def amazon_history_matches(conn: Any, order_ids: list[str]) -> dict[str, dict[st
                order_lines.ordered_at,
                stores.name AS store_name,
                stores.odoo_url AS odoo_url
-        FROM order_lines
+        FROM amazon_purchase_tracking_lines AS order_lines
         JOIN stores ON stores.id=order_lines.store_id
         WHERE order_lines.amazon_order_id IN ({placeholders})
           AND COALESCE(order_lines.amazon_order_id, '') != ''
@@ -6550,14 +6554,17 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
     rows = conn.execute(
         """
         SELECT *
-        FROM order_lines
+        FROM amazon_purchase_tracking_lines AS order_lines
         WHERE amazon_order_id=?
           AND COALESCE(order_engine, '') != 'third_party'
           AND COALESCE(tracking_status, '') != 'Payment revision needed'
+                          AND state!='cancelled'
         ORDER BY id
         """,
         (order_id,),
     ).fetchall()
+    if not rows and conn.execute('SELECT id FROM amazon_purchase_allocations WHERE amazon_order_id=? LIMIT 1',(order_id,)).fetchone():
+        return 0
     if not rows:
         dispatch_clear_packages_for_amazon_order(conn, order_id)
         return 0
@@ -7050,11 +7057,12 @@ def run_dispatch_rebuild_job(store_id: Optional[int] = None) -> None:
                     """
                     WITH candidate_orders AS (
                         SELECT DISTINCT amazon_order_id
-                        FROM order_lines
+                        FROM amazon_purchase_tracking_lines AS order_lines
                         WHERE COALESCE(amazon_order_id, '') != ''
                           AND COALESCE(tracking_payload, '') != ''
                           AND COALESCE(order_engine, '') != 'third_party'
                           AND COALESCE(tracking_status, '') != 'Payment revision needed'
+                          AND state!='cancelled'
                           AND (? IS NULL OR store_id=?)
                           AND NOT EXISTS (
                               SELECT 1
@@ -7066,10 +7074,11 @@ def run_dispatch_rebuild_job(store_id: Optional[int] = None) -> None:
                         LIMIT 5000
                     )
                     SELECT order_lines.*
-                    FROM order_lines
+                    FROM amazon_purchase_tracking_lines AS order_lines
                     JOIN candidate_orders ON candidate_orders.amazon_order_id=order_lines.amazon_order_id
                     WHERE COALESCE(order_lines.order_engine, '') != 'third_party'
                       AND COALESCE(order_lines.tracking_status, '') != 'Payment revision needed'
+                      AND order_lines.state!='cancelled'
                     ORDER BY order_lines.amazon_order_id, order_lines.id
                     """,
                     (store_id, store_id),
@@ -7954,6 +7963,7 @@ def dispatch_related_parts(conn: Any, package: dict[str, Any], limit: int = 20) 
         placeholder["rack_key"] = placeholder_rack
         placeholder["rack_label"] = dispatch_rack_label_for_package(placeholder)
         parts.append(placeholder)
+    parts = purchase_allocations.readiness_parts(sys.modules[__name__], conn, package, parts)
     collapsed_parts = collapse_dispatch_related_parts(parts)[:limit]
     pending_parts = [part for part in collapsed_parts if not part.get("received") or part.get("item_reconciliation_required")]
     if not pending_parts:
@@ -15492,7 +15502,7 @@ def tracking_rows(store_id: Optional[int] = None, status: str = "active", q: str
         rows = conn.execute(
             f"""
             SELECT *
-            FROM order_lines
+            FROM amazon_purchase_tracking_lines AS order_lines
             WHERE {where_status}
               AND COALESCE(order_engine, '') != 'third_party'
               AND (? IS NULL OR store_id=?)
@@ -15650,7 +15660,7 @@ def paged_tracking_orders(
             SELECT COUNT(*) AS count
             FROM (
                 SELECT {order_expr} AS amazon_key
-                FROM order_lines
+                FROM amazon_purchase_tracking_lines AS order_lines
                 WHERE {base_where}
                 GROUP BY {order_expr}
             ) grouped
@@ -15664,20 +15674,20 @@ def paged_tracking_orders(
                        MAX(NULLIF(tracking_checked_at, '')) AS checked_sort,
                        MAX(NULLIF(ordered_at, '')) AS ordered_sort,
                        MAX(NULLIF(updated_at, '')) AS updated_sort
-                FROM order_lines
+                FROM amazon_purchase_tracking_lines AS order_lines
                 WHERE {base_where}
                 GROUP BY {order_expr}
                 ORDER BY {target_order_sql}
                 LIMIT ? OFFSET ?
             )
             SELECT order_lines.id, order_lines.store_id, order_lines.odoo_order_id, order_lines.odoo_order_name,
-                   order_lines.odoo_line_id, order_lines.asin, order_lines.product_name, order_lines.state,
+                   order_lines.odoo_line_id, order_lines.asin, order_lines.product_name, order_lines.quantity, order_lines.state,
                    order_lines.amazon_order_id, order_lines.amazon_order_url, order_lines.amazon_cancelled_at,
                    order_lines.amazon_cancelled_order_id, order_lines.tracking_status, order_lines.tracking_payload,
                    order_lines.tracking_checked_at, order_lines.ordered_at, order_lines.updated_at,
                    {routed_account_name_expr} AS amazon_account_name,
                    {routed_account_type_expr} AS amazon_account_type
-            FROM order_lines
+            FROM amazon_purchase_tracking_lines AS order_lines
             JOIN target_orders ON target_orders.amazon_key={order_expr}
             WHERE {base_where}
             ORDER BY {order_sql}, order_lines.id
@@ -23716,6 +23726,7 @@ def run_shopify_script_export(job: dict[str, Any]) -> None:
 
 def run_shopify_script_export_impl(job: dict[str, Any]) -> None:
     settings = get_service_settings()
+    purchase_allocations.assert_export_coverage(sys.modules[__name__], job)
     store = get_store(int(job["store_id"]))
     route = clean_text(job["route"]).lower()
     script_path = settings["shopify_dtb_script_path"] if route == "dtb" else settings["shopify_dtc_script_path"]
@@ -25733,6 +25744,11 @@ def hydrate_order_line_rows(
     include_shopify: bool = True,
 ) -> list[dict[str, Any]]:
     row_dicts = rows_to_dicts(rows)
+    if conn is not None:
+        purchase_allocations.attach(conn, row_dicts)
+    else:
+        with db() as purchase_conn:
+            purchase_allocations.attach(purchase_conn, row_dicts)
     if conn is not None and include_metrics:
         enrich_order_line_page_metrics(conn, row_dicts)
     else:
@@ -25848,6 +25864,8 @@ def fast_exact_order_reference_search(
     exact_columns = ("odoo_order_name", "amazon_order_id", "amazon_cancelled_order_id")
     exact_clause = " OR ".join(f"UPPER(COALESCE(order_lines.{column}, '')) = UPPER(?)" for column in exact_columns)
     params: list[Any] = [*condition_params, *[clean_query for _ in exact_columns]]
+    exact_clause += " OR EXISTS (SELECT 1 FROM amazon_purchase_allocations a WHERE a.line_id=order_lines.id AND a.amazon_order_id=?)"
+    params.append(clean_query)
     where_sql = f"WHERE ({condition_suffix}) AND ({exact_clause})"
     with db() as conn:
         rows = conn.execute(
@@ -25917,6 +25935,8 @@ def fast_exact_order_reference_search(
     if not rows:
         return None
     row_dicts = rows_to_dicts(rows)
+    with db() as purchase_conn:
+        purchase_allocations.attach(purchase_conn,row_dicts)
     total = int(row_dicts[0].pop("_total_count", 0) or 0)
     for row in row_dicts:
         row.pop("_total_count", None)
@@ -27272,6 +27292,7 @@ def api_attach_inventory_item(inventory_id: int, payload: dict[str, Any]) -> dic
                 f"Inventory item #{inventory_id} was not changed.",
             )
         line = candidates[0]
+        purchase_allocations.guard_changes(sys.modules[__name__],conn,[line['id']])
         required_asin = effective_inventory_asin(line)
         original_order_asin = normalize_asin(line.get("original_asin") or line.get("asin"))
         replacement_override = bool(inventory_asin and inventory_asin != original_order_asin)
@@ -28374,6 +28395,7 @@ def api_assign_replacement_components(line_id: int, payload: ReplacementPayload)
     if not components:
         raise HTTPException(400, "Add at least one replacement ASIN.")
     with db() as conn:
+        purchase_allocations.guard_changes(sys.modules[__name__],conn,[line_id])
         root, existing = replacement_bundle_read(conn, line_id, payload.store_id, lock=True)
         saved_images = {}
         for row in existing:
@@ -28394,6 +28416,7 @@ def api_assign_replacement_components(line_id: int, payload: ReplacementPayload)
 
 def api_reset_replacement_components(line_id: int, store_id: int) -> dict[str, Any]:
     with db() as conn:
+        purchase_allocations.guard_changes(sys.modules[__name__],conn,[line_id])
         root, existing = replacement_bundle_read(conn, line_id, store_id, lock=True)
         try:
             removed = replacement_bundle.reset_components(conn, root, existing, utc_now())
@@ -28472,6 +28495,7 @@ def api_assign_replacement(line_id: int, payload: ReplacementPayload) -> dict[st
     uploaded_image = replacement_upload_image(payload.image_base64) if payload.image_base64 is not None else None
     title = fetch_amazon_product_title(replacement_asin)
     with db() as conn:
+        purchase_allocations.guard_changes(sys.modules[__name__],conn,[line_id])
         row = conn.execute("SELECT * FROM order_lines WHERE id=? AND store_id=? FOR UPDATE", (line_id, payload.store_id)).fetchone()
         if not row:
             row = conn.execute("SELECT * FROM order_lines WHERE id=? FOR UPDATE", (line_id,)).fetchone()
@@ -28584,6 +28608,7 @@ def api_reset_replacement(line_id: int, payload: dict[str, Any]) -> dict[str, An
     if not store_id:
         raise HTTPException(400, "Store is required.")
     with db() as conn:
+        purchase_allocations.guard_changes(sys.modules[__name__],conn,[line_id])
         root, existing = replacement_bundle_read(conn, line_id, store_id)
         if int(root.get("bundle_component_count") or 1) > 1 or root.get("bundle_price_share") is not None:
             return api_reset_replacement_components(line_id, store_id)
@@ -28938,7 +28963,7 @@ def api_amazon_invoice_orders(store_id: Optional[int] = None, limit: int = 100) 
                    order_lines.amazon_order_id,
                    MAX(order_lines.amazon_order_url) AS amazon_order_url,
                    MAX(COALESCE(order_lines.ordered_at, order_lines.updated_at)) AS last_ordered_at
-            FROM order_lines
+            FROM amazon_purchase_tracking_lines AS order_lines
             LEFT JOIN accounting_documents
               ON accounting_documents.odoo_order_name=order_lines.odoo_order_name
              AND accounting_documents.document_type='amazon'
@@ -34674,7 +34699,7 @@ def package_pickup_order_complete(packages: list[dict[str, Any]], lines: list[di
     """Require all active order items to have delivered, physically scanned parcels."""
     active_lines = {int(line["id"]) for line in lines
                     if clean_text(line.get("state")).lower() not in {"cancelled", "canceled", "cancel"}}
-    if not active_lines:
+    if not active_lines or any(line.get("purchase_allocation_incomplete") for line in lines):
         return False
     parts = collapse_dispatch_related_parts([
         package for package in packages
@@ -34724,7 +34749,10 @@ def annotate_pickup_complete_orders(conn: Any, cards: list[dict[str, Any]]) -> N
             """, params).fetchall())
         lines = rows_to_dicts(conn.execute(f"""
             WITH wanted(store_id,order_name) AS (VALUES {values})
-            SELECT l.id,l.store_id,l.odoo_order_name,l.state
+            SELECT l.id,l.store_id,l.odoo_order_name,l.state,
+                   EXISTS (SELECT 1 FROM amazon_purchase_allocations a WHERE a.line_id=l.id
+                     GROUP BY a.line_id HAVING ABS(SUM(CASE WHEN a.state='delivered' THEN a.quantity ELSE 0 END)-l.quantity)>0.000001
+                     OR MAX(CASE WHEN a.state NOT IN ('delivered','cancelled') THEN 1 ELSE 0 END)=1) AS purchase_allocation_incomplete
             FROM order_lines l JOIN wanted w
               ON l.store_id=w.store_id AND UPPER(l.odoo_order_name)=w.order_name
             """, params).fetchall())
@@ -35403,6 +35431,8 @@ def package_pickup_readiness_from_parts(parts: list[dict[str, Any]], *, order_li
             reasons.append(f"{len(pending)} of {total} known packages not yet scanned/received by the team" + (f" ({expected})" if expected else ""))
         if unresolved:
             reasons.append(f"{len(unresolved)} order line(s) awaiting shipment/ASIN reconciliation; package count not yet confirmed")
+            purchase_messages = [clean_text(part.get("delivery_label")) for part in unresolved if int(part.get("id") or 0) <= -(10**12)]
+            reasons.extend(dict.fromkeys(message for message in purchase_messages if message))
         if unmapped:
             reasons.append(f"{len(unmapped)} package(s) contain items without an exact order-line match")
         if not order_linked:
@@ -37341,7 +37371,12 @@ def api_tracking_update(payload: ChromeTrackingUpdatePayload) -> dict[str, Any]:
     for attempt in range(3):
         try:
             with _TRACKING_UPDATE_LOCK:
-                result = api_tracking_update_impl(payload)
+                try:
+                    result = purchase_allocations.update_tracking(sys.modules[__name__], payload)
+                except ValueError as exc:
+                    raise HTTPException(409, str(exc)) from exc
+                if result is None:
+                    result = api_tracking_update_impl(payload)
             if result.get("ok"):
                 with db() as conn:
                     result["pickup_scans_reconciled"] = reconcile_package_pickup_scans(conn)
@@ -38384,6 +38419,7 @@ def api_manual_amazon_match(payload: ManualAmazonOrderMatchPayload) -> dict[str,
         ).fetchall())
         if not rows:
             return {"ok": True, "matched": 0, "skipped": len(refs), "order_names": refs, "message": f"No unmatched pulled rows found for {', '.join(refs)}."}
+        purchase_allocations.guard_changes(sys.modules[__name__],conn,[int(row['id']) for row in rows])
         history_items = payload.items or parse_json_list_value(history.get("items_json"))
         evidence_quantities = amazon_history_order_record({"items": history_items})["asin_quantities"]
         verified_quantities = {}
@@ -38639,6 +38675,24 @@ def api_assign_third_party_tracking(payload: ThirdPartyTrackingPayload) -> dict[
     fast_page_cache_clear_matching({"package-pickups", "dispatch-related-parts", "dispatch-sorting-summary", "dispatch-sorting-summary-base", "dispatch-status", "dispatch-status-summary", "orders"})
     return {"ok": True, "package_id": package_id, "reconciled_scans": reconciled,
             "message": f"Tracking {code} assigned to {first['odoo_order_name']}." + (f" Matched {reconciled} earlier scan(s), keeping their original dates." if reconciled else " Ready for the dispatch team's receipt scan.")}
+
+
+@app.get("/api/lines/{line_id}/amazon-purchases")
+def api_get_amazon_purchases(line_id: int, store_id: int) -> dict[str, Any]:
+    try:
+        return purchase_allocations.get(sys.modules[__name__], store_id, line_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/lines/{line_id}/amazon-purchases")
+def api_save_amazon_purchases(line_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        store_id=int(payload.get("store_id") or 0)
+        with _TRACKING_UPDATE_LOCK:
+            return purchase_allocations.save(sys.modules[__name__], store_id, line_id, payload.get("allocations"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/lines/manual-fulfilment")
@@ -43474,6 +43528,7 @@ def api_reset_line_fulfilment(payload: DeleteLinesPayload) -> dict[str, Any]:
     now = utc_now()
     with db() as conn:
         selected_ids = validate_line_ids_for_store(conn, payload.store_id, payload.line_ids, "Reset selected")
+        purchase_allocations.guard_changes(sys.modules[__name__],conn,selected_ids)
         placeholders = ",".join("?" for _ in selected_ids)
         selected_rows = conn.execute(
             f"""

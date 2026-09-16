@@ -1,0 +1,22 @@
+.modal.show[data-slot="dialog-content"] .modal-dialog.amazon-purchase-dialog {
+  width: min(900px, calc(100vw - 32px));
+  max-width: 900px;
+}
+.modal.show[data-slot="dialog-content"] .amazon-purchase-dialog .modal-content {
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+.amazon-purchase-dialog .modal-content > p {
+  margin: 0;
+  padding: 0 20px;
+}
+.amazon-purchase-dialog .modal-content > div[style] {
+  margin: 0 20px;
+}
+.amazon-purchase-dialog .modal-header,
+.amazon-purchase-dialog .modal-footer,
+.amazon-purchase-dialog .modal-content > button { flex-shrink: 0; }
+.amazon-purchase-dialog .modal-content > button:not(.btn-close) { margin: 0 20px; }

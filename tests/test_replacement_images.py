@@ -213,7 +213,8 @@ class ShopifyImageResponseTests(unittest.TestCase):
         module.sync_one_order_to_dest = lambda odoo, shop, *_args: module.ensure_product_variant_for_line(
             odoo, shop, line={'product_id': [-1, 'replacement']})
         store = SimpleNamespace(odoo_url='test', odoo_db='test', odoo_user='test', odoo_password='test')
-        with patch.object(main, 'get_service_settings', return_value={'shopify_dtc_script_path': 'test'}), \
+        with patch.object(main.purchase_allocations, 'assert_export_coverage'), \
+             patch.object(main, 'get_service_settings', return_value={'shopify_dtc_script_path': 'test'}), \
              patch.object(main, 'get_store', return_value=store), \
              patch.object(main, 'load_external_script', return_value=module), \
              patch.object(main, 'apply_shopify_runtime_settings'), \

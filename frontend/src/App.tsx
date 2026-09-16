@@ -1,3 +1,4 @@
+import { AmazonPurchaseAllocations } from './components/AmazonPurchaseAllocations'
 import { ShopifyTitleReview } from "./components/ShopifyTitleReview"
 import { SmsSettings } from './components/SmsSettings'
 import { SupportWorkspace } from "@/components/SupportWorkspace"
@@ -197,6 +198,7 @@ type AmazonAccount = {
 }
 
 type OrderLine = {
+  amazon_purchases?: { amazon_order_id: string; quantity: number; state: string; tracking_status: string }[]
   id: number
   store_id: number
   store_name?: string
@@ -3664,6 +3666,8 @@ function App() {
   const [editingSpaid, setEditingSpaid] = useState<OrderLine | null>(null)
   const [editingReplacement, setEditingReplacement] = useState<OrderLine | null>(null)
   const [manualFulfilmentOpen, setManualFulfilmentOpen] = useState(false)
+  const [purchaseAllocationLine, setPurchaseAllocationLine] = useState<number | null>(null)
+  const [purchaseAllocationStore, setPurchaseAllocationStore] = useState(0)
   const [thirdPartyTrackingLines, setThirdPartyTrackingLines] = useState<OrderLine[]>([])
   const [inventoryFulfilmentOpen, setInventoryFulfilmentOpen] = useState(false)
   const [inventoryFulfilmentItems, setInventoryFulfilmentItems] = useState<InventoryItem[]>([])
@@ -5138,6 +5142,7 @@ function App() {
       case "cancelled_earlier":
         return row.amazon_cancelled_at ? <Badge className="bg-red-100 text-red-700 hover:bg-red-100">Yes</Badge> : <Badge variant="outline">No</Badge>
       case "amazon_order":
+        if (row.amazon_purchases?.length) return <div className="grid gap-1">{row.amazon_purchases.map(p => <a key={p.amazon_order_id} className="text-primary" href={`https://www.amazon.com/your-orders/order-details?orderID=${p.amazon_order_id}`} target="_blank" rel="noreferrer">{p.amazon_order_id} · {p.quantity} units · {p.state}</a>)}<Button size="sm" variant="outline" onClick={() => { setPurchaseAllocationStore(row.store_id); setPurchaseAllocationLine(row.id) }}>Manage purchases</Button></div>
         return row.amazon_order_url || row.amazon_cancelled_order_id ? (
           <a className="text-primary underline-offset-4 hover:underline" href={row.amazon_order_url} target="_blank">
             {row.amazon_order_id || row.amazon_cancelled_order_id}
@@ -5286,6 +5291,7 @@ function App() {
         setModal({ok: true, title: "Third-party tracking saved", message})
         void refreshCurrentOrdersPage()
       }} />
+      <AmazonPurchaseAllocations lineId={purchaseAllocationLine} storeId={purchaseAllocationStore} api={api} onClose={() => setPurchaseAllocationLine(null)} onSaved={() => { void refreshCurrentOrdersPage() }} />
       <ManualFulfilmentDialog
         open={manualFulfilmentOpen}
         selectedCount={selected.length}
@@ -6008,6 +6014,7 @@ function App() {
                       <CheckCircle2 className="size-4" />
                       Manually Fulfilled
                     </Button>
+                      <Button variant="outline" disabled={!canRunSelectedStoreAction || selected.length !== 1 || Boolean(busy)} onClick={() => { setPurchaseAllocationStore(Number(selectedRows[0]?.store_id || 0)); setPurchaseAllocationLine(selected[0]) }}>Amazon purchases / split quantity</Button>
                     <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy) || !selectedRows.length || selectedRows.some(row => row.order_engine !== "third_party") || new Set(selectedRows.map(row => row.odoo_order_id)).size !== 1} onClick={() => setThirdPartyTrackingLines(selectedRows)}>Assign third-party tracking</Button>
 	                    <Button
 	                      variant="outline"
@@ -6303,6 +6310,7 @@ function App() {
                         <CheckCircle2 className="size-4" />
                         Manually Fulfilled
                       </Button>
+                      <Button variant="outline" disabled={!canRunSelectedStoreAction || selected.length !== 1 || Boolean(busy)} onClick={() => { setPurchaseAllocationStore(Number(selectedRows[0]?.store_id || 0)); setPurchaseAllocationLine(selected[0]) }}>Amazon purchases / split quantity</Button>
 	                      <Button variant="outline" disabled={!canRunSelectedStoreAction || Boolean(busy)} onClick={openProcessReplacement}>
                         <RefreshCw className="size-4" />
                         Process Replacement

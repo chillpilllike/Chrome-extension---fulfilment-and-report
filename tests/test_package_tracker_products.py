@@ -41,7 +41,7 @@ class PackageTrackerProductTests(unittest.TestCase):
 
                 class Connection:
                     def execute(self, query, params):
-                        if "FROM order_lines" in query:
+                        if "FROM order_lines" in query or "FROM amazon_purchase_allocations" in query:
                             self.rows = []
                         else:
                             # Respect the real SQL projection so omitting tracking_url

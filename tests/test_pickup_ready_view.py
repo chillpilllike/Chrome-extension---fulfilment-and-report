@@ -39,12 +39,13 @@ class ReadyViewTests(unittest.TestCase):
         c=sqlite3.connect(':memory:');c.row_factory=sqlite3.Row
         c.executescript('''CREATE TABLE amazon_dispatch_packages(id,store_id,odoo_order_id,odoo_order_name,scan_code,canonical_scan_code,amazon_order_id,package_index,package_status,promise,order_line_ids_json);
         CREATE TABLE package_pickup_delivery_records(package_id,scanned_at);
-        CREATE TABLE order_lines(id,store_id,odoo_order_name,state);''')
+        CREATE TABLE order_lines(id,store_id,odoo_order_name,state,quantity);
+        CREATE TABLE amazon_purchase_allocations(line_id,state,quantity);''')
         for i,store,status,scanned in [(1,1,'Delivered','2026-09-10'),(2,1,'In transit',''),(3,2,'Delivered','2026-01-01')]:
             p=package(i,status=status)
             c.execute('INSERT INTO amazon_dispatch_packages VALUES(?,?,?,?,?,?,?,?,?,?,?)',(i,store,10,'NC1',p['scan_code'],p['scan_code'],p['amazon_order_id'],i,status,'','[1]'))
             c.execute('INSERT INTO package_pickup_delivery_records VALUES (?,?)',(i,scanned))
-        c.executemany('INSERT INTO order_lines VALUES (?,?,?,?)',[(1,1,'NC1','ordered'),(1,2,'NC1','ordered')])
+        c.executemany('INSERT INTO order_lines VALUES (?,?,?,?,?)',[(1,1,'NC1','ordered',1),(1,2,'NC1','ordered',1)])
         rows=[{'store_id':store,'odoo_order_name':'NC1','pickup_scanned_at':'2026-09-10','shopify_fulfilled':fulfilled} for store,fulfilled in [(1,False),(2,False),(2,True)]]
         main.annotate_pickup_complete_orders(c,[{'amazon_packages':rows}])
         self.assertEqual([r['order_ready_for_shopify'] for r in rows],[False,True,False])

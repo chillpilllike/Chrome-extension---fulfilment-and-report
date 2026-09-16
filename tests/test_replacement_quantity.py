@@ -21,6 +21,7 @@ class ReplacementQuantityTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(':memory:', factory=TestConnection)
         self.conn.row_factory = lambda cursor, row: dict(zip([c[0] for c in cursor.description], row))
+        self.conn.execute('CREATE TABLE amazon_purchase_allocations (id INTEGER,line_id INTEGER)')
         fields = {'id': 1, 'store_id': 2, 'odoo_order_id': 3, 'quantity': 1,
                   'asin': 'B000000001', 'product_name': '400 count', 'original_asin': None,
                   'original_product_name': None, 'original_quantity': None, 'replacement_quantity': None,
