@@ -125,6 +125,18 @@ def ensure_internal_reference(odoo, product, candidates=()):
     return encoded
 
 
+def shopify_only_sku(odoo, product, line):
+    if int(product.get('id') or 0) < 0:
+        replacement_asin = normalize_asin(product.get('default_code'))
+        if replacement_asin:
+            return replacement_asin
+    # Stable across retries, without changing the source store's product.
+    identity = [normalize(getattr(odoo, 'url', '')), normalize(getattr(odoo, 'db', '')),
+                int(product.get('id') or 0), int(line['id']) if not product.get('id') else 0]
+    digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:20].upper()
+    return f'SHOP-{digest}'
+
+
 def prepare(module, odoo, order_name, settings, rename_manager, *, repair_references=True, source_asins=None, fingerprint_skus=None):
     order = odoo.get_order_by_number(order_name)
     if not order:
@@ -152,8 +164,8 @@ def prepare(module, odoo, order_name, settings, rename_manager, *, repair_refere
             if source and source[0].get('product_id'):
                 brand_product = raw_client.get_product_product(int(source[0]['product_id'][0])) or {}
                 sku = normalize(brand_product.get('default_code'))
-        if clean and not sku and repair_references:
-            sku = ensure_internal_reference(odoo, brand_product, (source_asins or {}).get(int(line['id']), ()))
+        if not sku:
+            sku = shopify_only_sku(odoo, pp, line)
         brand_key = str(brand_product.get('product_tmpl_id'))
         if brand_key not in brands_cache:
             brands_cache[brand_key] = product_brands(odoo, brand_product) if clean else []
