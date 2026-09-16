@@ -310,16 +310,20 @@ class RelayPayments:
         website = urlsplit(snap['website_url']).hostname
         if not website or not row['payment_link']:
             raise ValueError('Missing website or payment link')
-        title = ('Payment received — ' if kind == 'received' else 'Complete payment for ') + snap['order_number']
-        intro = ('Relay has reported your payment initiation and your order is confirmed. Bank settlement is still processing.'
-                 if kind == 'received' else 'Your invoice is ready. Use the Pay button below to complete your order.')
-        rows = ''.join('<tr><td>'+escape(str(i['name']))+'</td><td>'+escape(str(i['quantity']))+'</td><td>'+escape(str(i['total']))+'</td></tr>' for i in snap['items'])
+        from .after_order_email import render_after_order_email
+        origin_parts = urlsplit(snap['website_url'])
+        if origin_parts.scheme != 'https' or origin_parts.username or origin_parts.password or origin_parts.port:
+            raise ValueError('A secure order website domain is required')
+        origin = 'https://' + website
+        logo_url = origin + '/web/image/website/' + str(int(snap['website_id'])) + '/logo'
         pay_url = self.settings()['public_base_url'].rstrip('/')+'/api/relay/pay/'+row['pay_token']
-        button = '' if kind == 'received' else '<p><a style="display:inline-block;background:#175c43;color:white;padding:16px 28px;border-radius:8px;text-decoration:none" href="'+escape(pay_url,quote=True)+'">Pay USD '+format(snap['amount_cents']/100,'.2f')+'</a></p>'
-        body = '<html><body style="font-family:Arial;max-width:640px;margin:auto;padding:24px"><h2>'+escape(snap['website_name'])+'</h2><h1>'+escape(title)+'</h1><p>'+intro+'</p><table width="100%"><tr><th>Item</th><th>Quantity</th><th>Total ('+escape(snap['original_currency'])+')</th></tr>'+rows+'</table><p>Subtotal: '+escape(snap['subtotal'])+' · Tax: '+escape(snap['tax'])+'</p><p>Order total: '+escape(snap['original_currency']+' '+snap['original_total'])+'</p><p>USD payable: '+format(snap['amount_cents']/100,'.2f')+' · Due: '+escape(snap['due_date'])+'</p>'+button+'</body></html>'
+        case = {'odoo_order_name':snap['order_number'], 'sender_domain':website,
+                'context':{'website_name':snap['website_name'],'website_logo_url':logo_url,
+                           'website_url':origin,'relay_payment':snap}}
+        title, body, plain = render_after_order_email(case,pay_url,actions=[],labels={},
+                                                     template_kind='relay_'+kind)
         return {'from':snap['website_name']+' <notifications@'+website.removeprefix('www.')+'>','to':[snap['customer_email']],
-                'reply_to':'support@'+website.removeprefix('www.'),'subject':title,'html':body,
-                'text':title+'\n'+intro+'\n'+'\n'.join(str(i['quantity'])+' × '+str(i['name'])+' — '+str(i['total'])+' '+snap['original_currency'] for i in snap['items'])+'\nOrder total: '+snap['original_currency']+' '+snap['original_total']+'\nUSD payable: '+format(snap['amount_cents']/100,'.2f')+('' if kind=='received' else '\nPay: '+pay_url)}
+                'reply_to':'support@'+website.removeprefix('www.'),'subject':title,'html':body,'text':plain}
 
     def emails(self):
         if self.settings()['test_mode']:

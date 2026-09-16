@@ -43,6 +43,8 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     if kind == "tracking" and context.get("risk_state") == "suspected_lost":
         kind = "package_lost"
     content = {
+        "relay_request": ("PAYMENT REQUEST", "Your invoice is ready.", "Complete payment", "Complete your order securely using the payment button below. Your invoice will be charged in USD at the amount shown.", "Complete your payment", "Your payment link belongs to this order. If you return later, use this same link."),
+        "relay_received": ("ORDER CONFIRMED", "Thank you for your payment.", "Payment received", "Relay has reported your payment initiation and your order is confirmed. Bank settlement is still processing.", "We’re here to help", "Keep your order number handy if you contact our team."),
         "new_order_welcome": ("THANK YOU", "Thank you for your order!", "Thank you for your order", "We’ve received your order and will begin processing it soon. We’re here to help whenever you need us.", "Here to help", "Keep your order number handy when contacting us so we can help you more quickly."),
         "warehouse_dispatch_delay": ("DISPATCH UPDATE", "An update on your dispatch.", "Your dispatch is taking longer than expected", "Your order’s dispatch has hit a hurdle, and our team has been notified. We expect to dispatch it within the next 24–48 hours.", "No action needed", "You don’t need to take any action. Our team is working to get your order on its way."),
         "item_unavailable": ("YOUR ORDER", "Let’s find your next best option.", "An item needs your choice", "Our team has prepared alternatives for an unavailable item in your order. Review the affected item below and choose how you’d like to continue.", "Choose what works for you", "You can change an alternative for 24 hours from your first selection. After that, a higher-priced choice requires payment of the difference; a cheaper choice is reviewed for a difference refund. If you remove an item, any amount charged for it will be refunded after our team reviews and confirms your request."),
@@ -163,9 +165,37 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         </td></tr></table>'''
         detail_lines = [panel_value, panel_detail]
 
+    if kind in {"relay_request", "relay_received"}:
+        payment = context["relay_payment"]
+        currency = escape(str(payment["original_currency"]))
+        money_rows = []
+        plain_items = []
+        for item in payment["items"]:
+            name = str(item["name"])
+            quantity = str(item["quantity"]).removesuffix(".0")
+            amount = str(item["total"])
+            money_rows.append(f'<tr><td style="padding:16px 12px 16px 0;border-bottom:1px solid #dedede;font-size:13px;line-height:21px;word-break:break-word">{escape(name)}<br><span style="color:#637167">Quantity {escape(quantity)}</span></td><td width="100" align="right" valign="top" style="padding:16px 0;border-bottom:1px solid #dedede;font-size:13px;line-height:21px;white-space:nowrap">{currency} {escape(amount)}</td></tr>')
+            plain_items.append(f'{name} — Quantity {quantity} — {payment["original_currency"]} {amount}')
+        items_html = '<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:24px;table-layout:fixed"><tr><th align="left" style="font-size:11px;color:#637167;padding-bottom:8px">ORDER DETAILS</th><th width="100" align="right" style="font-size:11px;color:#637167;padding-bottom:8px">AMOUNT</th></tr>'+''.join(money_rows)+'</table>'
+        for label, value in [("Subtotal",payment["subtotal"]),("Tax",payment["tax"]),("Order total",payment["original_total"])]:
+            items_html += f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding-top:12px;font-size:13px">{label}</td><td align="right" style="padding-top:12px;font-size:13px;font-weight:600">{currency} {escape(str(value))}</td></tr></table>'
+        usd = format(payment["amount_cents"]/100,'.2f')
+        panel = f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#eeeeee" style="margin-top:28px;border:1px solid #dedede"><tr><td style="padding:24px"><p style="margin:0 0 8px;font-size:10px;letter-spacing:1.3px;color:#506c5e">{"USD PAYMENT" if kind == "relay_received" else "AMOUNT TO PAY"}</p><p style="margin:0;font-size:30px;line-height:38px;font-weight:600;color:#193b2d">USD {usd}</p><p style="margin:8px 0 0;font-size:13px;color:#637167">Due {escape(str(payment["due_date"]))}</p></td></tr></table>'
+        detail_lines = [f'Order total: {payment["original_currency"]} {payment["original_total"]}',f'Subtotal: {payment["subtotal"]} · Tax: {payment["tax"]}',f'USD payment: {usd}',f'Due: {payment["due_date"]}']
+
     buttons = []
     plain_actions = []
-    if kind == "trustpilot_review":
+    if kind in {"relay_request", "relay_received"}:
+        if kind == "relay_request":
+            label = 'Pay USD ' + format(context['relay_payment']['amount_cents']/100,'.2f')
+            buttons.append(button(label, action_url))
+            plain_actions.append(label + ': ' + safe_url(action_url))
+        base = safe_url(context.get('website_url'))
+        if base:
+            contact = base.rstrip('/') + '/contactus'
+            buttons.append(button('Contact our team', contact, primary=False))
+            plain_actions.append('Contact our team: ' + contact)
+    elif kind == "trustpilot_review":
         buttons.append(button("Share an honest review", review_url))
         plain_actions.append(f"Share an honest review: {safe_url(review_url)}")
     elif kind == "tracking":

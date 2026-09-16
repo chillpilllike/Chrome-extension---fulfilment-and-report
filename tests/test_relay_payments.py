@@ -254,6 +254,27 @@ class EmailOutboxTests(unittest.TestCase):
   with patch.dict('os.environ',{'RESEND_API_KEY':'fake'}),patch('relay_bridge_test.relay_payments.requests.post') as post:
    self.svc.emails();post.assert_not_called()
   self.assertEqual('delivery_unknown',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
+ def test_branding_follows_each_order_website_and_escapes_items(self):
+  for host,site_id in [('shop.example.test',1),('second.example.test',42)]:
+   self.svc.current=lambda row:dict(SNAP,website_url='https://'+host,website_id=site_id,website_name='Brand & Co',items=[{'name':'Product <special>','quantity':2.0,'total':'36.23'}])
+   row=self.c.execute('SELECT * FROM relay_payments').fetchone()
+   mail=self.svc.email_payload(row,'request')
+   self.assertIn(f'https://{host}/web/image/website/{site_id}/logo',mail['html'])
+   self.assertIn(f'https://{host}/contactus',mail['html'])
+   self.assertIn('Product &lt;special&gt;',mail['html'])
+   self.assertIn('Pay USD 26.07',mail['html'])
+   self.assertIn('https://app.example.test/api/relay/pay/token',mail['html'])
+   self.assertNotIn('choice=',mail['html'])
+   self.assertEqual('support@'+host,mail['reply_to'])
+   self.assertIn('max-width:600px',mail['html'])
+ def test_received_email_has_branding_without_pay_button(self):
+  self.svc.current=lambda row:dict(SNAP,initiated_at='2026-09-17',state='done')
+  row=self.c.execute('SELECT * FROM relay_payments').fetchone()
+  mail=self.svc.email_payload(row,'received')
+  self.assertIn('ORDER CONFIRMED',mail['html'])
+  self.assertIn('Bank settlement is still processing',mail['html'])
+  self.assertNotIn('Pay USD',mail['html'])
+  self.assertIn('/web/image/website/1/logo',mail['html'])
  def test_missing_key_retains_queued_email(self):
   from unittest.mock import patch
   with patch.dict('os.environ',{},clear=True),self.assertRaises(ValueError):self.svc.emails()
