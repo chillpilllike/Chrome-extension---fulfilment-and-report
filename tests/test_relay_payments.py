@@ -152,6 +152,7 @@ class WorkflowTests(unittest.TestCase):
 class SyncScopeTests(WorkflowTests):
  def setUp(self):
   super().setUp()
+  self.svc.configure_notifications=Mock()
   self.c.execute("CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY,case_key TEXT UNIQUE,store_id INTEGER,website_id INTEGER,odoo_order_id INTEGER,odoo_order_name TEXT,case_type TEXT,status TEXT,severity TEXT,title TEXT,customer_email TEXT,affected_items_json TEXT,context_json TEXT,created_at TEXT,updated_at TEXT)")
  def test_real_store_object_and_single_website_inference(self):
   self.svc.get_store=lambda _:types.SimpleNamespace(website_id=None)
@@ -276,7 +277,7 @@ class ContactMiddlewareTests(WorkflowTests):
   path='/api/relay/extension/pending';headers={'X-Relay-Token':'valid-token'}
   self.assertEqual(401,client.post(path).status_code)
   response=client.post(path,headers=headers);self.assertEqual(200,response.status_code)
-  self.assertEqual(15,response.json()['poll_seconds']);self.assertEqual('NC-22',response.json()['items'][0]['order_number'])
+  self.assertEqual(2,response.json()['poll_seconds']);self.assertEqual('NC-22',response.json()['items'][0]['order_number'])
   self.assertNotIn('customer_email',response.json()['items'][0]);self.assertEqual('no-store',response.headers['cache-control'])
   settings['store_ids']=[2];self.assertEqual([],client.post(path,headers=headers).json()['items'])
   settings['store_ids']=[1]
@@ -384,3 +385,52 @@ class ContactLookupTests(WorkflowTests):
   self.assertEqual(result['invoice_number'],SNAP['invoice_number'])
   self.assertEqual(client.execute.call_args_list[0].args[2],[[123]])
   self.assertEqual(client.execute.call_args_list[1].args[2],[[42]])
+
+
+class NotificationTests(WorkflowTests):
+ def setUp(self):
+  super().setUp()
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  self.key='notification-secret-for-this-test-only'
+  self.values={'relay_notify_secret_1':self.key,'relay_payment_settings':json.dumps({**DEFAULTS,'enabled':True,'store_ids':[1],'public_base_url':'https://app.example.test'})}
+  self.svc.get_settings=lambda:self.values
+  self.svc.set_settings=lambda values:self.values.update(values)
+  self.svc.get_store=lambda _:types.SimpleNamespace(website_id=1)
+  self.svc.notification_sync=Mock()
+  app=FastAPI();app.include_router(self.svc.router());self.http=TestClient(app)
+ def notify(self,changes=None,key=None):
+  import time,hmac,hashlib
+  body=json.dumps({'store_id':1,'website_id':1,'timestamp':int(time.time()),**(changes or {})}).encode()
+  signature=hmac.new((key or self.key).encode(),body,hashlib.sha256).hexdigest()
+  return self.http.post('/api/relay/odoo/notify',content=body,headers={'X-Relay-Signature':signature})
+ def test_signed_notice_imports_authenticated_odoo_scope(self):
+  self.assertEqual(202,self.notify().status_code)
+  self.svc.notification_sync.assert_called_once_with(1,1)
+ def test_bad_signature_expired_or_wrong_website_cannot_import(self):
+  self.assertEqual(401,self.notify(key='wrong').status_code)
+  self.assertEqual(409,self.notify({'timestamp':1}).status_code)
+  self.assertEqual(409,self.notify({'website_id':2}).status_code)
+  self.svc.notification_sync.assert_not_called()
+ def test_disabled_bridge_does_not_import(self):
+  self.values['relay_payment_settings']=json.dumps({**DEFAULTS,'store_ids':[1]})
+  self.assertEqual(409,self.notify().status_code)
+  self.svc.notification_sync.assert_not_called()
+ def test_configure_reuses_secret_and_old_addon_preserves_fallback(self):
+  client=Mock()
+  self.svc.configure_notifications(1,client,1)
+  client.execute.assert_called_once_with('payment.transaction','relay_bridge_configure_notifications',[1,1,'https://app.example.test/api/relay/odoo/notify',self.key])
+  client.execute.side_effect=RuntimeError('Old addon')
+  self.svc.configure_notifications(1,client,1)
+  self.assertIn('one-minute',self.values['relay_notify_1_error'])
+ def test_completed_pending_order_is_reviewed_and_not_deleted(self):
+  self.svc.current=lambda row:{**SNAP,'state':'done'}
+  self.svc.review_pending()
+  self.assertEqual('review',self.c.execute('SELECT status FROM relay_payments').fetchone()[0])
+  self.svc.current=lambda row:dict(SNAP)
+  self.svc.review_pending()
+  self.assertEqual('waiting_link',self.c.execute('SELECT status FROM relay_payments').fetchone()[0])
+ def test_transport_outage_does_not_deactivate_order(self):
+  self.svc.current=Mock(side_effect=RuntimeError('offline'))
+  self.svc.review_pending()
+  self.assertEqual('waiting_link',self.c.execute('SELECT status FROM relay_payments').fetchone()[0])

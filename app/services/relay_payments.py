@@ -17,7 +17,7 @@ from html import escape
 from urllib.parse import urlsplit, urljoin
 
 import requests
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 from .relay_policy import match_capture, payment_key, parse_receipt
 from .relay_login import login_link, login_subject, recent_login_summaries
@@ -115,6 +115,26 @@ class RelayPayments:
             raise ValueError('Payment is no longer active')
         return fresh
 
+    def review_pending(self):
+        """Exclude changed/inactive Odoo requests from automatic discovery, retaining evidence."""
+        with self.db() as c:
+            rows=c.execute("SELECT * FROM relay_payments WHERE payment_link IS NULL AND (status='waiting_link' OR (status='review' AND last_error LIKE 'Pending request review:%'))").fetchall()
+        for row in rows:
+            if row['store_id'] not in self.settings()['store_ids']:continue
+            try:
+                fresh=self.current(row)
+                if fresh.get('state')!='pending' or fresh.get('initiated_at') or fresh.get('payment_link'):
+                    raise ValueError('Order is no longer awaiting a payment link')
+            except ValueError as exc:
+                with self.db() as c:
+                    c.execute("UPDATE relay_payments SET status='review',last_error=?,updated_at=? WHERE id=? AND payment_link IS NULL",('Pending request review: '+str(exc),now(),row['id']))
+            except Exception:
+                continue  # A transport outage is not evidence that an order is inactive.
+            else:
+                if row['status']=='review':
+                    with self.db() as c:
+                        c.execute("UPDATE relay_payments SET status='waiting_link',last_error=NULL,updated_at=? WHERE id=? AND payment_link IS NULL",(now(),row['id']))
+
     def sync(self):
         failed=[]
         for sid in self.settings()['store_ids']:
@@ -135,7 +155,29 @@ class RelayPayments:
             sites = client.execute('website', 'search_read', [[]], {'fields': ['id']})
             website_ids = sorted({int(site['id']) for site in sites})
         for scoped_id in website_ids:
+            self.configure_notifications(sid,client,scoped_id)
             self.sync_website(sid, client, scoped_id)
+
+    def configure_notifications(self,sid,client,website_id):
+        base=self.settings()['public_base_url'].rstrip('/')
+        if not base:return
+        name='relay_notify_secret_'+str(sid)
+        key=self.get_settings().get(name)
+        if not key:
+            key=secrets.token_urlsafe(32)
+            self.set_settings({name:key})
+        try:
+            client.execute('payment.transaction','relay_bridge_configure_notifications',[website_id,int(sid),base+'/api/relay/odoo/notify',key])
+            self.set_settings({'relay_notify_'+str(sid)+'_error':''})
+        except Exception:
+            self.set_settings({'relay_notify_'+str(sid)+'_error':'Immediate notifications unavailable; one-minute import remains active'})
+
+    def notification_sync(self,sid,website_id):
+        try:
+            self.sync_website(sid,self.client(sid),website_id)
+            self.review_pending()
+        except Exception:
+            self.set_settings({'relay_notify_'+str(sid)+'_error':'Notification import failed; one-minute import will retry'})
 
     def sync_website(self, sid, client, website_id):
         offset = 0
@@ -430,7 +472,7 @@ class RelayPayments:
             lock = guard.execute('SELECT pg_try_advisory_xact_lock(771905432) AS locked').fetchone()
             if not lock['locked']:
                 return
-            for name, action in [('sync',self.sync),('refresh',self.refresh_bound),('receiving',self.receive),('confirmation',self.confirmations),('email',self.emails)]:
+            for name, action in [('sync',self.sync),('pending_review',self.review_pending),('refresh',self.refresh_bound),('receiving',self.receive),('confirmation',self.confirmations),('email',self.emails)]:
                 try:
                     if name=='confirmation' and (self.settings()['test_mode']):
                         continue
@@ -521,10 +563,28 @@ class RelayPayments:
                 raise HTTPException(409,'Ambiguous login confirmation; sign in manually')
             from fastapi.responses import JSONResponse
             return JSONResponse({'ok':True,'link':next(iter(matches),None)},headers={'Cache-Control':'no-store'})
+        @r.post('/odoo/notify',status_code=202)
+        async def odoo_notify(request:Request,background:BackgroundTasks):
+            body=await request.body()
+            if len(body)>4096:raise HTTPException(413,'Notification too large')
+            try:
+                data=json.loads(body);sid=int(data['store_id']);website=int(data['website_id']);stamp=int(data['timestamp'])
+            except (ValueError,KeyError,TypeError):raise HTTPException(400,'Invalid notification') from None
+            key=self.get_settings().get('relay_notify_secret_'+str(sid),'')
+            signature=request.headers.get('X-Relay-Signature','')
+            expected=hmac.new(key.encode(),body,hashlib.sha256).hexdigest()
+            if not key or not hmac.compare_digest(expected,signature):raise HTTPException(401,'Invalid notification signature')
+            settings=self.settings()
+            if not settings['enabled'] or sid not in settings['store_ids'] or abs(time.time()-stamp)>300:
+                raise HTTPException(409,'Inactive or expired notification')
+            store=self.get_store(sid)
+            scoped=getattr(store,'website_id',None)
+            if website<1 or (scoped and int(scoped)!=website):raise HTTPException(409,'Website scope mismatch')
+            background.add_task(self.notification_sync,sid,website)
+            return {'ok':True}
         @r.post('/extension/pending')
         def pending_links(request:Request):
             extension(request)
-            self.ensure()
             stores=set(self.settings()['store_ids'])
             with self.db() as c:
                 rows=c.execute("SELECT id,store_id,request_id,snapshot_json FROM relay_payments WHERE status='waiting_link' AND payment_link IS NULL ORDER BY id").fetchall()
@@ -535,7 +595,7 @@ class RelayPayments:
                 if snap.get('initiated_at') or snap.get('state') not in ('pending','draft') or not snap.get('qbo_invoice_id'):continue
                 items.append({'request_id':row['request_id'],'order_number':snap['order_number'],'invoice_number':snap['invoice_number']})
             from fastapi.responses import JSONResponse
-            return JSONResponse({'ok':True,'items':items,'poll_seconds':15},headers={'Cache-Control':'no-store'})
+            return JSONResponse({'ok':True,'items':items,'poll_seconds':2},headers={'Cache-Control':'no-store'})
         @r.post('/extension/resolve')
         def resolve(request:Request,payload:dict):
             extension(request)
