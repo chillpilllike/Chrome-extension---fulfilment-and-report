@@ -20,9 +20,12 @@ CAPTURE.update(currency='USD',relay_invoice_id='relay-id-123',payment_link='http
 class PolicyTests(unittest.TestCase):
  def test_exact_match(self): self.assertTrue(match_capture(SNAP,CAPTURE))
  def test_every_identity_mismatch_blocks(self):
-  for key in ('order_number','invoice_number','customer_name','customer_email','amount_cents','currency'):
+  for key in ('order_number','invoice_number','customer_email','amount_cents','currency'):
    value=999 if key=='amount_cents' else 'other'
    with self.subTest(key=key), self.assertRaises(ValueError):match_capture(SNAP,{**CAPTURE,key:value})
+ def test_existing_contact_uses_email_not_name_or_phone(self):
+  self.assertTrue(match_capture(SNAP,{**CAPTURE,'customer_name':'Existing Relay customer','phone':'different'}))
+  with self.assertRaises(ValueError):match_capture(SNAP,{**CAPTURE,'customer_name':''})
  def test_no_fuzzy_or_missing_customer(self):
   for email in ('','billing+other@example.test'):
    with self.assertRaises(ValueError):match_capture(SNAP,{**CAPTURE,'customer_email':email})
@@ -104,7 +107,7 @@ class WorkflowTests(unittest.TestCase):
   self.assertEqual('Amit',audit['customer_name']);self.assertTrue(audit['approved_at'])
  def test_alias_never_relaxes_email_amount_order_or_invoice(self):
   self.approve_alias()
-  for change in ({'customer_email':'other@example.test'},{'amount_cents':1},{'order_number':'OTHER'},{'relay_invoice_id':'other-id'},{'customer_name':'Someone else'}):
+  for change in ({'customer_email':'other@example.test'},{'amount_cents':1},{'order_number':'OTHER'},{'relay_invoice_id':'other-id'}):
    with self.subTest(change=change),self.assertRaises(ValueError):
     self.svc.capture({**CAPTURE,'customer_name':'Amit',**change})
   self.svc.rpc.assert_not_called()

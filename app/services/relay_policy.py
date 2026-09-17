@@ -34,20 +34,14 @@ def payment_key(value):
 
 
 def match_capture(snapshot, capture):
-    """All four independent identities must agree; no fuzzy customer matching."""
-    required = ('invoice_number', 'order_number', 'customer_name', 'customer_email')
-    for key in required:
+    """Exact email identifies a customer; names/phones may differ across orders."""
+    for key in ('invoice_number', 'order_number', 'customer_email'):
         expected = normalized(snapshot.get(key))
         actual = normalized(capture.get(key))
-        # Relay's Customer summary includes a separate initials avatar in its text.
-        # Permit only the initials derived from this exact expected customer name.
-        if key == 'customer_name' and expected:
-            parts = expected.split(' [odoo-', 1)[0].split()
-            initials = parts[0][0] + (parts[-1][0] if len(parts) > 1 else '')
-            if actual == initials + ' ' + expected:
-                actual = expected
         if not expected or not actual or expected != actual:
             raise ValueError('Relay/Odoo mismatch: ' + key)
+    if not normalized(capture.get('customer_name')):
+        raise ValueError('Missing Relay customer name')
     if capture.get('currency') != 'USD' or type(capture.get('amount_cents')) is not int or snapshot['amount_cents'] != capture['amount_cents']:
         raise ValueError('Relay/Odoo currency or amount mismatch')
     if not re.fullmatch(r'[A-Za-z0-9_-]{5,100}', str(capture.get('relay_invoice_id', ''))):
