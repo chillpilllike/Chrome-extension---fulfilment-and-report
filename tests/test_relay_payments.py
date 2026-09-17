@@ -242,8 +242,27 @@ class ContactMiddlewareTests(WorkflowTests):
   self.svc.contact.assert_not_called()
   response=client.post('/api/relay/extension/contact',json=CAPTURE,headers={'X-Relay-Token':'valid-token'})
   self.assertEqual(200,response.status_code);self.svc.contact.assert_called_once()
+  self.svc.resend_api=Mock(return_value={'data':[]})
+  login_body={'journey_id':'current-journey-123','email':'am-it@outlook.com'}
+  self.assertEqual(401,client.post('/api/relay/extension/login-link',json=login_body).status_code)
+  self.assertEqual(200,client.post('/api/relay/extension/login-link',json=login_body,headers={'X-Relay-Token':'valid-token'}).status_code)
   self.assertEqual(401,client.get('/api/relay/extension/contact',headers={'X-Relay-Token':'valid-token'}).status_code)
   self.assertEqual(401,client.get('/api/relay/settings',headers={'X-Relay-Token':'valid-token'}).status_code)
+
+ def test_login_lookup_uses_extension_auth_and_never_mutates_orders(self):
+  import hashlib
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  self.svc.get_settings=lambda:{'relay_extension_token_hash':hashlib.sha256(b'valid-token').hexdigest(),'relay_payment_settings':json.dumps({'enabled':True})}
+  self.svc.resend_api=Mock(return_value={'data':[]})
+  app=FastAPI();app.include_router(self.svc.router());client=TestClient(app)
+  body={'journey_id':'current-journey-123','email':'am-it@outlook.com'}
+  self.assertEqual(401,client.post('/api/relay/extension/login-link',json=body).status_code)
+  self.svc.resend_api.assert_not_called()
+  response=client.post('/api/relay/extension/login-link',json=body,headers={'X-Relay-Token':'valid-token'})
+  self.assertEqual(200,response.status_code);self.assertEqual({'ok':True,'link':None},response.json())
+  self.assertEqual('no-store',response.headers['cache-control']);self.svc.rpc.assert_not_called()
+  self.assertEqual(400,client.post('/api/relay/extension/login-link',json={**body,'email':'wrong@example.com'},headers={'X-Relay-Token':'valid-token'}).status_code)
 
 class EmailOutboxTests(unittest.TestCase):
  tearDown=WorkflowTests.tearDown

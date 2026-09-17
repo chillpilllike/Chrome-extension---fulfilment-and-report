@@ -2,7 +2,8 @@
 
 Injected host functions keep this independent from the application's large main module.
 Only the server owns Odoo and Resend credentials. The extension credential can only
-resolve and upload matching links; it cannot confirm orders or change settings.
+resolve/upload matching payment links and retrieve an authenticated login link for
+a specific current journey; it cannot confirm orders or change settings.
 """
 import hashlib
 import hmac
@@ -19,6 +20,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from .relay_policy import match_capture, payment_key, parse_receipt
+from .relay_login import login_link, login_subject, recent_login_summaries
 
 DEFAULTS = {'enabled': False, 'store_ids': [], 'receiving_address': 'relay-payments@taloofalut.resend.app',
             'forwarders': 'am-it@outlook.com', 'authserv_ids': '', 'public_base_url': '', 'test_mode': True}
@@ -270,6 +272,8 @@ class RelayPayments:
         from urllib.parse import quote
         listing = self.resend_api('/emails/receiving?limit=100'+('&after='+quote(cursor,safe='') if cursor else ''))
         for summary in listing.get('data', []):
+            if login_subject(summary):
+                continue  # Login messages are never payment evidence.
             email_id = summary['id']
             with self.db() as c:
                 old = c.execute('SELECT status FROM relay_receipts WHERE email_id=?', (email_id,)).fetchone()
@@ -494,6 +498,29 @@ class RelayPayments:
             settings=self.settings()
             return {'ok':True,'service':'relay-payment-bridge','enabled':settings['enabled'],
                     'test_mode':bool(settings['test_mode'])}
+        @r.post('/extension/login-link')
+        def find_login_link(request:Request,payload:dict):
+            extension(request)
+            import re
+            from urllib.parse import quote
+            journey=str(payload.get('journey_id',''))
+            email=str(payload.get('email','')).strip().lower()
+            if not re.fullmatch(r'[A-Za-z0-9_-]{10,100}',journey) or email not in {v.strip().lower() for v in self.settings()['forwarders'].splitlines()}:
+                raise HTTPException(400,'Invalid login attempt')
+            listing=self.resend_api('/emails/receiving?limit=100')
+            matches=set()
+            for summary in recent_login_summaries(listing):
+                time.sleep(0.6)  # Bound reads and space them within Resend's rate limit.
+                full=self.resend_api('/emails/receiving/'+quote(summary['id'],safe=''))
+                try:
+                    link=login_link(full,self.settings(),journey,email)
+                except ValueError:
+                    continue  # Unauthenticated/unrelated mail cannot authorize a login.
+                if link:matches.add(link)
+            if len(matches)>1:
+                raise HTTPException(409,'Ambiguous login confirmation; sign in manually')
+            from fastapi.responses import JSONResponse
+            return JSONResponse({'ok':True,'link':next(iter(matches),None)},headers={'Cache-Control':'no-store'})
         @r.post('/extension/resolve')
         def resolve(request:Request,payload:dict):
             extension(request)

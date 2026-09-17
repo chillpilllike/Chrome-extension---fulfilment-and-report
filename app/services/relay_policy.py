@@ -53,13 +53,7 @@ def match_capture(snapshot, capture):
     return True
 
 
-def parse_receipt(message, settings, resolve_tracking=None):
-    """Authenticate the actual forwarder, never a From: line quoted in the body.
-
-    Receiving API access authenticates transport from Resend, not email authorship.
-    Require the receiver's first Authentication-Results field with aligned DMARC.
-    Unknown templates/authentication fail to manual review.
-    """
+def authenticate_forwarder(message, settings):
     expected = settings['receiving_address'].lower()
     targets = message.get('received_for') or message.get('to') or []
     if expected not in {parseaddr(v)[1].lower() for v in targets}:
@@ -80,6 +74,16 @@ def parse_receipt(message, settings, resolve_tracking=None):
     domain = sender.rsplit('@', 1)[-1]
     if not re.search(r'\bdmarc=pass\b[^;]*\bheader\.from=' + re.escape(domain) + r'(?:\s|;|$)', auth):
         raise ValueError('Forwarder DMARC alignment did not pass')
+
+
+def parse_receipt(message, settings, resolve_tracking=None):
+    """Authenticate the actual forwarder, never a From: line quoted in the body.
+
+    Receiving API access authenticates transport from Resend, not email authorship.
+    Require the receiver's first Authentication-Results field with aligned DMARC.
+    Unknown templates/authentication fail to manual review.
+    """
+    authenticate_forwarder(message, settings)
     markup = message.get('html') or ''
     if markup.startswith('data:text/html'):
         from urllib.parse import unquote
