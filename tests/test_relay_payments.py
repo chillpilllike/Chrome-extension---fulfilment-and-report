@@ -246,6 +246,8 @@ class ContactMiddlewareTests(WorkflowTests):
   login_body={'journey_id':'current-journey-123','email':'am-it@outlook.com'}
   self.assertEqual(401,client.post('/api/relay/extension/login-link',json=login_body).status_code)
   self.assertEqual(200,client.post('/api/relay/extension/login-link',json=login_body,headers={'X-Relay-Token':'valid-token'}).status_code)
+  self.assertEqual(401,client.post('/api/relay/extension/pending').status_code)
+  self.assertEqual(200,client.post('/api/relay/extension/pending',headers={'X-Relay-Token':'valid-token'}).status_code)
   self.assertEqual(401,client.get('/api/relay/extension/contact',headers={'X-Relay-Token':'valid-token'}).status_code)
   self.assertEqual(401,client.get('/api/relay/settings',headers={'X-Relay-Token':'valid-token'}).status_code)
 
@@ -263,6 +265,23 @@ class ContactMiddlewareTests(WorkflowTests):
   self.assertEqual(200,response.status_code);self.assertEqual({'ok':True,'link':None},response.json())
   self.assertEqual('no-store',response.headers['cache-control']);self.svc.rpc.assert_not_called()
   self.assertEqual(400,client.post('/api/relay/extension/login-link',json={**body,'email':'wrong@example.com'},headers={'X-Relay-Token':'valid-token'}).status_code)
+
+ def test_pending_queue_auth_scope_and_completed_link_exclusion(self):
+  import hashlib
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  settings={'enabled':True,'store_ids':[1]}
+  self.svc.get_settings=lambda:{'relay_extension_token_hash':hashlib.sha256(b'valid-token').hexdigest(),'relay_payment_settings':json.dumps(settings)}
+  app=FastAPI();app.include_router(self.svc.router());client=TestClient(app)
+  path='/api/relay/extension/pending';headers={'X-Relay-Token':'valid-token'}
+  self.assertEqual(401,client.post(path).status_code)
+  response=client.post(path,headers=headers);self.assertEqual(200,response.status_code)
+  self.assertEqual(15,response.json()['poll_seconds']);self.assertEqual('NC-22',response.json()['items'][0]['order_number'])
+  self.assertNotIn('customer_email',response.json()['items'][0]);self.assertEqual('no-store',response.headers['cache-control'])
+  settings['store_ids']=[2];self.assertEqual([],client.post(path,headers=headers).json()['items'])
+  settings['store_ids']=[1]
+  self.c.execute("UPDATE relay_payments SET payment_link='https://relay.cash/pay/test-token'");self.c.commit()
+  self.assertEqual([],client.post(path,headers=headers).json()['items'])
 
 class EmailOutboxTests(unittest.TestCase):
  tearDown=WorkflowTests.tearDown

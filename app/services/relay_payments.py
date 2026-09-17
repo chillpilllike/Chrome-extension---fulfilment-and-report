@@ -521,6 +521,21 @@ class RelayPayments:
                 raise HTTPException(409,'Ambiguous login confirmation; sign in manually')
             from fastapi.responses import JSONResponse
             return JSONResponse({'ok':True,'link':next(iter(matches),None)},headers={'Cache-Control':'no-store'})
+        @r.post('/extension/pending')
+        def pending_links(request:Request):
+            extension(request)
+            self.ensure()
+            stores=set(self.settings()['store_ids'])
+            with self.db() as c:
+                rows=c.execute("SELECT id,store_id,request_id,snapshot_json FROM relay_payments WHERE status='waiting_link' AND payment_link IS NULL ORDER BY id").fetchall()
+            items=[]
+            for row in rows:
+                if row['store_id'] not in stores:continue
+                snap=json.loads(row['snapshot_json'])
+                if snap.get('initiated_at') or snap.get('state') not in ('pending','draft') or not snap.get('qbo_invoice_id'):continue
+                items.append({'request_id':row['request_id'],'order_number':snap['order_number'],'invoice_number':snap['invoice_number']})
+            from fastapi.responses import JSONResponse
+            return JSONResponse({'ok':True,'items':items,'poll_seconds':15},headers={'Cache-Control':'no-store'})
         @r.post('/extension/resolve')
         def resolve(request:Request,payload:dict):
             extension(request)
