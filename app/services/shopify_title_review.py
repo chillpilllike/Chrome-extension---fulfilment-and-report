@@ -177,9 +177,26 @@ def prepare(module, odoo, order_name, settings, rename_manager, *, repair_refere
                           quantity=line.get('product_uom_qty'), price_unit=line.get('price_unit'),
                           price_total=line.get('price_total'), discount=line.get('discount')))
     fingerprint_items = [dict(item, sku=fingerprint_skus.get(item['key'], item['sku'])) for item in items] if fingerprint_skus else items
-    source = dict(items=fingerprint_items, clean=clean, keywords=keywords if clean else '', order=order)
+    # Internal notes and tags change during fulfilment without changing the
+    # reviewed products. Keep commercially relevant order fields in the guard.
+    order_source = {key: value for key, value in order.items() if key not in {'note', 'tag_ids'}}
+    source = dict(items=fingerprint_items, clean=clean, keywords=keywords if clean else '', order=order_source)
     fingerprint = hashlib.sha256(json.dumps(source, sort_keys=True, default=str).encode()).hexdigest()
-    return dict(items=items, fingerprint=fingerprint, clean=clean)
+    legacy_source = dict(source, order=order)
+    legacy_fingerprint = hashlib.sha256(json.dumps(legacy_source, sort_keys=True, default=str).encode()).hexdigest()
+    return dict(items=items, fingerprint=fingerprint, legacy_fingerprint=legacy_fingerprint, clean=clean)
+
+
+def preserve_reviewed_titles(snapshot, saved_snapshot):
+    """Keep operator wording for unchanged products when source changes reopen review."""
+    previous = {item['key']: item for item in saved_snapshot.get('items', [])}
+    if snapshot.get('clean') != saved_snapshot.get('clean'):
+        return snapshot
+    for item in snapshot['items']:
+        old = previous.get(item['key'])
+        if old and all(old.get(key) == item.get(key) for key in ('product_id', 'original_title', 'sku')):
+            item['prepared_title'] = old['prepared_title']
+    return snapshot
 
 
 def validate_items(items, clean, keywords):

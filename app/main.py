@@ -23565,7 +23565,13 @@ def resolve_shopify_title_review(job: dict[str, Any], snapshot: dict[str, Any], 
     with db() as conn:
         conn.execute("SELECT id FROM shopify_fulfilment_jobs WHERE id=? FOR UPDATE", (job["id"],)).fetchone()
         saved = conn.execute("SELECT * FROM shopify_title_reviews WHERE job_id=?", (job["id"],)).fetchone()
-        if saved and saved["fingerprint"] == snapshot["fingerprint"]:
+        if saved and saved["fingerprint"] in {snapshot["fingerprint"], snapshot.get("legacy_fingerprint")}:
+            if saved["fingerprint"] != snapshot["fingerprint"]:
+                migrated = json.loads(saved["snapshot_json"])
+                migrated["fingerprint"] = snapshot["fingerprint"]
+                migrated["legacy_fingerprint"] = snapshot.get("legacy_fingerprint")
+                saved = dict(saved, snapshot_json=json.dumps(migrated))
+                conn.execute("UPDATE shopify_title_reviews SET fingerprint=?,snapshot_json=? WHERE job_id=?", (snapshot["fingerprint"], saved["snapshot_json"], job["id"]))
             if saved["status"] == "approved":
                 approved = json.loads(saved["snapshot_json"])
                 review.validate_items(approved["items"], approved["clean"], keywords)
@@ -23574,6 +23580,13 @@ def resolve_shopify_title_review(job: dict[str, Any], snapshot: dict[str, Any], 
         else:
             hold = needs_review or bool(saved) or bool(validation_error)
             if hold:
+                if saved:
+                    snapshot = review.preserve_reviewed_titles(snapshot, json.loads(saved["snapshot_json"]))
+                    try:
+                        review.validate_items(snapshot["items"], snapshot["clean"], keywords)
+                        validation_error = "Order data changed since the last review. Your titles for unchanged products were kept; review and approve again."
+                    except ValueError as exc:
+                        validation_error = str(exc)
                 conn.execute("""INSERT INTO shopify_title_reviews(job_id,fingerprint,snapshot_json,status,updated_at)
                     VALUES (?,?,?,'pending',?) ON CONFLICT(job_id) DO UPDATE SET
                     fingerprint=excluded.fingerprint,snapshot_json=excluded.snapshot_json,status='pending',
@@ -23684,7 +23697,7 @@ def repair_shopify_review_references(job: dict[str, Any], snapshot: dict[str, An
     frozen = review.FrozenOdoo(client)
     rename = shopify_product_rename_manager(module, settings)
     before = review.prepare(module, frozen, str(job["odoo_order_name"]), settings, rename, repair_references=False, fingerprint_skus={item["key"]: "" for item in snapshot["items"] if not item.get("sku")})
-    if before["fingerprint"] != snapshot["fingerprint"]:
+    if snapshot["fingerprint"] not in {before["fingerprint"], before.get("legacy_fingerprint")}:
         raise ValueError("Odoo product data changed. Refresh the review before approving the titles.")
     return review.prepare(module, frozen, str(job["odoo_order_name"]), settings, rename, source_asins=shopify_title_source_asins(job))
 

@@ -84,6 +84,50 @@ class ReviewTests(unittest.TestCase):
         self.hold()
         row=self.conn.execute('SELECT * FROM shopify_title_reviews').fetchone()
         self.assertEqual((row['status'],row['revision']),('pending',2))
+    def test_changed_source_keeps_operator_title_for_same_product(self):
+        self.hold(); self.approve('Custom approved title')
+        self.snapshot['fingerprint'] = 'changed-price'
+        self.snapshot['items'][0]['price_unit'] = 200
+        self.hold()
+        saved = json.loads(self.conn.execute('SELECT snapshot_json FROM shopify_title_reviews').fetchone()['snapshot_json'])
+        self.assertEqual(saved['items'][0]['prepared_title'], 'Custom approved title')
+        self.assertEqual(saved['items'][0]['price_unit'], 200)
+
+    def test_changed_product_does_not_inherit_operator_title(self):
+        self.hold(); self.approve('Custom approved title')
+        self.snapshot['fingerprint'] = 'changed-product'
+        self.snapshot['items'][0]['original_title'] = 'Different product'
+        self.hold()
+        saved = json.loads(self.conn.execute('SELECT snapshot_json FROM shopify_title_reviews').fetchone()['snapshot_json'])
+        self.assertEqual(saved['items'][0]['prepared_title'], 'Red Box')
+
+    def test_legacy_fingerprint_keeps_existing_approval_valid(self):
+        self.hold(); self.approve('Custom approved title')
+        self.snapshot.update(fingerprint='new-format', legacy_fingerprint='abc')
+        resolved = main.resolve_shopify_title_review(self.job, self.snapshot, self.settings)
+        self.assertEqual(resolved['items'][0]['prepared_title'], 'Custom approved title')
+        self.assertEqual(self.conn.execute('SELECT fingerprint FROM shopify_title_reviews').fetchone()['fingerprint'], 'new-format')
+
+    def test_notes_and_tags_do_not_change_title_fingerprint(self):
+        client = Mock()
+        order = {'id': 1, 'order_line': [10], 'note': 'old note', 'tag_ids': [1]}
+        client.get_order_by_number.side_effect = lambda name: dict(order)
+        client.get_order_lines.return_value = [{'id': 10, 'product_id': [20, 'Box'], 'product_uom_qty': 1, 'price_unit': 10, 'price_total': 10}]
+        client.get_product_product.return_value = {'id': 20, 'name': 'Red Box', 'default_code': 'REF', 'product_tmpl_id': False}
+        module = SimpleNamespace(_should_ignore_odoo_line_item=lambda *args: False)
+        def prepare():
+            return review.prepare(module, review.FrozenOdoo(client), 'NC1', self.settings, Mock())
+        before = prepare()
+        order.update(note='Fulfilment updated', tag_ids=[2, 1])
+        after = prepare()
+        self.assertEqual(before['fingerprint'], after['fingerprint'])
+        self.assertNotEqual(before['legacy_fingerprint'], after['legacy_fingerprint'])
+        client.get_order_lines.return_value[0]['product_uom_qty'] = 2
+        self.assertNotEqual(after['fingerprint'], prepare()['fingerprint'])
+        client.get_order_lines.return_value[0]['product_uom_qty'] = 1
+        order['partner_shipping_id'] = [22, 'New recipient']
+        self.assertNotEqual(after['fingerprint'], prepare()['fingerprint'])
+
     def test_toggle_off_does_not_release_pending_reviews(self):
         self.hold();self.settings['shopify_title_approval_enabled']='false'
         self.hold()
