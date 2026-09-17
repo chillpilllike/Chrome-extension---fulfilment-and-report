@@ -434,3 +434,13 @@ class NotificationTests(WorkflowTests):
   self.svc.current=Mock(side_effect=RuntimeError('offline'))
   self.svc.review_pending()
   self.assertEqual('waiting_link',self.c.execute('SELECT status FROM relay_payments').fetchone()[0])
+
+ def test_odoo_snapshot_rejection_is_held_and_revalidated(self):
+  from xmlrpc.client import Fault
+  self.svc.current=Mock(side_effect=Fault(1,'Odoo rejected changed order'))
+  self.svc.review_pending()
+  row=self.c.execute('SELECT status,last_error FROM relay_payments').fetchone()
+  self.assertEqual('review',row['status']);self.assertNotIn('Fault',row['last_error'])
+  self.svc.current=lambda row:dict(SNAP)
+  self.svc.review_pending()
+  self.assertEqual('waiting_link',self.c.execute('SELECT status FROM relay_payments').fetchone()[0])

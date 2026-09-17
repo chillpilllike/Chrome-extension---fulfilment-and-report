@@ -12,6 +12,7 @@ import os
 import secrets
 import threading
 import time
+from xmlrpc.client import Fault
 from datetime import datetime, timezone
 from html import escape
 from urllib.parse import urlsplit, urljoin
@@ -125,9 +126,10 @@ class RelayPayments:
                 fresh=self.current(row)
                 if fresh.get('state')!='pending' or fresh.get('initiated_at') or fresh.get('payment_link'):
                     raise ValueError('Order is no longer awaiting a payment link')
-            except ValueError as exc:
+            except (ValueError,Fault) as exc:
+                reason="Odoo rejected the current payment snapshot; awaiting revalidation" if isinstance(exc,Fault) else str(exc)
                 with self.db() as c:
-                    c.execute("UPDATE relay_payments SET status='review',last_error=?,updated_at=? WHERE id=? AND payment_link IS NULL",('Pending request review: '+str(exc),now(),row['id']))
+                    c.execute("UPDATE relay_payments SET status='review',last_error=?,updated_at=? WHERE id=? AND payment_link IS NULL",('Pending request review: '+reason,now(),row['id']))
             except Exception:
                 continue  # A transport outage is not evidence that an order is inactive.
             else:
