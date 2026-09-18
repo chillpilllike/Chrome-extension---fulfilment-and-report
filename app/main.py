@@ -1130,6 +1130,12 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS airwallex_default_connection (
+                id INTEGER PRIMARY KEY,
+                configuration TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS airwallex_event_deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id INTEGER NOT NULL REFERENCES airwallex_webhook_events(id) ON DELETE CASCADE,
@@ -26327,6 +26333,7 @@ def startup() -> None:
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
                 threading.Thread(target=airwallex_retry_loop, name="airwallex-webhook-retry", daemon=True).start()
+                threading.Thread(target=airwallex_provision_loop, name="airwallex-auto-setup", daemon=True).start()
                 if should_reindex_typesense:
                     threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
                 threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
@@ -44008,6 +44015,67 @@ _AIRWALLEX_CONFIG_LOCK = threading.Lock()
 _AIRWALLEX_PROCESS_LOCK = threading.Lock()
 
 
+def airwallex_default_connection() -> dict[str, Any]:
+    # Private server-side credential storage; never returned by a settings/list API.
+    with db() as conn:
+        row = conn.execute('SELECT configuration FROM airwallex_default_connection WHERE id=1').fetchone()
+    return json.loads(row['configuration']) if row else {}
+
+
+@app.post('/api/airwallex/default-connection/{store_id}')
+def api_airwallex_set_default_connection(store_id: int, request: Request) -> dict[str, Any]:
+    if not request_has_admin_access(request):
+        raise HTTPException(403, 'Administrator access required')
+    store = get_store(store_id)
+    fields = ['airwallex_client_id', 'airwallex_api_key', 'airwallex_api_version',
+              'airwallex_account_id', 'airwallex_webhook_secret', 'airwallex_webhook_id',
+              'airwallex_pay_account_name', 'airwallex_pay_account_number', 'state']
+    providers = OdooClient(store).search_read('payment.provider',
+        [('code', '=', 'airwallex_transfer'), ('state', '=', 'enabled')], fields)
+    if len(providers) != 1:
+        raise HTTPException(400, 'Choose a store with exactly one enabled Airwallex provider')
+    provider = providers[0]
+    defaults = {key.removeprefix('airwallex_'): value for key, value in provider.items() if key != 'id'}
+    defaults['secret'] = defaults.pop('webhook_secret', '')
+    defaults['account_id'] = defaults.get('account_id') or ''
+    if not all(defaults.get(key) for key in ('client_id', 'api_key', 'secret', 'pay_account_name', 'pay_account_number')):
+        raise HTTPException(400, 'The source connection is incomplete')
+    # Do not replace an established default with a different financial account.
+    current = airwallex_default_connection()
+    if current and (current.get('client_id'), current.get('account_id') or '') != (defaults['client_id'], defaults.get('account_id') or ''):
+        raise HTTPException(409, 'A different default account is already configured')
+    with db() as conn:
+        conn.execute('''INSERT INTO airwallex_default_connection (id, configuration, updated_at)
+                        VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE
+                        SET configuration=excluded.configuration, updated_at=excluded.updated_at''',
+                     (airwallex_json_text(defaults), utc_now()))
+    return {'configured': True, 'source_store_id': store_id}
+
+
+def airwallex_provision_registered_stores() -> None:
+    defaults = airwallex_default_connection()
+    if not defaults:
+        return
+    # Never send the API key or webhook signing secret to an installation.
+    public = {key: defaults.get(key) or '' for key in (
+        'client_id', 'account_id', 'api_version', 'webhook_id', 'state',
+        'pay_account_name', 'pay_account_number')}
+    for row in list_stores():
+        if not int(row.get('active', 1)):
+            continue
+        try:
+            client = OdooClient(get_store(int(row['id'])))
+            results = client.execute('payment.provider', 'airwallex_hub_provision', [public])
+            for result in results or []:
+                if result.get('needs_accounts'):
+                    # A separate RPC commits the token before the account import calls us back.
+                    client.execute('payment.provider', 'action_airwallex_import_global_accounts',
+                                   [[result['provider_id']]])
+        except Exception as exc:
+            # Never log RPC payloads or credentials. Old/uninstalled addons retry after upgrade.
+            print(f"Airwallex setup pending for store {row['id']}: {type(exc).__name__}", flush=True)
+
+
 def airwallex_provider_configurations(force: bool = False) -> list[dict[str, Any]]:
     """Read webhook secrets from connected Odoo stores without persisting them in this app."""
     global _AIRWALLEX_CONFIG_CACHE
@@ -44018,6 +44086,9 @@ def airwallex_provider_configurations(force: bool = False) -> list[dict[str, Any
             return [dict(row) for row in cached]
 
     configurations: list[dict[str, Any]] = []
+    defaults = airwallex_default_connection()
+    if defaults:
+        configurations.append({**defaults, 'store_id': 0})
     seen: set[tuple[str, str, str]] = set()
     for store_row in list_stores():
         if not int(store_row.get("active", 1)):
@@ -44040,6 +44111,14 @@ def airwallex_provider_configurations(force: bool = False) -> list[dict[str, Any
             credentials_by_id = {row['id']: row for row in credentials}
             for provider in providers or []:
                 credential = credentials_by_id.get(provider.get('provider_id') or provider.get('id'), {})
+                hub_token = provider.get('hub_token')
+                if hub_token:
+                    # Resolve only the explicit shared account, never an arbitrary provider.
+                    if (defaults and credential.get('airwallex_client_id') == defaults.get('client_id')
+                            and (provider.get('account_id') or '') == (defaults.get('account_id') or '')
+                            and provider.get('state') == defaults.get('state')):
+                        configurations.append({**defaults, 'store_id': store.id, 'hub_token': hub_token})
+                    continue
                 secret = str(provider.get("webhook_secret") or provider.get("airwallex_webhook_secret") or "").strip()
                 if not secret:
                     continue
@@ -44224,6 +44303,16 @@ def process_airwallex_event(event_db_id: int, force: bool = False) -> dict[str, 
         return {"ok": matched, "status": status, "event_id": event_db_id, "attempted": attempted, "errors": errors}
 
 
+def airwallex_provision_loop() -> None:
+    time.sleep(45)
+    while True:
+        try:
+            airwallex_provision_registered_stores()
+        except Exception as exc:
+            print(f'Airwallex automatic setup retry: {type(exc).__name__}', flush=True)
+        time.sleep(300)
+
+
 def airwallex_retry_loop() -> None:
     time.sleep(30)
     while True:
@@ -44256,13 +44345,13 @@ async def api_airwallex_operation(request: Request) -> dict[str, Any]:
         raise HTTPException(400, 'Invalid operation')
     def matching_configurations(force=False):
         return [c for c in airwallex_provider_configurations(force=force)
-                if c.get('client_id') == operation.get('client_id')
+                if c.get('store_id') and c.get('client_id') == operation.get('client_id')
                 and c.get('account_id', '') == operation.get('account_id', '')
                 and (c['state'] == 'test') == bool(operation.get('sandbox'))
                 and verify_airwallex_webhook_signature(
                     timestamp=request.headers.get('x-timestamp', ''),
                     signature=request.headers.get('x-hub-signature', ''),
-                    raw_body=b'airwallex-operation:' + raw, secrets=[c['secret']])]
+                    raw_body=b'airwallex-operation:' + raw, secrets=[c.get('hub_token') or c['secret']])]
     configs = matching_configurations() or matching_configurations(force=True)
     if not configs:
         raise HTTPException(403, 'Connected Airwallex provider authentication failed')
@@ -44292,6 +44381,9 @@ async def api_airwallex_operation(request: Request) -> dict[str, Any]:
     with db() as conn:
         conn.execute("UPDATE airwallex_api_operations SET outcome='success', result_status=? WHERE id=?",
                      (str(result.get('status') or '') if isinstance(result, dict) else '', row['id']))
+    if config.get('hub_token') and isinstance(result, dict) and 'secret' in result:
+        # Managed installations do not need the real webhook signing secret.
+        result = {**result, 'secret': ''}
     return result
 
 
