@@ -3,6 +3,7 @@ import hmac
 import json
 import re
 import unittest
+import xmlrpc.client
 
 from app.services.airwallex_hub import (
     extract_order_reference,
@@ -10,10 +11,19 @@ from app.services.airwallex_hub import (
     order_prefix,
     verify_webhook_signature,
     webhook_event_details,
+    json_text,
 )
 
 
 class AirwallexHubTests(unittest.TestCase):
+    def test_json_rpc_transport_preserves_large_timestamps(self):
+        payload = {'data': {'created_at': 1789749635251, 'settled_at': 1789749638247}}
+        with self.assertRaises(OverflowError):
+            xmlrpc.client.dumps((payload,))
+        encoded = xmlrpc.client.dumps((json_text(payload),))
+        args, _ = xmlrpc.client.loads(encoded)
+        self.assertEqual(json.loads(args[0]), payload)
+
     def test_extracts_supported_store_references_from_customer_text(self):
         for value, expected in {
             "Binder NC20229": "NC20229",

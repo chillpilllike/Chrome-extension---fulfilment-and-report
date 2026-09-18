@@ -42678,7 +42678,7 @@ def process_airwallex_event(event_db_id: int, force: bool = False) -> dict[str, 
                     )
             try:
                 response = OdooClient(get_store(store_id)).execute(
-                    "payment.provider", "airwallex_hub_process_event", [payload]
+                    "payment.provider", "airwallex_hub_process_event", [airwallex_json_text(payload)]
                 )
                 response = response if isinstance(response, dict) else {"status": "error", "note": str(response)}
                 response_routed = bool(response.get("routed") or response.get("matched"))
