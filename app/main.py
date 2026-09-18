@@ -137,6 +137,7 @@ from app.services.airwallex_hub import (
     verify_webhook_signature as verify_airwallex_webhook_signature,
     webhook_event_details as airwallex_webhook_event_details,
 )
+from app.services.airwallex_api import execute_operation as execute_airwallex_operation, validate_operation as validate_airwallex_operation
 
 
 AMAZON_ORDER_RE = re.compile(r"\b(?:AMAZON|Amazon)\s+order\s*:\s*([A-Z0-9-]+)", re.IGNORECASE)
@@ -827,7 +828,7 @@ def request_requires_public_access(request: Request) -> bool:
         return False
     if request.method == 'POST' and re.fullmatch(r'/api/public/support-post-order/\d+/\d+/\d+/(status|resend)', path):
         return False  # Native tool authenticates its scoped key and verified conversation.
-    if request.method == "POST" and path == "/api/airwallex/webhook":
+    if request.method == "POST" and path in {"/api/airwallex/webhook", "/api/airwallex/operation"}:
         return False
     # The Odoo bridge authenticates its own shared key and website host in
     # both handlers. It must not require a customer's public-access session.
@@ -1029,7 +1030,7 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
     allow_public_frontend = request.method in {"GET", "HEAD"} and path in PUBLIC_FRONTEND_PATHS
     allow_public_api = (request.method in {"GET", "HEAD"} and path in PUBLIC_API_PATHS) or (request.method == "POST" and path in PUBLIC_POST_API_PATHS)
-    allow_airwallex_webhook = request.method == "POST" and path == "/api/airwallex/webhook"
+    allow_airwallex_webhook = request.method == "POST" and path in {"/api/airwallex/webhook", "/api/airwallex/operation"}
     allow_public_dispatch_post = request.method == "POST" and path.startswith(PUBLIC_DISPATCH_POST_PREFIXES)
     allow_public_dispatch_get = request.method in {"GET", "HEAD"} and path.startswith(PUBLIC_DISPATCH_GET_PREFIXES)
     allow_public_image_get = request.method in {"GET", "HEAD"} and (
@@ -1117,6 +1118,16 @@ def init_db() -> None:
                 last_received_at TEXT NOT NULL,
                 processed_at TEXT,
                 last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS airwallex_api_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_id INTEGER NOT NULL REFERENCES stores(id),
+                endpoint TEXT NOT NULL,
+                method TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                result_status TEXT,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS airwallex_event_deliveries (
@@ -44022,7 +44033,13 @@ def airwallex_provider_configurations(force: bool = False) -> list[dict[str, Any
                     [("code", "=", "airwallex_transfer"), ("state", "in", ["enabled", "test"])],
                     ["airwallex_webhook_secret", "airwallex_webhook_id", "airwallex_account_id", "state"],
                 )
+            credentials = odoo.search_read(
+                "payment.provider", [("code", "=", "airwallex_transfer")],
+                ["airwallex_client_id", "airwallex_api_key", "airwallex_api_version"],
+            )
+            credentials_by_id = {row['id']: row for row in credentials}
             for provider in providers or []:
+                credential = credentials_by_id.get(provider.get('provider_id') or provider.get('id'), {})
                 secret = str(provider.get("webhook_secret") or provider.get("airwallex_webhook_secret") or "").strip()
                 if not secret:
                     continue
@@ -44040,6 +44057,9 @@ def airwallex_provider_configurations(force: bool = False) -> list[dict[str, Any
                     "webhook_id": identity[0],
                     "account_id": identity[1],
                     "state": str(provider.get("state") or "enabled"),
+                    "client_id": credential.get('airwallex_client_id') or '',
+                    "api_key": credential.get('airwallex_api_key') or '',
+                    "api_version": credential.get('airwallex_api_version') or '',
                 })
         except Exception:
             continue
@@ -44221,6 +44241,62 @@ def airwallex_retry_loop() -> None:
         except Exception as exc:
             print(f"Airwallex webhook retry scheduler failed: {exc}", flush=True)
         time.sleep(60)
+
+
+@app.post("/api/airwallex/operation")
+async def api_airwallex_operation(request: Request) -> dict[str, Any]:
+    raw = await request.body()
+    if len(raw) > 16384:
+        raise HTTPException(413, 'Operation too large')
+    try:
+        operation = json.loads(raw)
+        if not isinstance(operation, dict):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise HTTPException(400, 'Invalid operation')
+    def matching_configurations(force=False):
+        return [c for c in airwallex_provider_configurations(force=force)
+                if c.get('client_id') == operation.get('client_id')
+                and c.get('account_id', '') == operation.get('account_id', '')
+                and (c['state'] == 'test') == bool(operation.get('sandbox'))
+                and verify_airwallex_webhook_signature(
+                    timestamp=request.headers.get('x-timestamp', ''),
+                    signature=request.headers.get('x-hub-signature', ''),
+                    raw_body=b'airwallex-operation:' + raw, secrets=[c['secret']])]
+    configs = matching_configurations() or matching_configurations(force=True)
+    if not configs:
+        raise HTTPException(403, 'Connected Airwallex provider authentication failed')
+    config = configs[0]
+    try:
+        validate_airwallex_operation(operation, config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    # Insert before the network request: failures and interrupted calls remain visible.
+    with db() as conn:
+        row = conn.execute(
+            '''INSERT INTO airwallex_api_operations (store_id, endpoint, method, outcome, created_at)
+               VALUES (?, ?, ?, 'started', ?) RETURNING id''',
+            (config['store_id'], operation['endpoint'], operation.get('method', 'GET'), utc_now()),
+        ).fetchone()
+    try:
+        from starlette.concurrency import run_in_threadpool
+        result = await run_in_threadpool(execute_airwallex_operation, operation, config)
+    except Exception:
+        with db() as conn:
+            conn.execute("UPDATE airwallex_api_operations SET outcome='error' WHERE id=?", (row['id'],))
+        raise HTTPException(502, 'Airwallex operation failed; retry through the fulfilment app')
+    with db() as conn:
+        conn.execute("UPDATE airwallex_api_operations SET outcome='success', result_status=? WHERE id=?",
+                     (str(result.get('status') or '') if isinstance(result, dict) else '', row['id']))
+    return result
+
+
+@app.get("/api/airwallex/operations")
+def api_airwallex_operations() -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute('''SELECT a.*, s.name AS store_name FROM airwallex_api_operations a
+                              JOIN stores s ON s.id=a.store_id ORDER BY a.id DESC LIMIT 100''').fetchall()
+    return {'rows': rows_to_dicts(rows)}
 
 
 @app.post("/api/airwallex/webhook")

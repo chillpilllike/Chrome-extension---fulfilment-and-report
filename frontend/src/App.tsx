@@ -8391,6 +8391,7 @@ function PackagePickupPage({
 }
 
 function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => void }) {
+  const [operations, setOperations] = useState<{id: number; created_at: string; store_name: string; method: string; endpoint: string; outcome: string; result_status: string}[]>([])
   const [rows, setRows] = useState<AirwallexEvent[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
@@ -8409,6 +8410,8 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
       const result = await api<{ rows: AirwallexEvent[]; total: number }>(`/api/airwallex/events?${params}`)
       setRows(result.rows || [])
       setTotal(Number(result.total || 0))
+      const activity = await api<{rows: typeof operations}>("/api/airwallex/operations")
+      setOperations(activity.rows || [])
     } catch (error) {
       onResult({ ok: false, title: "Airwallex Activity Failed", message: String(error) })
     } finally {
@@ -8482,6 +8485,13 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
           </Table>
         </CardContent>
         <CardFooter><PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="events" /></CardFooter>
+      </Card>
+      <Card>
+        <CardHeader><CardTitle>Airwallex API activity</CardTitle><CardDescription>Latest 100 settlement checks, account reads and webhook configuration requests made through the fulfilment app.</CardDescription></CardHeader>
+        <CardContent><Table>
+          <TableHeader><TableRow><TableHead>Time</TableHead><TableHead>Provider connection</TableHead><TableHead>Operation</TableHead><TableHead>Result</TableHead></TableRow></TableHeader>
+          <TableBody>{operations.map((row) => <TableRow key={row.id}><TableCell>{formatDateTime(row.created_at)}</TableCell><TableCell>{row.store_name}</TableCell><TableCell className="break-all">{row.method} {row.endpoint}</TableCell><TableCell>{row.outcome} {row.result_status}</TableCell></TableRow>)}{!operations.length && <TableRow><TableCell colSpan={4}>No API operations recorded yet.</TableCell></TableRow>}</TableBody>
+        </Table></CardContent>
       </Card>
       <Dialog open={Boolean(selected)} onOpenChange={(open) => !open && setSelected(null)}>
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-4xl">
