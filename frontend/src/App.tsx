@@ -100,6 +100,7 @@ const KNOWN_APP_PAGES = new Set([
   "shopify-tracking",
   "inventory",
   "cancelled-orders",
+  "airwallex-activity",
   "settings",
 ])
 const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "dispatch-sorting", "package-tracker", "package-pickups", "amazon-otp", "epost"])
@@ -155,6 +156,42 @@ type Store = {
   odoo_user: string
   odoo_password: string
   website_id?: number | string | null
+  airwallex_order_prefixes?: string
+}
+
+type AirwallexEvent = {
+  id: number
+  event_id: string
+  event_name: string
+  deposit_id: string
+  reference: string
+  order_reference: string
+  order_prefix: string
+  amount?: number
+  currency: string
+  deposit_status: string
+  processing_status: string
+  received_count: number
+  received_at: string
+  processed_at?: string
+  last_error?: string
+  delivery_count: number
+  matched_delivery_count: number
+}
+
+type AirwallexDelivery = {
+  id: number
+  store_name: string
+  odoo_url: string
+  airwallex_order_prefixes: string
+  attempt: number
+  delivery_status: string
+  odoo_event_status: string
+  order_reference: string
+  transaction_reference: string
+  response_payload?: string
+  error?: string
+  updated_at: string
 }
 
 type Address = {
@@ -1563,6 +1600,7 @@ const defaultUiCopy: UiCopy = {
   costly: { title: "Cost Review", description: "Approve or replace items with unfavorable cost." },
   "profit-loss": { title: "Profit / Loss", description: "Review fulfilment profitability and shipping costs." },
   accounting: { title: "Accounting", description: "Manage invoices, credit notes, and supporting documents." },
+  "airwallex-activity": { title: "Airwallex Activity", description: "Audit incoming Airwallex events and delivery to every connected Odoo store." },
   downloads: { title: "Downloads", description: "Export filtered data and download generated files." },
   "shopify-fulfilment": { title: "Shopify Fulfilment", description: "Queue Amazon-ordered Odoo sales into DTC or DTB Shopify fulfilment." },
   "shopify-tracking": { title: "Shopify Tracking to Odoo", description: "Sync Shopify tracking codes back to matching Odoo deliveries." },
@@ -2556,6 +2594,7 @@ const emptyStore: Omit<Store, "id"> = {
   odoo_user: "",
   odoo_password: "",
   website_id: null,
+  airwallex_order_prefixes: "",
 }
 
 const emptyAddress: Omit<Address, "id"> = {
@@ -5243,6 +5282,7 @@ function App() {
       label: "Finance",
       icon: Database,
       items: [
+        ["airwallex-activity", "Airwallex Activity", Database],
         ["profit-loss", "Profit / Loss", Database],
         ["accounting", "Accounting", Database],
         ["downloads", "Downloads", Download],
@@ -6366,6 +6406,9 @@ function App() {
             onChanged={refresh}
             onResult={setModal}
           />
+        )}
+        {page === "airwallex-activity" && (
+          <AirwallexActivityPage onResult={setModal} />
         )}
         {page === "after-order-care" && (
           <><RelayPayments stores={stores} storeId={storeId} api={api} /><AfterOrderCarePage storeId={storeId} onResult={setModal} initialQuery={afterOrderInitialQuery} /></>
@@ -8347,6 +8390,119 @@ function PackagePickupPage({
   )
 }
 
+function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => void }) {
+  const [rows, setRows] = useState<AirwallexEvent[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [query, setQuery] = useState("")
+  const [status, setStatus] = useState("")
+  const [loading, setLoading] = useState(true)
+  const [selected, setSelected] = useState<{ event: AirwallexEvent; deliveries: AirwallexDelivery[] } | null>(null)
+  const perPage = 50
+
+  async function refresh(nextPage = page) {
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({ page: String(nextPage), per_page: String(perPage) })
+      if (query.trim()) params.set("q", query.trim())
+      if (status) params.set("status", status)
+      const result = await api<{ rows: AirwallexEvent[]; total: number }>(`/api/airwallex/events?${params}`)
+      setRows(result.rows || [])
+      setTotal(Number(result.total || 0))
+    } catch (error) {
+      onResult({ ok: false, title: "Airwallex Activity Failed", message: String(error) })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void refresh(page) }, [page, status])
+
+  async function openEvent(row: AirwallexEvent) {
+    try {
+      const result = await api<{ event: AirwallexEvent; deliveries: AirwallexDelivery[] }>(`/api/airwallex/events/${row.id}`)
+      setSelected(result)
+    } catch (error) {
+      onResult({ ok: false, title: "Airwallex Event Failed", message: String(error) })
+    }
+  }
+
+  async function retry(row: AirwallexEvent) {
+    try {
+      const result = await api<{ ok: boolean; status: string; attempted: number }>(`/api/airwallex/events/${row.id}/retry`, { method: "POST" })
+      onResult({ ok: result.ok, title: "Airwallex Retry", message: `Status: ${result.status}. ${result.attempted || 0} store connection(s) checked.` })
+      await refresh(page)
+      if (selected?.event.id === row.id) await openEvent(row)
+    } catch (error) {
+      onResult({ ok: false, title: "Airwallex Retry Failed", message: String(error) })
+    }
+  }
+
+  return (
+    <div className="grid gap-4">
+      <Card>
+        <CardHeader>
+          <CardTitle>Central Airwallex Webhook</CardTitle>
+          <CardDescription>Every connected Odoo website receives verified deposit events through one universal webhook.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 md:grid-cols-[1fr_220px_auto]">
+          <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); setPage(1); void refresh(1) }}>
+            <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Order, deposit, reference or event ID" />
+            <Button type="submit" variant="outline"><Search className="size-4" />Search</Button>
+          </form>
+          <select className="form-select" value={status} onChange={(event) => { setStatus(event.target.value); setPage(1) }}>
+            <option value="">All statuses</option>
+            <option value="received">Received</option>
+            <option value="matched">Matched</option>
+            <option value="review">Needs review</option>
+            <option value="error">Error</option>
+          </select>
+          <Button variant="outline" onClick={() => void refresh(page)} disabled={loading}><RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} />Refresh</Button>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader><TableRow><TableHead>Received</TableHead><TableHead>Order</TableHead><TableHead>Reference</TableHead><TableHead>Amount</TableHead><TableHead>Airwallex</TableHead><TableHead>App</TableHead><TableHead>Odoo deliveries</TableHead><TableHead /></TableRow></TableHeader>
+            <TableBody>
+              {rows.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="whitespace-nowrap text-xs">{formatDateTime(row.received_at)}</TableCell>
+                  <TableCell><strong>{row.order_reference || "Not detected"}</strong><div className="text-xs text-muted-foreground">{row.order_prefix || "No prefix"}</div></TableCell>
+                  <TableCell className="max-w-64"><div className="truncate">{row.reference || "No reference"}</div><div className="text-xs text-muted-foreground">{row.deposit_id}</div></TableCell>
+                  <TableCell className="whitespace-nowrap">{row.amount ?? "—"} {row.currency}</TableCell>
+                  <TableCell><Badge variant="outline">{row.deposit_status || row.event_name}</Badge></TableCell>
+                  <TableCell><Badge variant={row.processing_status === "matched" ? "default" : "outline"}>{row.processing_status}</Badge>{row.received_count > 1 ? <div className="text-xs text-muted-foreground">Received {row.received_count}×</div> : null}</TableCell>
+                  <TableCell>{row.matched_delivery_count ? `${row.matched_delivery_count} matched` : `${row.delivery_count || 0} checked`}</TableCell>
+                  <TableCell className="whitespace-nowrap"><Button size="sm" variant="outline" onClick={() => void openEvent(row)}>View</Button> <Button size="sm" variant="outline" onClick={() => void retry(row)}>Retry</Button></TableCell>
+                </TableRow>
+              ))}
+              {!rows.length && <TableRow><TableCell colSpan={8} className="py-10 text-center text-muted-foreground">{loading ? "Loading Airwallex activity…" : "No Airwallex events found."}</TableCell></TableRow>}
+            </TableBody>
+          </Table>
+        </CardContent>
+        <CardFooter><PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="events" /></CardFooter>
+      </Card>
+      <Dialog open={Boolean(selected)} onOpenChange={(open) => !open && setSelected(null)}>
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-4xl">
+          <DialogHeader><DialogTitle>Airwallex event {selected?.event.event_id}</DialogTitle><DialogDescription>{selected?.event.order_reference || selected?.event.reference || selected?.event.deposit_id}</DialogDescription></DialogHeader>
+          {selected ? <div className="grid gap-4">
+            <div className="grid gap-2 rounded border p-3 text-sm md:grid-cols-2">
+              <div><span className="text-muted-foreground">Deposit</span><div className="font-mono">{selected.event.deposit_id}</div></div>
+              <div><span className="text-muted-foreground">Amount</span><div>{selected.event.amount} {selected.event.currency}</div></div>
+              <div><span className="text-muted-foreground">Reference</span><div>{selected.event.reference || "—"}</div></div>
+              <div><span className="text-muted-foreground">Status</span><div>{selected.event.deposit_status} → {selected.event.processing_status}</div></div>
+              {selected.event.last_error ? <div className="md:col-span-2 text-destructive">{selected.event.last_error}</div> : null}
+            </div>
+            <div><h3 className="mb-2 font-semibold">Odoo delivery activity</h3><div className="grid gap-2">{selected.deliveries.map((delivery) => <div key={delivery.id} className="rounded border p-3 text-sm"><div className="flex flex-wrap items-center justify-between gap-2"><strong>{delivery.store_name}</strong><Badge variant="outline">{delivery.delivery_status}</Badge></div><div className="mt-1 text-muted-foreground">Prefixes {delivery.airwallex_order_prefixes || "auto-detect"} · Attempt {delivery.attempt} · Odoo {delivery.odoo_event_status || "no response"}</div>{delivery.order_reference ? <div>Order: {delivery.order_reference}</div> : null}{delivery.error ? <div className="mt-1 text-destructive">{delivery.error}</div> : null}</div>)}{!selected.deliveries.length ? <div className="text-muted-foreground">No Odoo delivery has been attempted yet.</div> : null}</div></div>
+          </div> : null}
+          <DialogFooter><Button variant="outline" onClick={() => setSelected(null)}>Close</Button>{selected ? <Button onClick={() => void retry(selected.event)}>Retry Delivery</Button> : null}</DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
+
 function StoresPage({ stores, onChanged, onResult }: { stores: Store[]; onChanged: () => Promise<void>; onResult: (modal: ModalState) => void }) {
   const [editing, setEditing] = useState<Store | null>(null)
   const [creating, setCreating] = useState(false)
@@ -8357,6 +8513,7 @@ function StoresPage({ stores, onChanged, onResult }: { stores: Store[]; onChange
     `User: ${store.odoo_user || ""}`,
     `Password/API key: ${store.odoo_password || ""}`,
     `Website ID: ${store.website_id || ""}`,
+    `Airwallex order prefixes: ${store.airwallex_order_prefixes || ""}`,
   ].join("\n")).join("\n\n")
   async function copyStoreSettings() {
     const copied = await copyPlainText(storeSettingsText)
@@ -8390,10 +8547,10 @@ function StoresPage({ stores, onChanged, onResult }: { stores: Store[]; onChange
       </Card>
       <SettingsTable<Store>
         title="Odoo Stores"
-        description="Add, edit, test, or remove Odoo websites."
+        description="Add, edit, test, or remove Odoo websites and map their Airwallex order prefixes."
         rows={stores}
-        columns={["Name", "URL", "Database", "User", "Website ID"]}
-        renderRow={(store) => [store.name, store.odoo_url, store.odoo_db, store.odoo_user, store.website_id || ""]}
+        columns={["Name", "URL", "Database", "User", "Website ID", "Airwallex Prefixes"]}
+        renderRow={(store) => [store.name, store.odoo_url, store.odoo_db, store.odoo_user, store.website_id || "", store.airwallex_order_prefixes || "Auto-detect"]}
         onAdd={() => setCreating(true)}
         onEdit={setEditing}
         onDelete={async (store) => {
@@ -15161,6 +15318,8 @@ function StoreDialog({ open, value, id, onClose, onSaved, onResult }: { open: bo
           <TextField label="User" value={form.odoo_user} onChange={(odoo_user) => setForm({ ...form, odoo_user })} />
           <TextField label="Password" type="password" value={form.odoo_password} onChange={(odoo_password) => setForm({ ...form, odoo_password })} />
           <TextField label="Website ID" value={String(form.website_id || "")} onChange={(website_id) => setForm({ ...form, website_id })} />
+          <TextField label="Airwallex Order Prefixes" value={form.airwallex_order_prefixes || ""} onChange={(airwallex_order_prefixes) => setForm({ ...form, airwallex_order_prefixes })} />
+          <p className="text-xs text-muted-foreground md:col-span-2">Comma-separated prefixes, for example NC, SG, WK, ES, GK or NH. Unknown prefixes are safely checked against every connected store.</p>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>

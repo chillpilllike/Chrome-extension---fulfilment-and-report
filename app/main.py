@@ -47,7 +47,7 @@ from xml.sax.saxutils import escape as xml_escape
 from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -130,6 +130,13 @@ from app.services.after_order import (
 )
 from app.services.email_log import retry_block_reason, STATUS_LABELS as EMAIL_STATUS_LABELS
 from app.services.asin import decode_asin_reference, encode_asin, extract_asin_from_notes, normalize_asin, strip_html
+from app.services.airwallex_hub import (
+    HANDLED_EVENTS as AIRWALLEX_HANDLED_EVENTS,
+    json_text as airwallex_json_text,
+    normalize_prefixes as normalize_airwallex_prefixes,
+    verify_webhook_signature as verify_airwallex_webhook_signature,
+    webhook_event_details as airwallex_webhook_event_details,
+)
 
 
 AMAZON_ORDER_RE = re.compile(r"\b(?:AMAZON|Amazon)\s+order\s*:\s*([A-Z0-9-]+)", re.IGNORECASE)
@@ -675,6 +682,7 @@ FRONTEND_SHELL_PATHS = {
     "/inventory",
     "/cancelled-orders",
     "/chrome-queue",
+    "/airwallex-activity",
     "/settings",
 }
 
@@ -819,6 +827,8 @@ def request_requires_public_access(request: Request) -> bool:
         return False
     if request.method == 'POST' and re.fullmatch(r'/api/public/support-post-order/\d+/\d+/\d+/(status|resend)', path):
         return False  # Native tool authenticates its scoped key and verified conversation.
+    if request.method == "POST" and path == "/api/airwallex/webhook":
+        return False
     # The Odoo bridge authenticates its own shared key and website host in
     # both handlers. It must not require a customer's public-access session.
     if request.method in {"GET", "POST"} and re.fullmatch(
@@ -1019,13 +1029,14 @@ async def admin_access_middleware(request: Request, call_next: Any) -> Response:
     allow_frontend_shell = request.method in {"GET", "HEAD"} and path in FRONTEND_SHELL_PATHS
     allow_public_frontend = request.method in {"GET", "HEAD"} and path in PUBLIC_FRONTEND_PATHS
     allow_public_api = (request.method in {"GET", "HEAD"} and path in PUBLIC_API_PATHS) or (request.method == "POST" and path in PUBLIC_POST_API_PATHS)
+    allow_airwallex_webhook = request.method == "POST" and path == "/api/airwallex/webhook"
     allow_public_dispatch_post = request.method == "POST" and path.startswith(PUBLIC_DISPATCH_POST_PREFIXES)
     allow_public_dispatch_get = request.method in {"GET", "HEAD"} and path.startswith(PUBLIC_DISPATCH_GET_PREFIXES)
     allow_public_image_get = request.method in {"GET", "HEAD"} and (
         path.startswith("/api/inventory/asin-image/")
         or bool(re.fullmatch(r"/api/inventory/\d+/image", path))
     )
-    if token and not allow_public_frontend and not allow_public_api and not allow_public_dispatch_post and not allow_public_dispatch_get and not allow_public_image_get and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
+    if token and not allow_public_frontend and not allow_public_api and not allow_airwallex_webhook and not allow_public_dispatch_post and not allow_public_dispatch_get and not allow_public_image_get and not allow_frontend_shell and not path.startswith(PUBLIC_PATH_PREFIXES):
         supplied = supplied_admin_access_token(request)
         if supplied != token and supplied != MASTER_ADMIN_ACCESS_TOKEN:
             return Response("Admin token required.", status_code=401)
@@ -1082,9 +1093,46 @@ def init_db() -> None:
                 odoo_user TEXT NOT NULL,
                 odoo_password TEXT NOT NULL,
                 website_id INTEGER,
+                airwallex_order_prefixes TEXT NOT NULL DEFAULT '',
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS airwallex_webhook_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                event_name TEXT NOT NULL,
+                deposit_id TEXT,
+                reference TEXT,
+                order_reference TEXT,
+                order_prefix TEXT,
+                amount REAL,
+                currency TEXT,
+                deposit_status TEXT,
+                processing_status TEXT NOT NULL DEFAULT 'received',
+                raw_payload TEXT NOT NULL,
+                received_count INTEGER NOT NULL DEFAULT 1,
+                received_at TEXT NOT NULL,
+                last_received_at TEXT NOT NULL,
+                processed_at TEXT,
+                last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS airwallex_event_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES airwallex_webhook_events(id) ON DELETE CASCADE,
+                store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                delivery_status TEXT NOT NULL DEFAULT 'queued',
+                odoo_event_status TEXT,
+                order_reference TEXT,
+                transaction_reference TEXT,
+                response_payload TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(event_id, store_id)
             );
 
             CREATE TABLE IF NOT EXISTS order_lines (
@@ -2281,6 +2329,39 @@ def init_db() -> None:
         conn.executescript(reminder_schema)
         from app.services.care_sms import SCHEMA as sms_schema
         conn.executescript(sms_schema)
+        store_columns = {r["name"] for r in conn.execute("PRAGMA table_info(stores)").fetchall()}
+        if "airwallex_order_prefixes" not in store_columns:
+            conn.execute("ALTER TABLE stores ADD COLUMN airwallex_order_prefixes TEXT NOT NULL DEFAULT ''")
+        default_airwallex_prefixes = {
+            "nutricity usa": "NC",
+            "secretgreen": "SG",
+            "wildkart": "WK",
+            "espot": "ES",
+            "gofinchkart": "GK",
+            "nutrihub": "NH",
+            "boostgo": "BG",
+            "suppcity": "SC",
+            "vitagen": "VG",
+            "vitashop": "VS",
+            "nutrimax australia": "NM",
+        }
+        for store_name, prefixes in default_airwallex_prefixes.items():
+            conn.execute(
+                """
+                UPDATE stores SET airwallex_order_prefixes=?
+                WHERE LOWER(name)=? AND COALESCE(airwallex_order_prefixes, '')=''
+                """,
+                (prefixes, store_name),
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_airwallex_events_received ON airwallex_webhook_events(received_at DESC, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_airwallex_events_order ON airwallex_webhook_events(order_reference, processing_status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_airwallex_deliveries_event ON airwallex_event_deliveries(event_id, delivery_status)"
+        )
         ensure_performance_indexes(conn)
         conn.execute("UPDATE order_lines SET pulled_at = COALESCE(NULLIF(pulled_at, ''), created_at)")
         conn.execute(
@@ -2490,6 +2571,7 @@ class Store:
     odoo_user: str
     odoo_password: str
     website_id: Optional[int] = None
+    airwallex_order_prefixes: str = ""
 
 
 _ODOO_FIELDS_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -3594,6 +3676,7 @@ def get_store(store_id: int) -> Store:
         odoo_user=row["odoo_user"],
         odoo_password=row["odoo_password"],
         website_id=row["website_id"],
+        airwallex_order_prefixes=row.get("airwallex_order_prefixes") or "",
     )
     with _STORE_CACHE_LOCK:
         _STORE_CACHE[int(store_id)] = (store, now + 60)
@@ -26232,6 +26315,7 @@ def startup() -> None:
                 threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
+                threading.Thread(target=airwallex_retry_loop, name="airwallex-webhook-retry", daemon=True).start()
                 if should_reindex_typesense:
                     threading.Thread(target=start_typesense_reindex_job, daemon=True).start()
                 threading.Thread(target=enqueue_dispatch_summary_warm, daemon=True).start()
@@ -43843,8 +43927,8 @@ def api_create_store(payload: StorePayload) -> dict[str, Any]:
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO stores (name, odoo_url, odoo_db, odoo_user, odoo_password, website_id, active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            INSERT INTO stores (name, odoo_url, odoo_db, odoo_user, odoo_password, website_id, airwallex_order_prefixes, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
             (
                 payload.name,
@@ -43853,6 +43937,7 @@ def api_create_store(payload: StorePayload) -> dict[str, Any]:
                 payload.odoo_user,
                 payload.odoo_password,
                 parse_optional_int(payload.website_id),
+                ",".join(normalize_airwallex_prefixes(payload.airwallex_order_prefixes)),
                 utc_now(),
                 utc_now(),
             ),
@@ -43868,7 +43953,7 @@ def api_update_store(store_id: int, payload: StorePayload) -> dict[str, Any]:
         conn.execute(
             """
             UPDATE stores
-            SET name=?, odoo_url=?, odoo_db=?, odoo_user=?, odoo_password=?, website_id=?, updated_at=?
+            SET name=?, odoo_url=?, odoo_db=?, odoo_user=?, odoo_password=?, website_id=?, airwallex_order_prefixes=?, updated_at=?
             WHERE id=?
             """,
             (
@@ -43878,6 +43963,7 @@ def api_update_store(store_id: int, payload: StorePayload) -> dict[str, Any]:
                 payload.odoo_user,
                 payload.odoo_password,
                 parse_optional_int(payload.website_id),
+                ",".join(normalize_airwallex_prefixes(payload.airwallex_order_prefixes)),
                 utc_now(),
                 store_id,
             ),
@@ -43904,6 +43990,344 @@ def api_test_store(store_id: int) -> dict[str, Any]:
         return {"ok": True, "message": f"OK: {store.name} connected to Odoo {version.get('server_version', 'unknown')}."}
     except Exception as exc:
         return {"ok": False, "message": f"Failed: {exc}"}
+
+
+_AIRWALLEX_CONFIG_CACHE: tuple[list[dict[str, Any]], float] = ([], 0.0)
+_AIRWALLEX_CONFIG_LOCK = threading.Lock()
+_AIRWALLEX_PROCESS_LOCK = threading.Lock()
+
+
+def airwallex_provider_configurations(force: bool = False) -> list[dict[str, Any]]:
+    """Read webhook secrets from connected Odoo stores without persisting them in this app."""
+    global _AIRWALLEX_CONFIG_CACHE
+    now = time.monotonic()
+    with _AIRWALLEX_CONFIG_LOCK:
+        cached, expires_at = _AIRWALLEX_CONFIG_CACHE
+        if cached and expires_at > now and not force:
+            return [dict(row) for row in cached]
+
+    configurations: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for store_row in list_stores():
+        if not int(store_row.get("active", 1)):
+            continue
+        try:
+            store = get_store(int(store_row["id"]))
+            odoo = OdooClient(store)
+            try:
+                providers = odoo.execute("payment.provider", "airwallex_hub_configuration", [])
+            except Exception:
+                providers = odoo.search_read(
+                    "payment.provider",
+                    [("code", "=", "airwallex_transfer"), ("state", "in", ["enabled", "test"])],
+                    ["airwallex_webhook_secret", "airwallex_webhook_id", "airwallex_account_id", "state"],
+                )
+            for provider in providers or []:
+                secret = str(provider.get("webhook_secret") or provider.get("airwallex_webhook_secret") or "").strip()
+                if not secret:
+                    continue
+                identity = (
+                    str(provider.get("webhook_id") or provider.get("airwallex_webhook_id") or ""),
+                    str(provider.get("account_id") or provider.get("airwallex_account_id") or ""),
+                    secret,
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                configurations.append({
+                    "store_id": store.id,
+                    "secret": secret,
+                    "webhook_id": identity[0],
+                    "account_id": identity[1],
+                    "state": str(provider.get("state") or "enabled"),
+                })
+        except Exception:
+            continue
+    if not configurations:
+        with _AIRWALLEX_CONFIG_LOCK:
+            cached, expires_at = _AIRWALLEX_CONFIG_CACHE
+            if cached and expires_at > now - 3600:
+                return [dict(row) for row in cached]
+        return []
+    with _AIRWALLEX_CONFIG_LOCK:
+        _AIRWALLEX_CONFIG_CACHE = ([dict(row) for row in configurations], now + 300)
+    return configurations
+
+
+def airwallex_candidate_stores(prefix: str) -> list[dict[str, Any]]:
+    active_stores = [row for row in list_stores() if int(row.get("active", 1))]
+    exact = [
+        row for row in active_stores
+        if prefix and prefix in normalize_airwallex_prefixes(row.get("airwallex_order_prefixes"))
+    ]
+    if exact:
+        return exact
+    # Unknown/future prefixes are safely probed against every connected database. The addon
+    # still requires one exact transaction, amount, and currency match before confirmation.
+    return active_stores
+
+
+def upsert_airwallex_event(payload: dict[str, Any]) -> int:
+    details = airwallex_webhook_event_details(payload)
+    if not details["event_id"]:
+        raise ValueError("Airwallex event id is missing")
+    now = utc_now()
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM airwallex_webhook_events WHERE event_id=?", (details["event_id"],)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE airwallex_webhook_events
+                SET received_count=received_count+1, last_received_at=?, raw_payload=?
+                WHERE id=?
+                """,
+                (now, airwallex_json_text(payload), existing["id"]),
+            )
+            return int(existing["id"])
+        conn.execute(
+            """
+            INSERT INTO airwallex_webhook_events
+            (event_id, event_name, deposit_id, reference, order_reference, order_prefix,
+             amount, currency, deposit_status, processing_status, raw_payload,
+             received_at, last_received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?)
+            """,
+            (
+                details["event_id"], details["event_name"], details["deposit_id"],
+                details["reference"], details["order_reference"], details["order_prefix"],
+                details["amount"], details["currency"], details["status"],
+                airwallex_json_text(payload), now, now,
+            ),
+        )
+        created = conn.execute(
+            "SELECT id FROM airwallex_webhook_events WHERE event_id=?", (details["event_id"],)
+        ).fetchone()
+    return int(created["id"])
+
+
+def process_airwallex_event(event_db_id: int, force: bool = False) -> dict[str, Any]:
+    with _AIRWALLEX_PROCESS_LOCK:
+        with db() as conn:
+            event = conn.execute(
+                "SELECT * FROM airwallex_webhook_events WHERE id=?", (event_db_id,)
+            ).fetchone()
+        if not event:
+            raise ValueError("Airwallex event was not found")
+        if event["processing_status"] == "matched" and not force:
+            return {"ok": True, "status": "matched", "event_id": event_db_id}
+        payload = json.loads(event["raw_payload"])
+        candidates = airwallex_candidate_stores(str(event.get("order_prefix") or ""))
+        matched = False
+        routed = False
+        routed_status = ""
+        attempted = 0
+        errors: list[str] = []
+        for store_row in candidates:
+            store_id = int(store_row["id"])
+            attempted += 1
+            now = utc_now()
+            with db() as conn:
+                previous = conn.execute(
+                    "SELECT * FROM airwallex_event_deliveries WHERE event_id=? AND store_id=?",
+                    (event_db_id, store_id),
+                ).fetchone()
+                if previous:
+                    conn.execute(
+                        """
+                        UPDATE airwallex_event_deliveries
+                        SET attempt=attempt+1, delivery_status='sending', updated_at=?, error=NULL
+                        WHERE id=?
+                        """,
+                        (now, previous["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO airwallex_event_deliveries
+                        (event_id, store_id, attempt, delivery_status, created_at, updated_at)
+                        VALUES (?, ?, 1, 'sending', ?, ?)
+                        """,
+                        (event_db_id, store_id, now, now),
+                    )
+            try:
+                response = OdooClient(get_store(store_id)).execute(
+                    "payment.provider", "airwallex_hub_process_event", [payload]
+                )
+                response = response if isinstance(response, dict) else {"status": "error", "note": str(response)}
+                response_routed = bool(response.get("routed") or response.get("matched"))
+                delivery_status = "matched" if response.get("matched") else ("routed" if response_routed else "delivered")
+                with db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE airwallex_event_deliveries
+                        SET delivery_status=?, odoo_event_status=?, order_reference=?,
+                            transaction_reference=?, response_payload=?, updated_at=?, error=NULL
+                        WHERE event_id=? AND store_id=?
+                        """,
+                        (
+                            delivery_status, str(response.get("status") or ""),
+                            str(response.get("order_reference") or ""),
+                            str(response.get("transaction_reference") or ""),
+                            airwallex_json_text(response), utc_now(), event_db_id, store_id,
+                        ),
+                    )
+                if response.get("matched"):
+                    matched = True
+                if response_routed:
+                    routed = True
+                    routed_status = str(response.get("status") or "review")
+                    break
+            except Exception as exc:
+                error = f"{store_row.get('name') or store_id}: {exc}"
+                errors.append(error)
+                with db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE airwallex_event_deliveries
+                        SET delivery_status='error', error=?, updated_at=?
+                        WHERE event_id=? AND store_id=?
+                        """,
+                        (str(exc)[:2000], utc_now(), event_db_id, store_id),
+                    )
+        status = "matched" if matched else (routed_status or ("error" if errors else "review"))
+        with db() as conn:
+            conn.execute(
+                """
+                UPDATE airwallex_webhook_events
+                SET processing_status=?, processed_at=?, last_error=?
+                WHERE id=?
+                """,
+                (status, utc_now(), "\n".join(errors)[:4000] if errors else None, event_db_id),
+            )
+        return {"ok": matched, "status": status, "event_id": event_db_id, "attempted": attempted, "errors": errors}
+
+
+def airwallex_retry_loop() -> None:
+    time.sleep(30)
+    while True:
+        try:
+            with db() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id FROM airwallex_webhook_events
+                    WHERE processing_status IN ('received', 'error')
+                    ORDER BY received_at ASC LIMIT 50
+                    """
+                ).fetchall()
+            for row in rows:
+                process_airwallex_event(int(row["id"]), force=True)
+        except Exception as exc:
+            print(f"Airwallex webhook retry scheduler failed: {exc}", flush=True)
+        time.sleep(60)
+
+
+@app.post("/api/airwallex/webhook")
+async def api_airwallex_webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    raw_body = await request.body()
+    timestamp = request.headers.get("x-timestamp", "")
+    signature = request.headers.get("x-signature", "")
+    configurations = airwallex_provider_configurations()
+    secrets = [row["secret"] for row in configurations]
+    if not secrets:
+        raise HTTPException(503, "No connected Odoo Airwallex webhook secret is available")
+    signature_valid = verify_airwallex_webhook_signature(
+        timestamp=timestamp, signature=signature, raw_body=raw_body, secrets=secrets
+    )
+    if not signature_valid:
+        configurations = airwallex_provider_configurations(force=True)
+        signature_valid = verify_airwallex_webhook_signature(
+            timestamp=timestamp,
+            signature=signature,
+            raw_body=raw_body,
+            secrets=[row["secret"] for row in configurations],
+        )
+    if not signature_valid:
+        raise HTTPException(403, "Invalid Airwallex webhook signature")
+    try:
+        payload = json.loads(raw_body)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "Invalid Airwallex webhook JSON") from exc
+    details = airwallex_webhook_event_details(payload)
+    if details["event_name"] not in AIRWALLEX_HANDLED_EVENTS:
+        return {"received": True, "ignored": True}
+    event_db_id = upsert_airwallex_event(payload)
+    background_tasks.add_task(process_airwallex_event, event_db_id)
+    return {"received": True, "event_id": details["event_id"]}
+
+
+@app.get("/api/airwallex/events")
+def api_airwallex_events(
+    page: int = 1,
+    per_page: int = 50,
+    q: str = "",
+    status: str = "",
+) -> dict[str, Any]:
+    page, per_page, offset = pagination_bounds(page, per_page)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if q.strip():
+        like = f"%{q.strip()}%"
+        clauses.append("(event_id ILIKE ? OR deposit_id ILIKE ? OR reference ILIKE ? OR order_reference ILIKE ?)")
+        params.extend([like, like, like, like])
+    if status.strip():
+        clauses.append("processing_status=?")
+        params.append(status.strip())
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with db() as conn:
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM airwallex_webhook_events{where}", params
+        ).fetchone()
+        rows = conn.execute(
+            f"""
+            SELECT e.*,
+                   (SELECT COUNT(*) FROM airwallex_event_deliveries d WHERE d.event_id=e.id) AS delivery_count,
+                   (SELECT COUNT(*) FROM airwallex_event_deliveries d WHERE d.event_id=e.id AND d.delivery_status='matched') AS matched_delivery_count
+            FROM airwallex_webhook_events e{where}
+            ORDER BY e.received_at DESC, e.id DESC LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+    return {"rows": rows_to_dicts(rows), "total": int(total_row["count"]), "page": page, "per_page": per_page}
+
+
+@app.get("/api/airwallex/events/{event_db_id}")
+def api_airwallex_event(event_db_id: int) -> dict[str, Any]:
+    with db() as conn:
+        event = conn.execute("SELECT * FROM airwallex_webhook_events WHERE id=?", (event_db_id,)).fetchone()
+        deliveries = conn.execute(
+            """
+            SELECT d.*, s.name AS store_name, s.odoo_url, s.airwallex_order_prefixes
+            FROM airwallex_event_deliveries d JOIN stores s ON s.id=d.store_id
+            WHERE d.event_id=? ORDER BY d.id
+            """,
+            (event_db_id,),
+        ).fetchall()
+    if not event:
+        raise HTTPException(404, "Airwallex event not found")
+    return {"event": row_to_dict(event), "deliveries": rows_to_dicts(deliveries)}
+
+
+@app.post("/api/airwallex/events/{event_db_id}/retry")
+def api_retry_airwallex_event(event_db_id: int) -> dict[str, Any]:
+    return process_airwallex_event(event_db_id, force=True)
+
+
+@app.get("/api/airwallex/status")
+def api_airwallex_status() -> dict[str, Any]:
+    configurations = airwallex_provider_configurations()
+    stores = [{
+        "id": row["id"],
+        "name": row["name"],
+        "odoo_url": row["odoo_url"],
+        "prefixes": normalize_airwallex_prefixes(row.get("airwallex_order_prefixes")),
+    } for row in list_stores() if int(row.get("active", 1))]
+    return {
+        "webhook_url": "https://fulfilment.gofinch.com/api/airwallex/webhook",
+        "verified_provider_configurations": len(configurations),
+        "stores": stores,
+    }
 
 
 @app.get("/api/addresses")

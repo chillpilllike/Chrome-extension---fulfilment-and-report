@@ -12,6 +12,7 @@ class StorePayload(BaseModel):
     odoo_user: str
     odoo_password: str
     website_id: Optional[Union[str, int]] = None
+    airwallex_order_prefixes: str = ""
 
 
 class AddressPayload(BaseModel):
