@@ -787,7 +787,7 @@ function PackagePickupScanHistoryGroupCard({ group }: { group: PackagePickupScan
   const readiness = entry.current_order_readiness
   const activeEvents = group.events.filter((item) => !item.undone_at)
   const matched = activeEvents.some((item) => Boolean(item.matched))
-  const duplicate = activeEvents.length > 0 && activeEvents.every((item) => Boolean(item.duplicate))
+  const duplicate = !matched && activeEvents.length > 0 && activeEvents.every((item) => Boolean(item.duplicate))
   const undone = activeEvents.length === 0
   return (
     <div className={cn("pickup-history-group", duplicate ? "is-duplicate" : matched ? "is-success" : "is-error", undone && "is-undone")}>
@@ -803,17 +803,17 @@ function PackagePickupScanHistoryGroupCard({ group }: { group: PackagePickupScan
         <div className="pickup-history-scans">
           {group.events.map((scan) => {
             const scanMatched = Boolean(scan.matched)
-            const scanDuplicate = Boolean(scan.duplicate)
+            const scanDuplicate = Boolean(scan.duplicate) && !scanMatched
             const scanUndone = Boolean(scan.undone_at)
             return (
               <div key={scan.id} className={cn(scanDuplicate ? "is-duplicate" : scanMatched ? "is-success" : "is-error", scanUndone && "is-undone")}>
                 <div>
                   <b>{scan.shipment_id || scan.scan_code || "Not matched"}</b>
-                  <span className={scanUndone ? "is-undone" : scanDuplicate ? "is-duplicate" : scanMatched ? "is-success" : "is-error"}>{scanUndone ? "undone later" : scan.result_status.replaceAll("_", " ")}</span>
+                  <span className={scanUndone ? "is-undone" : scanDuplicate ? "is-duplicate" : scanMatched ? "is-success" : "is-error"}>{scanUndone ? "undone later" : scanMatched && Boolean(scan.duplicate) && scan.result_status !== "matched_after_tracking_refresh" ? "Already received" : scan.result_status.replaceAll("_", " ")}</span>
                 </div>
                 <small><b>Scanned</b> {formatDateTime(scan.scanned_at, { timeZone: "America/New_York", showTimeZone: true })}</small>
                 {scanUndone ? <small className="is-undone"><b>Undone</b> {formatDateTime(scan.undone_at!, { timeZone: "America/New_York", showTimeZone: true })}{scan.undone_reason ? ` · ${scan.undone_reason.replaceAll("_", " ")}` : ""}</small> : null}
-                <small>{scan.message}</small>
+                <small>{scanMatched && Boolean(scan.duplicate) ? "Package received. Original scan time retained; this repeat scan did not increase the received count." : scan.message}</small>
                 {scan.reconciled_at ? <details><summary>Original scan result</summary><small>{scan.original_message}</small><small>Automatically matched {formatDateTime(scan.reconciled_at, { timeZone: "America/New_York", showTimeZone: true })}</small></details> : null}
               </div>
             )
@@ -8010,7 +8010,7 @@ function PackagePickupPage({
             <div><span>Actual scans</span><strong>{todayPickupScanSummary.total_scans}</strong></div>
             <div className="is-success"><span>Matched</span><strong>{todayPickupScanSummary.matched}</strong></div>
             <div className="is-error"><span>Unsuccessful</span><strong>{todayPickupScanSummary.unsuccessful}</strong></div>
-            <div className="is-duplicate"><span>Duplicates</span><strong>{todayPickupScanSummary.duplicates}</strong></div>
+            <div><span>Repeat scans</span><strong>{todayPickupScanSummary.duplicates}</strong></div>
             <div><span>Undone later</span><strong>{todayPickupScanSummary.undone}</strong></div>
             <div className="is-ready"><span>Ready Odoo orders</span><strong>{todayPickupScanSummary.ready_to_ship_orders}</strong></div>
           </div>
