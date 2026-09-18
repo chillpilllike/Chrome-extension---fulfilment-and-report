@@ -42786,9 +42786,13 @@ async def api_airwallex_operation(request: Request) -> dict[str, Any]:
     try:
         from starlette.concurrency import run_in_threadpool
         result = await run_in_threadpool(execute_airwallex_operation, operation, config)
-    except Exception:
+    except Exception as exc:
+        upstream_response = getattr(exc, 'response', None)
+        failure_status = (f'HTTP {upstream_response.status_code}' if upstream_response is not None
+                          else type(exc).__name__)
         with db() as conn:
-            conn.execute("UPDATE airwallex_api_operations SET outcome='error' WHERE id=?", (row['id'],))
+            conn.execute("UPDATE airwallex_api_operations SET outcome='error', result_status=? WHERE id=?",
+                         (failure_status, row['id']))
         raise HTTPException(502, 'Airwallex operation failed; retry through the fulfilment app')
     with db() as conn:
         conn.execute("UPDATE airwallex_api_operations SET outcome='success', result_status=? WHERE id=?",

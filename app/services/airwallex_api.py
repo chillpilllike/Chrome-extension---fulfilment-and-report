@@ -45,7 +45,8 @@ def execute_operation(operation, config):
         with _lock:
             token, expiry = _tokens.get(identity, ('', 0))
             if not token or expiry <= time.monotonic():
-                headers = {'x-client-id': config['client_id'], 'x-api-key': config['api_key']}
+                headers = {'x-client-id': config['client_id'], 'x-api-key': config['api_key'],
+                           'Content-Type': 'application/json'}
                 if config.get('account_id'):
                     headers['x-login-as'] = config['account_id']
                 response = requests.post(base + '/api/v1/authentication/login', headers=headers, timeout=20)
