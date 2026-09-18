@@ -44056,15 +44056,19 @@ def airwallex_provision_registered_stores() -> None:
     defaults = airwallex_default_connection()
     if not defaults:
         return
-    # Never send the API key or webhook signing secret to an installation.
+    # Explicitly authorized default credentials go only to registered stores
+    # over their authenticated Odoo connection, never in addon source or logs.
     public = {key: defaults.get(key) or '' for key in (
-        'client_id', 'account_id', 'api_version', 'webhook_id', 'state',
+        'client_id', 'account_id', 'api_version', 'webhook_id', 'state', 'api_key', 'secret',
         'pay_account_name', 'pay_account_number')}
     for row in list_stores():
         if not int(row.get('active', 1)):
             continue
         try:
-            client = OdooClient(get_store(int(row['id'])))
+            store = get_store(int(row['id']))
+            if not store.odoo_url.lower().startswith('https://'):
+                continue
+            client = OdooClient(store)
             results = client.execute('payment.provider', 'airwallex_hub_provision', [public])
             for result in results or []:
                 if result.get('needs_accounts'):
