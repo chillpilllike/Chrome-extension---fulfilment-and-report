@@ -676,6 +676,7 @@ type PackagePickupRow = {
   odoo_order_name: string
   amazon_order_id: string
   amazon_order_url: string
+  tracking_issue?: string
   tracking_id?: string
   tracking_url?: string
   carrier?: string
@@ -8303,7 +8304,7 @@ function PackagePickupPage({
                               {row.tracking_url ? <a href={row.tracking_url} target="_blank" rel="noreferrer"><strong>{row.tracking_id}</strong></a> : <strong>{row.tracking_id}</strong>}
                               <small>{[row.carrier, row.delivery_status].filter(Boolean).join(" · ")}</small>
                             </span>
-                          ) : row.source_type !== "non_amazon" ? <span className="text-muted-foreground">Not captured</span> : "—"}
+                          ) : row.source_type !== "non_amazon" ? <span className="pickup-tracking-cell"><strong>{row.tracking_issue || "Tracking ID not captured"}</strong>{row.tracking_url ? <a href={row.tracking_url} target="_blank" rel="noreferrer">Open shipment to capture tracking</a> : <small>Capture this purchase with the tracking extension.</small>}</span> : "—"}
                         </span>
                         <span data-label="Delivery / scan times" className="pickup-package-times">
                           <small>{row.source_type === "third_party" ? "Receipt / expected" : "Amazon delivered"} · {row.delivered_display || formatDateTime(row.delivered_at, { timeZone: "America/New_York", showTimeZone: true }) || "Not recorded"}</small>

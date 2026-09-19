@@ -1,7 +1,7 @@
 from __future__ import annotations
 import sys
 from app.services import amazon_purchase_allocations as purchase_allocations
-from app.services import pickup_evidence_repair
+from app.services import pickup_evidence_repair, dispatch_purchase_identity
 
 from app.services.inventory_history import install_inventory_history, inventory_filter
 from app.services.inventory_labels import annotate_inventory_labels
@@ -6173,14 +6173,9 @@ def refresh_dispatch_packages_from_tracking(conn: Any, amazon_order_id: str, ama
     package_payloads = canonical_tracking_packages(packages)
     if not order_id or not package_payloads:
         return 0, []
-    conn.execute(
-        f"""
-        DELETE FROM amazon_dispatch_packages
-        WHERE amazon_order_id=?
-          AND NOT COALESCE({DISPATCH_PHYSICAL_PRIMARY_SCAN_SQL}, FALSE)
-        """,
-        (order_id,),
-    )
+    # A shipment without a carrier barcode is still a real expected package.
+    # Delete only aliases proven to be superseded by an exact physical shipment.
+    collapse_dispatch_shipment_alias_rows(conn, order_id)
     existing_rows = rows_to_dicts(conn.execute(
         "SELECT * FROM amazon_dispatch_packages WHERE amazon_order_id=? ORDER BY package_index, id",
         (order_id,),
@@ -6700,7 +6695,8 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
         if not matching_rows:
             continue
         primary = matching_rows[0]
-        code, display_code = codes[0]
+        code, display_code = dispatch_purchase_identity.protected_code(
+            sys.modules[__name__], conn, *codes[0], dict(primary))
         recipient_ref = dispatch_recipient_ref_from_rows(rows_to_dicts(matching_rows))
         destination_code, destination_name, _label = destination_country_from_row(row_to_dict(primary))
         dispatch_row = {
@@ -6744,6 +6740,10 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
                 priority=excluded.priority,
                 fulfilment_type=excluded.fulfilment_type,
                 updated_at=excluded.updated_at
+            WHERE amazon_dispatch_packages.store_id=excluded.store_id
+              AND COALESCE(amazon_dispatch_packages.odoo_order_id,0)=COALESCE(excluded.odoo_order_id,0)
+              AND COALESCE(amazon_dispatch_packages.odoo_order_name,'')=COALESCE(excluded.odoo_order_name,'')
+              AND COALESCE(amazon_dispatch_packages.amazon_order_id,'')=COALESCE(excluded.amazon_order_id,'')
             """,
             (
                 code,
@@ -6890,6 +6890,7 @@ def save_unassigned_tracking_packages(conn: Any, order_id: str, packages: list[d
 def bulk_upsert_dispatch_package_rows(conn: Any, values: list[tuple[Any, ...]]) -> None:
     if not values:
         return
+    values = dispatch_purchase_identity.protect_values(sys.modules[__name__], conn, values)
     deduped: dict[str, tuple[Any, ...]] = {}
     for value in values:
         scan_code = clean_text(value[0] if value else "")
@@ -6942,6 +6943,10 @@ def bulk_upsert_dispatch_package_rows(conn: Any, values: list[tuple[Any, ...]]) 
             priority=excluded.priority,
             fulfilment_type=excluded.fulfilment_type,
             updated_at=excluded.updated_at
+            WHERE amazon_dispatch_packages.store_id=excluded.store_id
+              AND COALESCE(amazon_dispatch_packages.odoo_order_id,0)=COALESCE(excluded.odoo_order_id,0)
+              AND COALESCE(amazon_dispatch_packages.odoo_order_name,'')=COALESCE(excluded.odoo_order_name,'')
+              AND COALESCE(amazon_dispatch_packages.amazon_order_id,'')=COALESCE(excluded.amazon_order_id,'')
         """,
         values,
         template="(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -35217,6 +35222,7 @@ def package_pickup_data(
             "amazon_order_id": clean_text(package.get("amazon_order_id")),
             "amazon_order_url": clean_text(package.get("amazon_order_url") or primary_line.get("amazon_order_url")),
             "tracking_id": tracking_id,
+            "tracking_issue": "Tracking association needs review" if package.get("display_code") == "Tracking association needs review" else "",
             "tracking_url": clean_text(package.get("tracking_url") or matched_tracking_part.get("tracking_url") or matched_tracking_part.get("trackingUrl")),
             "carrier": carrier or ("Third party" if third_party_package(package) else "Amazon"),
             "delivery_status": "Received" if third_party_package(package) and received else clean_text(package.get("package_status") or package.get("promise") or matched_tracking_part.get("status")) or "Delivered",
