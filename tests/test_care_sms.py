@@ -10,6 +10,17 @@ from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, d
 
 
 class SMSTests(unittest.TestCase):
+    def test_many_websites_fit_without_relaxing_secret_validation(self):
+        templates = {kind: {'template_id':'a'*24, 'text':'##brand##: Order ##order##. Review your order: ##url##'}
+                     for kind in ('expected_dispatch','warehouse_dispatch_delay','item_unavailable','no_alternatives',
+                                  'package_movement','delivery_confirmation','alternative_payment','refund_request_received','refund_completed')}
+        payload = {'enabled':True,'provider':'msg91','mappings':{
+            f'1:{i}':{'transactional_sms_enabled':False,'msg91':{'sender':'nutricity','templates':templates}}
+            for i in range(1,81)}}
+        self.assertGreater(len(validate_config(payload)),50000)
+        payload['mappings']['1:1']['msg91']['authkey']='not-allowed'
+        with self.assertRaises(ValueError): validate_config(payload)
+
     def setUp(self):
         self.conn = sqlite3.connect(':memory:')
         self.conn.row_factory = sqlite3.Row

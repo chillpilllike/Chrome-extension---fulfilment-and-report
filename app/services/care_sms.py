@@ -96,7 +96,9 @@ def validate_config(payload):
     if type(payload.get('enabled')) is not bool or payload.get('provider') not in PROVIDERS or not isinstance(payload.get('mappings'), dict):
         raise ValueError('Provide enabled, provider and website mappings.')
     raw = json.dumps(payload['mappings'])
-    if len(raw) > 50000 or re.search(r'auth.?key|token|password|secret', raw, re.I):
+    if len(raw.encode('utf-8')) > 500000:
+        raise ValueError('Website SMS mappings exceed the 500 KB configuration limit.')
+    if re.search(r'auth.?key|token|password|secret', raw, re.I):
         raise ValueError('Keep credentials in runtime secrets, not website mappings.')
     for key, site in payload['mappings'].items():
         if not re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*', key) or not isinstance(site, dict):
