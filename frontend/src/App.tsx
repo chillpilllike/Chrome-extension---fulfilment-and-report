@@ -674,6 +674,7 @@ type PackagePickupRow = {
   source_id: number
   store_id: number
   odoo_order_name: string
+  amazon_order_ids?: string[]
   amazon_order_id: string
   amazon_order_url: string
   tracking_issue?: string
@@ -8297,7 +8298,7 @@ function PackagePickupPage({
                     return (
                       <div key={receiveKey} className={`pickup-table-row ${row.shopify_fulfilled ? "is-fulfilled" : ""}`} role="row">
                         <span data-label="Odoo Order">{row.odoo_order_name ? <OdooOrderRef name={row.odoo_order_name} linkClassName="font-semibold" /> : <strong>Not entered</strong>}</span>
-                        <span data-label="Amazon Order">{row.amazon_order_url ? <a href={row.amazon_order_url} target="_blank" rel="noreferrer">{row.amazon_order_id}</a> : "—"}</span>
+                        <span data-label="Amazon Order">{(row.amazon_order_ids?.length || 0) > 1 ? <span className="pickup-tracking-cell">{row.amazon_order_ids!.map((id) => <a key={id} href={`https://www.amazon.com/your-orders/order-details?orderID=${encodeURIComponent(id)}`} target="_blank" rel="noreferrer">{id}</a>)}<small>Shared Amazon package</small></span> : row.amazon_order_url ? <a href={row.amazon_order_url} target="_blank" rel="noreferrer">{row.amazon_order_id}</a> : "—"}</span>
                         <span data-label="Tracking ID">
                           {row.tracking_id ? (
                             <span className="pickup-tracking-cell">

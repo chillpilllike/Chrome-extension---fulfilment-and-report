@@ -6775,6 +6775,7 @@ def sync_dispatch_packages_for_order(conn: Any, amazon_order_id: str) -> int:
             ),
         )
         updated += 1
+    dispatch_purchase_identity.reconcile_shared_packages(sys.modules[__name__], conn, order_id)
     collapse_dispatch_shipment_alias_rows(conn, order_id)
     reconcile_package_pickup_scans(conn)
     return updated
@@ -6952,6 +6953,8 @@ def bulk_upsert_dispatch_package_rows(conn: Any, values: list[tuple[Any, ...]]) 
         template="(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         page_size=1000,
     )
+    for order_id in sorted({value[3] for value in values if value[2] == "Tracking association needs review"}):
+        dispatch_purchase_identity.reconcile_shared_packages(sys.modules[__name__], conn, order_id)
 
 
 def save_otp_tracking_dispatch_packages(
@@ -7853,6 +7856,15 @@ def merge_dispatch_shipment_rows(existing: dict[str, Any], incoming: dict[str, A
         ), "")
         if matching_order_url:
             merged["amazon_order_url"] = matching_order_url
+    if (dispatch_physical_package_key(existing) == dispatch_physical_package_key(incoming)
+            and package_tracking_id_is_physical(existing.get("canonical_scan_code"))
+            and dispatch_purchase_identity.owner(existing)[:2] == dispatch_purchase_identity.owner(incoming)[:2]):
+        for field in ("order_line_ids_json", "asins_json", "products_json"):
+            values = parse_json_list_value(existing.get(field)) + parse_json_list_value(incoming.get(field))
+            merged[field] = json.dumps(list({json.dumps(value, sort_keys=True): value for value in values}.values()))
+        merged["amazon_order_ids"] = sorted(set(
+            existing.get("amazon_order_ids", []) + incoming.get("amazon_order_ids", [])
+            + [clean_text(existing.get("amazon_order_id")), clean_text(incoming.get("amazon_order_id"))]) - {""})
     return merged
 
 
@@ -7867,7 +7879,10 @@ def collapse_dispatch_related_parts(parts: list[dict[str, Any]]) -> list[dict[st
              for part in parts if int(part.get("id") or 0) not in aliases] if aliases else parts
     grouped: dict[str, dict[str, Any]] = {}
     for part in parts:
-        key = dispatch_order_shipment_key(part) or dispatch_physical_package_key(part)
+        physical = clean_text(part.get("canonical_scan_code"))
+        key = (f"physical:{dispatch_purchase_identity.owner(part)[:2]}:{physical}"
+               if package_tracking_id_is_physical(physical)
+               else dispatch_order_shipment_key(part) or dispatch_physical_package_key(part))
         if not key:
             key = f"{clean_text(part.get('recipient_ref')).upper()}|{clean_text(part.get('amazon_order_id')).upper()}|{clean_text(part.get('order_line_ids_json'))}"
         if not key:
@@ -35222,6 +35237,7 @@ def package_pickup_data(
             "amazon_order_id": clean_text(package.get("amazon_order_id")),
             "amazon_order_url": clean_text(package.get("amazon_order_url") or primary_line.get("amazon_order_url")),
             "tracking_id": tracking_id,
+            "amazon_order_ids": package.get("amazon_order_ids") or [clean_text(package.get("amazon_order_id"))],
             "tracking_issue": "Tracking association needs review" if package.get("display_code") == "Tracking association needs review" else "",
             "tracking_url": clean_text(package.get("tracking_url") or matched_tracking_part.get("tracking_url") or matched_tracking_part.get("trackingUrl")),
             "carrier": carrier or ("Third party" if third_party_package(package) else "Amazon"),
