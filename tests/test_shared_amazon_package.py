@@ -16,6 +16,7 @@ class SharedParcelDisplayTests(unittest.TestCase):
                       tracking_url='https://www.amazon.com/progress-tracker/package?orderId=113-0000000-0000002&shipmentId=TWO')
         rows = m.collapse_dispatch_related_parts([first, second])
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], 1)
         self.assertEqual(set(json.loads(rows[0]['order_line_ids_json'])), {10, 11})
         self.assertEqual(len(rows[0]['amazon_order_ids']), 2)
         self.assertEqual(rows[0]['pickup_scanned_at'], first['pickup_scanned_at'])

@@ -5577,6 +5577,13 @@ def merge_tracking_shipment_snapshots(existing: dict[str, Any], incoming: dict[s
     existing_physical = bool(tracking_package_physical_id(existing))
     incoming_physical = bool(tracking_package_physical_id(incoming))
     primary, secondary = (existing, incoming) if existing_physical and not incoming_physical else (incoming, existing)
+    if (existing.get("canonical_scan_code") == incoming.get("canonical_scan_code")
+            and package_tracking_id_is_physical(existing.get("canonical_scan_code"))
+            and dispatch_purchase_identity.owner(existing)[:2] == dispatch_purchase_identity.owner(incoming)[:2]):
+        if existing.get("scan_code") == existing.get("canonical_scan_code"):
+            primary, secondary = existing, incoming
+        elif incoming.get("scan_code") == incoming.get("canonical_scan_code"):
+            primary, secondary = incoming, existing
     merged = dict(secondary)
     for key, value in primary.items():
         if value not in (None, "", [], {}):
@@ -7803,7 +7810,7 @@ def dispatch_order_shipment_key(row: dict[str, Any]) -> str:
 
 def dispatch_part_quality(row: dict[str, Any]) -> tuple[int, int, int, str]:
     physical = 1 if package_tracking_id_is_physical(row.get("canonical_scan_code") or row.get("scan_code")) else 0
-    received = 1 if row.get("received") else 0
+    received = 1 if row.get("received") or row.get("received_at") or row.get("pickup_scanned_at") else 0
     delivery = clean_text(row.get("delivery_label") or row.get("package_status") or row.get("promise")).lower()
     if "delivered" in delivery:
         delivery_rank = 3
