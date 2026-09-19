@@ -2346,6 +2346,8 @@ def init_db() -> None:
         conn.executescript(reminder_schema)
         from app.services.care_sms import SCHEMA as sms_schema
         conn.executescript(sms_schema)
+        from app.services.delivery_followup import SCHEMA as followup_schema
+        conn.executescript(followup_schema)
         store_columns = {r["name"] for r in conn.execute("PRAGMA table_info(stores)").fetchall()}
         if "airwallex_order_prefixes" not in store_columns:
             conn.execute("ALTER TABLE stores ADD COLUMN airwallex_order_prefixes TEXT NOT NULL DEFAULT ''")
@@ -39308,6 +39310,8 @@ def delivery_checkin_case(case: dict[str, Any], *, enforce_delay: bool = False) 
 
 
 def after_order_allowed_actions(case: dict[str, Any]) -> list[str]:
+    if case.get('confirmed_at') and receipt_correction(case):
+        return ['received'] if after_order_tracking_is_current(case) else []
     if case.get("case_type") == "warehouse_dispatch_delay":
         return []
     if case.get("confirmed_at") or case.get("status") == "resolved":
@@ -39615,7 +39619,7 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
                     odoo_order_id=COALESCE(excluded.odoo_order_id, after_order_cases.odoo_order_id),
                     odoo_order_name=COALESCE(NULLIF(excluded.odoo_order_name, ''), after_order_cases.odoo_order_name),
                     case_type=CASE WHEN after_order_cases.confirmed_at IS NULL THEN excluded.case_type ELSE after_order_cases.case_type END,
-                    status=CASE WHEN after_order_cases.confirmed_at IS NOT NULL THEN after_order_cases.status WHEN after_order_cases.current_decision IS NOT NULL THEN 'needs_confirmation' ELSE excluded.status END,
+                    status=CASE WHEN after_order_cases.confirmed_at IS NOT NULL THEN after_order_cases.status WHEN after_order_cases.current_decision='not_received' THEN 'needs_attention' WHEN after_order_cases.current_decision IS NOT NULL THEN 'needs_confirmation' ELSE excluded.status END,
                     severity=excluded.severity,
                     title=excluded.title,
                     affected_items_json=excluded.affected_items_json,
@@ -40113,6 +40117,9 @@ def send_after_order_email(
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
+    from app.services.delivery_followup import KINDS as followup_kinds
+    if template_kind in followup_kinds and not (force_test or after_order_email_test_mode()):
+        delivery_followups.validate(case, template_kind)
     if case.get("case_type") == "relay_payment":
         raise HTTPException(409, "Relay payment emails use their verified payment outbox.")
     unavailable_email = showcase_kind == "item_unavailable" or (not showcase_kind and case.get("case_type") == "item_unavailable" and template_kind != "trustpilot_review")
@@ -40174,6 +40181,9 @@ def send_after_order_email(
             case_id, request, allowed_override=[], test_mode=force_test or after_order_email_test_mode(), view_only=True,
         ).get("url"))
     test_mode = force_test or after_order_email_test_mode()
+    if template_kind == 'delivery_issue_received' or showcase_kind == 'delivery_issue_received':
+        from app.services.care_sms import order_link
+        action_url = order_link(case.get('sender_domain'), case.get('odoo_order_id'))
     if not test_mode and allowed and clean_text(get_service_settings().get("after_order_website_portal_enabled")).lower() not in {"1", "true", "yes", "on"}:
         raise HTTPException(409, "Website portal routing must be enabled before live customer action emails.")
     intended_recipient = clean_text(case.get("customer_email"))
@@ -40221,6 +40231,8 @@ def send_after_order_email(
                 effective_template_kind = ""
             elif showcase_kind == "trustpilot_review":
                 effective_template_kind = "trustpilot_review"
+            elif showcase_kind == 'delivery_issue_received':
+                effective_template_kind = 'delivery_issue_received'
         tracker_query = clean_text(case.get("odoo_order_name")) or clean_text(case.get("tracking_code"))
         if tracker_query:
             email_case["context"]["tracking_url"] = after_order_absolute_url(
@@ -40260,6 +40272,8 @@ def send_after_order_email(
     if case.get("case_type") == "tracking" and not allowed:
         event_revision = hashlib.sha256(json.dumps({key: event_context.get(key) for key in ("latest_status", "latest_location", "last_update_at")}, sort_keys=True).encode()).hexdigest()
     idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{uuid.uuid4().hex if test_mode else event_revision}"
+    if template_kind in followup_kinds and not test_mode:
+        idempotency_key = delivery_followups.key(case, template_kind, 'draft') + ':' + str(case.get('decision_version') or 0)
     if case.get('case_type') == 'new_order_welcome' and not force_test:
         idempotency_key = f'after-order:{case_id}:new_order_welcome:once'
     if case.get('case_type') == 'warehouse_dispatch_delay' and not test_mode:
@@ -40534,7 +40548,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         case = hydrate_after_order_recipient_and_domain(case, strict=True)
         if automatic and case.get('current_decision'):
             raise HTTPException(409, 'Customer already responded; review before resending an old action email.')
-        if case.get("confirmed_at") and original.get("template_kind") != "trustpilot_review":
+        if case.get("confirmed_at") and original.get("template_kind") not in {"trustpilot_review", "delivery_issue_received"}:
             raise HTTPException(409, "The customer request was already confirmed. Its action email cannot be retried.")
         if original.get("request_fingerprint") != request_fingerprint(case) or not after_order_tracking_is_current(case):
             raise HTTPException(409, "The order or tracking changed. Create a current email instead.")
@@ -40554,9 +40568,14 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             if not permitted(locked, test_mode=after_order_email_test_mode()):
                 raise HTTPException(409, 'Automatic email exception is no longer eligible.')
             if not locked.get('test_mode'):
-                if case.get('case_type') != 'new_order_welcome':
+                if locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
+                    delivery_followups.validate(case, locked['template_kind'])
+                elif case.get('case_type') != 'new_order_welcome':
                     raise HTTPException(409, 'Automatic live email is limited to new-order welcome cases.')
-                welcome_emails.validate(case)
+                else:
+                    welcome_emails.validate(case)
+        if not locked.get('test_mode') and locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
+            delivery_followups.reserve(conn, case, locked['template_kind'], 'email', message_id)
         if locked.get('status') not in {'awaiting_approval', 'failed'} or hashlib.sha256(str(locked.get('payload_json') or '').encode()).hexdigest() != approval_digest:
             raise HTTPException(409, 'Email already processed or changed; approval was not applied.')
         if automatic:
@@ -40690,6 +40709,7 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
         ("package_lost", by_type.get("tracking", first_id)),
         ("package_movement", by_type.get("tracking", first_id)),
         ("trustpilot_review", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
+        ("delivery_issue_received", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
         ("alternative_payment", by_type.get("item_unavailable", first_id)),
     ]
     results = []
@@ -40732,7 +40752,7 @@ def create_after_order_action_link(
     require_after_order_case_in_scope(case)
     case = hydrate_after_order_recipient_and_domain(case)
     is_test = after_order_email_test_mode() if test_mode is None else bool(test_mode)
-    if case.get("confirmed_at") and not is_test:
+    if case.get("confirmed_at") and not is_test and not receipt_correction(case):
         raise HTTPException(409, "This decision is already confirmed and its links are expired.")
     allowed = list(allowed_override) if allowed_override is not None else after_order_allowed_actions(case)
     allowed = after_order_filter_removal(case, allowed)
@@ -40913,7 +40933,8 @@ def record_after_order_customer_decision(
     recorded = False
     with db() as conn:
         latest = conn.execute("SELECT * FROM after_order_cases WHERE id=? FOR UPDATE", (case["id"],)).fetchone()
-        if latest and not latest["confirmed_at"]:
+        correcting_receipt = bool(latest and receipt_correction(dict(latest)) and normalized == 'received')
+        if latest and (not latest["confirmed_at"] or correcting_receipt):
             if case.get('case_type') == 'item_unavailable' and conn.execute("SELECT 1 FROM after_order_line_removals WHERE case_id=? AND test_mode=0 AND approved_at IS NOT NULL AND status!='withdrawn'",(case['id'],)).fetchone():
                 raise HTTPException(409,'An affected line was already approved for removal. Contact our team before changing the whole-order request.')
             if case.get('case_type') == 'item_unavailable' and any((offer.get('selection') or {}).get('locked') for offer in alternative_workflow.rows(case['id'],False) if not line_id or int(offer['line_id'])==int(line_id)):
@@ -40930,9 +40951,10 @@ def record_after_order_customer_decision(
             cursor = conn.execute(
                 """UPDATE after_order_cases
                    SET previous_decision=current_decision, current_decision=?, selected_product_id=?, decision_version=decision_version+1,
-                       decision_updated_at=?, status='needs_confirmation', updated_at=?, decision_fingerprint=?
-                   WHERE id=? AND confirmed_at IS NULL""",
-                (normalized, int(selected_product_id or 0) or None, now, now, request_fingerprint(case), case["id"]),
+                       decision_updated_at=?, status='needs_confirmation', updated_at=?, decision_fingerprint=?,
+                       confirmed_at=NULL, decision_locked_at=NULL, confirmed_by=NULL
+                   WHERE id=? AND (confirmed_at IS NULL OR ?)""",
+                (normalized, int(selected_product_id or 0) or None, now, now, request_fingerprint(case), case["id"], correcting_receipt),
             )
             recorded = bool(cursor.rowcount)
             if recorded:
@@ -40941,6 +40963,11 @@ def record_after_order_customer_decision(
                     actor_type="customer", actor_label=actor_label, decision=normalized,
                     details={"previous_decision": previous, "selected_product_id": int(selected_product_id or 0) or None},
                 )
+                if case.get('case_type') == 'delivery_confirmation' and normalized == 'not_received':
+                    delivery_followups.cancel_pending(conn, case)
+                    conn.execute("UPDATE after_order_cases SET status='needs_attention' WHERE id=?", (case['id'],))
+                if correcting_receipt:
+                    conn.execute("UPDATE after_order_execution_jobs SET status='cancelled',updated_at=? WHERE case_id=? AND decision='not_received' AND status='pending'", (now, case['id']))
     refreshed = after_order_case_by_id(int(case["id"])) or case
     message = "Your latest request has been recorded for team confirmation." if recorded else "Our team has already confirmed this request."
     return recorded, refreshed, message
@@ -40986,7 +41013,7 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
             "title": case.get("title"),
             "status": case.get("status"),
             "current_decision": case.get("current_decision"),
-            "confirmed": bool(case.get("confirmed_at")),
+            "confirmed": bool(case.get("confirmed_at") and not receipt_correction(case)),
             "tracking_code": case.get("tracking_code"),
             "context": {
                 "latest_status": context.get("latest_status"),
@@ -41000,7 +41027,7 @@ def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any
         "alternative_search_terms": search_terms,
         "pinned_alternatives": after_order_pinned_alternatives(int(case["id"])),
         "line_alternatives": alternative_workflow.rows(int(case["id"]), bool(link.get("test_mode")) or after_order_email_test_mode()),
-        "locked": bool(case.get("confirmed_at") or link.get("invalidated_at")),
+        "locked": bool((case.get("confirmed_at") and not receipt_correction(case)) or link.get("invalidated_at")),
         "test_mode": bool(link.get("test_mode")) or after_order_email_test_mode(),
     }
 
@@ -41011,7 +41038,7 @@ def api_after_order_bridge_decision(token: str, request: Request, payload: After
     case, link = after_order_action_link(token)
     require_after_order_test_admin(request, link)
     case = require_after_order_website_host(request, case)
-    if case.get("confirmed_at") or link.get("invalidated_at"):
+    if (case.get("confirmed_at") and not (receipt_correction(case) and payload.decision == 'received')) or link.get("invalidated_at"):
         raise HTTPException(410, "This request has already been completed.")
     _, refreshed, message = record_after_order_customer_decision(
         case, link, payload.decision,
@@ -41023,7 +41050,7 @@ def api_after_order_bridge_decision(token: str, request: Request, payload: After
 
 
 def render_after_order_action_page(token: str, case: dict[str, Any], link: dict[str, Any], message: str = "", suggested: str = "") -> HTMLResponse:
-    locked = bool(case.get("confirmed_at") or link.get("invalidated_at"))
+    locked = bool((case.get("confirmed_at") and not receipt_correction(case)) or link.get("invalidated_at"))
     try:
         allowed = json.loads(link.get("allowed_actions_json") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -41070,7 +41097,7 @@ def public_after_order_action_submit(token: str, request: Request, decision: str
     case, link = after_order_action_link(token)
     if (after_order_email_test_mode() or link.get("test_mode")) and not request_has_admin_access(request):
         raise HTTPException(403, "Test actions are available to administrators only.")
-    if case.get("confirmed_at") or link.get("invalidated_at"):
+    if (case.get("confirmed_at") and not (receipt_correction(case) and decision == 'received')) or link.get("invalidated_at"):
         return render_after_order_action_page(token, case, link)
     try:
         _, refreshed, message = record_after_order_customer_decision(case, link, decision)
@@ -41197,7 +41224,7 @@ def execute_after_order_job(job_id: int, request: Request) -> dict[str, Any]:
         elif decision == "offer_alternatives":
             raise ValueError("Alternative selected: verify exact variant, stock, quantity and a customer-accepted price quote before amending the order. No charge or product substitution was performed.")
         elif decision == "received":
-            result = send_after_order_email(case_id, request, template_kind="trustpilot_review")
+            result = {"review_followup_scheduled": True}
         elif decision == "not_received":
             result = {"investigation_opened": True}
         elif decision == "proceed":
@@ -41346,6 +41373,7 @@ def run_welcome_email_checks():
     if parsed.scheme != 'https' or not parsed.hostname:
         return
     request = Request({'type':'http','method':'POST','scheme':'https','server':(parsed.hostname,443),'path':'/','root_path':'','query_string':b'','headers':[(b'host',parsed.hostname.encode())]})
+    delivery_followups.run_checks(request)
     return welcome_emails.run_checks(request)
 
 
@@ -45389,6 +45417,8 @@ from app.services.warehouse_dispatch_delay import Monitor as WarehouseDispatchMo
 warehouse_dispatch_delay = WarehouseDispatchMonitor(globals())
 from app.services.welcome_email import Monitor as WelcomeEmailMonitor
 welcome_emails = WelcomeEmailMonitor(globals())
+from app.services.delivery_followup import Monitor as DeliveryFollowupMonitor, receipt_correction
+delivery_followups = DeliveryFollowupMonitor(globals())
 from app.services.care_sms import SMS as CareSMS
 care_sms = CareSMS(globals())
 app.include_router(care_sms.router())

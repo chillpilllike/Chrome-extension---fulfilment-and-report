@@ -51,7 +51,8 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         "expected_dispatch": ("DISPATCH UPDATE", "A quick update on your order.", "Your expected dispatch date", "Your order has a later expected dispatch date. Please let us know if you’d like to proceed or cancel.", "How would you like to continue?", "If we don’t hear from you, we’ll continue processing your order."),
         "delivery_confirmation": ("DELIVERY CHECK-IN", "Has your order arrived?", "Did your order arrive?", "The carrier has marked your package as delivered. Please take a moment to tell us whether you received it.", "Please confirm your delivery", "If it hasn’t arrived, let us know so our team can look into it."),
         "package_lost": ("WE’RE HERE TO HELP", "Let’s get this sorted.", "Your package needs attention", "Your package hasn’t had confirmed movement for a while. We’re sorry for the uncertainty. You can request a replacement or a refund below.", "What would you prefer?", "Our team will review your request and help with the next steps."),
-        "trustpilot_review": ("THANK YOU", "Your feedback means a lot.", "Thank you for confirming delivery", "We’re glad your order arrived. If you have a moment, we’d love to hear about your experience.", "How was your experience?", "Share an honest review — your feedback helps us improve."),
+        "trustpilot_review": ("YOUR FEEDBACK", "Your feedback means a lot.", "How was your experience?", "If you have a moment, we’d love to hear about your experience with your order.", "Share your experience", "Share an honest review — your feedback helps us improve."),
+        "delivery_issue_received": ("WE’RE HERE TO HELP", "We’re looking into your delivery.", "We received your delivery report", "Thank you for letting us know your order hasn’t arrived. Our team will investigate the delivery and contact you shortly.", "No further action needed", "If your order arrives in the meantime, you can update your answer on your order page."),
         "tracking": ("ON ITS WAY", "A little closer to your door.", "Your package has moved", "There’s a new update on your package. You can find the latest details below.", "Follow your delivery", "See the full tracking history and the latest carrier updates."),
     }
     eyebrow, heading, subject_text, intro, action_heading, note = content.get(kind, content["tracking"])
@@ -198,6 +199,9 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     elif kind == "trustpilot_review":
         buttons.append(button("Share an honest review", review_url))
         plain_actions.append(f"Share an honest review: {safe_url(review_url)}")
+    elif kind == 'delivery_issue_received':
+        buttons.append(button('View your order', action_url))
+        plain_actions.append(f'View your order: {safe_url(action_url)}')
     elif kind == "tracking":
         tracking_url = safe_url(context.get("tracking_url"))
         buttons.append(button("Track all details", tracking_url))

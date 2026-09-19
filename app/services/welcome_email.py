@@ -16,7 +16,7 @@ def permitted(message, *, test_mode):
     if message.get('test_mode'):
         return (str(message.get('recipient') or '').lower() == TEST_RECIPIENT
                 and payload.get('to') == [TEST_RECIPIENT])
-    return not test_mode and message.get('template_kind') == KIND
+    return not test_mode and message.get('template_kind') in {KIND, 'trustpilot_review', 'delivery_issue_received'}
 
 
 def recent_confirmed(order, started_at):

@@ -1,0 +1,132 @@
+{
+  "Boostgo:trustpilot_review": {
+    "template_id": "6aaeefd6b320d4e5c4023f53",
+    "text": "Boostgo: Order ##order##. How was your experience? Share an honest review: ##url## - Boostgo Support",
+    "approval_status": "0"
+  },
+  "Boostgo:delivery_issue_received": {
+    "template_id": "6aaeefd76f29324f500caca2",
+    "text": "Boostgo: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - Boostgo Support",
+    "approval_status": "0"
+  },
+  "Espot:trustpilot_review": {
+    "template_id": "6aaeefd90dc17294aa0e7702",
+    "text": "Espot: Order ##order##. How was your experience? Share an honest review: ##url## - Espot Support",
+    "approval_status": "0"
+  },
+  "Espot:delivery_issue_received": {
+    "template_id": "6aaeefda42e825eda208fff2",
+    "text": "Espot: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - Espot Support",
+    "approval_status": "0"
+  },
+  "FinchKart:trustpilot_review": {
+    "template_id": "6aaeefdb9a7374aae3059e12",
+    "text": "FinchKart: Order ##order##. How was your experience? Share an honest review: ##url## - FinchKart Support",
+    "approval_status": "0"
+  },
+  "FinchKart:delivery_issue_received": {
+    "template_id": "6aaeefddf2f893f081060db2",
+    "text": "FinchKart: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - FinchKart Support",
+    "approval_status": "0"
+  },
+  "GofinchKart:trustpilot_review": {
+    "template_id": "6aaeefdec00e46865b0a1342",
+    "text": "GofinchKart: Order ##order##. How was your experience? Share an honest review: ##url## - GofinchKart Support",
+    "approval_status": "0"
+  },
+  "GofinchKart:delivery_issue_received": {
+    "template_id": "6aaeefdf808297d985070922",
+    "text": "GofinchKart: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - GofinchKart Support",
+    "approval_status": "0"
+  },
+  "NutriMax:trustpilot_review": {
+    "template_id": "6aaeefe107d36e2f8b06d0b2",
+    "text": "NutriMax: Order ##order##. How was your experience? Share an honest review: ##url## - NutriMax Support",
+    "approval_status": "0"
+  },
+  "NutriMax:delivery_issue_received": {
+    "template_id": "6aaeefe2efd07ca1370f8332",
+    "text": "NutriMax: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - NutriMax Support",
+    "approval_status": "0"
+  },
+  "Nutrihub:trustpilot_review": {
+    "template_id": "6aaeefe318d4f3afb003e932",
+    "text": "Nutrihub: Order ##order##. How was your experience? Share an honest review: ##url## - Nutrihub Support",
+    "approval_status": "0"
+  },
+  "Nutrihub:delivery_issue_received": {
+    "template_id": "6aaeefe5a2d95337860923d2",
+    "text": "Nutrihub: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - Nutrihub Support",
+    "approval_status": "0"
+  },
+  "PrimeSupps:trustpilot_review": {
+    "template_id": "6aaeefe61144c1413b01cbc2",
+    "text": "PrimeSupps: Order ##order##. How was your experience? Share an honest review: ##url## - PrimeSupps Support",
+    "approval_status": "0"
+  },
+  "PrimeSupps:delivery_issue_received": {
+    "template_id": "6aaeefe793b07118bb0451e2",
+    "text": "PrimeSupps: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - PrimeSupps Support",
+    "approval_status": "0"
+  },
+  "SecretGreen:trustpilot_review": {
+    "template_id": "6aaeefe823247dc04b0a0492",
+    "text": "SecretGreen: Order ##order##. How was your experience? Share an honest review: ##url## - SecretGreen Support",
+    "approval_status": "0"
+  },
+  "SecretGreen:delivery_issue_received": {
+    "template_id": "6aaeefea43cefb9115094262",
+    "text": "SecretGreen: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - SecretGreen Support",
+    "approval_status": "0"
+  },
+  "Suppcity:trustpilot_review": {
+    "template_id": "6aaeefeb684e66e95f0f2b32",
+    "text": "Suppcity: Order ##order##. How was your experience? Share an honest review: ##url## - Suppcity Support",
+    "approval_status": "0"
+  },
+  "Suppcity:delivery_issue_received": {
+    "template_id": "6aaeefec301f6d3b7f0cb3c2",
+    "text": "Suppcity: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - Suppcity Support",
+    "approval_status": "0"
+  },
+  "VitaShop:trustpilot_review": {
+    "template_id": "6aaeefee2018b265a10e92a2",
+    "text": "VitaShop: Order ##order##. How was your experience? Share an honest review: ##url## - VitaShop Support",
+    "approval_status": "0"
+  },
+  "VitaShop:delivery_issue_received": {
+    "template_id": "6aaeefef75f34d64730fb732",
+    "text": "VitaShop: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - VitaShop Support",
+    "approval_status": "0"
+  },
+  "Vitagen:trustpilot_review": {
+    "template_id": "6aaeeff0490c4153bd0d4792",
+    "text": "Vitagen: Order ##order##. How was your experience? Share an honest review: ##url## - Vitagen Support",
+    "approval_status": "0"
+  },
+  "Vitagen:delivery_issue_received": {
+    "template_id": "6aaeeff1c7c902ff43031362",
+    "text": "Vitagen: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - Vitagen Support",
+    "approval_status": "0"
+  },
+  "Wildkart:trustpilot_review": {
+    "template_id": "6aaeeff342a47db2ad0cc462",
+    "text": "Wildkart: Order ##order##. How was your experience? Share an honest review: ##url## - Wildkart Support",
+    "approval_status": "0"
+  },
+  "Wildkart:delivery_issue_received": {
+    "template_id": "6aaeeff4852c2f90d705ff32",
+    "text": "Wildkart: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - Wildkart Support",
+    "approval_status": "0"
+  },
+  "nutricity:trustpilot_review": {
+    "template_id": "6aaeeff611e2bcd7870e39f2",
+    "text": "Nutricity: Order ##order##. How was your experience? Share an honest review: ##url## - Nutricity Support",
+    "approval_status": "0"
+  },
+  "nutricity:delivery_issue_received": {
+    "template_id": "6aaeeff7ee0f310fef053db4",
+    "text": "Nutricity: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - Nutricity Support",
+    "approval_status": "0"
+  }
+}

@@ -13,7 +13,8 @@ TEST_NUMBER = '+19296526393'
 PROVIDERS = {'odoo', 'msg91', 'twilio'}
 KINDS = {'expected_dispatch', 'item_unavailable', 'no_alternatives', 'delivery_confirmation',
          'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment',
-         'price_difference', 'refund_request_received', 'refund_completed'}
+         'price_difference', 'refund_request_received', 'refund_completed',
+         'trustpilot_review', 'delivery_issue_received'}
 SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
  id INTEGER PRIMARY KEY AUTOINCREMENT, email_id INTEGER NOT NULL UNIQUE REFERENCES after_order_messages(id),
  case_id INTEGER NOT NULL REFERENCES after_order_cases(id), provider TEXT NOT NULL,
@@ -75,6 +76,8 @@ def order_link(domain, order_id):
 
 def render(kind, order, brand, link):
     summaries = {
+        'trustpilot_review':'How was your experience? Share an honest review:',
+        'delivery_issue_received':"Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly.",
         'expected_dispatch':'There is an update to your expected dispatch date.',
         'item_unavailable':'An item in your order needs your choice.',
         'no_alternatives':'An item is unavailable and no alternatives were found. Please choose how to proceed.',
@@ -90,6 +93,19 @@ def render(kind, order, brand, link):
 
 def digest(row):
     return hashlib.sha256(json.dumps({k:row[k] for k in ('provider','recipient','test_mode','body','snapshot_json','attempts')},sort_keys=True).encode()).hexdigest()
+
+
+def verify_followup_template(mapping):
+    """Never send a new follow-up through an unapproved or changed MSG91 template."""
+    response = requests.post('https://control.msg91.com/api/v5/sms/getTemplateVersions',
+        headers={'authkey':os.getenv('MSG91_AUTH_KEY', '')},
+        json={'template_id':mapping.get('template_id')}, timeout=20)
+    response.raise_for_status()
+    active = [x for x in response.json().get('data', []) if str(x.get('active_status')) == '1']
+    if len(active) != 1 or str(active[0].get('status')) != '1':
+        raise ValueError('This SMS template is awaiting MSG91 approval; no SMS was sent.')
+    if active[0].get('sender_id') != mapping.get('sender') or active[0].get('template_data') != mapping.get('text'):
+        raise ValueError('MSG91 template content or sender changed. Review the website mapping before sending.')
 
 
 def validate_config(payload):
@@ -232,11 +248,15 @@ class SMS:
             raise ValueError('Enable transactional SMS for this website after reviewing customer consent and destination requirements.')
         to = recipient(None if email['test_mode'] else self.phone(case),bool(email['test_mode']))
         link = order_link(domain,case.get('odoo_order_id'))
+        if kind == 'trustpilot_review':
+            link = r.trustpilot_review_url(domain)
         brand = (case.get('context') or {}).get('website_name') or case.get('store_name') or domain
         values = {'order':case['odoo_order_name'],'brand':brand,'url':link}
         body = render(kind,values['order'],brand,link)
         if provider == 'msg91':
             mapping = {**mapping,**(mapping.get('templates',{}).get(kind) or {})}
+            if kind in {'trustpilot_review', 'delivery_issue_received'}:
+                verify_followup_template(mapping)
             template = mapping.get('text') or ''
             names = set(re.findall(r'##(\w+)##',template))
             if not template or not names.issubset(values):
@@ -264,7 +284,7 @@ class SMS:
         try:
             row = self.prepare(email_id)
             if row and row['status'] == 'awaiting_approval':
-                if row['test_mode']:
+                if row['test_mode'] or json.loads(row['snapshot_json']).get('kind') in {'trustpilot_review', 'delivery_issue_received'}:
                     self.send(row['id'],automatic=True)
         except Exception:
             # A companion must never change the outcome of the independent email.
@@ -303,16 +323,20 @@ class SMS:
                 raise ValueError('This notification is excluded from SMS by the current cost-control policy.')
             if not self.config()['enabled']:
                 raise ValueError('SMS sending is disabled.')
+            if row['provider'] == 'msg91' and snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}:
+                verify_followup_template(snapshot['mapping'])
             validate_target(row,r.after_order_email_test_mode())
             if row['status'] not in {'awaiting_approval','failed'} or row['attempts'] >= 3:
                 raise ValueError('SMS already attempted or uncertain. Check provider logs; do not resend.')
             if automatic:
-                if row['attempts'] or row['status'] != 'awaiting_approval' or not row['test_mode']:
+                if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and snapshot['kind'] not in {'trustpilot_review', 'delivery_issue_received'}):
                     raise ValueError('This SMS needs individual approval.')
             elif digest(row) != approval:
                 raise ValueError('Review the current SMS preview before approving.')
             case = r.after_order_case_by_id(row['case_id']); r.require_after_order_case_in_scope(case)
             expected_link = order_link(snapshot['domain'], case.get('odoo_order_id'))
+            if snapshot['kind'] == 'trustpilot_review':
+                expected_link = r.trustpilot_review_url(snapshot['domain'])
             urls = re.findall(r'https?://[^\s<>"\']+', row['body'])
             if expected_link not in urls or any(url != expected_link for url in urls):
                 raise ValueError('SMS contains an outdated or incorrect order link. Prepare a new notification; do not resend this preview.')
@@ -332,15 +356,18 @@ class SMS:
                 if not site.get('transactional_sms_enabled'):
                     raise ValueError('Customer SMS has been disabled for this website.')
                 financial = snapshot['kind'] in {'price_difference','alternative_payment','refund_request_received','refund_completed'}
+                followup = snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}
                 if (self.phone(case) != row['recipient'] or r.request_fingerprint(case) != snapshot['request_fingerprint']
                         or case.get('sender_domain') != snapshot['domain']
-                        or (not financial and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
+                        or (not financial and not followup and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
                         or not r.after_order_tracking_is_current(case)):
                     raise ValueError('Order/recipient changed; SMS approval is blocked.')
                 if financial:
                     # Financial source messages need their own verified event/amount adapter.
                     # Do not infer a payment or completed refund from a button click.
                     raise ValueError('Financial SMS is held until its verified payment/refund event adapter is connected.')
+                if followup:
+                    r.delivery_followups.reserve(conn, case, snapshot['kind'], 'sms', sms_id)
                 if snapshot['kind'] == 'warehouse_dispatch_delay':
                     r.warehouse_dispatch_delay.validate(case)
                 if snapshot['kind'] in {'tracking', 'package_movement'} and r.after_order_tracking_updates_opted_out(case, case.get('customer_email') or ''):
@@ -414,6 +441,7 @@ class SMS:
         @router.get('/settings')
         def settings():
             return {**self.config(),'test_number':TEST_NUMBER,'test_mode':self.r.after_order_email_test_mode(),
+                    'supported_kinds':sorted(KINDS),
                     'policy':'selected-events-first-movement-v1',
                     'credentials':{'odoo':True,'twilio':bool(os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN')),'msg91':bool(os.getenv('MSG91_AUTH_KEY'))}}
 
