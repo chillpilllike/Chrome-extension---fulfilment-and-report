@@ -19,6 +19,10 @@ class SharedParcelDisplayTests(unittest.TestCase):
         self.assertEqual(rows[0]["id"], 1)
         self.assertEqual(set(json.loads(rows[0]['order_line_ids_json'])), {10, 11})
         self.assertEqual(len(rows[0]['amazon_order_ids']), 2)
+        scanned = m.dedupe_dispatch_package_rows([second, first])
+        self.assertEqual(len(scanned), 1)
+        self.assertEqual(scanned[0]['id'], 1)
+        self.assertEqual(scanned[0]['received_at'], first['received_at'])
         self.assertEqual(rows[0]['pickup_scanned_at'], first['pickup_scanned_at'])
         self.assertEqual(len(m.collapse_dispatch_related_parts([first, dict(second, odoo_order_id=51)])), 2)
 

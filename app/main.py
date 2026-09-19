@@ -7719,6 +7719,11 @@ def dedupe_dispatch_package_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
             grouped[key] = row
             ranks[key] = rank
             continue
+        if (package_tracking_id_is_physical(row.get("canonical_scan_code"))
+                and dispatch_purchase_identity.owner(existing)[:2] == dispatch_purchase_identity.owner(row)[:2]):
+            grouped[key] = merge_dispatch_shipment_rows(existing, row)
+            ranks[key] = max(rank, ranks.get(key, 0))
+            continue
         if rank > ranks.get(key, 0):
             existing["display_code"] = row.get("display_code") or existing.get("display_code")
             existing["scan_code"] = row.get("scan_code") or existing.get("scan_code")
