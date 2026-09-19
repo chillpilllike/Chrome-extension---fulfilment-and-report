@@ -61,11 +61,16 @@ class Monitor:
                                     (case['store_id'], case.get('tracking_code') or '')).fetchone()
         # A negative response on another parcel must never be hidden by a positive one.
         latest_parcels = {}
+        latest_answers = {}
+        for row in rows:  # Query is ordered by decision time, not carrier case creation.
+            if row.get('current_decision'):
+                latest_answers.setdefault(row.get('tracking_code') or str(row['id']), row)
         for row in sorted(rows, key=lambda x: x['id'], reverse=True):
             latest_parcels.setdefault(row.get('tracking_code') or str(row['id']), row)
         rows = [row for row in rows if row['id'] in {x['id'] for x in latest_parcels.values()}]
-        negative = next((x for x in rows if x.get('current_decision') == 'not_received'), None)
-        answer = negative or next((x for x in rows if x.get('current_decision')), rows[0] if rows else case)
+        answers = list(latest_answers.values())
+        negative = next((x for x in answers if x.get('current_decision') == 'not_received'), None)
+        answer = negative or next(iter(answers), rows[0] if rows else case)
         if negative:
             return ISSUE, answer
         delivered_at = ''

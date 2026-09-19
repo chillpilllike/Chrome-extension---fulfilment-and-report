@@ -144,6 +144,30 @@ class DeliveryFollowupTests(unittest.TestCase):
         self.assertIsNone(refreshed['confirmed_at'])
         self.assertEqual('cancelled', self.conn.execute('SELECT status FROM after_order_execution_jobs').fetchone()[0])
 
+    def test_new_carrier_case_does_not_erase_an_unresolved_non_delivery_report(self):
+        old = {**self.case,'case_type':'delivery_confirmation','tracking_code':'P1',
+               'current_decision':'not_received','decision_updated_at':'2000-01-01T00:00:00+00:00',
+               'context_json':'{"risk_state":"delivered"}'}
+        new = {**old,'id':2,'current_decision':None,'decision_updated_at':None}
+        rows = [old,new]
+        class Connection:
+            def execute(self, sql, values=()):
+                result = Mock()
+                result.fetchall.return_value = rows
+                result.fetchone.return_value = None
+                return result
+        @contextmanager
+        def db():
+            yield Connection()
+        monitor = Monitor({'db':db})
+        kind, answer = monitor.state(new)
+        self.assertEqual(ISSUE, kind)
+        self.assertEqual(1, answer['id'])
+        rows[:] = [{**new,'current_decision':'received','decision_updated_at':'2001-01-01T00:00:00+00:00'},old]
+        kind, answer = monitor.state(rows[0])
+        self.assertEqual(REVIEW, kind)
+        self.assertEqual(2, answer['id'])
+
 
 if __name__ == '__main__':
     unittest.main()
