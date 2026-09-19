@@ -98,7 +98,15 @@ def validate_config(payload):
     raw = json.dumps(payload['mappings'])
     if len(raw.encode('utf-8')) > 500000:
         raise ValueError('Website SMS mappings exceed the 500 KB configuration limit.')
-    if re.search(r'auth.?key|token|password|secret', raw, re.I):
+    def contains_credential_field(value):
+        # Brand names (e.g. SecretGreen) are values, not credential fields.
+        if isinstance(value, dict):
+            return any(re.search(r'auth.?key|token|password|secret', str(key), re.I)
+                       or contains_credential_field(child) for key, child in value.items())
+        if isinstance(value, list):
+            return any(contains_credential_field(child) for child in value)
+        return False
+    if contains_credential_field(payload['mappings']):
         raise ValueError('Keep credentials in runtime secrets, not website mappings.')
     for key, site in payload['mappings'].items():
         if not re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*', key) or not isinstance(site, dict):

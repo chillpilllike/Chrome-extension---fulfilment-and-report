@@ -10,6 +10,19 @@ from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, d
 
 
 class SMSTests(unittest.TestCase):
+    def test_secretgreen_brand_is_not_a_credential(self):
+        payload = {'enabled':False, 'provider':'msg91', 'mappings':{
+            '8:1':{'transactional_sms_enabled':False,'msg91':{
+                'sender':'SecretGreen','templates':{'expected_dispatch':{
+                    'template_id':'example','text':'SecretGreen: Order ##order##. ##url##'}}}}}}
+        self.assertIn('SecretGreen', validate_config(payload))
+        for field in ('authkey', 'auth_key', 'auth_token', 'password', 'client_secret'):
+            with self.subTest(field=field):
+                payload['mappings']['8:1']['msg91'][field] = 'blocked'
+                with self.assertRaises(ValueError):
+                    validate_config(payload)
+                del payload['mappings']['8:1']['msg91'][field]
+
     def test_many_websites_fit_without_relaxing_secret_validation(self):
         templates = {kind: {'template_id':'a'*24, 'text':'##brand##: Order ##order##. Review your order: ##url##'}
                      for kind in ('expected_dispatch','warehouse_dispatch_delay','item_unavailable','no_alternatives',
