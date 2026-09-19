@@ -5155,6 +5155,12 @@ def normalize_dispatch_scan_code(value: Any) -> str:
         text = url_match.group(1)
     text = html.unescape(text)
     text = re.sub(r"[^A-Z0-9-]", "", text)
+    # USPS concatenated GS1-128 labels prepend AI 420 and a 5/9-digit ZIP
+    # to the 22-digit tracking number shown by Amazon. Never trim arbitrary
+    # long numbers or match a hardware scan by a short suffix.
+    postal = re.fullmatch(r"420(?:\d{5}|\d{9})(9\d{21})", text)
+    if postal:
+        text = postal.group(1)
     return text
 
 

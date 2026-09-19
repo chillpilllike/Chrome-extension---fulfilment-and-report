@@ -64,6 +64,19 @@ class TestPickupAutoReconciliation(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT amazon_picked_up FROM package_pickup_checks").fetchone()[0], 1)
         self.assertEqual(self.conn.execute("SELECT scanned_at FROM package_pickup_delivery_records").fetchone()[0], event["scanned_at"])
 
+    def test_usps_routing_prefix_reconciles_original_scan_once(self):
+        tracking = '9361289691068393847592'
+        raw = '42011234' + tracking
+        self.conn.execute("UPDATE amazon_dispatch_packages SET scan_code=?,canonical_scan_code=?", (tracking, tracking))
+        self.conn.execute("UPDATE package_pickup_scan_events SET package_id=NULL,scan_code=?,result_status='not_found'", (raw,))
+        self.assertEqual(reconcile_package_pickup_scans(self.conn), 1)
+        self.assertEqual(self.event()['scan_code'], raw)
+        self.assertEqual(self.event()['original_result_status'], 'not_found')
+        self.assertEqual(self.event()['scanned_at'], '2026-09-02T15:05:51+00:00')
+        self.assertEqual(self.conn.execute("SELECT scanned_code FROM package_pickup_delivery_records").fetchone()[0], tracking)
+        self.assertEqual(reconcile_package_pickup_scans(self.conn), 0)
+        self.assertEqual(self.conn.execute("SELECT amazon_picked_up FROM package_pickup_checks").fetchone()[0], 1)
+
     def test_previously_unknown_exact_barcode_links_when_tracking_arrives(self):
         self.conn.execute("UPDATE package_pickup_scan_events SET package_id=NULL,store_id=0,result_status='not_found'")
         self.assertEqual(reconcile_package_pickup_scans(self.conn), 1)
