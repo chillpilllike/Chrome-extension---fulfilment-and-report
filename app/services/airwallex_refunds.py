@@ -88,13 +88,13 @@ def refund_totals(name, currency, transfers, local):
 
 
 def daily_refund_usage(local, transfers, now=None):
-    """Count submitted attempts, deduplicating app reservations and tagged external refunds."""
+    """Count successful refunds and reserve slots for unconfirmed transfers; deduplicate by ID."""
     now = now or datetime.now(timezone.utc)
     zone = ZoneInfo('Asia/Kolkata')
     day = now.astimezone(zone).date()
     start = datetime.combine(day, datetime.min.time(), zone)
     end = start + timedelta(days=1)
-    ids, requests, count = set(), set(), 0
+    ids, requests, successful, pending = set(), set(), 0, 0
     def today(value):
         try:
             stamp = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', str(value).replace('Z', '+00:00'))
@@ -104,21 +104,37 @@ def daily_refund_usage(local, transfers, now=None):
             return start <= timestamp < end
         except (ValueError, TypeError):
             raise ValueError('A refund date cannot be verified. Finance reconciliation is required.') from None
+    by_id = {r['id']: r for r in transfers if r.get('id')}
+    by_request = {r['request_id']: r for r in transfers if r.get('request_id')}
+    candidates = []
     for row in local:
-        ids.add(row.get('transfer_id'))
+        live = by_id.get(row.get('transfer_id')) or by_request.get(row['request_id'])
+        current = {**row, **live} if live else row
+        candidates.append(current)
+        if current.get('id') or row.get('transfer_id'):
+            ids.add(current.get('id') or row['transfer_id'])
         requests.add(row['request_id'])
-        if today(row['created_at']):
-            count += 1
     for row in transfers:
         if (row.get('id') and row['id'] in ids) or (row.get('request_id') and row['request_id'] in requests):
             continue
         reference = ' '.join(str(row.get(k) or '') for k in ('reference', 'remarks'))
-        if re.search(r'\brefund\b', reference, re.I) and today(row.get('created_at')):
-            count += 1
-            ids.add(row.get('id'))
+        if re.search(r'\brefund\b', reference, re.I):
+            candidates.append(row)
+            if row.get('id'):
+                ids.add(row['id'])
             if row.get('request_id'):
                 requests.add(row['request_id'])
-    return {'limit': 5, 'used': count, 'remaining': max(0, 5-count),
+    for row in candidates:
+        status = str(row.get('status') or 'UNKNOWN').upper()
+        if status in {'FAILED', 'CANCELLED', 'CANCELED'}:
+            continue
+        if today(row.get('created_at')):
+            if status == 'PAID':
+                successful += 1
+            else:
+                pending += 1
+    return {'limit': 5, 'used': successful + pending, 'successful': successful, 'pending': pending,
+            'remaining': max(0, 5-successful-pending),
             'timezone': 'Asia/Kolkata', 'date': str(day), 'resets_at': end.isoformat()}
 
 
@@ -242,13 +258,13 @@ class AirwallexRefunds:
 
     def daily_usage(self, transfers=None, now=None):
         with self.db() as c:
-            local = c.execute('SELECT request_id,transfer_id,created_at FROM airwallex_refund_payouts').fetchall()
+            local = c.execute('SELECT request_id,transfer_id,created_at,status FROM airwallex_refund_payouts').fetchall()
         return daily_refund_usage(local, self.transfers() if transfers is None else transfers, now)
 
     @staticmethod
     def daily_guard(usage):
         if usage['remaining'] <= 0:
-            raise ValueError('The daily limit of 5 refunds has been reached across all stores. Resets at midnight Asia/Kolkata.')
+            raise ValueError('The daily limit of 5 successful refunds is fully used or reserved by pending refunds. Failed or cancelled transfers free their daily slot. Resets at midnight Asia/Kolkata.')
 
     def order_client(self, store_id):
         store = self.get_store(store_id)

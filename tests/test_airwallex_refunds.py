@@ -141,15 +141,30 @@ class DailyLimitTests(unittest.TestCase):
         usage=daily_refund_usage(rows,transfers,now)
         self.assertEqual(usage['used'],2);self.assertEqual(usage['date'],'2026-09-21')
         self.assertEqual(usage['remaining'],3)
-    def test_uncertain_failed_and_cancelled_attempts_still_count(self):
+    def test_only_successful_and_pending_count(self):
         from datetime import datetime, timezone
         now=datetime.now(timezone.utc)
         rows=[{'request_id':str(i),'created_at':now.isoformat(),'status':state} for i,state in enumerate(
             ['SUBMITTING','UNKNOWN','PROCESSING','FAILED','CANCELLED'])]
         usage=daily_refund_usage(rows,[],now)
-        self.assertEqual(usage['remaining'],0)
-        with self.assertRaisesRegex(ValueError,'daily limit'):
-            AirwallexRefunds.daily_guard(usage)
+        self.assertEqual(usage['remaining'],2)
+        self.assertEqual(usage['successful'],0)
+        self.assertEqual(usage['pending'],3)
+    def test_live_failure_frees_stale_local_slot(self):
+        from datetime import datetime, timezone
+        now=datetime.now(timezone.utc)
+        rows=[{'request_id':'r','transfer_id':'t','status':'PROCESSING','created_at':now.isoformat()}]
+        transfers=[{'id':'t','request_id':'r','status':'FAILED','created_at':now.isoformat()}]
+        usage=daily_refund_usage(rows,transfers,now)
+        self.assertEqual(usage['remaining'],5)
+    def test_five_successes_block_but_failures_do_not(self):
+        from datetime import datetime, timezone
+        now=datetime.now(timezone.utc)
+        rows=[{'request_id':str(i),'status':state,'created_at':now.isoformat()} for i,state in enumerate(['PAID']*5+['FAILED','CANCELLED'])]
+        usage=daily_refund_usage(rows,[],now)
+        self.assertEqual(usage['successful'],5)
+        self.assertEqual(usage['pending'],0)
+        with self.assertRaisesRegex(ValueError,'daily limit'):AirwallexRefunds.daily_guard(usage)
     def test_bad_refund_timestamp_blocks(self):
         with self.assertRaises(ValueError):
             daily_refund_usage([], [{'id':'t1','reference':'Refund NC1','created_at':None}])
