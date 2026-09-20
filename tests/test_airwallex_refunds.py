@@ -30,7 +30,7 @@ class MemoryDB:
         elif 'WHERE account_key=?' in sql:
             self.result = [v for v in self.rows.values() if v.get('account_key')==params[0]]
         elif 'INSERT INTO airwallex_refund_payouts' in sql:
-            keys = ['request_id','order_key','store_id','order_id','order_name','account_key','amount','currency','recipient','edit_reason','payload_hash','created_at','updated_at','actor']
+            keys = ['request_id','order_key','store_id','order_id','order_name','account_key','amount','currency','recipient','edit_reason','payload_hash','created_at','updated_at','actor','funding_currency']
             row = dict(zip(keys, params)); row.update(status='SUBMITTING', transfer_id=None, last_error='')
             self.rows[row['request_id']] = row
         elif "SET status='UNKNOWN'" in sql:
@@ -187,6 +187,67 @@ class WorkflowTests(unittest.TestCase):
         self.service.prepare(f)
         payload=next(k['data'] for _,p,k in self.calls if p.endswith('transfers/validate'))
         self.assertEqual(payload['transfer_currency'],'CAD');self.assertEqual(payload['beneficiary']['bank_details']['account_currency'],'CAD')
+    def funding_mock(self, balances, quote=None):
+        original=self.service.call.side_effect
+        def call(method,path,**kw):
+            if path.endswith('/balances/current'):return balances
+            if path.endswith('/fx/rates/current'):return quote
+            return original(method,path,**kw)
+        self.service.call.side_effect=call
+
+    def test_funding_endpoint_never_returns_wallet_amounts(self):
+        self.funding_mock([{'currency':'CAD','available_amount':'12345.67','total_amount':98765},
+                           {'currency':'EUR','available_amount':0}])
+        app=FastAPI();app.include_router(self.service.router());client=TestClient(app)
+        r=client.get('/api/airwallex/refunds/funding-currencies',headers={'x-admin-token':'test-staff'})
+        self.assertEqual(r.json(),{'currencies':[{'currency':'CAD','status':'available'}, {'currency':'EUR','status':'empty'}]})
+        review=self.service.prepare(self.form())
+        self.assertNotIn('available_balance',review)
+        self.assertNotIn('12345',json.dumps(review))
+
+    def test_cross_currency_funding_preserves_refund_and_binds_selection(self):
+        self.funding_mock([{'currency':'EUR','available_amount':80}],{'buy_currency':'CAD','sell_currency':'EUR',
+            'rate_details':[{'level':'CLIENT','buy_amount':100,'sell_amount':65}]})
+        review=self.service.prepare(self.form(source_currency='EUR'))
+        self.assertEqual(review['source_currency'],'EUR');self.assertEqual(review['estimated_source_amount'],'65')
+        self.assertEqual(review['amount'],'100');self.assertEqual(review['currency'],'CAD')
+        payload=json.loads(self.service.cipher(self.cfg).decrypt(review['review_token'].encode()))
+        self.assertEqual(payload['transfer']['source_currency'],'EUR')
+        self.assertEqual(payload['transfer']['transfer_amount'],100)
+        result=self.service.submit(review['review_token'])
+        self.assertEqual(result['funding_currency'],'EUR')
+
+    def test_zero_funding_currency_blocks_without_fallback(self):
+        self.funding_mock([{'currency':'CAD','available_amount':10000},{'currency':'EUR','available_amount':0}])
+        with self.assertRaisesRegex(ValueError,'no available balance'):
+            self.service.prepare(self.form(source_currency='EUR'))
+        self.assertFalse(any(path.endswith('/create') for _,path,_ in self.calls))
+
+    def test_selected_balance_rechecked_at_submission(self):
+        review=self.service.prepare(self.form())
+        self.funding_mock([{'currency':'CAD','available_amount':0}])
+        with self.assertRaisesRegex(ValueError,'no available balance'):
+            self.service.submit(review['review_token'])
+        self.assertEqual(len(self.database.rows),0)
+
+    def test_provider_source_currency_mismatch_keeps_reservation(self):
+        review=self.service.prepare(self.form())
+        original=self.service.call.side_effect
+        def call(method,path,**kw):
+            result=original(method,path,**kw)
+            if path.endswith('/create'):result['source_currency']='USD'
+            return result
+        self.service.call.side_effect=call
+        result=self.service.submit(review['review_token'])
+        self.assertEqual(result['status'],'UNKNOWN')
+        self.assertEqual(len(self.database.rows),1)
+
+    def test_fx_quote_mismatch_and_insufficient_source_block(self):
+        for amount in [65,100]:
+            self.funding_mock([{'currency':'EUR','available_amount':60}],{'buy_currency':'CAD','sell_currency':'EUR',
+                'rate_details':[{'level':'CLIENT','buy_amount':amount,'sell_amount':65}]})
+            with self.assertRaises(ValueError):self.service.prepare(self.form(source_currency='EUR'))
+
     def test_partial_requires_warning_and_reason(self):
         with self.assertRaises(ValueError):self.service.prepare(self.form(amount='50'))
         self.service.prepare(self.form(amount='50',edit_acknowledged=True,edit_reason='One item'))

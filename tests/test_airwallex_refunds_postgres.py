@@ -57,7 +57,7 @@ class PostgresConcurrencyTests(unittest.TestCase):
                 row=c.execute('SELECT status FROM airwallex_refund_payouts WHERE request_id=?',(kw['data']['request_id'],)).fetchone()
             assert row['status']=='SUBMITTING'
             self.created.append(kw['data']['request_id'])
-            return {**kw['data'],'id':str(uuid.uuid4()),'status':'PROCESSING'}
+            return {**kw['data'],'source_currency':kw['data'].get('source_currency','CAD'),'id':str(uuid.uuid4()),'status':'PROCESSING'}
         return {}
     def token(self,amount='100'):
         t={'request_id':str(uuid.uuid4()),'transfer_amount':float(amount),'transfer_currency':'CAD',

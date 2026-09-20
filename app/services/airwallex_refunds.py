@@ -136,6 +136,7 @@ class ReviewInput(BaseModel):
     store_id: int = Field(gt=0)
     order_id: int = Field(gt=0)
     amount: str = Field(max_length=30)
+    source_currency: str = Field(default='', max_length=3, pattern=r'^([A-Z]{3})?$')
     fields: dict[str, str] = Field(default_factory=dict)
     edit_acknowledged: bool = False
     edit_reason: str = Field(default='', max_length=500)
@@ -169,6 +170,7 @@ class AirwallexRefunds:
             c.execute('''CREATE TABLE IF NOT EXISTS airwallex_refund_external_history (
                 account_key TEXT NOT NULL, transfer_id TEXT NOT NULL, payload TEXT NOT NULL,
                 synced_at TEXT NOT NULL, PRIMARY KEY(account_key,transfer_id))''')
+            c.execute("ALTER TABLE airwallex_refund_payouts ADD COLUMN IF NOT EXISTS funding_currency TEXT NOT NULL DEFAULT ''")
             c.execute('CREATE INDEX IF NOT EXISTS airwallex_refund_order_idx ON airwallex_refund_payouts(order_key)')
             c.execute('''CREATE TABLE IF NOT EXISTS airwallex_refund_webhook (
                 account_key TEXT PRIMARY KEY, webhook_id TEXT NOT NULL, secret TEXT NOT NULL)''')
@@ -200,7 +202,7 @@ class AirwallexRefunds:
 
     def call(self, method, path, *, data=None, params=None):
         # Only this staff service can use these endpoints, never the public Odoo operation proxy.
-        allowed = (method == 'GET' and (path in {'/api/v1/transfers', '/api/v1/balances/current'}
+        allowed = (method == 'GET' and (path in {'/api/v1/transfers', '/api/v1/balances/current', '/api/v1/fx/rates/current'}
                    or re.fullmatch(r'/api/v1/(transfers|deposits)/[A-Za-z0-9-]+', path))) or (
             method == 'POST' and path in {'/api/v1/beneficiary_form_schemas/generate',
                                          '/api/v1/beneficiaries/validate', '/api/v1/transfers/validate',
@@ -446,6 +448,41 @@ class AirwallexRefunds:
         params = {k: str(v)[:80] for k, v in params.items() if k in SCHEMA_KEYS and v}
         return self.call('POST', '/api/v1/beneficiary_form_schemas/generate', data=params)
 
+    def funding_currencies(self):
+        # Redact on the server, so exact balances never reach the browser/network response.
+        balances = self.call('GET', '/api/v1/balances/current')
+        totals = {}
+        for balance in balances:
+            currency = balance.get('currency', '')
+            if re.fullmatch(r'[A-Z]{3}', currency):
+                totals[currency] = totals.get(currency, ZERO) + money(balance['available_amount'])
+        return {'currencies': [{'currency': currency, 'status': 'available' if value > 0 else 'empty'}
+                              for currency, value in sorted(totals.items())]}
+
+    def check_funding(self, transfer):
+        source = transfer.get('source_currency') or transfer['transfer_currency']
+        target = transfer['transfer_currency']
+        balances = self.call('GET', '/api/v1/balances/current')
+        available = sum((money(b['available_amount']) for b in balances if b.get('currency') == source), ZERO)
+        if available <= 0:
+            raise ValueError('The selected funding currency has no available balance. Select another currency or fund it first.')
+        required = money(transfer['transfer_amount'])
+        converted = source != target
+        if converted:
+            quote = self.call('GET', '/api/v1/fx/rates/current', params={
+                'buy_currency': target, 'sell_currency': source, 'buy_amount': str(required)})
+            details = [r for r in quote.get('rate_details', []) if r.get('level') == 'CLIENT']
+            if (quote.get('buy_currency') != target or quote.get('sell_currency') != source
+                or len(details) != 1 or money(details[0].get('buy_amount')) != required):
+                raise ValueError('The funding conversion could not be verified. Select another currency or try again.')
+            required = money(details[0].get('sell_amount'))
+            if required <= 0:
+                raise ValueError('The funding conversion could not be verified.')
+        if available < required:
+            raise ValueError('Insufficient funds in the selected currency for this refund. Select another funding currency.')
+        # This is the cost of this refund, not the wallet balance. Fees are additional.
+        return {'source_currency': source, 'estimated_source_amount': str(required), 'conversion': converted}
+
     def prepare(self, form):
         if not form.recipient_confirmed or not form.other_refunds_checked:
             raise ValueError('Confirm recipient details and check for refunds through other providers first.')
@@ -482,15 +519,12 @@ class AirwallexRefunds:
         request_id = str(uuid.uuid4())
         transfer = {'request_id': request_id, 'reference': 'Refund ' + snapshot['order_name'],
                     'reason': 'other_services', 'remarks': 'Customer order refund', 'beneficiary': beneficiary,
-                    'source_currency': snapshot['currency'], 'transfer_currency': snapshot['currency'],
+                    'source_currency': form.source_currency or snapshot['currency'], 'transfer_currency': snapshot['currency'],
                     'transfer_amount': float(amount), 'transfer_method': schema_params['transfer_method'], 'fee_paid_by': 'PAYER'}
         if transfer['transfer_method'] == 'SWIFT':
             transfer['swift_charge_option'] = 'OUR'
         self.call('POST', '/api/v1/transfers/validate', data=transfer)
-        balances = self.call('GET', '/api/v1/balances/current')
-        available = sum((money(b['available_amount']) for b in balances if b.get('currency') == snapshot['currency']), ZERO)
-        if available < amount:
-            raise ValueError('Insufficient available balance in the refund currency. Fund that currency before refunding.')
+        funding = self.check_funding(transfer)
         cfg = self.config()
         payload = {'store_id': form.store_id, 'order_id': form.order_id, 'order_key': snapshot['order_key'],
                    'order_name': snapshot['order_name'], 'transfer': transfer, 'edit_reason': form.edit_reason,
@@ -502,7 +536,7 @@ class AirwallexRefunds:
                 'currency': snapshot['currency'], 'recipient': bank.get('account_name', ''),
                 'destination': (bank.get('account_routing_value1', '') if bank.get('local_clearing_system') == 'INTERAC'
                                 else '••••' + destination[-4:]), 'method': schema_params.get('local_clearing_system') or transfer['transfer_method'],
-                'available_balance': str(available), 'fees': 'Airwallex fees are additional and paid by the business. Exact fees are recorded after submission.',
+                **funding, 'fees': 'Airwallex fees are additional and paid by the business. Exact fees are recorded after submission.',
                 'expires_in_seconds': 600}
 
     def submit(self, token, actor='staff'):
@@ -528,20 +562,17 @@ class AirwallexRefunds:
                 raise ValueError('Order currency or identity changed. Review again.')
             amount_guard(payload['amount'], fresh['remaining'], fresh['rounding'])
             self.call('POST', '/api/v1/transfers/validate', data=transfer)
-            balances = self.call('GET', '/api/v1/balances/current')
-            available = sum((money(b['available_amount']) for b in balances if b.get('currency') == fresh['currency']), ZERO)
-            if available < money(payload['amount']):
-                raise ValueError('Insufficient balance in the refund currency. No transfer was submitted.')
+            self.check_funding(transfer)
             submitted_at = datetime.now(timezone.utc)
             self.daily_guard(self.daily_usage(now=submitted_at))
             now = submitted_at.isoformat()
             recipient = transfer['beneficiary']['bank_details'].get('account_name', '')
             c.execute('''INSERT INTO airwallex_refund_payouts
                 (request_id,order_key,store_id,order_id,order_name,account_key,amount,currency,status,
-                 recipient,edit_reason,payload_hash,created_at,updated_at,actor)
-                VALUES (?,?,?,?,?,?,?,?,'SUBMITTING',?,?,?,?,?,?)''',
+                 recipient,edit_reason,payload_hash,created_at,updated_at,actor,funding_currency)
+                VALUES (?,?,?,?,?,?,?,?,'SUBMITTING',?,?,?,?,?,?,?)''',
                 (rid,key,payload['store_id'],payload['order_id'],fresh['order_name'],payload['account_key'],
-                 payload['amount'],fresh['currency'],recipient,payload['edit_reason'],fingerprint,now,now,actor))
+                 payload['amount'],fresh['currency'],recipient,payload['edit_reason'],fingerprint,now,now,actor,transfer.get('source_currency') or fresh['currency']))
         try:
             result = self.call('POST', '/api/v1/transfers/create', data=transfer)
             self.record_result(rid, result)
@@ -561,7 +592,8 @@ class AirwallexRefunds:
             if not row:
                 return
             if (result.get('request_id') != rid or money(result.get('transfer_amount')) != money(row['amount'])
-                or result.get('transfer_currency') != row['currency'] or not result.get('id')):
+                or result.get('transfer_currency') != row['currency'] or not result.get('id')
+                or (row.get('funding_currency') and result.get('source_currency') != row['funding_currency'])):
                 raise ValueError('Transfer reconciliation mismatch.')
             c.execute('''UPDATE airwallex_refund_payouts SET status=?,transfer_id=?,updated_at=?,last_error='',
                          fee_amount=?,fee_currency=? WHERE request_id=?''',
@@ -653,6 +685,7 @@ class AirwallexRefunds:
                        'currency': t['transfer_currency'], 'status': t.get('status') or 'UNKNOWN',
                        'recipient': bank.get('account_name') or '', 'created_at': t.get('created_at'),
                        'fee_amount': str(t.get('fee_amount', '')), 'fee_currency': t.get('fee_currency'),
+                       'funding_currency': t.get('source_currency') or t['transfer_currency'],
                        'source': 'Manual Airwallex', 'mapping_status': state, 'last_error': ''}
                 if state == 'matched':
                     row.update(candidates[0]); mapped += 1
@@ -735,6 +768,9 @@ class AirwallexRefunds:
             guarded(self.config)
             guarded(self.call, 'GET', '/api/v1/balances/current')
             return {'connected': True, 'account': 'Shared Airwallex account'}
+        @r.get('/funding-currencies')
+        def funding_currencies():
+            return guarded(self.funding_currencies)
         @r.get('/limits')
         def limits():
             return guarded(self.daily_usage)
