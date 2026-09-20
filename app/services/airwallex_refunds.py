@@ -7,7 +7,8 @@ import json
 import re
 import uuid
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from urllib.parse import urlsplit
 
@@ -81,6 +82,41 @@ def refund_totals(name, currency, transfers, local):
                      'status': t['status'], 'reference': t['order_name'], 'created_at': t['created_at'],
                      'source': 'App'})
     return total, rows
+
+
+def daily_refund_usage(local, transfers, now=None):
+    """Count submitted attempts, deduplicating app reservations and tagged external refunds."""
+    now = now or datetime.now(timezone.utc)
+    zone = ZoneInfo('Asia/Kolkata')
+    day = now.astimezone(zone).date()
+    start = datetime.combine(day, datetime.min.time(), zone)
+    end = start + timedelta(days=1)
+    ids, requests, count = set(), set(), 0
+    def today(value):
+        try:
+            stamp = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', str(value).replace('Z', '+00:00'))
+            timestamp = datetime.fromisoformat(stamp)
+            if timestamp.tzinfo is None:
+                raise ValueError()
+            return start <= timestamp < end
+        except (ValueError, TypeError):
+            raise ValueError('A refund date cannot be verified. Finance reconciliation is required.') from None
+    for row in local:
+        ids.add(row.get('transfer_id'))
+        requests.add(row['request_id'])
+        if today(row['created_at']):
+            count += 1
+    for row in transfers:
+        if (row.get('id') and row['id'] in ids) or (row.get('request_id') and row['request_id'] in requests):
+            continue
+        reference = ' '.join(str(row.get(k) or '') for k in ('reference', 'remarks'))
+        if re.search(r'\brefund\b', reference, re.I) and today(row.get('created_at')):
+            count += 1
+            ids.add(row.get('id'))
+            if row.get('request_id'):
+                requests.add(row['request_id'])
+    return {'limit': 5, 'used': count, 'remaining': max(0, 5-count),
+            'timezone': 'Asia/Kolkata', 'date': str(day), 'resets_at': end.isoformat()}
 
 
 def set_path(target, path, value):
@@ -199,6 +235,16 @@ class AirwallexRefunds:
             seen.add(page)
         raise ValueError('Complete transfer history could not be checked. Refunds are blocked.')
 
+    def daily_usage(self, transfers=None, now=None):
+        with self.db() as c:
+            local = c.execute('SELECT request_id,transfer_id,created_at FROM airwallex_refund_payouts').fetchall()
+        return daily_refund_usage(local, self.transfers() if transfers is None else transfers, now)
+
+    @staticmethod
+    def daily_guard(usage):
+        if usage['remaining'] <= 0:
+            raise ValueError('The daily limit of 5 refunds has been reached across all stores. Resets at midnight Asia/Kolkata.')
+
     def order_client(self, store_id):
         store = self.get_store(store_id)
         return store, self.client_factory(store)
@@ -218,13 +264,27 @@ class AirwallexRefunds:
         return client.search_read('sale.order', domain,
             ['name', 'partner_id', 'amount_total', 'currency_id', 'state'], limit=25, order='id desc')
 
+    @staticmethod
+    def customer_matches(client, order, partner):
+        if not partner:
+            return False
+        if partner[0] == order['partner_id'][0]:
+            return True
+        # Odoo checkout transactions may belong to the customer's invoice contact.
+        if not order.get('partner_invoice_id') or partner[0] != order['partner_invoice_id'][0]:
+            return False
+        contacts = client.search_read('res.partner', [('id', 'in', [partner[0], order['partner_id'][0]])],
+                                      ['commercial_partner_id'])
+        roots = {p['commercial_partner_id'][0] for p in contacts if p.get('commercial_partner_id')}
+        return len(contacts) == 2 and len(roots) == 1 and all(p.get('commercial_partner_id') for p in contacts)
+
     def snapshot(self, store_id, order_id):
         store, client = self.order_client(store_id)
         domain = [('id', '=', order_id)]
         if store.website_id:
             domain.append(('website_id', '=', store.website_id))
         orders = client.search_read('sale.order', domain,
-            ['name', 'amount_total', 'currency_id', 'partner_id', 'invoice_ids', 'state', 'date_order'])
+            ['name', 'amount_total', 'currency_id', 'partner_id', 'partner_invoice_id', 'invoice_ids', 'state', 'date_order'])
         if len(orders) != 1:
             raise ValueError('Order does not belong to the selected store.')
         order = orders[0]
@@ -233,20 +293,20 @@ class AirwallexRefunds:
         if total <= 0:
             raise ValueError('The order has no positive refundable value.')
         fields = client.execute('payment.transaction', 'fields_get', [], {'attributes': ['type']})
-        tx_fields = ['amount', 'currency_id', 'state', 'operation', 'sale_order_ids', 'provider_code']
+        tx_fields = ['amount', 'currency_id', 'state', 'operation', 'sale_order_ids', 'provider_code', 'provider_id', 'partner_id', 'reference']
         tx_fields += [k for k in ('airwallex_deposit_id', 'airwallex_payment_amount',
-                                  'airwallex_payment_currency_id') if k in fields]
+                                  'airwallex_payment_currency_id', 'payment_method_id') if k in fields]
         txs = client.search_read('payment.transaction', [('sale_order_ids', 'in', [order_id])], tx_fields)
         # Include refund child transactions even when Odoo did not copy sale_order_ids.
         if txs and 'source_transaction_id' in fields:
             children = client.search_read('payment.transaction', [('source_transaction_id', 'in', [t['id'] for t in txs])], tx_fields)
             txs = list({t['id']: t for t in [*txs, *children]}.values())
         invoices = client.search_read('account.move', [('id', 'in', order['invoice_ids'])],
-            ['move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'currency_id']) if order['invoice_ids'] else []
+            ['move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'currency_id', 'partner_id']) if order['invoice_ids'] else []
         if order['invoice_ids']:
             reversals = client.search_read('account.move', [('reversed_entry_id', 'in', order['invoice_ids']),
                 ('move_type', '=', 'out_refund'), ('state', '=', 'posted')],
-                ['move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'currency_id'])
+                ['move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'currency_id', 'partner_id'])
             invoices = list({i['id']: i for i in [*invoices, *reversals]}.values())
         posted = [i for i in invoices if i['state'] == 'posted']
         if any(i['currency_id'][1] != order_currency for i in posted):
@@ -254,6 +314,7 @@ class AirwallexRefunds:
         credits = sum((money(i['amount_total']) for i in posted if i['move_type'] == 'out_refund'), ZERO)
         payments, provider_refunds, currencies = [], ZERO, set()
         seen_deposits = set()
+        payment_matches = []
         for t in txs:
             is_refund = t.get('operation') == 'refund' or money(t['amount']) < 0
             if is_refund and t['state'] not in {'cancel', 'error', 'draft'}:
@@ -263,12 +324,18 @@ class AirwallexRefunds:
             elif t['state'] == 'done' and not is_refund:
                 if t.get('sale_order_ids') != [order_id]:
                     raise ValueError('A payment covers multiple orders. Finance allocation is required.')
+                if not self.customer_matches(client, order, t.get('partner_id')):
+                    raise ValueError('The payment customer does not match the order customer. Finance review is required.')
                 amount, currency = money(t['amount']), t['currency_id'][1]
                 if currency != order_currency:
                     raise ValueError('The payment currency does not match its Odoo order.')
                 if amount <= 0:
                     raise ValueError('A completed payment has an invalid amount.')
                 collected = amount
+                match = {'transaction': t.get('reference') or str(t['id']),
+                         'provider': t['provider_id'][1] if t.get('provider_id') else t['provider_code'],
+                         'method': t['payment_method_id'][1] if t.get('payment_method_id') else '',
+                         'customer': t['partner_id'][1], 'customer_matched': True, 'order_matched': True}
                 if t.get('provider_code') == 'airwallex_transfer':
                     deposit_id = t.get('airwallex_deposit_id')
                     if not deposit_id or not UUID_RE.fullmatch(deposit_id):
@@ -279,11 +346,21 @@ class AirwallexRefunds:
                     deposit = self.call('GET', '/api/v1/deposits/' + deposit_id)
                     if deposit.get('status') != 'SETTLED':
                         raise ValueError('The original Airwallex deposit is not settled.')
+                    if not whole_reference(deposit.get('reference'), order['name']):
+                        raise ValueError('The Airwallex deposit reference does not match this order. Finance review is required.')
+                    reused = client.search_read('payment.transaction', [('airwallex_deposit_id', '=', deposit_id), ('id', '!=', t['id'])], ['id'])
+                    if reused:
+                        raise ValueError('The Airwallex deposit is linked to another payment. Finance review is required.')
+                    match.update(deposit_id=deposit_id, deposit_reference=deposit.get('reference'),
+                                 payer=(deposit.get('payer') or {}).get('name') or deposit.get('payer_name') or '',
+                                 deposit_status='SETTLED')
                     payment_currency = t.get('airwallex_payment_currency_id')
                     currency = payment_currency[1] if payment_currency else currency
                     collected = money(t.get('airwallex_payment_amount') if payment_currency else amount)
                     if deposit.get('currency') != currency or money(deposit['amount']) != collected:
                         raise ValueError('The settled deposit does not match the locked payment amount.')
+                match.update(amount=str(collected), currency=currency)
+                payment_matches.append(match)
                 payments.append((amount, collected))
                 currencies.add(currency)
         if len(currencies) > 1:
@@ -307,17 +384,34 @@ class AirwallexRefunds:
             paid_invoices = [i for i in posted if i['move_type'] == 'out_invoice' and i['payment_state'] == 'paid' and money(i['amount_residual']) == 0]
             if not paid_invoices:
                 raise ValueError('No completed payment or fully paid invoice could be verified in Odoo.')
+            if any(not self.customer_matches(client, order, i.get('partner_id')) for i in paid_invoices):
+                raise ValueError('The paid invoice customer does not match the order customer.')
             # Avoid allocating a multi-order invoice to just this order.
             invoice_ids = [i['id'] for i in paid_invoices]
             related = client.search_read('sale.order', [('invoice_ids', 'in', invoice_ids)], ['id'])
             if any(o['id'] != order_id for o in related):
                 raise ValueError('A paid invoice covers multiple orders. Finance allocation is required.')
+            invoice_fields = client.execute('account.move', 'fields_get', [], {'attributes': ['type']})
+            methods = set()
+            if 'invoice_payments_widget' in invoice_fields:
+                for inv in client.search_read('account.move', [('id', 'in', invoice_ids)], ['invoice_payments_widget']):
+                    widget = inv.get('invoice_payments_widget') or {}
+                    if isinstance(widget, str):
+                        widget = json.loads(widget) or {}
+                    for payment in widget.get('content', []):
+                        label = payment.get('payment_method_name') or payment.get('journal_name')
+                        if label:
+                            methods.add(label)
+            payment_matches.append({'provider': ' / '.join(sorted(methods)) or 'Original payment method unavailable in Odoo',
+                                    'method': 'Paid invoice', 'customer': order['partner_id'][1],
+                                    'customer_matched': True, 'order_matched': True, 'transaction': 'Invoice payment'})
             collected_paid = sum((money(i['amount_total']) for i in paid_invoices), ZERO)
             cap, rate, evidence = min(total, collected_paid), Decimal(1), 'Fully paid Odoo invoice'
         key = self.order_key(store, order_id)
         with self.db() as c:
             local = c.execute('SELECT * FROM airwallex_refund_payouts WHERE order_key=?', (key,)).fetchall()
-        used, history = refund_totals(order['name'], currency, self.transfers(), local)
+        transfers = self.transfers()
+        used, history = refund_totals(order['name'], currency, transfers, local)
         # Conservative: credit notes and external provider refunds may overlap; do not guess.
         accounting_deduction = (credits + provider_refunds) * rate
         remaining = max(ZERO, cap - used - accounting_deduction)
@@ -328,6 +422,8 @@ class AirwallexRefunds:
         state = client.search_read('res.country.state', [('id', '=', partner['state_id'][0])], ['code'])[0]['code'] if partner['state_id'] else ''
         return {'store_id': store_id, 'order_id': order_id, 'order_key': key, 'order_name': order['name'],
                 'customer': partner['name'], 'order_value': str(total), 'order_currency': order_currency,
+                'order_equivalent': str(total * rate), 'conversion_rate': str(rate),
+                'payment_matches': payment_matches,
                 'currency': currency, 'paid': str(collected_paid), 'cap': str(cap), 'refunded_reserved': str(used),
                 'accounting_deduction': str(accounting_deduction), 'remaining': str(remaining),
                 'rounding': str(rounding), 'evidence': evidence, 'history': history,
@@ -346,6 +442,7 @@ class AirwallexRefunds:
     def prepare(self, form):
         if not form.recipient_confirmed or not form.other_refunds_checked:
             raise ValueError('Confirm recipient details and check for refunds through other providers first.')
+        self.daily_guard(self.daily_usage())
         snapshot = self.snapshot(form.store_id, form.order_id)
         amount = amount_guard(form.amount, snapshot['remaining'], snapshot['rounding'])
         if amount != money(snapshot['remaining']) and (not form.edit_acknowledged or not form.edit_reason.strip()):
@@ -414,6 +511,7 @@ class AirwallexRefunds:
             raise ValueError('Airwallex account changed. Review again.')
         # Lock across processes and duplicate store registrations. Commit reservation BEFORE API call.
         with self.db() as c:
+            c.execute('SELECT pg_advisory_xact_lock(hashtextextended(?, 0))', ('airwallex-refund-global-daily-limit',))
             c.execute('SELECT pg_advisory_xact_lock(hashtextextended(?, 0))', (key,))
             existing = c.execute('SELECT * FROM airwallex_refund_payouts WHERE request_id=?', (rid,)).fetchone()
             if existing:
@@ -427,7 +525,9 @@ class AirwallexRefunds:
             available = sum((money(b['available_amount']) for b in balances if b.get('currency') == fresh['currency']), ZERO)
             if available < money(payload['amount']):
                 raise ValueError('Insufficient balance in the refund currency. No transfer was submitted.')
-            now = datetime.now(timezone.utc).isoformat()
+            submitted_at = datetime.now(timezone.utc)
+            self.daily_guard(self.daily_usage(now=submitted_at))
+            now = submitted_at.isoformat()
             recipient = transfer['beneficiary']['bank_details'].get('account_name', '')
             c.execute('''INSERT INTO airwallex_refund_payouts
                 (request_id,order_key,store_id,order_id,order_name,account_key,amount,currency,status,
@@ -535,6 +635,9 @@ class AirwallexRefunds:
             guarded(self.config)
             guarded(self.call, 'GET', '/api/v1/balances/current')
             return {'connected': True, 'account': 'Shared Airwallex account'}
+        @r.get('/limits')
+        def limits():
+            return guarded(self.daily_usage)
         @r.get('/orders')
         def orders(store_id: int, q: str = ''):
             return {'rows': guarded(self.search, store_id, q)}

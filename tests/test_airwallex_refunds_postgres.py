@@ -49,6 +49,7 @@ class PostgresConcurrencyTests(unittest.TestCase):
         except:c.rollback();raise
         finally:c.close()
     def call(self,method,path,**kw):
+        if path=='/api/v1/transfers':return {'items':[]}
         if path.endswith('balances/current'):return [{'currency':'CAD','available_amount':500}]
         if path.endswith('/create'):
             # Reservation must be visible from a separate DB connection before transmission.
@@ -77,5 +78,31 @@ class PostgresConcurrencyTests(unittest.TestCase):
         def send(_):gate.wait();return self.service.submit(token)
         with ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(send,range(2)))
         self.assertEqual(len(self.created),1);self.assertEqual(results[0]['request_id'],results[1]['request_id'])
+
+    def test_global_daily_cap_serializes_different_orders(self):
+        self.service.snapshot=lambda store,order:{'order_key':f'order-{order}','order_name':f'TEST-{order}',
+            'currency':'CAD','rounding':'.01','remaining':'100'}
+        tokens=[]
+        for i in range(8):
+            payload=json.loads(self.service.cipher(self.cfg).decrypt(self.token('1').encode()))
+            payload.update(order_id=i,order_key=f'order-{i}')
+            tokens.append(self.service.cipher(self.cfg).encrypt(json.dumps(payload).encode()).decode())
+        gate=threading.Barrier(8)
+        def send(token):
+            gate.wait()
+            try:return self.service.submit(token)['status']
+            except ValueError as e:
+                self.assertIn('daily limit',str(e));return 'BLOCKED'
+        with ThreadPoolExecutor(max_workers=8) as pool:results=list(pool.map(send,tokens))
+        self.assertEqual(results.count('PROCESSING'),5)
+        self.assertEqual(results.count('BLOCKED'),3)
+        self.assertEqual(len(self.created),5)
+        # An already-submitted review can still be checked without spending another slot.
+        for token in tokens:
+            rid=json.loads(self.service.cipher(self.cfg).decrypt(token.encode()))['transfer']['request_id']
+            if rid in self.created:
+                self.service.submit(token)
+                break
+        self.assertEqual(len(self.created),5)
 
 if __name__=='__main__':unittest.main()

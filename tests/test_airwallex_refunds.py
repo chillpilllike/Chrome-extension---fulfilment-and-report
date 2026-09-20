@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from app.services.airwallex_refunds import AirwallexRefunds, ReviewInput, amount_guard, refund_totals
+from app.services.airwallex_refunds import AirwallexRefunds, ReviewInput, amount_guard, refund_totals, daily_refund_usage
 
 
 class MemoryDB:
@@ -34,6 +34,8 @@ class MemoryDB:
             self.rows[params[-1]].update(dict(zip(keys,vals)))
         elif 'WHERE request_id=?' in sql:
             self.result = self.rows.get(params[0])
+        elif 'SELECT request_id,transfer_id,created_at' in sql:
+            self.result = list(self.rows.values())
         elif 'WHERE order_key=?' in sql:
             self.result = [v for v in self.rows.values() if v['order_key']==params[0]]
         return self
@@ -66,6 +68,32 @@ class RefundGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):refund_totals('NC100','CAD',transfers,[])
 
 
+class DailyLimitTests(unittest.TestCase):
+    def test_india_midnight_boundary_and_deduplication(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 9, 20, 18, 31, tzinfo=timezone.utc)
+        rows = [{'request_id':'r1','transfer_id':'t1','created_at':'2026-09-20T18:30:00+00:00'},
+                {'request_id':'r2','created_at':'2026-09-20T18:29:59+00:00'}]
+        transfers = [{'id':'t1','request_id':'r1','reference':'Refund NC1','created_at':rows[0]['created_at']},
+                     {'id':'t2','reference':'Partial Refund NC2','created_at':'2026-09-20T18:30:00+0000'},
+                     {'id':'t3','reference':'Supplier invoice','created_at':rows[0]['created_at']}]
+        usage=daily_refund_usage(rows,transfers,now)
+        self.assertEqual(usage['used'],2);self.assertEqual(usage['date'],'2026-09-21')
+        self.assertEqual(usage['remaining'],3)
+    def test_uncertain_failed_and_cancelled_attempts_still_count(self):
+        from datetime import datetime, timezone
+        now=datetime.now(timezone.utc)
+        rows=[{'request_id':str(i),'created_at':now.isoformat(),'status':state} for i,state in enumerate(
+            ['SUBMITTING','UNKNOWN','PROCESSING','FAILED','CANCELLED'])]
+        usage=daily_refund_usage(rows,[],now)
+        self.assertEqual(usage['remaining'],0)
+        with self.assertRaisesRegex(ValueError,'daily limit'):
+            AirwallexRefunds.daily_guard(usage)
+    def test_bad_refund_timestamp_blocks(self):
+        with self.assertRaises(ValueError):
+            daily_refund_usage([], [{'id':'t1','reference':'Refund NC1','created_at':None}])
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.database=MemoryDB()
@@ -80,6 +108,7 @@ class WorkflowTests(unittest.TestCase):
         self.calls=[]
         def call(method,path,**kw):
             self.calls.append((method,path,kw))
+            if path == '/api/v1/transfers':return {'items':[]}
             if path.endswith('/balances/current'):return [{'currency':'CAD','available_amount':200}]
             if path.endswith('/create'):return {**kw['data'],'id':'transfer-1','status':'PROCESSING'}
             return {}
@@ -108,6 +137,17 @@ class WorkflowTests(unittest.TestCase):
         self.snap['remaining']='99'
         with self.assertRaises(ValueError):self.service.submit(review['review_token'])
         self.assertFalse(any(p.endswith('/create') for _,p,_ in self.calls))
+    def test_daily_limit_rechecked_after_review_and_idempotent_retry(self):
+        from datetime import datetime, timezone
+        review=self.service.prepare(self.form())
+        for i in range(5):
+            self.database.rows[str(i)]={'request_id':str(i),'created_at':datetime.now(timezone.utc).isoformat()}
+        with self.assertRaisesRegex(ValueError,'daily limit'):
+            self.service.submit(review['review_token'])
+        with self.assertRaisesRegex(ValueError,'daily limit'):
+            self.service.prepare(self.form())
+        self.assertFalse(any(p.endswith('/create') for _,p,_ in self.calls))
+
     def test_duplicate_submission_creates_once(self):
         review=self.service.prepare(self.form())
         a=self.service.submit(review['review_token']);b=self.service.submit(review['review_token'])
@@ -174,11 +214,12 @@ class SnapshotTests(unittest.TestCase):
         self.order={'id':1,'name':'NC100','amount_total':100,'currency_id':[1,'CAD'],'partner_id':[7,'Test'],
                     'invoice_ids':[],'state':'sale','date_order':'2026-01-01'}
         self.tx={'id':10,'amount':100,'currency_id':[1,'CAD'],'state':'done','operation':'online_direct',
-                 'sale_order_ids':[1],'provider_code':'test'}
+                 'sale_order_ids':[1],'provider_code':'test','provider_id':[1,'Card provider'],'partner_id':[7,'Test'],'reference':'NC100'}
         self.transactions=[self.tx];self.invoices=[];self.children=[];self.external=[]
         self.database=MemoryDB();self.client=Mock();self.client.execute.return_value={k:{} for k in ['source_transaction_id','airwallex_deposit_id','airwallex_payment_amount','airwallex_payment_currency_id']}
         def read(model,domain,fields,**kw):
             if model=='sale.order':return [self.order]
+            if model=='payment.transaction' and domain[0][0]=='airwallex_deposit_id':return []
             if model=='payment.transaction':return self.children if domain[0][0]=='source_transaction_id' else self.transactions
             if model=='account.move':return self.invoices
             if model=='res.currency':return [{'rounding':.01}]
@@ -210,14 +251,47 @@ class SnapshotTests(unittest.TestCase):
     def test_locked_payment_conversion_and_settled_deposit(self):
         self.tx.update(provider_code='airwallex_transfer',airwallex_deposit_id='deposit-1',
                        airwallex_payment_amount=75,airwallex_payment_currency_id=[2,'USD'])
-        self.svc.call=Mock(return_value={'status':'SETTLED','amount':75,'currency':'USD'})
+        self.svc.call=Mock(return_value={'reference':'NC100','status':'SETTLED','amount':75,'currency':'USD'})
         result=self.svc.snapshot(1,1);self.assertEqual(result['currency'],'USD');self.assertEqual(Decimal(result['remaining']),75)
+        self.assertEqual(Decimal(result['order_equivalent']),75)
+        self.assertEqual(Decimal(result['conversion_rate']),Decimal('.75'))
         self.svc.call.return_value['status']='PENDING'
         with self.assertRaises(ValueError):self.svc.snapshot(1,1)
+    def test_customer_and_deposit_order_mismatch_blocked(self):
+        self.tx['partner_id']=[8,'Someone else']
+        with self.assertRaisesRegex(ValueError,'customer'):
+            self.svc.snapshot(1,1)
+        self.tx.update(partner_id=[7,'Test'],provider_code='airwallex_transfer',airwallex_deposit_id='d1')
+        self.svc.call=Mock(return_value={'reference':'NC1000','status':'SETTLED','amount':100,'currency':'CAD'})
+        with self.assertRaisesRegex(ValueError,'reference'):
+            self.svc.snapshot(1,1)
+    def test_invoice_contact_must_belong_to_same_customer(self):
+        order={'partner_id':[7,'Customer'],'partner_invoice_id':[8,'Billing']}
+        self.client.search_read=Mock(return_value=[{'commercial_partner_id':[7,'Customer']},{'commercial_partner_id':[7,'Customer']}])
+        self.assertTrue(self.svc.customer_matches(self.client,order,[8,'Billing']))
+        self.assertFalse(self.svc.customer_matches(self.client,order,[9,'Other']))
+        self.client.search_read.return_value[1]['commercial_partner_id']=[9,'Other']
+        self.assertFalse(self.svc.customer_matches(self.client,order,[8,'Billing']))
+
+    def test_original_method_and_equivalent_displayed(self):
+        self.tx.update(provider_code='razorpay',provider_id=[3,'Razorpay'],payment_method_id=[1,'VISA'])
+        result=self.svc.snapshot(1,1)
+        self.assertEqual(result['order_equivalent'],'100')
+        self.assertEqual(result['payment_matches'][0]['provider'],'Razorpay')
+        self.assertEqual(result['payment_matches'][0]['method'],'VISA')
+
+    def test_cross_currency_overpayment_cannot_exceed_order_equivalent(self):
+        self.tx.update(amount=150,provider_code='airwallex_transfer',airwallex_deposit_id='deposit-1',
+                       airwallex_payment_amount=112.5,airwallex_payment_currency_id=[2,'USD'])
+        self.svc.call=Mock(return_value={'reference':'NC100','status':'SETTLED','amount':112.5,'currency':'USD'})
+        result=self.svc.snapshot(1,1)
+        self.assertEqual(Decimal(result['remaining']),75)
+        with self.assertRaises(ValueError):amount_guard('75.01',result['remaining'],result['rounding'])
+
     def test_duplicate_deposit_is_blocked(self):
         self.tx.update(provider_code='airwallex_transfer',airwallex_deposit_id='deposit-1')
         self.transactions.append({**self.tx,'id':11})
-        self.svc.call=Mock(return_value={'status':'SETTLED','amount':100,'currency':'CAD'})
+        self.svc.call=Mock(return_value={'reference':'NC100','status':'SETTLED','amount':100,'currency':'CAD'})
         with self.assertRaises(ValueError):self.svc.snapshot(1,1)
     def test_posted_credit_note_is_deducted(self):
         self.order['invoice_ids']=[20]
