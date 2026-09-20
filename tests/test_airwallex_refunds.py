@@ -37,7 +37,7 @@ class MemoryDB:
             self.rows[params[-1]].update(status='UNKNOWN',last_error=params[0])
         elif 'SET status=?' in sql:
             keys = ['status','transfer_id','updated_at','last_error','fee_amount','fee_currency']
-            vals = [*params[:3], '', *params[3:5]]
+            vals = list(params[:6])
             self.rows[params[-1]].update(dict(zip(keys,vals)))
         elif 'WHERE request_id=?' in sql:
             self.result = self.rows.get(params[0])
@@ -284,6 +284,27 @@ class WorkflowTests(unittest.TestCase):
         result=self.service.submit(review['review_token']);self.assertEqual(result['status'],'UNKNOWN')
         self.service.submit(review['review_token']);self.assertEqual(self.service.call.call_count,len(self.calls)+1)
         self.assertEqual(next(iter(self.database.rows.values()))['amount'],'100')
+    def test_failed_transfer_reason_is_kept_in_history(self):
+        review=self.service.prepare(self.form())
+        result=self.service.submit(review['review_token'])
+        self.service.record_result(result['request_id'],{'request_id':result['request_id'],'id':'transfer-1',
+            'transfer_amount':100,'transfer_currency':'CAD','source_currency':'CAD','status':'FAILED',
+            'failure':{'code':'90301'}})
+        row=self.database.rows[result['request_id']]
+        self.assertEqual(row['status'],'FAILED');self.assertIn('does not match',row['last_error'])
+
+    def test_submission_rejection_retains_readable_reason_and_duplicate_guard(self):
+        from app.services.airwallex_refund_errors import RefundProviderError
+        review=self.service.prepare(self.form());original=self.service.call.side_effect
+        def call(method,path,**kw):
+            if path.endswith('/create'):raise RefundProviderError('The account holder name does not match the bank account.')
+            return original(method,path,**kw)
+        self.service.call.side_effect=call
+        result=self.service.submit(review['review_token'])
+        self.assertEqual(result['status'],'UNKNOWN');self.assertIn('name does not match',result['last_error'])
+        self.assertIn('Check its status',result['last_error'])
+        self.assertEqual(self.service.submit(review['review_token'])['request_id'],result['request_id'])
+
     def test_tampered_or_expired_review_rejected(self):
         token=self.service.prepare(self.form())['review_token']
         with self.assertRaises(ValueError):self.service.submit(token[:-8]+'tampered')

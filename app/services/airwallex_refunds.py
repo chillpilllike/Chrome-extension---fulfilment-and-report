@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ConfigDict
 
 from app.services.airwallex_api import server_request
+from app.services.airwallex_refund_errors import RefundProviderError, readable_error, transfer_failure, field_label
 from app.services.airwallex_hub import verify_webhook_signature
 
 ZERO = Decimal('0')
@@ -217,12 +218,7 @@ class AirwallexRefunds:
                 payload = response.json()
             except ValueError:
                 payload = {}
-            # Never return raw payloads: upstream errors can echo bank or credential data.
-            code = re.sub(r'[^A-Za-z0-9_]', '', str(payload.get('code', 'upstream_error')))[:80]
-            fields = [re.sub(r'[^a-zA-Z0-9_.]', '', str(e.get('source', '')))[:100]
-                      for e in payload.get('details', {}).get('errors', [])[:20]]
-            suffix = ': ' + ', '.join(fields) if any(fields) else ''
-            raise ValueError(f'Airwallex {response.status_code} ({code}){suffix}') from None
+            raise RefundProviderError(readable_error(payload, response.status_code)) from None
         except requests.RequestException:
             raise ValueError('Airwallex could not be reached. Refresh status before retrying.') from None
 
@@ -509,7 +505,7 @@ class AirwallexRefunds:
             value = (values.get(path, str(field.get('default') or '')) if item.get('enabled', True)
                      else str(field.get('default') or ''))[:500]
             if item.get('required') and not value.strip():
-                raise ValueError(f"Required recipient field: {field.get('label') or path}")
+                raise ValueError(f"Please complete: {field.get('label') or field_label(path)}.")
             if value:
                 set_path(recipient, path, value.strip())
         if recipient.get('beneficiary', {}).get('type') != 'BANK_ACCOUNT':
@@ -576,11 +572,11 @@ class AirwallexRefunds:
         try:
             result = self.call('POST', '/api/v1/transfers/create', data=transfer)
             self.record_result(rid, result)
-        except Exception:
+        except Exception as exc:
             # Do not automatically resend. Even HTTP errors can have an ambiguous result.
             with self.db() as c:
                 c.execute("UPDATE airwallex_refund_payouts SET status='UNKNOWN',last_error=?,updated_at=? WHERE request_id=?",
-                          ('Submission outcome requires reconciliation. Refresh status; do not create a replacement refund.',
+                          ((str(exc) + ' ' if isinstance(exc, RefundProviderError) else '') + 'We could not confirm whether the refund was sent. Check its status before sending another refund.',
                            datetime.now(timezone.utc).isoformat(), rid))
         with self.db() as c:
             row = c.execute('SELECT * FROM airwallex_refund_payouts WHERE request_id=?', (rid,)).fetchone()
@@ -595,9 +591,9 @@ class AirwallexRefunds:
                 or result.get('transfer_currency') != row['currency'] or not result.get('id')
                 or (row.get('funding_currency') and result.get('source_currency') != row['funding_currency'])):
                 raise ValueError('Transfer reconciliation mismatch.')
-            c.execute('''UPDATE airwallex_refund_payouts SET status=?,transfer_id=?,updated_at=?,last_error='',
+            c.execute('''UPDATE airwallex_refund_payouts SET status=?,transfer_id=?,updated_at=?,last_error=?,
                          fee_amount=?,fee_currency=? WHERE request_id=?''',
-                      (result.get('status') or 'UNKNOWN',result['id'],datetime.now(timezone.utc).isoformat(),
+                      (result.get('status') or 'UNKNOWN',result['id'],datetime.now(timezone.utc).isoformat(),transfer_failure(result),
                        str(result.get('fee_amount', '')),result.get('fee_currency'),rid))
 
     @staticmethod
@@ -686,7 +682,7 @@ class AirwallexRefunds:
                        'recipient': bank.get('account_name') or '', 'created_at': t.get('created_at'),
                        'fee_amount': str(t.get('fee_amount', '')), 'fee_currency': t.get('fee_currency'),
                        'funding_currency': t.get('source_currency') or t['transfer_currency'],
-                       'source': 'Manual Airwallex', 'mapping_status': state, 'last_error': ''}
+                       'source': 'Manual Airwallex', 'mapping_status': state, 'last_error': transfer_failure(t)}
                 if state == 'matched':
                     row.update(candidates[0]); mapped += 1
                 c.execute('''INSERT INTO airwallex_refund_external_history(account_key,transfer_id,payload,synced_at)

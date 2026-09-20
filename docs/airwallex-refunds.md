@@ -32,6 +32,8 @@ The refund cap continues to read live, complete Airwallex history on review and 
 
 ## Verification
 
+Provider validation and transfer failures are translated into staff-facing explanations and correction steps. Name mismatch, unsupported receiving currency, closed accounts, IBAN/bank-country mismatch and insufficient funding have specific messages. Field errors use readable labels. Failed app and imported transfers retain the translated reason in history. Unknown errors ask finance to check Airwallex instead of guessing the cause. Raw upstream messages, bank details, and wallet amounts are never echoed; uncertain submission outcomes remain reserved against duplicate refunds.
+
 - `python -m unittest discover -s tests -p 'test_airwallex*.py'`
 - `REFUND_TEST_POSTGRES_URL=... python -m unittest discover -s tests -p 'test_airwallex_refunds_postgres.py'` uses its own disposable schema and mocks all payouts.
 - `npm run build --prefix frontend`
@@ -46,3 +48,5 @@ The refund cap continues to read live, complete Airwallex history on review and 
 - Deposit reference and payer fields: https://www.airwallex.com/docs/api/2025-02-14/core_resources/deposits
 
 - Read-only FX rates: https://www.airwallex.com/docs/api/transactional_fx/rates
+- Error fields and validation rules: https://www.airwallex.com/docs/payouts/errors/transfer-error-codes
+- Transfer failure reasons: https://www.airwallex.com/docs/payouts/transfers/manage-transfers/failure-reasons
