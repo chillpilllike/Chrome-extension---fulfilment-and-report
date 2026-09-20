@@ -39714,10 +39714,13 @@ def api_after_order_cases(
     params.append(after_order_cutoff_date())
     normalized_status = clean_text(status).lower()
     from app.services.refund_queue import REFUND_QUEUE_SQL
+    from app.services.delivery_issue_queue import DELIVERY_ISSUE_QUEUE_SQL
     if normalized_status == "open":
         filters.append("after_order_cases.status NOT IN ('resolved', 'approved')")
     elif normalized_status == "refund_requests":
         filters.append(REFUND_QUEUE_SQL)
+    elif normalized_status == "reported_not_received":
+        filters.append(DELIVERY_ISSUE_QUEUE_SQL)
     elif normalized_status and normalized_status != "all":
         filters.append("after_order_cases.status=?")
         params.append(normalized_status)
@@ -39761,6 +39764,14 @@ def api_after_order_cases(
             (store_id,store_id,after_order_cutoff_date())).fetchone()['count']
     summary = {clean_text(row["status"]): int(row["count"] or 0) for row in summary_rows}
     summary['refund_requests'] = int(refund_count or 0)
+    with db() as conn:
+        delivery_issue_count = conn.execute(f"""SELECT COUNT(*) AS count FROM after_order_cases
+            WHERE (? IS NULL OR store_id=?) AND {DELIVERY_ISSUE_QUEUE_SQL}
+              AND COALESCE((SELECT MIN(NULLIF(order_lines.odoo_order_date,'')) FROM order_lines
+                            WHERE order_lines.store_id=after_order_cases.store_id
+                              AND order_lines.odoo_order_id=after_order_cases.odoo_order_id),'') >= ?""",
+            (store_id,store_id,after_order_cutoff_date())).fetchone()['count']
+    summary['reported_not_received'] = int(delivery_issue_count or 0)
     return {
         "ok": True,
         "rows": [after_order_case_dict(row) for row in rows],
