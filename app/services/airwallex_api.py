@@ -39,6 +39,11 @@ def execute_operation(operation, config):
     # A shared registration already exists: reuse it instead of creating a duplicate.
     if endpoint == '/api/v1/webhooks/create' and config.get('webhook_id'):
         return {'id': config['webhook_id'], 'secret': config['secret']}
+    return server_request(method, endpoint, config, params=params, data=data)
+
+
+def server_request(method, endpoint, config, *, params=None, data=None):
+    """Private transport. Callers must enforce their own operation and staff guards."""
     base = 'https://api.sandbox.airwallex.com' if config['state'] == 'test' else 'https://api.airwallex.com'
     identity = (base, config['client_id'], config.get('account_id', ''), config['api_key'])
     for attempt in range(2):
@@ -62,5 +67,5 @@ def execute_operation(operation, config):
                 _tokens.pop(identity, None)
             continue
         response.raise_for_status()
-        return response.json()
+        return response.json() if response.content else {}
     raise RuntimeError('Airwallex authentication failed')

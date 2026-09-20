@@ -684,6 +684,7 @@ FRONTEND_SHELL_PATHS = {
     "/cancelled-orders",
     "/chrome-queue",
     "/airwallex-activity",
+    "/airwallex-refunds",
     "/settings",
 }
 
@@ -26372,6 +26373,7 @@ def startup() -> None:
                 threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
+                threading.Thread(target=airwallex_refunds.loop, name="airwallex-refunds", daemon=True).start()
                 threading.Thread(target=airwallex_retry_loop, name="airwallex-webhook-retry", daemon=True).start()
                 threading.Thread(target=airwallex_provision_loop, name="airwallex-auto-setup", daemon=True).start()
                 if should_reindex_typesense:
@@ -44510,6 +44512,9 @@ async def api_airwallex_webhook(request: Request, background_tasks: BackgroundTa
         payload = json.loads(raw_body)
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, "Invalid Airwallex webhook JSON") from exc
+    if isinstance(payload, dict) and str(payload.get("name") or "").startswith("payout.transfer."):
+        background_tasks.add_task(airwallex_refunds.handle_webhook, payload)
+        return {"received": True}
     details = airwallex_webhook_event_details(payload)
     if details["event_name"] not in AIRWALLEX_HANDLED_EVENTS:
         return {"received": True, "ignored": True}
@@ -45455,6 +45460,13 @@ from app.support.post_order_chat import create_router as create_post_order_chat_
 app.include_router(create_post_order_chat_router(db,get_store,OdooClient))
 app.include_router(create_support_router(db=db, get_store=get_store, list_stores=list_stores,
                                        client_factory=OdooClient, admin_token=effective_admin_access_token))
+
+
+from app.services.airwallex_refunds import AirwallexRefunds
+airwallex_refunds = AirwallexRefunds(db=db, get_store=get_store, client_factory=OdooClient,
+    configuration=airwallex_default_connection,
+    staff_check=lambda request: bool(effective_admin_access_token()) and request_has_admin_access(request))
+app.include_router(airwallex_refunds.router())
 
 
 @app.get("/{frontend_path:path}")

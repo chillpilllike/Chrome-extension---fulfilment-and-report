@@ -44,6 +44,7 @@ import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { AfterCareWorkspace } from "@/components/AfterCareWorkspace"
 import { LineAlternativeButton, OrderCareTimeline } from "@/components/LineAlternatives"
+import { AirwallexRefunds } from "@/components/AirwallexRefunds"
 import { RelayPayments } from "@/components/RelayPayments"
 import { EmailLogWorkspace } from "@/components/EmailLogWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
@@ -101,6 +102,7 @@ const KNOWN_APP_PAGES = new Set([
   "inventory",
   "cancelled-orders",
   "airwallex-activity",
+  "airwallex-refunds",
   "settings",
 ])
 const PUBLIC_APP_PAGES = new Set(["tracking", "fulfilment-pending", "dispatch-status", "dispatch-sorting", "package-tracker", "package-pickups", "amazon-otp", "epost"])
@@ -1602,6 +1604,7 @@ const defaultUiCopy: UiCopy = {
   costly: { title: "Cost Review", description: "Approve or replace items with unfavorable cost." },
   "profit-loss": { title: "Profit / Loss", description: "Review fulfilment profitability and shipping costs." },
   accounting: { title: "Accounting", description: "Manage invoices, credit notes, and supporting documents." },
+  "airwallex-refunds": { title: "Airwallex Refunds", description: "Return customer payments with verified order limits and supported payout methods." },
   "airwallex-activity": { title: "Airwallex Activity", description: "Audit incoming Airwallex events and delivery to every connected Odoo store." },
   downloads: { title: "Downloads", description: "Export filtered data and download generated files." },
   "shopify-fulfilment": { title: "Shopify Fulfilment", description: "Queue Amazon-ordered Odoo sales into DTC or DTB Shopify fulfilment." },
@@ -5305,6 +5308,7 @@ function App() {
       icon: Database,
       items: [
         ["airwallex-activity", "Airwallex Activity", Database],
+        ["airwallex-refunds", "Airwallex Refunds", RefreshCw],
         ["profit-loss", "Profit / Loss", Database],
         ["accounting", "Accounting", Database],
         ["downloads", "Downloads", Download],
@@ -6430,6 +6434,7 @@ function App() {
             onResult={setModal}
           />
         )}
+        {page === "airwallex-refunds" && <AirwallexRefunds stores={stores} storeId={storeId} api={api} />}
         {page === "airwallex-activity" && (
           <AirwallexActivityPage onResult={setModal} />
         )}

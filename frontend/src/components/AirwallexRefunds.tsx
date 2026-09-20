@@ -1,0 +1,129 @@
+import { useEffect, useRef, useState } from 'react'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+
+type Props = { stores: {id:number;name:string}[]; storeId:string; api:<T>(path:string, options?:RequestInit)=>Promise<T> }
+type Order = {id:number;name:string;partner_id:[number,string];amount_total:number;currency_id:[number,string];state:string}
+type History = {id:string;amount:string;currency:string;status:string;reference:string;source:string;created_at:string}
+type Snapshot = {store_id:number;order_id:number;order_name:string;customer:string;order_value:string;order_currency:string;currency:string;paid:string;remaining:string;rounding:string;refunded_reserved:string;accounting_deduction:string;evidence:string;defaults:Record<string,string>;history:History[]}
+type Option = {label:string;value:string;description?:string}
+type SchemaField = {path:string;enabled?:boolean;required:boolean;field:{key:string;label:string;type:string;options?:Option[];default?:string;description?:string;refresh?:boolean}}
+type Schema = {fields:SchemaField[]}
+type Review = {review_token:string;order_name:string;amount:string;currency:string;recipient:string;destination:string;method:string;fees:string;available_balance:string}
+type Payout = {request_id:string;order_name:string;amount:string;currency:string;status:string;recipient:string;last_error:string;transfer_id:string;created_at:string;fee_amount?:string;fee_currency?:string}
+const selectors:Record<string,string> = {
+ 'beneficiary.bank_details.bank_country_code':'bank_country_code',
+ 'beneficiary.bank_details.account_currency':'account_currency',
+ 'beneficiary.entity_type':'entity_type', 'transfer_method':'transfer_method',
+ 'beneficiary.bank_details.local_clearing_system':'local_clearing_system',
+ 'beneficiary.address.country_code':'country_code', 'beneficiary.type':'beneficiary_type',
+}
+const format = (amount:string|number,currency:string) => {
+ try { return new Intl.NumberFormat(undefined,{style:'currency',currency}).format(Number(amount)) + ` ${currency}` }
+ catch { return `${amount} ${currency}` }
+}
+export function AirwallexRefunds({stores,storeId,api}:Props) {
+ const [selectedStore,setSelectedStore]=useState(storeId || ''), [query,setQuery]=useState('')
+ const [orders,setOrders]=useState<Order[]>([]),[snapshot,setSnapshot]=useState<Snapshot|null>(null)
+ const [schema,setSchema]=useState<Schema|null>(null),[values,setValues]=useState<Record<string,string>>({})
+ const [amount,setAmount]=useState(''),[editing,setEditing]=useState(false),[editDialog,setEditDialog]=useState(false),[editReason,setEditReason]=useState('')
+ const [recipientConfirmed,setRecipientConfirmed]=useState(false),[otherChecked,setOtherChecked]=useState(false)
+ const [review,setReview]=useState<Review|null>(null),[busy,setBusy]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState('')
+ const [history,setHistory]=useState<Payout[]>([]),[connected,setConnected]=useState(false),[loadingSchema,setLoadingSchema]=useState(false)
+ const generation=useRef(0), schemaGeneration=useRef(0), actionLock=useRef(false)
+ const post=<T,>(path:string,data:unknown)=>api<T>(`/api/airwallex/refunds${path}`,{method:'POST',body:JSON.stringify(data)})
+ const refreshHistory=()=>api<{rows:Payout[]}>('/api/airwallex/refunds/history').then(r=>setHistory(r.rows)).catch(e=>setError(String(e)))
+ useEffect(()=>{api<{connected:boolean}>('/api/airwallex/refunds/connection').then(r=>setConnected(r.connected)).catch(e=>setError(String(e)));void refreshHistory();const timer=setInterval(()=>void refreshHistory(),15000);return()=>clearInterval(timer)},[])
+ const reset=()=>{generation.current++;schemaGeneration.current++;setSnapshot(null);setSchema(null);setValues({});setReview(null);setOrders([]);setError('');setNotice('');setRecipientConfirmed(false);setOtherChecked(false);setEditing(false);setEditReason('')}
+ useEffect(()=>{reset();setSelectedStore(storeId||'')},[storeId])
+ async function loadSchema(next:Record<string,string>, initial=false) {
+  const ticket=++schemaGeneration.current
+  setLoadingSchema(true);setReview(null)
+  const params=Object.fromEntries(Object.entries(selectors).filter(([p])=>next[p]).map(([p,k])=>[k,next[p]]))
+  try {
+   const result=await post<Schema>('/schema',params)
+   if(ticket!==schemaGeneration.current)return
+   const merged={...next}
+   for(const f of result.fields){const path=f.path==='transfer_methods'?'transfer_method':f.path;if(!merged[path]&&f.field.default)merged[path]=f.field.default}
+   // First select Airwallex's default route, then fetch the full recipient requirements.
+   if(initial && !next.transfer_method && merged.transfer_method){await loadSchema(merged);return}
+   setSchema(result);setValues(merged)
+  }catch(e){if(ticket===schemaGeneration.current){setSchema(null);setError(String(e))}}
+  finally{if(ticket===schemaGeneration.current)setLoadingSchema(false)}
+ }
+ async function run(label:string, fn:()=>Promise<void>) {
+  if(actionLock.current)return
+  actionLock.current=true;setBusy(label);setError('');setNotice('')
+  try{await fn()}catch(e){setError(String(e))}finally{actionLock.current=false;setBusy('')}
+ }
+ async function choose(order:Order){
+  const ticket=++generation.current
+  setSnapshot(null);setSchema(null);setReview(null);setEditing(false);setEditReason('');setRecipientConfirmed(false);setOtherChecked(false)
+  await run('Checking payment and previous refunds',async()=>{
+   const s=await api<Snapshot>(`/api/airwallex/refunds/orders/${selectedStore}/${order.id}`)
+   if(ticket!==generation.current)return
+   setSnapshot(s);setAmount(s.remaining);setOrders([])
+   if(Number(s.remaining)>0)await loadSchema(s.defaults,true)
+  })
+ }
+ function changeField(path:string,value:string){
+  let next={...values,[path]:value};setReview(null);setRecipientConfirmed(false)
+  if(selectors[path]){
+   // Route changes discard stale bank details and reset bank-specific routing fields.
+   if(['bank_country_code','transfer_method','entity_type','local_clearing_system'].includes(selectors[path])){
+    next=Object.fromEntries(Object.entries(next).filter(([p])=>selectors[p]||p.startsWith('beneficiary.address.')||p==='beneficiary.bank_details.account_name'))
+    if(path==='beneficiary.bank_details.bank_country_code'||path==='transfer_method')delete next['beneficiary.bank_details.local_clearing_system']
+   }
+   setValues(next);void loadSchema(next)
+  }else setValues(next)
+ }
+ const canReview=!!snapshot&&!!schema&&!loadingSchema&&!busy&&recipientConfirmed&&otherChecked&&Number(amount)>0&&Number(amount)<=Number(snapshot.remaining)&&(!editing||!!editReason.trim())
+ const renderedFields=(schema?.fields||[]).filter(f=>f.enabled!==false&&f.path!=='nickname'&&f.path!=='beneficiary.type')
+ return <div className="space-y-5">
+  <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-5"><div><h2 className="text-xl font-semibold">Refund an order</h2><p className="mt-1 text-sm text-muted-foreground">Return customer funds using your shared Airwallex account.</p></div><span className={`rounded-full px-3 py-1 text-xs font-medium ${connected?'bg-emerald-50 text-emerald-800':'bg-amber-50 text-amber-800'}`}>{connected?'Airwallex connected':'Checking Airwallex connection'}</span></div>
+  {error&&<div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-800">{error}</div>}
+  {notice&&<div role="status" className="rounded-lg border bg-blue-50 p-4 text-blue-900">{notice}</div>}
+  {busy&&<p role="status" className="text-sm text-muted-foreground">{busy}…</p>}
+  <section className="rounded-xl border bg-card p-5 space-y-4"><h3 className="font-semibold">1. Select an order</h3>
+   <form className="flex flex-wrap items-end gap-3" onSubmit={e=>{e.preventDefault();void run('Searching orders',async()=>{const ticket=generation.current;const rows=(await api<{rows:Order[]}>(`/api/airwallex/refunds/orders?store_id=${selectedStore}&q=${encodeURIComponent(query)}`)).rows;if(ticket!==generation.current)return;setOrders(rows);if(!rows.length)setNotice('No matching orders found in this store.')})}}>
+    <label className="grid gap-1 text-sm">Store<select aria-label="Refund store" className="rounded-md border bg-background p-2" value={selectedStore} disabled={!!busy} onChange={e=>{reset();setSelectedStore(e.target.value)}}><option value="">Select store</option>{stores.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
+    <label className="grid gap-1 text-sm">Order number<Input placeholder="e.g. NC28342" value={query} disabled={!!busy} onChange={e=>setQuery(e.target.value)} /></label>
+    <Button type="submit" disabled={!selectedStore||query.trim().length<2||!!busy}>Find order</Button>
+   </form>
+   {orders.length>0&&<div className="divide-y rounded-lg border">{orders.map(o=><button type="button" className="flex w-full flex-wrap justify-between gap-2 p-3 text-left hover:bg-muted" key={o.id} disabled={!!busy} onClick={()=>void choose(o)}><span><strong>{o.name}</strong> · {o.partner_id[1]}</span><span>{format(o.amount_total,o.currency_id[1])} · {o.state}</span></button>)}</div>}
+  </section>
+  {snapshot&&<>
+   <section className="rounded-xl border bg-card p-5"><div className="flex flex-wrap justify-between gap-3"><div><h3 className="font-semibold">{snapshot.order_name} · {snapshot.customer}</h3><p className="mt-1 text-xs text-muted-foreground">Verified: {snapshot.evidence}</p></div><Button variant="outline" disabled={!!busy} onClick={()=>void choose({id:snapshot.order_id} as Order)}>Refresh payment checks</Button></div>
+    <div className="mt-5 grid gap-4 sm:grid-cols-4">{[['Order value',format(snapshot.order_value,snapshot.order_currency)],['Verified payment',format(snapshot.paid,snapshot.currency)],['Refunded / reserved',format(snapshot.refunded_reserved,snapshot.currency)],['Available to refund',format(snapshot.remaining,snapshot.currency)]].map(([label,value])=><div className="rounded-lg bg-muted/50 p-3" key={label}><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-lg font-semibold">{value}</p></div>)}</div>
+    {Number(snapshot.accounting_deduction)>0&&<p className="mt-3 text-sm">An additional {format(snapshot.accounting_deduction,snapshot.currency)} is held for Odoo credit notes or provider refunds.</p>}
+    {snapshot.history.length>0&&<details className="mt-4" open={Number(snapshot.remaining)===0}><summary className="cursor-pointer text-sm font-medium">Previous refunds and reservations ({snapshot.history.length})</summary><div className="mt-2 divide-y">{snapshot.history.map(h=><div className="flex flex-wrap justify-between gap-2 py-2 text-sm" key={h.id}><span>{h.reference} · {h.source}</span><span>{format(h.amount,h.currency)} · {h.status}</span></div>)}</div></details>}
+    {Number(snapshot.remaining)===0&&<p className="mt-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">No remaining amount is available to refund. Existing refunds and pending transfers are included.</p>}
+   </section>
+   {Number(snapshot.remaining)>0&&<section className="rounded-xl border bg-card p-5 space-y-5"><h3 className="font-semibold">2. Amount and recipient</h3>
+    <div className="flex flex-wrap items-end gap-3"><label className="grid gap-1 text-sm">Refund amount<Input aria-label="Refund amount" inputMode="decimal" type="number" min={snapshot.rounding} max={snapshot.remaining} step={snapshot.rounding} value={amount} disabled={!editing||!!busy} onChange={e=>{setAmount(e.target.value);setReview(null)}} /></label><label className="grid gap-1 text-sm">Currency<Input value={snapshot.currency} readOnly className="w-24" /></label><Button variant="outline" disabled={!!busy} onClick={()=>setEditDialog(true)}>Edit cost</Button></div>
+    {editing&&<label className="grid gap-1 text-sm">Reason for changing the amount<Input value={editReason} onChange={e=>{setEditReason(e.target.value);setReview(null)}} placeholder="e.g. Partial refund for one unavailable item" /></label>}
+    {snapshot.currency!==snapshot.order_currency&&<p className="rounded-lg bg-blue-50 p-3 text-sm">The customer paid in {snapshot.currency}. This refund uses the original locked payment conversion from {snapshot.order_currency}.</p>}
+    <p className="text-sm text-muted-foreground">Choose the recipient’s bank country and a supported method. Confirm the account details with the customer. The business pays Airwallex fees in addition to the refund amount.</p>
+    {loadingSchema&&<p role="status" className="text-sm">Loading Airwallex’s supported methods and required fields…</p>}
+    <fieldset disabled={loadingSchema||!!busy} className="grid gap-4 md:grid-cols-2">
+     {renderedFields.map(f=>{
+      const path=f.path==='transfer_methods'?'transfer_method':f.path, value=values[path]||'', fixed=path==='beneficiary.bank_details.account_currency'||(/account_routing_type[12]$/.test(path)&&!f.field.options?.length)
+      const options=f.field.options, choice=options?.find(o=>o.value===value)
+      return <label className="grid content-start gap-1 text-sm" key={path}>{f.field.label}{f.required?' *':''}
+       {options?.length?<select className="w-full rounded-md border bg-background p-2" value={value} disabled={fixed} onChange={e=>changeField(path,e.target.value)}><option value="">Select…</option>{options.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}</select>:<Input value={value} readOnly={fixed} maxLength={500} type={path.endsWith('security_question_answer')?'password':'text'} autoComplete="off" onChange={e=>changeField(path,e.target.value)}/>}
+       {(choice?.description||f.field.description)&&<span className="text-xs whitespace-pre-line text-muted-foreground">{choice?.description||f.field.description}</span>}
+      </label>
+     })}
+    </fieldset>
+    <div className="space-y-3 border-t pt-4 text-sm"><label className="flex items-start gap-2"><input className="mt-1" type="checkbox" checked={recipientConfirmed} onChange={e=>{setRecipientConfirmed(e.target.checked);setReview(null)}}/>I verified that these recipient details belong to this customer.</label><label className="flex items-start gap-2"><input className="mt-1" type="checkbox" checked={otherChecked} onChange={e=>{setOtherChecked(e.target.checked);setReview(null)}}/>I checked for refunds made through other payment providers or without an order reference. Any such refunds are recorded in Odoo before proceeding.</label></div>
+    <Button disabled={!canReview} onClick={()=>void run('Validating refund with Airwallex',async()=>{const ticket=generation.current;const checked=await post<Review>('/review',{store_id:snapshot.store_id,order_id:snapshot.order_id,amount,fields:values,edit_acknowledged:editing,edit_reason:editReason,recipient_confirmed:recipientConfirmed,other_refunds_checked:otherChecked});if(ticket===generation.current)setReview(checked)})}>Review refund</Button>
+   </section>}
+  </>}
+  <section className="rounded-xl border bg-card p-5"><div className="flex justify-between gap-2"><h3 className="font-semibold">Refund requests from this app</h3><Button variant="outline" disabled={!!busy} onClick={()=>void refreshHistory()}>Refresh list</Button></div><p className="mt-2 text-sm text-muted-foreground">Submitting, processing and uncertain requests reserve the amount. A failed transfer requires finance reconciliation before sending a replacement.</p>
+   {!history.length?<p className="py-5 text-sm text-muted-foreground">No refunds submitted from this page yet.</p>:<div className="mt-4 overflow-x-auto"><table className="w-full text-sm"><thead><tr className="border-b text-left"><th className="p-2">Order / recipient</th><th className="p-2">Amount</th><th className="p-2">Status</th><th className="p-2">Action</th></tr></thead><tbody>{history.map(h=><tr className="border-b" key={h.request_id}><td className="p-2"><strong>{h.order_name}</strong><br/>{h.recipient}</td><td className="p-2">{format(h.amount,h.currency)}{h.fee_amount&&<small className="block">Fee: {h.fee_amount} {h.fee_currency}</small>}</td><td className="p-2">{h.status}{h.last_error&&<p className="max-w-xs text-xs text-amber-800">{h.last_error}</p>}<small className="block text-muted-foreground">{h.transfer_id||h.request_id}</small></td><td className="p-2"><Button variant="outline" disabled={!!busy} onClick={()=>void run('Checking transfer status',async()=>{await post(`/${h.request_id}/refresh`,{});await refreshHistory()})}>Check status</Button></td></tr>)}</tbody></table></div>}
+  </section>
+  <Dialog open={editDialog} onOpenChange={setEditDialog}><DialogContent><DialogHeader><DialogTitle>Be careful when changing the refund amount</DialogTitle><DialogDescription>You are changing how much money will be returned to the customer. Check the order, currency and remaining refundable balance. You cannot exceed the remaining order value.</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={()=>setEditDialog(false)}>Cancel</Button><Button onClick={()=>{setEditing(true);setReview(null);setEditDialog(false)}}>I understand — edit amount</Button></DialogFooter></DialogContent></Dialog>
+  <Dialog open={!!review} onOpenChange={open=>{if(!open&&!busy)setReview(null)}}><DialogContent><DialogHeader><DialogTitle>Confirm refund transfer</DialogTitle><DialogDescription>Check the recipient and amount carefully. Submitting sends a real payment from your Airwallex account.</DialogDescription></DialogHeader>{error&&<p role="alert" className="text-sm text-red-700">{error}</p>}{review&&<div className="space-y-3"><p className="text-2xl font-semibold">{format(review.amount,review.currency)}</p><p>{review.order_name} → {review.recipient}</p><p className="text-sm">{review.method} · {review.destination}</p><p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{review.fees}</p><p className="text-xs text-muted-foreground">This review expires after 10 minutes. The refund limit is checked again when you submit.</p></div>}<DialogFooter><Button variant="outline" disabled={!!busy} onClick={()=>setReview(null)}>Go back</Button><Button disabled={!!busy||!review} onClick={()=>void run('Submitting refund',async()=>{if(!review)return;const result=await post<Payout>('/submit',{review_token:review.review_token,confirmed:true});setReview(null);setSnapshot(null);setSchema(null);setNotice(`${result.order_name}: ${result.status}. ${result.last_error||'The transfer status will be tracked below.'}`);await refreshHistory()})}>{busy?'Submitting…':'Send refund'}</Button></DialogFooter></DialogContent></Dialog>
+ </div>
+}
