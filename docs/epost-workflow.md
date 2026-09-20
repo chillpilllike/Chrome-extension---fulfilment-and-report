@@ -32,3 +32,16 @@ Exports use the same queue filtering as the page and include work queue, suggest
 ## Validation
 
 `tests/test_epost_workflow.py` covers blank/lookup cases, labels, processing-center messages, negated delivery, exceptions, explicit loss, date boundaries, invalid dates, refunds and exclusive queues. No production shipment is modified by these tests.
+
+## Count freshness (20 September 2026)
+
+The tracking API now reads saved records on every request for all stores, queues,
+searches, pages and reloads. It no longer caches complete responses by filter:
+those responses included independent store-wide summaries, and Redis's one-hour
+stale fallback replayed pre-scan counts (live reproduction: 16 → 13 when switching
+from Tracking not found to Needs attention). Counts can still change when saved
+shipment data actually changes.
+
+Validation: all 26 `test_epost*.py` tests pass. The new freshness regressions fail
+against the preceding implementation for every queue, plus reload/search/page
+requests following tracking and archive changes.

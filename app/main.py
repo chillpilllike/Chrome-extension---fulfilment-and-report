@@ -39075,10 +39075,9 @@ def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: 
     stale_days = max(1, min(90, int(stale_days or 10)))
     q = clean_text(q)
     search_engine = "postgres"
-    cache_key = ("epost-tracking", store_id, page, per_page, status, stale_days, bool(stale_only), q, bool(include_summary))
-    cached = fast_page_cache_get(cache_key)
-    if cached is not None:
-        return cached
+    # Queue-specific cached responses contain different store snapshots. In
+    # particular, Redis stale fallback can replay pre-scan counts for an hour.
+    # Always read saved records for every queue, search, page and reload.
     try:
         rows, total, page, per_page = paged_epost_tracking_rows(store_id, page, per_page, status, stale_days, stale_only, q)
     except Exception as exc:
@@ -39096,7 +39095,7 @@ def api_epost_tracking(store_id: Optional[int] = None, page: int = 1, per_page: 
             for key in summary:
                 if matches_queue(item, key):
                     summary[key] += 1
-    return fast_page_cache_set(cache_key, {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only, "q": q, "summary": summary}, 90)
+    return {"ok": True, "rows": rows, "page": page, "per_page": per_page, "total": total, "search_engine": search_engine, "stale_days": stale_days, "stale_only": stale_only, "q": q, "summary": summary}
 
 
 @app.post("/api/epost/tracking/{tracking_id}/refund")
