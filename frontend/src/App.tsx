@@ -44,6 +44,7 @@ import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { AfterCareWorkspace } from "@/components/AfterCareWorkspace"
 import { ManualRefundPanel } from "@/components/ManualRefundPanel"
+import { WelcomeTiming } from "@/components/WelcomeTiming"
 import { LineAlternativeButton, OrderCareTimeline } from "@/components/LineAlternatives"
 import { AirwallexRefunds } from "@/components/AirwallexRefunds"
 import { RelayPayments } from "@/components/RelayPayments"
@@ -12562,6 +12563,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
         </TeamTools>
       }>
 
+      <WelcomeTiming request={api} storeId={storeId}/>
       <div className="epost-selection"><span>Highest severity first · review a case before taking action</span><span>{searchQuery ? `Search: “${searchQuery}”` : "All orders in this queue"}</span></div>
       <Table className="epost-work-table care-work-table">
         <TableHeader><TableRow><TableHead>Order / store</TableHead><TableHead>Issue / evidence</TableHead><TableHead>Customer request</TableHead><TableHead>Next action</TableHead><TableHead>Manage</TableHead></TableRow></TableHeader>

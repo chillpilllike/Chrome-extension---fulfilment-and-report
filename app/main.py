@@ -26370,11 +26370,13 @@ def startup() -> None:
                 resume_interrupted_shopify_tracking_jobs()
                 threading.Thread(target=backfill_cxml_order_references, daemon=True).start()
                 threading.Thread(target=autosync_loop, daemon=True).start()
+                threading.Thread(target=order_import_loop, name="order-import-scheduler", daemon=True).start()
                 threading.Thread(target=backup_loop, daemon=True).start()
                 threading.Thread(target=amazon_otp_loop, daemon=True).start()
                 threading.Thread(target=odoo_chatter_outbox_schedule_loop, daemon=True).start()
                 threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
+                threading.Thread(target=welcome_email_loop, name="new-order-welcome", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
                 threading.Thread(target=airwallex_refunds.loop, name="airwallex-refunds", daemon=True).start()
                 threading.Thread(target=airwallex_retry_loop, name="airwallex-webhook-retry", daemon=True).start()
@@ -26889,24 +26891,32 @@ def queue_auto_pull_jobs(days: int, limit: int, batch_size: int) -> dict[str, An
     }
 
 
-def autosync_loop() -> None:
+def order_import_loop() -> None:
+    # Queueing imports is independent of slow Chrome/carrier reconciliation.
     last_run = time.time()
+    while True:
+        try:
+            with db() as guard:
+                if guard.execute('SELECT pg_try_advisory_xact_lock(781905440) AS locked').fetchone()['locked']:
+                    interval = int(float(get_service_settings().get('autosync_interval_minutes') or 0))
+                    elapsed = max(time.time()-last_run,setting_elapsed_seconds('autosync_last_run_at',interval*60))
+                    if interval > 0 and elapsed >= interval*60:
+                        result = queue_auto_pull_jobs(stored_pull_days(7),auto_pull_limit(stored_pull_limit()),stored_pull_batch_size())
+                        set_setting('autosync_last_message',result['message'])
+                        set_setting('autosync_last_run_at',utc_now())
+                        last_run = time.time()
+        except Exception as exc:
+            print(f"Order import scheduler needs attention: {clean_error_message(exc)}",flush=True)
+        time.sleep(30)
+
+
+def autosync_loop() -> None:
     last_chrome_run = time.time()
     last_cancelled_run = time.time()
     last_epost_run = 0.0
     while True:
         try:
             settings = get_service_settings()
-            interval = int(float(settings.get("autosync_interval_minutes") or 0))
-            elapsed = max(time.time() - last_run, setting_elapsed_seconds("autosync_last_run_at", interval * 60))
-            if interval > 0 and elapsed >= interval * 60:
-                days = stored_pull_days(7)
-                limit = auto_pull_limit(stored_pull_limit())
-                batch_size = stored_pull_batch_size()
-                result = queue_auto_pull_jobs(days, limit, batch_size)
-                set_setting("autosync_last_message", result["message"])
-                set_setting("autosync_last_run_at", utc_now())
-                last_run = time.time()
             raw_chrome_interval = int(float(settings.get("auto_chrome_fulfil_interval_minutes") or 0))
             chrome_enabled = clean_text(settings.get("auto_chrome_fulfil_enabled")).lower() in {"1", "true", "yes", "on", "enabled"}
             chrome_interval = max(1, raw_chrome_interval or 5)
@@ -41406,7 +41416,9 @@ def after_order_automation_loop() -> None:
     while True:
         time.sleep(60)
         try:
-            run_welcome_email_checks()
+            request = after_order_monitor_request()
+            if request:
+                delivery_followups.run_checks(request)
             # This independent monitor can only prepare approval-held drafts.
             # Broad automation and financial execution remain disabled.
             if clean_text(get_service_settings().get('after_order_warehouse_delay_enabled')) == 'true':
@@ -41418,14 +41430,33 @@ def after_order_automation_loop() -> None:
             print(f"After-order automation needs attention: {clean_error_message(exc)}", flush=True)
 
 
-def run_welcome_email_checks():
+def after_order_monitor_request():
     base = clean_text(get_service_settings().get('after_order_public_base_url') or os.getenv('AFTER_ORDER_PUBLIC_BASE_URL', ''))
     parsed = urlparse(base)
     if parsed.scheme != 'https' or not parsed.hostname:
         return
-    request = Request({'type':'http','method':'POST','scheme':'https','server':(parsed.hostname,443),'path':'/','root_path':'','query_string':b'','headers':[(b'host',parsed.hostname.encode())]})
-    delivery_followups.run_checks(request)
-    return welcome_emails.run_checks(request)
+    return Request({'type':'http','method':'POST','scheme':'https','server':(parsed.hostname,443),'path':'/','root_path':'','query_string':b'','headers':[(b'host',parsed.hostname.encode())]})
+
+
+def run_welcome_email_checks():
+    request = after_order_monitor_request()
+    if request:
+        return welcome_emails.run_checks(request)
+
+
+def welcome_email_loop() -> None:
+    # Welcome emails never wait behind carrier reconciliation or warehouse work.
+    while True:
+        try:
+            run_welcome_email_checks()
+        except Exception as exc:
+            print(f"New-order welcome check failed: {clean_error_message(exc)}", flush=True)
+        time.sleep(30)
+
+
+@app.get('/api/after-order/welcome-timing')
+def api_welcome_timing(store_id: Optional[int] = None):
+    return welcome_emails.timing(store_id)
 
 
 def run_warehouse_dispatch_checks() -> dict[str, Any]:
