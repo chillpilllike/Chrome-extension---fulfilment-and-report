@@ -40436,6 +40436,11 @@ def email_log_row(row: Any) -> dict[str, Any]:
     item["retry_block_reason"] = retry_block_reason(item, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
     item["can_retry"] = not item["retry_block_reason"]
     item["can_approve"] = item.get("provider") in {"resend", "odoo"} and item.get("status") in {"awaiting_approval", "failed"}
+    if item.get('template_kind') == 'refund_confirmed':
+        item['can_retry'] = item['can_approve'] = item.get('status') == 'failed' and int(item.get('attempt_count') or 0) < 5
+        item['retry_block_reason'] = 'Refund confirmations are managed by the refund email worker. Ask the administrator to review a failed or uncertain delivery.'
+    context = json.loads(item.pop('context_json', '{}') or '{}')
+    item['website_name'] = context.get('website_name') or item.get('sender_domain') or 'Website not recorded'
     item["approval_digest"] = hashlib.sha256(str(item.get("payload_json") or "").encode()).hexdigest()
     if item.get("status") == "awaiting_approval":
         item["status_label"] = "Awaiting team approval"
@@ -40447,7 +40452,7 @@ def email_log_row(row: Any) -> dict[str, Any]:
 
 @app.get("/api/after-order/emails")
 def api_after_order_email_log(store_id: Optional[int] = None, page: int = 1, per_page: int = 30,
-                            status: str = "all", mode: str = "all", q: str = "", date_from: str = "", date_to: str = "") -> dict[str, Any]:
+                            status: str = "all", mode: str = "all", q: str = "", date_from: str = "", date_to: str = "", website_id: Optional[int] = None) -> dict[str, Any]:
     queues = {"all": [], "attention": ["failed", "delivery_unknown", "bounced", "complained", "delivery_delayed"], "failed": ["failed"], "retrying": ["retrying", "sending"], "sent": ["sent", "sent_test"], "delivered": ["delivered"], "suppressed": ["bounced", "complained"], "uncertain": ["delivery_unknown", "delivery_delayed"], "preview": ["test_preview"]}
     queues["approval"] = ["awaiting_approval"]
     if status not in queues or mode not in {"all", "test", "live"}:
@@ -40463,12 +40468,17 @@ def api_after_order_email_log(store_id: Optional[int] = None, page: int = 1, per
     page, per_page, offset = pagination_bounds(page, min(100, max(1, per_page)))
     filters = ["(? IS NULL OR c.store_id=?)"]
     params: list[Any] = [store_id, store_id]
+    if website_id is not None:
+        if store_id is None:
+            raise HTTPException(400, 'Select a store connection before selecting a website.')
+        filters.append('c.website_id=?')
+        params.append(website_id)
     if mode == "test":
         filters.append("(m.test_mode=1 OR m.status IN ('sent_test', 'test_preview'))")
     elif mode == "live":
         filters.append("(m.test_mode=0 AND m.status NOT IN ('sent_test', 'test_preview'))")
     if clean_text(q):
-        filters.append("UPPER(COALESCE(m.subject,'') || ' ' || COALESCE(m.recipient,'') || ' ' || COALESCE(m.sender,'') || ' ' || COALESCE(c.odoo_order_name,'') || ' ' || s.name) LIKE ?")
+        filters.append("UPPER(COALESCE(m.subject,'') || ' ' || COALESCE(m.recipient,'') || ' ' || COALESCE(m.sender,'') || ' ' || COALESCE(c.odoo_order_name,'') || ' ' || s.name || ' ' || COALESCE(c.sender_domain,'')) LIKE ?")
         params.append(f"%{clean_text(q).upper()}%")
     if date_from:
         filters.append("SUBSTR(m.created_at,1,10)>=?")
@@ -40487,16 +40497,20 @@ def api_after_order_email_log(store_id: Optional[int] = None, page: int = 1, per
             params.extend(queues[status])
         rows = conn.execute(f"""SELECT m.id,m.case_id,m.provider,m.recipient,m.sender,m.subject,m.status,m.last_error,
                 m.provider_message_id,m.test_mode,m.attempt_count,m.created_at,m.updated_at,m.template_kind,
-                m.payload_json,m.request_fingerprint,c.store_id,c.website_id,c.odoo_order_name,s.name AS store_name
+                m.payload_json,m.request_fingerprint,c.store_id,c.website_id,c.odoo_order_name,c.context_json,c.sender_domain,s.name AS store_name
                 {source} WHERE {where} ORDER BY m.created_at DESC,m.id DESC LIMIT ? OFFSET ?""", [*params, per_page, offset]).fetchall()
-    return {"ok": True, "rows": [email_log_row(row) for row in rows], "total": summary[status], "summary": summary,
+    with db() as conn:
+        websites = rows_to_dicts(conn.execute("""SELECT DISTINCT c.website_id,c.sender_domain
+            FROM after_order_cases c JOIN after_order_messages m ON m.case_id=c.id
+            WHERE c.store_id=? AND c.website_id IS NOT NULL ORDER BY c.sender_domain""", (store_id,)).fetchall()) if store_id else []
+    return {"ok": True, "websites": websites, "rows": [email_log_row(row) for row in rows], "total": summary[status], "summary": summary,
             "page": page, "per_page": per_page, "test_mode": after_order_email_test_mode(), "test_recipient": after_order_test_recipient()}
 
 
 @app.get("/api/after-order/emails/{message_id}")
 def api_after_order_email_detail(message_id: int, store_id: Optional[int] = None) -> dict[str, Any]:
     with db() as conn:
-        row = conn.execute("""SELECT m.*,c.store_id,c.website_id,c.odoo_order_name,s.name AS store_name
+        row = conn.execute("""SELECT m.*,c.store_id,c.website_id,c.odoo_order_name,c.context_json,c.sender_domain,s.name AS store_name
             FROM after_order_messages m JOIN after_order_cases c ON c.id=m.case_id JOIN stores s ON s.id=c.store_id
             WHERE m.id=? AND (? IS NULL OR c.store_id=?)""", (message_id, store_id, store_id)).fetchone()
         if not row:
@@ -40535,6 +40549,12 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    if original.get('template_kind') == 'refund_confirmed':
+        require_after_order_case_in_scope(after_order_case_by_id(int(original['case_id'])))
+        try:
+            return refund_emails.approve_retry(original, approval_digest)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
     if str(original.get("template_kind") or "").startswith("relay_"):
         raise HTTPException(409, "Relay retries use the payment worker and its original idempotency key.")
     if policy_exception:
@@ -45480,8 +45500,12 @@ app.include_router(create_support_router(db=db, get_store=get_store, list_stores
 
 
 from app.services.airwallex_refunds import AirwallexRefunds
+from app.services.refund_emails import RefundEmails
+refund_emails = RefundEmails(db=db, get_store=get_store, client_factory=OdooClient,
+    test_mode=lambda: get_setting('airwallex_refund_email_enabled','false') != 'true',
+    suppressed=care_delivery.suppressed, list_stores=list_stores)
 airwallex_refunds = AirwallexRefunds(db=db, get_store=get_store, client_factory=OdooClient, list_stores=list_stores,
-    configuration=airwallex_default_connection,
+    configuration=airwallex_default_connection, notifications=refund_emails,
     staff_check=lambda request: bool(effective_admin_access_token()) and request_has_admin_access(request))
 app.include_router(airwallex_refunds.router())
 

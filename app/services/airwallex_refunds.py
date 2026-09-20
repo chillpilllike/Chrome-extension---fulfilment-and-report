@@ -168,11 +168,14 @@ class SubmitInput(BaseModel):
 
 
 class AirwallexRefunds:
-    def __init__(self, *, db, get_store, client_factory, configuration, staff_check, list_stores=None):
+    def __init__(self, *, db, get_store, client_factory, configuration, staff_check, list_stores=None, notifications=None):
         self.db, self.get_store, self.client_factory = db, get_store, client_factory
         self.configuration, self.staff_check = configuration, staff_check
         self.list_stores = list_stores or (lambda: [])
         self.last_history_sync = 0
+        self.notifications = notifications
+        if notifications:
+            notifications.refunds = self
 
     def init_db(self):
         with self.db() as c:
@@ -188,9 +191,14 @@ class AirwallexRefunds:
                 account_key TEXT NOT NULL, transfer_id TEXT NOT NULL, payload TEXT NOT NULL,
                 synced_at TEXT NOT NULL, PRIMARY KEY(account_key,transfer_id))''')
             c.execute("ALTER TABLE airwallex_refund_payouts ADD COLUMN IF NOT EXISTS funding_currency TEXT NOT NULL DEFAULT ''")
+            c.execute("ALTER TABLE airwallex_refund_payouts ADD COLUMN IF NOT EXISTS notify_customer INTEGER NOT NULL DEFAULT 0")
+            c.execute("ALTER TABLE airwallex_refund_payouts ADD COLUMN IF NOT EXISTS email_destination TEXT NOT NULL DEFAULT '{}'")
             c.execute('CREATE INDEX IF NOT EXISTS airwallex_refund_order_idx ON airwallex_refund_payouts(order_key)')
             c.execute('''CREATE TABLE IF NOT EXISTS airwallex_refund_webhook (
                 account_key TEXT PRIMARY KEY, webhook_id TEXT NOT NULL, secret TEXT NOT NULL)''')
+
+        if self.notifications:
+            self.notifications.init_db()
 
     def auth(self, request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
@@ -585,6 +593,10 @@ class AirwallexRefunds:
                 VALUES (?,?,?,?,?,?,?,?,'SUBMITTING',?,?,?,?,?,?,?)''',
                 (rid,key,payload['store_id'],payload['order_id'],fresh['order_name'],payload['account_key'],
                  payload['amount'],fresh['currency'],recipient,payload['edit_reason'],fingerprint,now,now,actor,transfer.get('source_currency') or fresh['currency']))
+            if self.notifications:
+                from app.services.refund_emails import masked_destination
+                c.execute('UPDATE airwallex_refund_payouts SET notify_customer=1,email_destination=? WHERE request_id=?',
+                          (json.dumps(masked_destination(transfer)),rid))
         try:
             result = self.call('POST', '/api/v1/transfers/create', data=transfer)
             self.record_result(rid, result)
@@ -611,11 +623,13 @@ class AirwallexRefunds:
                          fee_amount=?,fee_currency=? WHERE request_id=?''',
                       (result.get('status') or 'UNKNOWN',result['id'],datetime.now(timezone.utc).isoformat(),transfer_failure(result),
                        str(result.get('fee_amount', '')),result.get('fee_currency'),rid))
+            if self.notifications:
+                self.notifications.enqueue(c,row,result)
 
     @staticmethod
     def public_row(row):
         return {k: str(v) if isinstance(v, Decimal) else v for k,v in dict(row).items()
-                if k not in {'payload_hash','account_key','order_key'}}
+                if k not in {'payload_hash','account_key','order_key','email_destination','notify_customer'}}
 
     def refresh(self, rid):
         with self.db() as c:
@@ -715,6 +729,13 @@ class AirwallexRefunds:
         ids = {row.get('transfer_id') for row in local if row.get('transfer_id')}
         requests = {row['request_id'] for row in local}
         rows = [{**self.public_row(row), 'source': 'App', 'mapping_status': 'matched'} for row in local]
+        if self.notifications:
+            with self.db() as c:
+                jobs = {r['request_id']:r for r in c.execute('SELECT request_id,state,last_error,message_id FROM airwallex_refund_emails').fetchall()}
+            for row in rows:
+                job = jobs.get(row['request_id'])
+                if job:
+                    row.update(email_status=job['state'],email_error=job['last_error'],email_message_id=job['message_id'])
         for item in external:
             row = json.loads(item['payload'])
             if row['transfer_id'] not in ids and row['request_id'] not in requests:
@@ -758,6 +779,8 @@ class AirwallexRefunds:
             try:
                 self.init_db()
                 self.poll()
+                if self.notifications:
+                    self.notifications.cycle()
                 if time.monotonic() - self.last_history_sync > 300:
                     self.sync_history()
             except Exception:

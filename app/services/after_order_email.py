@@ -1,5 +1,6 @@
 """Shared, table-based customer email layout; no application or network access."""
 from html import escape
+from decimal import Decimal
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 
@@ -43,6 +44,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     if kind == "tracking" and context.get("risk_state") == "suspected_lost":
         kind = "package_lost"
     content = {
+        "refund_confirmed": ("REFUND CONFIRMED", "Your refund has been sent.", "Your refund has been processed", "We’ve successfully sent a refund for your order. You’ll find the amount and destination below.", "When will the credit appear?", "The credit may appear in your account within 24–48 hours after the successful refund. Timing depends on your bank. If it has not appeared after this time, reply to this email and our team will help."),
         "relay_request": ("PAYMENT REQUEST", "Your invoice is ready.", "Complete payment", "Complete your order securely using the payment button below. Your invoice will be charged in USD at the amount shown.", "Complete your payment", "Your payment link belongs to this order. If you return later, use this same link."),
         "relay_received": ("ORDER CONFIRMED", "Thank you for your payment.", "Payment received", "Relay has reported your payment initiation and your order is confirmed. Bank settlement is still processing.", "We’re here to help", "Keep your order number handy if you contact our team."),
         "new_order_welcome": ("THANK YOU", "Thank you for your order!", "Thank you for your order", "We’ve received your order and will begin processing it soon. We’re here to help whenever you need us.", "Here to help", "Keep your order number handy when contacting us so we can help you more quickly."),
@@ -124,6 +126,20 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
 
     panel = ""
     detail_lines = []
+    if kind == 'refund_confirmed':
+        refund = context['refund']
+        fields = [('Refund amount', format(Decimal(str(refund['amount'])).normalize(), 'f') + ' ' + str(refund['currency'])),
+                  ('Credited to', refund.get('holder') or 'Your verified recipient'),
+                  ('Destination account', refund.get('account') or 'Verified recipient account'),
+                  ('Bank', refund.get('bank') or ''),
+                  ('Refund reference', refund.get('reference') or '')]
+        panel = '<table role="presentation" width="100%" cellpadding="12" cellspacing="0" bgcolor="#eeeeee" style="margin-top:28px">'
+        for label, value in fields:
+            if value:
+                panel += '<tr><td style="font-size:13px;color:#637167">' + escape(label) + '</td><td style="font-size:14px;font-weight:600;word-break:break-word">' + escape(str(value)) + '</td></tr>'
+                detail_lines.append(label + ': ' + str(value))
+        panel += '</table>'
+        detail_lines.append('Only the last four account characters are shown for your privacy.')
     if kind == 'new_order_welcome':
         domain = str(case.get('sender_domain') or '').strip().lower()
         parsed_domain = urlsplit('https://' + domain)

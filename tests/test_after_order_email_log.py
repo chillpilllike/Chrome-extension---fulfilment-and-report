@@ -54,11 +54,11 @@ class LogHandlersTests(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript("""
         CREATE TABLE stores (id INTEGER PRIMARY KEY, name TEXT);
-        CREATE TABLE after_order_cases (id INTEGER PRIMARY KEY,store_id INTEGER,website_id INTEGER,odoo_order_name TEXT);
+        CREATE TABLE after_order_cases (id INTEGER PRIMARY KEY,store_id INTEGER,website_id INTEGER,odoo_order_name TEXT,context_json TEXT DEFAULT '{}',sender_domain TEXT);
         CREATE TABLE after_order_messages (id INTEGER PRIMARY KEY,case_id INTEGER,provider TEXT,recipient TEXT,sender TEXT,subject TEXT,status TEXT,last_error TEXT,provider_message_id TEXT,test_mode INTEGER,attempt_count INTEGER,created_at TEXT,updated_at TEXT,template_kind TEXT,payload_json TEXT,request_fingerprint TEXT,idempotency_key TEXT,html_preview TEXT);
         CREATE TABLE after_order_email_attempts (id INTEGER PRIMARY KEY,message_id INTEGER,attempt_number INTEGER,status TEXT,error TEXT,provider_message_id TEXT,created_at TEXT,updated_at TEXT,UNIQUE(message_id,attempt_number));
         INSERT INTO stores VALUES (1,'Demo Australia'),(2,'Demo Canada');
-        INSERT INTO after_order_cases VALUES (1,1,4,'DEMO-100'),(2,2,5,'DEMO-200');
+        INSERT INTO after_order_cases(id,store_id,website_id,odoo_order_name) VALUES (1,1,4,'DEMO-100'),(2,2,5,'DEMO-200');
         """)
         now = datetime.now(timezone.utc).isoformat()
         for identifier, case_id in ((1,1),(2,2)):
@@ -101,6 +101,15 @@ class LogHandlersTests(unittest.TestCase):
     def approve(self):
         payload = self.conn.execute('SELECT payload_json FROM after_order_messages WHERE id=1').fetchone()[0]
         return self.scope['retry_after_order_email'](1,object(),approval_digest=hashlib.sha256(payload.encode()).hexdigest())
+
+    def test_website_filter_and_display_are_specific_inside_shared_connection(self):
+        self.conn.execute("UPDATE after_order_cases SET store_id=1,context_json=?,sender_domain=? WHERE id=2", (json.dumps({'website_name':'Second website'}),'second.example.test'))
+        result=self.scope['api_after_order_email_log'](store_id=1,website_id=5)
+        self.assertEqual(result['total'],1)
+        self.assertEqual(result['rows'][0]['website_name'],'Second website')
+        self.assertEqual(result['rows'][0]['odoo_order_name'],'DEMO-200')
+        self.assertEqual(len(result['websites']),2)
+        with self.assertRaises(self.HTTPError):self.scope['api_after_order_email_log'](website_id=5)
 
     def test_list_filters_and_detail_enforce_store_scope_without_payload_leak(self):
         result=self.scope["api_after_order_email_log"](store_id=1,status="failed")

@@ -50,3 +50,15 @@ Provider validation and transfer failures are translated into staff-facing expla
 - Read-only FX rates: https://www.airwallex.com/docs/api/transactional_fx/rates
 - Error fields and validation rules: https://www.airwallex.com/docs/payouts/errors/transfer-error-codes
 - Transfer failure reasons: https://www.airwallex.com/docs/payouts/transfers/manage-transfers/failure-reasons
+
+## Successful-refund customer email
+
+Only newly submitted app refunds opt in to automatic confirmations. Existing refunds and manual history imports do not enqueue emails. The payout and durable notification reservation are recorded atomically when an authoritative Airwallex result is PAID. Pending, failed and uncertain payouts never trigger a success email. Each partial refund has its own once-only request key; copy describes the refunded amount without claiming the entire order was refunded.
+
+The refund worker verifies the current transfer, Odoo order customer and actual sale.order.website_id before sending. Cancelled website orders are supported. Sender, reply-to, website name and logo derive from that website, never the database-wide connection name. When an unambiguous registered connection exists for that website/database, the email log case belongs to it; otherwise the originating connection keeps the case with the actual website ID/domain. Email log supports website filtering inside a connection and displays website branding separately from connection names.
+
+Only masked account details (last four characters or masked e-transfer email), account holder and bank name are retained for the email. The message includes amount/currency, transfer reference and a 24–48 hour estimated credit-arrival explanation. Customer emails and saved previews use the existing after_order_messages and delivery-attempt log, with provider delivery tracking/suppression.
+
+Sending is independently controlled by app_settings.airwallex_refund_email_enabled=true; it does not enable other after-order email workflows. A PostgreSQL advisory lock excludes concurrent email workers. Uncertain acceptance retries reuse the exact saved payload and Resend idempotency key within 23 hours; older uncertain deliveries are held. Confirmed email failures require individual approval in Email log (maximum five attempts, same safe window). Sender/customer/site changes hold retries. Email problems never retry a payout and appear separately in refund history.
+
+Verification: test_refund_emails.py covers routing, masking, cancelled orders, eligibility, deduplication, uncertain acceptance, approval and site changes. A disposable PostgreSQL schema with a mocked email provider verifies concurrent worker exclusion and actual log SQL. Live identity/transfer reads generate a local preview only; historical customers are not emailed by verification.

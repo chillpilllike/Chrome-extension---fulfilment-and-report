@@ -8,7 +8,7 @@ import "./epost-workspace.css"
 import "./email-log.css"
 
 type Email = {
-  id: number; case_id: number; store_id: number; store_name: string; website_id?: number
+  id: number; case_id: number; store_id: number; store_name: string; website_id?: number; website_name?: string; sender_domain?: string
   odoo_order_name: string; subject: string; recipient: string; sender: string
   provider: string; provider_message_id?: string; status: string; status_label: string
   test_mode: boolean; attempt_count: number; template_kind?: string
@@ -16,7 +16,7 @@ type Email = {
   can_retry: boolean; retry_block_reason: string; can_approve: boolean; approval_digest: string
 }
 type Attempt = { attempt_number: number; status: string; error?: string; provider_message_id?: string; created_at: string; updated_at: string }
-type Result = { rows: Email[]; total: number; summary: Record<string, number>; test_mode: boolean; test_recipient: string }
+type Result = { websites: {website_id:number;sender_domain:string}[]; rows: Email[]; total: number; summary: Record<string, number>; test_mode: boolean; test_recipient: string }
 type Props = { storeId: string; api: <T>(path: string, options?: RequestInit) => Promise<T>; onResult: (result: { ok: boolean; title: string; message: string }) => void; onNavigate: (page: string, order?: string) => void }
 
 const queues = [
@@ -39,6 +39,7 @@ function Status({ row }: { row: Pick<Email, "status" | "status_label"> }) {
 
 export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props) {
   const [queue, setQueue] = useState("approval")
+  const [website, setWebsite] = useState("")
   const [mode, setMode] = useState("all")
   const [query, setQuery] = useState("")
   const [draft, setDraft] = useState("")
@@ -57,18 +58,19 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
   const [rules, setRules] = useState(false)
   const pageSize = 30
   const current = queues.find(value => value[0] === queue) || queues[0]
-  useEffect(() => { setPage(1); setDetailId(null); setData(null) }, [storeId])
+  useEffect(() => { setPage(1); setDetailId(null); setData(null); setWebsite("") }, [storeId])
   useEffect(() => {
     const controller = new AbortController()
     setLoading(true); setError("")
     const params = new URLSearchParams({ page: String(page), per_page: String(pageSize), status: queue, mode, q: query, date_from: from, date_to: to })
     if (storeId) params.set("store_id", storeId)
+    if (storeId && website) params.set("website_id", website)
     api<Result>(`/api/after-order/emails?${params}`, { signal: controller.signal }).then(result => {
       if (!controller.signal.aborted) setData(result)
     }).catch(reason => { if (!controller.signal.aborted) { setError(String(reason)); setData(null) } })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [api, storeId, page, queue, mode, query, from, to, tick])
+  }, [api, storeId, website, page, queue, mode, query, from, to, tick])
   useEffect(() => {
     setDetail(null); setDetailError("")
     if (detailId === null) return
@@ -107,7 +109,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
     <header className="epost-heading"><div><span className="epost-eyebrow">Customer communications</span><h2>Email log</h2><p>See what was sent. Understand failures. Retry with confidence.</p></div>
       <div className="epost-heading-actions"><Button variant="outline" onClick={() => setRules(!rules)} aria-expanded={rules}>How statuses work</Button><Button variant="outline" onClick={() => onNavigate("after-order-care")}>After-order care</Button><Button onClick={() => setTick(value => value + 1)} disabled={loading}>Refresh log</Button></div>
     </header>
-    <section className="epost-notice"><strong>Sending safeguards</strong><p>New-order welcome emails send automatically in live mode. Newly prepared test emails send without approval only to sonianuj1284@gmail.com. All other live emails and failed-send retries require individual team approval.</p></section>
+    <section className="epost-notice"><strong>Sending safeguards</strong><p>New-order welcome emails send automatically in live mode. Newly prepared test emails send without approval only to sonianuj1284@gmail.com. Successful new app refunds send a website-branded confirmation automatically in live mode. Refund confirmations have their own duplicate-protected delivery worker. Other live emails and failed-send retries require individual team approval.</p></section>
     {rules && <section className="epost-notice"><strong>Provider acceptance is not inbox delivery</strong><p>Sent means the provider returned a message ID. Read receipts and inbox delivery are not inferred. Retry is available only for confirmed failures with a saved payload and current order context, up to five attempts. Uncertain sends, sent messages and legacy records cannot be blindly retried.</p><p>In test mode, only stored test messages to the configured test address can be retried. No bulk retry runs from this page.</p></section>}
     <div className="epost-layout">
       <aside className="epost-queues" aria-label="Email work queues"><div className="epost-queue-title">Work queues <span>Filtered totals</span></div>
@@ -118,6 +120,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
         <section className="epost-queue-context"><div><span className="epost-step">Communication history</span><h3>{current[1]}</h3><p>{current[2]}</p></div><div className="epost-result-count">{loading ? "Loading…" : `${total.toLocaleString()} email${total === 1 ? "" : "s"}`}</div></section>
         <form className="epost-filters" onSubmit={event => { event.preventDefault(); change(setQuery, draft.trim()) }}>
           <div className="epost-search"><label htmlFor="email-search">Find an email</label><Input id="email-search" value={draft} onChange={event => setDraft(event.target.value)} placeholder="Order, email address, website or subject" /></div>
+          {storeId && <div><label htmlFor="email-website">Order website</label><select id="email-website" value={website} onChange={event=>change(setWebsite,event.target.value)}><option value="">All websites in this connection</option>{data?.websites?.map(site=><option key={`${site.website_id}:${site.sender_domain}`} value={site.website_id}>{site.sender_domain || `Website ${site.website_id}`}</option>)}</select></div>}
           <div><label htmlFor="email-mode">Mode</label><select id="email-mode" value={mode} onChange={event => change(setMode, event.target.value)}><option value="all">Test & live</option><option value="test">Test only</option><option value="live">Live only</option></select></div>
           <div><label htmlFor="email-from">From date</label><Input id="email-from" type="date" value={from} onChange={event => change(setFrom, event.target.value)} /></div>
           <div><label htmlFor="email-to">To date</label><Input id="email-to" type="date" value={to} onChange={event => change(setTo, event.target.value)} /></div><Button type="submit">Search</Button>
@@ -128,7 +131,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
         <Table className="email-log-table"><TableHeader><TableRow><TableHead>Email / order</TableHead><TableHead>Recipient / website</TableHead><TableHead>Status</TableHead><TableHead>Last activity</TableHead><TableHead>Actions</TableHead></TableRow></TableHeader><TableBody>
           {!loading && !error && !data?.rows.length && <TableRow><TableCell colSpan={5}><div className="epost-empty"><strong>No emails in this queue</strong><p>Change your filters or send a test email from After-order care.</p></div></TableCell></TableRow>}
           {data?.rows.map(row => <TableRow key={row.id}><TableCell><button className="email-order" onClick={() => onNavigate("after-order-care", row.odoo_order_name)}>{row.odoo_order_name || "Order unavailable"} ↗</button><strong className="email-subject">{row.subject || "Untitled email"}</strong><small>{(row.template_kind || "Email").replaceAll("_", " ")}</small></TableCell>
-            <TableCell><span className="email-recipient">{row.recipient || "Not supplied"}</span><small>{row.store_name}</small><small>From {row.sender || "Not configured"}</small><span className={`email-mode ${row.test_mode ? "is-test" : ""}`}>{row.test_mode ? "TEST" : "LIVE"}</span></TableCell>
+            <TableCell><span className="email-recipient">{row.recipient || "Not supplied"}</span><small>{row.website_name || row.sender_domain || row.store_name}</small><small>{row.sender_domain}</small><small>From {row.sender || "Not configured"}</small><span className={`email-mode ${row.test_mode ? "is-test" : ""}`}>{row.test_mode ? "TEST" : "LIVE"}</span></TableCell>
             <TableCell><Status row={retryId === row.id ? { status: "retrying", status_label: "Retrying" } : row} /><small>{row.status === "test_preview" ? "No send attempted" : `${row.attempt_count || 1} attempt${row.attempt_count > 1 ? "s" : ""}`}</small>{row.last_error && <p className="email-error-summary" title={row.last_error}>{row.last_error}</p>}</TableCell>
             <TableCell><span>{formatDate(row.updated_at)}</span><small>Created {formatDate(row.created_at)}</small><small>{row.provider}</small></TableCell>
             <TableCell><div className="email-row-actions"><Button variant="outline" onClick={() => setDetailId(row.id)}>View email</Button>{row.can_retry && <Button disabled={retryId !== null || loading} onClick={() => setRetryTarget(row)}>{retryId === row.id ? "Retrying…" : "Retry failed email"}</Button>}{row.status === "delivery_unknown" && <small>Check the provider before resending.</small>}</div></TableCell></TableRow>)}
@@ -138,7 +141,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
     </div>
     <Dialog open={detailId !== null} onOpenChange={open => { if (!open) setDetailId(null) }}><DialogContent className="epost-detail email-log-detail"><DialogHeader><DialogTitle>{detail?.row.subject || "Email details"}</DialogTitle><DialogDescription>Saved content and delivery attempts. Preview links are disabled.</DialogDescription></DialogHeader>
       {detailError && <p role="alert">{detailError}</p>}{!detail && !detailError && <p role="status">Loading email…</p>}
-      {detail && <><Status row={detail.row} /><dl><dt>Order / store</dt><dd>{detail.row.odoo_order_name} · {detail.row.store_name}</dd><dt>Recipient</dt><dd>{detail.row.recipient}</dd><dt>Sender</dt><dd>{detail.row.sender}</dd><dt>Provider message ID</dt><dd>{detail.row.provider_message_id || "No acceptance ID recorded"}</dd><dt>Mode</dt><dd>{detail.row.test_mode ? "Test" : "Live"}</dd></dl>
+      {detail && <><Status row={detail.row} /><dl><dt>Order / store</dt><dd>{detail.row.odoo_order_name} · {detail.row.website_name || detail.row.store_name} ({detail.row.sender_domain || "Website not recorded"})</dd><dt>Recipient</dt><dd>{detail.row.recipient}</dd><dt>Sender</dt><dd>{detail.row.sender}</dd><dt>Provider message ID</dt><dd>{detail.row.provider_message_id || "No acceptance ID recorded"}</dd><dt>Mode</dt><dd>{detail.row.test_mode ? "Test" : "Live"}</dd></dl>
         <section><h3>Send attempts</h3>{!detail.attempts.length && <p>Detailed attempt history is unavailable for this older record. Its saved status is shown above.</p>}<ol className="email-attempts">{detail.attempts.map(attempt => <li key={attempt.attempt_number}><strong>Attempt {attempt.attempt_number} · {attempt.status.replaceAll("_", " ")}</strong><small>{formatDate(attempt.created_at)} → {formatDate(attempt.updated_at)}</small>{attempt.error && <p className="email-log-error">{attempt.error}</p>}</li>)}</ol>
           {detail.row.can_approve ? <Button disabled={retryId !== null} onClick={() => { setDetailId(null); setRetryTarget(detail.row) }}>Approve sending this email</Button> : <p>{detail.row.retry_block_reason}</p>}</section>
         <SmsPreview key={detail.row.id} api={api} emailId={detail.row.id} />
