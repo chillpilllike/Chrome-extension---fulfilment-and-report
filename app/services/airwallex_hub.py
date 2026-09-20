@@ -80,3 +80,26 @@ def verify_webhook_signature(
 
 def json_text(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+# Keep the complete webhook audit, but list each deposit once. Lifecycle precedence
+# prevents delayed/retried pending notifications from replacing a settled payment.
+DEPOSIT_ACTIVITY_CTE = """
+WITH ranked_deposits AS (
+    SELECT e.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY CASE WHEN COALESCE(TRIM(deposit_id), '') <> ''
+                   THEN 'deposit:' || deposit_id ELSE 'event:' || event_id END
+               ORDER BY CASE event_name
+                   WHEN 'deposit.reversed' THEN 3
+                   WHEN 'deposit.settled' THEN 2
+                   WHEN 'deposit.rejected' THEN 2
+                   ELSE 1 END DESC, received_at DESC, id DESC
+           ) AS deposit_rank,
+           COUNT(*) OVER (
+               PARTITION BY CASE WHEN COALESCE(TRIM(deposit_id), '') <> ''
+                   THEN 'deposit:' || deposit_id ELSE 'event:' || event_id END
+           ) AS status_update_count
+    FROM airwallex_webhook_events e
+), current_deposits AS (SELECT * FROM ranked_deposits WHERE deposit_rank=1)
+"""

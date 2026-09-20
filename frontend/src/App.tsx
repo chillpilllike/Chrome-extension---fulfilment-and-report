@@ -173,6 +173,7 @@ type AirwallexEvent = {
   currency: string
   deposit_status: string
   processing_status: string
+  status_update_count?: number
   received_count: number
   received_at: string
   processed_at?: string
@@ -1605,7 +1606,7 @@ const defaultUiCopy: UiCopy = {
   "profit-loss": { title: "Profit / Loss", description: "Review fulfilment profitability and shipping costs." },
   accounting: { title: "Accounting", description: "Manage invoices, credit notes, and supporting documents." },
   "airwallex-refunds": { title: "Airwallex Refunds", description: "Return customer payments with verified order limits and supported payout methods." },
-  "airwallex-activity": { title: "Airwallex Activity", description: "Audit incoming Airwallex events and delivery to every connected Odoo store." },
+  "airwallex-activity": { title: "Airwallex Activity", description: "Track incoming Airwallex payments and their current status." },
   downloads: { title: "Downloads", description: "Export filtered data and download generated files." },
   "shopify-fulfilment": { title: "Shopify Fulfilment", description: "Queue Amazon-ordered Odoo sales into DTC or DTB Shopify fulfilment." },
   "shopify-tracking": { title: "Shopify Tracking to Odoo", description: "Sync Shopify tracking codes back to matching Odoo deliveries." },
@@ -8426,7 +8427,7 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
   const [query, setQuery] = useState("")
   const [status, setStatus] = useState("")
   const [loading, setLoading] = useState(true)
-  const [selected, setSelected] = useState<{ event: AirwallexEvent; deliveries: AirwallexDelivery[] } | null>(null)
+  const [selected, setSelected] = useState<{ event: AirwallexEvent; deliveries: AirwallexDelivery[]; updates: Pick<AirwallexEvent,"id"|"event_name"|"deposit_status"|"received_at">[] } | null>(null)
   const perPage = 50
 
   async function refresh(nextPage = page) {
@@ -8451,7 +8452,7 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
 
   async function openEvent(row: AirwallexEvent) {
     try {
-      const result = await api<{ event: AirwallexEvent; deliveries: AirwallexDelivery[] }>(`/api/airwallex/events/${row.id}`)
+      const result = await api<{ event: AirwallexEvent; deliveries: AirwallexDelivery[]; updates: Pick<AirwallexEvent,"id"|"event_name"|"deposit_status"|"received_at">[] }>(`/api/airwallex/events/${row.id}`)
       setSelected(result)
     } catch (error) {
       onResult({ ok: false, title: "Airwallex Event Failed", message: String(error) })
@@ -8473,8 +8474,8 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
     <div className="grid gap-4">
       <Card>
         <CardHeader>
-          <CardTitle>Central Airwallex Webhook</CardTitle>
-          <CardDescription>Every connected Odoo website receives verified deposit events through one universal webhook.</CardDescription>
+          <CardTitle>Incoming Airwallex payments</CardTitle>
+          <CardDescription>Each payment appears once with its latest payment state. Pending and settled notifications are status updates for the same payment, not separate payments.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-[1fr_220px_auto]">
           <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); setPage(1); void refresh(1) }}>
@@ -8502,17 +8503,17 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
                   <TableCell><strong>{row.order_reference || "Not detected"}</strong><div className="text-xs text-muted-foreground">{row.order_prefix || "No prefix"}</div></TableCell>
                   <TableCell className="max-w-64"><div className="truncate">{row.reference || "No reference"}</div><div className="text-xs text-muted-foreground">{row.deposit_id}</div></TableCell>
                   <TableCell className="whitespace-nowrap">{row.amount ?? "—"} {row.currency}</TableCell>
-                  <TableCell><Badge variant="outline">{row.deposit_status || row.event_name}</Badge></TableCell>
-                  <TableCell><Badge variant={row.processing_status === "matched" ? "default" : "outline"}>{row.processing_status}</Badge>{row.received_count > 1 ? <div className="text-xs text-muted-foreground">Received {row.received_count}×</div> : null}</TableCell>
+                  <TableCell><Badge variant="outline">{row.deposit_status || row.event_name}</Badge>{(row.status_update_count || 0)>1 && <div className="text-xs text-muted-foreground">{row.status_update_count} status updates · 1 payment</div>}</TableCell>
+                  <TableCell><Badge variant={row.processing_status === "matched" ? "default" : "outline"}>{row.processing_status}</Badge>{row.received_count > 1 ? <div className="text-xs text-muted-foreground">Notification delivered {row.received_count}×</div> : null}</TableCell>
                   <TableCell>{row.matched_delivery_count ? `${row.matched_delivery_count} matched` : `${row.delivery_count || 0} checked`}</TableCell>
                   <TableCell className="whitespace-nowrap"><Button size="sm" variant="outline" onClick={() => void openEvent(row)}>View</Button> <Button size="sm" variant="outline" onClick={() => void retry(row)}>Retry</Button></TableCell>
                 </TableRow>
               ))}
-              {!rows.length && <TableRow><TableCell colSpan={8} className="py-10 text-center text-muted-foreground">{loading ? "Loading Airwallex activity…" : "No Airwallex events found."}</TableCell></TableRow>}
+              {!rows.length && <TableRow><TableCell colSpan={8} className="py-10 text-center text-muted-foreground">{loading ? "Loading Airwallex activity…" : "No Airwallex payments found."}</TableCell></TableRow>}
             </TableBody>
           </Table>
         </CardContent>
-        <CardFooter><PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="events" /></CardFooter>
+        <CardFooter><PaginationControls page={page} total={total} perPage={perPage} onPage={setPage} disabled={loading} label="payments" /></CardFooter>
       </Card>
       <Card>
         <CardHeader><CardTitle>Airwallex API activity</CardTitle><CardDescription>Latest 100 settlement checks, account reads and webhook configuration requests made through the fulfilment app.</CardDescription></CardHeader>
@@ -8523,7 +8524,7 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
       </Card>
       <Dialog open={Boolean(selected)} onOpenChange={(open) => !open && setSelected(null)}>
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-4xl">
-          <DialogHeader><DialogTitle>Airwallex event {selected?.event.event_id}</DialogTitle><DialogDescription>{selected?.event.order_reference || selected?.event.reference || selected?.event.deposit_id}</DialogDescription></DialogHeader>
+          <DialogHeader><DialogTitle>Airwallex payment details</DialogTitle><DialogDescription>{selected?.event.order_reference || selected?.event.reference || selected?.event.deposit_id}</DialogDescription></DialogHeader>
           {selected ? <div className="grid gap-4">
             <div className="grid gap-2 rounded border p-3 text-sm md:grid-cols-2">
               <div><span className="text-muted-foreground">Deposit</span><div className="font-mono">{selected.event.deposit_id}</div></div>
@@ -8532,6 +8533,7 @@ function AirwallexActivityPage({ onResult }: { onResult: (modal: ModalState) => 
               <div><span className="text-muted-foreground">Status</span><div>{selected.event.deposit_status} → {selected.event.processing_status}</div></div>
               {selected.event.last_error ? <div className="md:col-span-2 text-destructive">{selected.event.last_error}</div> : null}
             </div>
+            <div><h3 className="mb-2 font-semibold">Payment status history</h3><p className="mb-2 text-sm text-muted-foreground">These are updates to this payment, not additional payments.</p>{selected.updates?.map(update=><div key={update.id} className="flex gap-3 text-sm"><span>{formatDateTime(update.received_at)}</span><span>{update.deposit_status || update.event_name}</span></div>)}</div>
             <div><h3 className="mb-2 font-semibold">Odoo delivery activity</h3><div className="grid gap-2">{selected.deliveries.map((delivery) => <div key={delivery.id} className="rounded border p-3 text-sm"><div className="flex flex-wrap items-center justify-between gap-2"><strong>{delivery.store_name}</strong><Badge variant="outline">{delivery.delivery_status}</Badge></div><div className="mt-1 text-muted-foreground">Prefixes {delivery.airwallex_order_prefixes || "auto-detect"} · Attempt {delivery.attempt} · Odoo {delivery.odoo_event_status || "no response"}</div>{delivery.order_reference ? <div>Order: {delivery.order_reference}</div> : null}{delivery.error ? <div className="mt-1 text-destructive">{delivery.error}</div> : null}</div>)}{!selected.deliveries.length ? <div className="text-muted-foreground">No Odoo delivery has been attempted yet.</div> : null}</div></div>
           </div> : null}
           <DialogFooter><Button variant="outline" onClick={() => setSelected(null)}>Close</Button>{selected ? <Button onClick={() => void retry(selected.event)}>Retry Delivery</Button> : null}</DialogFooter>

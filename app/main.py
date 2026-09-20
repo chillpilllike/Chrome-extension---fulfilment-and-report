@@ -132,6 +132,7 @@ from app.services.email_log import retry_block_reason, STATUS_LABELS as EMAIL_ST
 from app.services.asin import decode_asin_reference, encode_asin, extract_asin_from_notes, normalize_asin, strip_html
 from app.services.airwallex_hub import (
     HANDLED_EVENTS as AIRWALLEX_HANDLED_EVENTS,
+    DEPOSIT_ACTIVITY_CTE,
     json_text as airwallex_json_text,
     normalize_prefixes as normalize_airwallex_prefixes,
     verify_webhook_signature as verify_airwallex_webhook_signature,
@@ -44551,14 +44552,15 @@ def api_airwallex_events(
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with db() as conn:
         total_row = conn.execute(
-            f"SELECT COUNT(*) AS count FROM airwallex_webhook_events{where}", params
+            f"{DEPOSIT_ACTIVITY_CTE} SELECT COUNT(*) AS count FROM current_deposits{where}", params
         ).fetchone()
         rows = conn.execute(
             f"""
+            {DEPOSIT_ACTIVITY_CTE}
             SELECT e.*,
                    (SELECT COUNT(*) FROM airwallex_event_deliveries d WHERE d.event_id=e.id) AS delivery_count,
                    (SELECT COUNT(*) FROM airwallex_event_deliveries d WHERE d.event_id=e.id AND d.delivery_status='matched') AS matched_delivery_count
-            FROM airwallex_webhook_events e{where}
+            FROM current_deposits e{where}
             ORDER BY e.received_at DESC, e.id DESC LIMIT ? OFFSET ?
             """,
             [*params, per_page, offset],
@@ -44580,7 +44582,14 @@ def api_airwallex_event(event_db_id: int) -> dict[str, Any]:
         ).fetchall()
     if not event:
         raise HTTPException(404, "Airwallex event not found")
-    return {"event": row_to_dict(event), "deliveries": rows_to_dicts(deliveries)}
+    with db() as conn:
+        updates = conn.execute(
+            """SELECT id,event_name,deposit_status,received_at FROM airwallex_webhook_events
+               WHERE (deposit_id=? AND COALESCE(TRIM(deposit_id),'') <> '') OR id=?
+               ORDER BY received_at,id""", (event["deposit_id"],event_db_id)
+        ).fetchall()
+    return {"event": row_to_dict(event), "deliveries": rows_to_dicts(deliveries),
+            "updates": rows_to_dicts(updates)}
 
 
 @app.post("/api/airwallex/events/{event_db_id}/retry")
