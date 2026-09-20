@@ -40500,9 +40500,10 @@ def api_after_order_email_log(store_id: Optional[int] = None, page: int = 1, per
                 m.payload_json,m.request_fingerprint,c.store_id,c.website_id,c.odoo_order_name,c.context_json,c.sender_domain,s.name AS store_name
                 {source} WHERE {where} ORDER BY m.created_at DESC,m.id DESC LIMIT ? OFFSET ?""", [*params, per_page, offset]).fetchall()
     with db() as conn:
-        websites = rows_to_dicts(conn.execute("""SELECT DISTINCT c.website_id,c.sender_domain
+        websites = rows_to_dicts(conn.execute("""SELECT c.store_id,c.website_id,MAX(NULLIF(c.sender_domain,'')) AS sender_domain
             FROM after_order_cases c JOIN after_order_messages m ON m.case_id=c.id
-            WHERE c.store_id=? AND c.website_id IS NOT NULL ORDER BY c.sender_domain""", (store_id,)).fetchall()) if store_id else []
+            WHERE (? IS NULL OR c.store_id=?) AND c.website_id IS NOT NULL
+            GROUP BY c.store_id,c.website_id ORDER BY sender_domain""", (store_id,store_id)).fetchall())
     return {"ok": True, "websites": websites, "rows": [email_log_row(row) for row in rows], "total": summary[status], "summary": summary,
             "page": page, "per_page": per_page, "test_mode": after_order_email_test_mode(), "test_recipient": after_order_test_recipient()}
 

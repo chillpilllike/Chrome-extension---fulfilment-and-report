@@ -16,7 +16,7 @@ type Email = {
   can_retry: boolean; retry_block_reason: string; can_approve: boolean; approval_digest: string
 }
 type Attempt = { attempt_number: number; status: string; error?: string; provider_message_id?: string; created_at: string; updated_at: string }
-type Result = { websites: {website_id:number;sender_domain:string}[]; rows: Email[]; total: number; summary: Record<string, number>; test_mode: boolean; test_recipient: string }
+type Result = { websites: {store_id:number;website_id:number;sender_domain:string}[]; rows: Email[]; total: number; summary: Record<string, number>; test_mode: boolean; test_recipient: string }
 type Props = { storeId: string; api: <T>(path: string, options?: RequestInit) => Promise<T>; onResult: (result: { ok: boolean; title: string; message: string }) => void; onNavigate: (page: string, order?: string) => void }
 
 const queues = [
@@ -64,7 +64,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
     setLoading(true); setError("")
     const params = new URLSearchParams({ page: String(page), per_page: String(pageSize), status: queue, mode, q: query, date_from: from, date_to: to })
     if (storeId) params.set("store_id", storeId)
-    if (storeId && website) params.set("website_id", website)
+    if (website) {const [connection,site]=website.split(":");params.set("store_id",connection);params.set("website_id",site)}
     api<Result>(`/api/after-order/emails?${params}`, { signal: controller.signal }).then(result => {
       if (!controller.signal.aborted) setData(result)
     }).catch(reason => { if (!controller.signal.aborted) { setError(String(reason)); setData(null) } })
@@ -120,18 +120,18 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
         <section className="epost-queue-context"><div><span className="epost-step">Communication history</span><h3>{current[1]}</h3><p>{current[2]}</p></div><div className="epost-result-count">{loading ? "Loading…" : `${total.toLocaleString()} email${total === 1 ? "" : "s"}`}</div></section>
         <form className="epost-filters" onSubmit={event => { event.preventDefault(); change(setQuery, draft.trim()) }}>
           <div className="epost-search"><label htmlFor="email-search">Find an email</label><Input id="email-search" value={draft} onChange={event => setDraft(event.target.value)} placeholder="Order, email address, website or subject" /></div>
-          {storeId && <div><label htmlFor="email-website">Order website</label><select id="email-website" value={website} onChange={event=>change(setWebsite,event.target.value)}><option value="">All websites in this connection</option>{data?.websites?.map(site=><option key={`${site.website_id}:${site.sender_domain}`} value={site.website_id}>{site.sender_domain || `Website ${site.website_id}`}</option>)}</select></div>}
+          {<div><label htmlFor="email-website">Order website</label><select id="email-website" value={website} onChange={event=>change(setWebsite,event.target.value)}><option value="">All order websites</option>{data?.websites?.map(site=><option key={`${site.store_id}:${site.website_id}`} value={`${site.store_id}:${site.website_id}`}>{site.sender_domain || `Website ${site.website_id}`}</option>)}</select></div>}
           <div><label htmlFor="email-mode">Mode</label><select id="email-mode" value={mode} onChange={event => change(setMode, event.target.value)}><option value="all">Test & live</option><option value="test">Test only</option><option value="live">Live only</option></select></div>
           <div><label htmlFor="email-from">From date</label><Input id="email-from" type="date" value={from} onChange={event => change(setFrom, event.target.value)} /></div>
           <div><label htmlFor="email-to">To date</label><Input id="email-to" type="date" value={to} onChange={event => change(setTo, event.target.value)} /></div><Button type="submit">Search</Button>
         </form>
-        <div className="epost-selection"><span>{data?.test_mode ? `Test mode · retries only to ${data.test_recipient}` : "Live retries recheck the order, recipient and website."}</span><span>Dates shown in your local time · filters use saved UTC dates</span></div>
+        <div className="epost-selection"><span>{data?.test_mode ? `General email test mode · test recipient ${data.test_recipient} · refund confirmations use their separate sending setting` : "Live retries recheck the order, recipient and website."}</span><span>Dates shown in your local time · filters use saved UTC dates</span></div>
         {error && <div className="email-log-error" role="alert">{error}<Button variant="outline" onClick={() => setTick(value => value + 1)}>Reload</Button></div>}
         {loading && <div className="epost-loading" role="status">Loading email history…</div>}
         <Table className="email-log-table"><TableHeader><TableRow><TableHead>Email / order</TableHead><TableHead>Recipient / website</TableHead><TableHead>Status</TableHead><TableHead>Last activity</TableHead><TableHead>Actions</TableHead></TableRow></TableHeader><TableBody>
           {!loading && !error && !data?.rows.length && <TableRow><TableCell colSpan={5}><div className="epost-empty"><strong>No emails in this queue</strong><p>Change your filters or send a test email from After-order care.</p></div></TableCell></TableRow>}
           {data?.rows.map(row => <TableRow key={row.id}><TableCell><button className="email-order" onClick={() => onNavigate("after-order-care", row.odoo_order_name)}>{row.odoo_order_name || "Order unavailable"} ↗</button><strong className="email-subject">{row.subject || "Untitled email"}</strong><small>{(row.template_kind || "Email").replaceAll("_", " ")}</small></TableCell>
-            <TableCell><span className="email-recipient">{row.recipient || "Not supplied"}</span><small>{row.website_name || row.sender_domain || row.store_name}</small><small>{row.sender_domain}</small><small>From {row.sender || "Not configured"}</small><span className={`email-mode ${row.test_mode ? "is-test" : ""}`}>{row.test_mode ? "TEST" : "LIVE"}</span></TableCell>
+            <TableCell><span className="email-recipient">{row.recipient || "Not supplied"}</span><small>{row.website_name || row.sender_domain || row.store_name}</small>{row.sender_domain&&row.sender_domain!==row.website_name&&<small>{row.sender_domain}</small>}<small>From {row.sender || "Not configured"}</small><span className={`email-mode ${row.test_mode ? "is-test" : ""}`}>{row.test_mode ? "TEST" : "LIVE"}</span></TableCell>
             <TableCell><Status row={retryId === row.id ? { status: "retrying", status_label: "Retrying" } : row} /><small>{row.status === "test_preview" ? "No send attempted" : `${row.attempt_count || 1} attempt${row.attempt_count > 1 ? "s" : ""}`}</small>{row.last_error && <p className="email-error-summary" title={row.last_error}>{row.last_error}</p>}</TableCell>
             <TableCell><span>{formatDate(row.updated_at)}</span><small>Created {formatDate(row.created_at)}</small><small>{row.provider}</small></TableCell>
             <TableCell><div className="email-row-actions"><Button variant="outline" onClick={() => setDetailId(row.id)}>View email</Button>{row.can_retry && <Button disabled={retryId !== null || loading} onClick={() => setRetryTarget(row)}>{retryId === row.id ? "Retrying…" : "Retry failed email"}</Button>}{row.status === "delivery_unknown" && <small>Check the provider before resending.</small>}</div></TableCell></TableRow>)}

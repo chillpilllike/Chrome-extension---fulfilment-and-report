@@ -109,6 +109,7 @@ class LogHandlersTests(unittest.TestCase):
         self.assertEqual(result['rows'][0]['website_name'],'Second website')
         self.assertEqual(result['rows'][0]['odoo_order_name'],'DEMO-200')
         self.assertEqual(len(result['websites']),2)
+        self.assertEqual(len(self.scope['api_after_order_email_log']()['websites']),2)
         with self.assertRaises(self.HTTPError):self.scope['api_after_order_email_log'](website_id=5)
 
     def test_list_filters_and_detail_enforce_store_scope_without_payload_leak(self):
