@@ -26646,6 +26646,13 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
     return {"ok": True, "message": "Service settings saved.", "settings": response}
 
 
+@app.post("/api/cache/clear")
+def api_clear_page_cache() -> dict[str, Any]:
+    """Discard derived page responses; keep records, jobs and credentials intact."""
+    fast_page_cache_clear()
+    return {"ok": True, "message": "Page cache cleared. Reloading saved results."}
+
+
 @app.post("/api/settings/odoo-rpc-cache/clear")
 def api_clear_odoo_rpc_cache() -> dict[str, Any]:
     count = clear_amazon_history_odoo_direct_cache()

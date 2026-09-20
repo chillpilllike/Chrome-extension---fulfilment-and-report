@@ -3738,6 +3738,26 @@ function App() {
   const [columnDropTarget, setColumnDropTarget] = useState<{ key: OrderColumnKey; after: boolean } | null>(null)
   const [busy, setBusy] = useState("")
   const [modal, setModal] = useState<ModalState>(null)
+  const [clearingPageCache, setClearingPageCache] = useState(false)
+  useEffect(() => {
+    if (window.sessionStorage.getItem("page-cache-cleared") !== "true") return
+    window.sessionStorage.removeItem("page-cache-cleared")
+    setModal({ ok: true, title: "Cache cleared", message: "Saved results have been reloaded." })
+  }, [])
+
+  async function clearPageCache() {
+    if (clearingPageCache) return
+    setClearingPageCache(true)
+    try {
+      await api("/api/cache/clear", { method: "POST" })
+      window.sessionStorage.setItem("page-cache-cleared", "true")
+      window.location.reload()
+    } catch (error) {
+      setClearingPageCache(false)
+      setModal({ ok: false, title: "Unable to clear cache", message: String(error) })
+    }
+  }
+
   const [shopifyStatusForceSync, setShopifyStatusForceSync] = useState<ShopifyOrderStatusForceSyncProgress | null>(null)
   const [adminTokenSaved, setAdminTokenSaved] = useState(Boolean(savedAdminToken()))
   const [adminAccessOpen, setAdminAccessOpen] = useState(!savedAdminToken() && !pageAllowsPublicAccess(initialPage))
@@ -5624,6 +5644,7 @@ function App() {
         <button type="button" className="btn btn-icon app-menu-button" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu2 className="size-5" /></button>
         <div className="app-topbar-title"><strong>{pageTitle}</strong><span>{currentPageCopy.description}</span></div>
         <div className="app-topbar-actions">
+          {!publicVisitor && <button type="button" className="btn btn-sm" disabled={clearingPageCache} onClick={() => void clearPageCache()} title="Clear cached page results for all stores and reload this page">{clearingPageCache ? "Clearing cache…" : "Clear cache"}</button>}
           {!publicVisitor && <Button variant="ghost" size="icon-sm" onClick={() => setEditingCopyKey("app_header")} title="Edit app text"><Edit className="size-4" /></Button>}
           {!publicVisitor && (
             <div className="notification-menu">
