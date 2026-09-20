@@ -63,6 +63,43 @@ class RelayPayments:
             c.execute('''CREATE TABLE IF NOT EXISTS relay_customer_aliases (
                 payment_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, source_hash TEXT NOT NULL,
                 relay_invoice_id TEXT NOT NULL UNIQUE, customer_name TEXT NOT NULL, approved_at TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS relay_email_retries (
+                outbox_id INTEGER NOT NULL, generation INTEGER NOT NULL,
+                approved_at TEXT NOT NULL, prior_error TEXT NOT NULL, PRIMARY KEY(outbox_id,generation))''')
+
+    def rejected_email(self, message_id):
+        with self.db() as c:
+            job=c.execute('SELECT * FROM relay_email_outbox WHERE message_id=?',(message_id,)).fetchone()
+            message=c.execute('SELECT * FROM after_order_messages WHERE id=?',(message_id,)).fetchone()
+            attempts=c.execute('SELECT status,error,provider_message_id FROM after_order_email_attempts WHERE message_id=?',(message_id,)).fetchall()
+            if not job or not message or job['state'] not in ('failed','delivery_unknown') or message['status'] not in ('failed','delivery_unknown'):
+                raise ValueError('Only a confirmed rejected payment email can be retried.')
+            if job['provider_id'] or message['provider_message_id'] or not attempts or len(attempts)>=5:
+                raise ValueError('Provider acceptance exists or retry limit reached; do not resend.')
+            if any(a['provider_message_id'] or 'HTTP 403;' not in (a['error'] or '') for a in attempts):
+                raise ValueError('Every previous attempt must be a confirmed HTTP 403 rejection.')
+            row=c.execute('SELECT * FROM relay_payments WHERE id=?',(job['payment_id'],)).fetchone()
+        payload=self.email_payload(row,job['kind'])  # Rechecks current Odoo payment/recipient/amount.
+        proof=hashlib.sha256(json.dumps([dict(job),payload],sort_keys=True).encode()).hexdigest()
+        return job,message,payload,proof
+
+    def retry_rejected_email(self,message_id,proof,allow_prior_queue_reset=False):
+        if self.settings()['test_mode'] or self.email_test_mode():
+            raise ValueError('Live payment email retries are blocked in test mode.')
+        job,message,payload,current=self.rejected_email(message_id)
+        if not hmac.compare_digest(proof,current):
+            raise ValueError('Payment email changed. Review the current preview again.')
+        if json.loads(message['payload_json'] or '{}').get('_care_rollout_cancelled_at') and not allow_prior_queue_reset:
+            raise ValueError('This email predates the queue reset. Explicit approval is required to restore it.')
+        with self.db() as c:
+            locked=c.execute('SELECT * FROM relay_email_outbox WHERE id=? FOR UPDATE',(job['id'],)).fetchone()
+            if dict(locked)!=dict(job):
+                raise ValueError('Another worker changed this email. Reload before retrying.')
+            generation=c.execute('SELECT COALESCE(MAX(generation),0)+1 AS n FROM relay_email_retries WHERE outbox_id=?',(job['id'],)).fetchone()['n']
+            c.execute('INSERT INTO relay_email_retries(outbox_id,generation,approved_at,prior_error) VALUES(?,?,?,?)',(job['id'],generation,now(),job['error'] or 'HTTP 403'))
+            c.execute("UPDATE relay_email_outbox SET state='queued',payload_json=?,attempted_at=NULL,error=NULL WHERE id=?",(json.dumps(payload),job['id']))
+            c.execute("UPDATE after_order_messages SET status='retrying',payload_json=?,html_preview=?,subject=?,updated_at=? WHERE id=?",(json.dumps(payload),payload['html'],payload['subject'],now(),message_id))
+        return {'ok':True,'status':'retrying'}
 
     def approve_customer_alias(self, payment_id, payload):
         name = str(payload.get('customer_name', '')).strip()
@@ -427,6 +464,9 @@ class RelayPayments:
                 continue
             key = 'relay:'+row['request_id']+':'+job['kind']
             with self.db() as c:
+                recovery=c.execute('SELECT MAX(generation) AS n FROM relay_email_retries WHERE outbox_id=?',(job['id'],)).fetchone()
+                if recovery and recovery['n']:
+                    key+=':approved-retry:'+str(recovery['n'])
                 claimed = c.execute("UPDATE relay_email_outbox SET state='sending',payload_json=?,attempted_at=COALESCE(attempted_at,?) WHERE id=? AND state IN ('queued','retry') RETURNING id",(json.dumps(payload),now(),job['id'])).fetchone()
                 if not claimed:
                     continue
@@ -454,7 +494,7 @@ class RelayPayments:
                 status, error = 'sent', None
             except requests.HTTPError as exc:
                 code = exc.response.status_code if exc.response is not None else 0
-                status = 'retry' if code in (408,429) or code >= 500 else 'delivery_unknown'
+                status = 'failed' if code in (400,401,403,422) else ('retry' if code in (408,429) or code >= 500 else 'delivery_unknown')
                 error = 'Email provider returned HTTP '+str(code)+'; '+('retrying with the same key' if status=='retry' else 'review required')
             except Exception:
                 status, error = 'retry', 'Delivery acknowledgement unavailable; retrying the same payload and key'
@@ -497,6 +537,22 @@ class RelayPayments:
         def staff(request):
             if not self.staff_check(request):
                 raise HTTPException(401,'Staff authentication required')
+        @r.get('/emails/{message_id}/rejected-preview')
+        def rejected_preview(message_id:int,request:Request):
+            staff(request);self.ensure()
+            try:
+                job,message,payload,proof=self.rejected_email(message_id)
+                return {'approval_digest':proof,'subject':payload['subject'],'recipient':payload['to'],
+                        'prior_queue_reset':bool(json.loads(message['payload_json'] or '{}').get('_care_rollout_cancelled_at'))}
+            except ValueError as exc:
+                raise HTTPException(409,str(exc)) from exc
+        @r.post('/emails/{message_id}/retry-rejected')
+        def retry_rejected(message_id:int,request:Request,payload:dict):
+            staff(request);self.ensure()
+            try:
+                return self.retry_rejected_email(message_id,str(payload.get('approval_digest') or ''),payload.get('allow_prior_queue_reset') is True)
+            except ValueError as exc:
+                raise HTTPException(409,str(exc)) from exc
         def extension(request, require_enabled=True):
             expected=self.get_settings().get('relay_extension_token_hash','')
             supplied=request.headers.get('X-Relay-Token','')

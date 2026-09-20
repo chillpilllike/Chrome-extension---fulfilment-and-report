@@ -1,12 +1,13 @@
 """Provider-neutral SMS outbox. No fallback or retry after an uncertain send."""
 import hashlib
+import hmac
 import json
 import os
 import re
 from datetime import datetime, timezone, timedelta
 
 import requests
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from app.services.alternative_workflow import Runtime
 
 TEST_NUMBER = '+19296526393'
@@ -26,7 +27,28 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
 CREATE TABLE IF NOT EXISTS after_order_sms_first_movement (
  parcel_key TEXT PRIMARY KEY, email_id INTEGER NOT NULL REFERENCES after_order_messages(id),
  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS after_order_sms_attempts (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, sms_id INTEGER NOT NULL REFERENCES after_order_sms(id),
+ attempt_number INTEGER NOT NULL, status TEXT NOT NULL, provider_id TEXT, error TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(sms_id,attempt_number)
+);
+CREATE TABLE IF NOT EXISTS after_order_sms_receipts (
+ digest TEXT PRIMARY KEY, provider_id TEXT NOT NULL, recipient TEXT NOT NULL,
+ status TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL
 );'''
+
+
+def preparation_reason(email, enabled=True):
+    if not email:
+        return 'Source email not found.'
+    if email.get('template_kind') == 'new_order_welcome':
+        return 'New-order welcome emails intentionally have no SMS, to keep SMS costs down.'
+    if not eligible(email):
+        return 'This email type is excluded from the selected SMS notification policy (including reminders).'
+    if not enabled:
+        return 'SMS sending is disabled in Settings.'
+    return ''
 
 
 def eligible(email):
@@ -92,7 +114,7 @@ def render(kind, order, brand, link):
 
 
 def digest(row):
-    return hashlib.sha256(json.dumps({k:row[k] for k in ('provider','recipient','test_mode','body','snapshot_json','attempts')},sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps({k:row[k] for k in ('provider','recipient','test_mode','body','snapshot_json','attempts','status')},sort_keys=True).encode()).hexdigest()
 
 
 def verify_followup_template(mapping):
@@ -156,7 +178,7 @@ def deliver(row, mapping, client=None):
     if provider == 'odoo':
         # Creating the outgoing record hands it to Odoo's official SMS queue.
         # Do not call send() too: the Odoo cron could already be processing it.
-        uid = hashlib.sha256(('care-sms:' + str(row['id'])).encode()).hexdigest()[:32]
+        uid = hashlib.sha256(('care-sms:' + str(row['id']) + ':' + str(row.get('attempts',0) + 1)).encode()).hexdigest()[:32]
         ids = client.execute('sms.sms','search',[[('uuid','=',uid)]])
         ident = ids[0] if ids else client.execute('sms.sms','create',[{'number':target,'body':row['body'],'uuid':uid}])
         return str(ident), 'queued'
@@ -202,6 +224,53 @@ class SMS:
         return {'enabled':settings.get('after_order_sms_enabled') == 'true',
                 'provider':settings.get('after_order_sms_provider') or 'odoo',
                 'mappings':json.loads(settings.get('after_order_sms_mappings') or '{}')}
+
+    def receipt(self, payload):
+        """Called only after webhook authentication. Reports never initiate sends."""
+        ident=str(payload.get('requestId') or '')
+        target=number('+'+str(payload.get('telNum') or '').lstrip('+'))
+        code=str(payload.get('status'))
+        status={'0':'sent','1':'delivered','2':'provider_failed','9':'blocked',
+                '16':'rejected','25':'rejected','17':'blocked','20':'blocked'}.get(code)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{12,100}',ident) or not status:
+            raise ValueError('Unsupported SMS delivery report.')
+        details={k:str(payload.get(k) or '')[:500] for k in ('requestId','telNum','status','deliveryTime','failureReason','credit','smsLength')}
+        key=hashlib.sha256(json.dumps(details,sort_keys=True).encode()).hexdigest()
+        with self.r.db() as conn:
+            conn.execute('''INSERT INTO after_order_sms_receipts(digest,provider_id,recipient,status,details_json,created_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING''',(key,ident,target,status,json.dumps(details),self.r.utc_now()))
+            rows=conn.execute("SELECT * FROM after_order_sms WHERE provider='msg91' AND provider_id=? AND recipient=? FOR UPDATE",(ident,target)).fetchall()
+            for raw in rows:
+                row=dict(raw)
+                # Late queued/sent receipts cannot regress a final outcome or a newer attempt.
+                if row['status'] in {'sending','delivered','provider_failed','rejected','blocked'}:
+                    continue
+                conn.execute('UPDATE after_order_sms SET status=?,last_error=?,updated_at=? WHERE id=?',
+                    (status,details['failureReason'] or None,self.r.utc_now(),row['id']))
+                conn.execute('UPDATE after_order_sms_attempts SET status=?,error=?,updated_at=? WHERE sms_id=? AND provider_id=?',
+                    (status,details['failureReason'] or None,self.r.utc_now(),row['id'],ident))
+                if row['status']!=status:
+                    self.r.record_after_order_event(conn,row['case_id'],'sms_delivery_status',details={'sms_id':row['id'],'status':status,'provider_id':ident})
+        return {'ok':True}
+
+    def webhook_router(self):
+        router=APIRouter()
+        @router.post('/api/public/after-order-webhooks/msg91')
+        async def receive(request:Request):
+            secret=os.getenv('MSG91_WEBHOOK_SECRET','')
+            if len(secret)<32 or not hmac.compare_digest(request.headers.get('X-MSG91-Webhook-Secret',''),secret):
+                raise HTTPException(401,'Invalid webhook authentication')
+            body=await request.body()
+            if len(body)>32768:
+                raise HTTPException(413,'Delivery report too large')
+            try:
+                payload=json.loads(body)
+                if not isinstance(payload,dict):
+                    raise ValueError('Expected one delivery report')
+                return self.receipt(payload)
+            except (ValueError,TypeError) as exc:
+                raise HTTPException(400,'Invalid delivery report') from exc
+        return router
 
     def phone(self, case):
         r = self.r; client = r.OdooClient(r.get_store(case['store_id']))
@@ -311,7 +380,7 @@ class SMS:
         owner = conn.execute('SELECT email_id FROM after_order_sms_first_movement WHERE parcel_key=?', (key,)).fetchone()
         return owner['email_id'] == email['id']
 
-    def send(self, sms_id, approval='', automatic=False):
+    def send(self, sms_id, approval='', automatic=False, resend=False):
         r = self.r
         with r.db() as conn:
             raw = conn.execute('SELECT * FROM after_order_sms WHERE id=? FOR UPDATE',(sms_id,)).fetchone()
@@ -326,8 +395,11 @@ class SMS:
             if row['provider'] == 'msg91' and snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}:
                 verify_followup_template(snapshot['mapping'])
             validate_target(row,r.after_order_email_test_mode())
-            if row['status'] not in {'awaiting_approval','failed'} or row['attempts'] >= 3:
+            allowed = {'delivered'} if resend else {'awaiting_approval','failed','provider_failed','undelivered'}
+            if row['status'] not in allowed or row['attempts'] >= 3 or (resend and automatic):
                 raise ValueError('SMS already attempted or uncertain. Check provider logs; do not resend.')
+            if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received'}:
+                raise ValueError('This is a once-only notification. Duplicate sends are blocked.')
             if automatic:
                 if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and snapshot['kind'] not in {'trustpilot_review', 'delivery_issue_received'}):
                     raise ValueError('This SMS needs individual approval.')
@@ -383,6 +455,10 @@ class SMS:
                 if snapshot['kind'] == 'delivery_confirmation':
                     r.delivery_checkin_case(case, enforce_delay=True)
             conn.execute("UPDATE after_order_sms SET status='sending',attempts=attempts+1,updated_at=? WHERE id=?",(r.utc_now(),sms_id))
+            # Legacy aggregate history remains in its case events; do not invent
+            # precise attempt timestamps for sends that predate this table.
+            conn.execute('''INSERT INTO after_order_sms_attempts(sms_id,attempt_number,status,created_at,updated_at)
+                VALUES(?,?,'sending',?,?)''',(sms_id,row['attempts']+1,r.utc_now(),r.utc_now()))
             r.record_after_order_event(conn,row['case_id'],'sms_send_authorized',actor_type='system' if automatic else 'team',details={'sms_id':sms_id,'automatic':automatic})
         try:
             validate_target(row,r.after_order_email_test_mode())
@@ -395,6 +471,8 @@ class SMS:
             ident,status,error = None,'delivery_unknown','Acceptance uncertain. Inspect provider logs before any further send.'
         with r.db() as conn:
             conn.execute('UPDATE after_order_sms SET status=?,provider_id=?,last_error=?,updated_at=? WHERE id=?',(status,ident,error,r.utc_now(),sms_id))
+            conn.execute('UPDATE after_order_sms_attempts SET status=?,provider_id=?,error=?,updated_at=? WHERE sms_id=? AND attempt_number=?',
+                         (status,ident,error,r.utc_now(),sms_id,row['attempts']+1))
             r.record_after_order_event(conn,row['case_id'],'sms_send_result',details={'sms_id':sms_id,'status':status,'provider_id':ident,'error':error})
         return {'ok':status in {'accepted','queued'},'status':status,'error':error}
 
@@ -408,7 +486,14 @@ class SMS:
         if not row['provider_id']:
             raise ValueError('No provider reference exists. Check uncertain attempts in the provider dashboard.')
         if row['provider'] == 'msg91':
-            raise ValueError('MSG91 delivery receipts are not connected yet. Check the request ID in MSG91 logs; acceptance does not confirm delivery.')
+            with r.db() as conn:
+                receipt=conn.execute('SELECT details_json FROM after_order_sms_receipts WHERE provider_id=? AND recipient=? ORDER BY created_at DESC LIMIT 1',(row['provider_id'],row['recipient'])).fetchone()
+            if receipt:
+                self.receipt(json.loads(receipt['details_json']))
+                with r.db() as conn:
+                    current=conn.execute('SELECT status FROM after_order_sms WHERE id=?',(sms_id,)).fetchone()
+                return {'ok':True,'status':current['status']}
+            raise ValueError('No MSG91 delivery report received yet. Acceptance is not confirmed delivery. Check MSG91 logs; do not resend an uncertain message.')
         if row['provider'] == 'odoo':
             case = r.after_order_case_by_id(row['case_id'])
             client = r.OdooClient(r.get_store(case['store_id']))
@@ -430,13 +515,36 @@ class SMS:
         if status not in {'queued','processing','sent','delivered','provider_failed','cancelled','canceled','undelivered','accepted','sending'}:
             raise ValueError('Provider returned an unrecognized delivery status.')
         with r.db() as conn:
-            conn.execute('UPDATE after_order_sms SET status=?,updated_at=? WHERE id=?', (status,r.utc_now(),sms_id))
+            # A slow status query must never overwrite a newer retry attempt.
+            conn.execute('UPDATE after_order_sms SET status=?,updated_at=? WHERE id=? AND attempts=? AND provider_id=? AND status<>?', (status,r.utc_now(),sms_id,row['attempts'],row['provider_id'],'sending'))
+            conn.execute('UPDATE after_order_sms_attempts SET status=?,updated_at=? WHERE sms_id=? AND attempt_number=? AND provider_id=?',
+                         (status,r.utc_now(),sms_id,row['attempts'],row['provider_id']))
             if row['status'] != status:
                 r.record_after_order_event(conn,row['case_id'],'sms_delivery_status',details={'sms_id':sms_id,'status':status})
         return {'ok':True,'status':status}
 
     def router(self):
         router = APIRouter(prefix='/api/after-order/sms')
+
+        @router.get('/log')
+        def log(store_id:int=0, status:str='', q:str='', page:int=1):
+            cutoff = (datetime.now(timezone.utc)-timedelta(days=30)).isoformat()
+            where=['s.updated_at>=?']; args=[cutoff]
+            if store_id:
+                where.append('c.store_id=?'); args.append(store_id)
+            if status:
+                where.append('s.status=?'); args.append(status)
+            if q:
+                where.append('(LOWER(c.odoo_order_name) LIKE ? OR s.recipient LIKE ? OR LOWER(c.sender_domain) LIKE ?)')
+                args.extend(['%'+q.strip().lower()[:100]+'%']*3)
+            clause=' AND '.join(where)
+            with self.r.db() as conn:
+                total=conn.execute('SELECT COUNT(*) AS n FROM after_order_sms s JOIN after_order_cases c ON c.id=s.case_id WHERE '+clause,args).fetchone()['n']
+                rows=conn.execute('''SELECT s.id,s.email_id,s.provider,s.recipient,s.test_mode,s.status,s.body,s.attempts,s.provider_id,
+                    s.last_error,s.created_at,s.updated_at,c.odoo_order_name,c.sender_domain
+                    FROM after_order_sms s JOIN after_order_cases c ON c.id=s.case_id WHERE '''+clause+
+                    ' ORDER BY s.updated_at DESC,s.id DESC LIMIT 30 OFFSET ?',[*args,(max(1,page)-1)*30]).fetchall()
+            return {'rows':[dict(x) for x in rows],'total':total,'days':30}
 
         @router.get('/settings')
         def settings():
@@ -458,17 +566,27 @@ class SMS:
         def preview(email_id:int):
             with self.r.db() as conn:
                 raw = conn.execute('SELECT * FROM after_order_sms WHERE email_id=?',(email_id,)).fetchone()
+                email = conn.execute('SELECT * FROM after_order_messages WHERE id=?',(email_id,)).fetchone()
             if not raw:
-                return {'row':None}
-            row = dict(raw); row['approval_digest']=digest(row); row.pop('snapshot_json')
-            return {'row':row}
+                reason=preparation_reason(dict(email) if email else None,self.config()['enabled'])
+                return {'row':None,'can_prepare':not bool(reason),'reason':reason or 'No SMS is saved yet. Prepare it to validate the phone, website, template and current order.'}
+            row = dict(raw); row['approval_digest']=digest(row)
+            kind=json.loads(row['snapshot_json']).get('kind')
+            row['can_resend']=row['status']=='delivered' and row['attempts']<3 and kind not in {'tracking','package_movement','trustpilot_review','delivery_issue_received'}
+            row.pop('snapshot_json')
+            with self.r.db() as conn:
+                attempts=conn.execute('SELECT * FROM after_order_sms_attempts WHERE sms_id=? ORDER BY attempt_number',(row['id'],)).fetchall()
+            return {'row':row,'attempts':[dict(x) for x in attempts]}
 
         @router.post('/email/{email_id}/prepare')
         def prepare(email_id:int):
             try:
                 self.prepare(email_id)
                 self.companion(email_id)
-                return preview(email_id)
+                result=preview(email_id)
+                if not result['row'] and result.get('can_prepare'):
+                    result['reason']='No eligible in-transit event or approved SMS template was found. No SMS was sent.'
+                return result
             except ValueError as exc:
                 raise HTTPException(409,str(exc)) from exc
 
@@ -487,4 +605,13 @@ class SMS:
                 raise HTTPException(409,str(exc)) from exc
             except Exception as exc:
                 raise HTTPException(502,'Provider status check failed. No SMS was sent.') from exc
+
+        @router.post('/{sms_id}/resend')
+        def resend(sms_id:int,payload:dict):
+            if payload.get('confirm_duplicate_charge') is not True:
+                raise HTTPException(409,'Confirm that a second SMS may incur another charge.')
+            try:
+                return self.send(sms_id,approval=str(payload.get('approval_digest') or ''),resend=True)
+            except ValueError as exc:
+                raise HTTPException(409,str(exc)) from exc
         return router

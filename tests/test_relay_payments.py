@@ -292,6 +292,38 @@ class EmailOutboxTests(unittest.TestCase):
   self.c.execute("CREATE TABLE after_order_email_attempts(message_id INTEGER,attempt_number INTEGER,status TEXT,created_at TEXT,updated_at TEXT,provider_message_id TEXT,error TEXT)")
   self.svc.settings=lambda:{**DEFAULTS,'test_mode':False,'store_ids':[1],'public_base_url':'https://app.example.test'}
   self.svc.capture(CAPTURE)
+ def rejected403(self):
+  import requests
+  response=Mock(status_code=403)
+  response.raise_for_status.side_effect=requests.HTTPError(response=response)
+  with patch.dict('os.environ',{'RESEND_API_KEY':'fake'}),patch('relay_bridge_test.relay_payments.requests.post',return_value=response):
+   self.svc.emails()
+  return self.c.execute('SELECT id FROM after_order_messages').fetchone()[0]
+ def test_403_retry_requires_current_payment_and_explicit_review(self):
+  message_id=self.rejected403()
+  self.assertEqual('failed',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
+  job,message,payload,proof=self.svc.rejected_email(message_id)
+  with self.assertRaises(ValueError):self.svc.retry_rejected_email(message_id,'wrong')
+  self.svc.retry_rejected_email(message_id,proof)
+  response=Mock();response.json.return_value={'id':'recovered'}
+  with patch.dict('os.environ',{'RESEND_API_KEY':'fake'}),patch('relay_bridge_test.relay_payments.requests.post',return_value=response) as post:
+   self.svc.emails()
+   self.assertTrue(post.call_args.kwargs['headers']['Idempotency-Key'].endswith(':approved-retry:1'))
+  with self.assertRaises(ValueError):self.svc.rejected_email(message_id)
+ def test_403_paid_or_mixed_uncertain_attempts_block(self):
+  message_id=self.rejected403()
+  self.svc.current=lambda row:dict(SNAP,state='done',initiated_at='now')
+  with self.assertRaises(ValueError):self.svc.rejected_email(message_id)
+  self.svc.current=lambda row:dict(SNAP)
+  self.c.execute("UPDATE after_order_email_attempts SET error='Timeout'")
+  with self.assertRaises(ValueError):self.svc.rejected_email(message_id)
+ def test_403_old_queue_reset_needs_separate_override(self):
+  message_id=self.rejected403()
+  self.c.execute('UPDATE after_order_messages SET payload_json=?',(json.dumps({'_care_rollout_cancelled_at':'old'}),))
+  proof=self.svc.rejected_email(message_id)[3]
+  with self.assertRaises(ValueError):self.svc.retry_rejected_email(message_id,proof)
+  self.svc.retry_rejected_email(message_id,proof,True)
+  self.assertEqual(1,self.c.execute('SELECT COUNT(*) FROM relay_email_retries').fetchone()[0])
  def test_lost_ack_retries_identical_key_and_payload(self):
   from unittest.mock import patch
   import requests

@@ -6,10 +6,50 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, digest, number, order_link, recipient, validate_config, validate_target
+from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, digest, number, order_link, recipient, validate_config, validate_target, preparation_reason
 
 
 class SMSTests(unittest.TestCase):
+    def test_welcome_explains_intentional_exclusion(self):
+        self.assertIn('intentionally',preparation_reason({'template_kind':'new_order_welcome'}))
+
+    @patch('app.services.care_sms.deliver',side_effect=[Rejected('HTTP 403'),('provider12345678','accepted')])
+    def test_failed_retry_retains_attempts(self,send):
+        row=self.sms.prepare(1)
+        self.sms.send(row['id'],approval=digest(self.row()))
+        self.assertEqual('failed',self.row()['status'])
+        self.sms.send(row['id'],approval=digest(self.row()))
+        states=[r['status'] for r in self.conn.execute('SELECT status FROM after_order_sms_attempts ORDER BY attempt_number')]
+        self.assertEqual(['failed','accepted'],states)
+
+    @patch('app.services.care_sms.deliver',return_value=('provider12345678','accepted'))
+    def test_explicit_resend_only_after_delivered(self,send):
+        row=self.sms.prepare(1)
+        self.sms.send(row['id'],approval=digest(self.row()))
+        with self.assertRaises(ValueError):self.sms.send(row['id'],approval=digest(self.row()),resend=True)
+        self.conn.execute("UPDATE after_order_sms SET status='delivered'")
+        self.sms.send(row['id'],approval=digest(self.row()),resend=True)
+        self.assertEqual(2,send.call_count)
+
+    def test_receipts_match_recipient_and_do_not_regress(self):
+        row=self.sms.prepare(1)
+        self.conn.execute("UPDATE after_order_sms SET provider='msg91',provider_id='provider12345678',status='accepted',attempts=1")
+        payload={'requestId':'provider12345678','telNum':TEST_NUMBER[1:],'status':'1'}
+        self.sms.receipt({**payload,'telNum':'14155552671'})
+        self.assertEqual('accepted',self.row()['status'])
+        self.sms.receipt(payload);self.sms.receipt(payload)
+        self.sms.receipt({**payload,'status':'0'})
+        self.assertEqual('delivered',self.row()['status'])
+
+    def test_webhook_requires_private_header(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        app=FastAPI();app.include_router(self.sms.webhook_router())
+        with patch.dict('os.environ',{'MSG91_WEBHOOK_SECRET':'x'*32}):
+            client=TestClient(app)
+            self.assertEqual(401,client.post('/api/public/after-order-webhooks/msg91',json={}).status_code)
+            self.assertEqual(400,client.post('/api/public/after-order-webhooks/msg91',json={},headers={'X-MSG91-Webhook-Secret':'x'*32}).status_code)
+
     def test_secretgreen_brand_is_not_a_credential(self):
         payload = {'enabled':False, 'provider':'msg91', 'mappings':{
             '8:1':{'transactional_sms_enabled':False,'msg91':{

@@ -818,7 +818,7 @@ def request_has_public_access(request: Request) -> bool:
 
 def request_requires_public_access(request: Request) -> bool:
     path = request.url.path
-    if request.method == 'POST' and path == '/api/public/after-order-webhooks/resend':
+    if request.method == 'POST' and path in {'/api/public/after-order-webhooks/resend','/api/public/after-order-webhooks/msg91'}:
         return False  # Raw-body signature and replay checks are enforced by this handler.
     if request.method in {'GET','POST'} and re.fullmatch(r'/api/public/after-order/unsubscribe/[a-f0-9]{64}',path):
         return False  # Scoped opaque token; GET only shows preferences, POST opts out.
@@ -45532,6 +45532,7 @@ app.include_router(manual_refunds.launch_router())
 from app.services.care_sms import SMS as CareSMS
 care_sms = CareSMS(globals())
 app.include_router(care_sms.router())
+app.include_router(care_sms.webhook_router())
 
 
 from app.services.relay_payments import RelayPayments

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { SmsPreview } from './SmsSettings'
+import { SmsPreview, SmsLog } from './SmsSettings'
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
@@ -111,6 +111,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
     </header>
     <section className="epost-notice"><strong>Sending safeguards</strong><p>New-order welcome emails send automatically in live mode. Newly prepared test emails send without approval only to sonianuj1284@gmail.com. Successful new app refunds send a website-branded confirmation automatically in live mode. Refund confirmations have their own duplicate-protected delivery worker. Other live emails and failed-send retries require individual team approval.</p></section>
     {rules && <section className="epost-notice"><strong>Provider acceptance is not inbox delivery</strong><p>Sent means the provider returned a message ID. Read receipts and inbox delivery are not inferred. Retry is available only for confirmed failures with a saved payload and current order context, up to five attempts. Uncertain sends, sent messages and legacy records cannot be blindly retried.</p><p>In test mode, only stored test messages to the configured test address can be retried. No bulk retry runs from this page.</p></section>}
+    <details className="epost-notice"><summary className="cursor-pointer font-semibold">SMS log — last 30 days · preview, retry and resend</summary><SmsLog api={api} storeId={storeId}/></details>
     <div className="epost-layout">
       <aside className="epost-queues" aria-label="Email work queues"><div className="epost-queue-title">Work queues <span>Filtered totals</span></div>
         {queues.map(([key, label]) => <button key={key} className={`epost-queue ${queue === key ? "is-active" : ""}`} aria-pressed={queue === key} onClick={() => change(setQueue, key)}><span>{label}</span><strong>{data ? (data.summary[key] || 0).toLocaleString() : "—"}</strong></button>)}
@@ -145,6 +146,15 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
         <section><h3>Send attempts</h3>{!detail.attempts.length && <p>Detailed attempt history is unavailable for this older record. Its saved status is shown above.</p>}<ol className="email-attempts">{detail.attempts.map(attempt => <li key={attempt.attempt_number}><strong>Attempt {attempt.attempt_number} · {attempt.status.replaceAll("_", " ")}</strong><small>{formatDate(attempt.created_at)} → {formatDate(attempt.updated_at)}</small>{attempt.error && <p className="email-log-error">{attempt.error}</p>}</li>)}</ol>
           {detail.row.can_approve ? <Button disabled={retryId !== null} onClick={() => { setDetailId(null); setRetryTarget(detail.row) }}>Approve sending this email</Button> : <p>{detail.row.retry_block_reason}</p>}</section>
         <SmsPreview key={detail.row.id} api={api} emailId={detail.row.id} />
+        {detail.row.template_kind?.startsWith('relay_') && detail.row.last_error?.includes('HTTP 403;') && ['failed','delivery_unknown'].includes(detail.row.status) && <Button disabled={retryId!==null} onClick={async()=>{
+          setRetryId(detail.row.id)
+          try {
+            const p=await api<{approval_digest:string;subject:string;recipient:string[];prior_queue_reset:boolean}>(`/api/relay/emails/${detail.row.id}/rejected-preview`)
+            if(window.confirm(`Retry rejected email: ${p.subject} to ${p.recipient.join(', ')}?${p.prior_queue_reset?' This explicitly restores this email from the earlier queue reset.':''}`)) {
+              await api(`/api/relay/emails/${detail.row.id}/retry-rejected`,{method:'POST',body:JSON.stringify({approval_digest:p.approval_digest,allow_prior_queue_reset:p.prior_queue_reset})});setTick(t=>t+1)
+            }
+          } catch(e){setDetailError(String(e))}finally{setRetryId(null)}
+        }}>Recheck payment and retry rejected 403 email</Button>}
         <section><h3>Email preview</h3>{preview ? <iframe title="Saved email preview" sandbox="" referrerPolicy="no-referrer" srcDoc={preview} className="email-preview-frame" tabIndex={-1} /> : <p>No HTML preview was saved.</p>}</section></>}
     </DialogContent></Dialog>
     <Dialog open={retryTarget !== null} onOpenChange={open => { if (!open && retryId === null) setRetryTarget(null) }}><DialogContent><DialogHeader><DialogTitle>Approve this email attempt?</DialogTitle><DialogDescription>This approval sends the exact saved email to the recipient below, only if current order and safety checks still pass. Failures require another approval.</DialogDescription></DialogHeader>
