@@ -598,7 +598,12 @@ class AirwallexRefunds:
             if not re.search(r'\brefund\b', reference + ' ' + remarks, re.I):
                 continue
             match = re.search(r'\brefund\s+([A-Z0-9][A-Z0-9/_-]*)', reference, re.I)
-            name = match.group(1).upper() if match else ''
+            # Older manual transfers sometimes put only the order number in reference
+            # and mark the refund in remarks. Accept a whole order token, never a substring.
+            bare_reference = reference.strip()
+            name = match.group(1).upper() if match else (bare_reference.upper()
+                if re.fullmatch(r'[A-Z0-9][A-Z0-9/_-]*', bare_reference, re.I)
+                and any(ch.isdigit() for ch in bare_reference) else '')
             refunds[t['id']] = (t, name)
             if name:
                 names.add(name)
@@ -613,8 +618,9 @@ class AirwallexRefunds:
                 break
             try:
                 client = self.client_factory(stores[0][1])
-                orders = client.search_read('sale.order', [('name', 'in', sorted(names))],
-                    ['name', 'partner_id', 'website_id', 'amount_total', 'currency_id'])
+                orders = client.execute('sale.order', 'search_read', [[('name', 'in', sorted(names))]],
+                    {'fields': ['name', 'partner_id', 'website_id', 'amount_total', 'currency_id'],
+                     'context': {'active_test': False}})
                 for order in orders:
                     name = order['name'].upper()
                     if name not in matches:

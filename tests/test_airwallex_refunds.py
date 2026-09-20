@@ -79,7 +79,7 @@ class HistoryImportTests(unittest.TestCase):
     def setUp(self):
         self.db=MemoryDB()
         self.client=Mock()
-        self.client.search_read.return_value=[{'id':1,'name':'NC100','partner_id':[1,'Customer'],
+        self.client.execute.return_value=[{'id':1,'name':'NC100','partner_id':[1,'Customer'],
             'website_id':[1,'Shop'],'amount_total':100,'currency_id':[1,'CAD']}]
         self.service=AirwallexRefunds(db=self.db,get_store=lambda _:SimpleNamespace(
             odoo_url='https://test',odoo_db='test',website_id=1),client_factory=lambda _:self.client,
@@ -93,14 +93,20 @@ class HistoryImportTests(unittest.TestCase):
         self.service.sync_history()
         rows=self.service.history()['rows']
         self.assertEqual(len(rows),1);self.assertEqual(rows[0]['order_id'],1)
+        self.assertFalse(self.client.execute.call_args.args[3]['context']['active_test'])
         self.assertEqual(rows[0]['source'],'Manual Airwallex')
         self.assertNotIn('private-bank-number',str(self.db.external))
     def test_order_on_unconfigured_website_maps_without_bypassing_store_scope(self):
-        self.client.search_read.return_value[0]['website_id']=[39,'Archived shop']
+        self.client.execute.return_value[0]['website_id']=[39,'Archived shop']
         self.assertEqual(self.service.sync_history()['mapped'],1)
         row=self.service.history()['rows'][0]
         self.assertEqual(row['order_id'],1);self.assertIsNone(row['store_id'])
         self.assertIn('not configured',row['mapping_note'])
+
+    def test_bare_order_reference_with_refund_remark_maps(self):
+        self.transfers[0].update(reference='NC100',remarks='Customer refund')
+        self.assertEqual(self.service.sync_history()['mapped'],1)
+        self.assertEqual(self.service.history()['rows'][0]['order_name'],'NC100')
 
     def test_unmatched_and_partial_refund_still_visible(self):
         self.transfers[0]['reference']='Partial Refund NC999'
@@ -109,10 +115,10 @@ class HistoryImportTests(unittest.TestCase):
         row=self.service.history()['rows'][0]
         self.assertEqual(row['order_name'],'NC999');self.assertEqual(row['mapping_status'],'not_found')
     def test_ambiguous_or_unavailable_mapping_is_not_guessed(self):
-        self.client.search_read.return_value.append({**self.client.search_read.return_value[0],'id':2})
+        self.client.execute.return_value.append({**self.client.execute.return_value[0],'id':2})
         self.service.sync_history()
         self.assertEqual(self.service.history()['rows'][0]['mapping_status'],'ambiguous')
-        self.client.search_read.side_effect=RuntimeError('upstream unavailable')
+        self.client.execute.side_effect=RuntimeError('upstream unavailable')
         self.service.sync_history()
         self.assertEqual(self.service.history()['rows'][0]['mapping_status'],'unavailable')
     def test_app_and_manual_history_deduplicates_same_transfer(self):

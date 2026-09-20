@@ -22,7 +22,7 @@ A dedicated transfer-event subscription uses the existing webhook URL with its o
 
 ## Manual refund history
 
-The main history combines app reservations and imported Airwallex transfers with refund references. `Refund <order>` and `Partial Refund <order>` map by exact order name across registered Odoo databases. Imports use an upsert keyed by Airwallex account and transfer ID, and the merged list deduplicates by transfer ID/request ID. Only display fields are persisted; bank account numbers and full beneficiary data are excluded. Sync runs every five minutes and through the staff-only Sync Airwallex history button.
+The main history combines app reservations and imported Airwallex transfers with refund references. `Refund <order>` and `Partial Refund <order>` map by exact order name across registered Odoo databases, including archived orders. Legacy transfers with a bare order reference and a refund remark are also mapped. Imports use an upsert keyed by Airwallex account and transfer ID, and the merged list deduplicates by transfer ID/request ID. Only display fields are persisted; bank account numbers and full beneficiary data are excluded. Sync runs every five minutes and through the staff-only Sync Airwallex history button.
 
 Orders on websites without an app store registration are still mapped to their Odoo order and labelled; they cannot be opened through another store's scope. Missing or ambiguous orders remain visible and explicitly unresolved. A failed database lookup does not produce a guessed match.
 
