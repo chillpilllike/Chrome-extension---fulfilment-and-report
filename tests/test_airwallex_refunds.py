@@ -154,6 +154,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.service.verify_transfer_webhook(timestamp,'invalid',body))
         self.assertFalse(self.service.verify_transfer_webhook('1000',signature,body))
 
+    def test_transfer_hook_fast_path_does_not_consume_deposit_events(self):
+        import ast
+        from pathlib import Path
+        tree=ast.parse(Path('app/main.py').read_text())
+        fn=next(n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name=='api_airwallex_webhook')
+        fast=next(n for n in fn.body if isinstance(n,ast.If) and 'verify_transfer_webhook' in ast.unparse(n.test))
+        self.assertFalse(any(isinstance(n,ast.Return) for n in fast.body))
+        self.assertTrue(any(isinstance(n,ast.If) and 'payout.transfer.' in ast.unparse(n.test) for n in fast.body))
+
     def test_public_proxy_still_rejects_payouts(self):
         from app.services.airwallex_api import validate_operation
         with self.assertRaises(ValueError):validate_operation({'method':'POST','endpoint':'/api/v1/transfers/create'},self.cfg)
