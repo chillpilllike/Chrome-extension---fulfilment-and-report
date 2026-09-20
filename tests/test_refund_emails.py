@@ -55,7 +55,7 @@ class RefundEmailTests(unittest.TestCase):
         self.assertEqual(case['website_id'],22)
         self.assertEqual(msg['sender'],'Actual site <notifications@actual.example.com>')
         self.assertEqual(msg['recipient'],'customer@example.com')
-        self.assertIn('12.34 EUR',msg['html_preview']);self.assertIn('24–48',msg['html_preview'])
+        self.assertIn('12.34 EUR',msg['html_preview']);self.assertIn('24–72 business hours',msg['html_preview']);self.assertNotIn('after the successful refund',msg['html_preview'])
         self.assertIn('Account ending 1234',msg['html_preview'])
     def test_timeout_retry_uses_identical_payload_and_key(self):
         self.provider.send.side_effect=[RuntimeError('timeout'),{'id':'email1'}]
