@@ -44491,6 +44491,14 @@ async def api_airwallex_webhook(request: Request, background_tasks: BackgroundTa
     raw_body = await request.body()
     timestamp = request.headers.get("x-timestamp", "")
     signature = request.headers.get("x-signature", "")
+    if airwallex_refunds.verify_transfer_webhook(timestamp, signature, raw_body):
+        try:
+            transfer_payload = json.loads(raw_body)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Invalid Airwallex webhook JSON")
+        if isinstance(transfer_payload, dict) and str(transfer_payload.get("name") or "").startswith("payout.transfer."):
+            background_tasks.add_task(airwallex_refunds.handle_webhook, transfer_payload)
+        return {"received": True}
     configurations = airwallex_provider_configurations()
     secrets = [row["secret"] for row in configurations]
     if not secrets:

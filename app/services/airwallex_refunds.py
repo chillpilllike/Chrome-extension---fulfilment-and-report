@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ConfigDict
 
 from app.services.airwallex_api import server_request
+from app.services.airwallex_hub import verify_webhook_signature
 
 ZERO = Decimal('0')
 # Failed transfers can fail after being paid. Keep funds reserved until finance reconciles.
@@ -126,6 +127,8 @@ class AirwallexRefunds:
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '',
                 fee_amount TEXT, fee_currency TEXT, actor TEXT NOT NULL DEFAULT 'staff')''')
             c.execute('CREATE INDEX IF NOT EXISTS airwallex_refund_order_idx ON airwallex_refund_payouts(order_key)')
+            c.execute('''CREATE TABLE IF NOT EXISTS airwallex_refund_webhook (
+                account_key TEXT PRIMARY KEY, webhook_id TEXT NOT NULL, secret TEXT NOT NULL)''')
 
     def auth(self, request: Request, response: Response):
         response.headers["Cache-Control"] = "no-store"
@@ -476,6 +479,16 @@ class AirwallexRefunds:
             self.record_result(rid, matches[0])
         with self.db() as c:
             return self.public_row(c.execute('SELECT * FROM airwallex_refund_payouts WHERE request_id=?', (rid,)).fetchone())
+
+    def verify_transfer_webhook(self, timestamp, signature, raw_body):
+        try:
+            with self.db() as c:
+                row = c.execute('SELECT secret FROM airwallex_refund_webhook WHERE account_key=?',
+                    (self.account_key(self.config()),)).fetchone()
+            return bool(row and verify_webhook_signature(timestamp=timestamp, signature=signature,
+                raw_body=raw_body, secrets=[row['secret']]))
+        except Exception:
+            return False
 
     def handle_webhook(self, payload):
         data = payload.get('data') or {}

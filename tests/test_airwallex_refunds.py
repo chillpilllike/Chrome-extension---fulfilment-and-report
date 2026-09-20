@@ -144,6 +144,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(r.status_code,403)
         r=client.post('/api/airwallex/refunds/submit',json={'review_token':'x','confirmed':False},headers={'x-admin-token':'test-staff'})
         self.assertEqual(r.status_code,400)
+    def test_dedicated_webhook_rejects_invalid_and_stale_signatures(self):
+        import time, hmac, hashlib
+        self.database.execute=Mock(return_value=Mock(fetchone=lambda:{'secret':'test-hook'}))
+        body=b'{"name":"payout.transfer.paid"}'
+        timestamp=str(int(time.time()*1000))
+        signature=hmac.new(b'test-hook',timestamp.encode()+body,hashlib.sha256).hexdigest()
+        self.assertTrue(self.service.verify_transfer_webhook(timestamp,signature,body))
+        self.assertFalse(self.service.verify_transfer_webhook(timestamp,'invalid',body))
+        self.assertFalse(self.service.verify_transfer_webhook('1000',signature,body))
+
     def test_public_proxy_still_rejects_payouts(self):
         from app.services.airwallex_api import validate_operation
         with self.assertRaises(ValueError):validate_operation({'method':'POST','endpoint':'/api/v1/transfers/create'},self.cfg)

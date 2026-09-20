@@ -14,7 +14,7 @@ Review calls beneficiary/transfer validation endpoints only. A ten-minute encryp
 
 Transfer fees are additional and borne by the business. The review clearly states that exact fees are available after submission; they are not falsely shown as zero. The resulting fee/currency and provider transfer ID are recorded in the audit history.
 
-Signed transfer webhooks trigger authoritative status reads. A background loop polls reservations, including PAID transfers that can later fail. Failed/unknown outcomes stay reserved pending finance reconciliation. Confirmed cancelled transfers release their amount. This page does not automatically cancel Odoo orders, generate credit notes or send customer messages.
+A dedicated transfer-event subscription uses the existing webhook URL with its own private signing secret. Airwallex does not support changing the event list of an existing subscription. Signed transfer webhooks trigger authoritative status reads. A background loop polls reservations, including PAID transfers that can later fail. Failed/unknown outcomes stay reserved pending finance reconciliation. Confirmed cancelled transfers release their amount. This page does not automatically cancel Odoo orders, generate credit notes or send customer messages.
 
 ## Verification
 
