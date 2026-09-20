@@ -2350,6 +2350,8 @@ def init_db() -> None:
         conn.executescript(sms_schema)
         from app.services.delivery_followup import SCHEMA as followup_schema
         conn.executescript(followup_schema)
+        from app.services.manual_refunds import SCHEMA as manual_refund_schema
+        conn.executescript(manual_refund_schema)
         store_columns = {r["name"] for r in conn.execute("PRAGMA table_info(stores)").fetchall()}
         if "airwallex_order_prefixes" not in store_columns:
             conn.execute("ALTER TABLE stores ADD COLUMN airwallex_order_prefixes TEXT NOT NULL DEFAULT ''")
@@ -39197,7 +39199,7 @@ def after_order_test_recipient() -> str:
 def after_order_cutoff_date() -> str:
     # Fixed rollout floor, not a rolling 'today' filter. Settings may only
     # narrow eligibility further; old environment values cannot widen it.
-    rollout_floor = "2026-08-20"
+    rollout_floor = max("2026-08-20", clean_text(get_service_settings().get('after_order_manual_live_cutoff'))[:10])
     value = clean_text(get_service_settings().get("after_order_cutoff_date"))[:10]
     try:
         datetime.strptime(value, "%Y-%m-%d")
@@ -39891,7 +39893,7 @@ def after_order_absolute_url(request: Request, path: str) -> str:
     return f"{base}/{clean_text(path).lstrip('/')}"
 
 
-def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
+def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bool = False, allow_cancelled: bool = False) -> dict[str, Any]:
     """Resolve customer/site data from the case's own Odoo store at send time."""
     if not case.get("odoo_order_id"):
         return case
@@ -39904,7 +39906,7 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bo
         fields = odoo.existing_fields("sale.order", ["partner_id", "partner_invoice_id", "website_id", "state"])
         orders = odoo.read("sale.order", [int(case["odoo_order_id"])], fields)
         order = orders[0] if orders else {}
-        if strict and (not order or order.get("state") == "cancel" or not many2one_id(order.get("website_id"))):
+        if strict and (not order or (order.get("state") == "cancel" and not allow_cancelled) or not many2one_id(order.get("website_id"))):
             raise ValueError("A current, non-cancelled Odoo website order is required.")
         website_id = many2one_id(order.get("website_id")) or website_id
         partner_id = many2one_id(order.get("partner_id")) or many2one_id(order.get("partner_invoice_id"))
@@ -40550,6 +40552,11 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    if json.loads(original.get('payload_json') or '{}').get('_care_rollout_cancelled_at'):
+        raise HTTPException(409,'This earlier notification was cancelled at the manual-live reset. It cannot be sent or retried.')
+    manual_completion = original.get('template_kind') == 'manual_refund_completed'
+    if manual_completion:
+        manual_refunds.validate_message(original)
     if original.get('template_kind') == 'refund_confirmed':
         require_after_order_case_in_scope(after_order_case_by_id(int(original['case_id'])))
         try:
@@ -40586,16 +40593,16 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if not created or created <= datetime.now(timezone.utc) - timedelta(days=30):
         raise HTTPException(409, "The email's links may have expired. Create a current email from the order instead.")
     if not original.get("test_mode"):
-        case = hydrate_after_order_recipient_and_domain(case, strict=True)
+        case = hydrate_after_order_recipient_and_domain(case, strict=True, allow_cancelled=manual_completion)
         if automatic and case.get('current_decision'):
             raise HTTPException(409, 'Customer already responded; review before resending an old action email.')
-        if case.get("confirmed_at") and original.get("template_kind") not in {"trustpilot_review", "delivery_issue_received"}:
+        if case.get("confirmed_at") and original.get("template_kind") not in {"trustpilot_review", "delivery_issue_received", "manual_refund_completed"}:
             raise HTTPException(409, "The customer request was already confirmed. Its action email cannot be retried.")
-        if original.get("request_fingerprint") != request_fingerprint(case) or not after_order_tracking_is_current(case):
+        if not manual_completion and (original.get("request_fingerprint") != request_fingerprint(case) or not after_order_tracking_is_current(case)):
             raise HTTPException(409, "The order or tracking changed. Create a current email instead.")
         if clean_text(case.get("customer_email")).lower() != clean_text(original["recipient"]).lower() or after_order_sender(case)[0] != original["sender"]:
             raise HTTPException(409, "The recipient or website sender changed. Create a current email instead.")
-        if case.get("case_type") == "item_unavailable":
+        if case.get("case_type") == "item_unavailable" and not manual_completion:
             review = after_order_unavailable_review(case, for_send=True)
             if review["blocked"] or not review["approved"]:
                 raise HTTPException(409, review["reason"])
@@ -40609,7 +40616,9 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             if not permitted(locked, test_mode=after_order_email_test_mode()):
                 raise HTTPException(409, 'Automatic email exception is no longer eligible.')
             if not locked.get('test_mode'):
-                if locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
+                if manual_completion:
+                    manual_refunds.validate_message(locked)
+                elif locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
                     delivery_followups.validate(case, locked['template_kind'])
                 elif case.get('case_type') != 'new_order_welcome':
                     raise HTTPException(409, 'Automatic live email is limited to new-order welcome cases.')
@@ -40637,7 +40646,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
                 raise HTTPException(409, str(exc)) from exc
         if saved_payload.get('_care_reminder_parent'):
             care_reminders.validate(int(saved_payload['_care_reminder_parent']),int(saved_payload['_care_reminder_number']),case)
-        if not locked.get('test_mode') and case.get('case_type') == 'item_unavailable':
+        if not locked.get('test_mode') and case.get('case_type') == 'item_unavailable' and not manual_completion:
             current_revision = alternative_workflow.notification_revision(case)
             if saved_payload.get('_care_recommendations_revision') != current_revision:
                 raise HTTPException(409, 'Recommendations changed. Prepare and review a current email.')
@@ -41383,6 +41392,7 @@ def api_after_order_settings() -> dict[str, Any]:
         "ok": True,
         "email_approval_required": True,
         "financial_approval_required": True,
+        "refund_mode": "manual" if manual_refunds.enabled() else "provider",
         "approval_only_live": after_order_approval_only_live(),
         "cutoff_date": after_order_cutoff_date(),
         "email_test_mode": after_order_email_test_mode(),
@@ -41512,7 +41522,8 @@ def api_after_order_automation_settings(payload: AfterOrderTestModePayload) -> d
 
 @app.post("/api/after-order/settings/test-mode")
 def api_after_order_test_mode(payload: AfterOrderTestModePayload) -> dict[str, Any]:
-    if not payload.enabled and clean_text(get_service_settings().get("after_order_live_readiness_approved")) != "true":
+    manual_live = manual_refunds.enabled() and after_order_approval_only_live() and clean_text(get_service_settings().get('after_order_automation_enabled')) == 'false'
+    if not payload.enabled and not manual_live and clean_text(get_service_settings().get("after_order_live_readiness_approved")) != "true":
         raise HTTPException(409, "Live mode remains locked until payment/refund integration, dispatch handling time, website routing and end-to-end tests have been verified. Test emails remain available.")
     set_service_settings({"after_order_email_test_mode": "true" if payload.enabled else "false"})
     return {
@@ -41535,6 +41546,7 @@ def api_after_order_approval_only_live(payload: dict[str, Any]) -> dict[str, Any
     set_service_settings({
         'after_order_approval_only_live': 'true',
         'after_order_automation_enabled': 'false',
+        'after_order_refund_mode': 'manual',
     })
     if not after_order_approval_only_live() or clean_text(get_service_settings().get('after_order_automation_enabled')) != 'false':
         raise HTTPException(409, "Approval-only guard could not be persisted. Test mode is unchanged.")
@@ -45479,6 +45491,10 @@ from app.services.welcome_email import Monitor as WelcomeEmailMonitor
 welcome_emails = WelcomeEmailMonitor(globals())
 from app.services.delivery_followup import Monitor as DeliveryFollowupMonitor, receipt_correction
 delivery_followups = DeliveryFollowupMonitor(globals())
+from app.services.manual_refunds import ManualRefunds
+manual_refunds = ManualRefunds(globals())
+app.include_router(manual_refunds.router())
+app.include_router(manual_refunds.launch_router())
 from app.services.care_sms import SMS as CareSMS
 care_sms = CareSMS(globals())
 app.include_router(care_sms.router())
@@ -45504,7 +45520,8 @@ from app.services.airwallex_refunds import AirwallexRefunds
 from app.services.refund_emails import RefundEmails
 refund_emails = RefundEmails(db=db, get_store=get_store, client_factory=OdooClient,
     test_mode=lambda: get_setting('airwallex_refund_email_enabled','false').strip().lower() not in {'true','1','yes','on'},
-    suppressed=care_delivery.suppressed, list_stores=list_stores)
+    suppressed=care_delivery.suppressed, list_stores=list_stores,
+    cutoff_date=lambda: clean_text(get_service_settings().get('after_order_manual_live_cutoff')))
 airwallex_refunds = AirwallexRefunds(db=db, get_store=get_store, client_factory=OdooClient, list_stores=list_stores,
     configuration=airwallex_default_connection, notifications=refund_emails,
     staff_check=lambda request: bool(effective_admin_access_token()) and request_has_admin_access(request))

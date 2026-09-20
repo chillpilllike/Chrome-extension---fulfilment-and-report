@@ -43,6 +43,7 @@ import { BrowserMultiFormatOneDReader, BrowserMultiFormatReader, type IScannerCo
 import { APP_VERSION } from "@/appVersion"
 import { EpostWorkspace } from "@/components/EpostWorkspace"
 import { AfterCareWorkspace } from "@/components/AfterCareWorkspace"
+import { ManualRefundPanel } from "@/components/ManualRefundPanel"
 import { LineAlternativeButton, OrderCareTimeline } from "@/components/LineAlternatives"
 import { AirwallexRefunds } from "@/components/AirwallexRefunds"
 import { RelayPayments } from "@/components/RelayPayments"
@@ -12456,7 +12457,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
   useEffect(() => { void load(); return () => { requestRef.current += 1 } }, [storeId, status, page, searchQuery])
 
   const updateTestMode = async (enabled: boolean) => {
-    if (!enabled && !window.confirm("Turn off email test mode? Customer email delivery will be permitted once an email provider is connected.")) return
+    if (!enabled && !window.confirm("Turn off test mode? Approved emails, welcome messages and eligible delivery follow-ups can reach real customers. In manual-refund mode, marking a refund completed sends its confirmation email; no refund is executed automatically.")) return
     try {
       const result = await api<{ email_test_mode: boolean; email_test_recipient: string }>("/api/after-order/settings/test-mode", {
         method: "POST",
@@ -12633,7 +12634,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {row.refund_request?.last_error ? <span className="mt-1 block text-xs text-destructive">Odoo refund log: {row.refund_request.last_error}</span> : null}
                   {row.execution ? <span className="mt-2 block text-xs font-medium">Execution: {row.execution.status.replaceAll("_", " ")}</span> : null}
                   {row.execution?.last_error ? <p className="mt-1 max-h-20 overflow-y-auto text-xs text-destructive">{row.execution.last_error}</p> : null}
-                  {row.confirmed_at && row.execution?.status !== "completed" ? <p className="mt-1 text-xs text-amber-800">Approved only — execution is not yet complete.</p> : null}
+                  {row.confirmed_at && row.status !== "resolved" && row.execution?.status !== "completed" ? <p className="mt-1 text-xs text-amber-800">Approved only — execution is not yet complete.</p> : null}
                   {row.current_decision && !row.confirmed_at ? <Badge variant="outline" className="mt-2">{row.current_decision === "offer_alternatives" ? "24-hour window for each line" : "Link active until confirmation"}</Badge> : null}
                   {row.confirmed_at ? <Badge variant="secondary" className="mt-2">Links expired after approval</Badge> : null}
                 </div>
@@ -12655,6 +12656,7 @@ function AfterOrderCarePage({ storeId, onResult, initialQuery = "" }: { storeId:
                   {!itemCase && (row.odoo_order_name || row.tracking_code) ? <Button onClick={() => window.open(`/package-tracker?q=${encodeURIComponent(row.odoo_order_name || row.tracking_code || "")}&field=all`, "_blank", "noopener,noreferrer")}>Track all details</Button> : null}
                   <Button variant="outline" onClick={() => void openActivity(row)}>View activity</Button>
                 </div>
+                <ManualRefundPanel caseId={row.id} request={api} onComplete={()=>void load()}/>
                 <OrderCareTimeline caseId={row.id} orderNumber={row.odoo_order_name || ""} request={api}/>
               </div>
 

@@ -160,6 +160,7 @@ class StoredSelections(unittest.TestCase):
         def db(): yield Connection(self.conn)
         self.events=[]
         self.namespace={'db':db,'after_order_email_test_mode':lambda:False,
+            'manual_refunds':SimpleNamespace(enabled=lambda:False),
             'request_fingerprint':lambda case:'current','utc_now':lambda:'2026-09-06T10:00:00+00:00',
             'record_after_order_event':lambda *args,**kw:self.events.append((args,kw))}
         self.workflow=Workflow(self.namespace)
@@ -222,6 +223,12 @@ class StoredSelections(unittest.TestCase):
         self.namespace['OdooClient']=Mock(side_effect=AssertionError('Live call'))
         self.assertIn('Test preview',self.refund_endpoint()(1,10,RefundApproval(version=1,confirm_amount=10))['message'])
         self.namespace['OdooClient'].assert_not_called()
+
+    def test_manual_mode_never_executes_refund(self):
+        self.prepare_refund_choice()
+        self.namespace['manual_refunds']=SimpleNamespace(enabled=lambda:True)
+        with self.assertRaises(HTTPException):self.refund_endpoint()(1,10,RefundApproval(version=1,confirm_amount=10))
+        self.odoo.execute.assert_not_called()
 
     def test_refund_approval_requires_current_version_and_exact_amount(self):
         self.prepare_refund_choice()

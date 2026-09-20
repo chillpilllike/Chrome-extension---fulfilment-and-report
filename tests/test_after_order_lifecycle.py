@@ -84,10 +84,25 @@ class DryRunTests(unittest.TestCase):
         class Blocked(Exception):
             pass
         danger = Mock(side_effect=AssertionError("Changed live setting"))
-        function = extract("api_after_order_test_mode", {"AfterOrderTestModePayload": object, "clean_text": lambda v: str(v or ""), "get_service_settings": lambda: {}, "HTTPException": Blocked, "set_service_settings": danger})
+        function = extract("api_after_order_test_mode", {"manual_refunds":SimpleNamespace(enabled=lambda:False), "AfterOrderTestModePayload": object, "clean_text": lambda v: str(v or ""), "get_service_settings": lambda: {}, "HTTPException": Blocked, "set_service_settings": danger})
         with self.assertRaises(Blocked):
             function(SimpleNamespace(enabled=False))
         danger.assert_not_called()
+
+    def test_manual_live_requires_approval_guard_and_financial_automation_off(self):
+        from fastapi import HTTPException
+        for approval,automation in [(True,'false'),(False,'false'),(True,'true')]:
+            setter=Mock()
+            function=extract('api_after_order_test_mode',{'manual_refunds':SimpleNamespace(enabled=lambda:True),
+                'after_order_approval_only_live':lambda:approval,'AfterOrderTestModePayload':object,
+                'clean_text':lambda v:str(v or ''),'get_service_settings':lambda:{'after_order_automation_enabled':automation},
+                'HTTPException':HTTPException,'set_service_settings':setter,'after_order_email_test_mode':lambda:False,
+                'after_order_test_recipient':lambda:'test@example.test'})
+            if approval and automation=='false':
+                function(SimpleNamespace(enabled=False));setter.assert_called_once()
+            else:
+                with self.assertRaises(HTTPException):function(SimpleNamespace(enabled=False))
+                setter.assert_not_called()
 
     def test_confirmation_does_not_touch_database_odoo_or_mail(self):
         danger = Mock(side_effect=AssertionError("Side effect in test mode"))

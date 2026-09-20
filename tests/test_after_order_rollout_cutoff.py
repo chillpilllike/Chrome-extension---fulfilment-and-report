@@ -5,13 +5,13 @@ from pathlib import Path
 
 
 class RolloutCutoffTests(unittest.TestCase):
-    def helpers(self, configured):
+    def helpers(self, configured, manual_floor=''):
         tree = ast.parse(Path("app/main.py").read_text())
         names = {"after_order_cutoff_date", "after_order_case_is_in_scope"}
         module = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
         scope = {"datetime": datetime, "Any": object,
                  "clean_text": lambda v: str(v or "").strip(),
-                 "get_service_settings": lambda: {"after_order_cutoff_date": configured}}
+                 "get_service_settings": lambda: {"after_order_cutoff_date": configured,"after_order_manual_live_cutoff":manual_floor}}
         exec(compile(module, "cutoff", "exec"), scope)
         return scope
 
@@ -21,6 +21,12 @@ class RolloutCutoffTests(unittest.TestCase):
 
     def test_later_cutoff_allowed(self):
         self.assertEqual("2026-09-10", self.helpers("2026-09-10")["after_order_cutoff_date"]())
+
+    def test_manual_live_floor_cannot_be_broadened(self):
+        for value in ['2026-08-20','invalid','2026-09-19']:
+            scope=self.helpers(value,'2026-09-20')
+            self.assertEqual('2026-09-20',scope['after_order_cutoff_date']())
+            self.assertFalse(scope['after_order_case_is_in_scope']({'odoo_order_date':'2026-09-19 23:59:59'}))
 
     def test_order_date_boundaries(self):
         eligible = self.helpers("2026-08-01")["after_order_case_is_in_scope"]

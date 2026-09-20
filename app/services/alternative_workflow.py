@@ -368,6 +368,8 @@ class Workflow:
                 if case['current_decision'] != 'offer_alternatives' or r.request_fingerprint(case) != row['issue_fingerprint']:
                     raise ValueError('Order or customer request changed. Team review required.')
                 product = json.loads(row['product_json'])
+                if product['difference'] < 0 and r.manual_refunds.enabled():
+                    raise ValueError('Manual refund mode: complete the refund outside this app and record it with Mark manually refunded. Replacement fulfilment requires manual team review.')
                 if row['status'] == 'choosing':
                     self.event(conn,case,'selection_window_closed',line_id,deadline_at=row['deadline_at'],product_name=product['name'])
                 current = self.product(case,line,reference=product['default_code'])
@@ -490,6 +492,8 @@ class Workflow:
                 _, line = self.case_line(case_id,selection['line_id'])
                 try:
                     if product['difference'] < 0:
+                        if r.manual_refunds.enabled():
+                            raise ValueError('Manual refund mode: automatic refund verification and replacement release are blocked. Review the manually recorded refund and fulfilment separately.')
                         refund = r.OdooClient(r.get_store(case['store_id'])).execute('sale.order','after_order_execute_replacement_refund',
                             [[case['odoo_order_id']],int(case['website_id']),f'care:{case_id}:line:{selection["line_id"]}:v:{selection["version"]}'])
                         if not refund.get('refund_verified'):
@@ -609,6 +613,8 @@ class Workflow:
         @router.post('/api/after-order/cases/{case_id}/lines/{line_id}/approve-replacement-refund')
         def approve_refund(case_id: int, line_id: int, payload: RefundApproval):
             r = self.r
+            if r.manual_refunds.enabled():
+                raise HTTPException(409,'Manual refunds only. Complete the refund externally, then use Mark manually refunded in the after-order case.')
             if r.after_order_email_test_mode():
                 return {'ok':True,'message':'Test preview: no refund, credit note or payment was created.'}
             with r.db() as conn:

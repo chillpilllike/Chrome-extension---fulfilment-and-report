@@ -29,11 +29,12 @@ def masked_destination(transfer):
 
 
 class RefundEmails:
-    def __init__(self, *, db, get_store, client_factory, test_mode, suppressed, list_stores=None):
+    def __init__(self, *, db, get_store, client_factory, test_mode, suppressed, list_stores=None, cutoff_date=None):
         self.db, self.get_store, self.client_factory = db, get_store, client_factory
         self.test_mode, self.suppressed = test_mode, suppressed
         self.refunds = None
         self.list_stores = list_stores or (lambda: [])
+        self.cutoff_date = cutoff_date or (lambda: '')
 
     def init_db(self):
         with self.db() as c:
@@ -51,8 +52,11 @@ class RefundEmails:
     def identity(self, row):
         store = self.get_store(int(row['store_id']))
         client = self.client_factory(store)
-        orders = client.read('sale.order', [int(row['order_id'])], ['name','website_id','partner_id'])
+        orders = client.read('sale.order', [int(row['order_id'])], ['name','website_id','partner_id','date_order'])
         order = orders[0] if len(orders) == 1 else {}
+        cutoff = self.cutoff_date()
+        if cutoff and str(order.get('date_order') or '')[:10] < cutoff:
+            raise ValueError('Order is outside the notification rollout date window.')
         website_id = (order.get('website_id') or [None])[0]
         if not website_id or order.get('name') != row['order_name']:
             raise ValueError('The order website could not be verified. Email is held for review.')
@@ -94,11 +98,15 @@ class RefundEmails:
 
     def hold(self, job, message):
         with self.db() as c:
-            c.execute("UPDATE airwallex_refund_emails SET state='held',last_error=? WHERE request_id=?", (message,job['request_id']))
+            c.execute("UPDATE airwallex_refund_emails SET state='held',last_error=? WHERE request_id=? AND state!='cancelled'", (message,job['request_id']))
             if job.get('message_id'):
                 c.execute("UPDATE after_order_messages SET status='delivery_unknown',last_error=?,updated_at=? WHERE id=? AND status NOT IN ('sent','delivered','bounced','complained','delivery_delayed')", (message,now(),job['message_id']))
 
     def process(self, job):
+        with self.db() as c:
+            current = c.execute('SELECT state FROM airwallex_refund_emails WHERE request_id=?',(job['request_id'],)).fetchone()
+            if not current or current['state']=='cancelled':
+                return
         if job.get('message_id'):
             with self.db() as c:
                 saved = c.execute('SELECT status FROM after_order_messages WHERE id=?',(job['message_id'],)).fetchone()

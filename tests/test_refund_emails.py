@@ -93,3 +93,16 @@ class RefundEmailTests(unittest.TestCase):
         result=masked_destination({'beneficiary':{'bank_details':{'iban':'LT123456789012345678','account_name':'A'}}})
         self.assertEqual(result['account'],'Account ending 5678')
         self.assertNotIn('LT123456789012345678',json.dumps(result))
+
+    def test_cancelled_queue_snapshot_cannot_send(self):
+        self.enqueue();stale=self.job()
+        self.conn.execute("UPDATE airwallex_refund_emails SET state='cancelled'")
+        with patch('app.services.refund_emails.create_email_provider',return_value=self.provider):
+            self.service.process(stale)
+        self.provider.send.assert_not_called()
+
+    def test_rollout_cutoff_holds_unknown_or_old_order_date(self):
+        self.service.cutoff_date=lambda:'2026-09-20'
+        self.enqueue();self.cycle()
+        self.provider.send.assert_not_called()
+        self.assertEqual(self.job()['state'],'held')

@@ -25,6 +25,9 @@ def load_local_env() -> None:
 load_local_env()
 
 DEFAULT_SERVICE_SETTINGS = {
+    "after_order_refund_mode": "manual",
+    "after_order_manual_live_cutoff": "",
+    "after_order_manual_live_started_at": "",
     "typesense_url": os.getenv("TYPESENSE_URL", ""),
     "typesense_api_key": os.getenv("TYPESENSE_API_KEY", ""),
     "typesense_enabled": os.getenv("TYPESENSE_ENABLED", "false"),

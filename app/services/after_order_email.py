@@ -44,6 +44,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     if kind == "tracking" and context.get("risk_state") == "suspected_lost":
         kind = "package_lost"
     content = {
+        "manual_refund_completed": ("REFUND CONFIRMED", "Your refund has been processed.", "Your refund has been processed", "Our team has confirmed that your refund has been processed. The refund details are below.", "When will the credit appear?", "Please allow 24–48 hours for the credit to appear. Your bank or payment provider may take longer. If you need help, reply to this email."),
         "refund_confirmed": ("REFUND CONFIRMED", "Your refund has been sent.", "Your refund has been processed", "We’ve successfully sent a refund for your order. You’ll find the amount and destination below.", "When will the credit appear?", "The credit may appear in your account within 24–72 business hours. Timing depends on your bank. If it has not appeared after this time, reply to this email and our team will help."),
         "relay_request": ("PAYMENT REQUEST", "Your invoice is ready.", "Complete payment", "Complete your order securely using the payment button below. Your invoice will be charged in USD at the amount shown.", "Complete your payment", "Your payment link belongs to this order. If you return later, use this same link."),
         "relay_received": ("ORDER CONFIRMED", "Thank you for your payment.", "Payment received", "Relay has reported your payment initiation and your order is confirmed. Bank settlement is still processing.", "We’re here to help", "Keep your order number handy if you contact our team."),
@@ -126,6 +127,15 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
 
     panel = ""
     detail_lines = []
+    if kind == 'manual_refund_completed':
+        refund = context['refund']
+        fields = [('Refund amount',str(refund['amount'])+' '+str(refund['currency'])),
+                  ('Refund reference',refund['reference']),('Processed on',refund['completed_at'])]
+        panel = '<table role="presentation" width="100%" cellpadding="12" cellspacing="0" bgcolor="#eeeeee" style="margin-top:28px">'
+        for label,value in fields:
+            panel += '<tr><td>'+escape(label)+'</td><td style="font-weight:600">'+escape(str(value))+'</td></tr>'
+            detail_lines.append(label+': '+str(value))
+        panel += '</table>'
     if kind == 'refund_confirmed':
         refund = context['refund']
         fields = [('Refund amount', format(Decimal(str(refund['amount'])).normalize(), 'f') + ' ' + str(refund['currency'])),
