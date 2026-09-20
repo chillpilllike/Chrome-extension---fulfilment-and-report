@@ -219,6 +219,19 @@ class ManualRefundTests(unittest.TestCase):
         self.assertEqual(row["status"], "needs_review")
         self.client.execute.assert_not_called()
 
+    def test_repeat_launch_accepts_postgres_decoded_or_json_setting(self):
+        endpoint = self.service.launch_router().routes[0].endpoint
+        for value in [
+            "2026-09-20T15:00:00+00:00",
+            json.dumps("2026-09-20T15:00:00+00:00"),
+        ]:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO app_settings VALUES(?,?)",
+                ("after_order_manual_live_started_at", value),
+            )
+            self.assertTrue(endpoint({})["already_started"])
+        self.send.assert_not_called()
+
     def test_reset_cancels_queue_preserves_sent_and_uncertainty(self):
         from zoneinfo import ZoneInfo
 

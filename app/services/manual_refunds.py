@@ -481,7 +481,13 @@ class ManualRefunds:
                 saved = guard.execute(
                     "SELECT value FROM app_settings WHERE key='after_order_manual_live_started_at'"
                 ).fetchone()
-                if saved and json.loads(saved["value"] or '""'):
+                # PostgreSQL JSONB drivers may already decode the stored string;
+                # SQLite fixtures return its JSON spelling. Accept either form.
+                if saved and str(saved["value"] or "").strip() not in {
+                    "",
+                    '""',
+                    "null",
+                }:
                     return {
                         "ok": True,
                         "already_started": True,
