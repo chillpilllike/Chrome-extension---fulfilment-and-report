@@ -45503,7 +45503,7 @@ app.include_router(create_support_router(db=db, get_store=get_store, list_stores
 from app.services.airwallex_refunds import AirwallexRefunds
 from app.services.refund_emails import RefundEmails
 refund_emails = RefundEmails(db=db, get_store=get_store, client_factory=OdooClient,
-    test_mode=lambda: get_setting('airwallex_refund_email_enabled','false') != 'true',
+    test_mode=lambda: get_setting('airwallex_refund_email_enabled','false').strip().lower() not in {'true','1','yes','on'},
     suppressed=care_delivery.suppressed, list_stores=list_stores)
 airwallex_refunds = AirwallexRefunds(db=db, get_store=get_store, client_factory=OdooClient, list_stores=list_stores,
     configuration=airwallex_default_connection, notifications=refund_emails,
