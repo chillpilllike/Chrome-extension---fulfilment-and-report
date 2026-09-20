@@ -20,6 +20,14 @@ Transfer fees are additional and borne by the business. The review clearly state
 
 A dedicated transfer-event subscription uses the existing webhook URL with its own private signing secret. Airwallex does not support changing the event list of an existing subscription. Signed transfer webhooks trigger authoritative status reads. A background loop polls reservations, including PAID transfers that can later fail. Failed/unknown outcomes stay reserved pending finance reconciliation. Confirmed cancelled transfers release their amount. This page does not automatically cancel Odoo orders, generate credit notes or send customer messages.
 
+## Manual refund history
+
+The main history combines app reservations and imported Airwallex transfers with refund references. `Refund <order>` and `Partial Refund <order>` map by exact order name across registered Odoo databases. Imports use an upsert keyed by Airwallex account and transfer ID, and the merged list deduplicates by transfer ID/request ID. Only display fields are persisted; bank account numbers and full beneficiary data are excluded. Sync runs every five minutes and through the staff-only Sync Airwallex history button.
+
+Orders on websites without an app store registration are still mapped to their Odoo order and labelled; they cannot be opened through another store's scope. Missing or ambiguous orders remain visible and explicitly unresolved. A failed database lookup does not produce a guessed match.
+
+The refund cap continues to read live, complete Airwallex history on review and submission, independently of the imported display cache. Prior paid and pending partial refunds plus app reservations are deducted cumulatively. A full refund leaves no refundable amount. Repeated imports cannot add duplicate deductions, and repeated submission of a review cannot create another transfer. Cancelled transfers remain in history but release their monetary reservation; failed/unknown outcomes remain reserved.
+
 ## Verification
 
 - `python -m unittest discover -s tests -p 'test_airwallex*.py'`

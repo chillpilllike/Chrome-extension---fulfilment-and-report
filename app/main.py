@@ -45471,7 +45471,7 @@ app.include_router(create_support_router(db=db, get_store=get_store, list_stores
 
 
 from app.services.airwallex_refunds import AirwallexRefunds
-airwallex_refunds = AirwallexRefunds(db=db, get_store=get_store, client_factory=OdooClient,
+airwallex_refunds = AirwallexRefunds(db=db, get_store=get_store, client_factory=OdooClient, list_stores=list_stores,
     configuration=airwallex_default_connection,
     staff_check=lambda request: bool(effective_admin_access_token()) and request_has_admin_access(request))
 app.include_router(airwallex_refunds.router())

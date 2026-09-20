@@ -59,6 +59,8 @@ def refund_totals(name, currency, transfers, local):
     for t in transfers:
         if not whole_reference(' '.join(str(t.get(k) or '') for k in ('reference', 'remarks')), name):
             continue
+        if t['id'] in ids or (t.get('request_id') and t['request_id'] in request_ids):
+            continue
         ids.add(t['id'])
         request_ids.add(t.get('request_id'))
         amount = money(t['transfer_amount'])
@@ -148,9 +150,11 @@ class SubmitInput(BaseModel):
 
 
 class AirwallexRefunds:
-    def __init__(self, *, db, get_store, client_factory, configuration, staff_check):
+    def __init__(self, *, db, get_store, client_factory, configuration, staff_check, list_stores=None):
         self.db, self.get_store, self.client_factory = db, get_store, client_factory
         self.configuration, self.staff_check = configuration, staff_check
+        self.list_stores = list_stores or (lambda: [])
+        self.last_history_sync = 0
 
     def init_db(self):
         with self.db() as c:
@@ -162,6 +166,9 @@ class AirwallexRefunds:
                 edit_reason TEXT NOT NULL DEFAULT '', payload_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '',
                 fee_amount TEXT, fee_currency TEXT, actor TEXT NOT NULL DEFAULT 'staff')''')
+            c.execute('''CREATE TABLE IF NOT EXISTS airwallex_refund_external_history (
+                account_key TEXT NOT NULL, transfer_id TEXT NOT NULL, payload TEXT NOT NULL,
+                synced_at TEXT NOT NULL, PRIMARY KEY(account_key,transfer_id))''')
             c.execute('CREATE INDEX IF NOT EXISTS airwallex_refund_order_idx ON airwallex_refund_payouts(order_key)')
             c.execute('''CREATE TABLE IF NOT EXISTS airwallex_refund_webhook (
                 account_key TEXT PRIMARY KEY, webhook_id TEXT NOT NULL, secret TEXT NOT NULL)''')
@@ -580,6 +587,91 @@ class AirwallexRefunds:
         with self.db() as c:
             return self.public_row(c.execute('SELECT * FROM airwallex_refund_payouts WHERE request_id=?', (rid,)).fetchone())
 
+    def sync_history(self):
+        # Import sanitized history without changing provider transfers or Odoo.
+        transfers = self.transfers()
+        refunds = {}
+        names = set()
+        for t in transfers:
+            reference = str(t.get('reference') or '')
+            remarks = str(t.get('remarks') or '')
+            if not re.search(r'\brefund\b', reference + ' ' + remarks, re.I):
+                continue
+            match = re.search(r'\brefund\s+([A-Z0-9][A-Z0-9/_-]*)', reference, re.I)
+            name = match.group(1).upper() if match else ''
+            refunds[t['id']] = (t, name)
+            if name:
+                names.add(name)
+        groups = {}
+        for record in self.list_stores():
+            store = self.get_store(record['id'])
+            groups.setdefault((store.odoo_url.rstrip('/'), store.odoo_db), []).append((record, store))
+        matches = {name: {} for name in names}
+        failed = False
+        for stores in groups.values():
+            if not names:
+                break
+            try:
+                client = self.client_factory(stores[0][1])
+                orders = client.search_read('sale.order', [('name', 'in', sorted(names))],
+                    ['name', 'partner_id', 'website_id', 'amount_total', 'currency_id'])
+                for order in orders:
+                    name = order['name'].upper()
+                    if name not in matches:
+                        continue
+                    eligible = [(record, store) for record, store in stores
+                                if not store.website_id or (order.get('website_id') and store.website_id == order['website_id'][0])]
+                    # Orders on an unconfigured website still belong in history.
+                    # Keep their database/order identity, but do not bypass store access when opening.
+                    # Prefer an exact website registration over a database-wide registration.
+                    record, store = sorted(eligible or stores, key=lambda pair: (not bool(pair[1].website_id), pair[0]['id']))[0]
+                    key = self.order_key(store, order['id'])
+                    matches[name][key] = {'store_id': record['id'] if eligible else None,
+                        'store_name': record['name'] if eligible else (order.get('website_id') or [0, 'Unconfigured website'])[1],
+                        'mapping_note': '' if eligible else 'Order matched; website is not configured in this app.',
+                        'order_id': order['id'], 'customer': order['partner_id'][1],
+                        'order_value': str(order['amount_total']), 'order_currency': order['currency_id'][1]}
+            except Exception:
+                failed = True  # Never guess a unique mapping when another database could not be checked.
+        account = self.account_key(self.config())
+        now = datetime.now(timezone.utc).isoformat()
+        mapped = 0
+        with self.db() as c:
+            for tid, (t, name) in refunds.items():
+                candidates = list(matches.get(name, {}).values())
+                state = 'unavailable' if failed else 'matched' if len(candidates) == 1 else 'ambiguous' if candidates else 'not_found'
+                bank = (t.get('beneficiary') or {}).get('bank_details') or {}
+                row = {'request_id': t.get('request_id') or tid, 'transfer_id': tid,
+                       'order_name': name or t.get('reference') or 'Unidentified order',
+                       'reference': t.get('reference') or '', 'amount': str(money(t['transfer_amount'])),
+                       'currency': t['transfer_currency'], 'status': t.get('status') or 'UNKNOWN',
+                       'recipient': bank.get('account_name') or '', 'created_at': t.get('created_at'),
+                       'fee_amount': str(t.get('fee_amount', '')), 'fee_currency': t.get('fee_currency'),
+                       'source': 'Manual Airwallex', 'mapping_status': state, 'last_error': ''}
+                if state == 'matched':
+                    row.update(candidates[0]); mapped += 1
+                c.execute('''INSERT INTO airwallex_refund_external_history(account_key,transfer_id,payload,synced_at)
+                    VALUES (?,?,?,?) ON CONFLICT(account_key,transfer_id) DO UPDATE SET
+                    payload=excluded.payload,synced_at=excluded.synced_at''', (account, tid, json.dumps(row), now))
+        self.last_history_sync = time.monotonic()
+        return {'total': len(refunds), 'mapped': mapped, 'unresolved': len(refunds)-mapped, 'synced_at': now}
+
+    def history(self):
+        account = self.account_key(self.config())
+        with self.db() as c:
+            local = c.execute('SELECT * FROM airwallex_refund_payouts WHERE account_key=? ORDER BY created_at DESC', (account,)).fetchall()
+            external = c.execute('SELECT payload,synced_at FROM airwallex_refund_external_history WHERE account_key=?', (account,)).fetchall()
+        ids = {row.get('transfer_id') for row in local if row.get('transfer_id')}
+        requests = {row['request_id'] for row in local}
+        rows = [{**self.public_row(row), 'source': 'App', 'mapping_status': 'matched'} for row in local]
+        for item in external:
+            row = json.loads(item['payload'])
+            if row['transfer_id'] not in ids and row['request_id'] not in requests:
+                rows.append(row)
+                ids.add(row['transfer_id']); requests.add(row['request_id'])
+        rows.sort(key=lambda row: str(row.get('created_at') or ''), reverse=True)
+        return {'rows': rows, 'synced_at': max((r['synced_at'] for r in external), default=None)}
+
     def verify_transfer_webhook(self, timestamp, signature, raw_body):
         try:
             with self.db() as c:
@@ -615,6 +707,8 @@ class AirwallexRefunds:
             try:
                 self.init_db()
                 self.poll()
+                if time.monotonic() - self.last_history_sync > 300:
+                    self.sync_history()
             except Exception:
                 pass
             time.sleep(60)
@@ -658,9 +752,10 @@ class AirwallexRefunds:
             return guarded(self.submit, form.review_token, actor)
         @r.get('/history')
         def history():
-            with self.db() as c:
-                rows = c.execute('SELECT * FROM airwallex_refund_payouts ORDER BY created_at DESC LIMIT 100').fetchall()
-            return {'rows': [self.public_row(row) for row in rows]}
+            return guarded(self.history)
+        @r.post('/history/sync')
+        def sync_history():
+            return guarded(self.sync_history)
         @r.post('/{request_id}/refresh')
         def refresh(request_id: str):
             return guarded(self.refresh, request_id)

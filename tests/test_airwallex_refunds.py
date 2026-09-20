@@ -15,6 +15,7 @@ class MemoryDB:
     """Transaction lock fake; PostgreSQL concurrency is additionally checked in integration."""
     def __init__(self):
         self.rows = {}
+        self.external = {}
         self.lock = threading.RLock()
     @contextmanager
     def __call__(self):
@@ -22,7 +23,13 @@ class MemoryDB:
             yield self
     def execute(self, sql, params=()):
         self.result = None
-        if 'INSERT INTO airwallex_refund_payouts' in sql:
+        if 'INSERT INTO airwallex_refund_external_history' in sql:
+            self.external[(params[0],params[1])] = {'payload':params[2],'synced_at':params[3]}
+        elif 'SELECT payload,synced_at FROM airwallex_refund_external_history' in sql:
+            self.result = [v for (account,_),v in self.external.items() if account==params[0]]
+        elif 'WHERE account_key=?' in sql:
+            self.result = [v for v in self.rows.values() if v.get('account_key')==params[0]]
+        elif 'INSERT INTO airwallex_refund_payouts' in sql:
             keys = ['request_id','order_key','store_id','order_id','order_name','account_key','amount','currency','recipient','edit_reason','payload_hash','created_at','updated_at','actor']
             row = dict(zip(keys, params)); row.update(status='SUBMITTING', transfer_id=None, last_error='')
             self.rows[row['request_id']] = row
@@ -66,6 +73,54 @@ class RefundGuardTests(unittest.TestCase):
                    for i,name in enumerate(['Partial Refund NC100','Refund NC1000','Refund XNC100'])]
         self.assertEqual(refund_totals('NC100','USD',transfers,[])[0],20)
         with self.assertRaises(ValueError):refund_totals('NC100','CAD',transfers,[])
+
+
+class HistoryImportTests(unittest.TestCase):
+    def setUp(self):
+        self.db=MemoryDB()
+        self.client=Mock()
+        self.client.search_read.return_value=[{'id':1,'name':'NC100','partner_id':[1,'Customer'],
+            'website_id':[1,'Shop'],'amount_total':100,'currency_id':[1,'CAD']}]
+        self.service=AirwallexRefunds(db=self.db,get_store=lambda _:SimpleNamespace(
+            odoo_url='https://test',odoo_db='test',website_id=1),client_factory=lambda _:self.client,
+            list_stores=lambda:[{'id':1,'name':'Shop'}],configuration=lambda:dict(client_id='test',api_key='test',state='enabled'),staff_check=lambda _:True)
+        self.transfers=[{'id':'t1','request_id':'r1','reference':'Refund NC100','transfer_amount':30,
+            'transfer_currency':'CAD','status':'PAID','created_at':'2026-09-20T01:00:00+0000',
+            'beneficiary':{'bank_details':{'account_name':'Customer','account_number':'private-bank-number'}}}]
+        self.service.transfers=lambda:self.transfers
+    def test_import_is_mapped_idempotent_and_sanitized(self):
+        self.assertEqual(self.service.sync_history()['mapped'],1)
+        self.service.sync_history()
+        rows=self.service.history()['rows']
+        self.assertEqual(len(rows),1);self.assertEqual(rows[0]['order_id'],1)
+        self.assertEqual(rows[0]['source'],'Manual Airwallex')
+        self.assertNotIn('private-bank-number',str(self.db.external))
+    def test_order_on_unconfigured_website_maps_without_bypassing_store_scope(self):
+        self.client.search_read.return_value[0]['website_id']=[39,'Archived shop']
+        self.assertEqual(self.service.sync_history()['mapped'],1)
+        row=self.service.history()['rows'][0]
+        self.assertEqual(row['order_id'],1);self.assertIsNone(row['store_id'])
+        self.assertIn('not configured',row['mapping_note'])
+
+    def test_unmatched_and_partial_refund_still_visible(self):
+        self.transfers[0]['reference']='Partial Refund NC999'
+        result=self.service.sync_history()
+        self.assertEqual(result['unresolved'],1)
+        row=self.service.history()['rows'][0]
+        self.assertEqual(row['order_name'],'NC999');self.assertEqual(row['mapping_status'],'not_found')
+    def test_ambiguous_or_unavailable_mapping_is_not_guessed(self):
+        self.client.search_read.return_value.append({**self.client.search_read.return_value[0],'id':2})
+        self.service.sync_history()
+        self.assertEqual(self.service.history()['rows'][0]['mapping_status'],'ambiguous')
+        self.client.search_read.side_effect=RuntimeError('upstream unavailable')
+        self.service.sync_history()
+        self.assertEqual(self.service.history()['rows'][0]['mapping_status'],'unavailable')
+    def test_app_and_manual_history_deduplicates_same_transfer(self):
+        self.service.sync_history()
+        self.db.rows['r1']={'request_id':'r1','transfer_id':'t1','created_at':'2026-09-20',
+                          'account_key':self.service.account_key(self.service.config())}
+        rows=self.service.history()['rows']
+        self.assertEqual(len(rows),1);self.assertEqual(rows[0]['source'],'App')
 
 
 class DailyLimitTests(unittest.TestCase):
@@ -242,6 +297,18 @@ class SnapshotTests(unittest.TestCase):
     def test_external_refund_is_deducted(self):
         self.external=[{'id':'t1','reference':'Partial Refund NC100','transfer_amount':30,'transfer_currency':'CAD','status':'PAID'}]
         self.assertEqual(self.svc.snapshot(1,1)['remaining'],'70')
+    def test_multiple_manual_partial_refunds_deduct_once_and_full_refund_blocks(self):
+        first={'id':'t1','reference':'Partial Refund NC100','transfer_amount':30,'transfer_currency':'CAD','status':'PAID'}
+        second={**first,'id':'t2','transfer_amount':20}
+        self.external=[first,second,first.copy()]
+        result=self.svc.snapshot(1,1)
+        self.assertEqual(Decimal(result['remaining']),50)
+        with self.assertRaises(ValueError):amount_guard('50.01',result['remaining'],result['rounding'])
+        self.external.append({**first,'id':'t3','transfer_amount':50})
+        result=self.svc.snapshot(1,1)
+        self.assertEqual(Decimal(result['remaining']),0)
+        with self.assertRaises(ValueError):amount_guard('0.01',result['remaining'],result['rounding'])
+
     def test_refund_child_without_order_link_is_deducted(self):
         self.children=[{**self.tx,'id':11,'amount':20,'operation':'refund','sale_order_ids':[]}]
         self.assertEqual(self.svc.snapshot(1,1)['remaining'],'80')
