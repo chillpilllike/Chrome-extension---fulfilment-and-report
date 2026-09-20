@@ -26859,7 +26859,7 @@ def setting_elapsed_seconds(key: str, default_seconds: float = 0.0) -> float:
 
 
 def queue_auto_pull_jobs(days: int, limit: int, batch_size: int) -> dict[str, Any]:
-    stores = rows_to_dicts(list_stores())
+    stores = [s for s in rows_to_dicts(list_stores()) if s.get('active',1)]
     with db() as conn:
         mark_stale_pull_jobs(conn)
         active_rows = conn.execute(
@@ -26871,21 +26871,24 @@ def queue_auto_pull_jobs(days: int, limit: int, batch_size: int) -> dict[str, An
             ORDER BY pull_jobs.created_at ASC
             """
         ).fetchall()
-    if active_rows:
+    busy_stores = {int(row['store_id']) for row in active_rows}
+    ready_stores = [store for store in stores if int(store['id']) not in busy_stores]
+    if not ready_stores:
         return {
             "queued": 0,
             "active": len(active_rows),
             "stores": len(stores),
-            "message": f"Auto pull skipped because {len(active_rows)} pull job{'s' if len(active_rows) != 1 else ''} are already running.",
+            "message": f"No idle active stores to import; {len(active_rows)} pull jobs are already queued or running.",
         }
-    jobs = start_pull_jobs([int(store["id"]) for store in stores], days, limit, batch_size)
+    # A slow/offline website must not prevent the other stores' five-minute pulls.
+    jobs = start_pull_jobs([int(store["id"]) for store in ready_stores], days, limit, batch_size)
     return {
         "queued": len(jobs),
-        "active": 0,
+        "active": len(active_rows),
         "stores": len(stores),
         "message": (
             f"Auto queued {len(jobs)} pull job{'s' if len(jobs) != 1 else ''} "
-            f"for {len(stores)} store{'s' if len(stores) != 1 else ''} "
+            f"for {len(ready_stores)} idle store{'s' if len(ready_stores) != 1 else ''}; {len(active_rows)} existing jobs left running, "
             f"using last {days} day{'s' if days != 1 else ''}, limit {'all' if limit == 0 else limit}, batch size {batch_size}."
         ),
     }

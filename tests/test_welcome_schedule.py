@@ -115,5 +115,21 @@ class WelcomeScheduleTests(unittest.TestCase):
         self.assertIn('time.sleep(30)',ast.unparse(funcs['welcome_email_loop']))
         self.assertIn('pg_try_advisory_xact_lock',ast.unparse(funcs['order_import_loop']))
 
+    def test_slow_store_does_not_block_other_stores_or_duplicate_its_job(self):
+        tree=ast.parse(Path('app/main.py').read_text())
+        node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='queue_auto_pull_jobs')
+        conn=Mock();conn.execute.return_value.fetchall.return_value=[{'store_id':1}]
+        @contextmanager
+        def db():yield conn
+        start=Mock(return_value=['new-job'])
+        scope={'Any':object,'rows_to_dicts':lambda x:x,'list_stores':lambda:[{'id':1,'active':1},{'id':2,'active':1},{'id':3,'active':0}],
+            'db':db,'mark_stale_pull_jobs':Mock(),'start_pull_jobs':start}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'<scheduler>','exec'),scope)
+        result=scope['queue_auto_pull_jobs'](7,0,50)
+        start.assert_called_once_with([2],7,0,50)
+        self.assertEqual(result['active'],1)
+        conn.execute.return_value.fetchall.return_value=[{'store_id':1},{'store_id':2}]
+        start.reset_mock();scope['queue_auto_pull_jobs'](7,0,50);start.assert_not_called()
+
 
 if __name__=='__main__':unittest.main()
