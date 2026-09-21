@@ -58,6 +58,13 @@ or unapproved. `scripts/setup_localized_sms.py` provides dry-run registration
 output and appends a fixed brand suffix when a translated URL variable would
 otherwise be the final content.
 
+Follow-up: the user subsequently requested provider registration and automatic
+re-selection when approval changes. That work is deployed; 4,200 fixed-brand
+templates and all 4,900 lookup mappings are now registered/configured. See
+`docs/msg91-language-fallback-20260921.md` for current behavior and exceptions.
+Use the durable `scripts/register_sms_catalogs.py` for subsequent registration,
+not the original print-only registration script.
+
 ## New-order SMS diagnosis during this work
 
 Live settings had SMS enabled, MSG91 selected, test mode off and Nutricity Canada

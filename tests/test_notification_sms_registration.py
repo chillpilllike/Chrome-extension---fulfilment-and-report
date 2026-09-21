@@ -1,4 +1,5 @@
 import unittest
+import re
 from scripts.register_sms_catalogs import plan
 
 
@@ -16,6 +17,9 @@ class RegistrationTests(unittest.TestCase):
             self.assertEqual(1,row['text'].count('##url##'))
             self.assertFalse(row['text'].rstrip().endswith('##'))
             self.assertLess(len(row['text'])+150,1000)
+            url='https://nutricity.ca/my/orders/123'
+            body=row['text'].replace('##order##','NC123').replace('##url##',url)
+            self.assertEqual([url],re.findall(r'https?://[^\s<>"\']+',body))
 
 
 if __name__=='__main__':unittest.main()

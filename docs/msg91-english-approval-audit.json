@@ -1,0 +1,1463 @@
+{
+  "checked_at": "2026-09-21T18:24:24.128984+00:00",
+  "english_mappings": [
+    {
+      "sender": "nutricity",
+      "kind": "item_unavailable",
+      "template_id": "6aae7659de4d85797a0774f2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae76597dd5e916ae0a33b3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "expected_dispatch",
+      "template_id": "6aae7659a448edb25f0fcf45",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "no_alternatives",
+      "template_id": "6aae765bf073cc9edf0a77c3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae765b36e4c01587033395",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "package_movement",
+      "template_id": "6aae765be51e87336b0fcd22",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "refund_request_received",
+      "template_id": "6aae765c88711bf52d0e9da3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "refund_completed",
+      "template_id": "6aae765c8ad24bf858073a22",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "alternative_payment",
+      "template_id": "6aae765c9a6e12d0fe0eda12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "tracking",
+      "template_id": "6aae765be51e87336b0fcd22",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "price_difference",
+      "template_id": "6aae765c9a6e12d0fe0eda12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeeff611e2bcd7870e39f2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeeff7ee0f310fef053db4",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "nutricity",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11db923f3be0218044692",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae7626dbf421695802e0b3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "expected_dispatch",
+      "template_id": "6aae76262d90cf7b6e0bd1f2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "item_unavailable",
+      "template_id": "6aae762671ef4c56bd08ff33",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "no_alternatives",
+      "template_id": "6aae7627fe3bd4802b0703b2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae7627f0571df31d00da92",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "package_movement",
+      "template_id": "6aae76277a4e14f33e0c5d33",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "alternative_payment",
+      "template_id": "6aae7629c4f99b472b019263",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "refund_request_received",
+      "template_id": "6aae7629da675b652d039fe2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "refund_completed",
+      "template_id": "6aae76296d0118732e00ff62",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "tracking",
+      "template_id": "6aae76277a4e14f33e0c5d33",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "price_difference",
+      "template_id": "6aae7629c4f99b472b019263",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefe823247dc04b0a0492",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefea43cefb9115094262",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "SecretGreen",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11db38f287074d40bbe72",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae7664292cb823dc0bdd23",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "item_unavailable",
+      "template_id": "6aae766441203249210be854",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "expected_dispatch",
+      "template_id": "6aae76644e39a2d657096533",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "no_alternatives",
+      "template_id": "6aae766577bc3ce68e027834",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "package_movement",
+      "template_id": "6aae76662a25f980440c43a4",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae7666534ef030100a27f3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "alternative_payment",
+      "template_id": "6aae76679df0da4ca00ea102",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "refund_request_received",
+      "template_id": "6aae766726328dd740094cf2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "refund_completed",
+      "template_id": "6aae7667892795eb05085d42",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "tracking",
+      "template_id": "6aae76662a25f980440c43a4",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "price_difference",
+      "template_id": "6aae76679df0da4ca00ea102",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefdb9a7374aae3059e12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefddf2f893f081060db2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "FinchKart",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11da8b8b037ebca059b63",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "item_unavailable",
+      "template_id": "6aae766b561883f9d9038dc2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "expected_dispatch",
+      "template_id": "6aae766b01271a21e20ff462",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae766b2481705cd0049a22",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae766ce0bfd0230403cc12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "no_alternatives",
+      "template_id": "6aae766c4b2aa8e69909b273",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "package_movement",
+      "template_id": "6aae766c2918712a640f3da3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "alternative_payment",
+      "template_id": "6aae766ec700375c66065752",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "refund_completed",
+      "template_id": "6aae766e2481705cd0049a24",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "refund_request_received",
+      "template_id": "6aae766eab983dfd8602a8c2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "tracking",
+      "template_id": "6aae766c2918712a640f3da3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "price_difference",
+      "template_id": "6aae766ec700375c66065752",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefd6b320d4e5c4023f53",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefd76f29324f500caca2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Boostgo",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11d8b4614d2f6290f0642",
+      "approved": false,
+      "exact_match": true,
+      "ready": false
+    },
+    {
+      "sender": "Espot",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae7672f76d09242e057ae2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "item_unavailable",
+      "template_id": "6aae76721ac7a389eb01c164",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "expected_dispatch",
+      "template_id": "6aae7672be14681a5e015653",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "no_alternatives",
+      "template_id": "6aae76731e943a35340d24f2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "package_movement",
+      "template_id": "6aae7673fe8d1196a40f2ea3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae7674c700375c66065754",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "alternative_payment",
+      "template_id": "6aae7675126f7ce98b064484",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "refund_request_received",
+      "template_id": "6aae76758dc7ad2e730c04a6",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "refund_completed",
+      "template_id": "6aae7675296ab598160edbc2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "tracking",
+      "template_id": "6aae7673fe8d1196a40f2ea3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "price_difference",
+      "template_id": "6aae7675126f7ce98b064484",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefd90dc17294aa0e7702",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefda42e825eda208fff2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Espot",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11da4abac4dcd72000083",
+      "approved": false,
+      "exact_match": true,
+      "ready": false
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "item_unavailable",
+      "template_id": "6aae767900fd8c9bb40678f3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae76794692f835ab07faa2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "expected_dispatch",
+      "template_id": "6aae76790c91184d18015803",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae767ab340ddf86b04f4d2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "no_alternatives",
+      "template_id": "6aae767a2481705cd0049a26",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "package_movement",
+      "template_id": "6aae767ba4ee69ae1d088052",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "refund_request_received",
+      "template_id": "6aae767c1c72f47d740ce473",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "refund_completed",
+      "template_id": "6aae767c292cb823dc0bdd25",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "alternative_payment",
+      "template_id": "6aae767cabf53711560ca283",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "tracking",
+      "template_id": "6aae767ba4ee69ae1d088052",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "price_difference",
+      "template_id": "6aae767cabf53711560ca283",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefeb684e66e95f0f2b32",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefec301f6d3b7f0cb3c2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Suppcity",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11db4a6e78f6e520a1132",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "expected_dispatch",
+      "template_id": "6aae7680aea147591c0edde2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae768024f1bf73850e4254",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "item_unavailable",
+      "template_id": "6aae7680c5e7463d7c004d13",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "package_movement",
+      "template_id": "6aae7682f9d21b5cdf024fc3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "no_alternatives",
+      "template_id": "6aae76824329cde5ef0482f3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae76822a9a35ab3507f642",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "refund_request_received",
+      "template_id": "6aae7683a448edb25f0fcf47",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "alternative_payment",
+      "template_id": "6aae76834cb6acb24703dcd2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "refund_completed",
+      "template_id": "6aae7683a1680521780e7012",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "tracking",
+      "template_id": "6aae7682f9d21b5cdf024fc3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "price_difference",
+      "template_id": "6aae76834cb6acb24703dcd2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeeff0490c4153bd0d4792",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeeff1c7c902ff43031362",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Vitagen",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11db7dbc31640860c7602",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "expected_dispatch",
+      "template_id": "6aae7687d02f3625700a53d2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "item_unavailable",
+      "template_id": "6aae76880f239b20260f9232",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae76873f8fc96bcc0a87b2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "package_movement",
+      "template_id": "6aae7689bdaea48ce7056b12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "no_alternatives",
+      "template_id": "6aae7689fdee20875c0ae7f3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae76890e939161a60848a2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "refund_request_received",
+      "template_id": "6aae768a697eaef24b051fe4",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "refund_completed",
+      "template_id": "6aae768aec26dc3d73090073",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "alternative_payment",
+      "template_id": "6aae768ae61d5711620e0774",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "tracking",
+      "template_id": "6aae7689bdaea48ce7056b12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "price_difference",
+      "template_id": "6aae768ae61d5711620e0774",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefee2018b265a10e92a2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefef75f34d64730fb732",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "VitaShop",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11db6881d8d03e802cc42",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "expected_dispatch",
+      "template_id": "6aae768e41203249210be856",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae768e94760bcaf9033563",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "item_unavailable",
+      "template_id": "6aae768e3f92b32874084485",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "no_alternatives",
+      "template_id": "6aae768f296ab598160edbc4",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "package_movement",
+      "template_id": "6aae768f286ebe95770ed9f3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae768f287883d54b082d02",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "alternative_payment",
+      "template_id": "6aae7691ec26dc3d73090075",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "refund_request_received",
+      "template_id": "6aae76913f92b32874084487",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "refund_completed",
+      "template_id": "6aae7691d03ed0ec8304b6c3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "tracking",
+      "template_id": "6aae768f286ebe95770ed9f3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "price_difference",
+      "template_id": "6aae7691ec26dc3d73090075",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefe318d4f3afb003e932",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefe5a2d95337860923d2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Nutrihub",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11daf2b8f7745110989f2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "expected_dispatch",
+      "template_id": "6aae7695ec716f458a0ba1e7",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae76952f3c493f370bae92",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "item_unavailable",
+      "template_id": "6aae7695f40d16080e030ee7",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "package_movement",
+      "template_id": "6aae769668db4789b701bb73",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae76968e447dffac0edfc2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "no_alternatives",
+      "template_id": "6aae7696560f26f248011ac3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "alternative_payment",
+      "template_id": "6aae7698ac86cc013008d9e2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "refund_request_received",
+      "template_id": "6aae76980651ba3f710e2a82",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "refund_completed",
+      "template_id": "6aae7698ba75268cd70ee0c3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "tracking",
+      "template_id": "6aae769668db4789b701bb73",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "price_difference",
+      "template_id": "6aae7698ac86cc013008d9e2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeeff342a47db2ad0cc462",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeeff4852c2f90d705ff32",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "Wildkart",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11db84b8d2c57ea0c7752",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "expected_dispatch",
+      "template_id": "6aae769c88d717c7d8039ef2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae769c44b86159be05da62",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "item_unavailable",
+      "template_id": "6aae769c095d8390a701c373",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "package_movement",
+      "template_id": "6aae769d42ac694b2a0f5dd2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "no_alternatives",
+      "template_id": "6aae769dfb0c2ee1bb02d9a2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae769df2eccb8082077483",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "alternative_payment",
+      "template_id": "6aae769f835fc3b74502d422",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "refund_request_received",
+      "template_id": "6aae769fe51e87336b0fcd24",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "refund_completed",
+      "template_id": "6aae769f4329cde5ef0482f5",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "tracking",
+      "template_id": "6aae769d42ac694b2a0f5dd2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "price_difference",
+      "template_id": "6aae769f835fc3b74502d422",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefe107d36e2f8b06d0b2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefe2efd07ca1370f8332",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "NutriMax",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11dad4242936bdc0ed453",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae76a3ca95be2d9701f1f2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "expected_dispatch",
+      "template_id": "6aae76a21f28fbb7990a6772",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "item_unavailable",
+      "template_id": "6aae76a327d9387f00080003",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "package_movement",
+      "template_id": "6aae76a4b593fa4b610010d2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae76a403e9f460d7088e14",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "no_alternatives",
+      "template_id": "6aae76a478aede8af408d7e6",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "refund_completed",
+      "template_id": "6aae76a5456e3010ca0d9a53",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "refund_request_received",
+      "template_id": "6aae76a587e56cf712090753",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "alternative_payment",
+      "template_id": "6aae76a5a5e51a1dcd064a12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "tracking",
+      "template_id": "6aae76a4b593fa4b610010d2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "price_difference",
+      "template_id": "6aae76a5a5e51a1dcd064a12",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefe61144c1413b01cbc2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefe793b07118bb0451e2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "PrimeSupps",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11db18d62503170088892",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "warehouse_dispatch_delay",
+      "template_id": "6aae76a9bd579e53b10587a2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "item_unavailable",
+      "template_id": "6aae76a94e39a2d657096535",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "expected_dispatch",
+      "template_id": "6aae76a9368170bbe3058203",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "no_alternatives",
+      "template_id": "6aae76abd60292e1b204def2",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "package_movement",
+      "template_id": "6aae76ab5ed0a3c6db0282e3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "delivery_confirmation",
+      "template_id": "6aae76aba49b73dff10786d3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "alternative_payment",
+      "template_id": "6aae76acfe12bc46e9043db3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "refund_completed",
+      "template_id": "6aae76ac6d1045124908e912",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "refund_request_received",
+      "template_id": "6aae76ac6dc24724aa0c7f83",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "tracking",
+      "template_id": "6aae76ab5ed0a3c6db0282e3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "price_difference",
+      "template_id": "6aae76acfe12bc46e9043db3",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "trustpilot_review",
+      "template_id": "6aaeefdec00e46865b0a1342",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "delivery_issue_received",
+      "template_id": "6aaeefdf808297d985070922",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    },
+    {
+      "sender": "GofinchKart",
+      "kind": "new_order_welcome",
+      "template_id": "6ab11dab969a0e169c0fdc92",
+      "approved": true,
+      "exact_match": true,
+      "ready": true
+    }
+  ],
+  "ready": 180,
+  "total": 182
+}
