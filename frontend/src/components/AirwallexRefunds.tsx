@@ -33,6 +33,23 @@ const format = (amount:string|number,currency:string) => {
  try { return new Intl.NumberFormat(undefined,{style:'currency',currency}).format(Number(amount)) + ` ${currency}` }
  catch { return `${amount} ${currency}` }
 }
+function InstitutionSelect({options,value,onChange,label,description}:{options:Option[];value:string;onChange:(value:string)=>void;label:string;description?:string}) {
+ const [search,setSearch]=useState('')
+ const query=search.trim().toLowerCase()
+ const matches=options.filter(o=>`${o.value} ${o.label}`.toLowerCase().includes(query))
+ const selected=options.find(o=>o.value===value)
+ return <div className="grid content-start gap-1 text-sm">
+  <label htmlFor="refund-institution">{label}</label>
+  <Input aria-label="Search financial institution" placeholder="Search institution number or bank name" value={search} onChange={e=>setSearch(e.target.value)} autoComplete="off"/>
+  <select id="refund-institution" className="w-full rounded-md border bg-background p-2" value={value} onChange={e=>{onChange(e.target.value);setSearch('')}}>
+   <option value="">Select…</option>
+   {selected&&!matches.includes(selected)&&<option value={selected.value} hidden>{selected.value} — {selected.label}</option>}
+   {matches.map(o=><option key={o.value} value={o.value}>{o.value} — {o.label}</option>)}
+  </select>
+  {query&&<span role="status" className="text-xs text-muted-foreground">{matches.length?`${matches.length} matching institution${matches.length===1?'':'s'}`:'No matching institutions. Try another code or bank name.'}</span>}
+  {description&&<span className="text-xs text-muted-foreground">{description}</span>}
+ </div>
+}
 export function AirwallexRefunds({stores,storeId,api}:Props) {
  const [selectedStore,setSelectedStore]=useState(storeId || ''), [query,setQuery]=useState('')
  const [orders,setOrders]=useState<Order[]>([]),[snapshot,setSnapshot]=useState<Snapshot|null>(null)
@@ -132,6 +149,7 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
       const path=f.path==='transfer_methods'?'transfer_method':f.path, value=values[path]||'', fixed=path==='beneficiary.bank_details.account_currency'||(/account_routing_type[12]$/.test(path)&&!f.field.options?.length)
       const institution=values['beneficiary.bank_details.bank_country_code']==='CA'&&path==='beneficiary.bank_details.account_routing_value1'
       const options=institution?f.field.options?.slice().sort((a,b)=>a.value.localeCompare(b.value)):f.field.options, choice=options?.find(o=>o.value===value)
+      if(institution&&options?.length)return <InstitutionSelect key={path} options={options} value={value} onChange={v=>changeField(path,v)} label={`${f.field.label}${f.required?' *':''}`} description={choice?.description||f.field.description}/>
       return <label className="grid content-start gap-1 text-sm" key={path}>{f.field.label}{f.required?' *':''}
        {options?.length?<select className="w-full rounded-md border bg-background p-2" value={value} disabled={fixed} onChange={e=>changeField(path,e.target.value)}><option value="">Select…</option>{options.map(o=><option key={o.value} value={o.value}>{institution?`${o.value} — ${o.label}`:o.label}</option>)}</select>:<Input value={value} readOnly={fixed} maxLength={500} type={path.endsWith('security_question_answer')?'password':'text'} autoComplete="off" onChange={e=>changeField(path,e.target.value)}/>}
        {(choice?.description||f.field.description)&&<span className="text-xs whitespace-pre-line text-muted-foreground">{choice?.description||f.field.description}</span>}
