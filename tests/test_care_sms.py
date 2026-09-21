@@ -10,6 +10,84 @@ from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, d
 
 
 class SMSTests(unittest.TestCase):
+    @patch('app.services.care_sms.deliver',return_value=('provider12345678','accepted'))
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_live_automatic_welcome_falls_back_when_translation_returns_to_pending(self, verify, send):
+        self.french_msg91_fixture()
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.ns['welcome_emails']=SimpleNamespace(validate=Mock())
+        self.sms.phone=Mock(return_value='+14155552671')
+        self.conn.execute("UPDATE after_order_messages SET test_mode=0,template_kind='new_order_welcome'")
+        self.conn.execute("UPDATE after_order_sms_localizations SET template_kind='new_order_welcome'")
+        self.settings['after_order_sms_mappings']=self.settings['after_order_sms_mappings'].replace('item_unavailable','new_order_welcome')
+        row=self.sms.prepare(1)
+        def approved(mapping):
+            if mapping['template_id']=='french':raise ValueError('Pending again')
+        verify.side_effect=approved
+        self.sms.send(row['id'],automatic=True)
+        self.assertEqual('english',send.call_args.args[1]['template_id'])
+        self.assertEqual(1,self.row()['attempts'])
+        with self.assertRaises(ValueError):self.sms.send(row['id'],automatic=True)
+        self.assertEqual(1,send.call_count)
+
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_wrong_brand_translation_is_not_selected(self, verify):
+        self.french_msg91_fixture()
+        self.conn.execute("UPDATE after_order_sms_localizations SET mapping_json=?",(json.dumps({
+            'sender':'WrongBrand','template_id':'bad','text':'WrongBrand ##order## ##url## - Support'}),))
+        row=self.sms.prepare(1)
+        self.assertEqual('english',json.loads(row['snapshot_json'])['mapping']['template_id'])
+        self.assertNotIn('WrongBrand',row['body'])
+
+    @patch('app.services.care_sms.deliver',return_value=('provider12345678','accepted'))
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_revoked_translation_reselects_english_and_invalidates_manual_approval(self, verify, send):
+        self.french_msg91_fixture()
+        row = self.sms.prepare(1)
+        def approved(mapping):
+            if mapping['template_id'] == 'french':
+                raise ValueError('Pending again')
+        verify.side_effect = approved
+        with self.assertRaisesRegex(ValueError,'current SMS preview'):
+            self.sms.send(row['id'],approval=digest(row))
+        self.assertEqual('en_US',json.loads(self.row()['snapshot_json'])['language']['sent_language'])
+        send.assert_not_called()
+        self.sms.send(row['id'],approval=digest(self.row()))
+        self.assertEqual('english',send.call_args.args[1]['template_id'])
+
+    @patch('app.services.care_sms.deliver',return_value=('provider12345678','accepted'))
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_newly_approved_translation_selected_for_automatic_test(self, verify, send):
+        self.french_msg91_fixture()
+        verify.side_effect=lambda m: (_ for _ in ()).throw(ValueError('Pending')) if m['template_id']=='french' else None
+        row=self.sms.prepare(1)
+        verify.side_effect=None
+        self.sms.send(row['id'],automatic=True)
+        self.assertEqual('french',send.call_args.args[1]['template_id'])
+        self.assertEqual('fr_CA',json.loads(self.row()['snapshot_json'])['language']['sent_language'])
+
+    @patch('app.services.care_sms.deliver')
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_both_templates_pending_blocks_without_attempt(self, verify, send):
+        self.french_msg91_fixture()
+        row=self.sms.prepare(1)
+        verify.side_effect=ValueError('Pending')
+        with self.assertRaises(ValueError):self.sms.send(row['id'],automatic=True)
+        self.assertEqual(0,self.row()['attempts'])
+        send.assert_not_called()
+
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_unknown_or_delivered_sms_never_rewritten_for_language(self, verify):
+        self.french_msg91_fixture()
+        row=self.sms.prepare(1)
+        for status in ('delivery_unknown','accepted','sending','delivered'):
+            self.conn.execute('UPDATE after_order_sms SET status=?,attempts=1',(status,))
+            before=self.row()
+            verify.reset_mock()
+            self.sms.refresh_language(row['id'])
+            self.assertEqual(before,self.row())
+            verify.assert_not_called()
+
     def french_msg91_fixture(self):
         self.case['context']['requested_language']='fr_CA'
         self.settings['after_order_sms_provider']='msg91'

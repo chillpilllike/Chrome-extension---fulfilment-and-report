@@ -389,6 +389,8 @@ class SMS:
                 if localized and not catalog(requested_language).get('delivery_blocked'):
                     candidate = json.loads(localized['mapping_json'])
                     try:
+                        if candidate.get('sender') != mapping.get('sender'):
+                            raise ValueError('Localized template sender does not match the website.')
                         verify_followup_template(candidate)
                     except (ValueError,requests.RequestException):
                         pass  # Explicit user policy: use approved English while translation awaits approval.
@@ -421,6 +423,77 @@ class SMS:
             row = dict(conn.execute('SELECT * FROM after_order_sms WHERE email_id=?',(email_id,)).fetchone())
             r.record_after_order_event(conn,case['id'],'sms_prepared',details={'sms_id':row['id'],'provider':provider,'test_mode':bool(email['test_mode'])})
         return row
+
+    def refresh_language(self, sms_id):
+        """Reconcile pending/confirmed-failed MSG91 snapshots, never resend.
+
+        A changed manual preview receives a new digest and needs fresh approval.
+        Automatic notifications can use the approved fallback immediately.
+        """
+        r = self.r
+        with r.db() as conn:
+            raw = conn.execute('SELECT * FROM after_order_sms WHERE id=? FOR UPDATE', (sms_id,)).fetchone()
+            if not raw:
+                return
+            row = dict(raw)
+            if row['provider'] != 'msg91' or row['status'] not in {'awaiting_approval','failed','provider_failed','undelivered'} or row['attempts'] >= 3:
+                return
+            snapshot = json.loads(row['snapshot_json'])
+            requested = snapshot.get('language', {}).get('requested_language', 'en_US')
+            if requested.startswith('en'):
+                return
+            case = r.after_order_case_by_id(row['case_id'])
+            config = self.config()
+            base = dict(config['mappings'].get(f"{case['store_id']}:{case['website_id']}", {}).get('msg91') or {})
+            kind = snapshot['kind']
+            english = base.get('templates', {}).get(kind)
+            language = {'requested_language':requested, 'sent_language':'en_US',
+                        'fallback_reason':'No approved localized MSG91 template; English fallback.'}
+            mapping = None
+            data = catalog(requested)
+            localized = conn.execute('''SELECT mapping_json FROM after_order_sms_localizations
+                WHERE provider='msg91' AND sender=? AND language IN (?,?) AND template_kind=?
+                ORDER BY CASE WHEN language=? THEN 0 ELSE 1 END''',
+                (base.get('sender',''), requested, requested.split('_')[0], kind, requested)).fetchone()
+            if localized and data.get('complete') and not data.get('delivery_blocked'):
+                candidate = json.loads(localized['mapping_json'])
+                try:
+                    if candidate.get('sender') != base.get('sender'):
+                        raise ValueError('Localized template sender does not match the website.')
+                    verify_followup_template(candidate)
+                except (ValueError, requests.RequestException):
+                    pass
+                else:
+                    mapping = candidate
+                    language = {'requested_language':requested, 'sent_language':requested, 'fallback_reason':''}
+            if mapping is None:
+                if not english:
+                    raise ValueError('Configure a dedicated approved English fallback for this notification.')
+                mapping = {**base, **english}
+                verify_followup_template(mapping)  # Fail closed if English is not approved either.
+            link = order_link(snapshot['domain'], case.get('odoo_order_id'))
+            if kind == 'trustpilot_review':
+                link = r.trustpilot_review_url(snapshot['domain'])
+            values = {'order':case['odoo_order_name'], 'url':link,
+                      'brand':(case.get('context') or {}).get('website_name') or case.get('store_name') or snapshot['domain']}
+            template = mapping.get('text') or ''
+            names = set(re.findall(r'##(\w+)##', template))
+            if not template or not names.issubset(values):
+                raise ValueError('Invalid MSG91 template variables; no SMS was sent.')
+            mapping['variables'] = {name:values[name] for name in names}
+            body = template
+            for name in names:
+                body = body.replace('##'+name+'##', str(values[name]))
+            if len(body) > 1000:
+                raise ValueError('SMS exceeds the 1,000-character safety limit.')
+            if snapshot['mapping'] == mapping and snapshot.get('language') == language and row['body'] == body:
+                return
+            previous = snapshot.get('language', {}).get('sent_language')
+            snapshot.update(mapping=mapping, language=language)
+            conn.execute('UPDATE after_order_sms SET body=?,snapshot_json=?,updated_at=? WHERE id=?',
+                         (body, json.dumps(snapshot), r.utc_now(), sms_id))
+            r.record_after_order_event(conn,row['case_id'],'sms_language_reselected',details={
+                'sms_id':sms_id,'previous_language':previous,**language})
 
     def companion(self, email_id):
         try:
@@ -455,6 +528,7 @@ class SMS:
 
     def send(self, sms_id, approval='', automatic=False, resend=False):
         r = self.r
+        self.refresh_language(sms_id)
         with r.db() as conn:
             raw = conn.execute('SELECT * FROM after_order_sms WHERE id=? FOR UPDATE',(sms_id,)).fetchone()
             if not raw:
@@ -646,6 +720,7 @@ class SMS:
             return {**self.config(),'test_number':TEST_NUMBER,'test_mode':self.r.after_order_email_test_mode(),
                     'supported_kinds':sorted(KINDS),
                     'policy':'selected-events-first-movement-v1',
+                    'language_policy':'live-approved-localized-else-approved-english-v2',
                     'credentials':{'odoo':True,'twilio':bool(os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN')),'msg91':bool(os.getenv('MSG91_AUTH_KEY'))}}
 
         @router.post('/settings')
@@ -665,6 +740,12 @@ class SMS:
             if not raw:
                 reason=preparation_reason(dict(email) if email else None,self.config()['enabled'])
                 return {'row':None,'can_prepare':not bool(reason),'reason':reason or 'No SMS is saved yet. Prepare it to validate the phone, website, template and current order.'}
+            try:
+                self.refresh_language(raw['id'])
+            except (ValueError, requests.RequestException):
+                pass  # Keep the last preview visible; send still enforces live approval.
+            with self.r.db() as conn:
+                raw = conn.execute('SELECT * FROM after_order_sms WHERE id=?',(raw['id'],)).fetchone()
             row = dict(raw); row['approval_digest']=digest(row)
             kind=json.loads(row['snapshot_json']).get('kind')
             row['language']=json.loads(row['snapshot_json']).get('language',{})
