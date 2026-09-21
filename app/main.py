@@ -40685,6 +40685,9 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         attempt = int(locked.get("attempt_count") or 0) + 1
         saved_payload = json.loads(locked['payload_json'])
         language_snapshot = saved_payload.get('_care_language')
+        from app.services.notification_i18n import catalog
+        if language_snapshot and catalog(language_snapshot.get('sent_language')).get('delivery_blocked'):
+            raise HTTPException(409, 'This translation requires native-language review. Regenerate an English fallback preview.')
         if language_snapshot and language_snapshot.get('requested_language') != (case.get('context') or {}).get('requested_language', 'en_US'):
             raise HTTPException(409, 'Customer language changed. Regenerate and review the email before sending.')
         if not locked.get('test_mode') and locked.get('template_kind') == 'delivery_confirmation':

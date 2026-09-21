@@ -170,5 +170,23 @@
     "Your verified recipient": "Votre bénéficiaire vérifié",
     "these unavailable items": "ces articles indisponibles",
     "this unavailable item": "cet article indisponible"
+  },
+  "payment": {
+    "payment for your selected alternative": "paiement pour votre alternative sélectionnée",
+    "TEST payment-email preview": "APERÇU TEST de l’e-mail de paiement",
+    "TEST ONLY: payment email layout preview for order %s. No quotation, payment request or financial operation was created.": "TEST UNIQUEMENT : aperçu de l’e-mail de paiement pour la commande %s. Aucun devis, demande de paiement ou opération financière n’a été créé.",
+    "TEST PREVIEW ONLY — no payment is due and no quotation was created.": "APERÇU TEST UNIQUEMENT — aucun paiement n’est dû et aucun devis n’a été créé.",
+    "YOUR SELECTED ALTERNATIVE": "VOTRE ALTERNATIVE SÉLECTIONNÉE",
+    "One more step for your order.": "Encore une étape pour votre commande.",
+    "Your 24-hour selection window has ended. Your chosen alternative costs more than the original item. Please pay the difference below so we can continue processing your order.": "Votre délai de sélection de 24 heures est terminé. L’alternative choisie coûte plus cher que l’article initial. Veuillez régler la différence ci-dessous afin que nous puissions poursuivre le traitement de votre commande.",
+    "View full product details": "Voir tous les détails du produit",
+    "Order": "Commande",
+    "Example amount for layout testing only": "Montant fictif pour tester la présentation uniquement",
+    "Additional payment · quotation": "Paiement complémentaire · devis",
+    "View order · test preview": "Voir la commande · aperçu test",
+    "View quotation & pay securely": "Voir le devis et payer en toute sécurité",
+    "Payment is made on our website. If you need help with this quotation, please contact our team.": "Le paiement s’effectue sur notre site. Si vous avez besoin d’aide concernant ce devis, veuillez contacter notre équipe.",
+    "This message relates to order": "Ce message concerne la commande",
+    "placed on": "passée sur"
   }
 }

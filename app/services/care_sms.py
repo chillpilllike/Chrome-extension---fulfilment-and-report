@@ -10,7 +10,7 @@ import requests
 import phonenumbers as pn
 from fastapi import APIRouter, HTTPException, Request
 from app.services.alternative_workflow import Runtime
-from app.services.notification_i18n import normalize_language, sms_translation, sms_segments
+from app.services.notification_i18n import normalize_language, sms_translation, sms_segments, catalog
 
 TEST_NUMBER = '+19296526393'
 PROVIDERS = {'odoo', 'msg91', 'twilio'}
@@ -386,7 +386,7 @@ class SMS:
                         WHERE provider='msg91' AND sender=? AND language IN (?,?) AND template_kind=?
                         ORDER BY CASE WHEN language=? THEN 0 ELSE 1 END''',
                         (mapping.get('sender',''),requested_language,requested_language.split('_')[0],kind,requested_language)).fetchone()
-                if localized:
+                if localized and not catalog(requested_language).get('delivery_blocked'):
                     candidate = json.loads(localized['mapping_json'])
                     try:
                         verify_followup_template(candidate)
@@ -467,6 +467,8 @@ class SMS:
                 raise ValueError('Source notification type changed. Prepare a current SMS.')
             if not self.config()['enabled']:
                 raise ValueError('SMS sending is disabled.')
+            if catalog(snapshot.get('language',{}).get('sent_language')).get('delivery_blocked'):
+                raise ValueError('This translation requires native-language review. Prepare an English fallback preview.')
             if row['provider'] == 'msg91' and (snapshot['kind'] in AUTOMATIC_KINDS or not snapshot.get('language',{}).get('requested_language','en_US').startswith('en')):
                 verify_followup_template(snapshot['mapping'])
             validate_target(row,r.after_order_email_test_mode())

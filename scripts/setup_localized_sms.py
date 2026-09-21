@@ -21,7 +21,7 @@ def main():
     from app.services.notification_i18n import catalog,normalize_language
     language=normalize_language(args.language)
     data=catalog(language)
-    if not language or not data.get('complete') or not data.get('sms'):
+    if not language or not data.get('complete') or data.get('delivery_blocked') or not data.get('sms'):
         raise ValueError('A complete localized catalog with SMS copy is required.')
     existing=Path('docs/msg91-localized-templates.json')
     saved=json.loads(existing.read_text()) if existing.exists() else {}
@@ -40,11 +40,15 @@ def main():
         if key in saved:
             continue
         text=source.format(brand=brand,order='##order##',url='##url##')
+        # MSG91 requires fixed brand identification and no trailing variable.
+        # Brand is literal here, never a provider interpolation variable.
+        if text.rstrip().endswith('##url##'):
+            text += ' - ' + brand
         row={'sender':args.sender,'language':language,'kind':kind,'text':text,'sms_type':'UNICODE'}
         if args.apply:
             response=requests.post('https://control.msg91.com/api/v5/sms/addTemplate',headers={'authkey':auth},
                 files={k:(None,v) for k,v in {'template':text,'sender_id':args.sender,
-                    'template_name':args.sender+'_Care_'+language+'_'+kind,'smsType':'UNICODE'}.items()},timeout=30)
+                    'template_name':args.sender+'_Care_'+language.replace('@','_')+'_'+kind,'smsType':'UNICODE'}.items()},timeout=30)
             response.raise_for_status()
             result=response.json()
             if result.get('status')!='success' or not result.get('data',{}).get('template_id'):

@@ -1,0 +1,902 @@
+{
+  "method": "automated_screening_not_human_review",
+  "results": [
+    {
+      "catalog": "af",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; nothing happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ar",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a decision within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "az",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund. Cancellation and refund are only carried out with team approval; they do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "be",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refund require team approval; they do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "bg",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "bn",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; these do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "bs",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ca",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none of these actions happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "cnr",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a decision within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "cs",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refunds require team approval; nothing happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "cy",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a decision within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; these will not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "da",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; nothing happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "de",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "de_CH",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "el",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; these do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "es",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a decision within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "et",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "eu",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "fa",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "fi",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "fj",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ga",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "gd",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "gl",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none occur automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "he",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, the order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; they are not automatic",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "hi",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund depend on team approval; they are not automatic.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "hr",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not decide within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "hu",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, your order will be sent to our team for cancellation and refund. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "id",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "is",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a decision within 3 days, the order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "it",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ka",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "kab",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, your request will be forwarded to our team for review and resolution. The review and resolution are handled by the team; they are not processed automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": false,
+        "cancellation": false,
+        "approval": false,
+        "automatic": true
+      },
+      "manual_review_required": true
+    },
+    {
+      "catalog": "km",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval and are not processed automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ko",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not select within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refund require team approval and are not processed automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ko_KP",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not select within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refund require team approval and are not processed automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "la",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither is done automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "lb",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; nothing happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "lo",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; they do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "lt",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a decision within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refund require team approval; they do not occur automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "lv",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; they do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "mk",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "mn",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; they do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ms",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "mt",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; nothing happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "my",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval and do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "nb",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "nl",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; this does not happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "pl",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refunds require team approval; they do not happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "pt_AO",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "pt_BR",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; none occur automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "pt_PT",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ro",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; none happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "ru",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refunds require team approval; they do not happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "sk",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; nothing happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "sl",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; none happen automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "sq",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "sr@Cyrl",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "sr@latin",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a decision within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; neither happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "sv",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; nothing happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "sw",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; they do not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "th",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, your order will be sent to the team for cancellation and refund review. Cancellation and refunds require team approval; nothing happens automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "tl",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not choose within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; this does not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "tr",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refund require team approval; it does not happen automatically.",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "uk",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be forwarded to our team for cancellation and refund review. Cancellation and refunds require team approval; neither happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "zh_CN",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be submitted to the team for cancellation and refund review. Cancellation and refunds require team approval and are not automatic",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "zh_HK",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be handed over to the team for cancellation and refund review. Cancellation and refunds require team approval and are not automatic",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "zh_TW",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to the team for cancellation and refund review. Cancellation and refunds require team approval and are not automatic",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    },
+    {
+      "catalog": "zu",
+      "source_key": "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.",
+      "back_translation": "If you do not make a selection within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and refunds require team approval; nothing happens automatically",
+      "checks": {
+        "deadline": true,
+        "refund": true,
+        "cancellation": true,
+        "approval": true,
+        "automatic": true
+      },
+      "manual_review_required": false
+    }
+  ]
+}

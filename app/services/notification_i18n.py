@@ -7,6 +7,7 @@ import json
 import re
 import math
 import string
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from string import Formatter
@@ -17,10 +18,10 @@ RTL = {'ar', 'he', 'fa', 'ur', 'dv'}
 
 def normalize_language(value):
     value = str(value or '').strip().replace('-', '_')
-    if not re.fullmatch(r'[a-zA-Z]{2,3}(?:_[a-zA-Z0-9]{2,3})?(?:@(?:Cyrl|latin))?', value):
+    if not re.fullmatch(r'[a-zA-Z]{2,3}(?:_[a-zA-Z0-9]{2,3})?(?:@(?:Cyrl|latin))?', value, re.I):
         return ''
     if '@' in value:
-        return 'sr@Cyrl' if value.lower() == 'sr@cyrl' else 'sr@latin'
+        return {'sr@cyrl':'sr@Cyrl', 'sr@latin':'sr@latin'}.get(value.lower(), '')
     parts = value.split('_', 1)
     return parts[0].lower() + ('_' + parts[1].upper() if len(parts) == 2 else '')
 
@@ -39,25 +40,42 @@ def catalog(language):
     for candidate in (language, language.split('_')[0]):
         path = CATALOGS / (candidate + '.json')
         if path.is_file():
-            return json.loads(path.read_text(encoding='utf-8'))
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                return data if isinstance(data, dict) else {}
+            except (OSError, ValueError):
+                return {}
     return {}
+
+
+def valid_translation(source, value):
+    if not isinstance(value, str) or not value.strip() or '<' in value or '>' in value or re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', value):
+        return False
+    try:
+        # Compare the full fields, not only their names: a conversion/format
+        # specifier must never be introduced by a translation.
+        fields = lambda text: Counter((name, spec, conv) for _,name,spec,conv in Formatter().parse(text) if name is not None)
+        return fields(source) == fields(value)
+    except ValueError:
+        return False
 
 
 class Translator:
     def __init__(self, language):
         self.requested = normalize_language(language) or 'en_US'
         data = catalog(self.requested)
-        self.messages = data.get('messages', {})
+        self.messages = data.get('messages', {}) if isinstance(data.get('messages', {}),dict) else {}
         source = catalog('en_US').get('messages', {})
-        def fields(text):
-            return {name for _,name,_,_ in Formatter().parse(text) if name is not None}
-        complete = data.get('complete') and all(
-            isinstance(self.messages.get(key),str) and self.messages[key]
-            and '<' not in self.messages[key] and fields(key) == fields(self.messages[key])
+        complete = bool(source) and data.get('complete') and not data.get('delivery_blocked') and all(
+            valid_translation(key, self.messages.get(key))
             for key in source)
         self.language = self.requested if self.requested.startswith('en') or complete else 'en_US'
         self.version = data.get('version', 'english-v1') if self.language != 'en_US' else 'english-v1'
         self.fallback = '' if self.language == self.requested or self.requested.startswith('en') else 'Translation not yet complete; English fallback.'
+        if self.fallback and data.get('delivery_blocked'):
+            self.fallback = 'Translation requires native-language review; English fallback.'
+        self.method = data.get('translation_method', 'maintained') if not self.fallback else 'english_fallback'
+        self.human_reviewed = data.get('human_reviewed', False)
 
     def __call__(self, text, **values):
         translated = self.messages.get(text, text) if not self.language.startswith('en') else text
@@ -65,7 +83,7 @@ class Translator:
 
     @property
     def html_language(self):
-        return self.language.replace('_', '-')
+        return {'sr@Cyrl':'sr-Cyrl','sr@latin':'sr-Latn'}.get(self.language,self.language.replace('_', '-'))
 
     @property
     def direction(self):
@@ -73,7 +91,8 @@ class Translator:
 
     def metadata(self):
         return {'requested_language': self.requested, 'sent_language': self.language,
-                'fallback_reason': self.fallback, 'catalog_version': self.version}
+                'fallback_reason': self.fallback, 'catalog_version': self.version,
+                'translation_method': self.method, 'human_reviewed': self.human_reviewed}
 
 
 def for_case(case):
@@ -110,10 +129,18 @@ def language_inventory():
 def sms_translation(language, kind, brand, order, link):
     language = normalize_language(language) or 'en_US'
     kind = {'tracking':'package_movement', 'price_difference':'alternative_payment'}.get(kind, kind)
-    template = catalog(language).get('sms', {}).get(kind)
-    if not template:
+    data = catalog(language)
+    templates = data.get('sms', {}) if isinstance(data.get('sms', {}),dict) else {}
+    template = templates.get(kind)
+    try:
+        fields = [(name,spec,conv) for _,name,spec,conv in Formatter().parse(template or '') if name is not None]
+        valid_sms = bool(template) and set(fields) == {('brand','',None),('order','',None),('url','',None)}
+        valid_sms = valid_sms and fields.count(('order','',None)) == 1 and fields.count(('url','',None)) == 1
+    except ValueError:
+        valid_sms = False
+    if not data.get('complete') or data.get('delivery_blocked') or not valid_sms or not valid_translation(template,template):
         return None, {'requested_language':language,'sent_language':'en_US',
-                      'fallback_reason':'' if language.startswith('en') else 'SMS translation unavailable; English fallback.'}
+                      'fallback_reason':'' if language.startswith('en') else 'SMS translation requires review or is unavailable; English fallback.'}
     return template.format(brand=brand,order=order,url=link), {
         'requested_language':language,'sent_language':language,'fallback_reason':''}
 

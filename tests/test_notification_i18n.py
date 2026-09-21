@@ -29,7 +29,7 @@ class LanguageTests(unittest.TestCase):
             t=Translator(locale)
             self.assertEqual(locale,t.language)
             self.assertEqual('Quantité',t('Quantity'))
-        t=Translator('de_DE')
+        t=Translator('zz_ZZ')
         self.assertEqual('en_US',t.language)
         self.assertTrue(t.fallback)
         self.assertEqual('Quantity',t('Quantity'))
@@ -82,7 +82,7 @@ class LanguageTests(unittest.TestCase):
         body,meta=sms_translation('fr_CA','new_order_welcome','Nutricity','NC1','https://nutricity.ca/my/orders/1')
         self.assertIn('commande NC1 confirmée',body)
         self.assertEqual('fr_CA',meta['sent_language'])
-        body,meta=sms_translation('de_DE','new_order_welcome','Nutricity','NC1','https://nutricity.ca/my/orders/1')
+        body,meta=sms_translation('zz_ZZ','new_order_welcome','Nutricity','NC1','https://nutricity.ca/my/orders/1')
         self.assertIsNone(body)
         self.assertEqual('en_US',meta['sent_language'])
 

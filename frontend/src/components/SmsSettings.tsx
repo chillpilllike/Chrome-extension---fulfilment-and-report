@@ -9,7 +9,7 @@ export function SmsSettings({ api }: { api: API }) {
   const [mapping, setMapping] = useState('{}')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
-  const [languages,setLanguages] = useState<{code:string;name:string;sent_language:string;fallback_reason:string}[]>([])
+  const [languages,setLanguages] = useState<{code:string;name:string;sent_language:string;fallback_reason:string;translation_method?:string;human_reviewed?:boolean}[]>([])
   useEffect(()=>{api<{languages:typeof languages}>('/api/after-order/languages').then(d=>setLanguages(d.languages)).catch(()=>{})},[api])
   useEffect(() => { api<Config>('/api/after-order/sms/settings').then(c => { setConfig(c); setMapping(JSON.stringify(c.mappings, null, 2)) }).catch(e => setNotice(String(e))) }, [api])
   async function save() {
@@ -24,7 +24,7 @@ export function SmsSettings({ api }: { api: API }) {
       <p>{config.test_mode ? 'Test: only +19296526393, no approval for initial sends.' : 'Live: individual SMS approval required.'}</p>
       <p>New-order confirmation SMS sends automatically for confirmed orders. Other SMS: expected dispatch delay, dispatch hurdle, unavailable items (with or without alternatives), first parcel movement, and delivery confirmation. Payment and refund SMS remain held until verified event connections are completed. No reminder or lost-package SMS.</p>
       <p>{config.provider === 'odoo' ? 'Uses the order’s Odoo installation. Requires its SMS module and credits.' : config.credentials[config.provider] ? 'Runtime credentials present; sender and delivery need verification.' : 'Runtime credentials are not configured.'}</p>
-      <details><summary>Notification languages · {languages.length} configured locales</summary><p>The Odoo customer language is used. Incomplete translations and unapproved localized MSG91 templates fall back to English. Language is recorded in each message preview. Email coverage below does not imply MSG91 template approval.</p><div className="grid gap-1">{languages.map(l=><p key={l.code}>{l.name} ({l.code}) — {l.fallback_reason?'English fallback':'Email catalog ready'}</p>)}</div></details>
+      <details><summary>Notification languages · {languages.length} configured locales</summary><p>The Odoo customer language is used. Incomplete translations and unapproved localized MSG91 templates fall back to English. Language is recorded in each message preview. Email coverage below does not imply MSG91 template approval. Machine-generated catalogs pass automated checks but have not been reviewed by a native-language speaker.</p><div className="grid gap-1">{languages.map(l=><p key={l.code}>{l.name} ({l.code}) — {l.fallback_reason?'English fallback':l.translation_method==='machine_generated'?'Translated · machine-generated':'Email catalog ready'}</p>)}</div></details>
       <details><summary>Website sender and template mappings</summary><p>Keys are store_id:website_id. Enable transactional_sms_enabled only after reviewing consent and destination requirements. No secrets here.</p>
         <pre className="text-xs whitespace-pre-wrap">{'{"1:2":{"transactional_sms_enabled":false,"twilio":{"sender":"+15551234567"},"msg91":{"sender":"HEADER","templates":{"expected_dispatch":{"template_id":"MSG91_ID","dlt_template_id":"DLT_ID","text":"##brand##: Dispatch update for ##order##. ##url##"}}}}}'}</pre>
         <textarea aria-label="SMS website mappings JSON" className="form-control w-full min-h-40 font-mono" value={mapping} onChange={e => setMapping(e.target.value)} />

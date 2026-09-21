@@ -156,5 +156,37 @@
     "Your verified recipient": "Your verified recipient",
     "these unavailable items": "these unavailable items",
     "this unavailable item": "this unavailable item"
+  },
+  "payment": {
+    "payment for your selected alternative": "payment for your selected alternative",
+    "TEST payment-email preview": "TEST payment-email preview",
+    "TEST ONLY: payment email layout preview for order %s. No quotation, payment request or financial operation was created.": "TEST ONLY: payment email layout preview for order %s. No quotation, payment request or financial operation was created.",
+    "TEST PREVIEW ONLY — no payment is due and no quotation was created.": "TEST PREVIEW ONLY — no payment is due and no quotation was created.",
+    "YOUR SELECTED ALTERNATIVE": "YOUR SELECTED ALTERNATIVE",
+    "One more step for your order.": "One more step for your order.",
+    "Your 24-hour selection window has ended. Your chosen alternative costs more than the original item. Please pay the difference below so we can continue processing your order.": "Your 24-hour selection window has ended. Your chosen alternative costs more than the original item. Please pay the difference below so we can continue processing your order.",
+    "View full product details": "View full product details",
+    "Order": "Order",
+    "Example amount for layout testing only": "Example amount for layout testing only",
+    "Additional payment · quotation": "Additional payment · quotation",
+    "View order · test preview": "View order · test preview",
+    "View quotation & pay securely": "View quotation & pay securely",
+    "Payment is made on our website. If you need help with this quotation, please contact our team.": "Payment is made on our website. If you need help with this quotation, please contact our team.",
+    "This message relates to order": "This message relates to order",
+    "placed on": "placed on"
+  },
+  "sms": {
+    "new_order_welcome": "{brand}: Order {order}. Thank you for your order! We will begin processing it soon. View your order: {url}",
+    "trustpilot_review": "{brand}: Order {order}. How was your experience? Share an honest review: {url}",
+    "delivery_issue_received": "{brand}: Order {order}. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. {url}",
+    "expected_dispatch": "{brand}: Order {order}. There is an update to your expected dispatch date. {url}",
+    "item_unavailable": "{brand}: Order {order}. An item in your order needs your choice. {url}",
+    "no_alternatives": "{brand}: Order {order}. An item is unavailable and no alternatives were found. Please choose how to proceed. {url}",
+    "delivery_confirmation": "{brand}: Order {order}. The carrier marked your parcel delivered. Please confirm receipt. {url}",
+    "warehouse_dispatch_delay": "{brand}: Order {order}. Dispatch is delayed. Our team is working on it. No action needed. {url}",
+    "alternative_payment": "{brand}: Order {order}. Please review the payment details for your selected alternative. {url}",
+    "refund_request_received": "{brand}: Order {order}. Your refund request is under review. Please allow 24-48 hours for a response. {url}",
+    "refund_completed": "{brand}: Order {order}. Your refund has been processed. Your payment provider determines when the credit appears. {url}",
+    "package_movement": "{brand}: Order {order}. Your parcel has a tracking update. {url}"
   }
 }

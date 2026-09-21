@@ -10,4 +10,5 @@ __pycache__/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+.translation-cache/
 frontend/vite.config.ts.timestamp-*.mjs
