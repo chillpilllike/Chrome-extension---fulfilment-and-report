@@ -130,9 +130,10 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
     <fieldset disabled={loadingSchema||!!busy} className="grid gap-4 md:grid-cols-2">
      {renderedFields.map(f=>{
       const path=f.path==='transfer_methods'?'transfer_method':f.path, value=values[path]||'', fixed=path==='beneficiary.bank_details.account_currency'||(/account_routing_type[12]$/.test(path)&&!f.field.options?.length)
-      const options=f.field.options, choice=options?.find(o=>o.value===value)
+      const institution=values['beneficiary.bank_details.bank_country_code']==='CA'&&path==='beneficiary.bank_details.account_routing_value1'
+      const options=institution?f.field.options?.slice().sort((a,b)=>a.value.localeCompare(b.value)):f.field.options, choice=options?.find(o=>o.value===value)
       return <label className="grid content-start gap-1 text-sm" key={path}>{f.field.label}{f.required?' *':''}
-       {options?.length?<select className="w-full rounded-md border bg-background p-2" value={value} disabled={fixed} onChange={e=>changeField(path,e.target.value)}><option value="">Select…</option>{options.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}</select>:<Input value={value} readOnly={fixed} maxLength={500} type={path.endsWith('security_question_answer')?'password':'text'} autoComplete="off" onChange={e=>changeField(path,e.target.value)}/>}
+       {options?.length?<select className="w-full rounded-md border bg-background p-2" value={value} disabled={fixed} onChange={e=>changeField(path,e.target.value)}><option value="">Select…</option>{options.map(o=><option key={o.value} value={o.value}>{institution?`${o.value} — ${o.label}`:o.label}</option>)}</select>:<Input value={value} readOnly={fixed} maxLength={500} type={path.endsWith('security_question_answer')?'password':'text'} autoComplete="off" onChange={e=>changeField(path,e.target.value)}/>}
        {(choice?.description||f.field.description)&&<span className="text-xs whitespace-pre-line text-muted-foreground">{choice?.description||f.field.description}</span>}
       </label>
      })}
