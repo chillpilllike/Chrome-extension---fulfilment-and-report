@@ -1,0 +1,67 @@
+{
+  "Boostgo": {
+    "template_id": "6ab11d8b4614d2f6290f0642",
+    "sender": "Boostgo",
+    "text": "Boostgo: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - Boostgo Support"
+  },
+  "Espot": {
+    "template_id": "6ab11da4abac4dcd72000083",
+    "sender": "Espot",
+    "text": "Espot: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - Espot Support"
+  },
+  "FinchKart": {
+    "template_id": "6ab11da8b8b037ebca059b63",
+    "sender": "FinchKart",
+    "text": "FinchKart: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - FinchKart Support"
+  },
+  "GofinchKart": {
+    "template_id": "6ab11dab969a0e169c0fdc92",
+    "sender": "GofinchKart",
+    "text": "GofinchKart: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - GofinchKart Support"
+  },
+  "NutriMax": {
+    "template_id": "6ab11dad4242936bdc0ed453",
+    "sender": "NutriMax",
+    "text": "NutriMax: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - NutriMax Support"
+  },
+  "Nutrihub": {
+    "template_id": "6ab11daf2b8f7745110989f2",
+    "sender": "Nutrihub",
+    "text": "Nutrihub: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - Nutrihub Support"
+  },
+  "PrimeSupps": {
+    "template_id": "6ab11db18d62503170088892",
+    "sender": "PrimeSupps",
+    "text": "PrimeSupps: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - PrimeSupps Support"
+  },
+  "SecretGreen": {
+    "template_id": "6ab11db38f287074d40bbe72",
+    "sender": "SecretGreen",
+    "text": "SecretGreen: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - SecretGreen Support"
+  },
+  "Suppcity": {
+    "template_id": "6ab11db4a6e78f6e520a1132",
+    "sender": "Suppcity",
+    "text": "Suppcity: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - Suppcity Support"
+  },
+  "VitaShop": {
+    "template_id": "6ab11db6881d8d03e802cc42",
+    "sender": "VitaShop",
+    "text": "VitaShop: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - VitaShop Support"
+  },
+  "Vitagen": {
+    "template_id": "6ab11db7dbc31640860c7602",
+    "sender": "Vitagen",
+    "text": "Vitagen: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - Vitagen Support"
+  },
+  "Wildkart": {
+    "template_id": "6ab11db84b8d2c57ea0c7752",
+    "sender": "Wildkart",
+    "text": "Wildkart: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - Wildkart Support"
+  },
+  "nutricity": {
+    "template_id": "6ab11db923f3be0218044692",
+    "sender": "nutricity",
+    "text": "Nutricity: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - Nutricity Support"
+  }
+}

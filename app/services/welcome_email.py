@@ -57,6 +57,7 @@ class Monitor:
             if not guard.execute('SELECT pg_try_advisory_xact_lock(781905439) AS locked').fetchone()['locked']:
                 return
             result = self._run_checks(request, guard=guard)
+            self.r.care_sms.pending_welcomes()
             self.last_check_at = self.r.utc_now()
             return result
 

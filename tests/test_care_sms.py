@@ -10,8 +10,8 @@ from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, d
 
 
 class SMSTests(unittest.TestCase):
-    def test_welcome_explains_intentional_exclusion(self):
-        self.assertIn('intentionally',preparation_reason({'template_kind':'new_order_welcome'}))
+    def test_welcome_is_eligible(self):
+        self.assertEqual('',preparation_reason({'template_kind':'new_order_welcome'}))
 
     @patch('app.services.care_sms.deliver',side_effect=[Rejected('HTTP 403'),('provider12345678','accepted')])
     def test_failed_retry_retains_attempts(self,send):
@@ -243,16 +243,21 @@ class SMSTests(unittest.TestCase):
         self.sms.companion(1)
 
     @patch('app.services.care_sms.deliver',return_value=('1','accepted'))
-    def test_live_welcome_is_excluded(self, send):
+    def test_live_welcome_auto_sends_once(self, send):
         self.ns['after_order_email_test_mode']=lambda:False
         self.ns['welcome_emails']=Mock()
         self.conn.execute("UPDATE after_order_messages SET test_mode=0,template_kind='new_order_welcome',status='sent'")
         self.case.update(case_type='new_order_welcome',status='resolved')
         self.sms.phone=Mock(return_value='+14155552671')
         self.sms.companion(1)
-        self.ns['welcome_emails'].validate.assert_not_called()
-        send.assert_not_called()
-        self.assertIsNone(self.sms.prepare(1))
+        self.sms.companion(1)
+        self.ns['welcome_emails'].validate.assert_called_once_with(self.case)
+        send.assert_called_once()
+        self.assertEqual('accepted',self.row()['status'])
+        self.assertEqual('+14155552671',self.row()['recipient'])
+        self.conn.execute("INSERT INTO after_order_messages VALUES(2,1,'new_order_welcome','sent',0,'')")
+        self.sms.companion(2)
+        send.assert_called_once()
 
     def test_movement_once_per_parcel_and_mode(self):
         self.case.update(tracking_code='EPG123',context={'risk_state':'in_transit'})
@@ -264,6 +269,57 @@ class SMSTests(unittest.TestCase):
         self.assertEqual(first['id'],self.sms.prepare(1)['id'])
         self.case['tracking_code']='EPG456'
         self.assertIsNotNone(self.sms.prepare(2))
+
+    @patch('app.services.care_sms.deliver')
+    def test_unconfirmed_welcome_cannot_send(self, send):
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.ns['welcome_emails']=Mock()
+        self.ns['welcome_emails'].validate.side_effect=ValueError('Order cancelled')
+        self.conn.execute("UPDATE after_order_messages SET test_mode=0,template_kind='new_order_welcome'")
+        self.sms.phone=Mock(return_value='+14155552671')
+        self.sms.companion(1)
+        send.assert_not_called()
+        self.assertEqual(0,self.row()['attempts'])
+
+    @patch('app.services.care_sms.deliver',return_value=('1','accepted'))
+    def test_test_welcome_only_owner_and_no_duplicate_resend(self, send):
+        self.conn.execute("UPDATE after_order_messages SET template_kind='new_order_welcome'")
+        self.sms.companion(1)
+        self.assertEqual(TEST_NUMBER,self.row()['recipient'])
+        self.assertEqual('accepted',self.row()['status'])
+        self.conn.execute("UPDATE after_order_sms SET status='delivered'")
+        with self.assertRaises(ValueError):
+            self.sms.send(self.row()['id'],approval=digest(self.row()),resend=True)
+        send.assert_called_once()
+
+    @patch('app.services.care_sms.verify_followup_template',side_effect=ValueError('Pending approval'))
+    @patch('app.services.care_sms.deliver')
+    def test_welcome_requires_dedicated_approved_template(self, send, verify):
+        self.conn.execute("UPDATE after_order_messages SET template_kind='new_order_welcome'")
+        self.settings['after_order_sms_provider']='msg91'
+        self.settings['after_order_sms_mappings']=json.dumps({'1:2':{'msg91':{'sender':'nutricity','text':'wrong template'}}})
+        with self.assertRaisesRegex(ValueError,'dedicated'):self.sms.prepare(1)
+        verify.assert_not_called()
+        self.settings['after_order_sms_mappings']=json.dumps({'1:2':{'msg91':{'sender':'nutricity','templates':{'new_order_welcome':{'template_id':'pending','text':'Order ##order## ##url##'}}}}})
+        self.sms.companion(1)
+        verify.assert_called_once()
+        send.assert_not_called()
+
+    def test_pending_welcomes_no_historical_or_test_replay(self):
+        self.conn.execute('ALTER TABLE after_order_messages ADD COLUMN created_at TEXT')
+        now=datetime.now(timezone.utc).isoformat()
+        self.settings['after_order_welcome_sms_started_at']=now
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.conn.execute("UPDATE after_order_messages SET template_kind='new_order_welcome',test_mode=0,created_at=?",(now,))
+        self.conn.execute("INSERT INTO after_order_messages VALUES(2,1,'new_order_welcome','sent',0,'','2020-01-01')")
+        self.conn.execute("INSERT INTO after_order_messages VALUES(3,1,'new_order_welcome','sent',1,'',?)",(now,))
+        self.sms.companion=Mock()
+        self.sms.pending_welcomes()
+        self.sms.companion.assert_called_once_with(1)
+        self.sms.companion.reset_mock()
+        self.ns['after_order_email_test_mode']=lambda:True
+        self.sms.pending_welcomes()
+        self.sms.companion.assert_not_called()
 
     @patch('app.services.care_sms.deliver')
     def test_previously_queued_welcome_is_blocked(self, send):

@@ -15,7 +15,8 @@ PROVIDERS = {'odoo', 'msg91', 'twilio'}
 KINDS = {'expected_dispatch', 'item_unavailable', 'no_alternatives', 'delivery_confirmation',
          'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment',
          'price_difference', 'refund_request_received', 'refund_completed',
-         'trustpilot_review', 'delivery_issue_received'}
+         'trustpilot_review', 'delivery_issue_received', 'new_order_welcome'}
+AUTOMATIC_KINDS = {'trustpilot_review', 'delivery_issue_received', 'new_order_welcome'}
 SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
  id INTEGER PRIMARY KEY AUTOINCREMENT, email_id INTEGER NOT NULL UNIQUE REFERENCES after_order_messages(id),
  case_id INTEGER NOT NULL REFERENCES after_order_cases(id), provider TEXT NOT NULL,
@@ -26,6 +27,10 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
 );
 CREATE TABLE IF NOT EXISTS after_order_sms_first_movement (
  parcel_key TEXT PRIMARY KEY, email_id INTEGER NOT NULL REFERENCES after_order_messages(id),
+ created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS after_order_sms_welcome (
+ order_key TEXT PRIMARY KEY, sms_id INTEGER NOT NULL UNIQUE REFERENCES after_order_sms(id),
  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS after_order_sms_attempts (
@@ -42,8 +47,6 @@ CREATE TABLE IF NOT EXISTS after_order_sms_receipts (
 def preparation_reason(email, enabled=True):
     if not email:
         return 'Source email not found.'
-    if email.get('template_kind') == 'new_order_welcome':
-        return 'New-order welcome emails intentionally have no SMS, to keep SMS costs down.'
     if not eligible(email):
         return 'This email type is excluded from the selected SMS notification policy (including reminders).'
     if not enabled:
@@ -98,6 +101,7 @@ def order_link(domain, order_id):
 
 def render(kind, order, brand, link):
     summaries = {
+        'new_order_welcome':"Thank you for your order! We will begin processing it soon. View your order:",
         'trustpilot_review':'How was your experience? Share an honest review:',
         'delivery_issue_received':"Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly.",
         'expected_dispatch':'There is an update to your expected dispatch date.',
@@ -225,6 +229,23 @@ class SMS:
                 'provider':settings.get('after_order_sms_provider') or 'odoo',
                 'mappings':json.loads(settings.get('after_order_sms_mappings') or '{}')}
 
+    def pending_welcomes(self):
+        """Recover unattempted welcomes after template/configuration setup, never old orders."""
+        r = self.r
+        started = r.get_service_settings().get('after_order_welcome_sms_started_at')
+        if not started or not self.config()['enabled'] or r.after_order_email_test_mode():
+            return
+        since = max(str(started), (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat())
+        with r.db() as conn:
+            rows = conn.execute('''SELECT m.id FROM after_order_messages m
+                LEFT JOIN after_order_sms s ON s.email_id=m.id
+                WHERE m.template_kind='new_order_welcome' AND m.test_mode=0 AND m.created_at>=?
+                AND m.status NOT IN ('cancelled','superseded')
+                AND (s.id IS NULL OR (s.status='awaiting_approval' AND s.attempts=0))
+                ORDER BY m.id''', (since,)).fetchall()
+        for row in rows:
+            self.companion(row['id'])
+
     def receipt(self, payload):
         """Called only after webhook authentication. Reports never initiate sends."""
         ident=str(payload.get('requestId') or '')
@@ -293,7 +314,7 @@ class SMS:
             email = conn.execute('SELECT * FROM after_order_messages WHERE id=?',(email_id,)).fetchone()
             existing = conn.execute('SELECT * FROM after_order_sms WHERE email_id=?',(email_id,)).fetchone()
         if not email or not eligible(dict(email)):
-            return None  # Welcome, reminders, lost-package and marketing SMS are excluded.
+            return None  # Reminders, lost-package and marketing SMS are excluded.
         if existing:
             return dict(existing)
         email = dict(email); case = r.after_order_case_by_id(email['case_id'])
@@ -324,7 +345,9 @@ class SMS:
         body = render(kind,values['order'],brand,link)
         if provider == 'msg91':
             mapping = {**mapping,**(mapping.get('templates',{}).get(kind) or {})}
-            if kind in {'trustpilot_review', 'delivery_issue_received'}:
+            if kind in AUTOMATIC_KINDS:
+                if not mapping.get('templates', {}).get(kind):
+                    raise ValueError('Configure a dedicated approved MSG91 template for this notification.')
                 verify_followup_template(mapping)
             template = mapping.get('text') or ''
             names = set(re.findall(r'##(\w+)##',template))
@@ -353,7 +376,7 @@ class SMS:
         try:
             row = self.prepare(email_id)
             if row and row['status'] == 'awaiting_approval':
-                if row['test_mode'] or json.loads(row['snapshot_json']).get('kind') in {'trustpilot_review', 'delivery_issue_received'}:
+                if row['test_mode'] or json.loads(row['snapshot_json']).get('kind') in AUTOMATIC_KINDS:
                     self.send(row['id'],automatic=True)
         except Exception:
             # A companion must never change the outcome of the independent email.
@@ -390,22 +413,34 @@ class SMS:
             email = conn.execute('SELECT * FROM after_order_messages WHERE id=?',(row['email_id'],)).fetchone()
             if not email or not eligible(dict(email)) or snapshot['kind'] not in KINDS:
                 raise ValueError('This notification is excluded from SMS by the current cost-control policy.')
+            if snapshot['kind'] != email['template_kind'] and not (email['template_kind'] == 'item_unavailable' and snapshot['kind'] == 'no_alternatives'):
+                raise ValueError('Source notification type changed. Prepare a current SMS.')
             if not self.config()['enabled']:
                 raise ValueError('SMS sending is disabled.')
-            if row['provider'] == 'msg91' and snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}:
+            if row['provider'] == 'msg91' and snapshot['kind'] in AUTOMATIC_KINDS:
                 verify_followup_template(snapshot['mapping'])
             validate_target(row,r.after_order_email_test_mode())
             allowed = {'delivered'} if resend else {'awaiting_approval','failed','provider_failed','undelivered'}
             if row['status'] not in allowed or row['attempts'] >= 3 or (resend and automatic):
                 raise ValueError('SMS already attempted or uncertain. Check provider logs; do not resend.')
-            if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received'}:
+            if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome'}:
                 raise ValueError('This is a once-only notification. Duplicate sends are blocked.')
             if automatic:
-                if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and snapshot['kind'] not in {'trustpilot_review', 'delivery_issue_received'}):
+                if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and snapshot['kind'] not in AUTOMATIC_KINDS):
                     raise ValueError('This SMS needs individual approval.')
             elif digest(row) != approval:
                 raise ValueError('Review the current SMS preview before approving.')
             case = r.after_order_case_by_id(row['case_id']); r.require_after_order_case_in_scope(case)
+            if snapshot['kind'] == 'new_order_welcome':
+                if email['status'] in {'cancelled','superseded'}:
+                    raise ValueError('This welcome notification was cancelled or superseded.')
+                if not row['test_mode']:
+                    r.welcome_emails.validate(case)
+                key = json.dumps([case['store_id'], case['odoo_order_id'], bool(row['test_mode'])])
+                conn.execute('''INSERT INTO after_order_sms_welcome(order_key,sms_id,created_at)
+                    VALUES(?,?,?) ON CONFLICT(order_key) DO NOTHING''', (key,sms_id,r.utc_now()))
+                if conn.execute('SELECT sms_id FROM after_order_sms_welcome WHERE order_key=?',(key,)).fetchone()['sms_id'] != sms_id:
+                    raise ValueError('A welcome SMS is already reserved for this order. Duplicate blocked.')
             expected_link = order_link(snapshot['domain'], case.get('odoo_order_id'))
             if snapshot['kind'] == 'trustpilot_review':
                 expected_link = r.trustpilot_review_url(snapshot['domain'])
@@ -429,9 +464,10 @@ class SMS:
                     raise ValueError('Customer SMS has been disabled for this website.')
                 financial = snapshot['kind'] in {'price_difference','alternative_payment','refund_request_received','refund_completed'}
                 followup = snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}
+                welcome = snapshot['kind'] == 'new_order_welcome'
                 if (self.phone(case) != row['recipient'] or r.request_fingerprint(case) != snapshot['request_fingerprint']
                         or case.get('sender_domain') != snapshot['domain']
-                        or (not financial and not followup and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
+                        or (not financial and not followup and not welcome and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
                         or not r.after_order_tracking_is_current(case)):
                     raise ValueError('Order/recipient changed; SMS approval is blocked.')
                 if financial:
@@ -572,7 +608,7 @@ class SMS:
                 return {'row':None,'can_prepare':not bool(reason),'reason':reason or 'No SMS is saved yet. Prepare it to validate the phone, website, template and current order.'}
             row = dict(raw); row['approval_digest']=digest(row)
             kind=json.loads(row['snapshot_json']).get('kind')
-            row['can_resend']=row['status']=='delivered' and row['attempts']<3 and kind not in {'tracking','package_movement','trustpilot_review','delivery_issue_received'}
+            row['can_resend']=row['status']=='delivered' and row['attempts']<3 and kind not in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome'}
             row.pop('snapshot_json')
             with self.r.db() as conn:
                 attempts=conn.execute('SELECT * FROM after_order_sms_attempts WHERE sms_id=? ORDER BY attempt_number',(row['id'],)).fetchall()

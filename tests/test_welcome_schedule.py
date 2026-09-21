@@ -29,7 +29,7 @@ class WelcomeScheduleTests(unittest.TestCase):
         self.now=datetime.now(timezone.utc)
         self.settings={'after_order_welcome_started_at':(self.now-timedelta(days=2)).isoformat(),'autosync_interval_minutes':'5'}
         self.locked=True;self.sent=[]
-        self.monitor=Monitor(dict(db=self.db,get_service_settings=lambda:self.settings,
+        self.monitor=Monitor(dict(db=self.db,get_service_settings=lambda:self.settings,care_sms=Mock(),
           after_order_cutoff_date=lambda:(self.now-timedelta(days=1)).date().isoformat(),
           utc_now=lambda:self.now.isoformat(),send_after_order_email=self.send,clean_error_message=str,
           record_after_order_event=lambda c,cid,event,**kw:c.execute('INSERT INTO after_order_case_events VALUES(?,?)',(cid,event))))
