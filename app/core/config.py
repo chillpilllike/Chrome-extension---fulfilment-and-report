@@ -146,6 +146,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "after_order_automation_enabled": "false",
     "after_order_warehouse_delay_enabled": "false",
     "after_order_welcome_started_at": "",
+    "after_order_welcome_sms_started_at": "",
     "after_order_sms_enabled": "false",
     "after_order_sms_provider": "odoo",
     "after_order_sms_mappings": "{}",
