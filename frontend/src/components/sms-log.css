@@ -1,0 +1,20 @@
+.sms-log-panel{background:#fff;border:1px solid #dce3ec;border-radius:16px;overflow:hidden;color:#1e293b}
+.sms-log-toolbar{display:flex;align-items:end;gap:16px;padding:24px;background:#f8fafc}
+.sms-log-toolbar label{display:grid;gap:8px;font-size:13px;font-weight:600;flex:1}
+.sms-log-toolbar label:first-child{flex:2}.sms-log-toolbar input,.sms-log-toolbar select{min-height:42px}
+.sms-log-summary,.sms-log-pagination{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:16px 24px;color:#64748b;font-size:13px}
+.sms-log-row{display:grid;grid-template-columns:1fr 1.1fr 1.2fr auto;align-items:center;gap:24px;padding:22px 24px;border-top:1px solid #e8edf3}
+.sms-log-row:hover{background:#fbfcfe}.sms-log-row small{display:block;margin-top:7px;color:#64748b;font-size:12px}.sms-phone{font-weight:500}
+.sms-status{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;background:#eef2f7;color:#475569;padding:6px 10px;border-radius:6px}
+.sms-status:before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}.sms-status.is-success{background:#e7f5ee;color:#16734b}.sms-status.is-danger{background:#fff0ef;color:#b42318}.sms-status.is-pending{background:#fff4db;color:#936000}
+.sms-empty{text-align:center;padding:48px 20px;color:#64748b}.sms-empty h3{color:#334155;font-size:18px}
+.sms-message-dialog{width:calc(100vw - 32px);max-width:640px!important;margin:5vh auto!important}
+.sms-message-dialog .modal-content{max-height:90vh;overflow-y:auto;border-radius:16px;padding:0!important}
+.sms-message-dialog .modal-header{display:block;padding:24px 52px 20px 24px;border-bottom:1px solid #e8edf3}.sms-message-dialog .modal-header h2{font-size:20px;margin:0 0 8px}.sms-message-dialog .modal-header p{color:#64748b;font-size:13px;margin:0}
+.sms-preview{padding:24px;display:grid;gap:20px}.sms-preview p{margin:0}.sms-preview-status,.sms-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.sms-mode{font-size:11px;letter-spacing:.08em;color:#64748b;font-weight:600}
+.sms-metadata{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:0}.sms-metadata dt,.sms-section-label{font-size:12px;font-weight:600;color:#64748b;margin:0 0 8px}.sms-metadata dd{margin:0;font-size:15px}
+.sms-message-bubble{background:#eff4f9;border:1px solid #e2e8f0;border-radius:14px 14px 14px 3px;padding:22px;font:400 16px/1.7 Inter,system-ui,sans-serif;white-space:pre-wrap;overflow-wrap:anywhere;color:#1e293b}
+.sms-help{font-size:12px;color:#64748b;line-height:1.6}.sms-error{background:#fff1f0;color:#b42318;padding:12px;border-radius:8px;overflow-wrap:anywhere}
+.sms-confirm{padding:16px;background:#fffbeb;border:1px solid #f3db9a;border-radius:10px;display:grid;gap:12px}.sms-confirm p{font-size:14px;line-height:1.6}
+.sms-technical{border-top:1px solid #e8edf3;padding-top:16px;color:#64748b;font-size:12px;overflow-wrap:anywhere}.sms-technical summary{cursor:pointer;font-weight:600;margin-bottom:12px}.sms-attempt{padding:12px 0;border-bottom:1px solid #e8edf3}.sms-attempt small{display:block;margin-top:6px}
+@media(max-width:760px){.sms-log-toolbar{flex-wrap:wrap;padding:16px}.sms-log-toolbar label:first-child{flex-basis:100%}.sms-log-row{grid-template-columns:1fr 1fr;padding:18px 16px;gap:18px}.sms-log-summary{padding:16px;flex-wrap:wrap}.sms-message-dialog{margin:2vh auto!important}.sms-message-dialog .modal-content{max-height:96vh}.sms-preview{padding:20px}.sms-log-row .btn{justify-self:start}}
