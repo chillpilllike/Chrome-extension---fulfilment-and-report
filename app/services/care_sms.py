@@ -11,6 +11,7 @@ import phonenumbers as pn
 from fastapi import APIRouter, HTTPException, Request
 from app.services.alternative_workflow import Runtime
 from app.services.notification_i18n import normalize_language, sms_translation, sms_segments, catalog
+from app.services.sms_language_scope import website_language_allowed, TRANSLATED_SENDERS
 
 TEST_NUMBER = '+19296526393'
 PROVIDERS = {'odoo', 'msg91', 'twilio'}
@@ -253,6 +254,19 @@ class SMS:
                 'provider':settings.get('after_order_sms_provider') or 'odoo',
                 'mappings':json.loads(settings.get('after_order_sms_mappings') or '{}')}
 
+    def language_allowed(self, case, requested):
+        if requested.startswith('en'):return True
+        site=self.config()['mappings'].get(f"{case['store_id']}:{case['website_id']}",{})
+        sender=site.get('msg91',{}).get('sender')
+        if sender not in TRANSLATED_SENDERS:return False
+        try:
+            client=self.r.OdooClient(self.r.get_store(case['store_id']))
+            websites=client.read('website',[case['website_id']],['language_ids'])
+            languages=client.read('res.lang',websites[0]['language_ids'],['code','active'])
+            return website_language_allowed(sender,requested,[x['code'] for x in languages if x.get('active')])
+        except Exception:
+            return False  # Unverified website language must use English, never an installed-only locale.
+
     def pending_welcomes(self):
         """Recover unattempted welcomes after template/configuration setup, never old orders."""
         r = self.r
@@ -373,7 +387,10 @@ class SMS:
         values = {'order':case['odoo_order_name'],'brand':brand,'url':link}
         body = render(kind,values['order'],brand,link)
         requested_language = normalize_language((case.get('context') or {}).get('requested_language')) or 'en_US'
-        translated_body, language = sms_translation(requested_language,kind,brand,values['order'],link)
+        language_allowed = self.language_allowed(case,requested_language)
+        translated_body, language = sms_translation(requested_language if language_allowed else 'en_US',kind,brand,values['order'],link)
+        if not language_allowed:
+            language={'requested_language':requested_language,'sent_language':'en_US','fallback_reason':'SMS translation is not enabled on this website; English fallback.'}
         if translated_body and provider != 'msg91':
             body = translated_body
         if provider == 'msg91':
@@ -386,7 +403,7 @@ class SMS:
                         WHERE provider='msg91' AND sender=? AND language IN (?,?) AND template_kind=?
                         ORDER BY CASE WHEN language=? THEN 0 ELSE 1 END''',
                         (mapping.get('sender',''),requested_language,requested_language.split('_')[0],kind,requested_language)).fetchone()
-                if localized and not catalog(requested_language).get('delivery_blocked'):
+                if localized and language_allowed and not catalog(requested_language).get('delivery_blocked'):
                     candidate = json.loads(localized['mapping_json'])
                     try:
                         if candidate.get('sender') != mapping.get('sender'):
@@ -455,7 +472,7 @@ class SMS:
                 WHERE provider='msg91' AND sender=? AND language IN (?,?) AND template_kind=?
                 ORDER BY CASE WHEN language=? THEN 0 ELSE 1 END''',
                 (base.get('sender',''), requested, requested.split('_')[0], kind, requested)).fetchone()
-            if localized and data.get('complete') and not data.get('delivery_blocked'):
+            if localized and self.language_allowed(case,requested) and data.get('complete') and not data.get('delivery_blocked'):
                 candidate = json.loads(localized['mapping_json'])
                 try:
                     if candidate.get('sender') != base.get('sender'):
@@ -720,7 +737,7 @@ class SMS:
             return {**self.config(),'test_number':TEST_NUMBER,'test_mode':self.r.after_order_email_test_mode(),
                     'supported_kinds':sorted(KINDS),
                     'policy':'selected-events-first-movement-v1',
-                    'language_policy':'live-approved-localized-else-approved-english-v2',
+                    'language_policy':'website-active-approved-localized-else-english-v3',
                     'credentials':{'odoo':True,'twilio':bool(os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN')),'msg91':bool(os.getenv('MSG91_AUTH_KEY'))}}
 
         @router.post('/settings')

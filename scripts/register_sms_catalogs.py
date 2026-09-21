@@ -21,18 +21,18 @@ from psycopg2.extras import execute_values
 import requests
 
 from app.services.notification_i18n import catalog, valid_translation
+from app.services.sms_language_scope import allowed_catalogs, TRANSLATED_SENDERS
 
 ROOT = Path(__file__).resolve().parents[1]
 ALIASES = {'package_movement':'tracking', 'alternative_payment':'price_difference'}
 
 
-def plan(senders):
-    manifest = json.loads((ROOT/'app/services/notification_locales/manifest.json').read_text())
+def plan(senders, website_scope):
     english = catalog('en')['sms']
     rows = []
     for sender in senders:
         brand = 'Nutricity' if sender == 'nutricity' else sender
-        for language in sorted({x['catalog'] for x in manifest.values()} - {'en'}):
+        for language in sorted(allowed_catalogs(sender,website_scope.get(sender,[]))):
             data = catalog(language)
             if not data.get('complete') or data.get('delivery_blocked'):
                 continue
@@ -52,11 +52,29 @@ def plan(senders):
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--senders', nargs='+', required=True)
+    p.add_argument('--senders', nargs='+', choices=sorted(TRANSLATED_SENDERS), required=True)
     p.add_argument('--apply', action='store_true')
     p.add_argument('--journal', default='/tmp/care-msg91-registration.sqlite3')
     args=p.parse_args()
-    rows=plan(args.senders)
+    from scripts.audit_sms_website_languages import main as refresh_website_audit
+    refresh_website_audit()
+    audit=json.loads((ROOT/'docs/sms-website-language-audit.json').read_text())
+    if any(not s.get('ok') for s in audit['stores']):
+        raise ValueError('Website language audit incomplete; registration is blocked.')
+    scope={}
+    for store in audit['stores']:
+        for site in store['websites']:
+            if site.get('sms_enabled'):
+                scope.setdefault(site.get('sender'),set()).update(site['languages'])
+    rows=plan(args.senders,scope)
+    archive_path=ROOT/'docs/msg91-template-archive-manifest.json'
+    archived=json.loads(archive_path.read_text()) if archive_path.exists() else {}
+    # A newly re-enabled language must be restored and verified in MSG91 first.
+    # Never silently re-import a retired provider ID from the durable journal.
+    retired={k for k,v in archived.items() if v.get('provider_archive_status')!='restored'}
+    blocked=[r for r in rows if ':'.join(r[x] for x in ('sender','language','kind')) in retired]
+    if blocked:
+        raise ValueError(f'{len(blocked)} retired templates need verified restoration before registration.')
     print(json.dumps({'planned':len(rows),'senders':args.senders,'apply':args.apply}),flush=True)
     if not args.apply:return
     def secret(account):
@@ -114,7 +132,8 @@ def main():
             if count[0]%50==0:print(json.dumps({'registered':count[0],'planned':len(rows)}),flush=True)
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(register,rows))
-    exported={key:json.loads(value) for key,value in db.execute("SELECT key,row_json FROM registrations WHERE status='created'")}
+    expected={':'.join(row[x] for x in ('sender','language','kind')) for row in rows}
+    exported={key:json.loads(value) for key,value in db.execute("SELECT key,row_json FROM registrations WHERE status='created'") if key in expected}
     (ROOT/'docs/msg91-localized-templates.json').write_text(json.dumps(exported,ensure_ascii=False,indent=2)+'\n')
     mappings=[]
     for row in exported.values():

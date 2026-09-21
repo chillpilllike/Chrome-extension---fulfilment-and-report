@@ -10,6 +10,22 @@ from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, d
 
 
 class SMSTests(unittest.TestCase):
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_installed_but_unpublished_language_uses_english(self, verify):
+        self.french_msg91_fixture()
+        self.ns['OdooClient'].return_value.read.side_effect=lambda model,*_: [{'language_ids':[2]}] if model=='website' else [{'code':'en_US','active':True}]
+        row=self.sms.prepare(1)
+        self.assertEqual('en_US',json.loads(row['snapshot_json'])['language']['sent_language'])
+
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_language_removed_from_website_invalidates_manual_preview(self, verify):
+        self.french_msg91_fixture()
+        row=self.sms.prepare(1)
+        self.ns['OdooClient'].return_value.read.side_effect=lambda model,*_: [{'language_ids':[]}] if model=='website' else []
+        with self.assertRaisesRegex(ValueError,'current SMS preview'):
+            self.sms.send(row['id'],approval=digest(row))
+        self.assertEqual('en_US',json.loads(self.row()['snapshot_json'])['language']['sent_language'])
+
     @patch('app.services.care_sms.deliver',return_value=('provider12345678','accepted'))
     @patch('app.services.care_sms.verify_followup_template')
     def test_live_automatic_welcome_falls_back_when_translation_returns_to_pending(self, verify, send):
@@ -90,6 +106,7 @@ class SMSTests(unittest.TestCase):
 
     def french_msg91_fixture(self):
         self.case['context']['requested_language']='fr_CA'
+        self.ns['OdooClient'].return_value.read.side_effect=lambda model,*_: [{'language_ids':[1]}] if model=='website' else [{'code':'fr_CA','active':True}]
         self.settings['after_order_sms_provider']='msg91'
         self.settings['after_order_sms_mappings']=json.dumps({'1:2':{'transactional_sms_enabled':True,'msg91':{'sender':'nutricity','templates':{'item_unavailable':{'template_id':'english','text':'Nutricity: Order ##order## needs your choice. ##url## - Support'}}}}})
         mapping={'sender':'nutricity','template_id':'french','text':'Nutricity : commande ##order##. Choisissez : ##url## - Assistance Nutricity'}

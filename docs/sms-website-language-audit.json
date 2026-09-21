@@ -1,0 +1,1733 @@
+{
+  "checked_at": "2026-09-21T18:49:37.119699+00:00",
+  "stores": [
+    {
+      "store_id": 1,
+      "store_name": "Nutricity USA",
+      "websites": [
+        {
+          "key": "1:1",
+          "name": "NutriCity",
+          "domain": "https://nutricityusa.com",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:2",
+          "name": "Nutricity Canada",
+          "domain": "https://nutricity.ca",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_CA",
+            "fr_CA"
+          ]
+        },
+        {
+          "key": "1:3",
+          "name": "Nutricity New Zealand",
+          "domain": "https://nutricity.co.nz",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_NZ"
+          ]
+        },
+        {
+          "key": "1:4",
+          "name": "Nutricity India",
+          "domain": "https://nutricity.in",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_IN"
+          ]
+        },
+        {
+          "key": "1:5",
+          "name": "Nutricity Japan",
+          "domain": "https://nutricity.jp",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ja_JP"
+          ]
+        },
+        {
+          "key": "1:6",
+          "name": "NutriCity Mexico",
+          "domain": "https://nutricity.mx",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_MX"
+          ]
+        },
+        {
+          "key": "1:7",
+          "name": "NutriCity Austria",
+          "domain": "https://nutricity.at",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "de_DE",
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:8",
+          "name": "NutriCity Belgium",
+          "domain": "https://nutricity.be",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fr_BE",
+            "nl_BE"
+          ]
+        },
+        {
+          "key": "1:9",
+          "name": "NutriCity Denmark",
+          "domain": "https://nutricity.dk",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "da_DK",
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:10",
+          "name": "NutriCity Czech Republic",
+          "domain": "https://nutricity.cz",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "cs_CZ",
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:11",
+          "name": "NutriCity Finland",
+          "domain": "https://nutricity.fi",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fi_FI",
+            "sv_SE"
+          ]
+        },
+        {
+          "key": "1:12",
+          "name": "NutriCity France",
+          "domain": "https://nutricity.fr",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fr_FR"
+          ]
+        },
+        {
+          "key": "1:13",
+          "name": "Nutricity Germany",
+          "domain": "https://nutricityshop.de",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "de_DE",
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:14",
+          "name": "NutriCity Iceland",
+          "domain": "https://nutricity.is",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:15",
+          "name": "NutriCity Romania",
+          "domain": "https://nutricity.ro",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ro_RO"
+          ]
+        },
+        {
+          "key": "1:16",
+          "name": "NutriCity Serbia",
+          "domain": "https://nutricity.rs",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sr@Cyrl"
+          ]
+        },
+        {
+          "key": "1:17",
+          "name": "NutriCity Slovakia",
+          "domain": "https://nutricity.sk",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sk_SK"
+          ]
+        },
+        {
+          "key": "1:18",
+          "name": "NutriCity Slovenia",
+          "domain": "https://nutricity.si",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sl_SI"
+          ]
+        },
+        {
+          "key": "1:19",
+          "name": "NutriCity Turkey",
+          "domain": "https://nutricity.tr",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "tr_TR"
+          ]
+        },
+        {
+          "key": "1:20",
+          "name": "NutriCity Ukraine",
+          "domain": "https://nutricity.ua",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "uk_UA"
+          ]
+        },
+        {
+          "key": "1:21",
+          "name": "NutriCity Fiji",
+          "domain": "https://nutricity.fj",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:22",
+          "name": "NutriCity Indonesia",
+          "domain": "https://nutricity.id",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "id_ID"
+          ]
+        },
+        {
+          "key": "1:23",
+          "name": "NutriCity Laos",
+          "domain": "https://nutricity.la",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "lo_LA"
+          ]
+        },
+        {
+          "key": "1:24",
+          "name": "NutriCity Malaysia",
+          "domain": "https://nutricity.my",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ms_MY"
+          ]
+        },
+        {
+          "key": "1:25",
+          "name": "NutriCity Maldives",
+          "domain": "https://nutricity.mv",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:26",
+          "name": "NutriCity Micronesia",
+          "domain": "https://nutricity.fm",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:27",
+          "name": "NutriCity Thailand",
+          "domain": "https://nutricity.co.th",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "th_TH"
+          ]
+        },
+        {
+          "key": "1:28",
+          "name": "NutriCity Bahamas",
+          "domain": "https://nutricity.bs",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:29",
+          "name": "NutriCity Costa Rica",
+          "domain": "https://nutricity.cr",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_CR"
+          ]
+        },
+        {
+          "key": "1:30",
+          "name": "NutriCity Argentina",
+          "domain": "https://nutricity.ar",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_AR"
+          ]
+        },
+        {
+          "key": "1:31",
+          "name": "NutriCity Brazil",
+          "domain": "https://nutricity.com.br",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "pt_BR"
+          ]
+        },
+        {
+          "key": "1:32",
+          "name": "NutriCity Colombia",
+          "domain": "https://nutricity.co",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_CO"
+          ]
+        },
+        {
+          "key": "1:33",
+          "name": "NutriCity South Africa",
+          "domain": "https://nutricity.co.za",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:34",
+          "name": "NutriCity Israel",
+          "domain": "https://nutricity.co.il",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "he_IL"
+          ]
+        },
+        {
+          "key": "1:35",
+          "name": "NutriCity Sweden",
+          "domain": "https://nutricity.se",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sv_SE"
+          ]
+        },
+        {
+          "key": "1:36",
+          "name": "NutriCity Switzerland",
+          "domain": "https://nutricity.ch",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "de_CH",
+            "en_US",
+            "fr_CH",
+            "it_IT"
+          ]
+        },
+        {
+          "key": "1:37",
+          "name": "NutriCity UK",
+          "domain": "https://nutricity.uk",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_GB"
+          ]
+        },
+        {
+          "key": "1:38",
+          "name": "NutriCity Vatican City",
+          "domain": "https://nutricity.va",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "it_IT"
+          ]
+        },
+        {
+          "key": "1:39",
+          "name": "NutriCity Australia",
+          "domain": "https://nutricity.com.au",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_AU"
+          ]
+        },
+        {
+          "key": "1:40",
+          "name": "NutriCity Brunei",
+          "domain": "https://nutricity.bn",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ms_MY"
+          ]
+        },
+        {
+          "key": "1:41",
+          "name": "NutriCity South Korea",
+          "domain": "https://nutricity.kr",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ko_KR"
+          ]
+        },
+        {
+          "key": "1:42",
+          "name": "NutriCity Singapore",
+          "domain": "https://nutricity.sg",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ms_MY",
+            "zh_CN"
+          ]
+        },
+        {
+          "key": "1:43",
+          "name": "NutriCity Chile",
+          "domain": "https://nutricity.cl",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_CL"
+          ]
+        },
+        {
+          "key": "1:44",
+          "name": "NutriCity Ireland",
+          "domain": "https://nutricity.ie",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:45",
+          "name": "NutriCity Italy",
+          "domain": "https://nutricity.co.it",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "it_IT"
+          ]
+        },
+        {
+          "key": "1:46",
+          "name": "NutriCity Luxembourg",
+          "domain": "https://nutricity.lu",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "de_DE",
+            "en_US",
+            "fr_FR",
+            "lb_LU"
+          ]
+        },
+        {
+          "key": "1:47",
+          "name": "NutriCity Malta",
+          "domain": "https://nutricity.mt",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:48",
+          "name": "NutriCity Netherlands",
+          "domain": "https://nutricity.nl",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "nl_NL"
+          ]
+        },
+        {
+          "key": "1:49",
+          "name": "NutriCity Norway",
+          "domain": "https://nutricity.no",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "nb_NO"
+          ]
+        },
+        {
+          "key": "1:50",
+          "name": "NutriCity Portugal",
+          "domain": "https://nutricity.pt",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "pt_PT"
+          ]
+        },
+        {
+          "key": "1:51",
+          "name": "NutriCity Russia",
+          "domain": "https://nutricity.ru",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ru_RU"
+          ]
+        },
+        {
+          "key": "1:52",
+          "name": "NutriCity San Marino",
+          "domain": "https://nutricity.sm",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "it_IT"
+          ]
+        },
+        {
+          "key": "1:53",
+          "name": "NutriCity Spain",
+          "domain": "https://nutricity.es",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_ES"
+          ]
+        },
+        {
+          "key": "1:54",
+          "name": "NutriCity Uruguay",
+          "domain": "https://nutricity.uy",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_UY"
+          ]
+        },
+        {
+          "key": "1:55",
+          "name": "NutriCity Seychelles",
+          "domain": "https://nutricity.sc",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:56",
+          "name": "NutriCity Bulgaria",
+          "domain": "https://nutricity.bg",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "bg_BG",
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:57",
+          "name": "NutriCity Croatia",
+          "domain": "https://nutricity.hr",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "hr_HR"
+          ]
+        },
+        {
+          "key": "1:58",
+          "name": "NutriCity Estonia",
+          "domain": "https://nutricity.ee",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "et_EE"
+          ]
+        },
+        {
+          "key": "1:59",
+          "name": "NutriCity Greece",
+          "domain": "https://nutricity.gr",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "el_GR",
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:60",
+          "name": "NutriCity Hungary",
+          "domain": "https://nutricityshop.hu",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "de_DE",
+            "en_US",
+            "hu_HU"
+          ]
+        },
+        {
+          "key": "1:61",
+          "name": "NutriCity Kosovo",
+          "domain": "https://nutricity.xk",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sq_AL"
+          ]
+        },
+        {
+          "key": "1:62",
+          "name": "NutriCity Latvia",
+          "domain": "https://nutricity.lv",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "lv_LV"
+          ]
+        },
+        {
+          "key": "1:63",
+          "name": "NutriCity Lithuania",
+          "domain": "https://nutricity.lt",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "lt_LT"
+          ]
+        },
+        {
+          "key": "1:64",
+          "name": "NutriCity China",
+          "domain": "https://nutricity.cn",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "zh_CN"
+          ]
+        },
+        {
+          "key": "1:65",
+          "name": "NutriCity Poland",
+          "domain": "https://nutricity.pl",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "pl_PL"
+          ]
+        },
+        {
+          "key": "1:66",
+          "name": "NutriCity Taiwan",
+          "domain": "https://nutricity.tw",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "zh_TW"
+          ]
+        },
+        {
+          "key": "1:67",
+          "name": "NutriCity Moldova",
+          "domain": "https://nutricity.md",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ro_RO",
+            "ru_RU"
+          ]
+        },
+        {
+          "key": "1:68",
+          "name": "NutriCity Montenegro",
+          "domain": "https://nutricity.me",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sr@Cyrl"
+          ]
+        },
+        {
+          "key": "1:69",
+          "name": "NutriCity North Macedonia",
+          "domain": "https://nutricity.mk",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "mk_MK",
+            "sq_AL"
+          ]
+        },
+        {
+          "key": "1:70",
+          "name": "backend",
+          "domain": "https://backend.nutricityusa.com",
+          "sender": null,
+          "sms_enabled": false,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "1:71",
+          "name": "NutriCity Cyprus",
+          "domain": "https://nutricity.cy",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "el_GR",
+            "en_US",
+            "tr_TR"
+          ]
+        },
+        {
+          "key": "1:72",
+          "name": "Nutricity AU",
+          "domain": "https://nutricityaustralia.com",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_AU"
+          ]
+        },
+        {
+          "key": "1:73",
+          "name": "Nutricity NZ",
+          "domain": "https://nutricity.nz",
+          "sender": "nutricity",
+          "sms_enabled": true,
+          "languages": [
+            "en_NZ"
+          ]
+        },
+        {
+          "key": "1:74",
+          "name": "Finch Kart",
+          "domain": "https://finchkart.com",
+          "sender": "FinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 8,
+      "store_name": "Secretgreen",
+      "websites": [
+        {
+          "key": "8:1",
+          "name": "Secretgreen AU",
+          "domain": "https://secretgreen.com.au",
+          "sender": "SecretGreen",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 9,
+      "store_name": "wildkart",
+      "websites": [
+        {
+          "key": "9:1",
+          "name": "Wildkart AU",
+          "domain": "https://wildkartau.com",
+          "sender": "Wildkart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 3,
+      "store_name": "espot",
+      "websites": [
+        {
+          "key": "3:1",
+          "name": "Espot Australia",
+          "domain": "https://espotau.com",
+          "sender": "Espot",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 11,
+      "store_name": "Gofinchkart",
+      "websites": [
+        {
+          "key": "11:1",
+          "name": "Gofinchkart",
+          "domain": "https://gofinchkart.com",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:2",
+          "name": "GofinchKart United Kingdom",
+          "domain": "https://gofinchkart.uk",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "cy_GB",
+            "en_US",
+            "gd_GB"
+          ]
+        },
+        {
+          "key": "11:3",
+          "name": "GofinchKart Spain",
+          "domain": "https://gofinchkart.es",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "ca_ES",
+            "en_US",
+            "es_ES"
+          ]
+        },
+        {
+          "key": "11:5",
+          "name": "GofinchKart Australia",
+          "domain": "https://gofinchkart.com.au",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_AU"
+          ]
+        },
+        {
+          "key": "11:7",
+          "name": "GofinchKart New Zealand",
+          "domain": "https://gofinchkart.co.nz",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_NZ"
+          ]
+        },
+        {
+          "key": "11:8",
+          "name": "GofinchKart France",
+          "domain": "https://gofinchkart.fr",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fr_FR"
+          ]
+        },
+        {
+          "key": "11:9",
+          "name": "GofinchKart Germany",
+          "domain": "https://gofinchkartshop.de",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "de_DE",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:10",
+          "name": "GofinchKart Iceland",
+          "domain": "https://gofinchkart.is",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "is_IS"
+          ]
+        },
+        {
+          "key": "11:11",
+          "name": "GofinchKart Japan",
+          "domain": "https://gofinchkart.jp",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ja_JP"
+          ]
+        },
+        {
+          "key": "11:12",
+          "name": "GofinchKart Canada",
+          "domain": "https://gofinchkart.ca",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fr_CA"
+          ]
+        },
+        {
+          "key": "11:13",
+          "name": "GofinchKart Italy",
+          "domain": "https://gofinchkart.co.it",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "it_IT"
+          ]
+        },
+        {
+          "key": "11:14",
+          "name": "GofinchKart Bahamas",
+          "domain": "https://gofinchkart.bs",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_IN",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:15",
+          "name": "GofinchKart Belgium",
+          "domain": "https://gofinchkart.be",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fr_BE",
+            "nl_BE"
+          ]
+        },
+        {
+          "key": "11:16",
+          "name": "GofinchKart South Africa",
+          "domain": "https://gofinchkart.co.za",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "af_ZA",
+            "en_US",
+            "zu_ZA"
+          ]
+        },
+        {
+          "key": "11:17",
+          "name": "GofinchKart Colombia",
+          "domain": "https://gofinchkart.co",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_ES"
+          ]
+        },
+        {
+          "key": "11:18",
+          "name": "GofinchKart Brazil",
+          "domain": "https://gofinchkart.com.br",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "pt_AO"
+          ]
+        },
+        {
+          "key": "11:19",
+          "name": "GofinchKart Argentina",
+          "domain": "https://gofinchkart.ar",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_AR"
+          ]
+        },
+        {
+          "key": "11:20",
+          "name": "GofinchKart Costa Rica",
+          "domain": "https://gofinchkart.cr",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_ES"
+          ]
+        },
+        {
+          "key": "11:21",
+          "name": "GofinchKart Thailand",
+          "domain": "https://gofinchkart.th",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "th_TH"
+          ]
+        },
+        {
+          "key": "11:22",
+          "name": "GofinchKart Micronesia",
+          "domain": "https://gofinchkart.fm",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_GB",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:23",
+          "name": "GofinchKart Maldives",
+          "domain": "https://gofinchkart.mv",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "dv_MV",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:24",
+          "name": "GofinchKart Malaysia",
+          "domain": "https://gofinchkart.my",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ms_MY",
+            "zh_CN"
+          ]
+        },
+        {
+          "key": "11:25",
+          "name": "GofinchKart Laos",
+          "domain": "https://gofinchkart.la",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "lo_LA"
+          ]
+        },
+        {
+          "key": "11:26",
+          "name": "GofinchKart Indonesia",
+          "domain": "https://gofinchkart.id",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "id_ID"
+          ]
+        },
+        {
+          "key": "11:27",
+          "name": "GofinchKart India",
+          "domain": "https://gofinchkart.in",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_IN",
+            "en_US",
+            "hi_IN"
+          ]
+        },
+        {
+          "key": "11:28",
+          "name": "GofinchKart Fiji",
+          "domain": "https://gofinchkart.fj",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fj_FJ"
+          ]
+        },
+        {
+          "key": "11:29",
+          "name": "Gofinchkart China",
+          "domain": "https://gofinchkart.cn",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "zh_CN"
+          ]
+        },
+        {
+          "key": "11:30",
+          "name": "GofinchKart Ukraine",
+          "domain": "https://gofinchkart.ua",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ru_RU",
+            "uk_UA"
+          ]
+        },
+        {
+          "key": "11:31",
+          "name": "GofinchKart Turkey",
+          "domain": "https://gofinchkart.tr",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "tr_TR"
+          ]
+        },
+        {
+          "key": "11:32",
+          "name": "GofinchKart Slovenia",
+          "domain": "https://gofinchkart.si",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sl_SI"
+          ]
+        },
+        {
+          "key": "11:33",
+          "name": "GofinchKart Slovakia",
+          "domain": "https://gofinchkart.sk",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sk_SK"
+          ]
+        },
+        {
+          "key": "11:34",
+          "name": "GofinchKart Serbia",
+          "domain": "https://gofinchkart.rs",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sr@Cyrl"
+          ]
+        },
+        {
+          "key": "11:35",
+          "name": "GofinchKart Poland",
+          "domain": "https://gofinchkart.pl",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "pl_PL"
+          ]
+        },
+        {
+          "key": "11:36",
+          "name": "GofinchKart Romania",
+          "domain": "https://gofinchkart.ro",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ro_RO"
+          ]
+        },
+        {
+          "key": "11:37",
+          "name": "GofinchKart North Macedonia",
+          "domain": "https://gofinchkart.mk",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "mk_MK",
+            "sq_AL"
+          ]
+        },
+        {
+          "key": "11:38",
+          "name": "GofinchKart Montenegro",
+          "domain": "https://gofinchkart.me",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "cnr_ME",
+            "en_US",
+            "sr@Cyrl"
+          ]
+        },
+        {
+          "key": "11:39",
+          "name": "GofinchKart Moldova",
+          "domain": "https://gofinchkart.md",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ro_RO",
+            "ru_RU"
+          ]
+        },
+        {
+          "key": "11:40",
+          "name": "GofinchKart Lithuania",
+          "domain": "https://gofinchkart.lt",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "lt_LT",
+            "ru_RU"
+          ]
+        },
+        {
+          "key": "11:41",
+          "name": "Gofinchkart Latvia",
+          "domain": "https://gofinchkart.lv",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "lv_LV",
+            "ru_RU"
+          ]
+        },
+        {
+          "key": "11:42",
+          "name": "GofinchKart Kosovo",
+          "domain": "https://gofinchkart.xk",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sq_AL",
+            "sr@Cyrl"
+          ]
+        },
+        {
+          "key": "11:43",
+          "name": "GofinchKart Hungary",
+          "domain": "https://gofinchkart.hu",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "hu_HU"
+          ]
+        },
+        {
+          "key": "11:44",
+          "name": "GofinchKart Greece",
+          "domain": "https://gofinchkart.gr",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "el_GR",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:45",
+          "name": "GofinchKart Estonia",
+          "domain": "https://gofinchkart.ee",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "et_EE",
+            "ru_RU"
+          ]
+        },
+        {
+          "key": "11:46",
+          "name": "GofinchKart Croatia",
+          "domain": "https://gofinchkart.hr",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "hr_HR"
+          ]
+        },
+        {
+          "key": "11:47",
+          "name": "GofinchKart Bulgaria",
+          "domain": "https://gofinchkart.bg",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "bg_BG",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:48",
+          "name": "GofinchKart Seychelles",
+          "domain": "https://gofinchkart.sc",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fr_FR"
+          ]
+        },
+        {
+          "key": "11:49",
+          "name": "GofinchKart Uruguay",
+          "domain": "https://gofinchkart.uy",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_ES"
+          ]
+        },
+        {
+          "key": "11:50",
+          "name": "GofinchKart Chile",
+          "domain": "https://gofinchkart.cl",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "es_ES"
+          ]
+        },
+        {
+          "key": "11:51",
+          "name": "GofinchKart Taiwan",
+          "domain": "https://gofinchkart.tw",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "zh_TW"
+          ]
+        },
+        {
+          "key": "11:52",
+          "name": "GofinchKart Singapore",
+          "domain": "https://gofinchkart.sg",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ms_MY",
+            "zh_CN"
+          ]
+        },
+        {
+          "key": "11:53",
+          "name": "GofinchKart South Korea",
+          "domain": "https://gofinchkart.kr",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ko_KP"
+          ]
+        },
+        {
+          "key": "11:54",
+          "name": "GofinchKart Brunei",
+          "domain": "https://gofinchkart.bn",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ms_MY"
+          ]
+        },
+        {
+          "key": "11:55",
+          "name": "GofinchKart Vatican City",
+          "domain": "https://gofinchkart.va",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "it_IT",
+            "la_LA"
+          ]
+        },
+        {
+          "key": "11:56",
+          "name": "GofinchKart Switzerland",
+          "domain": "https://gofinchkart.ch",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "de_CH",
+            "en_US",
+            "fr_CH",
+            "it_IT"
+          ]
+        },
+        {
+          "key": "11:57",
+          "name": "GofinchKart Sweden",
+          "domain": "https://gofinchkart.se",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "sv_SE"
+          ]
+        },
+        {
+          "key": "11:58",
+          "name": "GofinchKart San Marino",
+          "domain": "https://gofinchkart.sm",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "it_IT"
+          ]
+        },
+        {
+          "key": "11:59",
+          "name": "GofinchKart Russia",
+          "domain": "https://gofinchkart.ru",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ru_RU"
+          ]
+        },
+        {
+          "key": "11:60",
+          "name": "GofinchKart Portugal",
+          "domain": "https://gofinchkart.pt",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "pt_AO"
+          ]
+        },
+        {
+          "key": "11:61",
+          "name": "GofinchKart Netherlands",
+          "domain": "https://gofinchkart.nl",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "nl_NL"
+          ]
+        },
+        {
+          "key": "11:62",
+          "name": "GofinchKart Malta",
+          "domain": "https://gofinchkart.mt",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "mt_MT"
+          ]
+        },
+        {
+          "key": "11:63",
+          "name": "GofinchKart Luxembourg",
+          "domain": "https://gofinchkart.lu",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "de_DE",
+            "en_US",
+            "fr_FR",
+            "lb_LU"
+          ]
+        },
+        {
+          "key": "11:64",
+          "name": "GofinchKart Denmark",
+          "domain": "https://gofinchkart.dk",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "da_DK",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:65",
+          "name": "GofinchKart Finland",
+          "domain": "https://gofinchkart.fi",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "fi_FI",
+            "sv_SE"
+          ]
+        },
+        {
+          "key": "11:66",
+          "name": "GofinchKart Czech Republic",
+          "domain": "https://gofinchkart.cz",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "cs_CZ",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:67",
+          "name": "GofinchKart Austria",
+          "domain": "https://gofinchkart.at",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "de_DE",
+            "en_US"
+          ]
+        },
+        {
+          "key": "11:68",
+          "name": "GofinchKart Ireland",
+          "domain": "https://gofinchkart.ie",
+          "sender": "GofinchKart",
+          "sms_enabled": true,
+          "languages": [
+            "en_US",
+            "ga_IE"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 7,
+      "store_name": "nutrihub",
+      "websites": [
+        {
+          "key": "7:1",
+          "name": "Nutrihub CA",
+          "domain": "https://nutrihub.ca",
+          "sender": "Nutrihub",
+          "sms_enabled": true,
+          "languages": [
+            "en_CA"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 2,
+      "store_name": "boostgo",
+      "websites": [
+        {
+          "key": "2:1",
+          "name": "Boostgo Australia",
+          "domain": "https://boostgo.com.au",
+          "sender": "Boostgo",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 4,
+      "store_name": "suppcity",
+      "websites": [
+        {
+          "key": "4:1",
+          "name": "Suppcity Australia",
+          "domain": "https://suppcityau.com",
+          "sender": "Suppcity",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 5,
+      "store_name": "vitagen",
+      "websites": [
+        {
+          "key": "5:1",
+          "name": "Vitagen AU",
+          "domain": "https://vitagenau.com",
+          "sender": "Vitagen",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 6,
+      "store_name": "vitashop",
+      "websites": [
+        {
+          "key": "6:1",
+          "name": "VitaShop NZ",
+          "domain": "https://vitashop.co.nz",
+          "sender": "VitaShop",
+          "sms_enabled": true,
+          "languages": [
+            "en_US"
+          ]
+        }
+      ],
+      "ok": true
+    },
+    {
+      "store_id": 10,
+      "store_name": "NutriMax Australia",
+      "websites": [
+        {
+          "key": "10:1",
+          "name": "NutriMax Australia",
+          "domain": "https://nutrimaxaustralia.com",
+          "sender": "NutriMax",
+          "sms_enabled": true,
+          "languages": [
+            "en_AU"
+          ]
+        },
+        {
+          "key": "10:2",
+          "name": "PrimeSupps",
+          "domain": "https://primesupps.com.au",
+          "sender": "PrimeSupps",
+          "sms_enabled": true,
+          "languages": [
+            "en_AU"
+          ]
+        }
+      ],
+      "ok": true
+    }
+  ]
+}

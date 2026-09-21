@@ -18,6 +18,8 @@ def main():
     parser.add_argument('--sender',required=True)
     parser.add_argument('--apply',action='store_true')
     args=parser.parse_args()
+    if args.apply:
+        raise ValueError('Use scripts.register_sms_catalogs: it audits website-enabled languages and journals provider changes safely.')
     from app.services.notification_i18n import catalog,normalize_language
     language=normalize_language(args.language)
     data=catalog(language)

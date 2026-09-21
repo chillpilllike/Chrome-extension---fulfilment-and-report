@@ -1,0 +1,68 @@
+{
+  "website_key": "1:74",
+  "previous_mapping": {
+    "transactional_sms_enabled": true,
+    "msg91": {
+      "sender": "FinchKart",
+      "templates": {
+        "warehouse_dispatch_delay": {
+          "template_id": "6aae7664292cb823dc0bdd23",
+          "text": "FinchKart: Order ##order##. Dispatch delayed. We expect dispatch in 24-48 hours. No action needed. ##url## - FinchKart Support"
+        },
+        "item_unavailable": {
+          "template_id": "6aae766441203249210be854",
+          "text": "FinchKart: Order ##order##. An item is unavailable. Review alternatives or other options within 3 days: ##url## - FinchKart Support"
+        },
+        "expected_dispatch": {
+          "template_id": "6aae76644e39a2d657096533",
+          "text": "FinchKart: Order ##order##. Expected dispatch update. Review your options: ##url## - FinchKart Support"
+        },
+        "no_alternatives": {
+          "template_id": "6aae766577bc3ce68e027834",
+          "text": "FinchKart: Order ##order##. An item is unavailable; no alternatives found. Review your options within 3 days: ##url## - FinchKart Support"
+        },
+        "package_movement": {
+          "template_id": "6aae76662a25f980440c43a4",
+          "text": "FinchKart: Order ##order##. Your parcel is on its way. View tracking: ##url## - FinchKart Support"
+        },
+        "delivery_confirmation": {
+          "template_id": "6aae7666534ef030100a27f3",
+          "text": "FinchKart: Order ##order##. The carrier marked your parcel delivered. Please confirm receipt: ##url## - FinchKart Support"
+        },
+        "alternative_payment": {
+          "template_id": "6aae76679df0da4ca00ea102",
+          "text": "FinchKart: Order ##order##. Your alternative needs an additional payment. Review the amount: ##url## - FinchKart Support"
+        },
+        "refund_request_received": {
+          "template_id": "6aae766726328dd740094cf2",
+          "text": "FinchKart: Order ##order##. Refund request received. Please allow 24-48 hours for team review. ##url## - FinchKart Support"
+        },
+        "refund_completed": {
+          "template_id": "6aae7667892795eb05085d42",
+          "text": "FinchKart: Order ##order##. Your refund is processed. Crediting time depends on your payment provider. ##url## - FinchKart Support"
+        },
+        "tracking": {
+          "template_id": "6aae76662a25f980440c43a4",
+          "text": "FinchKart: Order ##order##. Your parcel is on its way. View tracking: ##url## - FinchKart Support"
+        },
+        "price_difference": {
+          "template_id": "6aae76679df0da4ca00ea102",
+          "text": "FinchKart: Order ##order##. Your alternative needs an additional payment. Review the amount: ##url## - FinchKart Support"
+        },
+        "trustpilot_review": {
+          "template_id": "6aaeefdb9a7374aae3059e12",
+          "text": "FinchKart: Order ##order##. How was your experience? Share an honest review: ##url## - FinchKart Support"
+        },
+        "delivery_issue_received": {
+          "template_id": "6aaeefddf2f893f081060db2",
+          "text": "FinchKart: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - FinchKart Support"
+        },
+        "new_order_welcome": {
+          "template_id": "6ab11da8b8b037ebca059b63",
+          "sender": "FinchKart",
+          "text": "FinchKart: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - FinchKart Support"
+        }
+      }
+    }
+  }
+}
