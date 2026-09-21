@@ -118,6 +118,8 @@ class ResendEmailProvider:
         self.timeout_seconds = max(1, timeout_seconds)
 
     def send(self, message: dict[str, Any], *, idempotency_key: str) -> dict[str, Any]:
+        from app.services.website_email_policy import require_email_enabled
+        require_email_enabled(message=message)
         if not self.api_key:
             raise ValueError("RESEND_API_KEY is not configured on the server.")
         response = requests.post(

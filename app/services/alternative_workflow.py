@@ -251,6 +251,8 @@ class Workflow:
         if r.after_order_email_test_mode():
             raise HTTPException(409,'Odoo quotation emails cannot be retried in test mode.')
         case = r.after_order_case_by_id(message['case_id'])
+        from app.services.website_email_policy import require_email_enabled
+        require_email_enabled(case=case, message=message)
         r.require_after_order_case_in_scope(case)
         case = r.hydrate_after_order_recipient_and_domain(case,strict=True)
         if r.after_order_unavailable_review(case)['blocked'] or r.request_fingerprint(case) != message['request_fingerprint']:

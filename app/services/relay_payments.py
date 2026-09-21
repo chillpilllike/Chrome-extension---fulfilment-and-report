@@ -467,6 +467,13 @@ class RelayPayments:
                     c.execute('UPDATE relay_payments SET last_error=? WHERE id=?', ('Payment email held: current Odoo data needs verification',row['id']))
                 continue
             key = 'relay:'+row['request_id']+':'+job['kind']
+            from app.services.website_email_policy import require_email_enabled
+            try:
+                require_email_enabled(message=payload)
+            except ValueError as exc:
+                with self.db() as c:
+                    c.execute("UPDATE relay_email_outbox SET state='failed',error=? WHERE id=?",(str(exc),job['id']))
+                continue
             with self.db() as c:
                 recovery=c.execute('SELECT MAX(generation) AS n FROM relay_email_retries WHERE outbox_id=?',(job['id'],)).fetchone()
                 if recovery and recovery['n']:

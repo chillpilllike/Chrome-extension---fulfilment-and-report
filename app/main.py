@@ -40168,6 +40168,11 @@ def send_after_order_email(
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
+    from app.services.website_email_policy import require_email_enabled
+    try:
+        require_email_enabled(case=case)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
     require_after_order_case_in_scope(case)
     from app.services.delivery_followup import KINDS as followup_kinds
     if template_kind in followup_kinds and not (force_test or after_order_email_test_mode()):
@@ -40599,6 +40604,11 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if not original:
         raise HTTPException(404, "Email record not found.")
     original = row_to_dict(original)
+    from app.services.website_email_policy import require_email_enabled
+    try:
+        require_email_enabled(case=after_order_case_by_id(int(original['case_id'])), message=original)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
     if json.loads(original.get('payload_json') or '{}').get('_care_rollout_cancelled_at'):
         raise HTTPException(409,'This earlier notification was cancelled at the manual-live reset. It cannot be sent or retried.')
     manual_completion = original.get('template_kind') == 'manual_refund_completed'
@@ -41441,8 +41451,10 @@ def api_after_order_confirm(case_id: int, payload: AfterOrderConfirmPayload, req
 
 @app.get("/api/after-order/settings")
 def api_after_order_settings() -> dict[str, Any]:
+    from app.services.website_email_policy import PAUSED_DOMAINS
     return {
         "ok": True,
+        "email_paused_domains": sorted(PAUSED_DOMAINS),
         "email_approval_required": True,
         "financial_approval_required": True,
         "refund_mode": "manual" if manual_refunds.enabled() else "provider",
