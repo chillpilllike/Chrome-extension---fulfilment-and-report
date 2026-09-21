@@ -197,6 +197,8 @@ class AirwallexRefunds:
             c.execute('''CREATE TABLE IF NOT EXISTS airwallex_refund_webhook (
                 account_key TEXT PRIMARY KEY, webhook_id TEXT NOT NULL, secret TEXT NOT NULL)''')
 
+        with self.db() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS airwallex_refund_odoo (request_id TEXT PRIMARY KEY, state TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '')")
         if self.notifications:
             self.notifications.init_db()
 
@@ -779,6 +781,8 @@ class AirwallexRefunds:
             try:
                 self.init_db()
                 self.poll()
+                from app.services.refund_odoo import sync_paid_refunds
+                sync_paid_refunds(self)
                 if self.notifications:
                     self.notifications.cycle()
                 if time.monotonic() - self.last_history_sync > 300:

@@ -13,7 +13,7 @@ class RefundEmailTests(unittest.TestCase):
     def setUp(self):
         self.conn=sqlite3.connect(':memory:');self.conn.row_factory=sqlite3.Row
         self.conn.executescript('''
-        CREATE TABLE airwallex_refund_payouts(request_id TEXT PRIMARY KEY,store_id INTEGER,order_id INTEGER,order_name TEXT,status TEXT,amount TEXT,currency TEXT,transfer_id TEXT,email_destination TEXT);
+        CREATE TABLE airwallex_refund_payouts(request_id TEXT PRIMARY KEY,store_id INTEGER,order_id INTEGER,order_name TEXT,status TEXT,amount TEXT,currency TEXT,transfer_id TEXT,email_destination TEXT,created_at TEXT);
         CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY,case_key TEXT UNIQUE,store_id INTEGER,website_id INTEGER,odoo_order_id INTEGER,odoo_order_name TEXT,case_type TEXT,status TEXT,severity TEXT,title TEXT,customer_email TEXT,sender_domain TEXT,context_json TEXT,created_at TEXT,updated_at TEXT);
         CREATE TABLE after_order_messages(id INTEGER PRIMARY KEY,case_id INTEGER,provider TEXT,recipient TEXT,sender TEXT,subject TEXT,html_preview TEXT,status TEXT,idempotency_key TEXT UNIQUE,payload_json TEXT,created_at TEXT,updated_at TEXT,test_mode INTEGER,template_kind TEXT,attempt_count INTEGER,provider_message_id TEXT,last_error TEXT);
         CREATE TABLE after_order_email_attempts(id INTEGER PRIMARY KEY,message_id INTEGER,attempt_number INTEGER,status TEXT,created_at TEXT,updated_at TEXT,provider_message_id TEXT,error TEXT);
@@ -22,10 +22,10 @@ class RefundEmailTests(unittest.TestCase):
         self.client=Mock();self.client.read.side_effect=self.read
         self.service=RefundEmails(db=self.db,get_store=lambda id:SimpleNamespace(website_id=None),client_factory=lambda store:self.client,test_mode=lambda:False,suppressed=lambda *a:False)
         self.service.refunds=Mock();self.service.init_db()
-        self.conn.execute("INSERT INTO airwallex_refund_payouts VALUES('r1',1,20,'NC20','PAID','12.34','EUR','transfer1',?)",(json.dumps({'account':'Account ending 1234','holder':'Customer'}),))
+        self.conn.execute("INSERT INTO airwallex_refund_payouts VALUES('r1',1,20,'NC20','PAID','12.34','EUR','transfer1',?,'2026-09-20T12:00:00+00:00')",(json.dumps({'account':'Account ending 1234','holder':'Customer'}),))
         self.provider=Mock();self.provider.send.return_value={'id':'email1'}
     def read(self,model,ids,fields):
-        return {'sale.order':[{'name':'NC20','website_id':[self.site_id,'Actual site'],'partner_id':[7,'Customer'],'state':'cancel'}],
+        return {'sale.order':[{'name':'NC20','website_id':[self.site_id,'Actual site'],'partner_id':[7,'Customer'],'state':'cancel','date_order':'2026-09-18 12:35:04'}],
                 'website':[{'name':'Actual site','domain':'https://actual.example.com'}],
                 'res.partner':[{'email':'customer@example.com'}]}[model]
     @contextmanager
@@ -101,8 +101,15 @@ class RefundEmailTests(unittest.TestCase):
             self.service.process(stale)
         self.provider.send.assert_not_called()
 
-    def test_rollout_cutoff_holds_unknown_or_old_order_date(self):
+    def test_rollout_cutoff_uses_refund_date_not_order_date(self):
         self.service.cutoff_date=lambda:'2026-09-20'
+        self.enqueue();self.cycle()
+        self.assertEqual(self.provider.send.call_count,1)
+        self.assertEqual(self.job()['state'],'sent')
+
+    def test_refund_before_rollout_is_held(self):
+        self.service.cutoff_date=lambda:'2026-09-20'
+        self.conn.execute("UPDATE airwallex_refund_payouts SET created_at='2026-09-18T12:00:00+00:00'")
         self.enqueue();self.cycle()
         self.provider.send.assert_not_called()
         self.assertEqual(self.job()['state'],'held')

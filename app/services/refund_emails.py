@@ -5,6 +5,7 @@ import os
 import re
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from app.services.after_order import create_email_provider, EmailRejected
 from app.services.after_order_email import render_after_order_email
@@ -55,8 +56,14 @@ class RefundEmails:
         orders = client.read('sale.order', [int(row['order_id'])], ['name','website_id','partner_id','date_order'])
         order = orders[0] if len(orders) == 1 else {}
         cutoff = self.cutoff_date()
-        if cutoff and str(order.get('date_order') or '')[:10] < cutoff:
-            raise ValueError('Order is outside the notification rollout date window.')
+        if cutoff:
+            created = str(row.get('created_at') or '')
+            try:
+                refund_date = datetime.fromisoformat(created.replace('Z', '+00:00')).astimezone(ZoneInfo('Asia/Kolkata')).date().isoformat()
+            except (ValueError, TypeError):
+                raise ValueError('Refund creation date could not be verified. Email is held for review.')
+            if refund_date < cutoff:
+                raise ValueError('Refund predates the notification rollout. Email is held for review.')
         website_id = (order.get('website_id') or [None])[0]
         if not website_id or order.get('name') != row['order_name']:
             raise ValueError('The order website could not be verified. Email is held for review.')
