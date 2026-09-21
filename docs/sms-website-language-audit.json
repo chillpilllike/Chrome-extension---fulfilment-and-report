@@ -807,7 +807,7 @@
           "name": "Finch Kart",
           "domain": "https://finchkart.com",
           "sender": "FinchKart",
-          "sms_enabled": true,
+          "sms_enabled": false,
           "languages": [
             "en_US"
           ]

@@ -27105,7 +27105,8 @@
     "text": "PrimeSupps: Porudžbina ##order##. Vaša pošiljka ima ažuriranje za praćenje. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763682163a157b00016d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27114,7 +27115,8 @@
     "text": "PrimeSupps: Order ##order##. Tack för din beställning! Vi kommer snart att börja behandla den. Visa din beställning: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763608ec6e75cc0ff711",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27123,7 +27125,8 @@
     "text": "PrimeSupps: Order ##order##. Hur var din upplevelse? Dela en ärlig recension: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17637d821d3da6403d6b2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27132,7 +27135,8 @@
     "text": "PrimeSupps: Order ##order##. Tack för att du meddelade oss att din beställning inte har kommit fram. Vårt team kommer att undersöka leveransen och kontakta dig inom kort. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17637798c7ee18206dab4",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27141,7 +27145,8 @@
     "text": "PrimeSupps: Order ##order##. Det finns en uppdatering av ditt förväntade leveransdatum. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17637a89b19b8fe04777a",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27150,7 +27155,8 @@
     "text": "PrimeSupps: Order ##order##. En vara i din beställning behöver ditt val. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17637fefb953ed803b21e",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27159,7 +27165,8 @@
     "text": "PrimeSupps: Order ##order##. En vara är otillgänglig och inga alternativ hittades. Vänligen välj hur du vill gå vidare. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176383e43a2e8780e1706",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27168,7 +27175,8 @@
     "text": "PrimeSupps: Order ##order##. Transportören har markerat ditt paket som levererat. Vänligen bekräfta mottagandet. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176382c8683fe490f9e5a",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27177,7 +27185,8 @@
     "text": "PrimeSupps: Order ##order##. Leveransen är försenad. Vårt team arbetar med det. Ingen åtgärd krävs. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176384b3dc9bd350610c4",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27186,7 +27195,8 @@
     "text": "PrimeSupps: Order ##order##. Vänligen granska betalningsuppgifterna för ditt valda alternativ. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17638ee25451e4c05e75c",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27195,7 +27205,8 @@
     "text": "PrimeSupps: Order ##order##. Din begäran om återbetalning granskas. Vänligen tillåt 24-48 timmar för svar. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17639086e0d0a06080f51",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:refund_completed": {
     "sender": "PrimeSupps",
@@ -27204,7 +27215,8 @@
     "text": "PrimeSupps: Order ##order##. Din återbetalning har behandlats. Din betalningsleverantör avgör när krediten syns. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176399ed1094e4f084b51",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sv:package_movement": {
     "sender": "PrimeSupps",
@@ -27213,7 +27225,8 @@
     "text": "PrimeSupps: Order ##order##. Ditt paket har en uppdatering i spårningen. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763a579a6595a309ceaa",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27222,7 +27235,8 @@
     "text": "PrimeSupps: Agizo ##order##. Asante kwa agizo lako! Tutaanza kulishughulikia hivi karibuni. Angalia agizo lako: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176395c6e195ff001c4a5",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27231,7 +27245,8 @@
     "text": "PrimeSupps: Agizo ##order##. Ulikuwa na uzoefu gani? Shiriki maoni yako ya kweli: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763a86a5110abb0562fc",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27240,7 +27255,8 @@
     "text": "PrimeSupps: Agizo ##order##. Asante kwa kutujulisha kuwa agizo lako halijafika. Timu yetu itachunguza utoaji na kuwasiliana nawe hivi karibuni. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763a12008ce6a909529e",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27249,7 +27265,8 @@
     "text": "PrimeSupps: Agizo ##order##. Kuna taarifa mpya kuhusu tarehe yako inayotarajiwa ya usafirishaji. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763a1067a4d20a027ef0",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27258,7 +27275,8 @@
     "text": "PrimeSupps: Agizo ##order##. Kipengee kimoja katika agizo lako kinahitaji uchaguzi wako. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763a0e45fd6b83017ffd",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27267,7 +27285,8 @@
     "text": "PrimeSupps: Agizo ##order##. Kipengee hakipatikani na hakuna mbadala zilizopatikana. Tafadhali chagua jinsi ya kuendelea. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763b3e61a8a0dd0d5d60",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27276,7 +27295,8 @@
     "text": "PrimeSupps: Agizo ##order##. Mtoaji huduma ameonyesha kifurushi chako kimeshafikishwa. Tafadhali thibitisha kupokea. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763baa00039b33053a3e",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27285,7 +27305,8 @@
     "text": "PrimeSupps: Agizo ##order##. Usafirishaji umechelewa. Timu yetu inafanya kazi juu yake. Huna haja ya kuchukua hatua. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763ba5792fa3610a7b7f",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27294,7 +27315,8 @@
     "text": "PrimeSupps: Agizo ##order##. Tafadhali hakiki maelezo ya malipo kwa chaguo lako ulilochagua. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763c6f9c9bd0a507ea3b",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27303,7 +27325,8 @@
     "text": "PrimeSupps: Agizo ##order##. Ombi lako la kurejeshewa fedha lipo katika ukaguzi. Tafadhali subiri saa 24-48 kwa jibu. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763c5d452ec6790388b5",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:refund_completed": {
     "sender": "PrimeSupps",
@@ -27312,7 +27335,8 @@
     "text": "PrimeSupps: Agizo ##order##. Rejesho lako la fedha limefanyiwa. Mtoa huduma wa malipo ndiye huamua lini mikopo itaonekana. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763cfcc974ee1f0265af",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:sw:package_movement": {
     "sender": "PrimeSupps",
@@ -27321,7 +27345,8 @@
     "text": "PrimeSupps: Agizo ##order##. Kifurushi chako kina taarifa mpya ya ufuatiliaji. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763c34c6cf92720609d6",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27330,7 +27355,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. ขอบคุณสำหรับคำสั่งซื้อของคุณ! เราจะเริ่มดำเนินการในเร็วๆ นี้ ดูคำสั่งซื้อของคุณได้ที่: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763dc513c342f802fc12",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27339,7 +27365,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. ประสบการณ์ของคุณเป็นอย่างไร? แชร์รีวิวอย่างตรงไปตรงมาที่: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763d7f9d38fbcd065ea8",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27348,7 +27375,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. ขอบคุณที่แจ้งให้เราทราบว่าสินค้ายังไม่มาถึง ทีมงานของเราจะตรวจสอบการจัดส่งและติดต่อคุณในเร็วๆ นี้ ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763d0b4efb462002df9f",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27357,7 +27385,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. มีการอัปเดตวันที่คาดว่าจะจัดส่งของคุณ ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763db6fc0047920c00d0",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27366,7 +27395,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. มีสินค้าชิ้นหนึ่งในคำสั่งซื้อของคุณที่ต้องการการเลือกของคุณ ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763e164bd5b9ef0cdfaa",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27375,7 +27405,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. สินค้าชิ้นหนึ่งไม่สามารถใช้ได้และไม่พบตัวเลือกอื่น กรุณาเลือกวิธีดำเนินการต่อ ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763e50dc4d58050296fe",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27384,7 +27415,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. ผู้จัดส่งระบุว่าพัสดุของคุณถูกจัดส่งแล้ว กรุณายืนยันการรับ ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763e5c6e195ff001c4a7",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27393,7 +27425,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. การจัดส่งล่าช้า ทีมงานของเรากำลังดำเนินการ ไม่มีความจำเป็นต้องดำเนินการใดๆ ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763e1722d8a769097be3",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27402,7 +27435,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. กรุณาตรวจสอบรายละเอียดการชำระเงินสำหรับตัวเลือกที่คุณเลือก ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763f492bdbce97089eaa",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27411,7 +27445,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. คำขอคืนเงินของคุณกำลังอยู่ระหว่างการตรวจสอบ กรุณารอ 24-48 ชั่วโมงสำหรับการตอบกลับ ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763fb0552302bf066ea9",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:refund_completed": {
     "sender": "PrimeSupps",
@@ -27420,7 +27455,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. การคืนเงินของคุณได้รับการดำเนินการแล้ว ผู้ให้บริการชำระเงินจะเป็นผู้กำหนดว่าเครดิตจะปรากฏเมื่อใด ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763fe9eafd1c2d000d52",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:th:package_movement": {
     "sender": "PrimeSupps",
@@ -27429,7 +27465,8 @@
     "text": "PrimeSupps: คำสั่งซื้อ ##order##. พัสดุของคุณมีการอัปเดตการติดตาม ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1763f617b897764068c5b",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27438,7 +27475,8 @@
     "text": "PrimeSupps: Order ##order##. Salamat sa iyong order! Sis simulan namin ang pagproseso nito sa lalong madaling panahon. Tingnan ang iyong order: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17640d679e6c80b06308e",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27447,7 +27485,8 @@
     "text": "PrimeSupps: Order ##order##. Kumusta ang iyong karanasan? Magbahagi ng tapat na pagsusuri: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176400f928a50870554f0",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27456,7 +27495,8 @@
     "text": "PrimeSupps: Order ##order##. Salamat sa pagpapaalam na hindi pa dumadating ang iyong order. Susuriin ng aming koponan ang paghahatid at makikipag-ugnayan sa iyo agad. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17640476b0e95e90aa8d2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27465,7 +27505,8 @@
     "text": "PrimeSupps: Order ##order##. May update sa iyong inaasahang petsa ng pagpapadala. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176404fd4a8bba20e9a72",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27474,7 +27515,8 @@
     "text": "PrimeSupps: Order ##order##. May item sa iyong order na nangangailangan ng iyong pagpili. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176411e478c101b0b2509",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27483,7 +27525,8 @@
     "text": "PrimeSupps: Order ##order##. May item na hindi available at walang alternatibo na natagpuan. Mangyaring piliin kung paano magpapatuloy. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176416021ea41280c77f1",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27492,7 +27535,8 @@
     "text": "PrimeSupps: Order ##order##. Inirekord ng carrier na naihatid na ang iyong parsela. Mangyaring kumpirmahin ang pagtanggap. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764134fb36e82c04f44c",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27501,7 +27545,8 @@
     "text": "PrimeSupps: Order ##order##. Naantala ang pagpapadala. Ang aming koponan ay nagtatrabaho dito. Walang kailangang aksyon. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764187cb4048e109661d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27510,7 +27555,8 @@
     "text": "PrimeSupps: Order ##order##. Mangyaring suriin ang mga detalye ng pagbabayad para sa iyong napiling alternatibo. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17642ebec24d42a0250f2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27519,7 +27565,8 @@
     "text": "PrimeSupps: Order ##order##. Kasalukuyang sinusuri ang iyong kahilingan para sa refund. Mangyaring maghintay ng 24-48 na oras para sa tugon. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17642429643ecbe0765b0",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:refund_completed": {
     "sender": "PrimeSupps",
@@ -27528,7 +27575,8 @@
     "text": "PrimeSupps: Order ##order##. Naiproseso na ang iyong refund. Ang iyong payment provider ang magtatakda kung kailan lilitaw ang credit. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176429338016b140f6742",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tl:package_movement": {
     "sender": "PrimeSupps",
@@ -27537,7 +27585,8 @@
     "text": "PrimeSupps: Order ##order##. May update sa tracking ng iyong parsela. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764261b5f1e7930fefff",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27546,7 +27595,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Siparişiniz için teşekkür ederiz! Yakında işlemeye başlayacağız. Siparişinizi görüntüleyin: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17643603a0b0b21048e99",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27555,7 +27605,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Deneyiminiz nasıldı? Dürüst bir değerlendirme paylaşın: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764309b640d0c10738ad",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27564,7 +27615,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Siparişinizin ulaşmadığını bildirdiğiniz için teşekkür ederiz. Ekibimiz teslimatı inceleyecek ve kısa süre içinde sizinle iletişime geçecektir. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17643a5792fa3610a7b81",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27573,7 +27625,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Beklenen gönderim tarihinizde bir güncelleme var. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17643b1bfed7e3604c6d7",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27582,7 +27635,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Siparişinizde bir ürün için seçiminiz gerekiyor. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176441eb9a38a990419d2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27591,7 +27645,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Bir ürün mevcut değil ve alternatif bulunamadı. Lütfen nasıl ilerlemek istediğinizi seçin. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17644fcc974ee1f0265b1",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27600,7 +27655,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Kargo paketinizi teslim edildi olarak işaretledi. Lütfen teslimatı onaylayın. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764409ba7ba3510f45ed",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27609,7 +27665,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Gönderim gecikiyor. Ekibimiz üzerinde çalışıyor. Herhangi bir işlem yapmanıza gerek yok. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17644d0d2fe9d47021316",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27618,7 +27675,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Seçtiğiniz alternatif için ödeme detaylarını lütfen inceleyin. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176457f24f9f400083791",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27627,7 +27685,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Geri ödeme talebiniz inceleniyor. Yanıt için lütfen 24-48 saat bekleyin. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17645687a84d693021e98",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:refund_completed": {
     "sender": "PrimeSupps",
@@ -27636,7 +27695,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Geri ödemeniz işlendi. Kredi ne zaman görüneceğini ödeme sağlayıcınız belirler. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176458a428220960a79ce",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:tr:package_movement": {
     "sender": "PrimeSupps",
@@ -27645,7 +27705,8 @@
     "text": "PrimeSupps: Sipariş ##order##. Paketinizin takip güncellemesi var. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17645ec7f54afc505b3c5",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27654,7 +27715,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Дякуємо за ваше замовлення! Ми незабаром почнемо його обробку. Переглянути замовлення: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17646b988ee2fb60e688b",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27663,7 +27725,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Як пройшов ваш досвід? Поділіться чесним відгуком: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17646a7c1f9ad3208d7dd",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27672,7 +27735,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Дякуємо, що повідомили, що ваше замовлення не надійшло. Наша команда розслідує доставку і незабаром зв'яжеться з вами. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17646b0552302bf066eab",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27681,7 +27745,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Є оновлення щодо очікуваної дати відправлення. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176472bb1924f320e5b03",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27690,7 +27755,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Один із товарів у вашому замовленні потребує вашого вибору. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17647b2425e1427038fb2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27699,7 +27765,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Товар недоступний, і альтернатив не знайдено. Будь ласка, виберіть, як діяти далі. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764761de58f3a806f82c",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27708,7 +27775,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Перевізник позначив вашу посилку як доставлену. Будь ласка, підтвердіть отримання. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764743cd4227670b635c",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27717,7 +27785,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Відправка затримується. Наша команда працює над цим. Дія не потрібна. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17647fabd49a45e0974fe",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27726,7 +27795,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Будь ласка, перегляньте деталі оплати за обрану альтернативу. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17648fe4bc4cf680c0b6e",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27735,7 +27805,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Ваш запит на відшкодування перебуває на розгляді. Будь ласка, зачекайте 24-48 годин для відповіді. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17648eb33732e5f0ddb3d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:refund_completed": {
     "sender": "PrimeSupps",
@@ -27744,7 +27815,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Ваше відшкодування оброблено. Коли кредит з'явиться, визначає ваш платіжний провайдер. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176483db1b16423065d30",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:uk:package_movement": {
     "sender": "PrimeSupps",
@@ -27753,7 +27825,8 @@
     "text": "PrimeSupps: Замовлення ##order##. Ваш пакет має оновлення відстеження. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764828687713b105f8e0",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27762,7 +27835,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Cảm ơn bạn đã đặt hàng! Chúng tôi sẽ bắt đầu xử lý đơn hàng của bạn sớm. Xem đơn hàng của bạn: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176499f46ed4de304cf06",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27771,7 +27845,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Trải nghiệm của bạn thế nào? Hãy chia sẻ đánh giá chân thật: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176496f066a9a3b0b3b4a",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27780,7 +27855,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Cảm ơn bạn đã thông báo đơn hàng chưa đến. Đội ngũ của chúng tôi sẽ điều tra việc giao hàng và liên hệ với bạn trong thời gian sớm nhất. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176492be8053ebe05b86b",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27789,7 +27865,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Có cập nhật về ngày dự kiến gửi hàng của bạn. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17649de746ce5dc0d7e74",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27798,7 +27875,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Một mặt hàng trong đơn hàng của bạn cần bạn lựa chọn. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764a5ff004dc8501d00d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27807,7 +27885,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Một mặt hàng không có sẵn và không tìm thấy lựa chọn thay thế. Vui lòng chọn cách xử lý tiếp theo. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764a884851f8d20c17cc",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27816,7 +27895,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Đơn vị vận chuyển đã đánh dấu bưu kiện của bạn là đã giao. Vui lòng xác nhận đã nhận hàng. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764a9116f276ad05efa3",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27825,7 +27905,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Việc giao hàng bị trì hoãn. Đội ngũ của chúng tôi đang xử lý. Không cần hành động gì thêm. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764acdb677741f079ce4",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27834,7 +27915,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Vui lòng kiểm tra lại chi tiết thanh toán cho lựa chọn thay thế bạn đã chọn. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764bb448d1996709b19a",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27843,7 +27925,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Yêu cầu hoàn tiền của bạn đang được xem xét. Vui lòng chờ 24-48 giờ để nhận phản hồi. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764b41080e6f4003e76f",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:refund_completed": {
     "sender": "PrimeSupps",
@@ -27852,7 +27935,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Yêu cầu hoàn tiền của bạn đã được xử lý. Nhà cung cấp thanh toán của bạn sẽ quyết định khi nào khoản tiền được ghi có. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764b09b640d0c10738af",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:vi:package_movement": {
     "sender": "PrimeSupps",
@@ -27861,7 +27945,8 @@
     "text": "PrimeSupps: Đơn hàng ##order##. Bưu kiện của bạn có cập nhật theo dõi. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764b7fdf25def905788e",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27870,7 +27955,8 @@
     "text": "PrimeSupps：订单##order##。感谢您的订单！我们将尽快开始处理。查看您的订单：##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764c9a95117e2c0034b8",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27879,7 +27965,8 @@
     "text": "PrimeSupps：订单##order##。您的体验如何？请分享真实评价：##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764cd3c444ab5706e5ae",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27888,7 +27975,8 @@
     "text": "PrimeSupps：订单##order##。感谢您告知我们订单尚未送达。我们的团队将调查送货情况并尽快联系您。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764cbaa1299f800e9d2d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -27897,7 +27985,8 @@
     "text": "PrimeSupps：订单##order##。您的预计发货日期有更新。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764dc3f6cf6be80db5f6",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:item_unavailable": {
     "sender": "PrimeSupps",
@@ -27906,7 +27995,8 @@
     "text": "PrimeSupps：订单##order##。您的订单中有商品需要您做出选择。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764d31d88484700b927a",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:no_alternatives": {
     "sender": "PrimeSupps",
@@ -27915,7 +28005,8 @@
     "text": "PrimeSupps：订单##order##。有商品缺货且未找到替代品。请您选择如何处理。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764d593c08e30e0cf035",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -27924,7 +28015,8 @@
     "text": "PrimeSupps：订单##order##。承运人标记您的包裹已送达。请确认收货。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764d87cb4048e109661f",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -27933,7 +28025,8 @@
     "text": "PrimeSupps：订单##order##。发货延迟。我们的团队正在处理。无需您采取行动。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764da3dc5afcbc05e5ba",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:alternative_payment": {
     "sender": "PrimeSupps",
@@ -27942,7 +28035,8 @@
     "text": "PrimeSupps：订单##order##。请查看您选择的替代品的付款详情。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764edfa0e1c1b40ffe7c",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:refund_request_received": {
     "sender": "PrimeSupps",
@@ -27951,7 +28045,8 @@
     "text": "PrimeSupps：订单##order##。您的退款请求正在审核中。请允许24-48小时内回复。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764e0ab4564e9300a8b0",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:refund_completed": {
     "sender": "PrimeSupps",
@@ -27960,7 +28055,8 @@
     "text": "PrimeSupps：订单##order##。您的退款已处理。信用何时到账由您的支付服务商决定。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764ea8cf62ff350b4c1e",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_CN:package_movement": {
     "sender": "PrimeSupps",
@@ -27969,7 +28065,8 @@
     "text": "PrimeSupps：订单##order##。您的包裹有追踪更新。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764e12bdc7c91f0ccabe",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -27978,7 +28075,8 @@
     "text": "PrimeSupps：訂單##order##。感謝您的訂購！我們將盡快開始處理。查看您的訂單：##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764f1d3d0836a50758dd",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -27987,7 +28085,8 @@
     "text": "PrimeSupps：訂單##order##。您的體驗如何？請分享真實評價：##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764fe95aa7bf330895af",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -27996,7 +28095,8 @@
     "text": "PrimeSupps：訂單##order##。感謝您告知我們您的訂單尚未送達。我們的團隊將調查送貨情況並盡快與您聯繫。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764fdd1fb04c600fad26",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -28005,7 +28105,8 @@
     "text": "PrimeSupps：訂單##order##。您的預計發貨日期有更新。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1764f8c45e3f05203aed9",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:item_unavailable": {
     "sender": "PrimeSupps",
@@ -28014,7 +28115,8 @@
     "text": "PrimeSupps：訂單##order##。您的訂單中有商品需要您做出選擇。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17650852865266c0a69f6",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:no_alternatives": {
     "sender": "PrimeSupps",
@@ -28023,7 +28125,8 @@
     "text": "PrimeSupps：訂單##order##。有商品缺貨且未找到替代品。請選擇如何處理。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176506021ea41280c77f3",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -28032,7 +28135,8 @@
     "text": "PrimeSupps：訂單##order##。承運商標記您的包裹已送達。請確認收貨。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17650830a53fd670b2ca2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -28041,7 +28145,8 @@
     "text": "PrimeSupps：訂單##order##。發貨延遲中。我們的團隊正在處理，無需您採取行動。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176517d5369a4a703941f",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:alternative_payment": {
     "sender": "PrimeSupps",
@@ -28050,7 +28155,8 @@
     "text": "PrimeSupps：訂單##order##。請查看您所選替代品的付款詳情。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176511931ec5c8501c43b",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:refund_request_received": {
     "sender": "PrimeSupps",
@@ -28059,7 +28165,8 @@
     "text": "PrimeSupps：訂單##order##。您的退款申請正在審核中。請允許24-48小時回覆。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765185ccd069870c9bda",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:refund_completed": {
     "sender": "PrimeSupps",
@@ -28068,7 +28175,8 @@
     "text": "PrimeSupps：訂單##order##。您的退款已處理。何時顯示退款金額由您的付款服務商決定。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765176d1e36b0b093915",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_HK:package_movement": {
     "sender": "PrimeSupps",
@@ -28077,7 +28185,8 @@
     "text": "PrimeSupps：訂單##order##。您的包裹有追蹤更新。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765290460068fc00620b",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -28086,7 +28195,8 @@
     "text": "PrimeSupps：訂單##order##。感謝您的訂購！我們將很快開始處理。查看您的訂單：##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176526c451fb7490bd9d4",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -28095,7 +28205,8 @@
     "text": "PrimeSupps：訂單##order##。您的體驗如何？請分享真實評價：##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17652a5707ff5940e1cb2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -28104,7 +28215,8 @@
     "text": "PrimeSupps：訂單##order##。感謝您告知訂單尚未送達。我們的團隊將調查配送情況並盡快與您聯繫。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17652fd897229f906d110",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -28113,7 +28225,8 @@
     "text": "PrimeSupps：訂單##order##。您的預計發貨日期有更新。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17653a23efa25800e5469",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:item_unavailable": {
     "sender": "PrimeSupps",
@@ -28122,7 +28235,8 @@
     "text": "PrimeSupps：訂單##order##。您的訂單中有商品需要您做出選擇。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765387dbca2d7c0d3204",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:no_alternatives": {
     "sender": "PrimeSupps",
@@ -28131,7 +28245,8 @@
     "text": "PrimeSupps：訂單##order##。有商品缺貨且未找到替代品。請選擇如何處理。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176539287e07bb10ed05d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -28140,7 +28255,8 @@
     "text": "PrimeSupps：訂單##order##。承運商標記您的包裹已送達。請確認收貨。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17653b125aad4180fa814",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -28149,7 +28265,8 @@
     "text": "PrimeSupps：訂單##order##。發貨延遲。我們的團隊正在處理中。無需您採取行動。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17654742685b4cf075745",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:alternative_payment": {
     "sender": "PrimeSupps",
@@ -28158,7 +28275,8 @@
     "text": "PrimeSupps：訂單##order##。請查看您選擇的替代品付款詳情。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17654feb633136e006272",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:refund_request_received": {
     "sender": "PrimeSupps",
@@ -28167,7 +28285,8 @@
     "text": "PrimeSupps：訂單##order##。您的退款申請正在審核中。請允許24-48小時回覆。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765423741058f107ffc9",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:refund_completed": {
     "sender": "PrimeSupps",
@@ -28176,7 +28295,8 @@
     "text": "PrimeSupps：訂單##order##。您的退款已處理。何時入帳由您的付款提供商決定。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176547f24f9f400083793",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zh_TW:package_movement": {
     "sender": "PrimeSupps",
@@ -28185,7 +28305,8 @@
     "text": "PrimeSupps：訂單##order##。您的包裹有追蹤更新。##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765582163a157b00016f",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:new_order_welcome": {
     "sender": "PrimeSupps",
@@ -28194,7 +28315,8 @@
     "text": "PrimeSupps: I-oda ##order##. Siyabonga nge-oda lakho! Sizoqala ukulucubungula maduzane. Buka i-oda lakho: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176554537c319fd0d1981",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:trustpilot_review": {
     "sender": "PrimeSupps",
@@ -28203,7 +28325,8 @@
     "text": "PrimeSupps: I-oda ##order##. Uhambo lwakho belunjani? Yabelana ngombono wakho oqotho: ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176552be8053ebe05b86d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:delivery_issue_received": {
     "sender": "PrimeSupps",
@@ -28212,7 +28335,8 @@
     "text": "PrimeSupps: I-oda ##order##. Siyabonga ngokusazisa ukuthi i-oda lakho alikafiki. Ithimba lethu lizophenya ngokulethwa futhi likuthinte maduze. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17655429643ecbe0765b2",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:expected_dispatch": {
     "sender": "PrimeSupps",
@@ -28221,7 +28345,8 @@
     "text": "PrimeSupps: I-oda ##order##. Kunokubuyekezwa kosuku olulindelekile lokuthunyelwa kwakho. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765623bfc1b375056c98",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:item_unavailable": {
     "sender": "PrimeSupps",
@@ -28230,7 +28355,8 @@
     "text": "PrimeSupps: I-oda ##order##. Into ethile ku-oda lakho idinga ukukhethwa kwakho. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17656603a0b0b21048e9b",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:no_alternatives": {
     "sender": "PrimeSupps",
@@ -28239,7 +28365,8 @@
     "text": "PrimeSupps: I-oda ##order##. Into ayitholakali futhi azitholakali ezinye izindlela. Sicela ukhethe ukuthi uqhubeke kanjani. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17656ae7de93039001b9d",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:delivery_confirmation": {
     "sender": "PrimeSupps",
@@ -28248,7 +28375,8 @@
     "text": "PrimeSupps: I-oda ##order##. Umthumeli ubonise ukuthi iphakheji yakho ilethwe. Sicela uqinisekise ukutholwa kwayo. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17656585bac489400632f",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:warehouse_dispatch_delay": {
     "sender": "PrimeSupps",
@@ -28257,7 +28385,8 @@
     "text": "PrimeSupps: I-oda ##order##. Ukuthunyelwa kubambezeleka. Ithimba lethu lisebenza kulokhu. Awudingi ukwenza lutho. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17657b640ba26550a33c1",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:alternative_payment": {
     "sender": "PrimeSupps",
@@ -28266,7 +28395,8 @@
     "text": "PrimeSupps: I-oda ##order##. Sicela ubuke imininingwane yokukhokha ye-alternative oyikhethile. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176570a3b47e08f082f73",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:refund_request_received": {
     "sender": "PrimeSupps",
@@ -28275,7 +28405,8 @@
     "text": "PrimeSupps: I-oda ##order##. Isicelo sakho sokubuyiselwa kwemali sisahlolisiswa. Sicela unikeze amahora angama-24-48 ukuze uphendule. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab1765731320916370ed608",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:refund_completed": {
     "sender": "PrimeSupps",
@@ -28284,7 +28415,8 @@
     "text": "PrimeSupps: I-oda ##order##. Imali yakho ebuyisiwe isicubunguliwe. Umhlinzeki wakho wokukhokha unquma ukuthi isikweletu sizovela nini. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab176573fdadda0ed0c981a",
-    "provider_archive_status": "pending"
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
   },
   "PrimeSupps:zu:package_movement": {
     "sender": "PrimeSupps",
@@ -28293,6 +28425,103 @@
     "text": "PrimeSupps: I-oda ##order##. Iphakheji yakho inokubuyekezwa kokulandela. ##url## - PrimeSupps",
     "sms_type": "UNICODE",
     "template_id": "6ab17658f8a5fb11ac04c961",
+    "provider_archive_status": "archived",
+    "verification": "MSG91 archive confirmation and active total 4392 -> 4259 on 2026-09-22"
+  },
+  "FinchKart:en_US:warehouse_dispatch_delay": {
+    "template_id": "6aae7664292cb823dc0bdd23",
+    "text": "FinchKart: Order ##order##. Dispatch delayed. We expect dispatch in 24-48 hours. No action needed. ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "warehouse_dispatch_delay",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:item_unavailable": {
+    "template_id": "6aae766441203249210be854",
+    "text": "FinchKart: Order ##order##. An item is unavailable. Review alternatives or other options within 3 days: ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "item_unavailable",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:expected_dispatch": {
+    "template_id": "6aae76644e39a2d657096533",
+    "text": "FinchKart: Order ##order##. Expected dispatch update. Review your options: ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "expected_dispatch",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:no_alternatives": {
+    "template_id": "6aae766577bc3ce68e027834",
+    "text": "FinchKart: Order ##order##. An item is unavailable; no alternatives found. Review your options within 3 days: ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "no_alternatives",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:package_movement": {
+    "template_id": "6aae76662a25f980440c43a4",
+    "text": "FinchKart: Order ##order##. Your parcel is on its way. View tracking: ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "package_movement",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:delivery_confirmation": {
+    "template_id": "6aae7666534ef030100a27f3",
+    "text": "FinchKart: Order ##order##. The carrier marked your parcel delivered. Please confirm receipt: ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "delivery_confirmation",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:alternative_payment": {
+    "template_id": "6aae76679df0da4ca00ea102",
+    "text": "FinchKart: Order ##order##. Your alternative needs an additional payment. Review the amount: ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "alternative_payment",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:refund_request_received": {
+    "template_id": "6aae766726328dd740094cf2",
+    "text": "FinchKart: Order ##order##. Refund request received. Please allow 24-48 hours for team review. ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "refund_request_received",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:refund_completed": {
+    "template_id": "6aae7667892795eb05085d42",
+    "text": "FinchKart: Order ##order##. Your refund is processed. Crediting time depends on your payment provider. ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "refund_completed",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:trustpilot_review": {
+    "template_id": "6aaeefdb9a7374aae3059e12",
+    "text": "FinchKart: Order ##order##. How was your experience? Share an honest review: ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "trustpilot_review",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:delivery_issue_received": {
+    "template_id": "6aaeefddf2f893f081060db2",
+    "text": "FinchKart: Order ##order##. Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly. ##url## - FinchKart Support",
+    "sender": "FinchKart",
+    "language": "en_US",
+    "kind": "delivery_issue_received",
+    "provider_archive_status": "pending"
+  },
+  "FinchKart:en_US:new_order_welcome": {
+    "template_id": "6ab11da8b8b037ebca059b63",
+    "sender": "FinchKart",
+    "text": "FinchKart: Order ##order## confirmed. Thank you! Processing starts soon. View order: ##url## - FinchKart Support",
+    "language": "en_US",
+    "kind": "new_order_welcome",
     "provider_archive_status": "pending"
   }
 }
