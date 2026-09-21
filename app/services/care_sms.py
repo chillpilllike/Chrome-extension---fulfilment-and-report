@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone, timedelta
 
 import requests
+import phonenumbers as pn
 from fastapi import APIRouter, HTTPException, Request
 from app.services.alternative_workflow import Runtime
 
@@ -75,6 +76,23 @@ def number(value):
 
 def recipient(value, test):
     return TEST_NUMBER if test else number(value)
+
+
+def customer_number(value, country_code=None):
+    """Normalize only with the phone owner's verified Odoo country, never the store domain."""
+    raw = str(value or '').strip()
+    region = str(country_code or '').upper()
+    if not raw or not re.fullmatch(r'[+\d\s().-]+', raw):
+        raise ValueError('Customer phone is missing or ambiguous. Correct it in Odoo.')
+    if not raw.startswith('+') and region not in pn.SUPPORTED_REGIONS:
+        raise ValueError('National customer phone requires a verified Odoo contact country.')
+    try:
+        parsed = pn.parse(raw, region if region in pn.SUPPORTED_REGIONS else None)
+    except pn.NumberParseException:
+        raise ValueError('Customer phone cannot be parsed. Correct it in Odoo.') from None
+    if parsed.extension or not pn.is_valid_number(parsed):
+        raise ValueError('Customer phone is invalid. Correct it in Odoo.')
+    return number(pn.format_number(parsed, pn.PhoneNumberFormat.E164))
 
 
 def validate_target(row, current_test):
@@ -298,13 +316,18 @@ class SMS:
         order = client.read('sale.order',[case['odoo_order_id']],['partner_id','state','website_id'])[0]
         if order['state'] not in {'sale','done'} or not order.get('website_id') or order['website_id'][0] != case.get('website_id'):
             raise ValueError('A current confirmed order on the matching website is required.')
-        fields = client.existing_fields('res.partner',['mobile','phone','phone_blacklisted'])
+        fields = client.existing_fields('res.partner',['mobile','phone','phone_blacklisted','country_id'])
         if 'phone_blacklisted' not in fields:
             raise ValueError('Odoo phone suppression support must be verified before customer SMS.')
         partner = client.read('res.partner',[order['partner_id'][0]],fields)[0]
         if partner.get('phone_blacklisted'):
             raise ValueError('Customer phone is blocked from SMS in Odoo.')
-        return number(partner.get('mobile') or partner.get('phone'))
+        country = partner.get('country_id')
+        code = None
+        if country:
+            countries = client.read('res.country',[country[0]],['code'])
+            code = countries[0].get('code') if countries else None
+        return customer_number(partner.get('mobile') or partner.get('phone'), code)
 
     def prepare(self, email_id):
         r = self.r; config = self.config()

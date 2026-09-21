@@ -6,10 +6,18 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, digest, number, order_link, recipient, validate_config, validate_target, preparation_reason
+from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, digest, number, customer_number, order_link, recipient, validate_config, validate_target, preparation_reason
 
 
 class SMSTests(unittest.TestCase):
+    def test_customer_phone_uses_contact_country_not_website(self):
+        self.assertEqual('+14165551234',customer_number('(416) 555-1234','CA'))
+        self.assertEqual('+442079460018',customer_number('020 7946 0018','GB'))
+        self.assertEqual('+442079460018',customer_number('+44 20 7946 0018','CA'))
+        self.assertEqual('+14165551234',customer_number('1 416 555 1234','CA'))
+        for value,region in [('4165551234',None),('123','CA'),('4165551234 ext 9','CA'),('', 'CA')]:
+            with self.subTest(value=value),self.assertRaises(ValueError):customer_number(value,region)
+
     def test_welcome_is_eligible(self):
         self.assertEqual('',preparation_reason({'template_kind':'new_order_welcome'}))
 
