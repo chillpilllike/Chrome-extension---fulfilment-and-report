@@ -134,6 +134,9 @@ def main():
         list(pool.map(register,rows))
     expected={':'.join(row[x] for x in ('sender','language','kind')) for row in rows}
     exported={key:json.loads(value) for key,value in db.execute("SELECT key,row_json FROM registrations WHERE status='created'") if key in expected}
+    # Registering one sender must not discard the other sender's active inventory.
+    saved=json.loads((ROOT/'docs/msg91-localized-templates.json').read_text())
+    exported={**{k:v for k,v in saved.items() if v.get('sender') not in args.senders},**exported}
     (ROOT/'docs/msg91-localized-templates.json').write_text(json.dumps(exported,ensure_ascii=False,indent=2)+'\n')
     mappings=[]
     for row in exported.values():

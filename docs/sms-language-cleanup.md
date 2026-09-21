@@ -8,7 +8,8 @@ configuration falls back to approved English. Email catalogs are unchanged.
 Production mapping cleanup retained 1,056 translated provider templates:
 480 for Nutricity (40 shared catalogs) and 576 for GofinchKart (48). With the two
 event aliases this is 1,232 database mappings. Removed 3,668 unused mappings.
-FinchKart website 1:74 is disabled; all 66 GofinchKart websites remain enabled.
+FinchKart website 1:74 is disabled and its English template references cleared
+(a recoverable mapping backup is saved); all 66 GofinchKart websites remain enabled.
 SMS history and other brands' English mappings are preserved.
 
 Provider cleanup is **partial**: 133 PrimeSupps translations were recoverably
