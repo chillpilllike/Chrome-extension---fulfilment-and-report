@@ -1,6 +1,6 @@
 # SMS log and delivery reports
 
-The Email log page includes an expandable SMS log, showing messages created or
+The separate SMS log page (`/sms-log`) shows messages created or
 updated within 30 days. Older records are retained, not deleted. Each new send
 attempt has its own provider reference and result. Legacy records keep their
 existing aggregate attempt count; missing historical timestamps are not invented.

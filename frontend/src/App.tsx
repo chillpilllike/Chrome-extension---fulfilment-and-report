@@ -49,6 +49,7 @@ import { LineAlternativeButton, OrderCareTimeline } from "@/components/LineAlter
 import { AirwallexRefunds } from "@/components/AirwallexRefunds"
 import { RelayPayments } from "@/components/RelayPayments"
 import { EmailLogWorkspace } from "@/components/EmailLogWorkspace"
+import { SmsLogWorkspace } from "@/components/SmsLogWorkspace"
 import { TeamWorkspaceHeader, TeamQueues, TeamTools } from "@/components/TeamWorkspace"
 import "@/components/after-care-workspace.css"
 import "@/components/inventory-workspace.css"
@@ -78,6 +79,7 @@ const KNOWN_APP_PAGES = new Set([
   "orders",
   "after-order-care",
   "email-log",
+  "sms-log",
   "support",
   "pull-jobs",
   "chrome-queue",
@@ -1588,6 +1590,7 @@ const defaultUiCopy: UiCopy = {
   "after-order-care": { title: "After-order care", description: "Review customer decisions, shipment exceptions, and approved follow-up actions." },
   "support": { title: "Customer support", description: "Secretgreen order context and customer-safe replies." },
   "email-log": { title: "Email log", description: "Review sent emails, failures and safe retries across your websites." },
+  "sms-log": { title: "SMS log", description: "Review SMS delivery, failures, retries and resends across your websites." },
   "pull-jobs": { title: "Pull Jobs", description: "Monitor background Odoo order imports." },
   "chrome-queue": { title: "Chrome Queue", description: "Review Chrome extension jobs and release stale locks." },
   tracking: { title: "Amazon Tracking", description: "Review package tracking captured from Amazon." },
@@ -5274,6 +5277,7 @@ function App() {
         ["orders", "Orders", ShoppingCart],
         ["after-order-care", "After-order care", Bell],
         ["email-log", "Email log", Bell],
+        ["sms-log", "SMS log", Bell],
         ["support", "Customer support", Bell],
         ["pull-jobs", "Pull Jobs", RefreshCw],
         ["chrome-queue", "Chrome Queue", Lock],
@@ -6446,6 +6450,7 @@ function App() {
         )}
         {page === "support" && <SupportWorkspace api={api} />}
         {page === "email-log" && <EmailLogWorkspace storeId={storeId} api={api} onResult={setModal} onNavigate={(target, order) => { setAfterOrderInitialQuery(order || ""); setPage(target) }} />}
+        {page === "sms-log" && <SmsLogWorkspace storeId={storeId} api={api} />}
         {page === "tracking" && (
           <TrackingPage
             storeId={storeId}

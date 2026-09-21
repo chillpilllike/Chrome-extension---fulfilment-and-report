@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react"
-import { SmsPreview, SmsLog } from './SmsSettings'
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
@@ -111,7 +110,6 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
     </header>
     <section className="epost-notice"><strong>Sending safeguards</strong><p>New-order welcome emails send automatically in live mode. Newly prepared test emails send without approval only to sonianuj1284@gmail.com. Successful new app refunds send a website-branded confirmation automatically in live mode. Refund confirmations have their own duplicate-protected delivery worker. Other live emails and failed-send retries require individual team approval.</p></section>
     {rules && <section className="epost-notice"><strong>Provider acceptance is not inbox delivery</strong><p>Sent means the provider returned a message ID. Read receipts and inbox delivery are not inferred. Retry is available only for confirmed failures with a saved payload and current order context, up to five attempts. Uncertain sends, sent messages and legacy records cannot be blindly retried.</p><p>In test mode, only stored test messages to the configured test address can be retried. No bulk retry runs from this page.</p></section>}
-    <details className="epost-notice"><summary className="cursor-pointer font-semibold">SMS log — last 30 days · preview, retry and resend</summary><SmsLog api={api} storeId={storeId}/></details>
     <div className="epost-layout">
       <aside className="epost-queues" aria-label="Email work queues"><div className="epost-queue-title">Work queues <span>Filtered totals</span></div>
         {queues.map(([key, label]) => <button key={key} className={`epost-queue ${queue === key ? "is-active" : ""}`} aria-pressed={queue === key} onClick={() => change(setQueue, key)}><span>{label}</span><strong>{data ? (data.summary[key] || 0).toLocaleString() : "—"}</strong></button>)}
@@ -145,7 +143,6 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
       {detail && <><Status row={detail.row} /><dl><dt>Order / store</dt><dd>{detail.row.odoo_order_name} · {detail.row.website_name || detail.row.store_name} ({detail.row.sender_domain || "Website not recorded"})</dd><dt>Recipient</dt><dd>{detail.row.recipient}</dd><dt>Sender</dt><dd>{detail.row.sender}</dd><dt>Provider message ID</dt><dd>{detail.row.provider_message_id || "No acceptance ID recorded"}</dd><dt>Mode</dt><dd>{detail.row.test_mode ? "Test" : "Live"}</dd></dl>
         <section><h3>Send attempts</h3>{!detail.attempts.length && <p>Detailed attempt history is unavailable for this older record. Its saved status is shown above.</p>}<ol className="email-attempts">{detail.attempts.map(attempt => <li key={attempt.attempt_number}><strong>Attempt {attempt.attempt_number} · {attempt.status.replaceAll("_", " ")}</strong><small>{formatDate(attempt.created_at)} → {formatDate(attempt.updated_at)}</small>{attempt.error && <p className="email-log-error">{attempt.error}</p>}</li>)}</ol>
           {detail.row.can_approve ? <Button disabled={retryId !== null} onClick={() => { setDetailId(null); setRetryTarget(detail.row) }}>Approve sending this email</Button> : <p>{detail.row.retry_block_reason}</p>}</section>
-        <SmsPreview key={detail.row.id} api={api} emailId={detail.row.id} />
         {detail.row.template_kind?.startsWith('relay_') && detail.row.last_error?.includes('HTTP 403;') && ['failed','delivery_unknown'].includes(detail.row.status) && <Button disabled={retryId!==null} onClick={async()=>{
           setRetryId(detail.row.id)
           try {

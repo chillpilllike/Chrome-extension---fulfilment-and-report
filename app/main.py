@@ -659,6 +659,7 @@ FRONTEND_SHELL_PATHS = {
     "/orders",
     "/after-order-care",
     "/email-log",
+    "/sms-log",
     "/support",
     "/pull-jobs",
     "/tracking",
