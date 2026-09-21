@@ -39917,7 +39917,7 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bo
     context = dict(case.get("context") or {})
     try:
         odoo = OdooClient(get_store(int(case["store_id"])))
-        fields = odoo.existing_fields("sale.order", ["partner_id", "partner_invoice_id", "website_id", "state"])
+        fields = odoo.existing_fields("sale.order", ["partner_id", "partner_invoice_id", "website_id", "state", "lang"])
         orders = odoo.read("sale.order", [int(case["odoo_order_id"])], fields)
         order = orders[0] if orders else {}
         if strict and (not order or (order.get("state") == "cancel" and not allow_cancelled) or not many2one_id(order.get("website_id"))):
@@ -39926,11 +39926,14 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bo
         partner_id = many2one_id(order.get("partner_id")) or many2one_id(order.get("partner_invoice_id"))
         if strict and not partner_id:
             raise ValueError("Odoo did not supply the current order customer.")
-        if partner_id and (strict or not customer_email):
-            partners = odoo.read("res.partner", [partner_id], odoo.existing_fields("res.partner", ["email"]))
+        partner = {}
+        website = {}
+        if partner_id:
+            partners = odoo.read("res.partner", [partner_id], odoo.existing_fields("res.partner", ["email", "lang"]))
+            partner = partners[0] if partners else {}
             customer_email = clean_text((partners[0] if partners else {}).get("email"))
         if website_id:
-            websites = odoo.read("website", [int(website_id)], odoo.existing_fields("website", ["domain", "name"]))
+            websites = odoo.read("website", [int(website_id)], odoo.existing_fields("website", ["domain", "name", "default_lang_id"]))
             website = websites[0] if websites else {}
             raw_domain = clean_text(website.get("domain"))
             website_name = clean_text(website.get("name"))
@@ -39945,6 +39948,12 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bo
                     context["website_logo_url"] = f"{website_origin}/web/image/website/{int(website_id)}/logo?v={int(time.time())}"
             elif strict:
                 raise ValueError("The order website has no domain configured.")
+        from app.services.notification_i18n import resolve_language
+        default_language = None
+        if not order.get('lang') and not partner.get('lang') and website.get('default_lang_id'):
+            language_rows = odoo.read('res.lang', [many2one_id(website['default_lang_id'])], ['code'])
+            default_language = language_rows[0].get('code') if language_rows else None
+        context.update(resolve_language(order.get('lang'), partner.get('lang'), default_language))
         if strict and (not customer_email or not sender_domain):
             raise ValueError("Current customer email and website domain are required.")
     except Exception as exc:
@@ -39957,7 +39966,7 @@ def hydrate_after_order_recipient_and_domain(case: dict[str, Any], *, strict: bo
         with db() as conn:
             current = conn.execute("SELECT context_json FROM after_order_cases WHERE id=? FOR UPDATE", (case["id"],)).fetchone()
             merged_context = json.loads(current["context_json"] or "{}") if current else {}
-            for key in ("website_name", "website_logo_url"):
+            for key in ("website_name", "website_logo_url", "requested_language", "language_source"):
                 if key in context:
                     merged_context[key] = context[key]
             conn.execute(
@@ -40001,14 +40010,21 @@ def after_order_email_content(
                 (case['store_id'],case['odoo_order_id'])).fetchall())
         product_ids = list({int(row['product_id']) for row in lines if row.get('product_id')})
         odoo = OdooClient(get_store(case['store_id']))
-        products = odoo.read('product.product',product_ids,['website_url']) if product_ids else []
+        from app.services.notification_i18n import for_case
+        products = odoo.execute('product.product','read',[product_ids],{'fields':['website_url','display_name'],
+            'context':{'lang':for_case(case).language}}) if product_ids else []
         paths = {int(p['id']):clean_text(p.get('website_url')) for p in products}
+        names = {int(p['id']):clean_text(p.get('display_name')) for p in products}
         by_line = {int(row['id']):paths.get(int(row.get('product_id') or 0),'') for row in lines}
+        names_by_line = {int(row['id']):names.get(int(row.get('product_id') or 0),'') for row in lines}
         items = []
         for source in case.get('affected_items') or []:
             item = dict(source)
             path = by_line.get(int(item.get('line_id') or 0),'')
             item['odoo_product_url'] = 'https://' + case['sender_domain'] + path if path.startswith('/shop/') else ''
+            translated_name = names_by_line.get(int(item.get('line_id') or 0),'')
+            if translated_name:
+                item['product_name'] = translated_name
             items.append(item)
         case = {**case,'affected_items':items}
     except Exception:
@@ -40351,6 +40367,12 @@ def send_after_order_email(
                 "html": html_body,
                 "text": text_body,
             }
+        from app.services.notification_i18n import for_case
+        message_payload['_care_language'] = for_case(email_case).metadata()
+        if showcase_kind == 'alternative_payment':
+            message_payload['_care_language'] = preview.get('language') or {
+                'requested_language':(case.get('context') or {}).get('requested_language','en_US'),
+                'sent_language':'en_US','fallback_reason':'Odoo addon has not supplied localized payment-preview metadata.'}
         if unsubscribe_url:
             message_payload["headers"] = {
                 "List-Unsubscribe": f"<{unsubscribe_url}>",
@@ -40457,6 +40479,11 @@ def email_log_row(row: Any) -> dict[str, Any]:
         item['retry_block_reason'] = 'Refund confirmations are managed by the refund email worker. Ask the administrator to review a failed or uncertain delivery.'
     context = json.loads(item.pop('context_json', '{}') or '{}')
     item['website_name'] = context.get('website_name') or item.get('sender_domain') or 'Website not recorded'
+    saved_message = json.loads(item.get('payload_json') or '{}')
+    item['language'] = saved_message.get('_care_language') or {
+        'requested_language': (saved_message.get('headers') or {}).get('X-Requested-Language', ''),
+        'sent_language': (saved_message.get('headers') or {}).get('X-Notification-Language', ''),
+        'fallback_reason': ''}
     item["approval_digest"] = hashlib.sha256(str(item.get("payload_json") or "").encode()).hexdigest()
     if item.get("status") == "awaiting_approval":
         item["status_label"] = "Awaiting team approval"
@@ -40464,6 +40491,12 @@ def email_log_row(row: Any) -> dict[str, Any]:
     for field in ("payload_json", "request_fingerprint", "idempotency_key"):
         item.pop(field, None)
     return item
+
+
+@app.get("/api/after-order/languages")
+def api_after_order_languages():
+    from app.services.notification_i18n import language_inventory
+    return {'fallback':'en_US','languages':language_inventory()}
 
 
 @app.get("/api/after-order/emails")
@@ -40651,6 +40684,9 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             raise HTTPException(409, reason)
         attempt = int(locked.get("attempt_count") or 0) + 1
         saved_payload = json.loads(locked['payload_json'])
+        language_snapshot = saved_payload.get('_care_language')
+        if language_snapshot and language_snapshot.get('requested_language') != (case.get('context') or {}).get('requested_language', 'en_US'):
+            raise HTTPException(409, 'Customer language changed. Regenerate and review the email before sending.')
         if not locked.get('test_mode') and locked.get('template_kind') == 'delivery_confirmation':
             delivery_checkin_case(case,enforce_delay=True)
         if not locked.get('test_mode') and case.get('case_type') == 'warehouse_dispatch_delay':

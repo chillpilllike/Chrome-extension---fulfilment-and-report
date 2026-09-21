@@ -10,6 +10,7 @@ import requests
 import phonenumbers as pn
 from fastapi import APIRouter, HTTPException, Request
 from app.services.alternative_workflow import Runtime
+from app.services.notification_i18n import normalize_language, sms_translation, sms_segments
 
 TEST_NUMBER = '+19296526393'
 PROVIDERS = {'odoo', 'msg91', 'twilio'}
@@ -33,6 +34,11 @@ CREATE TABLE IF NOT EXISTS after_order_sms_first_movement (
 CREATE TABLE IF NOT EXISTS after_order_sms_welcome (
  order_key TEXT PRIMARY KEY, sms_id INTEGER NOT NULL UNIQUE REFERENCES after_order_sms(id),
  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS after_order_sms_localizations (
+ provider TEXT NOT NULL, sender TEXT NOT NULL, language TEXT NOT NULL,
+ template_kind TEXT NOT NULL, mapping_json TEXT NOT NULL,
+ PRIMARY KEY(provider,sender,language,template_kind)
 );
 CREATE TABLE IF NOT EXISTS after_order_sms_attempts (
  id INTEGER PRIMARY KEY AUTOINCREMENT, sms_id INTEGER NOT NULL REFERENCES after_order_sms(id),
@@ -366,10 +372,31 @@ class SMS:
         brand = (case.get('context') or {}).get('website_name') or case.get('store_name') or domain
         values = {'order':case['odoo_order_name'],'brand':brand,'url':link}
         body = render(kind,values['order'],brand,link)
+        requested_language = normalize_language((case.get('context') or {}).get('requested_language')) or 'en_US'
+        translated_body, language = sms_translation(requested_language,kind,brand,values['order'],link)
+        if translated_body and provider != 'msg91':
+            body = translated_body
         if provider == 'msg91':
             mapping = {**mapping,**(mapping.get('templates',{}).get(kind) or {})}
-            if kind in AUTOMATIC_KINDS:
-                if not mapping.get('templates', {}).get(kind):
+            if not requested_language.startswith('en'):
+                language = {'requested_language':requested_language,'sent_language':'en_US',
+                            'fallback_reason':'No approved localized MSG91 template; English fallback.'}
+                with r.db() as conn:
+                    localized = conn.execute('''SELECT mapping_json FROM after_order_sms_localizations
+                        WHERE provider='msg91' AND sender=? AND language IN (?,?) AND template_kind=?
+                        ORDER BY CASE WHEN language=? THEN 0 ELSE 1 END''',
+                        (mapping.get('sender',''),requested_language,requested_language.split('_')[0],kind,requested_language)).fetchone()
+                if localized:
+                    candidate = json.loads(localized['mapping_json'])
+                    try:
+                        verify_followup_template(candidate)
+                    except (ValueError,requests.RequestException):
+                        pass  # Explicit user policy: use approved English while translation awaits approval.
+                    else:
+                        mapping = candidate
+                        language = {'requested_language':requested_language,'sent_language':requested_language,'fallback_reason':''}
+            if kind in AUTOMATIC_KINDS or not requested_language.startswith('en'):
+                if language['sent_language'].startswith('en') and not mapping.get('templates', {}).get(kind):
                     raise ValueError('Configure a dedicated approved MSG91 template for this notification.')
                 verify_followup_template(mapping)
             template = mapping.get('text') or ''
@@ -383,7 +410,7 @@ class SMS:
         if len(body) > 1000:
             raise ValueError('SMS exceeds the 1,000-character safety limit. Review the template/link.')
         snapshot = {'mapping':mapping,'request_fingerprint':r.request_fingerprint(case),'domain':domain,'kind':kind,
-                    'email_created_at':email.get('created_at')}
+                    'email_created_at':email.get('created_at'),'language':language}
         with r.db() as conn:
             if kind in {'tracking', 'package_movement'}:
                 if not self.reserve_movement(conn, case, email):
@@ -440,7 +467,7 @@ class SMS:
                 raise ValueError('Source notification type changed. Prepare a current SMS.')
             if not self.config()['enabled']:
                 raise ValueError('SMS sending is disabled.')
-            if row['provider'] == 'msg91' and snapshot['kind'] in AUTOMATIC_KINDS:
+            if row['provider'] == 'msg91' and (snapshot['kind'] in AUTOMATIC_KINDS or not snapshot.get('language',{}).get('requested_language','en_US').startswith('en')):
                 verify_followup_template(snapshot['mapping'])
             validate_target(row,r.after_order_email_test_mode())
             allowed = {'delivered'} if resend else {'awaiting_approval','failed','provider_failed','undelivered'}
@@ -477,6 +504,8 @@ class SMS:
                     raise ValueError('The first movement SMS is already reserved for this parcel. Later movement texts are blocked.')
             if not row['test_mode']:
                 case = r.hydrate_after_order_recipient_and_domain(case, strict=True)
+                if snapshot.get('language',{}).get('requested_language','en_US') != ((case.get('context') or {}).get('requested_language') or 'en_US'):
+                    raise ValueError('Customer language changed. Prepare and review a new SMS.')
                 created = datetime.fromisoformat((snapshot.get('email_created_at') or row['created_at']).replace('Z', '+00:00'))
                 if created.tzinfo is None:
                     created = created.replace(tzinfo=timezone.utc)
@@ -599,11 +628,16 @@ class SMS:
             clause=' AND '.join(where)
             with self.r.db() as conn:
                 total=conn.execute('SELECT COUNT(*) AS n FROM after_order_sms s JOIN after_order_cases c ON c.id=s.case_id WHERE '+clause,args).fetchone()['n']
-                rows=conn.execute('''SELECT s.id,s.email_id,s.provider,s.recipient,s.test_mode,s.status,s.body,s.attempts,s.provider_id,
+                rows=conn.execute('''SELECT s.id,s.email_id,s.provider,s.recipient,s.test_mode,s.status,s.body,s.attempts,s.provider_id,s.snapshot_json,
                     s.last_error,s.created_at,s.updated_at,c.odoo_order_name,c.sender_domain
                     FROM after_order_sms s JOIN after_order_cases c ON c.id=s.case_id WHERE '''+clause+
                     ' ORDER BY s.updated_at DESC,s.id DESC LIMIT 30 OFFSET ?',[*args,(max(1,page)-1)*30]).fetchall()
-            return {'rows':[dict(x) for x in rows],'total':total,'days':30}
+            results = []
+            for raw in rows:
+                item = dict(raw)
+                item['language'] = json.loads(item.pop('snapshot_json')).get('language', {})
+                results.append(item)
+            return {'rows':results,'total':total,'days':30}
 
         @router.get('/settings')
         def settings():
@@ -631,6 +665,8 @@ class SMS:
                 return {'row':None,'can_prepare':not bool(reason),'reason':reason or 'No SMS is saved yet. Prepare it to validate the phone, website, template and current order.'}
             row = dict(raw); row['approval_digest']=digest(row)
             kind=json.loads(row['snapshot_json']).get('kind')
+            row['language']=json.loads(row['snapshot_json']).get('language',{})
+            row['segment_estimate']=sms_segments(row['body'],json.loads(row['snapshot_json']).get('mapping',{}).get('sms_type')=='UNICODE')
             row['can_resend']=row['status']=='delivered' and row['attempts']<3 and kind not in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome'}
             row.pop('snapshot_json')
             with self.r.db() as conn:

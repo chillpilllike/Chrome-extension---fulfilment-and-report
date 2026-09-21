@@ -11,6 +11,7 @@ type Email = {
   odoo_order_name: string; subject: string; recipient: string; sender: string
   provider: string; provider_message_id?: string; status: string; status_label: string
   test_mode: boolean; attempt_count: number; template_kind?: string
+  language?: {requested_language?:string;sent_language?:string;fallback_reason?:string}
   last_error?: string; created_at: string; updated_at: string; html_preview?: string
   can_retry: boolean; retry_block_reason: string; can_approve: boolean; approval_digest: string
 }
@@ -140,7 +141,7 @@ export function EmailLogWorkspace({ storeId, api, onResult, onNavigate }: Props)
     </div>
     <Dialog open={detailId !== null} onOpenChange={open => { if (!open) setDetailId(null) }}><DialogContent className="epost-detail email-log-detail"><DialogHeader><DialogTitle>{detail?.row.subject || "Email details"}</DialogTitle><DialogDescription>Saved content and delivery attempts. Preview links are disabled.</DialogDescription></DialogHeader>
       {detailError && <p role="alert">{detailError}</p>}{!detail && !detailError && <p role="status">Loading email…</p>}
-      {detail && <><Status row={detail.row} /><dl><dt>Order / store</dt><dd>{detail.row.odoo_order_name} · {detail.row.website_name || detail.row.store_name} ({detail.row.sender_domain || "Website not recorded"})</dd><dt>Recipient</dt><dd>{detail.row.recipient}</dd><dt>Sender</dt><dd>{detail.row.sender}</dd><dt>Provider message ID</dt><dd>{detail.row.provider_message_id || "No acceptance ID recorded"}</dd><dt>Mode</dt><dd>{detail.row.test_mode ? "Test" : "Live"}</dd></dl>
+      {detail && <><Status row={detail.row} /><dl><dt>Order / store</dt><dd>{detail.row.odoo_order_name} · {detail.row.website_name || detail.row.store_name} ({detail.row.sender_domain || "Website not recorded"})</dd><dt>Language</dt><dd>{detail.row.language?.sent_language || "Not recorded (legacy email)"}{detail.row.language?.requested_language && <> · Requested: {detail.row.language.requested_language}</>}{detail.row.language?.fallback_reason && <small>{detail.row.language.fallback_reason}</small>}</dd><dt>Recipient</dt><dd>{detail.row.recipient}</dd><dt>Sender</dt><dd>{detail.row.sender}</dd><dt>Provider message ID</dt><dd>{detail.row.provider_message_id || "No acceptance ID recorded"}</dd><dt>Mode</dt><dd>{detail.row.test_mode ? "Test" : "Live"}</dd></dl>
         <section><h3>Send attempts</h3>{!detail.attempts.length && <p>Detailed attempt history is unavailable for this older record. Its saved status is shown above.</p>}<ol className="email-attempts">{detail.attempts.map(attempt => <li key={attempt.attempt_number}><strong>Attempt {attempt.attempt_number} · {attempt.status.replaceAll("_", " ")}</strong><small>{formatDate(attempt.created_at)} → {formatDate(attempt.updated_at)}</small>{attempt.error && <p className="email-log-error">{attempt.error}</p>}</li>)}</ol>
           {detail.row.can_approve ? <Button disabled={retryId !== null} onClick={() => { setDetailId(null); setRetryTarget(detail.row) }}>Approve sending this email</Button> : <p>{detail.row.retry_block_reason}</p>}</section>
         {detail.row.template_kind?.startsWith('relay_') && detail.row.last_error?.includes('HTTP 403;') && ['failed','delivery_unknown'].includes(detail.row.status) && <Button disabled={retryId!==null} onClick={async()=>{

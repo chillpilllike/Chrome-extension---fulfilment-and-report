@@ -307,6 +307,7 @@ class ManualRefunds:
                 email_case, "", actions=[], labels={}, template_kind=KIND
             )
             sender, domain = r.after_order_sender(case)
+            from app.services.notification_i18n import for_case
             payload = {
                 "from": sender,
                 "to": [case["customer_email"]],
@@ -317,6 +318,7 @@ class ManualRefunds:
                 "_care_manual_refund_id": ident,
                 "_care_manual_refund_amount": str(value),
                 "_care_manual_refund_currency": body.currency.upper(),
+                "_care_language": for_case(email_case).metadata(),
             }
             msg = conn.execute(
                 """INSERT INTO after_order_messages

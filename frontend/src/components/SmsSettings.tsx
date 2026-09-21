@@ -9,6 +9,8 @@ export function SmsSettings({ api }: { api: API }) {
   const [mapping, setMapping] = useState('{}')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
+  const [languages,setLanguages] = useState<{code:string;name:string;sent_language:string;fallback_reason:string}[]>([])
+  useEffect(()=>{api<{languages:typeof languages}>('/api/after-order/languages').then(d=>setLanguages(d.languages)).catch(()=>{})},[api])
   useEffect(() => { api<Config>('/api/after-order/sms/settings').then(c => { setConfig(c); setMapping(JSON.stringify(c.mappings, null, 2)) }).catch(e => setNotice(String(e))) }, [api])
   async function save() {
     if (!config) return
@@ -22,6 +24,7 @@ export function SmsSettings({ api }: { api: API }) {
       <p>{config.test_mode ? 'Test: only +19296526393, no approval for initial sends.' : 'Live: individual SMS approval required.'}</p>
       <p>New-order confirmation SMS sends automatically for confirmed orders. Other SMS: expected dispatch delay, dispatch hurdle, unavailable items (with or without alternatives), first parcel movement, and delivery confirmation. Payment and refund SMS remain held until verified event connections are completed. No reminder or lost-package SMS.</p>
       <p>{config.provider === 'odoo' ? 'Uses the order’s Odoo installation. Requires its SMS module and credits.' : config.credentials[config.provider] ? 'Runtime credentials present; sender and delivery need verification.' : 'Runtime credentials are not configured.'}</p>
+      <details><summary>Notification languages · {languages.length} configured locales</summary><p>The Odoo customer language is used. Incomplete translations and unapproved localized MSG91 templates fall back to English. Language is recorded in each message preview. Email coverage below does not imply MSG91 template approval.</p><div className="grid gap-1">{languages.map(l=><p key={l.code}>{l.name} ({l.code}) — {l.fallback_reason?'English fallback':'Email catalog ready'}</p>)}</div></details>
       <details><summary>Website sender and template mappings</summary><p>Keys are store_id:website_id. Enable transactional_sms_enabled only after reviewing consent and destination requirements. No secrets here.</p>
         <pre className="text-xs whitespace-pre-wrap">{'{"1:2":{"transactional_sms_enabled":false,"twilio":{"sender":"+15551234567"},"msg91":{"sender":"HEADER","templates":{"expected_dispatch":{"template_id":"MSG91_ID","dlt_template_id":"DLT_ID","text":"##brand##: Dispatch update for ##order##. ##url##"}}}}}'}</pre>
         <textarea aria-label="SMS website mappings JSON" className="form-control w-full min-h-40 font-mono" value={mapping} onChange={e => setMapping(e.target.value)} />
@@ -29,7 +32,7 @@ export function SmsSettings({ api }: { api: API }) {
       </details><Button disabled={busy} onClick={() => void save()}>Save SMS settings</Button></>}{notice && <p role="status">{notice}</p>}
   </section>
 }
-type Row = { id: number; provider: string; recipient: string; test_mode: boolean; body: string; status: string; last_error?: string; attempts: number; approval_digest: string; can_resend?: boolean; provider_id?: string }
+type Row = { id: number; provider: string; recipient: string; test_mode: boolean; body: string; status: string; last_error?: string; attempts: number; approval_digest: string; can_resend?: boolean; provider_id?: string; language?:{requested_language?:string;sent_language?:string;fallback_reason?:string}; segment_estimate?:{encoding:string;parts:number;note:string} }
 const smsLabels:Record<string,string> = {awaiting_approval:'Awaiting approval',accepted:'Accepted by provider',queued:'Queued',sent:'Sent',delivered:'Delivered',failed:'Failed',provider_failed:'Delivery failed',undelivered:'Undelivered',delivery_unknown:'Check delivery',sending:'Sending',blocked:'Blocked',rejected:'Rejected',processing:'Processing',cancelled:'Cancelled',canceled:'Cancelled'}
 function SmsStatus({status}:{status:string}) { return <span className={`sms-status ${status==='delivered'?'is-success':['failed','provider_failed','undelivered','rejected','blocked'].includes(status)?'is-danger':status==='awaiting_approval'?'is-pending':''}`}>{smsLabels[status] || status}</span> }
 export function SmsPreview({ api, emailId, onChange }: { api: API; emailId: number; onChange?:()=>void }) {
@@ -44,7 +47,9 @@ export function SmsPreview({ api, emailId, onChange }: { api: API; emailId: numb
       <div className="sms-preview-status"><SmsStatus status={row.status}/><span className="sms-mode">{row.test_mode?'TEST':'LIVE'}</span></div>
       <dl className="sms-metadata"><div><dt>Recipient</dt><dd>{row.recipient}</dd></div><div><dt>Provider</dt><dd>{row.provider.toUpperCase()}</dd></div></dl>
       <div><h3 className="sms-section-label">Message preview</h3><div className="sms-message-bubble">{row.body}</div></div>
+      <p className="sms-help">Language: {row.language?.sent_language || 'Not recorded (legacy SMS)'}{row.language?.requested_language && <> · Requested: {row.language.requested_language}</>}{row.language?.fallback_reason && <><br/>{row.language.fallback_reason}</>}</p>
       {row.last_error && <p className="sms-error" role="alert">{row.last_error}</p>}
+      {row.segment_estimate && <p className="sms-help">Estimated SMS parts: {row.segment_estimate.parts} ({row.segment_estimate.encoding}). {row.segment_estimate.note}</p>}
       <p className="sms-help">Accepted, queued or sent does not confirm delivery. Opening this preview does not send anything.</p>
       <div className="sms-actions">
       {['awaiting_approval', 'failed','provider_failed','undelivered'].includes(row.status) && row.attempts < 3 && <Button disabled={busy||!!confirm} onClick={()=>setConfirm('send')}>{row.attempts ? 'Retry failed SMS' : 'Approve & send SMS'}</Button>}

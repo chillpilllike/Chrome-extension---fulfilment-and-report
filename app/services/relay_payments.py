@@ -428,10 +428,14 @@ class RelayPayments:
         case = {'odoo_order_name':snap['order_number'], 'sender_domain':website,
                 'context':{'website_name':snap['website_name'],'website_logo_url':logo_url,
                            'website_url':origin,'relay_payment':snap}}
+        from .notification_i18n import odoo_language, language_headers
+        if snap.get('order_id'):
+            case['context'].update(odoo_language(self.client(row['store_id']),snap['order_id']))
         title, body, plain = render_after_order_email(case,pay_url,actions=[],labels={},
                                                      template_kind='relay_'+kind)
         return {'from':snap['website_name']+' <notifications@'+website.removeprefix('www.')+'>','to':[snap['customer_email']],
-                'reply_to':'support@'+website.removeprefix('www.'),'subject':title,'html':body,'text':plain}
+                'reply_to':'support@'+website.removeprefix('www.'),'subject':title,'html':body,'text':plain,
+                'headers':language_headers(case)}
 
     def emails(self):
         if self.settings()['test_mode']:

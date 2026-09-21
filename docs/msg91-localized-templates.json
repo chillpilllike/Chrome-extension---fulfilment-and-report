@@ -1,0 +1,98 @@
+{
+  "nutricity:fr:new_order_welcome": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "new_order_welcome",
+    "text": "Nutricity : commande ##order## confirmée. Merci ! Préparation prochainement. Détails : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12ac6ed754e8eee08e6b2"
+  },
+  "nutricity:fr:expected_dispatch": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "expected_dispatch",
+    "text": "Nutricity : commande ##order##. La date d’expédition estimée a changé. Vos options : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12ac76d483d501c097c34"
+  },
+  "nutricity:fr:warehouse_dispatch_delay": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "warehouse_dispatch_delay",
+    "text": "Nutricity : commande ##order##. Expédition retardée. Notre équipe intervient. Aucune action requise : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12ac8bf60ae96e308d375"
+  },
+  "nutricity:fr:item_unavailable": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "item_unavailable",
+    "text": "Nutricity : commande ##order##. Article indisponible. Choisissez une alternative : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12ac974d2188fdd0bebd2"
+  },
+  "nutricity:fr:no_alternatives": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "no_alternatives",
+    "text": "Nutricity : commande ##order##. Article indisponible, sans alternative adaptée. Vos options : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12ac943e3638d4f03ddf3"
+  },
+  "nutricity:fr:package_movement": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "package_movement",
+    "text": "Nutricity : commande ##order##. Votre colis progresse. Suivi : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12acac5f2e648f103b4a3"
+  },
+  "nutricity:fr:delivery_confirmation": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "delivery_confirmation",
+    "text": "Nutricity : commande ##order##. Colis indiqué livré. Confirmez sa réception : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12acb6d04ca89fe05c007"
+  },
+  "nutricity:fr:alternative_payment": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "alternative_payment",
+    "text": "Nutricity : commande ##order##. Consultez le paiement complémentaire pour votre remplacement : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12acc0957f083040c2163"
+  },
+  "nutricity:fr:refund_request_received": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "refund_request_received",
+    "text": "Nutricity : commande ##order##. Demande de remboursement en cours d’examen. Réponse sous 24 à 48 h : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12acdad4bea5fdb0fe7f4"
+  },
+  "nutricity:fr:refund_completed": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "refund_completed",
+    "text": "Nutricity : commande ##order##. Remboursement traité. Le délai de crédit dépend de votre banque : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12ace9a1301516b0bc9a2"
+  },
+  "nutricity:fr:trustpilot_review": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "trustpilot_review",
+    "text": "Nutricity : commande ##order##. Votre avis compte. Partagez votre expérience : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12acf6d9423b2b80780d2"
+  },
+  "nutricity:fr:delivery_issue_received": {
+    "sender": "nutricity",
+    "language": "fr",
+    "kind": "delivery_issue_received",
+    "text": "Nutricity : commande ##order##. Merci pour votre signalement de non-réception. Notre équipe vous contactera : ##url## - Assistance Nutricity",
+    "sms_type": "UNICODE",
+    "template_id": "6ab12ad0496a2e50bb0aeea2"
+  }
+}

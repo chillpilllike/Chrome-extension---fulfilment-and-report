@@ -63,7 +63,7 @@ class RefundEmails:
         if store.website_id and int(store.website_id) != int(website_id):
             raise ValueError('The order no longer belongs to this website. Email is held for review.')
         sites = client.read('website', [website_id], ['name','domain'])
-        people = client.read('res.partner', [order['partner_id'][0]], ['email'])
+        people = client.read('res.partner', [order['partner_id'][0]], ['email','lang'])
         site = sites[0] if len(sites) == 1 else {}
         raw = str(site.get('domain') or '').strip()
         parsed = urlsplit(raw if '://' in raw else 'https://' + raw)
@@ -82,19 +82,23 @@ class RefundEmails:
                     and s.get('odoo_db') == getattr(store,'odoo_db',None)
                     and str(s.get('odoo_url') or '').rstrip('/') == str(getattr(store,'odoo_url','')).rstrip('/')]
         log_store_id = int(matching[0]['id']) if len(matching) == 1 else int(row['store_id'])
-        return {'log_store_id':log_store_id, 'website_id': int(website_id), 'website_name':brand, 'domain':domain,
+        from .notification_i18n import resolve_language
+        language = resolve_language(customer_language=(people[0] if people else {}).get('lang'))
+        return {**language,'log_store_id':log_store_id, 'website_id': int(website_id), 'website_name':brand, 'domain':domain,
                 'recipient':recipient, 'logo':'https://' + domain + '/web/image/website/' + str(website_id) + '/logo'}
 
     def payload(self, row, site):
         details = json.loads(row.get('email_destination') or '{}')
         case = {'odoo_order_name':row['order_name'], 'sender_domain':site['domain'],
                 'context':{'website_name':site['website_name'],'website_logo_url':site['logo'],
+                           'requested_language':site.get('requested_language','en_US'),
                            'refund':{'amount':str(row['amount']), 'currency':row['currency'],
                                      'reference':row['transfer_id'], **details}}}
         subject, body, plain = render_after_order_email(case, '', actions=[], labels={}, template_kind='refund_confirmed')
+        from .notification_i18n import language_headers
         return {'from':site['website_name']+' <notifications@'+site['domain']+'>',
                 'to':[site['recipient']], 'reply_to':'support@'+site['domain'],
-                'subject':subject,'html':body,'text':plain}
+                'subject':subject,'html':body,'text':plain,'headers':language_headers(case)}
 
     def hold(self, job, message):
         with self.db() as c:

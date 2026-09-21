@@ -10,6 +10,43 @@ from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, d
 
 
 class SMSTests(unittest.TestCase):
+    def french_msg91_fixture(self):
+        self.case['context']['requested_language']='fr_CA'
+        self.settings['after_order_sms_provider']='msg91'
+        self.settings['after_order_sms_mappings']=json.dumps({'1:2':{'transactional_sms_enabled':True,'msg91':{'sender':'nutricity','templates':{'item_unavailable':{'template_id':'english','text':'Nutricity: Order ##order## needs your choice. ##url## - Support'}}}}})
+        mapping={'sender':'nutricity','template_id':'french','text':'Nutricity : commande ##order##. Choisissez : ##url## - Assistance Nutricity'}
+        self.conn.execute("INSERT INTO after_order_sms_localizations VALUES('msg91','nutricity','fr','item_unavailable',?)",(json.dumps(mapping),))
+
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_approved_localized_sms_uses_french_mapping(self, verify):
+        self.french_msg91_fixture()
+        row=self.sms.prepare(1)
+        self.assertIn('commande NC123',row['body'])
+        self.assertEqual('fr_CA',json.loads(row['snapshot_json'])['language']['sent_language'])
+        self.assertEqual('french',json.loads(row['snapshot_json'])['mapping']['template_id'])
+
+    @patch('app.services.care_sms.verify_followup_template',side_effect=[ValueError('Pending'),None])
+    def test_pending_localized_sms_falls_back_without_changing_english_template(self, verify):
+        self.french_msg91_fixture()
+        row=self.sms.prepare(1)
+        self.assertIn('Order NC123',row['body'])
+        snapshot=json.loads(row['snapshot_json'])
+        self.assertEqual('fr_CA',snapshot['language']['requested_language'])
+        self.assertEqual('en_US',snapshot['language']['sent_language'])
+        self.assertEqual('english',snapshot['mapping']['template_id'])
+        self.assertTrue(snapshot['language']['fallback_reason'])
+
+    @patch('app.services.care_sms.deliver')
+    def test_customer_language_change_invalidates_sms_approval(self, send):
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.conn.execute('UPDATE after_order_messages SET test_mode=0')
+        self.sms.phone=Mock(return_value='+14155552671')
+        row=self.sms.prepare(1)
+        self.case['context']['requested_language']='fr_CA'
+        with self.assertRaisesRegex(ValueError,'language changed'):
+            self.sms.send(row['id'],approval=digest(row))
+        send.assert_not_called()
+
     def test_customer_phone_uses_contact_country_not_website(self):
         self.assertEqual('+14165551234',customer_number('(416) 555-1234','CA'))
         self.assertEqual('+442079460018',customer_number('020 7946 0018','GB'))

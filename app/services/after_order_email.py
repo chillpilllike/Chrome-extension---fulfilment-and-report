@@ -2,6 +2,7 @@
 from html import escape
 from decimal import Decimal
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
+from .notification_i18n import for_case
 
 
 FONT = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
@@ -37,6 +38,7 @@ def button(label, url, *, primary=True, destructive=False):
 
 
 def render_after_order_email(case, action_url, *, actions, labels, template_kind="", unsubscribe_url="", review_url=""):
+    t = for_case(case)
     context = case.get("context") or {}
     order = str(case.get("odoo_order_name") or "Your order")
     website = str(context.get("website_name") or case.get("store_name") or "Customer care")
@@ -58,71 +60,69 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         "delivery_issue_received": ("WE’RE HERE TO HELP", "We’re looking into your delivery.", "We received your delivery report", "Thank you for letting us know your order hasn’t arrived. Our team will investigate the delivery and contact you shortly.", "No further action needed", "If your order arrives in the meantime, you can update your answer on your order page."),
         "tracking": ("ON ITS WAY", "A little closer to your door.", "Your package has moved", "There’s a new update on your package. You can find the latest details below.", "Follow your delivery", "See the full tracking history and the latest carrier updates."),
     }
-    eyebrow, heading, subject_text, intro, action_heading, note = content.get(kind, content["tracking"])
+    eyebrow, heading, subject_text, intro, action_heading, note = map(t, content.get(kind, content["tracking"]))
     no_alternatives = kind == 'item_unavailable' and bool(context.get('no_alternative_line_ids')) and 'offer_alternatives' not in actions
     if no_alternatives:
-        heading = 'An item in your order is unavailable.'
-        intro = 'Our team checked sourcing options but could not find suitable alternatives for the unavailable item or items below. Please choose how you would like to continue.'
-        note = 'Our team will review your choice before making changes or processing any refund.'
+        heading = t('An item in your order is unavailable.')
+        intro = t('Our team checked sourcing options but could not find suitable alternatives for the unavailable item or items below. Please choose how you would like to continue.')
+        note = t('Our team will review your choice before making changes or processing any refund.')
     if kind == "item_unavailable" and context.get('three_day_policy_enabled'):
         # Filtered actions, not row count: quantities/shipping/duplicate ASINs
         # do not establish that another fulfilable product will remain.
         removable = bool({"exclude_item_and_proceed", "cancel_affected_item"}.intersection(actions))
-        affected = "these unavailable items" if len(case.get("affected_items") or []) > 1 else "this unavailable item"
+        affected = t("these unavailable items" if len(case.get("affected_items") or []) > 1 else "this unavailable item")
         outcome = (
-            f"If you make no choice within 3 days, we will process the rest of your order without {affected}. "
-            "Any amount paid for the removed items will go to our team for refund review and approval."
+            t("If you make no choice within 3 days, we will process the rest of your order without {affected}. Any amount paid for the removed items will go to our team for refund review and approval.", affected=affected)
             if removable else
-            "If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. "
-            "Cancellation and any refund require team approval; neither happens automatically."
+            t("If you make no choice within 3 days, your order will be sent to our team for cancellation and refund review. Cancellation and any refund require team approval; neither happens automatically.")
         )
         note = (
-            "Please choose an option within 3 days of this notification. " + outcome + " "
+            t("Please choose an option within 3 days of this notification.") + " " + outcome + " " + t(
             "Once you select an alternative, you have a separate 24-hour window from your first selection to change it. "
             "The 3-day no-response rule does not cancel a choice you have already made. "
             "After the 24-hour window, a higher-priced choice requires payment of the difference; "
             "a cheaper choice is reviewed for a difference refund. "
-            "If you choose to remove an item, any amount paid for it is subject to our team's refund review and approval."
+            "If you choose to remove an item, any amount paid for it is subject to our team's refund review and approval.")
         )
     if no_alternatives and context.get('three_day_policy_enabled'):
-        note = 'Please choose an option within 3 days of this notification. ' + outcome
+        note = t('Please choose an option within 3 days of this notification.') + ' ' + outcome
     subject = f"{order} — {subject_text}"
-    preheader = f"{subject_text} for {order}. {intro}"
+    preheader = f"{subject} — {intro}"
     logo_url = safe_url(context.get("website_logo_url"))
     logo = f'<img src="{escape(logo_url, quote=True)}" alt="{escape(website, quote=True)}" width="144" style="display:block;width:144px;max-width:100%;height:auto;border:0;color:#193b32;font-family:{FONT};font-size:18px;font-weight:600">' if logo_url else f'<span style="font-family:{FONT};font-size:20px;line-height:28px;font-weight:700;letter-spacing:-.6px;color:#193b32">{escape(website)}</span>'
 
     item_rows = []
     plain_items = []
     for item in case.get("affected_items") or []:
-        name = str(item.get("product_name") or "Order item")
+        name = str(item.get("product_name") or t("Order item"))
         if item.get('no_alternatives'):
-            name += ' — No suitable alternatives available'
+            name += ' — ' + t('No suitable alternatives available')
         quantity = str(item.get("quantity") or 1)
         if quantity.endswith(".0"):
             quantity = quantity[:-2]
         thumbnail = safe_url(item.get("thumbnail_url"))
         product_url = storefront_product_url(item.get("odoo_product_url"),case.get('sender_domain'))
         image = f'<img src="{escape(thumbnail, quote=True)}" alt="{escape(name, quote=True)}" width="64" height="64" style="display:block;width:64px;height:64px;object-fit:contain;border:0;border-radius:0;background:#ffffff;font-size:10px;color:#66756e">' if thumbnail else '<span style="font-size:24px;color:#a4b1aa">&#9633;</span>'
-        link = f'<a href="{escape(product_url, quote=True)}" style="font-family:{FONT};font-size:12px;line-height:20px;font-weight:500;color:#28594a;text-decoration:underline">View item</a>' if product_url else ""
+        link = f'<a href="{escape(product_url, quote=True)}" style="font-family:{FONT};font-size:12px;line-height:20px;font-weight:500;color:#28594a;text-decoration:underline">{escape(t("View item"))}</a>' if product_url else ""
         item_rows.append(f'''<tr><td style="padding:0 0 10px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#eeeeee" style="background:#eeeeee;border-radius:0">
           <tr><td width="64" valign="middle" align="center" style="width:64px;padding:16px">{image}</td>
           <td valign="middle" style="padding:16px 16px 16px 0;font-family:{FONT};font-size:14px;line-height:21px;color:#24372e">
-          <strong style="font-weight:600">{escape(name)}</strong><br><span style="font-size:12px;line-height:24px;color:#64756a">Quantity {escape(quantity)}</span>{'<br>' + link if link else ''}
+          <strong style="font-weight:600">{escape(name)}</strong><br><span style="font-size:12px;line-height:24px;color:#64756a">{escape(t('Quantity'))} {escape(quantity)}</span>{'<br>' + link if link else ''}
           </td></tr></table></td></tr>''')
-        plain_items.append(f"{name} — Quantity {quantity}")
+        plain_items.append(f"{name} — {t('Quantity')} {quantity}")
         recommendations = item.get('recommendations') or []
         if kind == 'item_unavailable' and recommendations:
-            item_rows.append('<tr><td style="padding:14px 0 10px;font-size:16px;font-weight:600">Best alternatives for this item</td></tr>')
+            item_rows.append('<tr><td style="padding:14px 0 10px;font-size:16px;font-weight:600">'+escape(t('Best alternatives for this item'))+'</td></tr>')
             for alternative in recommendations:
-                title = escape(str(alternative.get('name') or 'Alternative product'))
+                title = escape(str(alternative.get('name') or t('Alternative product')))
                 photo = safe_url(alternative.get('thumbnail_url'))
                 details = safe_url(alternative.get('details_url'))
                 selection = safe_url(alternative.get('select_url'))
                 item_rows.append(f'''<tr><td style="padding:0 0 16px"><table role="presentation" width="100%" cellpadding="12" cellspacing="0" bgcolor="#eeeeee"><tr>
                   <td width="80"><a href="{escape(details, quote=True)}" target="_blank" rel="noopener noreferrer"><img src="{escape(photo, quote=True)}" alt="{title}" width="80" height="80" style="display:block;object-fit:contain;border:0;background:#ffffff"></a></td>
-                  <td style="font-size:14px;line-height:22px"><strong>{title}</strong><br><a href="{escape(details, quote=True)}" target="_blank" rel="noopener noreferrer" style="color:#28594a;text-decoration:underline">View full product details</a></td></tr>
-                  <tr><td colspan="2">{button('Review and confirm this alternative', selection)}</td></tr></table></td></tr>''')
-                plain_items.append(f"Recommended: {alternative.get('name')}\nProduct details: {details}\nReview and confirm: {selection}")
+                  <td style="font-size:14px;line-height:22px"><strong>{title}</strong><br><a href="{escape(details, quote=True)}" target="_blank" rel="noopener noreferrer" style="color:#28594a;text-decoration:underline">{escape(t('View full product details'))}</a></td></tr>
+                  <tr><td colspan="2">{button(t('Review and confirm this alternative'), selection)}</td></tr></table></td></tr>''')
+                plain_items.append(f"{t('Recommended')}: {alternative.get('name')}\n{t('Product details')}: {details}\n{t('Review and confirm')}: {selection}")
     items_html = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:28px">' + "".join(item_rows) + "</table>" if item_rows else ""
 
     panel = ""
@@ -133,23 +133,25 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
                   ('Refund reference',refund['reference']),('Processed on',refund['completed_at'])]
         panel = '<table role="presentation" width="100%" cellpadding="12" cellspacing="0" bgcolor="#eeeeee" style="margin-top:28px">'
         for label,value in fields:
+            label = t(label)
             panel += '<tr><td>'+escape(label)+'</td><td style="font-weight:600">'+escape(str(value))+'</td></tr>'
             detail_lines.append(label+': '+str(value))
         panel += '</table>'
     if kind == 'refund_confirmed':
         refund = context['refund']
         fields = [('Refund amount', format(Decimal(str(refund['amount'])).normalize(), 'f') + ' ' + str(refund['currency'])),
-                  ('Credited to', refund.get('holder') or 'Your verified recipient'),
-                  ('Destination account', refund.get('account') or 'Verified recipient account'),
+                  ('Credited to', refund.get('holder') or t('Your verified recipient')),
+                  ('Destination account', refund.get('account') or t('Verified recipient account')),
                   ('Bank', refund.get('bank') or ''),
                   ('Refund reference', refund.get('reference') or '')]
         panel = '<table role="presentation" width="100%" cellpadding="12" cellspacing="0" bgcolor="#eeeeee" style="margin-top:28px">'
         for label, value in fields:
+            label = t(label)
             if value:
                 panel += '<tr><td style="font-size:13px;color:#637167">' + escape(label) + '</td><td style="font-size:14px;font-weight:600;word-break:break-word">' + escape(str(value)) + '</td></tr>'
                 detail_lines.append(label + ': ' + str(value))
         panel += '</table>'
-        detail_lines.append('Only the last four account characters are shown for your privacy.')
+        detail_lines.append(t('Only the last four account characters are shown for your privacy.'))
     if kind == 'new_order_welcome':
         domain = str(case.get('sender_domain') or '').strip().lower()
         parsed_domain = urlsplit('https://' + domain)
@@ -164,23 +166,24 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         ]
         panel = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:28px">'
         for icon, title, body in sections:
+            title, body = t(title), t(body)
             panel += f'<tr><td valign="top" width="30" style="padding:0 8px 24px 0;color:#28594a;font-size:21px" aria-hidden="true">{icon}</td><td style="padding:0 0 24px;font-size:14px;line-height:24px"><strong>{escape(title)}</strong><p style="margin:8px 0 0;color:#637167">{escape(body)}</p></td></tr>'
             detail_lines.append(title + '\n' + body)
         panel += '</table>'
         contact_url = base + '/contactus'
-        panel += f'<p style="font-size:14px;line-height:28px;margin:0 0 24px"><a href="mailto:support@{escape(domain, quote=True)}" style="color:#28594a;text-decoration:underline">Email our team</a><br><a href="{escape(contact_url, quote=True)}" style="color:#28594a;text-decoration:underline">Contact form</a><br><a href="{escape(base, quote=True)}" style="color:#28594a;text-decoration:underline">Visit our website for chat</a></p>'
-        detail_lines += ['Email: support@' + domain, 'Contact form: ' + contact_url, 'Website chat: ' + base]
+        panel += f'<p style="font-size:14px;line-height:28px;margin:0 0 24px"><a href="mailto:support@{escape(domain, quote=True)}" style="color:#28594a;text-decoration:underline">{escape(t("Email our team"))}</a><br><a href="{escape(contact_url, quote=True)}" style="color:#28594a;text-decoration:underline">{escape(t("Contact form"))}</a><br><a href="{escape(base, quote=True)}" style="color:#28594a;text-decoration:underline">{escape(t("Visit our website for chat"))}</a></p>'
+        detail_lines += [t('Email') + ': support@' + domain, t('Contact form') + ': ' + contact_url, t('Website chat') + ': ' + base]
     if kind == "expected_dispatch":
-        date = str(context.get("expected_dispatch_date") or "We’ll keep you updated")
-        panel_label, panel_value, panel_detail = "ESTIMATED DISPATCH", date, "An estimate, not a guaranteed delivery date."
+        date = str(context.get("expected_dispatch_date") or t("We’ll keep you updated"))
+        panel_label, panel_value, panel_detail = t("ESTIMATED DISPATCH"), date, t("An estimate, not a guaranteed delivery date.")
     elif kind == "delivery_confirmation":
-        panel_label = "CARRIER DELIVERY DETAILS"
-        panel_value = "Delivered: " + str(context.get("delivery_datetime") or "Not provided by carrier")
-        panel_detail = "Location: " + str(context.get("delivery_location") or "Not provided by carrier") + "\nDestination postal code: " + str(context.get("delivery_postal_code") or "Not provided by carrier")
+        panel_label = t("CARRIER DELIVERY DETAILS")
+        panel_value = t("Delivered") + ": " + str(context.get("delivery_datetime") or t("Not provided by carrier"))
+        panel_detail = t("Location") + ": " + str(context.get("delivery_location") or t("Not provided by carrier")) + "\n" + t("Destination postal code") + ": " + str(context.get("delivery_postal_code") or t("Not provided by carrier"))
     elif kind == "tracking":
-        panel_label = "LATEST CARRIER UPDATE"
-        panel_value = "Status: " + str(context.get("latest_status") or "Not provided by carrier")
-        panel_detail = "Date and time: " + str(context.get("last_update_at") or "Not provided by carrier") + "\nLocation: " + str(context.get("latest_location") or "Not provided by carrier")
+        panel_label = t("LATEST CARRIER UPDATE")
+        panel_value = t("Status") + ": " + str(context.get("latest_status") or t("Not provided by carrier"))
+        panel_detail = t("Date and time") + ": " + str(context.get("last_update_at") or t("Not provided by carrier")) + "\n" + t("Location") + ": " + str(context.get("latest_location") or t("Not provided by carrier"))
     else:
         panel_label = panel_value = panel_detail = ""
     if panel_label:
@@ -201,37 +204,37 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
             name = str(item["name"])
             quantity = str(item["quantity"]).removesuffix(".0")
             amount = str(item["total"])
-            money_rows.append(f'<tr><td style="padding:16px 12px 16px 0;border-bottom:1px solid #dedede;font-size:13px;line-height:21px;word-break:break-word">{escape(name)}<br><span style="color:#637167">Quantity {escape(quantity)}</span></td><td width="100" align="right" valign="top" style="padding:16px 0;border-bottom:1px solid #dedede;font-size:13px;line-height:21px;white-space:nowrap">{currency} {escape(amount)}</td></tr>')
-            plain_items.append(f'{name} — Quantity {quantity} — {payment["original_currency"]} {amount}')
-        items_html = '<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:24px;table-layout:fixed"><tr><th align="left" style="font-size:11px;color:#637167;padding-bottom:8px">ORDER DETAILS</th><th width="100" align="right" style="font-size:11px;color:#637167;padding-bottom:8px">AMOUNT</th></tr>'+''.join(money_rows)+'</table>'
+            money_rows.append(f'<tr><td style="padding:16px 12px 16px 0;border-bottom:1px solid #dedede;font-size:13px;line-height:21px;word-break:break-word">{escape(name)}<br><span style="color:#637167">{escape(t("Quantity"))} {escape(quantity)}</span></td><td width="100" align="right" valign="top" style="padding:16px 0;border-bottom:1px solid #dedede;font-size:13px;line-height:21px;white-space:nowrap">{currency} {escape(amount)}</td></tr>')
+            plain_items.append(f'{name} — {t("Quantity")} {quantity} — {payment["original_currency"]} {amount}')
+        items_html = f'<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:24px;table-layout:fixed"><tr><th align="left" style="font-size:11px;color:#637167;padding-bottom:8px">{escape(t("ORDER DETAILS"))}</th><th width="100" align="right" style="font-size:11px;color:#637167;padding-bottom:8px">{escape(t("AMOUNT"))}</th></tr>'+''.join(money_rows)+'</table>'
         for label, value in [("Subtotal",payment["subtotal"]),("Tax",payment["tax"]),("Order total",payment["original_total"])]:
-            items_html += f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding-top:12px;font-size:13px">{label}</td><td align="right" style="padding-top:12px;font-size:13px;font-weight:600">{currency} {escape(str(value))}</td></tr></table>'
+            items_html += f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding-top:12px;font-size:13px">{escape(t(label))}</td><td align="right" style="padding-top:12px;font-size:13px;font-weight:600">{currency} {escape(str(value))}</td></tr></table>'
         usd = format(payment["amount_cents"]/100,'.2f')
-        panel = f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#eeeeee" style="margin-top:28px;border:1px solid #dedede"><tr><td style="padding:24px"><p style="margin:0 0 8px;font-size:10px;letter-spacing:1.3px;color:#506c5e">{"USD PAYMENT" if kind == "relay_received" else "AMOUNT TO PAY"}</p><p style="margin:0;font-size:30px;line-height:38px;font-weight:600;color:#193b2d">USD {usd}</p><p style="margin:8px 0 0;font-size:13px;color:#637167">Due {escape(str(payment["due_date"]))}</p></td></tr></table>'
-        detail_lines = [f'Order total: {payment["original_currency"]} {payment["original_total"]}',f'Subtotal: {payment["subtotal"]} · Tax: {payment["tax"]}',f'USD payment: {usd}',f'Due: {payment["due_date"]}']
+        panel = f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#eeeeee" style="margin-top:28px;border:1px solid #dedede"><tr><td style="padding:24px"><p style="margin:0 0 8px;font-size:10px;letter-spacing:1.3px;color:#506c5e">{escape(t("USD PAYMENT" if kind == "relay_received" else "AMOUNT TO PAY"))}</p><p style="margin:0;font-size:30px;line-height:38px;font-weight:600;color:#193b2d">USD {usd}</p><p style="margin:8px 0 0;font-size:13px;color:#637167">{escape(t("Due"))} {escape(str(payment["due_date"]))}</p></td></tr></table>'
+        detail_lines = [f'{t("Order total")}: {payment["original_currency"]} {payment["original_total"]}',f'{t("Subtotal")}: {payment["subtotal"]} · {t("Tax")}: {payment["tax"]}',f'{t("USD PAYMENT")}: {usd}',f'{t("Due")}: {payment["due_date"]}']
 
     buttons = []
     plain_actions = []
     if kind in {"relay_request", "relay_received"}:
         if kind == "relay_request":
-            label = 'Pay USD ' + format(context['relay_payment']['amount_cents']/100,'.2f')
+            label = t('Pay USD') + ' ' + format(context['relay_payment']['amount_cents']/100,'.2f')
             buttons.append(button(label, action_url))
             plain_actions.append(label + ': ' + safe_url(action_url))
         base = safe_url(context.get('website_url'))
         if base:
             contact = base.rstrip('/') + '/contactus'
-            buttons.append(button('Contact our team', contact, primary=False))
-            plain_actions.append('Contact our team: ' + contact)
+            buttons.append(button(t('Contact our team'), contact, primary=False))
+            plain_actions.append(t('Contact our team') + ': ' + contact)
     elif kind == "trustpilot_review":
-        buttons.append(button("Share an honest review", review_url))
-        plain_actions.append(f"Share an honest review: {safe_url(review_url)}")
+        buttons.append(button(t("Share an honest review"), review_url))
+        plain_actions.append(f"{t('Share an honest review')}: {safe_url(review_url)}")
     elif kind == 'delivery_issue_received':
-        buttons.append(button('View your order', action_url))
-        plain_actions.append(f'View your order: {safe_url(action_url)}')
+        buttons.append(button(t('View your order'), action_url))
+        plain_actions.append(f'{t("View your order")}: {safe_url(action_url)}')
     elif kind == "tracking":
         tracking_url = safe_url(context.get("tracking_url"))
-        buttons.append(button("Track all details", tracking_url))
-        plain_actions.append(f"Track all details: {tracking_url}")
+        buttons.append(button(t("Track all details"), tracking_url))
+        plain_actions.append(f"{t('Track all details')}: {tracking_url}")
     else:
         for index, action in enumerate(actions):
             if action == 'remove_line':
@@ -241,21 +244,21 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
             parts = urlsplit(action_url)
             query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "choice"] + [("choice", action)]
             url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-            label = labels.get(action, action.replace("_", " ").capitalize())
+            label = t(labels.get(action, action.replace("_", " ").capitalize()))
             destructive = action in {"refund", "cancel_order", "cancel_affected_item"}
             buttons.append(button(label, url, primary=index == 0 and not destructive, destructive=destructive))
             plain_actions.append(f"{label}: {url}")
     if kind == 'delivery_confirmation' and safe_url(context.get('tracking_url')):
-        buttons.append(button('Track all details', context['tracking_url'], primary=False))
-        plain_actions.append('Track all details: ' + context['tracking_url'])
+        buttons.append(button(t('Track all details'), context['tracking_url'], primary=False))
+        plain_actions.append(t('Track all details') + ': ' + context['tracking_url'])
     action_html = f'''<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:30px"><tr><td style="border-top:1px solid #edf0ec;padding-top:26px;font-family:{FONT}">
       <h2 style="margin:0 0 8px;font-size:15px;line-height:23px;font-weight:600;color:#26392f">{action_heading}</h2>
       <p style="margin:0 0 20px;font-size:13px;line-height:22px;color:#6a766e">{note}</p>
       {''.join(buttons)}</td></tr></table>'''
     unsubscribe = safe_url(unsubscribe_url)
-    footer = f"This message relates to order {order} placed on {website}."
+    footer = t("This message relates to order {order} placed on {website}.", order=order, website=website)
     html_body = f'''<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="x-apple-disable-message-reformatting">
+<html lang="{t.html_language}" dir="{t.direction}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="x-apple-disable-message-reformatting">
 <title>{escape(subject)}</title>
 <!--[if !mso]><!--><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"><!--<![endif]-->
 <style>body,table,td,a{{font-family:{FONT}}}table{{border-collapse:separate}}a{{text-decoration:none}}@media only screen and (max-width:620px){{.outer{{padding:20px 12px!important}}.content{{padding:28px 24px 30px!important}}.heading{{font-size:28px!important;line-height:35px!important}}.brand{{padding:0 8px 22px!important}}}}</style>
@@ -265,18 +268,18 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff"><tr><td class="outer" align="center" style="padding:44px 16px">
 <!--[if mso]><table role="presentation" width="600" align="center"><tr><td><![endif]-->
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;margin:0 auto">
-<tr><td class="brand" style="padding:0 4px 28px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td valign="middle">{logo}</td><td align="right" valign="middle" style="font-family:{FONT};font-size:11px;line-height:18px;color:#738076">ORDER<br><strong style="font-size:13px;font-weight:600;color:#34493c">{escape(order)}</strong></td></tr></table></td></tr>
+<tr><td class="brand" style="padding:0 4px 28px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td valign="middle">{logo}</td><td align="right" valign="middle" style="font-family:{FONT};font-size:11px;line-height:18px;color:#738076">{escape(t("ORDER"))}<br><strong style="font-size:13px;font-weight:600;color:#34493c">{escape(order)}</strong></td></tr></table></td></tr>
 <tr><td bgcolor="#f5f5f5" style="background:#f5f5f5;border:1px solid #e0e0e0;border-radius:0;overflow:hidden">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="content" style="padding:40px 40px 36px;font-family:{FONT}">
 <p style="margin:0 0 16px;color:#557364;font-size:10px;line-height:16px;font-weight:600;letter-spacing:1.8px">{eyebrow}</p>
 <h1 class="heading" style="margin:0 0 18px;font-family:{FONT};font-size:34px;line-height:41px;letter-spacing:-1.2px;font-weight:600;color:#193b2d">{heading}</h1>
 <p style="margin:0;font-family:{FONT};font-size:15px;line-height:26px;color:#637167">{intro}</p>
 {panel}{items_html}{action_html}
-<p style="margin:24px 0 0;font-family:{FONT};font-size:12px;line-height:20px;color:#7a857d">With care,<br><strong style="font-weight:500;color:#42584a">The {escape(website)} team</strong></p>
+<p style="margin:24px 0 0;font-family:{FONT};font-size:12px;line-height:20px;color:#7a857d">{escape(t("With care,"))}<br><strong style="font-weight:500;color:#42584a">{escape(t("The {website} team", website=website))}</strong></p>
 </td></tr></table></td></tr>
 <tr><td align="center" style="padding:24px 20px 0;font-family:{FONT};font-size:11px;line-height:19px;color:#7a847c">{escape(footer)}
-{f'<p style="margin:12px 0 0"><a href="{escape(unsubscribe, quote=True)}" style="font-family:{FONT};font-size:11px;line-height:19px;color:#68796d;text-decoration:underline">Unsubscribe from movement and review emails</a></p>' if unsubscribe else ''}
+{f'<p style="margin:12px 0 0"><a href="{escape(unsubscribe, quote=True)}" style="font-family:{FONT};font-size:11px;line-height:19px;color:#68796d;text-decoration:underline">{escape(t("Unsubscribe from movement and review emails"))}</a></p>' if unsubscribe else ''}
 </td></tr></table><!--[if mso]></td></tr></table><![endif]-->
 </td></tr></table></body></html>'''
-    plain = "\n\n".join(filter(None, [subject, intro, "\n".join(detail_lines), "\n".join(plain_items), note, "\n".join(plain_actions), footer, f"Unsubscribe from movement and review emails: {unsubscribe}" if unsubscribe else ""]))
+    plain = "\n\n".join(filter(None, [subject, intro, "\n".join(detail_lines), "\n".join(plain_items), note, "\n".join(plain_actions), footer, f"{t('Unsubscribe from movement and review emails')}: {unsubscribe}" if unsubscribe else ""]))
     return subject, html_body, plain
