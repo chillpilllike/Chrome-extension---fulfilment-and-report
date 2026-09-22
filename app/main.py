@@ -26378,6 +26378,7 @@ def startup() -> None:
                 threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
                 threading.Thread(target=welcome_email_loop, name="new-order-welcome", daemon=True).start()
+                threading.Thread(target=shopify_dispatch_loop, name="shopify-dispatch", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
                 threading.Thread(target=airwallex_refunds.loop, name="airwallex-refunds", daemon=True).start()
                 threading.Thread(target=airwallex_retry_loop, name="airwallex-webhook-retry", daemon=True).start()
@@ -39299,6 +39300,11 @@ def after_order_filter_removal(case: dict[str, Any], actions: list[str]) -> list
 
 
 def after_order_tracking_is_current(case: dict[str, Any]) -> bool:
+    if case.get('case_type') == 'shopify_dispatch':
+        try:
+            return shopify_dispatch.validate(case)
+        except Exception:
+            return False
     if not case.get("tracking_code"):
         return case.get("case_type") not in {"tracking", "delivery_confirmation"}
     if case.get("tracking_provider") != "epg":
@@ -40233,6 +40239,9 @@ def send_after_order_email(
         ).get("url"))
     elif allowed:
         action_url = clean_text(create_after_order_action_link(case_id, request, test_mode=force_test or after_order_email_test_mode()).get("url"))
+    elif case.get('case_type') == 'shopify_dispatch':
+        from app.services.care_sms import order_link
+        branded_tracking_url = order_link(case.get('sender_domain'),case.get('odoo_order_id'))
     elif showcase_kind == "package_movement" or (not showcase_kind and not template_kind and case.get("case_type") == "tracking"):
         branded_tracking_url = clean_text(create_after_order_action_link(
             case_id, request, allowed_override=[], test_mode=force_test or after_order_email_test_mode(), view_only=True,
@@ -40259,7 +40268,7 @@ def send_after_order_email(
         preference_eligible = (
             template_kind == "trustpilot_review"
             or showcase_kind in {"package_movement", "trustpilot_review"}
-            or (not allowed and case.get("case_type") == "tracking")
+            or (not allowed and case.get("case_type") in {"tracking", "shopify_dispatch"})
         )
         if preference_eligible and not test_mode and after_order_tracking_updates_opted_out(case, recipient):
             raise ValueError("This customer opted out of package movement and review emails for this site.")
@@ -40329,6 +40338,10 @@ def send_after_order_email(
     if case.get("case_type") == "tracking" and not allowed:
         event_revision = hashlib.sha256(json.dumps({key: event_context.get(key) for key in ("latest_status", "latest_location", "last_update_at")}, sort_keys=True).encode()).hexdigest()
     idempotency_key = f"after-order:{case_id}:{showcase_kind or template_kind or case.get('case_type')}:{uuid.uuid4().hex if test_mode else event_revision}"
+    if case.get('case_type') == 'shopify_dispatch' and not force_test:
+        if template_kind or showcase_kind or reminder_parent:
+            raise HTTPException(409, 'DTC dispatch notifications have no alternate templates or reminders.')
+        idempotency_key = f'after-order:{case_id}:shopify_dispatch:once'
     if template_kind in followup_kinds and not test_mode:
         idempotency_key = delivery_followups.key(case, template_kind, 'draft') + ':' + str(case.get('decision_version') or 0)
     if case.get('case_type') == 'new_order_welcome' and not force_test:
@@ -40663,7 +40676,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             review = after_order_unavailable_review(case, for_send=True)
             if review["blocked"] or not review["approved"]:
                 raise HTTPException(409, review["reason"])
-        preference_eligible = original.get("template_kind") in {"package_movement", "trustpilot_review"} or (original.get("template_kind") == "tracking" and (case.get("context") or {}).get("risk_state") == "in_transit")
+        preference_eligible = original.get("template_kind") in {"package_movement", "trustpilot_review", "shopify_dispatch"} or (original.get("template_kind") == "tracking" and (case.get("context") or {}).get("risk_state") == "in_transit")
         if preference_eligible and after_order_tracking_updates_opted_out(case, original["recipient"]):
             raise HTTPException(409, "This customer opted out of these notifications.")
     with db() as conn:
@@ -40677,6 +40690,8 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
                     manual_refunds.validate_message(locked)
                 elif locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
                     delivery_followups.validate(case, locked['template_kind'])
+                elif locked.get('template_kind') == 'shopify_dispatch':
+                    shopify_dispatch.validate(case)
                 elif case.get('case_type') != 'new_order_welcome':
                     raise HTTPException(409, 'Automatic live email is limited to new-order welcome cases.')
                 else:
@@ -41483,6 +41498,27 @@ def after_order_automation_loop() -> None:
             run_after_order_automation()
         except Exception as exc:
             print(f"After-order automation needs attention: {clean_error_message(exc)}", flush=True)
+
+
+def shopify_dispatch_loop():
+    while True:
+        time.sleep(60)
+        try:
+            request = after_order_monitor_request()
+            if request:
+                shopify_dispatch.run_checks(request)
+        except Exception as exc:
+            shopify_dispatch.last_error = clean_error_message(exc)
+            print(f"DTC dispatch monitor needs attention: {shopify_dispatch.last_error}", flush=True)
+
+
+@app.get('/api/after-order/shopify-dispatch/status')
+def api_shopify_dispatch_status():
+    with db() as conn:
+        rows = conn.execute("SELECT status,COUNT(*) AS count FROM after_order_messages WHERE template_kind='shopify_dispatch' GROUP BY status").fetchall()
+    return {'version':'dtc-dispatch-v1','started_at':get_service_settings().get('after_order_shopify_dispatch_started_at'),
+            'last_check_at':shopify_dispatch.last_check_at,'last_error':shopify_dispatch.last_error,
+            'test_mode':after_order_email_test_mode(),'messages':rows_to_dicts(rows)}
 
 
 def after_order_monitor_request():
@@ -45575,6 +45611,8 @@ from app.services.warehouse_dispatch_delay import Monitor as WarehouseDispatchMo
 warehouse_dispatch_delay = WarehouseDispatchMonitor(globals())
 from app.services.welcome_email import Monitor as WelcomeEmailMonitor
 welcome_emails = WelcomeEmailMonitor(globals())
+from app.services.shopify_dispatch import Monitor as ShopifyDispatchMonitor
+shopify_dispatch = ShopifyDispatchMonitor(globals())
 from app.services.delivery_followup import Monitor as DeliveryFollowupMonitor, receipt_correction
 delivery_followups = DeliveryFollowupMonitor(globals())
 from app.services.manual_refunds import ManualRefunds

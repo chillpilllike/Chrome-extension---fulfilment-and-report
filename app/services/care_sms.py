@@ -18,8 +18,14 @@ PROVIDERS = {'odoo', 'msg91', 'twilio'}
 KINDS = {'expected_dispatch', 'item_unavailable', 'no_alternatives', 'delivery_confirmation',
          'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment',
          'price_difference', 'refund_request_received', 'refund_completed',
-         'trustpilot_review', 'delivery_issue_received', 'new_order_welcome'}
-AUTOMATIC_KINDS = {'trustpilot_review', 'delivery_issue_received', 'new_order_welcome'}
+         'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch'}
+AUTOMATIC_KINDS = {'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch'}
+
+
+def template_kind(kind):
+    # Reuse the approved, translated tracking template; dispatch has its own
+    # event, send permission and deduplication, never a fabricated carrier scan.
+    return 'package_movement' if kind == 'shopify_dispatch' else kind
 SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
  id INTEGER PRIMARY KEY AUTOINCREMENT, email_id INTEGER NOT NULL UNIQUE REFERENCES after_order_messages(id),
  case_id INTEGER NOT NULL REFERENCES after_order_cases(id), provider TEXT NOT NULL,
@@ -383,18 +389,24 @@ class SMS:
         link = order_link(domain,case.get('odoo_order_id'))
         if kind == 'trustpilot_review':
             link = r.trustpilot_review_url(domain)
+        if kind == 'shopify_dispatch':
+            from app.services.shopify_dispatch import sms_link
+            if not email['test_mode']:
+                r.shopify_dispatch.validate(case)
+            link = sms_link(case,link)
+        source_kind = template_kind(kind)
         brand = (case.get('context') or {}).get('website_name') or case.get('store_name') or domain
         values = {'order':case['odoo_order_name'],'brand':brand,'url':link}
-        body = render(kind,values['order'],brand,link)
+        body = render(source_kind,values['order'],brand,link)
         requested_language = normalize_language((case.get('context') or {}).get('requested_language')) or 'en_US'
         language_allowed = self.language_allowed(case,requested_language)
-        translated_body, language = sms_translation(requested_language if language_allowed else 'en_US',kind,brand,values['order'],link)
+        translated_body, language = sms_translation(requested_language if language_allowed else 'en_US',source_kind,brand,values['order'],link)
         if not language_allowed:
             language={'requested_language':requested_language,'sent_language':'en_US','fallback_reason':'SMS translation is not enabled on this website; English fallback.'}
         if translated_body and provider != 'msg91':
             body = translated_body
         if provider == 'msg91':
-            mapping = {**mapping,**(mapping.get('templates',{}).get(kind) or {})}
+            mapping = {**mapping,**(mapping.get('templates',{}).get(source_kind) or {})}
             if not requested_language.startswith('en'):
                 language = {'requested_language':requested_language,'sent_language':'en_US',
                             'fallback_reason':'No approved localized MSG91 template; English fallback.'}
@@ -402,7 +414,7 @@ class SMS:
                     localized = conn.execute('''SELECT mapping_json FROM after_order_sms_localizations
                         WHERE provider='msg91' AND sender=? AND language IN (?,?) AND template_kind=?
                         ORDER BY CASE WHEN language=? THEN 0 ELSE 1 END''',
-                        (mapping.get('sender',''),requested_language,requested_language.split('_')[0],kind,requested_language)).fetchone()
+                        (mapping.get('sender',''),requested_language,requested_language.split('_')[0],source_kind,requested_language)).fetchone()
                 if localized and language_allowed and not catalog(requested_language).get('delivery_blocked'):
                     candidate = json.loads(localized['mapping_json'])
                     try:
@@ -415,7 +427,7 @@ class SMS:
                         mapping = candidate
                         language = {'requested_language':requested_language,'sent_language':requested_language,'fallback_reason':''}
             if kind in AUTOMATIC_KINDS or not requested_language.startswith('en'):
-                if language['sent_language'].startswith('en') and not mapping.get('templates', {}).get(kind):
+                if language['sent_language'].startswith('en') and not mapping.get('templates', {}).get(source_kind):
                     raise ValueError('Configure a dedicated approved MSG91 template for this notification.')
                 verify_followup_template(mapping)
             template = mapping.get('text') or ''
@@ -463,7 +475,8 @@ class SMS:
             config = self.config()
             base = dict(config['mappings'].get(f"{case['store_id']}:{case['website_id']}", {}).get('msg91') or {})
             kind = snapshot['kind']
-            english = base.get('templates', {}).get(kind)
+            source_kind = template_kind(kind)
+            english = base.get('templates', {}).get(source_kind)
             language = {'requested_language':requested, 'sent_language':'en_US',
                         'fallback_reason':'No approved localized MSG91 template; English fallback.'}
             mapping = None
@@ -471,7 +484,7 @@ class SMS:
             localized = conn.execute('''SELECT mapping_json FROM after_order_sms_localizations
                 WHERE provider='msg91' AND sender=? AND language IN (?,?) AND template_kind=?
                 ORDER BY CASE WHEN language=? THEN 0 ELSE 1 END''',
-                (base.get('sender',''), requested, requested.split('_')[0], kind, requested)).fetchone()
+                (base.get('sender',''), requested, requested.split('_')[0], source_kind, requested)).fetchone()
             if localized and self.language_allowed(case,requested) and data.get('complete') and not data.get('delivery_blocked'):
                 candidate = json.loads(localized['mapping_json'])
                 try:
@@ -491,6 +504,9 @@ class SMS:
             link = order_link(snapshot['domain'], case.get('odoo_order_id'))
             if kind == 'trustpilot_review':
                 link = r.trustpilot_review_url(snapshot['domain'])
+            if kind == 'shopify_dispatch':
+                from app.services.shopify_dispatch import sms_link
+                link = sms_link(case,link)
             values = {'order':case['odoo_order_name'], 'url':link,
                       'brand':(case.get('context') or {}).get('website_name') or case.get('store_name') or snapshot['domain']}
             template = mapping.get('text') or ''
@@ -566,7 +582,7 @@ class SMS:
             allowed = {'delivered'} if resend else {'awaiting_approval','failed','provider_failed','undelivered'}
             if row['status'] not in allowed or row['attempts'] >= 3 or (resend and automatic):
                 raise ValueError('SMS already attempted or uncertain. Check provider logs; do not resend.')
-            if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome'}:
+            if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome','shopify_dispatch'}:
                 raise ValueError('This is a once-only notification. Duplicate sends are blocked.')
             if automatic:
                 if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and snapshot['kind'] not in AUTOMATIC_KINDS):
@@ -574,6 +590,11 @@ class SMS:
             elif digest(row) != approval:
                 raise ValueError('Review the current SMS preview before approving.')
             case = r.after_order_case_by_id(row['case_id']); r.require_after_order_case_in_scope(case)
+            if snapshot['kind'] == 'shopify_dispatch':
+                if email['status'] in {'cancelled','superseded'}:
+                    raise ValueError('This dispatch notification was cancelled or superseded.')
+                if not row['test_mode']:
+                    r.shopify_dispatch.validate(case)
             if snapshot['kind'] == 'new_order_welcome':
                 if email['status'] in {'cancelled','superseded'}:
                     raise ValueError('This welcome notification was cancelled or superseded.')
@@ -588,7 +609,11 @@ class SMS:
             if snapshot['kind'] == 'trustpilot_review':
                 expected_link = r.trustpilot_review_url(snapshot['domain'])
             urls = re.findall(r'https?://[^\s<>"\']+', row['body'])
-            if expected_link not in urls or any(url != expected_link for url in urls):
+            expected_urls = {expected_link}
+            if snapshot['kind'] == 'shopify_dispatch':
+                from app.services.shopify_dispatch import carrier_url
+                expected_urls = {carrier_url(x['url']) for x in case['context']['dispatch_parcels']}
+            if set(urls) != expected_urls:
                 raise ValueError('SMS contains an outdated or incorrect order link. Prepare a new notification; do not resend this preview.')
             if snapshot['kind'] in {'tracking', 'package_movement'}:
                 if (case.get('context') or {}).get('risk_state') != 'in_transit':
@@ -609,7 +634,7 @@ class SMS:
                     raise ValueError('Customer SMS has been disabled for this website.')
                 financial = snapshot['kind'] in {'price_difference','alternative_payment','refund_request_received','refund_completed'}
                 followup = snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}
-                welcome = snapshot['kind'] == 'new_order_welcome'
+                welcome = snapshot['kind'] in {'new_order_welcome','shopify_dispatch'}
                 if (self.phone(case) != row['recipient'] or r.request_fingerprint(case) != snapshot['request_fingerprint']
                         or case.get('sender_domain') != snapshot['domain']
                         or (not financial and not followup and not welcome and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
@@ -623,7 +648,7 @@ class SMS:
                     r.delivery_followups.reserve(conn, case, snapshot['kind'], 'sms', sms_id)
                 if snapshot['kind'] == 'warehouse_dispatch_delay':
                     r.warehouse_dispatch_delay.validate(case)
-                if snapshot['kind'] in {'tracking', 'package_movement'} and r.after_order_tracking_updates_opted_out(case, case.get('customer_email') or ''):
+                if snapshot['kind'] in {'tracking', 'package_movement', 'shopify_dispatch'} and r.after_order_tracking_updates_opted_out(case, case.get('customer_email') or ''):
                     raise ValueError('Customer opted out of tracking updates.')
                 email = conn.execute('SELECT * FROM after_order_messages WHERE id=?', (row['email_id'],)).fetchone()
                 payload = json.loads(dict(email).get('payload_json') or '{}')

@@ -46,6 +46,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     if kind == "tracking" and context.get("risk_state") == "suspected_lost":
         kind = "package_lost"
     content = {
+        "shopify_dispatch": ("DISPATCH UPDATE", "Follow your delivery", "Follow your delivery", "There’s a new update on your package. You can find the latest details below.", "Follow your delivery", "See the full tracking history and the latest carrier updates."),
         "manual_refund_completed": ("REFUND CONFIRMED", "Your refund has been processed.", "Your refund has been processed", "Our team has confirmed that your refund has been processed. The refund details are below.", "When will the credit appear?", "Please allow 24–48 hours for the credit to appear. Your bank or payment provider may take longer. If you need help, reply to this email."),
         "refund_confirmed": ("REFUND CONFIRMED", "Your refund has been sent.", "Your refund has been processed", "We’ve successfully sent a refund for your order. You’ll find the amount and destination below.", "When will the credit appear?", "The credit may appear in your account within 24–72 business hours. Timing depends on your bank. If it has not appeared after this time, reply to this email and our team will help."),
         "relay_request": ("PAYMENT REQUEST", "Your invoice is ready.", "Complete payment", "Complete your order securely using the payment button below. Your invoice will be charged in USD at the amount shown.", "Complete your payment", "Your payment link belongs to this order. If you return later, use this same link."),
@@ -180,6 +181,10 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         panel_label = t("CARRIER DELIVERY DETAILS")
         panel_value = t("Delivered") + ": " + str(context.get("delivery_datetime") or t("Not provided by carrier"))
         panel_detail = t("Location") + ": " + str(context.get("delivery_location") or t("Not provided by carrier")) + "\n" + t("Destination postal code") + ": " + str(context.get("delivery_postal_code") or t("Not provided by carrier"))
+    elif kind == "shopify_dispatch":
+        panel_label = t("DISPATCH UPDATE")
+        panel_value = ', '.join(x['number'] for x in context.get('dispatch_parcels', []))
+        panel_detail = t("Date and time") + ": " + str(context.get('dispatch_created_at') or '')
     elif kind == "tracking":
         panel_label = t("LATEST CARRIER UPDATE")
         panel_value = t("Status") + ": " + str(context.get("latest_status") or t("Not provided by carrier"))
@@ -231,6 +236,16 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     elif kind == 'delivery_issue_received':
         buttons.append(button(t('View your order'), action_url))
         plain_actions.append(f'{t("View your order")}: {safe_url(action_url)}')
+    elif kind == "shopify_dispatch":
+        for parcel in context.get('dispatch_parcels', []):
+            from app.services.shopify_dispatch import carrier_url
+            url = carrier_url(parcel['url'])
+            label = t('Track all details') + ' — ' + parcel['number']
+            buttons.append(button(label, url))
+            plain_actions.append(label + ': ' + url)
+        tracking_url = safe_url(context.get('tracking_url'))
+        buttons.append(button(t('View your order'), tracking_url, primary=False))
+        plain_actions.append(t('View your order') + ': ' + tracking_url)
     elif kind == "tracking":
         tracking_url = safe_url(context.get("tracking_url"))
         buttons.append(button(t("Track all details"), tracking_url))

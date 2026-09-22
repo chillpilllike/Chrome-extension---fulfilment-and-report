@@ -89,6 +89,9 @@ def request_fingerprint(case: dict[str, Any]) -> str:
     }
     if context.get('parcel_mapping'):
         snapshot['parcel_mapping'] = context['parcel_mapping']
+    if case.get('case_type') == 'shopify_dispatch':
+        snapshot['dispatch_source'] = context.get('dispatch_source')
+        snapshot['dispatch_parcels'] = context.get('dispatch_parcels')
     return hashlib.sha256(json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
 
 
