@@ -26378,6 +26378,7 @@ def startup() -> None:
                 threading.Thread(target=odoo_ordered_tag_reconciliation_loop, daemon=True).start()
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
                 threading.Thread(target=welcome_email_loop, name="new-order-welcome", daemon=True).start()
+                threading.Thread(target=email_approval_loop, name="email-approval-dispatch", daemon=True).start()
                 threading.Thread(target=shopify_dispatch_loop, name="shopify-dispatch", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
                 threading.Thread(target=airwallex_refunds.loop, name="airwallex-refunds", daemon=True).start()
@@ -26598,6 +26599,8 @@ def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]
     values = {}
     raw_tracking_config: Optional[dict[str, Any]] = None
     for key, value in payload.settings.items():
+        if key in {'after_order_email_bypass_approval','after_order_email_bypass_existing','after_order_email_bypass_enabled_at'}:
+            raise HTTPException(400,'Use Customer email approval settings to change automatic sending.')
         if value == "********":
             values[key] = current.get(key, "")
         elif key in {
@@ -40426,11 +40429,14 @@ def send_after_order_email(
         from app.services.welcome_email import permitted
         candidate = {'provider':provider_name,'status':'awaiting_approval','attempt_count':0,
                      'test_mode':test_mode,'recipient':recipient,'payload_json':json.dumps(message_payload),
-                     'template_kind':showcase_kind or template_kind or case.get('case_type')}
-        care_sms.companion(reservation['id'])
-        if permitted(candidate, test_mode=after_order_email_test_mode()):
-            result = retry_after_order_email(reservation['id'], request, policy_exception=True)
+                     'template_kind':showcase_kind or template_kind or case.get('case_type'),'created_at':now}
+        if permitted(candidate, test_mode=after_order_email_test_mode(), settings=get_email_approval_settings()):
+            try:
+                result = retry_after_order_email(reservation['id'], request, policy_exception=True)
+            finally:
+                care_sms.companion(reservation['id'])
             return {**result, 'message_id':reservation['id'],'recipient':recipient}
+        care_sms.companion(reservation['id'])
         return {"ok": True, "status": "awaiting_approval", "message_id": reservation["id"],
                 "message": "Email prepared for team approval. Nothing has been sent.", "recipient": recipient}
         if not test_mode and after_order_email_test_mode():
@@ -40612,6 +40618,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if automatic or (not approval_digest and not policy_exception):
         raise HTTPException(409, "Team approval is required for each email attempt. Review it in Email log.")
     from app.services.email_log import automatic_retry_reason
+    from app.services.email_approval import bypassed
     with db() as conn:
         original = conn.execute("SELECT * FROM after_order_messages WHERE id=?", (message_id,)).fetchone()
     if not original:
@@ -40637,7 +40644,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         raise HTTPException(409, "Relay retries use the payment worker and its original idempotency key.")
     if policy_exception:
         from app.services.welcome_email import permitted
-        if not permitted(original, test_mode=after_order_email_test_mode()):
+        if not permitted(original, test_mode=after_order_email_test_mode(), settings=get_email_approval_settings()):
             raise HTTPException(409, 'This email requires individual team approval.')
         approval_digest = hashlib.sha256(str(original.get('payload_json') or '').encode()).hexdigest()
     if original.get('status') not in {'awaiting_approval', 'failed'} or original.get('provider') not in {'resend','odoo'}:
@@ -40651,7 +40658,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if care_delivery.suppressed(original['recipient'], bool(original.get('test_mode'))):
         raise HTTPException(409, 'This recipient is suppressed after a bounce or complaint.')
     if original.get('provider') == 'odoo':
-        return alternative_workflow.retry_quote_email(original, approval_digest=approval_digest)
+        return alternative_workflow.retry_quote_email(original, approval_digest=approval_digest, policy_exception=policy_exception)
     reason = retry_block_reason({**original, 'status': 'failed'}, test_mode=after_order_email_test_mode(), test_recipient=after_order_test_recipient())
     if reason:
         raise HTTPException(409, reason)
@@ -40664,6 +40671,9 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         raise HTTPException(409, "The email's links may have expired. Create a current email from the order instead.")
     if not original.get("test_mode"):
         case = hydrate_after_order_recipient_and_domain(case, strict=True, allow_cancelled=manual_completion)
+        if policy_exception and case.get('current_decision') and (original.get('template_kind') in {'expected_dispatch','item_unavailable','package_lost','delivery_confirmation'} or
+                (original.get('template_kind')=='tracking' and (case.get('context') or {}).get('risk_state')=='suspected_lost')):
+            raise HTTPException(409,'Customer already responded. An old action email will not be sent automatically.')
         if automatic and case.get('current_decision'):
             raise HTTPException(409, 'Customer already responded; review before resending an old action email.')
         if case.get("confirmed_at") and original.get("template_kind") not in {"trustpilot_review", "delivery_issue_received", "manual_refund_completed"}:
@@ -40683,7 +40693,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         locked = conn.execute("SELECT * FROM after_order_messages WHERE id=? FOR UPDATE", (message_id,)).fetchone()
         locked = row_to_dict(locked)
         if policy_exception:
-            if not permitted(locked, test_mode=after_order_email_test_mode()):
+            if not permitted(locked, test_mode=after_order_email_test_mode(), settings=get_email_approval_settings()):
                 raise HTTPException(409, 'Automatic email exception is no longer eligible.')
             if not locked.get('test_mode'):
                 if manual_completion:
@@ -40692,10 +40702,12 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
                     delivery_followups.validate(case, locked['template_kind'])
                 elif locked.get('template_kind') == 'shopify_dispatch':
                     shopify_dispatch.validate(case)
-                elif case.get('case_type') != 'new_order_welcome':
-                    raise HTTPException(409, 'Automatic live email is limited to new-order welcome cases.')
-                else:
+                elif case.get('case_type') == 'new_order_welcome':
                     welcome_emails.validate(case)
+                elif bypassed(locked,get_email_approval_settings()):
+                    pass  # Email approval only; all case/event validators still run below.
+                else:
+                    raise HTTPException(409, 'This email requires team approval.')
         if not locked.get('test_mode') and locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
             delivery_followups.reserve(conn, case, locked['template_kind'], 'email', message_id)
         if locked.get('status') not in {'awaiting_approval', 'failed'} or hashlib.sha256(str(locked.get('payload_json') or '').encode()).hexdigest() != approval_digest:
@@ -40722,6 +40734,9 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
                 warehouse_dispatch_delay.validate(case)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
+        if policy_exception and not locked.get('test_mode'):
+            from app.services.email_approval import require_current_action_notice
+            require_current_action_notice(case,locked,globals())
         if saved_payload.get('_care_reminder_parent'):
             care_reminders.validate(int(saved_payload['_care_reminder_parent']),int(saved_payload['_care_reminder_number']),case)
         if not locked.get('test_mode') and case.get('case_type') == 'item_unavailable' and not manual_completion:
@@ -40743,6 +40758,8 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     try:
         if after_order_email_test_mode() and not locked.get("test_mode"):
             raise ValueError("Live retry stopped because test mode is enabled.")
+        if policy_exception and not permitted(original,test_mode=after_order_email_test_mode(),settings=get_email_approval_settings()):
+            raise ValueError('Automatic email permission was disabled before sending. Review this message manually.')
         provider = create_email_provider(locked["provider"], {"api_key": os.getenv("RESEND_API_KEY", "")})
         result = provider.send({k:v for k,v in saved_payload.items() if not k.startswith('_care_')}, idempotency_key=retry_key)
         provider_id = clean_text(result.get("id"))
@@ -41470,7 +41487,7 @@ def api_after_order_settings() -> dict[str, Any]:
     return {
         "ok": True,
         "email_paused_domains": sorted(PAUSED_DOMAINS),
-        "email_approval_required": True,
+        "email_approval_required": get_email_approval_settings().get('after_order_email_bypass_approval') != 'true',
         "financial_approval_required": True,
         "refund_mode": "manual" if manual_refunds.enabled() else "provider",
         "approval_only_live": after_order_approval_only_live(),
@@ -41498,6 +41515,46 @@ def after_order_automation_loop() -> None:
             run_after_order_automation()
         except Exception as exc:
             print(f"After-order automation needs attention: {clean_error_message(exc)}", flush=True)
+
+
+def get_email_approval_settings():
+    # Read at every send boundary, rather than waiting for five-minute settings caches.
+    from app.services.email_approval import KEYS
+    with db() as conn:
+        rows=conn.execute('SELECT key,value FROM app_settings WHERE key IN (?,?,?)',KEYS).fetchall()
+    return {row['key']:str(row['value'] or '') for row in rows}
+
+
+@app.get('/api/after-order/settings/email-approval')
+def api_email_approval_settings():
+    from app.services.email_approval import KEYS
+    settings=get_email_approval_settings()
+    return {'bypass_approval':settings.get(KEYS[0])=='true','include_existing':settings.get(KEYS[1])=='true',
+            'enabled_at':settings.get(KEYS[2]),'financial_approval_required':True,'sms_approval_unchanged':True,
+            'last_check_at':email_approval_dispatcher.last_check_at}
+
+
+@app.post('/api/after-order/settings/email-approval')
+def api_set_email_approval_settings(payload: dict[str,Any]):
+    from app.services.email_approval import KEYS
+    enabled=payload.get('bypass_approval');existing=payload.get('include_existing',False)
+    if type(enabled) is not bool or type(existing) is not bool:
+        raise HTTPException(400,'Provide boolean bypass_approval and include_existing values.')
+    if enabled and payload.get('confirm_live_sends') is not True:
+        raise HTTPException(400,'Confirm automatic email sending before enabling this option.')
+    set_service_settings({KEYS[0]:'true' if enabled else 'false',KEYS[1]:'true' if enabled and existing else 'false',KEYS[2]:utc_now() if enabled else ''})
+    return api_email_approval_settings()
+
+
+def email_approval_loop():
+    while True:
+        try:
+            request=after_order_monitor_request()
+            if request:
+                email_approval_dispatcher.run(request)
+        except Exception as exc:
+            print(f'Email approval dispatcher needs attention: {clean_error_message(exc)}',flush=True)
+        time.sleep(30)
 
 
 def shopify_dispatch_loop():
@@ -45611,6 +45668,8 @@ from app.services.warehouse_dispatch_delay import Monitor as WarehouseDispatchMo
 warehouse_dispatch_delay = WarehouseDispatchMonitor(globals())
 from app.services.welcome_email import Monitor as WelcomeEmailMonitor
 welcome_emails = WelcomeEmailMonitor(globals())
+from app.services.email_approval import Dispatcher as EmailApprovalDispatcher
+email_approval_dispatcher = EmailApprovalDispatcher(globals())
 from app.services.shopify_dispatch import Monitor as ShopifyDispatchMonitor
 shopify_dispatch = ShopifyDispatchMonitor(globals())
 from app.services.delivery_followup import Monitor as DeliveryFollowupMonitor, receipt_correction

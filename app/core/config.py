@@ -143,6 +143,9 @@ DEFAULT_SERVICE_SETTINGS = {
     # this immediately before sending, including for messages queued earlier.
     "after_order_email_test_mode": os.getenv("AFTER_ORDER_EMAIL_TEST_MODE", "true"),
     "after_order_approval_only_live": "false",
+    "after_order_email_bypass_approval": "false",
+    "after_order_email_bypass_existing": "false",
+    "after_order_email_bypass_enabled_at": "",
     "after_order_automation_enabled": "false",
     "after_order_warehouse_delay_enabled": "false",
     "after_order_welcome_started_at": "",

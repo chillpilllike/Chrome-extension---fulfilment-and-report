@@ -163,8 +163,8 @@ class MonitorTests(unittest.TestCase):
           CREATE TABLE app_settings(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT);
           CREATE TABLE stores(id INTEGER,odoo_db TEXT,active INTEGER);
           INSERT INTO stores VALUES(1,'test',1);
-          CREATE TABLE order_lines(store_id INTEGER,odoo_order_id INTEGER,odoo_order_name TEXT);
-          INSERT INTO order_lines VALUES(1,99,'NC9');
+          CREATE TABLE order_lines(store_id INTEGER,odoo_order_id INTEGER,odoo_order_name TEXT,odoo_order_date TEXT DEFAULT '2026-09-23');
+          INSERT INTO order_lines(store_id,odoo_order_id,odoo_order_name) VALUES(1,99,'NC9');
           CREATE TABLE shopify_export_order_map(state_scope TEXT,dest_name TEXT,src_order_key TEXT,dest_order_id TEXT);
           INSERT INTO shopify_export_order_map VALUES('dtc','DTC','test:NC9','9');
           CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY AUTOINCREMENT,case_key TEXT UNIQUE,
@@ -201,6 +201,8 @@ class MonitorTests(unittest.TestCase):
         self.sms=Mock();self.retry=Mock()
         self.m.r.namespace['care_sms']=SimpleNamespace(companion=self.sms)
         self.m.r.namespace['retry_after_order_email']=self.retry
+        self.m.r.namespace['after_order_case_is_in_scope']=lambda case:True
+        self.m.r.namespace['after_order_case_by_id']=lambda cid:{'id':cid}
 
     def tearDown(self):self.conn.close()
 
@@ -231,7 +233,7 @@ class MonitorTests(unittest.TestCase):
         self.m.run_checks(None)
         self.send.assert_not_called()
         self.assertIsNone(self.conn.execute("SELECT value FROM app_settings WHERE key LIKE 'shopify_dispatch_cursor:%'").fetchone())
-        self.conn.execute("INSERT INTO order_lines VALUES(1,99,'NC9')")
+        self.conn.execute("INSERT INTO order_lines(store_id,odoo_order_id,odoo_order_name) VALUES(1,99,'NC9')")
         self.m.run_checks(None);self.assertEqual(1,self.send.call_count)
 
     def test_initial_activation_never_backfills(self):
@@ -239,6 +241,13 @@ class MonitorTests(unittest.TestCase):
         self.send.assert_not_called();self.client.graphql.assert_not_called()
         saved=self.conn.execute('SELECT value FROM app_settings WHERE key=?',(SETTING,)).fetchone()
         self.assertIsInstance(json.loads(saved['value']),str)
+
+    def test_pre_cutoff_order_is_excluded_without_scan_error(self):
+        self.m.r.namespace['after_order_case_is_in_scope']=lambda case:False
+        self.m.run_checks(None)
+        self.send.assert_not_called()
+        self.assertIsNone(self.m.last_error)
+        self.assertIsNotNone(self.conn.execute("SELECT value FROM app_settings WHERE key LIKE 'shopify_dispatch_cursor:%'").fetchone())
 
     def test_all_pages_processed_before_cursor_advances(self):
         final=self.client.graphql.return_value

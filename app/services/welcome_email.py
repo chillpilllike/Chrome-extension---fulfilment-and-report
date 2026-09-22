@@ -16,16 +16,23 @@ def delay_minutes(placed, completed=None):
     return max(0, ((moment(completed) if completed else datetime.now(timezone.utc))-moment(placed)).total_seconds()/60)
 
 
-def permitted(message, *, test_mode):
-    payload = json.loads(message.get('payload_json') or '{}')
-    if message.get('provider') != 'resend' or message.get('status') != 'awaiting_approval' or int(message.get('attempt_count') or 0):
+def permitted(message, *, test_mode, settings=None):
+    try:
+        payload = json.loads(message.get('payload_json') or '{}')
+    except (TypeError,ValueError):
+        return False
+    if not isinstance(payload,dict):
+        return False
+    if message.get('provider') not in {'resend','odoo'} or message.get('status') != 'awaiting_approval' or int(message.get('attempt_count') or 0):
         return False
     if payload.get('cc') or payload.get('bcc'):
         return False
     if message.get('test_mode'):
-        return (str(message.get('recipient') or '').lower() == TEST_RECIPIENT
+        return (message.get('provider') == 'resend' and str(message.get('recipient') or '').lower() == TEST_RECIPIENT
                 and payload.get('to') == [TEST_RECIPIENT])
-    return not test_mode and message.get('template_kind') in {KIND, 'shopify_dispatch', 'trustpilot_review', 'delivery_issue_received', 'manual_refund_completed'}
+    from app.services.email_approval import bypassed
+    baseline = message.get('provider') == 'resend' and not message.get('provider_message_id') and message.get('template_kind') in {KIND, 'shopify_dispatch', 'trustpilot_review', 'delivery_issue_received', 'manual_refund_completed'}
+    return not test_mode and (baseline or bypassed(message, settings or {}))
 
 
 def recent_confirmed(order, started_at):

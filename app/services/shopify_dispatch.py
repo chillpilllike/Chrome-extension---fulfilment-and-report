@@ -188,6 +188,8 @@ class Monitor:
                 (SELECT 1 FROM after_order_messages m WHERE m.case_id=c.id)''').fetchall()
         for row in pending:
             try:
+                if not r.after_order_case_is_in_scope(r.after_order_case_by_id(row['id']) or {}):
+                    continue
                 r.send_after_order_email(row['id'],request)
             except Exception as exc:
                 self.last_error=r.clean_error_message(exc)
@@ -220,13 +222,16 @@ class Monitor:
                     return True  # Not an order exported by this app.
                 if len(mappings)!=1:
                     raise ValueError('Ambiguous DTC export mapping.')
-                orders=conn.execute('''SELECT DISTINCT l.store_id,l.odoo_order_id,l.odoo_order_name,s.odoo_db
+                orders=conn.execute('''SELECT l.store_id,l.odoo_order_id,l.odoo_order_name,s.odoo_db,MIN(l.odoo_order_date) AS odoo_order_date
                     FROM order_lines l JOIN stores s ON s.id=l.store_id
-                    WHERE (s.odoo_db || ':' || l.odoo_order_name)=? AND s.active=1''',
+                    WHERE (s.odoo_db || ':' || l.odoo_order_name)=? AND s.active=1
+                    GROUP BY l.store_id,l.odoo_order_id,l.odoo_order_name,s.odoo_db''',
                     (mappings[0]['src_order_key'],)).fetchall()
             if len(orders)!=1:
                 return False  # Retry after import; never guess an order or skip it via cursor advancement.
             order=dict(orders[0])
+            if not r.after_order_case_is_in_scope(order):
+                return True  # Expected exclusion, not a scanner failure or a reason to block its cursor.
             if not {'SRC_ODOO_DB:'+order['odoo_db'],'SRC_ODOO_ORDER:'+order['odoo_order_name']}.issubset(node['order']['tags']):
                 raise ValueError('Original-order tags do not match the export ledger.')
             parcels=evidence(node,source['src_order_id'],started)

@@ -244,7 +244,7 @@ class Workflow:
             ON CONFLICT(message_id,attempt_number) DO UPDATE SET status=excluded.status,error=excluded.error,updated_at=excluded.updated_at''',
             (message['id'],message['attempt_count'],status,mail.get('error') or None,str(mail['id']),r.utc_now(),r.utc_now()))
 
-    def retry_quote_email(self, message, approval_digest=''):
+    def retry_quote_email(self, message, approval_digest='', policy_exception=False):
         if not approval_digest:
             raise HTTPException(409, 'Review and approve the saved quotation email before sending.')
         r = self.r
@@ -266,6 +266,10 @@ class Workflow:
             if (latest['status'] not in ('awaiting_approval','failed') or latest['attempt_count'] >= 5
                     or hashlib.sha256(str(latest['payload_json']).encode()).hexdigest() != approval_digest):
                 raise HTTPException(409,'Only a failed quotation email with fewer than five attempts may be retried.')
+            if policy_exception:
+                from app.services.welcome_email import permitted
+                if not permitted(dict(latest),test_mode=r.after_order_email_test_mode(),settings=r.get_email_approval_settings()):
+                    raise HTTPException(409,'Automatic quotation email permission is disabled.')
             row = next((offer for offer in self.rows(case['id'],False) if
                 str((offer.get('selection') or {}).get('result',{}).get('mail',{}).get('id')) == str(message['provider_message_id'])),None)
             if not row or row['selection']['status'] != 'waiting_payment' or case.get('current_decision') != 'offer_alternatives':
@@ -273,7 +277,7 @@ class Workflow:
             attempt=int(latest['attempt_count'] or 0)+1
             conn.execute("INSERT INTO after_order_email_attempts(message_id,attempt_number,status,created_at,updated_at) VALUES(?,?,'sending',?,?)",
                 (message['id'],attempt,r.utc_now(),r.utc_now()))
-            self.event(conn,case,'quotation_email_send_approved',row['line_id'],actor='team',message_id=message['id'],attempt=attempt,approval_digest=approval_digest)
+            self.event(conn,case,'quotation_email_send_approved',row['line_id'],actor='system' if policy_exception else 'team',message_id=message['id'],attempt=attempt,approval_digest=approval_digest)
             try:
                 r.OdooClient(r.get_store(case['store_id'])).execute('sale.order','after_order_retry_quote_email',
                     [[case['odoo_order_id']],row['selection']['result']['quote_id'],json.loads(latest['payload_json'])['odoo_approval_digest']])
