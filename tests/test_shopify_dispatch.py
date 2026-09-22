@@ -210,7 +210,9 @@ class MonitorTests(unittest.TestCase):
         row=self.conn.execute('SELECT * FROM after_order_cases').fetchone()
         self.assertEqual('[]',row['affected_items_json'])  # No invented parcel-to-line mapping.
         self.assertEqual('shopify_dtc',row['tracking_provider'])
-        self.assertIsNotNone(self.conn.execute("SELECT value FROM app_settings WHERE key LIKE 'shopify_dispatch_cursor:%'").fetchone())
+        saved=self.conn.execute("SELECT value FROM app_settings WHERE key LIKE 'shopify_dispatch_cursor:%'").fetchone()
+        self.assertIsNotNone(saved)
+        self.assertIsInstance(json.loads(saved['value']),str)  # Valid JSONB input on production PostgreSQL.
 
     def test_resume_unattempted_email_and_missing_sms_only(self):
         self.m.run_checks(None)
@@ -235,7 +237,8 @@ class MonitorTests(unittest.TestCase):
     def test_initial_activation_never_backfills(self):
         self.settings.clear();self.m.run_checks(None)
         self.send.assert_not_called();self.client.graphql.assert_not_called()
-        self.assertIsNotNone(self.conn.execute('SELECT value FROM app_settings WHERE key=?',(SETTING,)).fetchone())
+        saved=self.conn.execute('SELECT value FROM app_settings WHERE key=?',(SETTING,)).fetchone()
+        self.assertIsInstance(json.loads(saved['value']),str)
 
     def test_all_pages_processed_before_cursor_advances(self):
         final=self.client.graphql.return_value

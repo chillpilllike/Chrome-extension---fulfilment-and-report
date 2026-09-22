@@ -130,7 +130,7 @@ class Monitor:
             if not started:
                 with r.db() as conn:
                     conn.execute('INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING',
-                                 (SETTING,r.utc_now(),r.utc_now()))
+                                 (SETTING,json.dumps(r.utc_now()),r.utc_now()))
                 return
             self.last_error = None
             self.resume_pending(request)
@@ -139,7 +139,11 @@ class Monitor:
                 cursor_key='shopify_dispatch_cursor:'+shop
                 with r.db() as conn:
                     saved=conn.execute('SELECT value FROM app_settings WHERE key=?',(cursor_key,)).fetchone()
-                since=max(moment(started),moment(saved['value'])-timedelta(minutes=5)) if saved else moment(started)
+                saved_value=saved['value'] if saved else None
+                # PostgreSQL decodes JSONB; lightweight test DBs retain JSON text.
+                if isinstance(saved_value,str) and saved_value.startswith('"'):
+                    saved_value=json.loads(saved_value)
+                since=max(moment(started),moment(saved_value)-timedelta(minutes=5)) if saved else moment(started)
                 through=datetime.now(timezone.utc)
                 query=f'updated_at:>={since.isoformat()} updated_at:<={through.isoformat()}'
                 cursor=None; complete=True
@@ -168,7 +172,7 @@ class Monitor:
                     with r.db() as conn:
                         conn.execute('''INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?)
                             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at''',
-                            (cursor_key,through.isoformat(),r.utc_now()))
+                            (cursor_key,json.dumps(through.isoformat()),r.utc_now()))
             self.last_check_at=r.utc_now()
 
     def resume_pending(self, request):
