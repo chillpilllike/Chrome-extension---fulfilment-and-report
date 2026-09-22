@@ -80,7 +80,7 @@ class PostgresConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(self.created),1);self.assertEqual(results[0]['request_id'],results[1]['request_id'])
 
     def test_global_daily_cap_serializes_different_orders(self):
-        self.service.snapshot=lambda store,order:{'order_key':f'order-{order}','order_name':f'TEST-{order}',
+        self.service.snapshot=lambda store,order,*args:{'order_key':f'order-{order}','order_name':f'TEST-{order}',
             'currency':'CAD','rounding':'.01','remaining':'100'}
         tokens=[]
         for i in range(8):

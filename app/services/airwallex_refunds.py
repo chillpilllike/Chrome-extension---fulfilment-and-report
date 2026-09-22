@@ -7,6 +7,11 @@ import json
 import re
 import uuid
 import time
+import logging
+import socket
+import xmlrpc.client
+from concurrent.futures import Future, ThreadPoolExecutor
+from app.services.refund_cache import RefundMetadataCache
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -20,6 +25,9 @@ from pydantic import BaseModel, Field, ConfigDict
 from app.services.airwallex_api import server_request
 from app.services.airwallex_refund_errors import RefundProviderError, readable_error, transfer_failure, field_label
 from app.services.airwallex_hub import verify_webhook_signature
+
+_reads = ThreadPoolExecutor(max_workers=8, thread_name_prefix='refund-read')
+_log = logging.getLogger(__name__)
 
 ZERO = Decimal('0')
 # Failed transfers can fail after being paid. Keep funds reserved until finance reconciles.
@@ -173,6 +181,7 @@ class AirwallexRefunds:
         self.configuration, self.staff_check = configuration, staff_check
         self.list_stores = list_stores or (lambda: [])
         self.last_history_sync = 0
+        self.metadata = RefundMetadataCache()
         self.notifications = notifications
         if notifications:
             notifications.refunds = self
@@ -245,6 +254,8 @@ class AirwallexRefunds:
             except ValueError:
                 payload = {}
             raise RefundProviderError(readable_error(payload, response.status_code)) from None
+        except requests.Timeout:
+            raise ValueError('Airwallex took too long to respond. Check refund history before trying again; do not send a second refund while the first is unconfirmed.') from None
         except requests.RequestException:
             raise ValueError('Airwallex could not be reached. Refresh status before retrying.') from None
 
@@ -309,7 +320,30 @@ class AirwallexRefunds:
         roots = {p['commercial_partner_id'][0] for p in contacts if p.get('commercial_partner_id')}
         return len(contacts) == 2 and len(roots) == 1 and all(p.get('commercial_partner_id') for p in contacts)
 
-    def snapshot(self, store_id, order_id):
+    @staticmethod
+    def metadata_scope(store):
+        return (store.odoo_url, store.odoo_db, getattr(store, 'odoo_user', ''),
+                hashlib.sha256(str(getattr(store, 'odoo_password', '')).encode()).hexdigest())
+
+    def recipient_details(self, store, partner_id):
+        # XML-RPC transports cannot be shared concurrently: use a separate client.
+        client = self.client_factory(store)
+        people = client.search_read('res.partner', [('id', '=', partner_id)],
+            ['name', 'email', 'street', 'street2', 'city', 'zip', 'country_id', 'state_id'])
+        if len(people) != 1:
+            raise ValueError('The order customer could not be loaded from Odoo. Ask the administrator to check this order.')
+        partner = people[0]
+        scope = self.metadata_scope(store)
+        def code(model, reference):
+            if not reference:
+                return ''
+            return self.metadata.get((scope, model, reference[0]),
+                lambda: client.search_read(model, [('id', '=', reference[0])], ['code'])[0]['code'])
+        return partner, code('res.country', partner['country_id']), code('res.country.state', partner['state_id'])
+
+    def snapshot(self, store_id, order_id, transfers=None):
+        # Independent Airwallex read overlaps Odoo verification; financial results are never cached.
+        transfers = _reads.submit(self.transfers) if transfers is None else transfers
         store, client = self.order_client(store_id)
         domain = [('id', '=', order_id)]
         if store.website_id:
@@ -319,11 +353,13 @@ class AirwallexRefunds:
         if len(orders) != 1:
             raise ValueError('Order does not belong to the selected store.')
         order = orders[0]
+        recipient = _reads.submit(self.recipient_details, store, order['partner_id'][0])
         order_currency = order['currency_id'][1]
         total = money(order['amount_total'])
         if total <= 0:
             raise ValueError('The order has no positive refundable value.')
-        fields = client.execute('payment.transaction', 'fields_get', [], {'attributes': ['type']})
+        metadata_key = self.metadata_scope(store)
+        fields = self.metadata.get(('transaction-fields', metadata_key), lambda: client.execute('payment.transaction', 'fields_get', [], {'attributes': ['type']}))
         tx_fields = ['amount', 'currency_id', 'state', 'operation', 'sale_order_ids', 'provider_code', 'provider_id', 'partner_id', 'reference']
         tx_fields += [k for k in ('airwallex_deposit_id', 'airwallex_payment_amount',
                                   'airwallex_payment_currency_id', 'payment_method_id') if k in fields]
@@ -332,13 +368,9 @@ class AirwallexRefunds:
         if txs and 'source_transaction_id' in fields:
             children = client.search_read('payment.transaction', [('source_transaction_id', 'in', [t['id'] for t in txs])], tx_fields)
             txs = list({t['id']: t for t in [*txs, *children]}.values())
-        invoices = client.search_read('account.move', [('id', 'in', order['invoice_ids'])],
+        invoices = client.search_read('account.move', ['|', ('id', 'in', order['invoice_ids']),
+            '&', ('reversed_entry_id', 'in', order['invoice_ids']), '&', ('move_type', '=', 'out_refund'), ('state', '=', 'posted')],
             ['move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'currency_id', 'partner_id']) if order['invoice_ids'] else []
-        if order['invoice_ids']:
-            reversals = client.search_read('account.move', [('reversed_entry_id', 'in', order['invoice_ids']),
-                ('move_type', '=', 'out_refund'), ('state', '=', 'posted')],
-                ['move_type', 'state', 'payment_state', 'amount_total', 'amount_residual', 'currency_id', 'partner_id'])
-            invoices = list({i['id']: i for i in [*invoices, *reversals]}.values())
         posted = [i for i in invoices if i['state'] == 'posted']
         if any(i['currency_id'][1] != order_currency for i in posted):
             raise ValueError('Mixed invoice currencies require finance reconciliation.')
@@ -397,7 +429,8 @@ class AirwallexRefunds:
         if len(currencies) > 1:
             raise ValueError('Payments in multiple currencies need finance allocation.')
         currency = next(iter(currencies), order_currency)
-        currency_record = client.search_read('res.currency', [('name', '=', currency)], ['rounding'])
+        currency_record = self.metadata.get(('currency', metadata_key, currency),
+            lambda: client.search_read('res.currency', [('name', '=', currency)], ['rounding']))
         if len(currency_record) != 1:
             raise ValueError('Currency precision is unavailable.')
         rounding = money(currency_record[0]['rounding'])
@@ -441,16 +474,13 @@ class AirwallexRefunds:
         key = self.order_key(store, order_id)
         with self.db() as c:
             local = c.execute('SELECT * FROM airwallex_refund_payouts WHERE order_key=?', (key,)).fetchall()
-        transfers = self.transfers()
+        transfers = transfers.result() if isinstance(transfers, Future) else transfers
         used, history = refund_totals(order['name'], currency, transfers, local)
         # Conservative: credit notes and external provider refunds may overlap; do not guess.
         accounting_deduction = (credits + provider_refunds) * rate
         remaining = max(ZERO, cap - used - accounting_deduction)
         remaining = (remaining / rounding).to_integral_value(rounding=ROUND_DOWN) * rounding
-        partner = client.search_read('res.partner', [('id', '=', order['partner_id'][0])],
-            ['name', 'email', 'street', 'street2', 'city', 'zip', 'country_id', 'state_id'])[0]
-        country = client.search_read('res.country', [('id', '=', partner['country_id'][0])], ['code'])[0]['code'] if partner['country_id'] else ''
-        state = client.search_read('res.country.state', [('id', '=', partner['state_id'][0])], ['code'])[0]['code'] if partner['state_id'] else ''
+        partner, country, state = recipient.result()
         return {'store_id': store_id, 'order_id': order_id, 'order_key': key, 'order_name': order['name'],
                 'customer': partner['name'], 'order_value': str(total), 'order_currency': order_currency,
                 'order_equivalent': str(total * rate), 'conversion_rate': str(rate),
@@ -468,7 +498,10 @@ class AirwallexRefunds:
 
     def schema(self, params):
         params = {k: str(v)[:80] for k, v in params.items() if k in SCHEMA_KEYS and v}
-        return self.call('POST', '/api/v1/beneficiary_form_schemas/generate', data=params)
+        cfg = self.config()
+        identity = (self.account_key(cfg), cfg.get('state'), cfg.get('api_version'))
+        return self.metadata.get(('schema', identity, json.dumps(params, sort_keys=True)),
+            lambda: self.call('POST', '/api/v1/beneficiary_form_schemas/generate', data=params))
 
     def funding_currencies(self):
         # Redact on the server, so exact balances never reach the browser/network response.
@@ -508,8 +541,9 @@ class AirwallexRefunds:
     def prepare(self, form):
         if not form.recipient_confirmed or not form.other_refunds_checked:
             raise ValueError('Confirm recipient details and check for refunds through other providers first.')
-        self.daily_guard(self.daily_usage())
-        snapshot = self.snapshot(form.store_id, form.order_id)
+        transfers = _reads.submit(self.transfers)
+        snapshot = self.snapshot(form.store_id, form.order_id, transfers)
+        self.daily_guard(self.daily_usage(transfers.result()))
         amount = amount_guard(form.amount, snapshot['remaining'], snapshot['rounding'])
         if amount != money(snapshot['remaining']) and (not form.edit_acknowledged or not form.edit_reason.strip()):
             raise ValueError('Acknowledge the Edit cost warning and enter a reason for a partial refund.')
@@ -579,14 +613,15 @@ class AirwallexRefunds:
             existing = c.execute('SELECT * FROM airwallex_refund_payouts WHERE request_id=?', (rid,)).fetchone()
             if existing:
                 return self.public_row(existing)
-            fresh = self.snapshot(payload['store_id'], payload['order_id'])
+            transfers = _reads.submit(self.transfers)
+            fresh = self.snapshot(payload['store_id'], payload['order_id'], transfers)
             if fresh['order_key'] != key or fresh['currency'] != transfer['transfer_currency']:
                 raise ValueError('Order currency or identity changed. Review again.')
             amount_guard(payload['amount'], fresh['remaining'], fresh['rounding'])
             self.call('POST', '/api/v1/transfers/validate', data=transfer)
             self.check_funding(transfer)
             submitted_at = datetime.now(timezone.utc)
-            self.daily_guard(self.daily_usage(now=submitted_at))
+            self.daily_guard(self.daily_usage(transfers.result(), now=submitted_at))
             now = submitted_at.isoformat()
             recipient = transfer['beneficiary']['bank_details'].get('account_name', '')
             c.execute('''INSERT INTO airwallex_refund_payouts
@@ -640,7 +675,10 @@ class AirwallexRefunds:
             raise ValueError('Refund request was not found.')
         if row['account_key'] != self.account_key(self.config()):
             raise ValueError('Refund belongs to another Airwallex account.')
-        matches = self.transfers(request_id=rid)
+        if row.get('transfer_id') and UUID_RE.fullmatch(row['transfer_id']):
+            matches = [self.call('GET', '/api/v1/transfers/' + row['transfer_id'])]
+        else:
+            matches = self.transfers(request_id=rid)
         matches = [t for t in matches if t.get('request_id') == rid]
         if len(matches) == 1:
             self.record_result(rid, matches[0])
@@ -794,14 +832,23 @@ class AirwallexRefunds:
     def router(self):
         r = APIRouter(prefix='/api/airwallex/refunds', dependencies=[Depends(self.auth)])
         def guarded(fn, *args, **kwargs):
+            started = time.monotonic()
             try:
                 return fn(*args, **kwargs)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from None
             except HTTPException:
                 raise
-            except Exception:
-                raise HTTPException(503, 'Refund verification is unavailable. Check refund history and transfer status before retrying.') from None
+            except (socket.timeout, TimeoutError, requests.Timeout):
+                raise HTTPException(504, 'Payment verification took too long. Check refund history before trying again. If a refund is pending or needs a status check, do not submit another one.') from None
+            except xmlrpc.client.Fault:
+                _log.warning('Refund operation %s failed: Odoo rejected the request', getattr(fn, '__name__', type(fn).__name__))
+                raise HTTPException(503, 'Odoo could not verify the order details. Ask the administrator to check the Odoo connection and access permissions, then try again.') from None
+            except Exception as exc:
+                _log.warning('Refund operation %s failed (%s)', getattr(fn, '__name__', type(fn).__name__), type(exc).__name__)
+                raise HTTPException(503, 'Refund verification is temporarily unavailable. Check refund history and transfer status before retrying. If this continues, contact the administrator.') from None
+            finally:
+                _log.info('Refund operation %s completed in %.2fs', getattr(fn, '__name__', type(fn).__name__), time.monotonic() - started)
         @r.get('/connection')
         def connection():
             guarded(self.config)

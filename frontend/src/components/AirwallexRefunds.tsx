@@ -25,6 +25,7 @@ const selectors:Record<string,string> = {
 const errorMessage = (error:unknown) => {
  const message=error instanceof Error?error.message:String(error)
  if(/failed to fetch|networkerror|load failed/i.test(message))return 'Unable to reach the app. Check your connection, then check refund history before retrying.'
+ if(/<html|<!doctype|bad gateway|gateway timeout|internal server error|service unavailable/i.test(message))return 'The server could not finish this request. Check refund history and transfer status before trying again. If a refund is pending or needs a status check, do not send another one.'
  if(message.trim().startsWith('{')||message.trim().startsWith('['))return 'Some refund details could not be accepted. Check the form and try again.'
  return message.replace(/^Error:\s*/, '')
 }
@@ -57,15 +58,17 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
  const [amount,setAmount]=useState(''),[editing,setEditing]=useState(false),[editDialog,setEditDialog]=useState(false),[editReason,setEditReason]=useState('')
  const [recipientConfirmed,setRecipientConfirmed]=useState(false),[otherChecked,setOtherChecked]=useState(false)
  const [review,setReview]=useState<Review|null>(null),[busy,setBusy]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState('')
+ const [busySeconds,setBusySeconds]=useState(0)
  const [history,setHistory]=useState<Payout[]>([]),[connected,setConnected]=useState(false),[loadingSchema,setLoadingSchema]=useState(false)
  const [funding,setFunding]=useState<FundingCurrency[]>([]),[sourceCurrency,setSourceCurrency]=useState('')
- const refreshFunding=()=>api<{currencies:FundingCurrency[]}>('/api/airwallex/refunds/funding-currencies').then(r=>setFunding(r.currencies)).catch(e=>{setFunding([]);setError(errorMessage(e))})
+ const refreshFunding=()=>api<{currencies:FundingCurrency[]}>('/api/airwallex/refunds/funding-currencies').then(r=>{setFunding(r.currencies);setConnected(true)}).catch(e=>{setConnected(false);setFunding([]);setError(errorMessage(e))})
  const [daily,setDaily]=useState<DailyLimit|null>(null)
  const refreshLimits=()=>api<DailyLimit>('/api/airwallex/refunds/limits').then(setDaily).catch(e=>{setDaily(null);setError(errorMessage(e))})
  const generation=useRef(0), schemaGeneration=useRef(0), actionLock=useRef(false)
  const post=<T,>(path:string,data:unknown)=>api<T>(`/api/airwallex/refunds${path}`,{method:'POST',body:JSON.stringify(data)})
  const refreshHistory=()=>api<{rows:Payout[]}>('/api/airwallex/refunds/history').then(r=>setHistory(r.rows)).catch(e=>setError(errorMessage(e)))
- useEffect(()=>{api<{connected:boolean}>('/api/airwallex/refunds/connection').then(r=>setConnected(r.connected)).catch(e=>setError(errorMessage(e)));void refreshHistory();void refreshLimits();void refreshFunding();const timer=setInterval(()=>{void refreshHistory();void refreshLimits()},15000);return()=>clearInterval(timer)},[])
+ useEffect(()=>{void refreshHistory();void refreshLimits();void refreshFunding();const timer=setInterval(()=>{if(!actionLock.current&&document.visibilityState==='visible'){void refreshHistory();void refreshLimits()}},30000);return()=>clearInterval(timer)},[])
+ useEffect(()=>{setBusySeconds(0);if(!busy)return;const started=Date.now();const timer=setInterval(()=>setBusySeconds(Math.floor((Date.now()-started)/1000)),1000);return()=>clearInterval(timer)},[busy])
  const reset=()=>{generation.current++;schemaGeneration.current++;setSnapshot(null);setSchema(null);setValues({});setReview(null);setOrders([]);setError('');setNotice('');setRecipientConfirmed(false);setOtherChecked(false);setEditing(false);setEditReason('')}
  useEffect(()=>{reset();setSelectedStore(storeId||'')},[storeId])
  async function loadSchema(next:Record<string,string>, initial=false) {
@@ -114,6 +117,7 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
  return <div className="space-y-5">
   <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-5"><div><h2 className="text-xl font-semibold">Refund an order</h2><p className="mt-1 text-sm text-muted-foreground">Return customer funds using your shared Airwallex account. After success, the customer receives a confirmation from the order’s website with masked account details.</p></div><span className={`rounded-full px-3 py-1 text-xs font-medium ${connected?'bg-emerald-50 text-emerald-800':'bg-amber-50 text-amber-800'}`}>{connected?'Airwallex connected':'Checking Airwallex connection'}</span></div>
   <div role="status" className="rounded-lg border bg-muted/40 p-4 text-sm">{daily?<><strong>Daily refund limit: {daily.successful} / {daily.limit} successful · {daily.pending} pending · {daily.remaining} available</strong><p className="mt-1 text-muted-foreground">Shared across all stores and staff. Resets at midnight India time (Asia/Kolkata). Up to 5 successful refunds from each day’s submissions. Pending or uncertain transfers temporarily reserve a slot; confirmed failed and cancelled transfers do not count. Airwallex transfers labelled “refund” are included.</p>{daily.remaining===0&&<p className="mt-2 font-medium text-red-700">All daily slots are used or reserved. A failed or cancelled pending transfer frees a slot; otherwise the limit resets at midnight.</p>}</>:"Checking the daily refund limit…"}</div>
+  {busy&&busySeconds>=5&&<p role="status" className="text-sm text-muted-foreground">{busy} · {busySeconds}s. {busySeconds>=15?"Odoo or Airwallex is taking longer than usual. Keep this page open; do not start a second refund.":"Checking with Odoo and Airwallex…"}</p>}
   {error&&<div role="alert" className="whitespace-pre-line rounded-lg border border-red-200 bg-red-50 p-4 text-red-800">{error}</div>}
   {notice&&<div role="status" className="rounded-lg border bg-blue-50 p-4 text-blue-900">{notice}</div>}
   {busy&&<p role="status" className="text-sm text-muted-foreground">{busy}…</p>}

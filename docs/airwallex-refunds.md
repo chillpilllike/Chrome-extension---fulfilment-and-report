@@ -66,3 +66,9 @@ Verification: test_refund_emails.py covers routing, masking, cancelled orders, e
 Refund confirmation rollout uses the app refund submission timestamp (India date), not the Odoo order creation date. An older order refunded on or after the configured rollout date is eligible. Existing held jobs are rechecked automatically; sent messages retain their once-only protection.
 
 Confirmed paid app refunds also add the Odoo `Refunded` tag and an internal chatter note with the specific amount, currency and transfer reference. This runs independently of email sending. A separate durable sync record, worker lock and existing-note lookup make retries safe; partial refund notes do not imply a full-order refund. Manual history imports are not automatically annotated by this worker.
+
+## Refund page latency
+
+Order verification overlaps fresh Airwallex transfer history and recipient reads with Odoo payment checks. Each parallel Odoo path owns its XML-RPC client. Review and submit reuse their operation's fresh history for the order cap and daily limit, while the final submit still rechecks live order/payment/deposit data, funds and provider validation under the existing reservation locks. No cross-request financial eligibility or balances are cached. Only schema, Odoo field definitions, country/state codes and currency precision are cached for five minutes in a bounded, connection-scoped metadata cache. Known transfers reconcile by ID instead of listing history again.
+
+The page avoids duplicate balance checks and pauses background refresh during active work. Slow operations show elapsed time. Odoo faults, timeouts and HTML gateway errors become staff-readable messages; uncertain submission outcomes still require reconciliation and are never automatically resent. Server diagnostics log operation names, duration and exception type without payment/customer data.
