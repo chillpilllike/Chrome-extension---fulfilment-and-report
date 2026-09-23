@@ -10,8 +10,12 @@ website, consent/suppression, test destination and source event again. Maximum
 three attempts. Confirmed failures can be retried. Only confirmed delivered
 messages can be explicitly resent with duplicate-charge confirmation. Once-only
 movement/review/issue acknowledgements cannot be duplicated. Uncertain or pending
-sends cannot be blindly resent. Financial-event SMS remains held pending the
-verified adapter. Welcome emails and reminders intentionally do not create SMS.
+sends cannot be blindly resent. Financial-event SMS uses verified manual-refund,
+customer-request and unpaid-quotation adapters, with individual SMS approval.
+Welcome emails create automatic SMS; reminders intentionally do not create SMS.
+Known fixed-line numbers are blocked before sending, with a valid contact mobile
+used when available. Definitive MSG91 delivery failures can recover after one
+hour (three attempts total); rejected/blocked/uncertain messages stay held.
 
 ## MSG91 delivery report connection
 

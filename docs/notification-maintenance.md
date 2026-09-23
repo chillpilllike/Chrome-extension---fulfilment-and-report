@@ -39,3 +39,9 @@ and does not record a customer decision or perform financial operations.
 MSG91 read-only audit on 2026-09-23: 166 of 168 configured English mappings match
 approved active versions. Boostgo/Espot welcome text matches but has status 0
 (not approved). These stay held; no other brand's template is substituted.
+
+NC29769 and NC29714 have Australian numbers classified as FIXED_LINE, and the
+provider reports rejection. The contact resolver now skips known fixed lines;
+a mobile number must be supplied if neither stored contact number supports SMS.
+NC29725 and NC29913 are New Zealand mobile numbers with definitive failure
+receipts (generic provider error), eligible for bounded recovery if still current.
