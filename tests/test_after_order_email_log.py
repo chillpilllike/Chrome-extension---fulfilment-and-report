@@ -57,6 +57,7 @@ class LogHandlersTests(unittest.TestCase):
         CREATE TABLE after_order_cases (id INTEGER PRIMARY KEY,store_id INTEGER,website_id INTEGER,odoo_order_name TEXT,context_json TEXT DEFAULT '{}',sender_domain TEXT);
         CREATE TABLE after_order_messages (id INTEGER PRIMARY KEY,case_id INTEGER,provider TEXT,recipient TEXT,sender TEXT,subject TEXT,status TEXT,last_error TEXT,provider_message_id TEXT,test_mode INTEGER,attempt_count INTEGER,created_at TEXT,updated_at TEXT,template_kind TEXT,payload_json TEXT,request_fingerprint TEXT,idempotency_key TEXT,html_preview TEXT);
         CREATE TABLE after_order_email_attempts (id INTEGER PRIMARY KEY,message_id INTEGER,attempt_number INTEGER,status TEXT,error TEXT,provider_message_id TEXT,created_at TEXT,updated_at TEXT,UNIQUE(message_id,attempt_number));
+        CREATE TABLE after_order_case_events(case_id INTEGER,event_type TEXT,details_json TEXT);
         INSERT INTO stores VALUES (1,'Demo Australia'),(2,'Demo Canada');
         INSERT INTO after_order_cases(id,store_id,website_id,odoo_order_name) VALUES (1,1,4,'DEMO-100'),(2,2,5,'DEMO-200');
         """)
@@ -185,3 +186,30 @@ class LogHandlersTests(unittest.TestCase):
         for change in ({'test_mode':1},{'attempt_count':4},{'status':'bounced'},{'status':'complained'},
                        {'updated_at':now.isoformat()},{'created_at':(now-timedelta(hours=24)).isoformat()}):
             self.assertTrue(automatic_retry_reason({**row,**change},now))
+
+    def test_authorized_hourly_recovery_reuses_exact_payload_key(self):
+        from app.services.email_log import automatic_retry_reason
+        self.scope.update(automatic_retry_reason=automatic_retry_reason,
+            after_order_email_test_mode=lambda:False,
+            hydrate_after_order_recipient_and_domain=lambda c,**kw:{**c,'customer_email':'test@example.test'},
+            request_fingerprint=lambda c:'snapshot',after_order_tracking_is_current=lambda c:True,
+            after_order_sender=lambda c:('notifications@example.test','example.test'))
+        old=(datetime.now(timezone.utc)-timedelta(hours=2)).isoformat()
+        for state in ('failed','delivery_unknown','sending','retrying'):
+            self.conn.execute('DELETE FROM after_order_email_attempts')
+            self.conn.execute('DELETE FROM after_order_case_events')
+            self.conn.execute("INSERT INTO after_order_case_events VALUES(1,'email_policy_authorized',?)",(json.dumps({'message_id':1}),))
+            payload={'to':['test@example.test'],'html':'<p>Saved email</p>','_care_retry_key':'original-provider-key'}
+            self.conn.execute("UPDATE after_order_messages SET template_kind='new_order_welcome',test_mode=0,status=?,attempt_count=1,created_at=?,updated_at=?,payload_json=? WHERE id=1",(state,old,old,json.dumps(payload)))
+            result=self.scope['retry_after_order_email'](1,object(),automatic=True)
+            self.assertEqual('sent',result['status'])
+            self.assertEqual('original-provider-key',self.provider.send.call_args.kwargs['idempotency_key'])
+            self.assertNotIn('_care_retry_key',self.provider.send.call_args.args[0])
+
+    def test_unapproved_failed_record_never_auto_retried(self):
+        from app.services.email_log import automatic_retry_reason
+        self.scope['automatic_retry_reason']=automatic_retry_reason
+        old=(datetime.now(timezone.utc)-timedelta(hours=2)).isoformat()
+        self.conn.execute("UPDATE after_order_messages SET test_mode=0,created_at=?,updated_at=? WHERE id=1",(old,old))
+        with self.assertRaises(self.HTTPError):self.scope['retry_after_order_email'](1,object(),automatic=True)
+        self.provider.send.assert_not_called()

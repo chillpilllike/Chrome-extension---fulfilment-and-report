@@ -68,13 +68,15 @@ class ApprovalHoldTests(unittest.TestCase):
                 fn(1, None)
             send.assert_not_called()
 
-    def test_workers_and_legacy_retry_cannot_send(self):
+    def test_legacy_retry_without_approval_cannot_send(self):
         tree = ast.parse(Path('app/main.py').read_text())
         fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'retry_after_order_email')
         fn.decorator_list = []
         scope = {'HTTPException': HTTPException, 'Request': Request, 'Any': Any, 'db': Mock()}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), '<retry>', 'exec'), scope)
-        for kw in ({}, {'automatic': True}, {'automatic': True, 'approval_digest': 'anything'}):
+        # Authorized hourly recovery is separately tested with stored evidence,
+        # elapsed time and exact provider-key reuse in test_after_order_email_log.
+        for kw in ({}, {'automatic': False}):
             with self.assertRaises(HTTPException) as exc:
                 scope['retry_after_order_email'](1, None, **kw)
             self.assertEqual(409, exc.exception.status_code)

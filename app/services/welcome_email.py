@@ -31,7 +31,7 @@ def permitted(message, *, test_mode, settings=None):
         return (message.get('provider') == 'resend' and str(message.get('recipient') or '').lower() == TEST_RECIPIENT
                 and payload.get('to') == [TEST_RECIPIENT])
     from app.services.email_approval import bypassed
-    baseline = message.get('provider') == 'resend' and not message.get('provider_message_id') and message.get('template_kind') in {KIND, 'shopify_dispatch', 'trustpilot_review', 'delivery_issue_received', 'manual_refund_completed'}
+    baseline = message.get('provider') == 'resend' and not message.get('provider_message_id') and message.get('template_kind') in {KIND, 'shopify_dispatch', 'trustpilot_review', 'delivery_issue_received', 'manual_refund_completed', 'refund_request_received'}
     return not test_mode and (baseline or bypassed(message, settings or {}))
 
 

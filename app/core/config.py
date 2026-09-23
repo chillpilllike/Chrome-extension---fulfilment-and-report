@@ -146,6 +146,8 @@ DEFAULT_SERVICE_SETTINGS = {
     "after_order_email_bypass_approval": "false",
     "after_order_email_bypass_existing": "false",
     "after_order_email_bypass_enabled_at": "",
+    "after_order_notifications_enabled": "false",
+    "after_order_dispatch_handling_days": "2",
     "after_order_automation_enabled": "false",
     "after_order_warehouse_delay_enabled": "false",
     "after_order_welcome_started_at": "",

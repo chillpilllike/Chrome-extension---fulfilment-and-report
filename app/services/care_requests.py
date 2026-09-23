@@ -129,7 +129,7 @@ class Requests:
                 if cursor.rowcount:
                     r.alternative_workflow.event(conn,case,'response_deadline_started',int(item['line_id']),deadline_at=(stamp+timedelta(days=3)).isoformat(),message_id=message['id'])
 
-    def run_due(self):
+    def run_due(self, *, review_only=False):
         r = self.r
         if r.after_order_email_test_mode():
             return
@@ -167,6 +167,8 @@ class Requests:
                 conn.execute('UPDATE after_order_response_windows SET state=?,outcome=?,updated_at=? WHERE case_id=? AND line_id=? AND issue_fingerprint=?',
                     ('expired' if outcome.endswith('review') else 'closed',outcome,r.utc_now(),case['id'],window['line_id'],window['issue_fingerprint']))
                 r.alternative_workflow.event(conn,case,'response_deadline_closed',window['line_id'],outcome=outcome)
+        if review_only:
+            return  # Notification worker may flag expiry, never release an order.
         with r.db() as conn:
             ready = conn.execute("SELECT case_id FROM after_order_line_removals WHERE test_mode=0 AND status IN ('auto_remove_pending','finance_review') GROUP BY case_id ORDER BY MIN(updated_at),case_id LIMIT 200").fetchall()
             for candidate in ready:

@@ -26379,6 +26379,7 @@ def startup() -> None:
                 threading.Thread(target=after_order_automation_loop, name="after-order-care", daemon=True).start()
                 threading.Thread(target=welcome_email_loop, name="new-order-welcome", daemon=True).start()
                 threading.Thread(target=email_approval_loop, name="email-approval-dispatch", daemon=True).start()
+                threading.Thread(target=notification_loop, name="care-notification-maintenance", daemon=True).start()
                 threading.Thread(target=shopify_dispatch_loop, name="shopify-dispatch", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
                 threading.Thread(target=airwallex_refunds.loop, name="airwallex-refunds", daemon=True).start()
@@ -40041,7 +40042,9 @@ def after_order_email_content(
         pass
 
     if (template_kind or case.get('case_type')) == 'item_unavailable':
-        no_alternatives = alternative_workflow.unavailable_without_alternatives(case)
+        no_alternatives = (set(case['context'].get('no_alternative_line_ids',[]))
+            if (case.get('context') or {}).get('_owner_test_no_alternatives')
+            else alternative_workflow.unavailable_without_alternatives(case))
         case = {**case,'context':{**(case.get('context') or {}),'no_alternative_line_ids':sorted(no_alternatives)},
                 'affected_items':[{**item,'no_alternatives':int(item['line_id']) in no_alternatives} for item in case.get('affected_items') or []]}
         offers = [offer for offer in alternative_workflow.rows(case['id'])
@@ -40188,7 +40191,10 @@ def send_after_order_email(
         delivery_followups.validate(case, template_kind)
     if case.get("case_type") == "relay_payment":
         raise HTTPException(409, "Relay payment emails use their verified payment outbox.")
-    unavailable_email = showcase_kind == "item_unavailable" or (not showcase_kind and case.get("case_type") == "item_unavailable" and template_kind != "trustpilot_review")
+    refund_ack = template_kind == 'refund_request_received'
+    if refund_ack and not (force_test or after_order_email_test_mode()):
+        refund_notices.validate(case)
+    unavailable_email = showcase_kind in {'item_unavailable','no_alternatives'} or (not showcase_kind and case.get("case_type") == "item_unavailable" and not template_kind)
     if case.get('case_type') == 'new_order_welcome' and not force_test:
         welcome_emails.validate(case)
     if case.get('case_type') == 'warehouse_dispatch_delay' and not (force_test or after_order_email_test_mode()):
@@ -40225,6 +40231,11 @@ def send_after_order_email(
         "trustpilot_review": [],
         "alternative_payment": [],
         "new_order_welcome": [],
+        "refund_request_received": [],
+        "manual_refund_completed": [],
+        "warehouse_dispatch_delay": [],
+        "shopify_dispatch": [],
+        "no_alternatives": ['exclude_item_and_proceed','cancel_order'],
     }
     allowed = showcase_actions.get(showcase_kind, after_order_allowed_actions(case) if not template_kind else [])
     if unavailable_email and 'offer_alternatives' not in after_order_allowed_actions(case):
@@ -40278,9 +40289,18 @@ def send_after_order_email(
         unsubscribe_url = create_after_order_unsubscribe_url(case, request, recipient) if preference_eligible else ""
         email_case = dict(case)
         email_case["context"] = dict(case.get("context") or {})
-        email_case['context']['three_day_policy_enabled'] = test_mode or clean_text(get_service_settings().get('after_order_completion_enabled')) == 'true'
+        email_case['context']['three_day_policy_enabled'] = test_mode or clean_text(get_service_settings().get('after_order_notifications_enabled')) == 'true' or clean_text(get_service_settings().get('after_order_completion_enabled')) == 'true'
         effective_template_kind = template_kind
         if showcase_kind:
+            if showcase_kind in {'refund_request_received','manual_refund_completed','warehouse_dispatch_delay','shopify_dispatch'}:
+                effective_template_kind=showcase_kind
+            if showcase_kind=='manual_refund_completed':
+                email_case['context']['refund']={'amount':'1.00','currency':'USD','reference':'OWNER-TEST-ONLY','completed_at':utc_now()}
+            if showcase_kind=='no_alternatives':
+                effective_template_kind='item_unavailable'
+                email_case['case_type']='item_unavailable'
+                email_case['context']['_owner_test_no_alternatives']=True
+                email_case['context']['no_alternative_line_ids']=[i['line_id'] for i in case.get('affected_items') or []]
             if showcase_kind == 'new_order_welcome':
                 email_case['case_type'] = 'new_order_welcome'
                 effective_template_kind = 'new_order_welcome'
@@ -40320,7 +40340,7 @@ def send_after_order_email(
             action_url,
             template_kind=effective_template_kind,
             unsubscribe_url=unsubscribe_url,
-            actions_override=allowed if showcase_kind else None,
+            actions_override=allowed if showcase_kind or template_kind else None,
         )
         if showcase_kind == 'alternative_payment':
             if not test_mode:
@@ -40333,6 +40353,9 @@ def send_after_order_email(
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     event_context = case.get("context") or {}
+    if test_mode:
+        subject='[TEST] '+subject
+        text_body='OWNER TEST ONLY — no customer decision or financial operation was performed.\n\n'+text_body
     event_revision = request_fingerprint(case)
     if email_case['context'].get('three_day_policy_enabled') and unavailable_email:
         event_revision += ':three-day-v1'
@@ -40349,6 +40372,8 @@ def send_after_order_email(
         idempotency_key = delivery_followups.key(case, template_kind, 'draft') + ':' + str(case.get('decision_version') or 0)
     if case.get('case_type') == 'new_order_welcome' and not force_test:
         idempotency_key = f'after-order:{case_id}:new_order_welcome:once'
+    if refund_ack and not test_mode:
+        idempotency_key = f'after-order:{case_id}:refund_request_received:once'
     if case.get('case_type') == 'warehouse_dispatch_delay' and not test_mode:
         if reminder_parent or template_kind or showcase_kind:
             raise HTTPException(409, 'Dispatch-delay notices have no reminders or alternate live templates.')
@@ -40613,9 +40638,9 @@ def api_after_order_approve_email(message_id: int, payload: dict[str, str], requ
 
 
 def retry_after_order_email(message_id: int, request: Request, *, automatic: bool = False, approval_digest: str = "", policy_exception: bool = False) -> dict[str, Any]:
-    # Approval-only rollout: each individual send attempt requires a fresh
-    # authenticated team action. Workers and legacy retry routes cannot send.
-    if automatic or (not approval_digest and not policy_exception):
+    # Recovery below requires a prior persisted authorization, a bounded retry
+    # window, and reuse of the exact provider key; it cannot approve new drafts.
+    if not automatic and not approval_digest and not policy_exception:
         raise HTTPException(409, "Team approval is required for each email attempt. Review it in Email log.")
     from app.services.email_log import automatic_retry_reason
     from app.services.email_approval import bypassed
@@ -40632,7 +40657,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
     if json.loads(original.get('payload_json') or '{}').get('_care_rollout_cancelled_at'):
         raise HTTPException(409,'This earlier notification was cancelled at the manual-live reset. It cannot be sent or retried.')
     manual_completion = original.get('template_kind') == 'manual_refund_completed'
-    if manual_completion:
+    if manual_completion and not original.get('test_mode'):
         manual_refunds.validate_message(original)
     if original.get('template_kind') == 'refund_confirmed':
         require_after_order_case_in_scope(after_order_case_by_id(int(original['case_id'])))
@@ -40647,7 +40672,19 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         if not permitted(original, test_mode=after_order_email_test_mode(), settings=get_email_approval_settings()):
             raise HTTPException(409, 'This email requires individual team approval.')
         approval_digest = hashlib.sha256(str(original.get('payload_json') or '').encode()).hexdigest()
-    if original.get('status') not in {'awaiting_approval', 'failed'} or original.get('provider') not in {'resend','odoo'}:
+    if automatic:
+        reason = automatic_retry_reason(original)
+        if reason:
+            raise HTTPException(409, reason)
+        # A persisted send authorization is required; never recover an unapproved draft.
+        with db() as conn:
+            authorizations = conn.execute("SELECT details_json FROM after_order_case_events WHERE case_id=? AND event_type IN ('email_send_approved','email_policy_authorized')", (original['case_id'],)).fetchall()
+            authorized = any(str(json.loads(row['details_json']).get('message_id'))==str(message_id) for row in authorizations)
+        if not authorized:
+            raise HTTPException(409,'No prior send authorization; manual review required.')
+        approval_digest = hashlib.sha256(str(original.get('payload_json') or '').encode()).hexdigest()
+    retry_states = {'failed','delivery_unknown','sending','retrying'} if automatic else {'awaiting_approval','failed'}
+    if original.get('status') not in retry_states or original.get('provider') not in {'resend','odoo'}:
         raise HTTPException(409, 'This email cannot be approved. Check its current state.')
     if hashlib.sha256(str(original.get('payload_json') or '').encode()).hexdigest() != approval_digest:
         raise HTTPException(409, 'The email changed. Review it again before approving.')
@@ -40674,7 +40711,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
         if policy_exception and case.get('current_decision') and (original.get('template_kind') in {'expected_dispatch','item_unavailable','package_lost','delivery_confirmation'} or
                 (original.get('template_kind')=='tracking' and (case.get('context') or {}).get('risk_state')=='suspected_lost')):
             raise HTTPException(409,'Customer already responded. An old action email will not be sent automatically.')
-        if automatic and case.get('current_decision'):
+        if automatic and case.get('current_decision') and original.get('template_kind') not in {'manual_refund_completed','refund_request_received','delivery_issue_received','trustpilot_review'}:
             raise HTTPException(409, 'Customer already responded; review before resending an old action email.')
         if case.get("confirmed_at") and original.get("template_kind") not in {"trustpilot_review", "delivery_issue_received", "manual_refund_completed"}:
             raise HTTPException(409, "The customer request was already confirmed. Its action email cannot be retried.")
@@ -40682,7 +40719,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             raise HTTPException(409, "The order or tracking changed. Create a current email instead.")
         if clean_text(case.get("customer_email")).lower() != clean_text(original["recipient"]).lower() or after_order_sender(case)[0] != original["sender"]:
             raise HTTPException(409, "The recipient or website sender changed. Create a current email instead.")
-        if case.get("case_type") == "item_unavailable" and not manual_completion:
+        if case.get("case_type") == "item_unavailable" and not manual_completion and original.get('template_kind') != 'refund_request_received':
             review = after_order_unavailable_review(case, for_send=True)
             if review["blocked"] or not review["approved"]:
                 raise HTTPException(409, review["reason"])
@@ -40698,6 +40735,8 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             if not locked.get('test_mode'):
                 if manual_completion:
                     manual_refunds.validate_message(locked)
+                elif locked.get('template_kind') == 'refund_request_received':
+                    refund_notices.validate(case)
                 elif locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
                     delivery_followups.validate(case, locked['template_kind'])
                 elif locked.get('template_kind') == 'shopify_dispatch':
@@ -40710,7 +40749,7 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
                     raise HTTPException(409, 'This email requires team approval.')
         if not locked.get('test_mode') and locked.get('template_kind') in {'trustpilot_review', 'delivery_issue_received'}:
             delivery_followups.reserve(conn, case, locked['template_kind'], 'email', message_id)
-        if locked.get('status') not in {'awaiting_approval', 'failed'} or hashlib.sha256(str(locked.get('payload_json') or '').encode()).hexdigest() != approval_digest:
+        if locked.get('status') not in retry_states or hashlib.sha256(str(locked.get('payload_json') or '').encode()).hexdigest() != approval_digest:
             raise HTTPException(409, 'Email already processed or changed; approval was not applied.')
         if automatic:
             reason = automatic_retry_reason(locked)
@@ -40739,7 +40778,9 @@ def retry_after_order_email(message_id: int, request: Request, *, automatic: boo
             require_current_action_notice(case,locked,globals())
         if saved_payload.get('_care_reminder_parent'):
             care_reminders.validate(int(saved_payload['_care_reminder_parent']),int(saved_payload['_care_reminder_number']),case)
-        if not locked.get('test_mode') and case.get('case_type') == 'item_unavailable' and not manual_completion:
+        if not locked.get('test_mode') and locked.get('template_kind') == 'refund_request_received':
+            refund_notices.validate(case)
+        if not locked.get('test_mode') and case.get('case_type') == 'item_unavailable' and not manual_completion and locked.get('template_kind') != 'refund_request_received':
             current_revision = alternative_workflow.notification_revision(case)
             if saved_payload.get('_care_recommendations_revision') != current_revision:
                 raise HTTPException(409, 'Recommendations changed. Prepare and review a current email.')
@@ -40818,6 +40859,19 @@ def api_after_order_prepare_live_email(case_id: int, request: Request) -> dict[s
     return result
 
 
+@app.post('/api/after-order/cases/{case_id}/test-notification/{kind}')
+def api_after_order_test_notification(case_id: int, kind: str, request: Request):
+    # Explicit owner-only preview, without pausing real customer automation.
+    # The provider boundary validates the fixed owner destination again.
+    kinds={'new_order_welcome','expected_dispatch','item_unavailable','no_alternatives',
+           'delivery_confirmation','package_lost','package_movement','trustpilot_review',
+           'delivery_issue_received','alternative_payment','refund_request_received',
+           'manual_refund_completed','warehouse_dispatch_delay','shopify_dispatch'}
+    if kind not in kinds:
+        raise HTTPException(400,'Unknown notification template.')
+    return send_after_order_email(case_id,request,force_test=True,showcase_kind=kind)
+
+
 @app.post("/api/after-order/send-all-test-emails")
 def api_after_order_send_all_test_emails(request: Request, store_id: Optional[int] = None) -> dict[str, Any]:
     """Send the complete visual email suite to the configured test inbox."""
@@ -40856,6 +40910,11 @@ def api_after_order_send_all_test_emails(request: Request, store_id: Optional[in
         ("trustpilot_review", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
         ("delivery_issue_received", by_type.get("delivery_confirmation", by_type.get("tracking", first_id))),
         ("alternative_payment", by_type.get("item_unavailable", first_id)),
+        ('refund_request_received',first_id),
+        ('manual_refund_completed',first_id),
+        ('warehouse_dispatch_delay',first_id),
+        ('no_alternatives',by_type.get('item_unavailable',first_id)),
+        ('shopify_dispatch',by_type.get('shopify_dispatch',first_id)),
     ]
     results = []
     for index, (kind, case_id) in enumerate(suite):
@@ -41534,6 +41593,25 @@ def api_email_approval_settings():
             'last_check_at':email_approval_dispatcher.last_check_at}
 
 
+@app.get('/api/after-order/notifications/status')
+def api_notification_worker_status():
+    return {'enabled':get_service_settings().get('after_order_notifications_enabled')=='true',
+            'last_check_at':notification_worker.last_check_at,'errors':notification_worker.errors,
+            'financial_approval_required':True,'dispatch_handling_days':get_service_settings().get('after_order_dispatch_handling_days')}
+
+
+@app.post('/api/after-order/notifications/settings')
+def api_notification_worker_settings(payload: dict[str,Any]):
+    enabled=payload.get('enabled'); days=payload.get('dispatch_handling_days')
+    if type(enabled) is not bool or type(days) is not int or not 0<=days<=14:
+        raise HTTPException(400,'Provide enabled and a dispatch handling allowance of 0–14 calendar days.')
+    if enabled and payload.get('confirm_notifications') is not True:
+        raise HTTPException(400,'Confirm preparing notifications for eligible orders before enabling.')
+    set_service_settings({'after_order_notifications_enabled':'true' if enabled else 'false',
+                          'after_order_dispatch_handling_days':str(days)})
+    return api_notification_worker_status()
+
+
 @app.post('/api/after-order/settings/email-approval')
 def api_set_email_approval_settings(payload: dict[str,Any]):
     from app.services.email_approval import KEYS
@@ -41555,6 +41633,17 @@ def email_approval_loop():
         except Exception as exc:
             print(f'Email approval dispatcher needs attention: {clean_error_message(exc)}',flush=True)
         time.sleep(30)
+
+
+def notification_loop():
+    while True:
+        try:
+            request=after_order_monitor_request()
+            if request:
+                notification_worker.run(request)
+        except Exception as exc:
+            notification_worker.errors['worker']=clean_error_message(exc)
+        time.sleep(60)
 
 
 def shopify_dispatch_loop():
@@ -45670,6 +45759,10 @@ from app.services.welcome_email import Monitor as WelcomeEmailMonitor
 welcome_emails = WelcomeEmailMonitor(globals())
 from app.services.email_approval import Dispatcher as EmailApprovalDispatcher
 email_approval_dispatcher = EmailApprovalDispatcher(globals())
+from app.services.refund_notices import Notices as RefundNotices
+refund_notices = RefundNotices(globals())
+from app.services.notification_worker import Worker as NotificationWorker
+notification_worker = NotificationWorker(globals())
 from app.services.shopify_dispatch import Monitor as ShopifyDispatchMonitor
 shopify_dispatch = ShopifyDispatchMonitor(globals())
 from app.services.delivery_followup import Monitor as DeliveryFollowupMonitor, receipt_correction

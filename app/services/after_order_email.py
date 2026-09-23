@@ -46,6 +46,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
     if kind == "tracking" and context.get("risk_state") == "suspected_lost":
         kind = "package_lost"
     content = {
+        "refund_request_received": ("WE’RE HERE TO HELP", "Our team will review your request and help with the next steps.", "Our team will review your request and help with the next steps.", "Keep your order number handy if you contact our team.", "No further action needed", "Keep your order number handy if you contact our team."),
         "shopify_dispatch": ("DISPATCH UPDATE", "Follow your delivery", "Follow your delivery", "There’s a new update on your package. You can find the latest details below.", "Follow your delivery", "See the full tracking history and the latest carrier updates."),
         "manual_refund_completed": ("REFUND CONFIRMED", "Your refund has been processed.", "Your refund has been processed", "Our team has confirmed that your refund has been processed. The refund details are below.", "When will the credit appear?", "Please allow 24–48 hours for the credit to appear. Your bank or payment provider may take longer. If you need help, reply to this email."),
         "refund_confirmed": ("REFUND CONFIRMED", "Your refund has been sent.", "Your refund has been processed", "We’ve successfully sent a refund for your order. You’ll find the amount and destination below.", "When will the credit appear?", "The credit may appear in your account within 24–72 business hours. Timing depends on your bank. If it has not appeared after this time, reply to this email and our team will help."),
@@ -62,6 +63,12 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         "tracking": ("ON ITS WAY", "A little closer to your door.", "Your package has moved", "There’s a new update on your package. You can find the latest details below.", "Follow your delivery", "See the full tracking history and the latest carrier updates."),
     }
     eyebrow, heading, subject_text, intro, action_heading, note = map(t, content.get(kind, content["tracking"]))
+    if kind == 'refund_request_received':
+        # Reuse the maintained refund-acknowledgement translation in every catalog,
+        # rather than sending untranslated new financial prose to other locales.
+        from app.services.notification_i18n import sms_translation
+        intro, _ = sms_translation(t.language,'refund_request_received',website,order,'')
+        intro = intro.strip()
     no_alternatives = kind == 'item_unavailable' and bool(context.get('no_alternative_line_ids')) and 'offer_alternatives' not in actions
     if no_alternatives:
         heading = t('An item in your order is unavailable.')

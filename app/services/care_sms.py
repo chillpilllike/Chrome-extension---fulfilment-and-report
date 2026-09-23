@@ -18,14 +18,15 @@ PROVIDERS = {'odoo', 'msg91', 'twilio'}
 KINDS = {'expected_dispatch', 'item_unavailable', 'no_alternatives', 'delivery_confirmation',
          'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment',
          'price_difference', 'refund_request_received', 'refund_completed',
-         'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch'}
+         'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch', 'manual_refund_completed'}
 AUTOMATIC_KINDS = {'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch'}
 
 
 def template_kind(kind):
     # Reuse the approved, translated tracking template; dispatch has its own
     # event, send permission and deduplication, never a fabricated carrier scan.
-    return 'package_movement' if kind == 'shopify_dispatch' else kind
+    return {'shopify_dispatch':'package_movement','manual_refund_completed':'refund_completed',
+            'price_difference':'alternative_payment'}.get(kind,kind)
 SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
  id INTEGER PRIMARY KEY AUTOINCREMENT, email_id INTEGER NOT NULL UNIQUE REFERENCES after_order_messages(id),
  case_id INTEGER NOT NULL REFERENCES after_order_cases(id), provider TEXT NOT NULL,
@@ -106,6 +107,23 @@ def customer_number(value, country_code=None):
     if parsed.extension or not pn.is_valid_number(parsed):
         raise ValueError('Customer phone is invalid. Correct it in Odoo.')
     return number(pn.format_number(parsed, pn.PhoneNumberFormat.E164))
+
+
+def sms_customer_number(values, country_code=None):
+    """Prefer a valid contact mobile; never spend SMS credits on a known fixed line."""
+    error='Customer has no valid SMS-capable contact number. Add a mobile number in Odoo.'
+    for value in values:
+        if not value:
+            continue
+        try:
+            normalized=customer_number(value,country_code)
+            if pn.number_type(pn.parse(normalized,None))==pn.PhoneNumberType.FIXED_LINE:
+                error='Customer number is a fixed-line landline. Add a mobile number in Odoo; email remains available.'
+                continue
+            return normalized
+        except ValueError as exc:
+            error=str(exc)
+    raise ValueError(error)
 
 
 def validate_target(row, current_test):
@@ -337,10 +355,10 @@ class SMS:
                 raise HTTPException(400,'Invalid delivery report') from exc
         return router
 
-    def phone(self, case):
+    def phone(self, case, *, allow_cancelled=False):
         r = self.r; client = r.OdooClient(r.get_store(case['store_id']))
         order = client.read('sale.order',[case['odoo_order_id']],['partner_id','state','website_id'])[0]
-        if order['state'] not in {'sale','done'} or not order.get('website_id') or order['website_id'][0] != case.get('website_id'):
+        if order['state'] not in ({'sale','done','cancel'} if allow_cancelled else {'sale','done'}) or not order.get('website_id') or order['website_id'][0] != case.get('website_id'):
             raise ValueError('A current confirmed order on the matching website is required.')
         fields = client.existing_fields('res.partner',['mobile','phone','phone_blacklisted','country_id'])
         if 'phone_blacklisted' not in fields:
@@ -353,7 +371,7 @@ class SMS:
         if country:
             countries = client.read('res.country',[country[0]],['code'])
             code = countries[0].get('code') if countries else None
-        return customer_number(partner.get('mobile') or partner.get('phone'), code)
+        return sms_customer_number([partner.get('mobile'),partner.get('phone')], code)
 
     def prepare(self, email_id):
         r = self.r; config = self.config()
@@ -368,8 +386,13 @@ class SMS:
             return dict(existing)
         email = dict(email); case = r.after_order_case_by_id(email['case_id'])
         r.require_after_order_case_in_scope(case)
-        case = r.hydrate_after_order_recipient_and_domain(case,strict=not email['test_mode'])
-        if not email['test_mode'] and email.get('request_fingerprint') and email['request_fingerprint'] != r.request_fingerprint(case):
+        if email['template_kind']=='manual_refund_completed':
+            if not email['test_mode']:
+                r.manual_refunds.validate_message(email)
+            case = r.hydrate_after_order_recipient_and_domain(case,strict=not email['test_mode'],allow_cancelled=True)
+        else:
+            case = r.hydrate_after_order_recipient_and_domain(case,strict=not email['test_mode'])
+        if email['template_kind']!='manual_refund_completed' and not email['test_mode'] and email.get('request_fingerprint') and email['request_fingerprint'] != r.request_fingerprint(case):
             raise ValueError('Source email is stale. Prepare a current email before SMS.')
         domain = case.get('sender_domain') or ''
         if not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}',domain):
@@ -385,7 +408,8 @@ class SMS:
         mapping = dict(site.get(provider) or {})
         if not email['test_mode'] and not site.get('transactional_sms_enabled'):
             raise ValueError('Enable transactional SMS for this website after reviewing customer consent and destination requirements.')
-        to = recipient(None if email['test_mode'] else self.phone(case),bool(email['test_mode']))
+        contact = None if email['test_mode'] else (self.phone(case,allow_cancelled=True) if kind=='manual_refund_completed' else self.phone(case))
+        to = recipient(contact,bool(email['test_mode']))
         link = order_link(domain,case.get('odoo_order_id'))
         if kind == 'trustpilot_review':
             link = r.trustpilot_review_url(domain)
@@ -534,13 +558,17 @@ class SMS:
             if row and row['status'] == 'awaiting_approval':
                 if row['test_mode'] or json.loads(row['snapshot_json']).get('kind') in AUTOMATIC_KINDS:
                     self.send(row['id'],automatic=True)
-        except Exception:
+        except Exception as exc:
             # A companion must never change the outcome of the independent email.
             try:
                 with self.r.db() as conn:
                     email = conn.execute('SELECT case_id FROM after_order_messages WHERE id=?',(email_id,)).fetchone()
                     if email:
-                        self.r.record_after_order_event(conn,email['case_id'],'sms_needs_attention',details={'email_id':email_id,'reason':'SMS preparation blocked. Open the SMS preview to check configuration.'})
+                        reason=self.r.clean_error_message(exc)
+                        prior=conn.execute("SELECT details_json FROM after_order_case_events WHERE case_id=? AND event_type='sms_needs_attention' ORDER BY id DESC LIMIT 1",(email['case_id'],)).fetchone()
+                        details={'email_id':email_id,'reason':reason}
+                        if not prior or json.loads(prior['details_json'])!=details:
+                            self.r.record_after_order_event(conn,email['case_id'],'sms_needs_attention',details=details)
             except Exception:
                 pass
 
@@ -559,7 +587,64 @@ class SMS:
         owner = conn.execute('SELECT email_id FROM after_order_sms_first_movement WHERE parcel_key=?', (key,)).fetchone()
         return owner['email_id'] == email['id']
 
-    def send(self, sms_id, approval='', automatic=False, resend=False):
+    def recover_failed(self):
+        """Only definitive delivery failures; rejected/unknown/accepted sends stay held."""
+        r=self.r
+        if r.after_order_email_test_mode() or not self.config()['enabled']:
+            return
+        with r.db() as conn:
+            rows=conn.execute("SELECT * FROM after_order_sms WHERE test_mode=0 AND provider='msg91' AND status='provider_failed' AND attempts BETWEEN 1 AND 2 ORDER BY updated_at").fetchall()
+        for raw in rows:
+            try:
+                self.send(raw['id'],recovery=True)
+            except Exception:
+                pass  # Current row/receipt remains visible; never turn failure into an unbounded resend.
+
+    def reconcile_receipts(self):
+        # A provider webhook can arrive before the send response has been saved.
+        with self.r.db() as conn:
+            rows=conn.execute("""SELECT id FROM after_order_sms s WHERE provider='msg91'
+                AND status IN ('accepted','queued','sent','delivery_unknown')
+                AND EXISTS(SELECT 1 FROM after_order_sms_receipts e
+                    WHERE e.provider_id=s.provider_id AND e.recipient=s.recipient)
+                ORDER BY updated_at LIMIT 200""").fetchall()
+        for row in rows:
+            self.refresh(row['id'])
+
+    def recovery_allowed(self, conn, row):
+        if row['provider']!='msg91' or row['test_mode'] or row['status']!='provider_failed' or not 1 <= row['attempts'] < 3:
+            return False
+        changed=datetime.fromisoformat(row['updated_at'].replace('Z','+00:00'))
+        if changed.tzinfo is None or datetime.now(timezone.utc)<changed+timedelta(hours=1):
+            return False
+        receipt=conn.execute("SELECT 1 FROM after_order_sms_receipts WHERE provider_id=? AND recipient=? AND status='provider_failed' LIMIT 1",(row['provider_id'],row['recipient'])).fetchone()
+        return bool(receipt)
+
+    def validate_financial(self, case, email, kind):
+        r=self.r
+        if kind=='manual_refund_completed':
+            r.manual_refunds.validate_message(dict(email))
+        elif kind=='refund_request_received':
+            r.refund_notices.validate(case)
+        elif kind in {'price_difference','alternative_payment'}:
+            # Require a team-approved persisted quotation and current unpaid Odoo evidence.
+            offers=r.alternative_workflow.rows(case['id'],False)
+            selected=next((x.get('selection') for x in offers if str((x.get('selection') or {}).get('result',{}).get('mail',{}).get('id'))==str(email['provider_message_id'])),None)
+            result=(selected or {}).get('result') or {}
+            if not selected or selected['status']!='waiting_payment' or not result.get('quote_id') or result.get('payment_verified') or case.get('current_decision')!='offer_alternatives':
+                raise ValueError('No current verified unpaid replacement quotation.')
+            client=r.OdooClient(r.get_store(case['store_id']))
+            quotes=client.read('sale.order',[int(result['quote_id'])],['state','website_id','currency_id','amount_total','transaction_ids','invoice_ids','is_expired'])
+            quote=quotes[0] if len(quotes)==1 else {}
+            if quote.get('state') not in {'draft','sent'} or quote.get('is_expired') or not quote.get('website_id') or quote['website_id'][0]!=case['website_id'] or quote.get('amount_total',0)<=0 or quote.get('invoice_ids'):
+                raise ValueError('Quotation changed, expired or invoiced; check payment before messaging.')
+            transactions=client.read('payment.transaction',quote['transaction_ids'],['state']) if quote.get('transaction_ids') else []
+            if any(x['state'] in {'pending','authorized','done'} for x in transactions):
+                raise ValueError('A payment is in progress or complete; no payment reminder SMS sent.')
+        else:
+            raise ValueError('No verified financial-event adapter for this SMS.')
+
+    def send(self, sms_id, approval='', automatic=False, resend=False, recovery=False):
         r = self.r
         self.refresh_language(sms_id)
         with r.db() as conn:
@@ -576,7 +661,7 @@ class SMS:
                 raise ValueError('SMS sending is disabled.')
             if catalog(snapshot.get('language',{}).get('sent_language')).get('delivery_blocked'):
                 raise ValueError('This translation requires native-language review. Prepare an English fallback preview.')
-            if row['provider'] == 'msg91' and (snapshot['kind'] in AUTOMATIC_KINDS or not snapshot.get('language',{}).get('requested_language','en_US').startswith('en')):
+            if row['provider'] == 'msg91':
                 verify_followup_template(snapshot['mapping'])
             validate_target(row,r.after_order_email_test_mode())
             allowed = {'delivered'} if resend else {'awaiting_approval','failed','provider_failed','undelivered'}
@@ -584,7 +669,11 @@ class SMS:
                 raise ValueError('SMS already attempted or uncertain. Check provider logs; do not resend.')
             if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome','shopify_dispatch'}:
                 raise ValueError('This is a once-only notification. Duplicate sends are blocked.')
-            if automatic:
+            if recovery:
+                if not self.recovery_allowed(conn,row):
+                    raise ValueError('SMS is not eligible for safe automatic recovery.')
+                automatic=True
+            elif automatic:
                 if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and snapshot['kind'] not in AUTOMATIC_KINDS):
                     raise ValueError('This SMS needs individual approval.')
             elif digest(row) != approval:
@@ -621,7 +710,10 @@ class SMS:
                 if not self.reserve_movement(conn, case, dict(email)):
                     raise ValueError('The first movement SMS is already reserved for this parcel. Later movement texts are blocked.')
             if not row['test_mode']:
-                case = r.hydrate_after_order_recipient_and_domain(case, strict=True)
+                if snapshot['kind']=='manual_refund_completed':
+                    case = r.hydrate_after_order_recipient_and_domain(case, strict=True,allow_cancelled=True)
+                else:
+                    case = r.hydrate_after_order_recipient_and_domain(case, strict=True)
                 if snapshot.get('language',{}).get('requested_language','en_US') != ((case.get('context') or {}).get('requested_language') or 'en_US'):
                     raise ValueError('Customer language changed. Prepare and review a new SMS.')
                 created = datetime.fromisoformat((snapshot.get('email_created_at') or row['created_at']).replace('Z', '+00:00'))
@@ -632,18 +724,17 @@ class SMS:
                 site = self.config()['mappings'].get(f"{case['store_id']}:{case['website_id']}", {})
                 if not site.get('transactional_sms_enabled'):
                     raise ValueError('Customer SMS has been disabled for this website.')
-                financial = snapshot['kind'] in {'price_difference','alternative_payment','refund_request_received','refund_completed'}
+                financial = snapshot['kind'] in {'price_difference','alternative_payment','refund_request_received','refund_completed','manual_refund_completed'}
                 followup = snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}
                 welcome = snapshot['kind'] in {'new_order_welcome','shopify_dispatch'}
-                if (self.phone(case) != row['recipient'] or r.request_fingerprint(case) != snapshot['request_fingerprint']
+                current_phone=self.phone(case,allow_cancelled=True) if snapshot['kind']=='manual_refund_completed' else self.phone(case)
+                if (current_phone != row['recipient'] or (snapshot['kind']!='manual_refund_completed' and r.request_fingerprint(case) != snapshot['request_fingerprint'])
                         or case.get('sender_domain') != snapshot['domain']
                         or (not financial and not followup and not welcome and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
-                        or not r.after_order_tracking_is_current(case)):
+                        or (snapshot['kind']!='manual_refund_completed' and not r.after_order_tracking_is_current(case))):
                     raise ValueError('Order/recipient changed; SMS approval is blocked.')
                 if financial:
-                    # Financial source messages need their own verified event/amount adapter.
-                    # Do not infer a payment or completed refund from a button click.
-                    raise ValueError('Financial SMS is held until its verified payment/refund event adapter is connected.')
+                    self.validate_financial(case,email,snapshot['kind'])
                 if followup:
                     r.delivery_followups.reserve(conn, case, snapshot['kind'], 'sms', sms_id)
                 if snapshot['kind'] == 'warehouse_dispatch_delay':
