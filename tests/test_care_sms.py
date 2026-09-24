@@ -10,6 +10,47 @@ from app.services.care_sms import SMS, SCHEMA, TEST_NUMBER, Rejected, deliver, d
 
 
 class SMSTests(unittest.TestCase):
+    @patch('app.services.care_sms.deliver',return_value=('1','accepted'))
+    def test_bypass_releases_live_queue_once_not_test_drafts(self, send):
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.conn.execute('UPDATE after_order_messages SET test_mode=0')
+        self.sms.phone=Mock(return_value='+14155552671')
+        self.sms.prepare(1)
+        self.sms.release_pending()
+        send.assert_not_called()
+        self.settings['after_order_sms_approval_required']='false'
+        self.sms.release_pending()
+        send.assert_called_once()
+        self.sms.release_pending()
+        send.assert_called_once()
+        self.conn.execute("UPDATE after_order_sms SET test_mode=1,status='awaiting_approval',attempts=0")
+        self.sms.release_pending()
+        send.assert_called_once()
+
+    @patch('app.services.care_sms.deliver')
+    def test_bypass_does_not_override_cancelled_source_or_test_mode(self, send):
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.ns['clean_error_message']=str
+        self.conn.execute('UPDATE after_order_messages SET test_mode=0')
+        self.sms.phone=Mock(return_value='+14155552671')
+        self.sms.prepare(1)
+        self.settings['after_order_sms_approval_required']='false'
+        self.conn.execute("UPDATE after_order_messages SET status='cancelled'")
+        self.sms.release_pending()
+        self.assertIn('cancelled',self.row()['last_error'])
+        self.ns['after_order_email_test_mode']=lambda:True
+        self.sms.release_pending()
+        send.assert_not_called()
+
+    @patch('app.services.care_sms.deliver',return_value=('1','accepted'))
+    def test_bypass_new_live_companion_sends_without_preview_approval(self, send):
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.conn.execute('UPDATE after_order_messages SET test_mode=0')
+        self.sms.phone=Mock(return_value='+14155552671')
+        self.settings['after_order_sms_approval_required']='false'
+        self.sms.companion(1)
+        send.assert_called_once()
+
     @patch('app.services.care_sms.verify_followup_template')
     def test_installed_but_unpublished_language_uses_english(self, verify):
         self.french_msg91_fixture()

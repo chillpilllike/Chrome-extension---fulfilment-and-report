@@ -154,6 +154,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "after_order_shopify_dispatch_started_at": "",
     "after_order_welcome_sms_started_at": "",
     "after_order_sms_enabled": "false",
+    "after_order_sms_approval_required": "true",
     "after_order_sms_provider": "odoo",
     "after_order_sms_mappings": "{}",
     "after_order_test_recipient": os.getenv("AFTER_ORDER_TEST_RECIPIENT", "sonianuj1284@gmail.com"),

@@ -58,7 +58,7 @@ export function EmailApprovalSettings({ api }: { api: API }) {
       <h4 className="font-semibold">Notification scheduling</h4>
       <label className="flex items-center gap-2"><input type="checkbox" role="switch" checked={monitorEnabled} onChange={e=>setMonitorEnabled(e.target.checked)} disabled={busy}/> Prepare notifications, reminders and safe retries</label>
       <label className="flex items-center gap-2">Dispatch handling allowance (calendar days)<input className="w-20 rounded border p-2" type="number" min="0" max="14" value={handling} onChange={e=>setHandling(Number(e.target.value))} disabled={busy}/></label>
-      <p className="text-sm text-muted-foreground">Expired customer choices go to team review. This scheduler never executes a refund, charge or replacement. Other SMS still require approval.</p>
+      <p className="text-sm text-muted-foreground">Expired customer choices go to team review. This scheduler never executes a refund, charge or replacement. SMS follows its separate approval setting.</p>
       <p className="text-sm">Last check: {monitor.last_check_at || 'Not run yet'}</p>
       {Object.entries(monitor.errors).map(([stage,error])=><p role="alert" key={stage} className="text-sm text-red-600">{stage}: {error}</p>)}
       <div><Button disabled={busy} onClick={()=>void saveMonitor()}>Save notification scheduling</Button></div>

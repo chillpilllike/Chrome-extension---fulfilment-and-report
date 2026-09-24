@@ -275,8 +275,31 @@ class SMS:
     def config(self):
         settings = self.r.get_service_settings()
         return {'enabled':settings.get('after_order_sms_enabled') == 'true',
+                'approval_required':settings.get('after_order_sms_approval_required', 'true') != 'false',
                 'provider':settings.get('after_order_sms_provider') or 'odoo',
                 'mappings':json.loads(settings.get('after_order_sms_mappings') or '{}')}
+
+    def automatic_kind(self, kind):
+        return kind in AUTOMATIC_KINDS or (kind in KINDS and not self.config()['approval_required'])
+
+    def release_pending(self):
+        """Release only unattempted live drafts. All send-time safeguards still apply."""
+        r = self.r
+        if r.after_order_email_test_mode() or not self.config()['enabled'] or self.config()['approval_required']:
+            return
+        with r.db() as conn:
+            rows = conn.execute("SELECT id,case_id FROM after_order_sms WHERE test_mode=0 AND status='awaiting_approval' AND attempts=0 ORDER BY updated_at,id LIMIT 100").fetchall()
+        for row in rows:
+            try:
+                self.send(row['id'], automatic=True)
+            except Exception as exc:
+                reason = r.clean_error_message(exc)
+                with r.db() as conn:
+                    current = conn.execute('SELECT status,last_error FROM after_order_sms WHERE id=?',(row['id'],)).fetchone()
+                    if current and current['status']=='awaiting_approval':
+                        conn.execute("UPDATE after_order_sms SET last_error=?,updated_at=? WHERE id=? AND status='awaiting_approval'",(reason,r.utc_now(),row['id']))
+                        if current['last_error'] != reason:
+                            r.record_after_order_event(conn,row['case_id'],'sms_automatic_send_blocked',details={'sms_id':row['id'],'reason':reason})
 
     def language_allowed(self, case, requested):
         if requested.startswith('en'):return True
@@ -556,7 +579,7 @@ class SMS:
         try:
             row = self.prepare(email_id)
             if row and row['status'] == 'awaiting_approval':
-                if row['test_mode'] or json.loads(row['snapshot_json']).get('kind') in AUTOMATIC_KINDS:
+                if row['test_mode'] or self.automatic_kind(json.loads(row['snapshot_json']).get('kind')):
                     self.send(row['id'],automatic=True)
         except Exception as exc:
             # A companion must never change the outcome of the independent email.
@@ -655,6 +678,8 @@ class SMS:
             email = conn.execute('SELECT * FROM after_order_messages WHERE id=?',(row['email_id'],)).fetchone()
             if not email or not eligible(dict(email)) or snapshot['kind'] not in KINDS:
                 raise ValueError('This notification is excluded from SMS by the current cost-control policy.')
+            if email['status'] in {'cancelled','superseded'}:
+                raise ValueError('The source notification was cancelled or superseded.')
             if snapshot['kind'] != email['template_kind'] and not (email['template_kind'] == 'item_unavailable' and snapshot['kind'] == 'no_alternatives'):
                 raise ValueError('Source notification type changed. Prepare a current SMS.')
             if not self.config()['enabled']:
@@ -674,7 +699,7 @@ class SMS:
                     raise ValueError('SMS is not eligible for safe automatic recovery.')
                 automatic=True
             elif automatic:
-                if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and snapshot['kind'] not in AUTOMATIC_KINDS):
+                if row['attempts'] or row['status'] != 'awaiting_approval' or (not row['test_mode'] and not self.automatic_kind(snapshot['kind'])):
                     raise ValueError('This SMS needs individual approval.')
             elif digest(row) != approval:
                 raise ValueError('Review the current SMS preview before approving.')
@@ -858,11 +883,17 @@ class SMS:
 
         @router.post('/settings')
         def save(payload:dict):
+            if 'approval_required' in payload and not isinstance(payload['approval_required'],bool):
+                raise HTTPException(400,'approval_required must be a boolean.')
+            if payload.get('approval_required') is False and payload.get('confirm_release_pending') is not True:
+                raise HTTPException(409,'Confirm automatic sending of eligible queued and future live SMS.')
             try:
                 raw = validate_config(payload)
             except ValueError as exc:
                 raise HTTPException(400,str(exc)) from exc
             self.r.set_service_settings({'after_order_sms_enabled':str(payload['enabled']).lower(),'after_order_sms_provider':payload['provider'],'after_order_sms_mappings':raw})
+            if 'approval_required' in payload:
+                self.r.set_service_settings({'after_order_sms_approval_required':str(payload['approval_required']).lower()})
             return settings()
 
         @router.get('/email/{email_id}')

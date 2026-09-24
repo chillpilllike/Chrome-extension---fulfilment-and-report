@@ -25,6 +25,7 @@ class Worker:
                 'reminders': lambda: r.care_reminders.run_due(request),
                 'sms_recovery': r.care_sms.recover_failed,
                 'sms_receipts': r.care_sms.reconcile_receipts,
+                'sms_approval_release': r.care_sms.release_pending,
                 'refund_acknowledgements': lambda: r.refund_notices.run(request),
                 'financial_sms_preparation': self.financial_sms,
                 'case_notifications': lambda: self.prepare(request),
@@ -48,7 +49,7 @@ class Worker:
                   AND m.status NOT IN ('cancelled','superseded') AND s.id IS NULL
                   AND m.created_at>=? ORDER BY m.id""", (r.after_order_cutoff_date(),)).fetchall()
         for row in rows:
-            r.care_sms.companion(row['id'])  # Financial SMS keeps its independent approval.
+            r.care_sms.companion(row['id'])  # Notification approval never executes a financial action.
 
     def selection_reviews(self):
         r = self.r
