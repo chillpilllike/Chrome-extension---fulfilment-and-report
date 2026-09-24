@@ -19,7 +19,20 @@ replacement release. Selection expiry changes the selection to `needs_review`.
 Refund acknowledgements require an actual current customer request. Manual refund
 completion emails/SMS require the immutable staff-entered completion record.
 Quotation SMS requires the linked current unpaid quotation; ambiguous payments
-are held. Financial SMS retains individual preview approval.
+are held. Financial transaction approvals are independent of message approvals.
+
+As of 2026-09-24, Settings → Customer SMS includes a separate approval bypass:
+`after_order_sms_approval_required=false`. Saving it requires explicit
+`confirm_release_pending=true`. It authorizes eligible queued and future live
+messages, including verified financial notices, but never executes a financial
+action. The notification worker releases only unattempted live drafts, rotating
+blocked drafts by their last check time. Test drafts, attempted/uncertain sends,
+cancelled source notifications, stale messages, suppressed sites and invalid
+recipients are not released. MSG91 approval and all existing current-order,
+source-review, delivery-delay, opt-out and duplicate guards still apply.
+
+The user stopped owner-test SMS sending on 2026-09-23. Do not invoke test email
+endpoints that also send companion test SMS without fresh authorization.
 
 Email retry requires a persisted send authorization, the original payload/key,
 one hour since the attempt, and fewer than four attempts within the 23-hour safe
