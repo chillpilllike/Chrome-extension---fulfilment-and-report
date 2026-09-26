@@ -16,12 +16,14 @@ FIELDS = {
     'entity_type': 'Account holder type', 'transfer_method': 'Transfer method',
     'local_clearing_system': 'Local transfer method', 'transfer_amount': 'Refund amount',
     'source_currency': 'Pay from currency', 'transfer_currency': 'Refund currency',
-    'account_routing_value1': 'Bank routing details', 'account_routing_value2': 'Bank routing details',
+    'account_routing_type1': 'Recipient identifier type', 'account_routing_type2': 'Recipient identifier type',
+    'account_routing_value1': 'Bank routing or recipient identifier', 'account_routing_value2': 'Bank routing details',
     'security_question': 'Security question', 'security_question_answer': 'Security answer',
 }
 NAME_MISMATCH = 'The account holder name does not match the bank account. Ask the customer for the exact name registered with their bank.'
 INSUFFICIENT = 'There are not enough funds in the selected currency. Choose another funding currency or ask finance to add funds.'
 GENERAL = {
+    'schema_definition_not_found': 'This combination of recipient country, currency and transfer method is not available. Choose another supported method.',
     '90301': NAME_MISMATCH, 'beneficiary_name_mismatch': NAME_MISMATCH,
     'account_name_mismatch': NAME_MISMATCH, 'not_matched': NAME_MISMATCH,
     '90101': 'The bank could not accept the account name or number. Confirm both with the customer.',

@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ConfigDict
 
 from app.services.airwallex_api import server_request
+from app.services.refund_destination import destination_label
 from app.services.airwallex_refund_errors import RefundProviderError, readable_error, transfer_failure, field_label
 from app.services.airwallex_hub import verify_webhook_signature
 
@@ -33,8 +34,6 @@ ZERO = Decimal('0')
 # Failed transfers can fail after being paid. Keep funds reserved until finance reconciles.
 RELEASED = {'CANCELLED', 'CANCELED'}
 UUID_RE = re.compile(r'^[a-zA-Z0-9-]{1,100}$')
-SCHEMA_KEYS = {'bank_country_code', 'account_currency', 'entity_type', 'transfer_method',
-               'local_clearing_system', 'country_code', 'beneficiary_type'}
 
 
 def money(value):
@@ -497,7 +496,14 @@ class AirwallexRefunds:
                     'beneficiary.additional_info.personal_email': partner['email'] or ''}}
 
     def schema(self, params):
-        params = {k: str(v)[:80] for k, v in params.items() if k in SCHEMA_KEYS and v}
+        # Airwallex's condition map includes country-specific refresh fields, such as
+        # account_routing_type1 for PayID/Interac. Only this read-only generator
+        # receives these bounded scalar parameters; never accept URLs or payloads.
+        params = {('type' if k == 'beneficiary_type' else k): str(v)[:500]
+                  for k, v in params.items() if re.fullmatch(r'[a-z][a-z0-9_]{0,79}', k)
+                  and isinstance(v, (str, int, bool)) and v}
+        if len(params) > 50:
+            raise ValueError('Too many recipient options. Reload the refund form.')
         cfg = self.config()
         identity = (self.account_key(cfg), cfg.get('state'), cfg.get('api_version'))
         return self.metadata.get(('schema', identity, json.dumps(params, sort_keys=True)),
@@ -553,10 +559,32 @@ class AirwallexRefunds:
             'bank_country_code': 'beneficiary.bank_details.bank_country_code', 'account_currency': 'beneficiary.bank_details.account_currency',
             'entity_type': 'beneficiary.entity_type', 'transfer_method': 'transfer_method',
             'local_clearing_system': 'beneficiary.bank_details.local_clearing_system',
-            'country_code': 'beneficiary.address.country_code', 'beneficiary_type': 'beneficiary.type'}.items()}
+            'country_code': 'beneficiary.address.country_code', 'type': 'beneficiary.type'}.items()}
         if not schema_params['transfer_method'] or not schema_params['bank_country_code']:
             raise ValueError('Select the recipient country and supported transfer method.')
-        schema = self.schema(schema_params)
+        # Discover condition keys from Airwallex itself, then resolve dependent
+        # requirements before validating/building the beneficiary. Do not trust
+        # a browser-supplied list of required fields.
+        for _ in range(5):
+            schema = self.schema(schema_params)
+            updated = dict(schema_params)
+            for item in schema.get('fields', []):
+                field = item.get('field', {})
+                if field.get('refresh'):
+                    path = item['path']
+                    if path == 'transfer_methods':
+                        path = 'transfer_method'
+                    value = values.get(path) or field.get('default')
+                    options = field.get('options') or []
+                    if value and options and value not in [o['value'] for o in options]:
+                        raise ValueError(f"Select a supported option for {field.get('label', 'recipient details')}.")
+                    if value:
+                        updated[field['key']] = value
+            if updated == schema_params:
+                break
+            schema_params = updated
+        else:
+            raise ValueError('Airwallex could not confirm the recipient fields. Reload the refund form.')
         recipient = {}
         for item in schema.get('fields', []):
             path, field = item.get('path', ''), item.get('field', {})
@@ -587,11 +615,9 @@ class AirwallexRefunds:
                    'account_key': self.account_key(cfg), 'amount': str(amount)}
         token = self.cipher(cfg).encrypt(json.dumps(payload, sort_keys=True).encode()).decode()
         bank = beneficiary.get('bank_details', {})
-        destination = bank.get('iban') or bank.get('account_number') or bank.get('account_routing_value1') or ''
         return {'review_token': token, 'order_name': snapshot['order_name'], 'amount': str(amount),
                 'currency': snapshot['currency'], 'recipient': bank.get('account_name', ''),
-                'destination': (bank.get('account_routing_value1', '') if bank.get('local_clearing_system') == 'INTERAC'
-                                else '••••' + destination[-4:]), 'method': schema_params.get('local_clearing_system') or transfer['transfer_method'],
+                'destination': destination_label(bank), 'method': schema_params.get('local_clearing_system') or transfer['transfer_method'],
                 **funding, 'fees': 'Airwallex fees are additional and paid by the business. Exact fees are recorded after submission.',
                 'expires_in_seconds': 600}
 

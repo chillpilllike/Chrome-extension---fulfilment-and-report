@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
+from app.services.refund_destination import destination_label
 from app.services.after_order import create_email_provider, EmailRejected
 from app.services.after_order_email import render_after_order_email
 
@@ -18,12 +19,7 @@ def now():
 def masked_destination(transfer):
     beneficiary = transfer.get('beneficiary') or {}
     bank = beneficiary.get('bank_details') or {}
-    account = str(bank.get('iban') or bank.get('account_number') or '').replace(' ', '')
-    email = str(beneficiary.get('personal_email') or '')
-    destination = 'Account ending ' + account[-4:] if len(account) >= 4 else 'Verified recipient account'
-    if not account and '@' in email:
-        name, domain = email.rsplit('@', 1)
-        destination = name[:1] + '•••@' + domain
+    destination = destination_label(bank)
     return {'account': destination, 'holder': str(bank.get('account_name') or ''),
             'bank': str(bank.get('bank_name') or ''),
             'method': str(bank.get('local_clearing_system') or transfer.get('transfer_method') or 'Bank transfer')}

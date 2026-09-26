@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { type Option, type Schema, schemaSelectors, schemaParams, reconcileSchema, changedSchemaValues } from './refundSchema'
+import { useEffect, useId, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -9,19 +10,9 @@ type History = {id:string;amount:string;currency:string;status:string;reference:
 type DailyLimit = {successful:number;pending:number;limit:number;used:number;remaining:number;timezone:string;date:string;resets_at:string}
 type PaymentMatch = {provider:string;method:string;customer:string;transaction:string;amount?:string;currency?:string;deposit_reference?:string;deposit_id?:string;payer?:string}
 type Snapshot = {order_equivalent:string;conversion_rate:string;payment_matches:PaymentMatch[];store_id:number;order_id:number;order_name:string;customer:string;order_value:string;order_currency:string;currency:string;paid:string;remaining:string;rounding:string;refunded_reserved:string;accounting_deduction:string;evidence:string;defaults:Record<string,string>;history:History[]}
-type Option = {label:string;value:string;description?:string}
-type SchemaField = {path:string;enabled?:boolean;required:boolean;field:{key:string;label:string;type:string;options?:Option[];default?:string;description?:string;refresh?:boolean}}
-type Schema = {fields:SchemaField[]}
 type FundingCurrency = {currency:string;status:'available'|'empty'}
 type Review = {source_currency:string;estimated_source_amount:string;conversion:boolean;review_token:string;order_name:string;amount:string;currency:string;recipient:string;destination:string;method:string;fees:string}
 type Payout = {email_status?:string;email_error?:string;email_message_id?:number;funding_currency?:string;mapping_note?:string;source?:string;mapping_status?:string;store_id?:number;store_name?:string;order_id?:number;request_id:string;order_name:string;amount:string;currency:string;status:string;recipient:string;last_error:string;transfer_id:string;created_at:string;fee_amount?:string;fee_currency?:string}
-const selectors:Record<string,string> = {
- 'beneficiary.bank_details.bank_country_code':'bank_country_code',
- 'beneficiary.bank_details.account_currency':'account_currency',
- 'beneficiary.entity_type':'entity_type', 'transfer_method':'transfer_method',
- 'beneficiary.bank_details.local_clearing_system':'local_clearing_system',
- 'beneficiary.address.country_code':'country_code', 'beneficiary.type':'beneficiary_type',
-}
 const errorMessage = (error:unknown) => {
  const message=error instanceof Error?error.message:String(error)
  if(/failed to fetch|networkerror|load failed/i.test(message))return 'Unable to reach the app. Check your connection, then check refund history before retrying.'
@@ -35,14 +26,15 @@ const format = (amount:string|number,currency:string) => {
  catch { return `${amount} ${currency}` }
 }
 function InstitutionSelect({options,value,onChange,label,description}:{options:Option[];value:string;onChange:(value:string)=>void;label:string;description?:string}) {
+ const id=useId()
  const [search,setSearch]=useState('')
  const query=search.trim().toLowerCase()
  const matches=options.filter(o=>`${o.value} ${o.label}`.toLowerCase().includes(query))
  const selected=options.find(o=>o.value===value)
  return <div className="grid content-start gap-1 text-sm">
-  <label htmlFor="refund-institution">{label}</label>
+  <label htmlFor={id}>{label}</label>
   <Input aria-label="Search financial institution" placeholder="Search institution number or bank name" value={search} onChange={e=>setSearch(e.target.value)} autoComplete="off"/>
-  <select id="refund-institution" className="w-full rounded-md border bg-background p-2" value={value} onChange={e=>{onChange(e.target.value);setSearch('')}}>
+  <select id={id} className="w-full rounded-md border bg-background p-2" value={value} onChange={e=>{onChange(e.target.value);setSearch('')}}>
    <option value="">Select…</option>
    {selected&&!matches.includes(selected)&&<option value={selected.value} hidden>{selected.value} — {selected.label}</option>}
    {matches.map(o=><option key={o.value} value={o.value}>{o.value} — {o.label}</option>)}
@@ -59,7 +51,7 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
  const [recipientConfirmed,setRecipientConfirmed]=useState(false),[otherChecked,setOtherChecked]=useState(false)
  const [review,setReview]=useState<Review|null>(null),[busy,setBusy]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState('')
  const [busySeconds,setBusySeconds]=useState(0)
- const [history,setHistory]=useState<Payout[]>([]),[connected,setConnected]=useState(false),[loadingSchema,setLoadingSchema]=useState(false)
+ const [history,setHistory]=useState<Payout[]>([]),[connected,setConnected]=useState(false),[loadingSchema,setLoadingSchema]=useState(false),[schemaError,setSchemaError]=useState(false)
  const [funding,setFunding]=useState<FundingCurrency[]>([]),[sourceCurrency,setSourceCurrency]=useState('')
  const refreshFunding=()=>api<{currencies:FundingCurrency[]}>('/api/airwallex/refunds/funding-currencies').then(r=>{setFunding(r.currencies);setConnected(true)}).catch(e=>{setConnected(false);setFunding([]);setError(errorMessage(e))})
  const [daily,setDaily]=useState<DailyLimit|null>(null)
@@ -74,17 +66,22 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
  useEffect(()=>{reset();setSelectedStore(storeId||'')},[storeId])
  async function loadSchema(next:Record<string,string>, initial=false) {
   const ticket=++schemaGeneration.current
-  setLoadingSchema(true);setReview(null)
-  const params=Object.fromEntries(Object.entries(selectors).filter(([p])=>next[p]).map(([p,k])=>[k,next[p]]))
+  setLoadingSchema(true);setReview(null);setError('')
   try {
-   const result=await post<Schema>('/schema',params)
-   if(ticket!==schemaGeneration.current)return
-   const merged={...next}
-   for(const f of result.fields){const path=f.path==='transfer_methods'?'transfer_method':f.path;if(!merged[path]&&f.field.default)merged[path]=f.field.default}
-   // First select Airwallex's default route, then fetch the full recipient requirements.
-   if(initial && !next.transfer_method && merged.transfer_method){await loadSchema(merged);return}
-   setSchema(result);setValues(merged)
-  }catch(e){if(ticket===schemaGeneration.current){setSchema(null);setError(errorMessage(e))}}
+   let current=initial?null:schema, merged=next
+   for(let attempt=0;attempt<5;attempt++){
+    const params=schemaParams(merged,current)
+    const result=await post<Schema>('/schema',params)
+    if(ticket!==schemaGeneration.current)return
+    merged=reconcileSchema(merged,result)
+    const updated=schemaParams(merged,result)
+    if(Object.keys({...params,...updated}).every(k=>params[k]===updated[k])){
+     setSchema(result);setValues(merged);setSchemaError(false);return
+    }
+    current=result
+   }
+   throw new Error('Airwallex could not confirm the recipient fields. Select the country and transfer method again.')
+  }catch(e){if(ticket===schemaGeneration.current){setSchemaError(true);setError(errorMessage(e))}}
   finally{if(ticket===schemaGeneration.current)setLoadingSchema(false)}
  }
  async function run(label:string, fn:()=>Promise<void>) {
@@ -103,19 +100,14 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
   })
  }
  function changeField(path:string,value:string){
-  let next={...values,[path]:value};setReview(null);setRecipientConfirmed(false)
-  if(selectors[path]){
-   // Route changes discard stale bank details and reset bank-specific routing fields.
-   if(['bank_country_code','transfer_method','entity_type','local_clearing_system'].includes(selectors[path])){
-    next=Object.fromEntries(Object.entries(next).filter(([p])=>selectors[p]||p.startsWith('beneficiary.address.')||p==='beneficiary.bank_details.account_name'))
-    if(path==='beneficiary.bank_details.bank_country_code'||path==='transfer_method')delete next['beneficiary.bank_details.local_clearing_system']
-   }
-   setValues(next);void loadSchema(next)
-  }else setValues(next)
+  const next=changedSchemaValues(values,schema,path,value)
+  setReview(null);setRecipientConfirmed(false);setValues(next)
+  if(schemaSelectors(schema)[path]&&schema?.fields.find(f=>f.path===path)?.field.type!=='INPUT')void loadSchema(next)
  }
+
  const renderedFields=(schema?.fields||[]).filter(f=>f.enabled!==false&&f.path!=='nickname'&&f.path!=='beneficiary.type')
  const missingFields=renderedFields.filter(f=>f.required&&!(values[f.path==='transfer_methods'?'transfer_method':f.path]||f.field.default||'').trim()).map(f=>f.field.label)
- const canReview=missingFields.length===0&&funding.some(f=>f.currency===sourceCurrency&&f.status==='available')&&!!daily&&daily.remaining>0&&!!snapshot&&!!schema&&!loadingSchema&&!busy&&recipientConfirmed&&otherChecked&&Number(amount)>0&&Number(amount)<=Number(snapshot.remaining)&&(!editing||!!editReason.trim())
+ const canReview=missingFields.length===0&&funding.some(f=>f.currency===sourceCurrency&&f.status==='available')&&!!daily&&daily.remaining>0&&!!snapshot&&!!schema&&!schemaError&&!loadingSchema&&!busy&&recipientConfirmed&&otherChecked&&Number(amount)>0&&Number(amount)<=Number(snapshot.remaining)&&(!editing||!!editReason.trim())
 
  return <div className="space-y-5">
   <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-5"><div><h2 className="text-xl font-semibold">Refund an order</h2><p className="mt-1 text-sm text-muted-foreground">Return customer funds using your shared Airwallex account. After success, the customer receives a confirmation from the order’s website with masked account details.</p></div><span className={`rounded-full px-3 py-1 text-xs font-medium ${connected?'bg-emerald-50 text-emerald-800':'bg-amber-50 text-amber-800'}`}>{connected?'Airwallex connected':'Checking Airwallex connection'}</span></div>
@@ -149,16 +141,16 @@ export function AirwallexRefunds({stores,storeId,api}:Props) {
     <p className="text-sm text-muted-foreground">Wallet amounts are private. A currency listed without “0 balance” has funds, but may not cover this refund. {sourceCurrency!==snapshot.currency?`Airwallex will convert ${sourceCurrency} to ${snapshot.currency}; the customer’s refund amount stays fixed. The final exchange rate and additional fees apply when submitted.`:`This refund will use your ${snapshot.currency} balance.`}</p>
     {editing&&<label className="grid gap-1 text-sm">Reason for changing the amount<Input value={editReason} onChange={e=>{setEditReason(e.target.value);setReview(null)}} placeholder="e.g. Partial refund for one unavailable item" /></label>}
     {snapshot.currency!==snapshot.order_currency&&<p className="rounded-lg bg-blue-50 p-3 text-sm">The customer paid in {snapshot.currency}. This refund uses the original locked payment conversion from {snapshot.order_currency}.</p>}
-    <p className="text-sm text-muted-foreground">Choose the recipient’s bank country and a supported method. Confirm the account details with the customer. The business pays Airwallex fees in addition to the refund amount.</p>
+    <p className="text-sm text-muted-foreground">Choose the recipient’s bank country and a supported method. For Australian PayID, choose Local, then NPP, then the email, phone or business identifier type. Available options depend on the country, currency and account-holder type. Confirm the account details with the customer. The business pays Airwallex fees in addition to the refund amount.</p>
     {loadingSchema&&<p role="status" className="text-sm">Loading Airwallex’s supported methods and required fields…</p>}
     <fieldset disabled={loadingSchema||!!busy} className="grid gap-4 md:grid-cols-2">
      {renderedFields.map(f=>{
       const path=f.path==='transfer_methods'?'transfer_method':f.path, value=values[path]||'', fixed=path==='beneficiary.bank_details.account_currency'||(/account_routing_type[12]$/.test(path)&&!f.field.options?.length)
-      const institution=values['beneficiary.bank_details.bank_country_code']==='CA'&&path==='beneficiary.bank_details.account_routing_value1'
+      const institution=/account_routing_value[12]$/.test(path)
       const options=institution?f.field.options?.slice().sort((a,b)=>a.value.localeCompare(b.value)):f.field.options, choice=options?.find(o=>o.value===value)
       if(institution&&options?.length)return <InstitutionSelect key={path} options={options} value={value} onChange={v=>changeField(path,v)} label={`${f.field.label}${f.required?' *':''}`} description={choice?.description||f.field.description}/>
       return <label className="grid content-start gap-1 text-sm" key={path}>{f.field.label}{f.required?' *':''}
-       {options?.length?<select className="w-full rounded-md border bg-background p-2" value={value} disabled={fixed} onChange={e=>changeField(path,e.target.value)}><option value="">Select…</option>{options.map(o=><option key={o.value} value={o.value}>{institution?`${o.value} — ${o.label}`:o.label}</option>)}</select>:<Input value={value} readOnly={fixed} maxLength={500} type={path.endsWith('security_question_answer')?'password':'text'} autoComplete="off" onChange={e=>changeField(path,e.target.value)}/>}
+       {options?.length?<select className="w-full rounded-md border bg-background p-2" value={value} disabled={fixed} onChange={e=>changeField(path,e.target.value)}><option value="">Select…</option>{options.map(o=><option key={o.value} value={o.value}>{institution?`${o.value} — ${o.label}`:o.label}</option>)}</select>:<Input value={value} readOnly={fixed} maxLength={500} placeholder={f.field.placeholder||f.field.example||undefined} type={path.endsWith('security_question_answer')?'password':'text'} autoComplete="off" onBlur={()=>{if(f.field.refresh)void loadSchema(values)}} onChange={e=>changeField(path,e.target.value)}/>}
        {(choice?.description||f.field.description)&&<span className="text-xs whitespace-pre-line text-muted-foreground">{choice?.description||f.field.description}</span>}
       </label>
      })}
