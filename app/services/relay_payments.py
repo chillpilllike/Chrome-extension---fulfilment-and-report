@@ -5,6 +5,7 @@ Only the server owns Odoo and Resend credentials. The extension credential can o
 resolve/upload matching payment links and retrieve an authenticated login link for
 a specific current journey; it cannot confirm orders or change settings.
 """
+import base64
 import hashlib
 import hmac
 import json
@@ -19,7 +20,8 @@ from urllib.parse import urlsplit, urljoin
 
 import requests
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from cryptography.fernet import Fernet, InvalidToken
 from .relay_policy import match_capture, payment_key, parse_receipt
 from .relay_login import login_link, login_subject, recent_login_summaries
 
@@ -37,6 +39,31 @@ class RelayPayments:
         self.get_settings, self.set_settings, self.staff_check = get_settings, set_settings, staff_check
         self.email_test_mode = email_test_mode
         self.lock = threading.Lock()
+
+    def _token_cipher(self):
+        key = os.getenv('RELAY_TOKEN_ENCRYPTION_KEY') or os.getenv('MASTER_ADMIN_ACCESS_TOKEN') or os.getenv('ADMIN_ACCESS_TOKEN')
+        if not key:
+            raise HTTPException(503, 'Token storage encryption is not configured')
+        return Fernet(base64.urlsafe_b64encode(hashlib.sha256(('relay-upload-token-v1:' + key).encode()).digest()))
+
+    def save_extension_token(self, value):
+        if not isinstance(value, str) or not 32 <= len(value) <= 256 or any(c.isspace() for c in value):
+            raise HTTPException(400, 'Use an upload token of 32–256 characters without spaces')
+        encrypted = self._token_cipher().encrypt(value.encode()).decode()
+        self.set_settings({'relay_extension_token_hash': hashlib.sha256(value.encode()).hexdigest(),
+                           'relay_extension_token_encrypted': encrypted})
+
+    def reveal_extension_token(self):
+        encrypted = self.get_settings().get('relay_extension_token_encrypted', '')
+        if not encrypted:
+            return ''
+        try:
+            value = self._token_cipher().decrypt(encrypted.encode()).decode()
+        except (InvalidToken, ValueError):
+            raise HTTPException(409, 'Saved token cannot be decrypted; use Edit to save it again')
+        if not hmac.compare_digest(hashlib.sha256(value.encode()).hexdigest(), self.get_settings().get('relay_extension_token_hash', '')):
+            raise HTTPException(409, 'Saved token no longer matches; use Edit to save the current token')
+        return value
 
     def settings(self):
         raw = self.get_settings().get('relay_payment_settings') or '{}'
@@ -601,8 +628,17 @@ class RelayPayments:
         @r.post('/extension-token')
         def token(request:Request):
             staff(request);value=secrets.token_urlsafe(32)
-            self.set_settings({'relay_extension_token_hash':hashlib.sha256(value.encode()).hexdigest()})
+            self.save_extension_token(value)
             return {'token':value}
+        @r.get('/extension-token')
+        def view_token(request:Request):
+            staff(request)
+            return JSONResponse({'token': self.reveal_extension_token()}, headers={'Cache-Control': 'no-store'})
+        @r.put('/extension-token')
+        def save_token(request:Request,payload:dict):
+            staff(request)
+            self.save_extension_token(payload.get('token'))
+            return {'ok': True}
         @r.post('/extension/check')
         def check_connection(request:Request):
             extension(request, require_enabled=False)

@@ -476,3 +476,38 @@ class NotificationTests(WorkflowTests):
   self.svc.current=lambda row:dict(SNAP)
   self.svc.review_pending()
   self.assertEqual('waiting_link',self.c.execute('SELECT status FROM relay_payments').fetchone()[0])
+
+class ExtensionTokenSettingsTests(unittest.TestCase):
+ def setUp(self):
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  self.values={}
+  self.svc=RelayPayments(db=None,get_store=None,client_factory=None,get_settings=lambda:self.values,set_settings=lambda v:self.values.update(v),staff_check=lambda req:req.headers.get('X-Test-Staff')=='yes',email_test_mode=lambda:False)
+  self.svc.ensure=lambda:None
+  app=FastAPI();app.include_router(self.svc.router());self.http=TestClient(app)
+  self.env=patch.dict('os.environ',{'RELAY_TOKEN_ENCRYPTION_KEY':'unit-test-encryption-secret'})
+  self.env.start();self.headers={'X-Test-Staff':'yes'};self.token='unit-test-upload-token-0123456789abcdef'
+ def tearDown(self):self.env.stop();self.http.close()
+ def test_save_reveal_and_authenticate_without_plaintext_storage(self):
+  self.assertEqual(200,self.http.put('/api/relay/extension-token',json={'token':self.token},headers=self.headers).status_code)
+  self.assertNotIn(self.token,json.dumps(self.values))
+  r=self.http.get('/api/relay/extension-token',headers=self.headers)
+  self.assertEqual(self.token,r.json()['token']);self.assertEqual('no-store',r.headers['cache-control'])
+  self.assertEqual(200,self.http.post('/api/relay/extension/check',headers={'X-Relay-Token':self.token}).status_code)
+  self.assertNotIn(self.token,self.http.get('/api/relay/settings',headers=self.headers).text)
+ def test_staff_only_and_invalid_values_do_not_replace(self):
+  for method in ['get','put','post']:
+   self.assertEqual(401,getattr(self.http,method)('/api/relay/extension-token',**({'json':{'token':self.token}} if method=='put' else {})).status_code)
+  self.svc.save_extension_token(self.token);before=dict(self.values)
+  for value in ['',None,'short','x'*32+' ',123]:
+   self.assertEqual(400,self.http.put('/api/relay/extension-token',json={'token':value},headers=self.headers).status_code)
+   self.assertEqual(before,self.values)
+ def test_replace_invalidates_old_token(self):
+  self.svc.save_extension_token(self.token);new='new-unit-test-upload-token-0123456789abcdef'
+  self.http.put('/api/relay/extension-token',json={'token':new},headers=self.headers)
+  self.assertEqual(401,self.http.post('/api/relay/extension/check',headers={'X-Relay-Token':self.token}).status_code)
+  self.assertEqual(new,self.svc.reveal_extension_token())
+ def test_legacy_hash_reveals_nothing_and_generated_tokens_are_saved(self):
+  self.assertEqual('',self.http.get('/api/relay/extension-token',headers=self.headers).json()['token'])
+  r=self.http.post('/api/relay/extension-token',headers=self.headers)
+  self.assertEqual(r.json()['token'],self.svc.reveal_extension_token())

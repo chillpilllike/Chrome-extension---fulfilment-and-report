@@ -26550,6 +26550,7 @@ def api_service_settings() -> dict[str, Any]:
     settings = get_service_settings()
     masked = dict(settings)
     secret_keys = (
+        "relay_extension_token_encrypted",
         "typesense_api_key",
         "redis_url",
         "storage_s3_secret_access_key",
