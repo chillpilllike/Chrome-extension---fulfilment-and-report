@@ -482,7 +482,10 @@ class ExtensionTokenSettingsTests(unittest.TestCase):
   from fastapi import FastAPI
   from fastapi.testclient import TestClient
   self.values={}
-  self.svc=RelayPayments(db=None,get_store=None,client_factory=None,get_settings=lambda:self.values,set_settings=lambda v:self.values.update(v),staff_check=lambda req:req.headers.get('X-Test-Staff')=='yes',email_test_mode=lambda:False)
+  config_spec=importlib.util.spec_from_file_location('relay_test_config',ROOT/'app/core/config.py')
+  config=importlib.util.module_from_spec(config_spec);config_spec.loader.exec_module(config)
+  self.allowed=config.DEFAULT_SERVICE_SETTINGS
+  self.svc=RelayPayments(db=None,get_store=None,client_factory=None,get_settings=lambda:self.values,set_settings=lambda v:self.values.update({k:val for k,val in v.items() if k in self.allowed}),staff_check=lambda req:req.headers.get('X-Test-Staff')=='yes',email_test_mode=lambda:False)
   self.svc.ensure=lambda:None
   app=FastAPI();app.include_router(self.svc.router());self.http=TestClient(app)
   self.env=patch.dict('os.environ',{'RELAY_TOKEN_ENCRYPTION_KEY':'unit-test-encryption-secret'})
