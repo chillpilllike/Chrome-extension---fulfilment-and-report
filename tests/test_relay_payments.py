@@ -83,6 +83,7 @@ class TrackingReceiptTests(PolicyTests):
 class Adapter:
  def __init__(self,c):self.c=c
  def execute(self,sql,args=()):
+  if 'pg_try_advisory_xact_lock' in sql: return self.c.execute('SELECT 1 AS locked')
   return self.c.execute(sql.replace(' FOR UPDATE','').replace('INTEGER PRIMARY KEY AUTOINCREMENT','INTEGER PRIMARY KEY AUTOINCREMENT'),args)
 
 class WorkflowTests(unittest.TestCase):
@@ -292,6 +293,33 @@ class EmailOutboxTests(unittest.TestCase):
   self.c.execute("CREATE TABLE after_order_email_attempts(message_id INTEGER,attempt_number INTEGER,status TEXT,created_at TEXT,updated_at TEXT,provider_message_id TEXT,error TEXT)")
   self.svc.settings=lambda:{**DEFAULTS,'test_mode':False,'store_ids':[1],'public_base_url':'https://app.example.test'}
   self.svc.capture(CAPTURE)
+ def test_capture_route_dispatches_without_waiting_for_cycle_and_deduplicates(self):
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  import hashlib
+  token='test-token'
+  self.svc.get_settings=lambda:{'relay_extension_token_hash':hashlib.sha256(token.encode()).hexdigest()}
+  self.svc.settings=lambda:{**DEFAULTS,'enabled':True,'test_mode':False,'store_ids':[1],'public_base_url':'https://app.example.test'}
+  app=FastAPI();app.include_router(self.svc.router())
+  response=Mock();response.json.return_value={'id':'immediate'}
+  with patch.dict('os.environ',{'RESEND_API_KEY':'fake'}),patch('relay_bridge_test.relay_payments.requests.post',return_value=response) as post:
+   client=TestClient(app)
+   for _ in range(2):
+    result=client.post('/api/relay/extension/capture',json=CAPTURE,headers={'X-Relay-Token':token})
+    self.assertEqual(200,result.status_code)
+   self.assertEqual(1,post.call_count)
+  self.assertEqual('sent',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
+ def test_targeted_dispatch_does_not_send_other_payments(self):
+  response=Mock();response.json.return_value={'id':'immediate'}
+  with patch.dict('os.environ',{'RESEND_API_KEY':'fake'}),patch('relay_bridge_test.relay_payments.requests.post',return_value=response) as post:
+   self.svc.emails(payment_id=999)
+   post.assert_not_called()
+  self.assertEqual('queued',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
+ def test_immediate_failure_preserves_durable_queue(self):
+  self.svc.settings=lambda:{**DEFAULTS,'enabled':True}
+  self.svc.emails=Mock(side_effect=RuntimeError('unavailable'))
+  self.svc.dispatch_captured_email(1)
+  self.assertEqual('queued',self.c.execute('SELECT state FROM relay_email_outbox').fetchone()[0])
  def rejected403(self):
   import requests
   response=Mock(status_code=403)

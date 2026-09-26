@@ -464,7 +464,30 @@ class RelayPayments:
                 'reply_to':'support@'+website.removeprefix('www.'),'subject':title,'html':body,'text':plain,
                 'headers':language_headers(case)}
 
-    def emails(self):
+    def dispatch_captured_email(self, payment_id):
+        # The capture has already committed. Delivery failure must not turn a
+        # successfully saved link into an upload failure; the outbox retries it.
+        try:
+            if self.settings()['enabled']:
+                self.emails(payment_id=payment_id)
+        except Exception:
+            self.set_settings({'relay_email_error': 'Immediate delivery deferred; queued email will retry automatically'})
+
+    def emails(self, payment_id=None):
+        # Separate from the slow sync/receipt cycle. Serialize all email senders
+        # across processes before recovering any interrupted sending rows.
+        for _ in range(120):
+            with self.db() as guard:
+                acquired = guard.execute('SELECT pg_try_advisory_xact_lock(771905433) AS locked').fetchone()
+                if acquired['locked']:
+                    self._emails(payment_id)
+                    return
+            # Release the connection while waiting so concurrent uploads cannot
+            # exhaust the pool and prevent the active sender from finishing.
+            time.sleep(0.25)
+        # Busy sender: leave the durable outbox for the scheduled fallback.
+
+    def _emails(self, payment_id=None):
         if self.settings()['test_mode']:
             return
         if not os.getenv('RESEND_API_KEY'):
@@ -472,8 +495,10 @@ class RelayPayments:
         with self.db() as c:
             # A prior process may have died after Resend accepted the request.
             # Reuse its immutable payload/key only inside the provider's 24h window.
-            c.execute("UPDATE relay_email_outbox SET state='retry' WHERE state='sending'")
-            jobs = c.execute("SELECT * FROM relay_email_outbox WHERE state IN ('queued','retry') ORDER BY id LIMIT 50").fetchall()
+            scope = ' AND payment_id=?' if payment_id is not None else ''
+            params = (payment_id,) if payment_id is not None else ()
+            c.execute("UPDATE relay_email_outbox SET state='retry' WHERE state='sending'" + scope, params)
+            jobs = c.execute("SELECT * FROM relay_email_outbox WHERE state IN ('queued','retry')" + scope + " ORDER BY id LIMIT 50", params).fetchall()
         for job in jobs:
             first_attempt = job['attempted_at']
             if first_attempt and (datetime.now(timezone.utc)-datetime.fromisoformat(first_attempt)).total_seconds() >= 23*3600:
@@ -552,7 +577,7 @@ class RelayPayments:
             lock = guard.execute('SELECT pg_try_advisory_xact_lock(771905432) AS locked').fetchone()
             if not lock['locked']:
                 return
-            for name, action in [('sync',self.sync),('pending_review',self.review_pending),('refresh',self.refresh_bound),('receiving',self.receive),('confirmation',self.confirmations),('email',self.emails)]:
+            for name, action in [('email',self.emails),('sync',self.sync),('pending_review',self.review_pending),('refresh',self.refresh_bound),('receiving',self.receive),('confirmation',self.confirmations),('email',self.emails)]:
                 try:
                     if name=='confirmation' and (self.settings()['test_mode']):
                         continue
@@ -717,10 +742,12 @@ class RelayPayments:
             except ValueError as exc:
                 raise HTTPException(409,str(exc)) from None
         @r.post('/extension/capture')
-        def capture(request:Request,payload:dict):
+        def capture(request:Request,payload:dict,background:BackgroundTasks):
             extension(request)
             try:
-                return self.capture(payload)
+                result = self.capture(payload)
+                background.add_task(self.dispatch_captured_email, result['payment_id'])
+                return result
             except ValueError as exc:
                 raise HTTPException(409,str(exc)) from None
         @r.post('/payments/{payment_id}/resend-branded')
