@@ -1,5 +1,6 @@
 """Shared, table-based customer email layout; no application or network access."""
 from html import escape
+import re
 from decimal import Decimal
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 from .notification_i18n import for_case
@@ -51,7 +52,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         "manual_refund_completed": ("REFUND CONFIRMED", "Your refund has been processed.", "Your refund has been processed", "Our team has confirmed that your refund has been processed. The refund details are below.", "When will the credit appear?", "Please allow 24–48 hours for the credit to appear. Your bank or payment provider may take longer. If you need help, reply to this email."),
         "refund_confirmed": ("REFUND CONFIRMED", "Your refund has been sent.", "Your refund has been processed", "We’ve successfully sent a refund for your order. You’ll find the amount and destination below.", "When will the credit appear?", "The credit may appear in your account within 24–72 business hours. Timing depends on your bank. If it has not appeared after this time, reply to this email and our team will help."),
         "relay_request": ("PAYMENT REQUEST", "Your invoice is ready.", "Complete payment", "Complete your order securely using the payment button below. Your invoice will be charged in USD at the amount shown.", "Complete your payment", "Your payment link belongs to this order. If you return later, use this same link."),
-        "relay_received": ("ORDER CONFIRMED", "Thank you for your payment.", "Payment received", "Relay has reported your payment initiation and your order is confirmed. Bank settlement is still processing.", "We’re here to help", "Keep your order number handy if you contact our team."),
+        "relay_received": ("ORDER CONFIRMED", "Thank you for your order!", "ORDER CONFIRMED", "", "We’re here to help", "Keep your order number handy if you contact our team."),
         "new_order_welcome": ("THANK YOU", "Thank you for your order!", "Thank you for your order", "We’ve received your order and will begin processing it soon. We’re here to help whenever you need us.", "Here to help", "Keep your order number handy when contacting us so we can help you more quickly."),
         "warehouse_dispatch_delay": ("DISPATCH UPDATE", "An update on your dispatch.", "Your dispatch is taking longer than expected", "Your order’s dispatch has hit a hurdle, and our team has been notified. We expect to dispatch it within the next 24–48 hours.", "No action needed", "You don’t need to take any action. Our team is working to get your order on its way."),
         "item_unavailable": ("YOUR ORDER", "Let’s find your next best option.", "An item needs your choice", "Our team has prepared alternatives for an unavailable item in your order. Review the affected item below and choose how you’d like to continue.", "Choose what works for you", "You can change an alternative for 24 hours from your first selection. After that, a higher-priced choice requires payment of the difference; a cheaper choice is reviewed for a difference refund. If you remove an item, any amount charged for it will be refunded after our team reviews and confirms your request."),
@@ -69,6 +70,11 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
         from app.services.notification_i18n import sms_translation
         intro, _ = sms_translation(t.language,'refund_request_received',website,order,'')
         intro = intro.strip()
+    if kind == 'relay_received':
+        # QuickBooks adds a matching suffix; keep internal identifiers out of greetings.
+        name = str((context.get('relay_payment') or {}).get('customer_name') or '').strip()
+        name = re.sub(r'\s*\[(?:Odoo|Customer)-[^\[\]]+\]$', '', name).strip()
+        intro = (name + ' — ' if name else '') + t('ORDER CONFIRMED') + ': ' + order
     no_alternatives = kind == 'item_unavailable' and bool(context.get('no_alternative_line_ids')) and 'offer_alternatives' not in actions
     if no_alternatives:
         heading = t('An item in your order is unavailable.')
@@ -295,7 +301,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="content" style="padding:40px 40px 36px;font-family:{FONT}">
 <p style="margin:0 0 16px;color:#557364;font-size:10px;line-height:16px;font-weight:600;letter-spacing:1.8px">{eyebrow}</p>
 <h1 class="heading" style="margin:0 0 18px;font-family:{FONT};font-size:34px;line-height:41px;letter-spacing:-1.2px;font-weight:600;color:#193b2d">{heading}</h1>
-<p style="margin:0;font-family:{FONT};font-size:15px;line-height:26px;color:#637167">{intro}</p>
+<p style="margin:0;font-family:{FONT};font-size:15px;line-height:26px;color:#637167">{escape(intro) if kind == "relay_received" else intro}</p>
 {panel}{items_html}{action_html}
 <p style="margin:24px 0 0;font-family:{FONT};font-size:12px;line-height:20px;color:#7a857d">{escape(t("With care,"))}<br><strong style="font-weight:500;color:#42584a">{escape(t("The {website} team", website=website))}</strong></p>
 </td></tr></table></td></tr>

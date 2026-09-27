@@ -401,7 +401,11 @@ class EmailOutboxTests(unittest.TestCase):
   row=self.c.execute('SELECT * FROM relay_payments').fetchone()
   mail=self.svc.email_payload(row,'received')
   self.assertIn('ORDER CONFIRMED',mail['html'])
-  self.assertIn('Bank settlement is still processing',mail['html'])
+  self.assertIn('Amit Soni — ORDER CONFIRMED: NC-22',mail['html'])
+  self.assertIn('Amit Soni — ORDER CONFIRMED: NC-22',mail['text'])
+  for phrase in ('Bank settlement', 'payment initiation', '[Odoo-'):
+   self.assertNotIn(phrase,mail['html'])
+   self.assertNotIn(phrase,mail['text'])
   self.assertNotIn('Pay USD',mail['html'])
   self.assertIn('/web/image/website/1/logo',mail['html'])
  def test_manual_branded_resend_preserves_original_and_is_idempotent(self):
