@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Čas obdelave in odprem",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Prosimo, da za obdelavo pred odpremo računate 2–3 dni. Naročila, oddana v četrtek ali petek, običajno odpremimo v ponedeljek, saj ob koncih tedna ne odpremamo. Če je ponedeljek državni praznik, odpremo nadaljujemo naslednji delovni dan. To so ocene; obvestili vas bomo, če bo vaše naročilo potrebovalo več časa.",
     "A little closer to your door.": "Malo bližje vašim vratom.",
     "A quick update on your order.": "Hitro obvestilo o vašem naročilu.",
     "AMOUNT": "ZNESEK",

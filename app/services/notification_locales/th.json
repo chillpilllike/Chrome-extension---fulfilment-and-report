@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "ระยะเวลาการจัดการและการจัดส่ง",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "กรุณาเผื่อเวลา 2–3 วันสำหรับการจัดการก่อนการจัดส่ง คำสั่งซื้อที่ทำในวันพฤหัสบดีหรือวันศุกร์โดยปกติจะถูกจัดส่งในวันจันทร์ เนื่องจากเราไม่จัดส่งในวันหยุดสุดสัปดาห์ หากวันจันทร์เป็นวันหยุดราชการ การจัดส่งจะเริ่มต้นอีกครั้งในวันทำการถัดไป ตัวเลขเหล่านี้เป็นการประมาณการ เราจะแจ้งให้คุณทราบหากคำสั่งซื้อของคุณต้องใช้เวลามากขึ้น",
     "A little closer to your door.": "ใกล้ประตูบ้านคุณมากขึ้นเล็กน้อย",
     "A quick update on your order.": "อัปเดตด่วนเกี่ยวกับคำสั่งซื้อของคุณ",
     "AMOUNT": "จำนวนเงิน",

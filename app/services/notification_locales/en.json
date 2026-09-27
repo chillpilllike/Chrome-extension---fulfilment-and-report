@@ -2,6 +2,8 @@
   "version": "english-v1",
   "complete": true,
   "messages": {
+    "Handling time and dispatch": "Handling time and dispatch",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.",
     "A little closer to your door.": "A little closer to your door.",
     "A quick update on your order.": "A quick update on your order.",
     "AMOUNT": "AMOUNT",

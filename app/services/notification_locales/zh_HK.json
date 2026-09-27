@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "處理時間及發貨",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "請預留 2–3 天作為處理時間，然後才會發貨。星期四或星期五下的訂單通常會在星期一發貨，因為我們週末不發貨。如遇星期一為公眾假期，發貨將於下一個工作日恢復。以上為預計時間，如訂單需要更長時間，我們會通知您。",
     "A little closer to your door.": "離你家門口更近一步",
     "A quick update on your order.": "關於您的訂單的最新消息",
     "AMOUNT": "金額",

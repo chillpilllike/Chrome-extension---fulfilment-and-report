@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Tempo de processamento e envio",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Por favor, permita 2–3 dias para o processamento antes do envio. Pedidos feitos na quinta ou sexta-feira normalmente são enviados na segunda-feira, pois não realizamos envios nos finais de semana. Se a segunda-feira for feriado, o envio será retomado no próximo dia útil. Estes são prazos estimados; informaremos caso seu pedido precise de mais tempo.",
     "A little closer to your door.": "Um pouco mais perto da sua porta",
     "A quick update on your order.": "Uma atualização rápida sobre seu pedido",
     "AMOUNT": "VALOR",

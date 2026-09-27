@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Χρόνος επεξεργασίας και αποστολής",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Παρακαλούμε επιτρέψτε 2–3 ημέρες για την επεξεργασία πριν από την αποστολή. Οι παραγγελίες που γίνονται την Πέμπτη ή την Παρασκευή συνήθως αποστέλλονται τη Δευτέρα, καθώς δεν πραγματοποιούμε αποστολές τα Σαββατοκύριακα. Εάν η Δευτέρα είναι αργία, η αποστολή συνεχίζεται την επόμενη εργάσιμη ημέρα. Αυτές είναι εκτιμήσεις· θα σας ενημερώσουμε εάν η παραγγελία σας χρειαστεί περισσότερο χρόνο.",
     "A little closer to your door.": "Λίγο πιο κοντά στην πόρτα σας",
     "A quick update on your order.": "Μια γρήγορη ενημέρωση για την παραγγελία σας",
     "AMOUNT": "ΠΟΣΟ",

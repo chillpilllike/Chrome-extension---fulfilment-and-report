@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "ကိုင်တွယ်ချိန်နှင့် ပို့ဆောင်ခြင်း",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "ပို့ဆောင်မှုမပြုမီ ကိုင်တွယ်ချိန်အဖြစ် 2–3 ရက်ခန့် ခွင့်ပြုပါရန် တောင်းဆိုပါသည်။ ကြာသပတေးနေ့ သို့မဟုတ် သောကြာနေ့တွင် မှာယူသော အော်ဒါများကို ပုံမှန်အားဖြင့် တနင်္လာနေ့တွင်ပို့ဆောင်ပါသည်၊ အပတ်စဉ်အနားရက်များတွင် ပို့ဆောင်မှုမပြုလုပ်ပါ။ တနင်္လာနေ့သည် အများပြည်သူအားလပ်ရက်ဖြစ်ပါက နောက်ထပ်လုပ်ငန်းရက်တွင်ပို့ဆောင်မှု ပြန်လည်စတင်ပါမည်။ ၎င်းသည် ခန့်မှန်းချက်များဖြစ်ပြီး၊ သင့်အော်ဒါအတွက် ပိုမိုအချိန်လိုအပ်ပါက ကျွန်ုပ်တို့မှ အသိပေးပါမည်။",
     "A little closer to your door.": "သင့်တံခါးတံခါးနားနီးလာပြီ။",
     "A quick update on your order.": "သင့်အမှာစာအပေါ် အမြန်ဆုံးအသစ်တင်ချက်။",
     "AMOUNT": "ပမာဏ",

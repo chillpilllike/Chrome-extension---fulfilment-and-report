@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Beaarbechtungszäit an Versand",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "W.e.g. erlaabt 2–3 Deeg fir d'Beaarbechtung virun dem Versand. Bestellungen, déi en Donneschdeg oder Freideg gemaach ginn, ginn normalerweis den Méindeg verschéckt, well mir um Weekend net verschécken. Wann de Méindeg en ëffentleche Feierdag ass, geet de Versand um nächste Geschäftsdag weider. Dëst sinn Schätzunge; mir informéieren Iech, wann Är Bestellung méi Zäit brauch.",
     "A little closer to your door.": "E bësse méi no bei Ärer Dier",
     "A quick update on your order.": "Eng séier Aktualiséierung vun Ärer Bestellung",
     "AMOUNT": "Betrag",

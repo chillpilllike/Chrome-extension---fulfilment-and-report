@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Ħin ta' trattament u tbaħħir",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Jekk jogħġbok ipprovdilna 2–3 ijiem għat-trattament qabel it-tbaħħir. L-ordnijiet li jsiru nhar l-Erbgħa jew il-Ġimgħa normalment jitħallew jitbaħħru nhar it-Tnejn, peress li ma nitbiegħdux fil-weekend. Jekk it-Tnejn ikun festa pubblika, it-tbaħħir jerġa' jibda fil-jum tax-xogħol li jmiss. Dawn huma stimi; se ninfurmak jekk l-ordni tiegħek teħtieġ aktar żmien.",
     "A little closer to your door.": "Ftit eqreb lejn il-bieb tiegħek",
     "A quick update on your order.": "Aġġornament rapidu dwar l-ordni tiegħek",
     "AMOUNT": "AMMONT",

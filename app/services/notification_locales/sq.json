@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Koha e përpunimit dhe dërgimit",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Ju lutemi lejoni 2–3 ditë për përpunim para dërgimit. Porositë e bëra të enjten ose të premten zakonisht dërgohen të hënën, pasi ne nuk dërgojmë në fundjavë. Nëse e hëna është një ditë pushimi zyrtare, dërgimi rifillon në ditën e ardhshme të punës. Këto janë vlerësime; do t'ju njoftojmë nëse porosia juaj ka nevojë për më shumë kohë.",
     "A little closer to your door.": "Pak më afër derës suaj",
     "A quick update on your order.": "Një përditësim i shpejtë për porosinë tuaj",
     "AMOUNT": "SHUMA",

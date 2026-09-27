@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Ùine làimhseachaidh agus cur air falbh",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Feuch an leig thu seachad 2–3 làithean airson làimhseachadh mus tèid cur air falbh. Mar as trice bidh òrdughan a thèid a chuir air Diardaoin no Dihaoine air an cur air falbh air Diluain, oir chan eil sinn a’ cur air falbh air deireadh-sheachdain. Ma tha Diluain na là saor poblach, thèid cur air falbh a leantainn air an ath latha obrach. Tha seo nan tomhasan; cuiridh sinn fios thugad ma dh’ fheumas do òrdugh barrachd ùine.",
     "A little closer to your door.": "Beagan nas fhaisge air do dhoras.",
     "A quick update on your order.": "Ùrachadh luath mu do òrdugh.",
     "AMOUNT": "SUIMH",

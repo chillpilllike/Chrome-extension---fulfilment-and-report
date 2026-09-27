@@ -47,6 +47,7 @@ class LanguageTests(unittest.TestCase):
                 for row in ast.literal_eval(node.value).values():required.update(row)
             if isinstance(node,ast.Assign) and any(isinstance(x,ast.Name) and x.id=='sections' for x in node.targets):
                 for _,title,body in ast.literal_eval(node.value):required.update((title,body))
+        required.discard('')  # Optional blank intro text needs no translation entry.
         self.assertFalse(required-source)
         self.assertEqual(source,set(french))
         for key,value in french.items():

@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "زمان پردازش و ارسال",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "لطفاً 2–3 روز برای پردازش قبل از ارسال در نظر بگیرید. سفارش‌هایی که در روزهای پنج‌شنبه یا جمعه ثبت می‌شوند معمولاً در روز دوشنبه ارسال می‌شوند، زیرا ما در آخر هفته ارسال نداریم. اگر دوشنبه تعطیل رسمی باشد، ارسال در اولین روز کاری بعدی از سر گرفته می‌شود. این زمان‌ها تخمینی هستند؛ در صورتی که سفارش شما به زمان بیشتری نیاز داشته باشد، به شما اطلاع خواهیم داد.",
     "A little closer to your door.": "کمی نزدیک‌تر به درب شما",
     "A quick update on your order.": "یک به‌روزرسانی سریع درباره سفارش شما",
     "AMOUNT": "مبلغ",

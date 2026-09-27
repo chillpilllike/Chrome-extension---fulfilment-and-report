@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Temps de gestió i enviament",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Si us plau, permeteu 2–3 dies per a la gestió abans de l'enviament. Les comandes realitzades el dijous o divendres normalment s'envien el dilluns, ja que no fem enviaments durant el cap de setmana. Si el dilluns és un dia festiu, l'enviament es reprèn el següent dia laborable. Aquestes són estimacions; us informarem si la vostra comanda necessita més temps.",
     "A little closer to your door.": "Una mica més a prop de la teva porta",
     "A quick update on your order.": "Una actualització ràpida sobre la teva comanda",
     "AMOUNT": "IMPORT",

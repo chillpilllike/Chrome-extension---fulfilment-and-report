@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "ពេលវេលាចំណាយសម្រាប់ដំណើរការ និងការផ្ញើ",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "សូមអនុញ្ញាតឲ្យមានពេលវេលា 2–3 ថ្ងៃសម្រាប់ដំណើរការមុនពេលផ្ញើ។ ការបញ្ជាទិញដែលបានធ្វើនៅថ្ងៃព្រហស្បតិ៍ ឬថ្ងៃសុក្រ ជាទូទៅនឹងត្រូវបានផ្ញើនៅថ្ងៃច័ន្ទ ពីព្រោះយើងមិនផ្ញើនៅចុងសប្តាហ៍ទេ។ ប្រសិនបើថ្ងៃច័ន្ទជាថ្ងៃឈប់សម្រាកជាតិ ការផ្ញើនឹងបន្តនៅថ្ងៃធ្វើការ​បន្ទាប់។ នេះគឺជាការប៉ាន់ស្មាន; យើងនឹងជូនដំណឹងអ្នក ប្រសិនបើការបញ្ជាទិញរបស់អ្នកត្រូវការពេលវេលាបន្ថែម។",
     "A little closer to your door.": "ជិតទៅទ្វាររបស់អ្នកបន្តិច។",
     "A quick update on your order.": "ព័ត៌មានថ្មីៗអំពីការបញ្ជាទិញរបស់អ្នក។",
     "AMOUNT": "ចំនួនទឹកប្រាក់",

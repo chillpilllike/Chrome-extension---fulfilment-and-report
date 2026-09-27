@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Isikhathi sokuphatha nokuthumela",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Sicela uvumele izinsuku ezi-2 kuya ku-3 zokuphatha ngaphambi kokuthunyelwa. Ama-oda afakwa ngoLwesine noma ngoLwesihlanu ngokuvamile athunyelwa ngoMsombuluko, njengoba singathumeli ngezimpelasonto. Uma uMsombuluko kuwusuku lweholide lukahulumeni, ukuthumela kuzoqala ngosuku olulandelayo lwebhizinisi. Lezi zilinganiso; sizokwazisa uma i-oda lakho lidinga isikhathi esengeziwe.",
     "A little closer to your door.": "Kuseduze kancane nomnyango wakho",
     "A quick update on your order.": "Isibuyekezo esisheshayo ngomyalelo wakho",
     "AMOUNT": "INANI",

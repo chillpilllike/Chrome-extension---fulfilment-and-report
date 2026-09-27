@@ -7,6 +7,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "ހެންޑްލިންގ ޓައިމް އަދި ޑިސްޕޭޗް",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "ޑިސްޕޭޗް ކުރަން އަދި ހެންޑްލިންގ ކޮންމެ ދައްކަން 2–3 ދުވަސް އަދިއްޖެ. ހުކުރަން އޮފް ތުރުސްޑޭ އަދި ފުރައިޑޭ އަދި އޮރޑަރުތަކު މަންޑޭ ދިސްޕޭޗް ކުރެވޭނެ، ގައިވާ ވީކެންޑްސް އަދިވާ ޑިސްޕޭޗް ނޫން. މަންޑޭ އެއް ޕަބްލިކް ހޮލިޑޭ އިން އެއްޗެއް އެންމެ، ޑިސްޕޭޗް ކުރަން މިއަދު ބިޒްނެސް ދައްކާއި އެއްޗެއް ކުރެވޭނެ. މިތާރީގައި އެސްޓިމޭޓްސް އެއްޗެއްވެސް؛ އޮރޑަރުގެ ހަމައެއް ވަނީ އިންސްޓްރަކްޝަން ކުރަން ކުރެވޭނެ އެއްޗެއް އަދި އަންނަވަނީ އަދިއްޖެ.",
     "A little closer to your door.": "އައު ދަރު އަށް އައު ބައްދަލު",
     "A quick update on your order.": "އައު އޯޑަރު އަދި އައު ބައްދަލު",
     "AMOUNT": "އަދިވެސް",

@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Timpul de procesare și expediere",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Vă rugăm să permiteți 2–3 zile pentru procesare înainte de expediere. Comenzile plasate joi sau vineri sunt, de obicei, expediate luni, deoarece nu expediem în weekend. Dacă luni este o sărbătoare legală, expedierea va fi reluată în următoarea zi lucrătoare. Acestea sunt estimări; vă vom informa dacă comanda dumneavoastră necesită mai mult timp.",
     "A little closer to your door.": "Puțin mai aproape de ușa ta.",
     "A quick update on your order.": "O actualizare rapidă despre comanda ta.",
     "AMOUNT": "SUMA",

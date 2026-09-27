@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Behandlingstid og afsendelse",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Venligst tillad 2–3 dage til behandling før afsendelse. Ordrer afgivet torsdag eller fredag afsendes normalt om mandagen, da vi ikke afsender i weekenden. Hvis mandag er en helligdag, genoptages afsendelsen den næste hverdag. Dette er estimater; vi giver dig besked, hvis din ordre kræver mere tid.",
     "A little closer to your door.": "Lidt tættere på din dør",
     "A quick update on your order.": "En hurtig opdatering om din ordre",
     "AMOUNT": "BELØB",

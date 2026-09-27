@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Czas realizacji i wysyłki",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Prosimy o uwzględnienie 2–3 dni na realizację przed wysyłką. Zamówienia złożone w czwartek lub piątek są zazwyczaj wysyłane w poniedziałek, ponieważ nie realizujemy wysyłek w weekendy. Jeśli poniedziałek jest dniem wolnym od pracy, wysyłka wznowi się w następny dzień roboczy. Są to szacunkowe terminy; poinformujemy Cię, jeśli realizacja Twojego zamówienia zajmie więcej czasu.",
     "A little closer to your door.": "Trochę bliżej twoich drzwi",
     "A quick update on your order.": "Szybka aktualizacja twojego zamówienia",
     "AMOUNT": "KWOTA",

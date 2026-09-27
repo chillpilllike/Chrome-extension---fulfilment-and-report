@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "হ্যান্ডলিং সময় এবং প্রেরণ",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "প্রেরণের আগে হ্যান্ডলিংয়ের জন্য 2–3 দিন অনুমতি দিন। বৃহস্পতিবার বা শুক্রবার দেওয়া অর্ডার সাধারণত সোমবার প্রেরণ করা হয়, কারণ আমরা সাপ্তাহিক ছুটির দিনে প্রেরণ করি না। যদি সোমবার একটি সরকারি ছুটি হয়, তবে পরবর্তী কার্যদিবসে প্রেরণ পুনরায় শুরু হয়। এগুলো আনুমানিক সময়; যদি আপনার অর্ডারের জন্য আরও সময় প্রয়োজন হয়, আমরা আপনাকে জানাব।",
     "A little closer to your door.": "আপনার দরজার একটু কাছাকাছি।",
     "A quick update on your order.": "আপনার অর্ডারের একটি দ্রুত আপডেট।",
     "AMOUNT": "পরিমাণ",

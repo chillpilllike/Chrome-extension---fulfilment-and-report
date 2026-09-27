@@ -38,6 +38,11 @@ class WelcomeTests(unittest.TestCase):
         case={'case_type':'new_order_welcome','sender_domain':'nutricity.com.au','odoo_order_name':'NC-TEST','context':{'website_name':'Nutricity Australia'}}
         subject,markup,plain=render_after_order_email(case,'',actions=[],labels={})
         self.assertIn('NC-TEST',subject)
+        self.assertIn('2–3 days',plain)
+        self.assertIn('Thursday or Friday',plain)
+        self.assertIn('do not dispatch on weekends',plain)
+        self.assertLess(markup.index('Handling time and dispatch'),markup.index('Need help with your order?'))
+        self.assertLess(plain.index('Handling time and dispatch'),plain.index('Need help with your order?'))
         for text in ['Friday','Monday','48 hours or longer','next business day','https://nutricity.com.au/contactus','mailto:support@nutricity.com.au']:
             self.assertIn(text,markup)
         self.assertNotIn('insurance',plain)

@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Käitlemisaeg ja saatmine",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Palun arvestage, et enne saatmist kulub 2–3 päeva käitlemiseks. Neljapäeval või reedel esitatud tellimused saadetakse tavaliselt esmaspäeval, kuna nädalavahetustel me saadetisi ei tee. Kui esmaspäev on riigipüha, jätkub saatmine järgmisel tööpäeval. Need on hinnangud; anname teile teada, kui teie tellimus vajab rohkem aega.",
     "A little closer to your door.": "Veidi lähemale teie uksele",
     "A quick update on your order.": "Kiire uuendus teie tellimuse kohta",
     "AMOUNT": "SUMMA",

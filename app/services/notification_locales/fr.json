@@ -16,6 +16,8 @@
     "delivery_issue_received": "{brand} : commande {order}. Merci pour votre signalement de non-réception. Notre équipe vous contactera : {url} - Assistance {brand}"
   },
   "messages": {
+    "Handling time and dispatch": "Délai de traitement et d'expédition",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Veuillez prévoir un délai de traitement de 2 à 3 jours avant l'expédition. Les commandes passées le jeudi ou le vendredi sont généralement expédiées le lundi, car nous n'expédions pas le week-end. Si le lundi est un jour férié, l'expédition reprend le jour ouvrable suivant. Ce sont des estimations ; nous vous informerons si votre commande nécessite plus de temps.",
     "A little closer to your door.": "Votre colis se rapproche.",
     "A quick update on your order.": "Des nouvelles de votre commande.",
     "AMOUNT": "MONTANT",

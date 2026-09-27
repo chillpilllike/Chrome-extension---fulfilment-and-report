@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "처리 시간 및 발송",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "발송 전에 2–3일의 처리를 허용해 주십시오. 목요일이나 금요일에 주문하신 경우, 주말에는 발송하지 않으므로 보통 월요일에 발송됩니다. 월요일이 공휴일인 경우, 다음 영업일에 발송이 재개됩니다. 이는 예상 시간이며, 주문에 더 많은 시간이 필요한 경우 알려드리겠습니다.",
     "A little closer to your door.": "당신의 문 앞으로 조금 더 가까이.",
     "A quick update on your order.": "주문에 대한 빠른 업데이트입니다.",
     "AMOUNT": "금액",

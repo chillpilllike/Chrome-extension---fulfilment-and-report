@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Tempus tractationis et expeditio",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Quaeso sinite 2–3 dies ad tractationem ante expeditio. Ordines die Iovis vel Veneris facti plerumque die Lunae expediuntur, cum in fine hebdomadis non expediamus. Si dies festus publicus est die Lunae, expeditio in proximo die negotiabili resumitur. Haec sunt aestimationes; certiores faciemus si ordo vestri plus temporis requirit.",
     "A little closer to your door.": "Paulo propius ad ostium tuum",
     "A quick update on your order.": "Brevis renovatio de ordine tuo",
     "AMOUNT": "SUMMA",

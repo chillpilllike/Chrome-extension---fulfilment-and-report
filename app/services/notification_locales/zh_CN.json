@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "处理时间和发货",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "请预留 2–3 天的处理时间后发货。周四或周五下的订单通常会在周一发出，因为我们周末不发货。如果周一是公共假日，发货将在下一个工作日恢复。这些时间为预估值；如果您的订单需要更多时间，我们会通知您。",
     "A little closer to your door.": "离您家门更近一点",
     "A quick update on your order.": "关于您的订单的最新更新",
     "AMOUNT": "金额",

@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Amser trin a danfon",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Rhowch ganiatâd am 2–3 diwrnod ar gyfer trin cyn danfon. Fel arfer, archebion a wneir ar ddydd Iau neu ddydd Gwener yn cael eu danfon ar ddydd Llun, gan nad ydym yn danfon ar benwythnosau. Os yw dydd Llun yn wyl gyhoeddus, bydd y danfon yn ailddechrau ar y diwrnod busnes nesaf. Mae hyn yn amcangyfrifon; byddwn yn eich hysbysu os oes angen mwy o amser ar eich archeb.",
     "A little closer to your door.": "Ychydig yn agosach at dy ddrws",
     "A quick update on your order.": "Diweddariad cyflym ar dy archeb",
     "AMOUNT": "SWM",

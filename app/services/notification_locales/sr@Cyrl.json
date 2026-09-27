@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Време обраде и отпреме",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Молимо вас да рачунате са 2–3 дана за обраду пре отпреме. Наруџбине које се пошаљу у четвртак или петак обично се отпремају у понедељак, јер не отпремамо викендом. Ако је понедељак државни празник, отпрема се наставља следећег радног дана. Ово су процене; обавестићемо вас ако вашој наруџбини треба више времена.",
     "A little closer to your door.": "Мало ближе до ваших врата",
     "A quick update on your order.": "Брза информација о вашој поруџбини",
     "AMOUNT": "ИЗНОС",

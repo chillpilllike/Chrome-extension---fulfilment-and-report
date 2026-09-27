@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Боловсруулах хугацаа ба илгээх",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Илгээхээс өмнө 2–3 хоногийн боловсруулалтын хугацааг зөвшөөрнө үү. Пүрэв гараг эсвэл Баасан гарагт өгсөн захиалгууд ихэвчлэн Даваа гарагт илгээгддэг, учир нь бид амралтын өдрүүдэд илгээдэггүй. Хэрэв Даваа гараг нь амралтын өдөр бол илгээх үйл ажиллагаа дараагийн ажлын өдөр үргэлжилнэ. Эдгээр нь тооцоолол бөгөөд таны захиалга илүү их хугацаа шаардах бол бид танд мэдэгдэнэ.",
     "A little closer to your door.": "Таны хаалганы ойролцоо.",
     "A quick update on your order.": "Таны захиалгын тухай хурдан шинэчлэлт.",
     "AMOUNT": "ДҮН",

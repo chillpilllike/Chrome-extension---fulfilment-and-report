@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Hanteringstyd en versending",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Laat asseblief 2–3 dae toe vir hantering voor versending. Bestellings wat op Donderdag of Vrydag geplaas word, word gewoonlik Maandag versend, aangesien ons nie oor naweke versend nie. As Maandag ’n openbare vakansiedag is, hervat die versending op die volgende werksdag. Dit is skatgings; ons sal jou laat weet as jou bestelling meer tyd benodig.",
     "A little closer to your door.": "Net bietjie nader aan jou deur.",
     "A quick update on your order.": "'n Vinnige opdatering oor jou bestelling.",
     "AMOUNT": "BEDRAG",

@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "ເວລາການຈັດການແລະການຈັດສົ່ງ",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "ກະລຸນາອະນຸຍາດເວລາ 2–3 ມື້ໃນການຈັດການກ່ອນການຈັດສົ່ງ. ຄໍາສັ່ງທີ່ສັ່ງໃນວັນພະຫັດ ຫຼື ວັນສຸກ ມັກຈະຖືກຈັດສົ່ງໃນວັນຈັນ ເນື່ອງຈາກພວກເຮົາບໍ່ຈັດສົ່ງໃນສຸດສະຫວາດ. ຖ້າວັນຈັນເປັນວັນພິເສດ ການຈັດສົ່ງຈະກັບມາດຳເນີນຕໍ່ໃນວັນທຳອິດທີ່ເປັນວັນທຳງານ. ນີ້ແມ່ນການປະເມີນ; ພວກເຮົາຈະແຈ້ງໃຫ້ທ່ານຮູ້ຖ້າຄໍາສັ່ງຂອງທ່ານຕ້ອງການເວລາເພີ່ມເຕີມ.",
     "A little closer to your door.": "ໃກ້ປະຕູຂອງທ່ານຫຼາຍຂຶ້ນໜ້ອຍ",
     "A quick update on your order.": "ອັບເດດດ່ວນເກື່ອງການສັ່ງຊື້ຂອງທ່ານ",
     "AMOUNT": "ຈຳນວນ",

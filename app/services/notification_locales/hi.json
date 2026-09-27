@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "प्रसंस्करण समय और प्रेषण",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "कृपया प्रेषण से पहले 2–3 दिनों का प्रसंस्करण समय दें। गुरुवार या शुक्रवार को किए गए ऑर्डर सामान्यतः सोमवार को प्रेषित किए जाते हैं, क्योंकि हम सप्ताहांत में प्रेषण नहीं करते। यदि सोमवार सार्वजनिक अवकाश होता है, तो प्रेषण अगले कार्य दिवस से पुनः शुरू होगा। ये अनुमानित समय हैं; यदि आपके ऑर्डर को अधिक समय की आवश्यकता होगी तो हम आपको सूचित करेंगे।",
     "A little closer to your door.": "आपके दरवाज़े के थोड़ा करीब।",
     "A quick update on your order.": "आपके आदेश पर एक त्वरित अपडेट।",
     "AMOUNT": "राशि",

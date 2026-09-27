@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "処理時間と発送",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "発送前に2〜3日間の処理期間をいただいております。木曜日または金曜日にご注文いただいた場合、通常は月曜日に発送いたします。週末は発送を行っておりません。月曜日が祝日の場合は、翌営業日に発送を再開いたします。これらはあくまで目安であり、ご注文に追加の時間が必要な場合はご連絡いたします。",
     "A little closer to your door.": "あなたの玄関にもう少し近づきました。",
     "A quick update on your order.": "ご注文の最新情報です。",
     "AMOUNT": "金額",

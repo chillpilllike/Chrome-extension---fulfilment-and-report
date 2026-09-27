@@ -5,6 +5,8 @@
   "human_reviewed": false,
   "source_sha256": "b9c45f589a66917820cc8ce61ee9c07ecf0a7cec3469dc9f09f5e6d79ccbad85",
   "messages": {
+    "Handling time and dispatch": "Vreme obrade i isporuke",
+    "Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.": "Molimo dozvolite 2–3 dana za obradu pre slanja. Porudžbine napravljene u četvrtak ili petak obično se šalju u ponedeljak, jer ne šaljemo tokom vikenda. Ako je ponedeljak državni praznik, slanje se nastavlja narednog radnog dana. Ovo su procene; obavestićemo vas ako je vašoj porudžbini potrebno više vremena.",
     "A little closer to your door.": "Malo bliže vašim vratima.",
     "A quick update on your order.": "Brza informacija o vašoj porudžbini.",
     "AMOUNT": "IZNOS",

@@ -173,6 +173,7 @@ def render_after_order_email(case, action_url, *, actions, labels, template_kind
             raise ValueError('A verified storefront domain is required for the welcome email.')
         base = 'https://' + domain
         sections = [
+            ('◷', 'Handling time and dispatch', 'Please allow 2–3 days for handling before dispatch. Orders placed on Thursday or Friday are normally dispatched on Monday, as we do not dispatch on weekends. If Monday is a public holiday, dispatch resumes on the next business day. These are estimates; we’ll let you know if your order needs more time.'),
             ('✉', 'Need help with your order?', 'Contact us by email, through our website contact form, or via chat on our website.'),
             ('◷', 'Friday and weekend enquiries', 'If you email us on Friday or over the weekend, our team will return on Monday during business hours to review and reply. If Monday is a public holiday, please allow until the next business day.'),
             ('▣', 'After your package is dispatched', 'We work with our courier partners to resolve delivery questions. Their investigations can take 48 hours or longer. Thank you for your patience—we’ll follow up and keep you informed.'),
