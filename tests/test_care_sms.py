@@ -255,6 +255,12 @@ class SMSTests(unittest.TestCase):
         payload['mappings']['1:1']['msg91']['authkey']='not-allowed'
         with self.assertRaises(ValueError): validate_config(payload)
 
+    def test_relay_setting_is_persistable(self):
+        import ast
+        from pathlib import Path
+        tree=ast.parse(Path('app/core/config.py').read_text())
+        self.assertTrue(any(isinstance(n,ast.Dict) and any(isinstance(k,ast.Constant) and k.value=='after_order_relay_sms_enabled' for k in n.keys) for n in ast.walk(tree)))
+
     def relay_fixture(self):
         self.settings['after_order_relay_sms_enabled']='true'
         self.ns['after_order_email_test_mode']=lambda:False
