@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import './sms-log.css'
 type API = <T>(path: string, options?: RequestInit) => Promise<T>
-type Config = { enabled: boolean; approval_required: boolean; provider: string; mappings: Record<string, unknown>; credentials: Record<string, boolean>; test_mode: boolean }
+type Config = { relay_enabled: boolean; enabled: boolean; approval_required: boolean; provider: string; mappings: Record<string, unknown>; credentials: Record<string, boolean>; test_mode: boolean }
 export function SmsSettings({ api }: { api: API }) {
   const [config, setConfig] = useState<Config | null>(null)
   const [mapping, setMapping] = useState('{}')
@@ -16,12 +16,13 @@ export function SmsSettings({ api }: { api: API }) {
     if (!config) return
     if (!config.approval_required && !window.confirm('Send eligible queued and future live SMS automatically? Recipient, website, cutoff, template, duplicate and financial-event checks still apply. This does not execute refunds or charges.')) return
     setBusy(true)
-    try { setConfig(await api<Config>('/api/after-order/sms/settings', { method: 'POST', body: JSON.stringify({ enabled: config.enabled, approval_required: config.approval_required, confirm_release_pending: !config.approval_required, provider: config.provider, mappings: JSON.parse(mapping) }) })); setNotice('Saved. Existing SMS keeps its original provider. Eligible live drafts are processed by notification scheduling when approval bypass is enabled.'); }
+    try { setConfig(await api<Config>('/api/after-order/sms/settings', { method: 'POST', body: JSON.stringify({ enabled: config.enabled, relay_enabled: config.relay_enabled, approval_required: config.approval_required, confirm_release_pending: !config.approval_required, provider: config.provider, mappings: JSON.parse(mapping) }) })); setNotice('Saved. Existing SMS keeps its original provider. Eligible live drafts are processed by notification scheduling when approval bypass is enabled.'); }
     catch (e) { setNotice(String(e)) } finally { setBusy(false) }
   }
   return <section className="card p-4 grid gap-3"><h3 className="font-semibold">Customer SMS</h3><p>SMS has its own preview and approval setting. SMS failures never resend emails. Existing Odoo dispatch notifications remain unchanged.</p>
     {config && <><label><input type="checkbox" checked={config.enabled} onChange={e => setConfig({ ...config, enabled: e.target.checked })} /> Enable SMS companions</label>
       <label><input type="checkbox" checked={!config.approval_required} onChange={e => setConfig({ ...config, approval_required: !e.target.checked })} /> Bypass team approval for queued and future live SMS</label>
+      <label><input type="checkbox" checked={!!config.relay_enabled} onChange={e => setConfig({ ...config, relay_enabled: e.target.checked })} /> Send Relay payment-link SMS immediately, including unpaid orders from the last two days</label>
       <label>SMS engine <select className="form-select" value={config.provider} onChange={e => setConfig({ ...config, provider: e.target.value })}><option value="odoo">Odoo — existing SMS service</option><option value="msg91">MSG91</option><option value="twilio">Twilio</option></select></label>
       <p>{config.test_mode ? 'Test: only +19296526393, no approval for initial sends.' : config.approval_required ? 'Live: new-order, Shopify DTC dispatch and eligible delivery follow-up SMS send automatically. Other SMS require individual approval.' : 'Live: eligible queued and future SMS send automatically after safety checks. Test drafts are excluded from queue release.'}</p>
       <p>Supported events include new orders, dispatch delays, unavailable items, first parcel movement, delivery confirmation, reviews, delivery issues and verified payment/refund notices. Message approval bypass never executes refunds, charges or replacements. No reminder or lost-package SMS.</p>

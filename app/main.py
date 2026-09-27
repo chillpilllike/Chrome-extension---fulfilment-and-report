@@ -45783,6 +45783,7 @@ relay_payments = RelayPayments(db=db, get_store=get_store, client_factory=OdooCl
     get_settings=get_service_settings, set_settings=set_service_settings,
     staff_check=lambda request: bool(effective_admin_access_token()) and request_has_admin_access(request),
     email_test_mode=after_order_email_test_mode)
+relay_payments.sms_callback = care_sms.relay_pending
 app.include_router(relay_payments.router())
 
 from app.support.portal import create_portal_router

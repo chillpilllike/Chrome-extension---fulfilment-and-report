@@ -39,6 +39,7 @@ class RelayPayments:
         self.get_settings, self.set_settings, self.staff_check = get_settings, set_settings, staff_check
         self.email_test_mode = email_test_mode
         self.lock = threading.Lock()
+        self.sms_callback = lambda payment_id=None: None
 
     def _token_cipher(self):
         key = os.getenv('RELAY_TOKEN_ENCRYPTION_KEY') or os.getenv('MASTER_ADMIN_ACCESS_TOKEN') or os.getenv('ADMIN_ACCESS_TOKEN')
@@ -473,6 +474,11 @@ class RelayPayments:
         except Exception:
             self.set_settings({'relay_email_error': 'Immediate delivery deferred; queued email will retry automatically'})
 
+        try:
+            self.sms_callback(payment_id)
+        except Exception:
+            self.set_settings({'relay_sms_error':'Payment SMS deferred; review SMS history/settings'})
+
     def emails(self, payment_id=None):
         # Separate from the slow sync/receipt cycle. Serialize all email senders
         # across processes before recovering any interrupted sending rows.
@@ -577,7 +583,7 @@ class RelayPayments:
             lock = guard.execute('SELECT pg_try_advisory_xact_lock(771905432) AS locked').fetchone()
             if not lock['locked']:
                 return
-            for name, action in [('email',self.emails),('sync',self.sync),('pending_review',self.review_pending),('refresh',self.refresh_bound),('receiving',self.receive),('confirmation',self.confirmations),('email',self.emails)]:
+            for name, action in [('email',self.emails),('sync',self.sync),('pending_review',self.review_pending),('refresh',self.refresh_bound),('receiving',self.receive),('confirmation',self.confirmations),('email',self.emails),('sms',self.sms_callback)]:
                 try:
                     if name=='confirmation' and (self.settings()['test_mode']):
                         continue

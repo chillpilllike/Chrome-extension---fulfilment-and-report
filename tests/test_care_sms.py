@@ -255,6 +255,84 @@ class SMSTests(unittest.TestCase):
         payload['mappings']['1:1']['msg91']['authkey']='not-allowed'
         with self.assertRaises(ValueError): validate_config(payload)
 
+    def relay_fixture(self):
+        self.settings['after_order_relay_sms_enabled']='true'
+        self.ns['after_order_email_test_mode']=lambda:False
+        self.ns['clean_error_message']=str
+        self.ns['require_after_order_case_in_scope']=Mock(side_effect=ValueError('No paid-order import'))
+        self.case['customer_email']='buyer@example.test'
+        self.conn.execute("UPDATE after_order_messages SET template_kind='relay_request',test_mode=0")
+        self.conn.execute('CREATE TABLE relay_payments(case_id INTEGER,store_id INTEGER,payment_link TEXT,pay_token TEXT)')
+        self.conn.execute("INSERT INTO relay_payments VALUES(1,1,'https://relay.cash/pay/verified','opaque')")
+        self.snap={'state':'pending','initiated_at':None,'order_id':123,'website_id':2,'order_number':'NC123','customer_email':'buyer@example.test','transaction_id':5}
+        self.order={'id':123,'state':'draft','website_id':[2,'Shop'],'partner_invoice_id':[7,'Buyer'],'transaction_ids':[5],'invoice_ids':[],'date_order':datetime.now(timezone.utc).isoformat()}
+        self.tx=[{'id':5,'state':'pending'}]
+        self.partner={'email':'buyer@example.test','mobile':'+14155552671','phone':False,'phone_blacklisted':False,'country_id':[1,'US']}
+        self.invoices=[]
+        client=self.ns['OdooClient'].return_value
+        client.existing_fields.side_effect=lambda model,fields:fields
+        client.read.side_effect=lambda model,*args:{'sale.order':[self.order],'payment.transaction':self.tx,'res.partner':[self.partner],'res.country':[{'code':'US'}],'account.move':self.invoices}[model]
+        self.ns['relay_payments']=SimpleNamespace(settings=lambda:{'enabled':True,'test_mode':False,'public_base_url':'https://app.example'},current=lambda row:self.snap)
+
+    @patch('app.services.care_sms.deliver',return_value=('sms1','accepted'))
+    def test_relay_unconfirmed_order_uses_verified_link_once(self,send):
+        self.relay_fixture()
+        self.sms.companion(1)
+        self.assertEqual('accepted',self.row()['status'])
+        self.assertIn('https://app.example/api/relay/pay/opaque',self.row()['body'])
+        self.assertIn('payment link is ready',self.row()['body'])
+        self.sms.companion(1)
+        send.assert_called_once()
+        self.ns['require_after_order_case_in_scope'].assert_not_called()
+
+    @patch('app.services.care_sms.deliver')
+    def test_relay_payment_received_after_preview_blocks_sms(self,send):
+        self.relay_fixture();row=self.sms.prepare(1)
+        self.tx.append({'id':9,'state':'done'})
+        with self.assertRaisesRegex(ValueError,'Another payment'):self.sms.send(row['id'],automatic=True)
+        send.assert_not_called()
+
+    def test_relay_catchup_excludes_old_confirmed_initiated_and_other_pending(self):
+        from datetime import timedelta
+        for reason in ['old','sale','cancel','initiated','pending','paid_invoice','suppressed','wrong_email']:
+            with self.subTest(reason=reason):
+                self.relay_fixture()
+                if reason=='old':self.order['date_order']=(datetime.now(timezone.utc)-timedelta(days=3)).isoformat()
+                if reason in {'sale','cancel'}:self.order['state']=reason
+                if reason=='initiated':self.snap['initiated_at']='today'
+                if reason=='pending':self.tx.append({'id':9,'state':'pending'})
+                if reason=='paid_invoice':self.order['invoice_ids']=[3];self.invoices=[{'state':'posted','payment_state':'paid'}]
+                if reason=='suppressed':self.partner['phone_blacklisted']=True
+                if reason=='wrong_email':self.partner['email']='other@example.test'
+                with self.assertRaises(ValueError):self.sms.prepare(1)
+                self.conn.execute('DROP TABLE relay_payments')
+
+    @patch('app.services.care_sms.deliver',return_value=('sms1','accepted'))
+    def test_relay_branded_resend_does_not_send_second_sms(self,send):
+        self.relay_fixture();self.sms.companion(1)
+        self.conn.execute("INSERT INTO after_order_messages VALUES(2,1,'relay_request_branded_v1','sent',0,'')")
+        self.sms.companion(2)
+        send.assert_called_once()
+
+    @patch('app.services.care_sms.verify_followup_template')
+    def test_relay_msg91_requires_dedicated_template(self,verify):
+        self.relay_fixture();self.settings['after_order_sms_provider']='msg91'
+        self.settings['after_order_sms_mappings']=json.dumps({'1:2':{'transactional_sms_enabled':True,'msg91':{'sender':'Brand','text':'wrong'}}})
+        with self.assertRaisesRegex(ValueError,'dedicated'):self.sms.prepare(1)
+        verify.assert_not_called()
+
+    def test_relay_minute_fallback_scopes_capture_and_respects_disable(self):
+        self.relay_fixture()
+        self.conn.execute('ALTER TABLE relay_payments ADD COLUMN id INTEGER DEFAULT 4')
+        self.conn.execute("ALTER TABLE relay_payments ADD COLUMN status TEXT DEFAULT 'email_sent'")
+        self.conn.execute('ALTER TABLE after_order_messages ADD COLUMN created_at TEXT')
+        self.conn.execute('UPDATE after_order_messages SET created_at=?',(datetime.now(timezone.utc).isoformat(),))
+        self.sms.companion=Mock()
+        self.sms.relay_pending(99);self.sms.companion.assert_not_called()
+        self.sms.relay_pending(4);self.sms.companion.assert_called_once_with(1)
+        self.sms.companion.reset_mock();self.settings['after_order_relay_sms_enabled']='false'
+        self.sms.relay_pending();self.sms.companion.assert_not_called()
+
     def setUp(self):
         self.conn = sqlite3.connect(':memory:')
         self.conn.row_factory = sqlite3.Row

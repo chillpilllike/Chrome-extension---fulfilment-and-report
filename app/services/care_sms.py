@@ -18,16 +18,21 @@ PROVIDERS = {'odoo', 'msg91', 'twilio'}
 KINDS = {'expected_dispatch', 'item_unavailable', 'no_alternatives', 'delivery_confirmation',
          'package_movement', 'tracking', 'warehouse_dispatch_delay', 'alternative_payment',
          'price_difference', 'refund_request_received', 'refund_completed',
-         'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch', 'manual_refund_completed'}
-AUTOMATIC_KINDS = {'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch'}
+         'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch', 'manual_refund_completed', 'relay_request', 'relay_request_branded_v1'}
+AUTOMATIC_KINDS = {'trustpilot_review', 'delivery_issue_received', 'new_order_welcome', 'shopify_dispatch', 'relay_request', 'relay_request_branded_v1'}
 
 
 def template_kind(kind):
     # Reuse the approved, translated tracking template; dispatch has its own
     # event, send permission and deduplication, never a fabricated carrier scan.
     return {'shopify_dispatch':'package_movement','manual_refund_completed':'refund_completed',
-            'price_difference':'alternative_payment'}.get(kind,kind)
-SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms (
+            'price_difference':'alternative_payment','relay_request_branded_v1':'relay_request'}.get(kind,kind)
+RELAY_KINDS = {'relay_request','relay_request_branded_v1'}
+
+SCHEMA = '''CREATE TABLE IF NOT EXISTS after_order_sms_relay (
+ order_key TEXT PRIMARY KEY, sms_id INTEGER NOT NULL UNIQUE, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS after_order_sms (
  id INTEGER PRIMARY KEY AUTOINCREMENT, email_id INTEGER NOT NULL UNIQUE REFERENCES after_order_messages(id),
  case_id INTEGER NOT NULL REFERENCES after_order_cases(id), provider TEXT NOT NULL,
  recipient TEXT NOT NULL, test_mode INTEGER NOT NULL, body TEXT NOT NULL,
@@ -150,6 +155,7 @@ def order_link(domain, order_id):
 
 def render(kind, order, brand, link):
     summaries = {
+        'relay_request':'Your payment link is ready. Pay securely to complete your order:',
         'new_order_welcome':"Thank you for your order! We will begin processing it soon. View your order:",
         'trustpilot_review':'How was your experience? Share an honest review:',
         'delivery_issue_received':"Thank you for letting us know your order hasn't arrived. Our team will investigate the delivery and contact you shortly.",
@@ -276,6 +282,7 @@ class SMS:
         settings = self.r.get_service_settings()
         return {'enabled':settings.get('after_order_sms_enabled') == 'true',
                 'approval_required':settings.get('after_order_sms_approval_required', 'true') != 'false',
+                'relay_enabled':settings.get('after_order_relay_sms_enabled') == 'true',
                 'provider':settings.get('after_order_sms_provider') or 'odoo',
                 'mappings':json.loads(settings.get('after_order_sms_mappings') or '{}')}
 
@@ -378,6 +385,71 @@ class SMS:
                 raise HTTPException(400,'Invalid delivery report') from exc
         return router
 
+    def relay_context(self, case):
+        """Current Odoo evidence, including payments through other gateways."""
+        r = self.r
+        if not self.config()['relay_enabled'] or not r.relay_payments.settings()['enabled'] or r.relay_payments.settings()['test_mode']:
+            raise ValueError('Relay payment SMS is disabled or in test mode.')
+        with r.db() as conn:
+            rows = conn.execute('SELECT * FROM relay_payments WHERE case_id=?', (case['id'],)).fetchall()
+        if len(rows) != 1 or not rows[0]['payment_link']:
+            raise ValueError('A unique verified Relay payment link is required.')
+        payment = dict(rows[0]); snap = r.relay_payments.current(payment)
+        if snap.get('state') != 'pending' or snap.get('initiated_at'):
+            raise ValueError('Payment is no longer awaiting customer action.')
+        if (payment['store_id'] != case['store_id'] or snap['order_id'] != case['odoo_order_id']
+                or snap['website_id'] != case['website_id'] or snap['order_number'] != case['odoo_order_name']
+                or snap['customer_email'].strip().lower() != (case.get('customer_email') or '').strip().lower()):
+            raise ValueError('Relay order/customer identity changed.')
+        client = r.OdooClient(r.get_store(case['store_id']))
+        orders = client.read('sale.order',[snap['order_id']],['state','website_id','partner_invoice_id','transaction_ids','invoice_ids','date_order'])
+        if len(orders) != 1:
+            raise ValueError('Order unavailable.')
+        order = orders[0]
+        if order['state'] not in {'draft','sent'} or not order.get('website_id') or order['website_id'][0] != snap['website_id']:
+            raise ValueError('Order is confirmed, cancelled or on another website.')
+        created = datetime.fromisoformat(str(order['date_order']).replace('Z','+00:00'))
+        if created.tzinfo is None: created = created.replace(tzinfo=timezone.utc)
+        if created < datetime.now(timezone.utc)-timedelta(days=2):
+            raise ValueError('Only pending Relay orders from the last two days receive payment SMS.')
+        transactions = client.read('payment.transaction',order['transaction_ids'],['state']) if order.get('transaction_ids') else []
+        if any(t['state'] in {'done','authorized'} or (t['state']=='pending' and t['id']!=snap['transaction_id']) for t in transactions):
+            raise ValueError('Another payment is complete or in progress; no payment SMS sent.')
+        invoices = client.read('account.move',order['invoice_ids'],['state','payment_state']) if order.get('invoice_ids') else []
+        if any(i['state']!='cancel' and i['payment_state'] in {'paid','in_payment','partial','reversed'} for i in invoices):
+            raise ValueError('Invoice payment already recorded; no payment SMS sent.')
+        fields = client.existing_fields('res.partner',['mobile','phone','phone_blacklisted','country_id','email'])
+        if 'phone_blacklisted' not in fields or not order.get('partner_invoice_id'):
+            raise ValueError('Billing phone suppression cannot be verified.')
+        partner = client.read('res.partner',[order['partner_invoice_id'][0]],fields)[0]
+        if partner.get('phone_blacklisted') or (partner.get('email') or '').strip().lower()!=snap['customer_email'].strip().lower():
+            raise ValueError('Billing contact changed or phone is blocked from SMS.')
+        countries = client.read('res.country',[partner['country_id'][0]],['code']) if partner.get('country_id') else []
+        phone = sms_customer_number([partner.get('mobile'),partner.get('phone')], countries[0]['code'] if countries else None)
+        base = r.relay_payments.settings()['public_base_url'].rstrip('/')
+        from urllib.parse import urlsplit
+        if urlsplit(base).scheme!='https' or not urlsplit(base).hostname:
+            raise ValueError('Secure Relay payment URL is required.')
+        return {'phone':phone,'url':base+'/api/relay/pay/'+payment['pay_token']}
+
+    def relay_pending(self, payment_id=None):
+        if not self.config()['enabled'] or not self.config()['relay_enabled'] or self.r.after_order_email_test_mode():
+            return
+        scope = ' AND p.id=?' if payment_id is not None else ''
+        params = [(datetime.now(timezone.utc)-timedelta(days=2)).isoformat()]
+        if payment_id is not None: params.append(int(payment_id))
+        with self.r.db() as conn:
+            rows=conn.execute("""SELECT m.id FROM after_order_messages m
+                JOIN relay_payments p ON p.case_id=m.case_id
+                LEFT JOIN after_order_sms s ON s.email_id=m.id
+                WHERE m.template_kind IN ('relay_request','relay_request_branded_v1')
+                  AND m.test_mode=0 AND m.status NOT IN ('cancelled','superseded')
+                  AND p.payment_link IS NOT NULL AND p.status IN ('ready','email_sent') AND m.created_at>=?
+                  AND (s.id IS NULL OR (s.status='awaiting_approval' AND s.attempts=0))
+                """ + scope + ' ORDER BY m.id LIMIT 100', params).fetchall()
+        for row in rows:
+            self.companion(row['id'])
+
     def phone(self, case, *, allow_cancelled=False):
         r = self.r; client = r.OdooClient(r.get_store(case['store_id']))
         order = client.read('sale.order',[case['odoo_order_id']],['partner_id','state','website_id'])[0]
@@ -408,7 +480,8 @@ class SMS:
         if existing:
             return dict(existing)
         email = dict(email); case = r.after_order_case_by_id(email['case_id'])
-        r.require_after_order_case_in_scope(case)
+        if email['template_kind'] not in RELAY_KINDS:
+            r.require_after_order_case_in_scope(case)
         if email['template_kind']=='manual_refund_completed':
             if not email['test_mode']:
                 r.manual_refunds.validate_message(email)
@@ -431,9 +504,10 @@ class SMS:
         mapping = dict(site.get(provider) or {})
         if not email['test_mode'] and not site.get('transactional_sms_enabled'):
             raise ValueError('Enable transactional SMS for this website after reviewing customer consent and destination requirements.')
-        contact = None if email['test_mode'] else (self.phone(case,allow_cancelled=True) if kind=='manual_refund_completed' else self.phone(case))
+        relay = self.relay_context(case) if kind in RELAY_KINDS else None
+        contact = relay['phone'] if relay else None if email['test_mode'] else (self.phone(case,allow_cancelled=True) if kind=='manual_refund_completed' else self.phone(case))
         to = recipient(contact,bool(email['test_mode']))
-        link = order_link(domain,case.get('odoo_order_id'))
+        link = relay['url'] if relay else order_link(domain,case.get('odoo_order_id'))
         if kind == 'trustpilot_review':
             link = r.trustpilot_review_url(domain)
         if kind == 'shopify_dispatch':
@@ -548,7 +622,7 @@ class SMS:
                     raise ValueError('Configure a dedicated approved English fallback for this notification.')
                 mapping = {**base, **english}
                 verify_followup_template(mapping)  # Fail closed if English is not approved either.
-            link = order_link(snapshot['domain'], case.get('odoo_order_id'))
+            link = self.relay_context(case)['url'] if kind in RELAY_KINDS else order_link(snapshot['domain'], case.get('odoo_order_id'))
             if kind == 'trustpilot_review':
                 link = r.trustpilot_review_url(snapshot['domain'])
             if kind == 'shopify_dispatch':
@@ -692,7 +766,7 @@ class SMS:
             allowed = {'delivered'} if resend else {'awaiting_approval','failed','provider_failed','undelivered'}
             if row['status'] not in allowed or row['attempts'] >= 3 or (resend and automatic):
                 raise ValueError('SMS already attempted or uncertain. Check provider logs; do not resend.')
-            if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome','shopify_dispatch'}:
+            if resend and snapshot['kind'] in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome','shopify_dispatch','relay_request','relay_request_branded_v1'}:
                 raise ValueError('This is a once-only notification. Duplicate sends are blocked.')
             if recovery:
                 if not self.recovery_allowed(conn,row):
@@ -703,7 +777,9 @@ class SMS:
                     raise ValueError('This SMS needs individual approval.')
             elif digest(row) != approval:
                 raise ValueError('Review the current SMS preview before approving.')
-            case = r.after_order_case_by_id(row['case_id']); r.require_after_order_case_in_scope(case)
+            case = r.after_order_case_by_id(row['case_id'])
+            if snapshot['kind'] not in RELAY_KINDS:
+                r.require_after_order_case_in_scope(case)
             if snapshot['kind'] == 'shopify_dispatch':
                 if email['status'] in {'cancelled','superseded'}:
                     raise ValueError('This dispatch notification was cancelled or superseded.')
@@ -719,7 +795,8 @@ class SMS:
                     VALUES(?,?,?) ON CONFLICT(order_key) DO NOTHING''', (key,sms_id,r.utc_now()))
                 if conn.execute('SELECT sms_id FROM after_order_sms_welcome WHERE order_key=?',(key,)).fetchone()['sms_id'] != sms_id:
                     raise ValueError('A welcome SMS is already reserved for this order. Duplicate blocked.')
-            expected_link = order_link(snapshot['domain'], case.get('odoo_order_id'))
+            relay = self.relay_context(case) if snapshot['kind'] in RELAY_KINDS else None
+            expected_link = relay['url'] if relay else order_link(snapshot['domain'], case.get('odoo_order_id'))
             if snapshot['kind'] == 'trustpilot_review':
                 expected_link = r.trustpilot_review_url(snapshot['domain'])
             urls = re.findall(r'https?://[^\s<>"\']+', row['body'])
@@ -752,11 +829,11 @@ class SMS:
                 financial = snapshot['kind'] in {'price_difference','alternative_payment','refund_request_received','refund_completed','manual_refund_completed'}
                 followup = snapshot['kind'] in {'trustpilot_review', 'delivery_issue_received'}
                 welcome = snapshot['kind'] in {'new_order_welcome','shopify_dispatch'}
-                current_phone=self.phone(case,allow_cancelled=True) if snapshot['kind']=='manual_refund_completed' else self.phone(case)
+                current_phone=relay['phone'] if relay else self.phone(case,allow_cancelled=True) if snapshot['kind']=='manual_refund_completed' else self.phone(case)
                 if (current_phone != row['recipient'] or (snapshot['kind']!='manual_refund_completed' and r.request_fingerprint(case) != snapshot['request_fingerprint'])
                         or case.get('sender_domain') != snapshot['domain']
-                        or (not financial and not followup and not welcome and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
-                        or (snapshot['kind']!='manual_refund_completed' and not r.after_order_tracking_is_current(case))):
+                        or (not relay and not financial and not followup and not welcome and (case.get('confirmed_at') or case.get('current_decision') or case.get('status') == 'resolved'))
+                        or (not relay and snapshot['kind']!='manual_refund_completed' and not r.after_order_tracking_is_current(case))):
                     raise ValueError('Order/recipient changed; SMS approval is blocked.')
                 if financial:
                     self.validate_financial(case,email,snapshot['kind'])
@@ -776,6 +853,11 @@ class SMS:
                         raise ValueError('Sourcing review is incomplete or expired.')
                 if snapshot['kind'] == 'delivery_confirmation':
                     r.delivery_checkin_case(case, enforce_delay=True)
+            if relay:
+                key=json.dumps([case['store_id'],case['odoo_order_id']])
+                conn.execute('INSERT INTO after_order_sms_relay(order_key,sms_id,created_at) VALUES(?,?,?) ON CONFLICT(order_key) DO NOTHING',(key,sms_id,r.utc_now()))
+                if conn.execute('SELECT sms_id FROM after_order_sms_relay WHERE order_key=?',(key,)).fetchone()['sms_id']!=sms_id:
+                    raise ValueError('A payment SMS is already reserved for this order.')
             conn.execute("UPDATE after_order_sms SET status='sending',attempts=attempts+1,updated_at=? WHERE id=?",(r.utc_now(),sms_id))
             # Legacy aggregate history remains in its case events; do not invent
             # precise attempt timestamps for sends that predate this table.
@@ -883,6 +965,8 @@ class SMS:
 
         @router.post('/settings')
         def save(payload:dict):
+            if 'relay_enabled' in payload and type(payload['relay_enabled']) is not bool:
+                raise HTTPException(400,'relay_enabled must be a boolean.')
             if 'approval_required' in payload and not isinstance(payload['approval_required'],bool):
                 raise HTTPException(400,'approval_required must be a boolean.')
             if payload.get('approval_required') is False and payload.get('confirm_release_pending') is not True:
@@ -894,6 +978,8 @@ class SMS:
             self.r.set_service_settings({'after_order_sms_enabled':str(payload['enabled']).lower(),'after_order_sms_provider':payload['provider'],'after_order_sms_mappings':raw})
             if 'approval_required' in payload:
                 self.r.set_service_settings({'after_order_sms_approval_required':str(payload['approval_required']).lower()})
+            if 'relay_enabled' in payload:
+                self.r.set_service_settings({'after_order_relay_sms_enabled':str(payload['relay_enabled']).lower()})
             return settings()
 
         @router.get('/email/{email_id}')
@@ -914,7 +1000,7 @@ class SMS:
             kind=json.loads(row['snapshot_json']).get('kind')
             row['language']=json.loads(row['snapshot_json']).get('language',{})
             row['segment_estimate']=sms_segments(row['body'],json.loads(row['snapshot_json']).get('mapping',{}).get('sms_type')=='UNICODE')
-            row['can_resend']=row['status']=='delivered' and row['attempts']<3 and kind not in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome'}
+            row['can_resend']=row['status']=='delivered' and row['attempts']<3 and kind not in {'tracking','package_movement','trustpilot_review','delivery_issue_received','new_order_welcome','relay_request','relay_request_branded_v1'}
             row.pop('snapshot_json')
             with self.r.db() as conn:
                 attempts=conn.execute('SELECT * FROM after_order_sms_attempts WHERE sms_id=? ORDER BY attempt_number',(row['id'],)).fetchall()
