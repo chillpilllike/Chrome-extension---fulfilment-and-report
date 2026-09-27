@@ -283,6 +283,7 @@ class SMS:
         return {'enabled':settings.get('after_order_sms_enabled') == 'true',
                 'approval_required':settings.get('after_order_sms_approval_required', 'true') != 'false',
                 'relay_enabled':settings.get('after_order_relay_sms_enabled') == 'true',
+                'relay_provider':settings.get('after_order_relay_sms_provider') or settings.get('after_order_sms_provider') or 'odoo',
                 'provider':settings.get('after_order_sms_provider') or 'odoo',
                 'mappings':json.loads(settings.get('after_order_sms_mappings') or '{}')}
 
@@ -477,7 +478,9 @@ class SMS:
             existing = conn.execute('SELECT * FROM after_order_sms WHERE email_id=?',(email_id,)).fetchone()
         if not email or not eligible(dict(email)):
             return None  # Reminders, lost-package and marketing SMS are excluded.
-        if existing:
+        desired = config['relay_provider'] if email['template_kind'] in RELAY_KINDS else config['provider']
+        rebuild = existing and email['template_kind'] in RELAY_KINDS and existing['provider']!=desired and existing['status']=='awaiting_approval' and existing['attempts']==0
+        if existing and not rebuild:
             return dict(existing)
         email = dict(email); case = r.after_order_case_by_id(email['case_id'])
         if email['template_kind'] not in RELAY_KINDS:
@@ -493,7 +496,7 @@ class SMS:
         domain = case.get('sender_domain') or ''
         if not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}',domain):
             raise ValueError('Verified website domain is required for SMS.')
-        kind = email['template_kind']; provider = config['provider']
+        kind = email['template_kind']; provider = desired
         if kind in {'tracking','package_movement'} and (case.get('context') or {}).get('risk_state') != 'in_transit':
             return None
         if kind == 'item_unavailable':
@@ -502,6 +505,11 @@ class SMS:
                 kind = 'no_alternatives'
         site = config['mappings'].get(f"{case['store_id']}:{case['website_id']}",{})
         mapping = dict(site.get(provider) or {})
+        if kind in RELAY_KINDS and provider=='twilio':
+            if not re.fullmatch(r'AC[0-9a-fA-F]{32}',os.getenv('TWILIO_ACCOUNT_SID','')) or not os.getenv('TWILIO_AUTH_TOKEN'):
+                raise ValueError('Configure Twilio runtime credentials before sending Relay payment SMS.')
+            if not (mapping.get('sender') or mapping.get('messaging_service_sid')):
+                raise ValueError('Configure this website Twilio sending number or Messaging Service SID.')
         if not email['test_mode'] and not site.get('transactional_sms_enabled'):
             raise ValueError('Enable transactional SMS for this website after reviewing customer consent and destination requirements.')
         relay = self.relay_context(case) if kind in RELAY_KINDS else None
@@ -570,6 +578,8 @@ class SMS:
             conn.execute('''INSERT INTO after_order_sms(email_id,case_id,provider,recipient,test_mode,body,snapshot_json,created_at,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(email_id) DO NOTHING''',
                 (email_id,case['id'],provider,to,email['test_mode'],body,json.dumps(snapshot),r.utc_now(),r.utc_now()))
+            if rebuild:
+                conn.execute("UPDATE after_order_sms SET provider=?,recipient=?,body=?,snapshot_json=?,updated_at=?,last_error=NULL WHERE email_id=? AND attempts=0 AND status='awaiting_approval'",(provider,to,body,json.dumps(snapshot),r.utc_now(),email_id))
             row = dict(conn.execute('SELECT * FROM after_order_sms WHERE email_id=?',(email_id,)).fetchone())
             r.record_after_order_event(conn,case['id'],'sms_prepared',details={'sms_id':row['id'],'provider':provider,'test_mode':bool(email['test_mode'])})
         return row
@@ -760,6 +770,8 @@ class SMS:
                 raise ValueError('SMS sending is disabled.')
             if catalog(snapshot.get('language',{}).get('sent_language')).get('delivery_blocked'):
                 raise ValueError('This translation requires native-language review. Prepare an English fallback preview.')
+            if snapshot['kind'] in RELAY_KINDS and row['provider'] != self.config()['relay_provider']:
+                raise ValueError('Relay SMS provider changed; rebuild the unattempted message before sending.')
             if row['provider'] == 'msg91':
                 verify_followup_template(snapshot['mapping'])
             validate_target(row,r.after_order_email_test_mode())
@@ -965,6 +977,8 @@ class SMS:
 
         @router.post('/settings')
         def save(payload:dict):
+            if 'relay_provider' in payload and payload['relay_provider'] not in PROVIDERS:
+                raise HTTPException(400,'Invalid Relay SMS provider.')
             if 'relay_enabled' in payload and type(payload['relay_enabled']) is not bool:
                 raise HTTPException(400,'relay_enabled must be a boolean.')
             if 'approval_required' in payload and not isinstance(payload['approval_required'],bool):
@@ -980,6 +994,8 @@ class SMS:
                 self.r.set_service_settings({'after_order_sms_approval_required':str(payload['approval_required']).lower()})
             if 'relay_enabled' in payload:
                 self.r.set_service_settings({'after_order_relay_sms_enabled':str(payload['relay_enabled']).lower()})
+            if 'relay_provider' in payload:
+                self.r.set_service_settings({'after_order_relay_sms_provider':payload['relay_provider']})
             return settings()
 
         @router.get('/email/{email_id}')

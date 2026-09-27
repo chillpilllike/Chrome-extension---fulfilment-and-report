@@ -7,3 +7,5 @@ One SMS per store/order, as soon as the captured link is bound and a source paym
 Before preparing and sending, revalidate Relay identity/link plus the current unconfirmed Odoo order, billing email/phone/suppression, website, transactions and invoice payment state. Other completed/authorized or pending gateway payments, initiated Relay payments, confirmed/cancelled orders, changed customers and orders older than two days are blocked. Unknown provider acceptance is never blindly resent.
 
 Dedicated MSG91 relay_request templates must be approved. Pending approval remains blocked and is checked by the minute fallback. SMS status and previews use the existing SMS log.
+
+Relay payment SMS has its own provider selector. Twilio requires runtime TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN plus each website’s Twilio sender or Messaging Service SID in the existing sender mappings. Changing the Relay provider leaves other SMS unchanged. Only unattempted messages may be rebuilt for a new provider; accepted/uncertain sends are never automatically sent again through another provider.

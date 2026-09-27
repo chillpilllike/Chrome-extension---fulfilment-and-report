@@ -261,6 +261,33 @@ class SMSTests(unittest.TestCase):
         tree=ast.parse(Path('app/core/config.py').read_text())
         self.assertTrue(any(isinstance(n,ast.Dict) and any(isinstance(k,ast.Constant) and k.value=='after_order_relay_sms_enabled' for k in n.keys) for n in ast.walk(tree)))
 
+    @patch.dict('os.environ',{'TWILIO_ACCOUNT_SID':'AC'+'a'*32,'TWILIO_AUTH_TOKEN':'test'})
+    def test_relay_provider_override_rebuilds_only_unattempted_sms(self):
+        self.relay_fixture();old=self.sms.prepare(1)
+        self.settings['after_order_sms_provider']='msg91'
+        self.settings['after_order_relay_sms_provider']='twilio'
+        self.settings['after_order_sms_mappings']=json.dumps({'1:2':{'transactional_sms_enabled':True,'twilio':{'sender':'+14155552671'}}})
+        new=self.sms.prepare(1)
+        self.assertEqual(old['id'],new['id']);self.assertEqual('twilio',new['provider'])
+        self.assertEqual('msg91',self.sms.config()['provider'])
+        self.assertIn('/api/relay/pay/opaque',new['body'])
+        self.conn.execute("UPDATE after_order_sms SET attempts=1,status='delivery_unknown'")
+        self.settings['after_order_relay_sms_provider']='msg91'
+        self.assertEqual('twilio',self.sms.prepare(1)['provider'])
+
+    @patch.dict('os.environ',{'TWILIO_ACCOUNT_SID':'','TWILIO_AUTH_TOKEN':''})
+    def test_relay_twilio_missing_credentials_does_not_reserve_send(self):
+        self.relay_fixture();self.settings['after_order_relay_sms_provider']='twilio'
+        with self.assertRaisesRegex(ValueError,'credentials'):self.sms.prepare(1)
+        self.assertEqual(0,self.conn.execute('SELECT COUNT(*) FROM after_order_sms').fetchone()[0])
+
+    @patch('app.services.care_sms.deliver')
+    def test_old_provider_cannot_send_after_relay_provider_switch(self,send):
+        self.relay_fixture();row=self.sms.prepare(1)
+        self.settings['after_order_relay_sms_provider']='twilio'
+        with self.assertRaisesRegex(ValueError,'provider changed'):self.sms.send(row['id'],automatic=True)
+        send.assert_not_called()
+
     def relay_fixture(self):
         self.settings['after_order_relay_sms_enabled']='true'
         self.ns['after_order_email_test_mode']=lambda:False

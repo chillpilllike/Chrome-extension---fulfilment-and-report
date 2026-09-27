@@ -155,6 +155,7 @@ DEFAULT_SERVICE_SETTINGS = {
     "after_order_welcome_sms_started_at": "",
     "after_order_sms_enabled": "false",
     "after_order_relay_sms_enabled": "false",
+    "after_order_relay_sms_provider": "",
     "after_order_sms_approval_required": "true",
     "after_order_sms_provider": "odoo",
     "after_order_sms_mappings": "{}",
