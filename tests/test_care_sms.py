@@ -270,7 +270,7 @@ class SMSTests(unittest.TestCase):
         new=self.sms.prepare(1)
         self.assertEqual(old['id'],new['id']);self.assertEqual('twilio',new['provider'])
         self.assertEqual('msg91',self.sms.config()['provider'])
-        self.assertIn('/api/relay/pay/opaque',new['body'])
+        self.assertIn('https://relay.cash/pay/verified',new['body'])
         self.conn.execute("UPDATE after_order_sms SET attempts=1,status='delivery_unknown'")
         self.settings['after_order_relay_sms_provider']='msg91'
         self.assertEqual('twilio',self.sms.prepare(1)['provider'])
@@ -297,7 +297,7 @@ class SMSTests(unittest.TestCase):
         self.conn.execute("UPDATE after_order_messages SET template_kind='relay_request',test_mode=0")
         self.conn.execute('CREATE TABLE relay_payments(case_id INTEGER,store_id INTEGER,payment_link TEXT,pay_token TEXT)')
         self.conn.execute("INSERT INTO relay_payments VALUES(1,1,'https://relay.cash/pay/verified','opaque')")
-        self.snap={'state':'pending','initiated_at':None,'order_id':123,'website_id':2,'order_number':'NC123','customer_email':'buyer@example.test','transaction_id':5}
+        self.snap={'state':'pending','initiated_at':None,'order_id':123,'website_id':2,'order_number':'NC123','customer_email':'buyer@example.test','transaction_id':5,'payment_link':'https://relay.cash/pay/verified'}
         self.order={'id':123,'state':'draft','website_id':[2,'Shop'],'partner_invoice_id':[7,'Buyer'],'transaction_ids':[5],'invoice_ids':[],'date_order':datetime.now(timezone.utc).isoformat()}
         self.tx=[{'id':5,'state':'pending'}]
         self.partner={'email':'buyer@example.test','mobile':'+14155552671','phone':False,'phone_blacklisted':False,'country_id':[1,'US']}
@@ -307,12 +307,29 @@ class SMSTests(unittest.TestCase):
         client.read.side_effect=lambda model,*args:{'sale.order':[self.order],'payment.transaction':self.tx,'res.partner':[self.partner],'res.country':[{'code':'US'}],'account.move':self.invoices}[model]
         self.ns['relay_payments']=SimpleNamespace(settings=lambda:{'enabled':True,'test_mode':False,'public_base_url':'https://app.example'},current=lambda row:self.snap)
 
+    def test_relay_direct_link_must_match_current_order(self):
+        self.relay_fixture()
+        self.snap['payment_link']='https://relay.cash/pay/another'
+        with self.assertRaisesRegex(ValueError,'differs'):
+            self.sms.prepare(1)
+
+    def test_relay_unsent_preview_rebuilds_old_redirect(self):
+        self.relay_fixture()
+        row=self.sms.prepare(1)
+        self.conn.execute("UPDATE after_order_sms SET body=REPLACE(body,?,?) WHERE id=?",
+                          ('https://relay.cash/pay/verified','https://app.example/api/relay/pay/opaque',row['id']))
+        updated=self.sms.prepare(1)
+        self.assertEqual(row['id'],updated['id'])
+        self.assertIn('https://relay.cash/pay/verified',updated['body'])
+        self.assertNotIn('/api/relay/pay/',updated['body'])
+
     @patch('app.services.care_sms.deliver',return_value=('sms1','accepted'))
     def test_relay_unconfirmed_order_uses_verified_link_once(self,send):
         self.relay_fixture()
         self.sms.companion(1)
         self.assertEqual('accepted',self.row()['status'])
-        self.assertIn('https://app.example/api/relay/pay/opaque',self.row()['body'])
+        self.assertIn('https://relay.cash/pay/verified',self.row()['body'])
+        self.assertNotIn('/api/relay/pay/',self.row()['body'])
         self.assertIn('payment link is ready',self.row()['body'])
         self.sms.companion(1)
         send.assert_called_once()

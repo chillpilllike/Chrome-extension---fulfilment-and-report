@@ -427,11 +427,14 @@ class SMS:
             raise ValueError('Billing contact changed or phone is blocked from SMS.')
         countries = client.read('res.country',[partner['country_id'][0]],['code']) if partner.get('country_id') else []
         phone = sms_customer_number([partner.get('mobile'),partner.get('phone')], countries[0]['code'] if countries else None)
-        base = r.relay_payments.settings()['public_base_url'].rstrip('/')
-        from urllib.parse import urlsplit
-        if urlsplit(base).scheme!='https' or not urlsplit(base).hostname:
-            raise ValueError('Secure Relay payment URL is required.')
-        return {'phone':phone,'url':base+'/api/relay/pay/'+payment['pay_token']}
+        from app.services.relay_policy import payment_key
+        link = payment['payment_link']
+        key = payment_key(link)
+        if not key or link != 'https://relay.cash/pay/'+key:
+            raise ValueError('Verified direct Relay payment URL is required.')
+        if snap.get('payment_link') != link:
+            raise ValueError('Relay payment link differs from the current order.')
+        return {'phone':phone,'url':link}
 
     def relay_pending(self, payment_id=None):
         if not self.config()['enabled'] or not self.config()['relay_enabled'] or self.r.after_order_email_test_mode():
@@ -479,7 +482,7 @@ class SMS:
         if not email or not eligible(dict(email)):
             return None  # Reminders, lost-package and marketing SMS are excluded.
         desired = config['relay_provider'] if email['template_kind'] in RELAY_KINDS else config['provider']
-        rebuild = existing and email['template_kind'] in RELAY_KINDS and existing['provider']!=desired and existing['status']=='awaiting_approval' and existing['attempts']==0
+        rebuild = existing and email['template_kind'] in RELAY_KINDS and existing['status']=='awaiting_approval' and existing['attempts']==0
         if existing and not rebuild:
             return dict(existing)
         email = dict(email); case = r.after_order_case_by_id(email['case_id'])

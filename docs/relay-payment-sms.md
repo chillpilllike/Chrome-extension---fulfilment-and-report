@@ -13,3 +13,5 @@ Relay payment SMS has its own provider selector. Twilio requires runtime TWILIO_
 ### Twilio fraud checks
 
 Twilio sends explicitly request RiskCheck=enable. There are no application-level hourly or daily payment-SMS quotas. Existing current-order, recipient, opt-out, once-per-order and uncertain-delivery guards remain enforced. Twilio's own fraud protection and geographic permissions still apply.
+
+Payment SMS now use the captured canonical https://relay.cash/pay/ link, verified against the current Odoo transaction. Unattempted previews rebuild on preparation. Accepted or uncertain messages are never resent just to change their link.
