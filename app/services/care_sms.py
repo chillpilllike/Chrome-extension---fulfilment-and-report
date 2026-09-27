@@ -245,7 +245,7 @@ def deliver(row, mapping, client=None):
         account = os.getenv('TWILIO_ACCOUNT_SID',''); token = os.getenv('TWILIO_AUTH_TOKEN','')
         if not re.fullmatch(r'AC[0-9a-fA-F]{32}',account) or not token:
             raise Rejected('Configure TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN runtime secrets.')
-        data = {'To':target,'Body':row['body']}
+        data = {'To':target,'Body':row['body'],'RiskCheck':'enable'}
         sender = mapping.get('messaging_service_sid') or mapping.get('sender')
         if not sender:
             raise Rejected('Configure this website Twilio sender or messaging service.')

@@ -9,3 +9,7 @@ Before preparing and sending, revalidate Relay identity/link plus the current un
 Dedicated MSG91 relay_request templates must be approved. Pending approval remains blocked and is checked by the minute fallback. SMS status and previews use the existing SMS log.
 
 Relay payment SMS has its own provider selector. Twilio requires runtime TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN plus each website’s Twilio sender or Messaging Service SID in the existing sender mappings. Changing the Relay provider leaves other SMS unchanged. Only unattempted messages may be rebuilt for a new provider; accepted/uncertain sends are never automatically sent again through another provider.
+
+### Twilio fraud checks
+
+Twilio sends explicitly request RiskCheck=enable. There are no application-level hourly or daily payment-SMS quotas. Existing current-order, recipient, opt-out, once-per-order and uncertain-delivery guards remain enforced. Twilio's own fraud protection and geographic permissions still apply.

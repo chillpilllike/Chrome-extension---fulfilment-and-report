@@ -520,6 +520,7 @@ class SMSTests(unittest.TestCase):
         result=deliver({'provider':'twilio','recipient':TEST_NUMBER,'body':'Test'},{'sender':'+14155552671'})
         self.assertEqual('accepted',result[1])
         self.assertEqual(TEST_NUMBER,post.call_args.kwargs['data']['To'])
+        self.assertEqual('enable',post.call_args.kwargs['data']['RiskCheck'])
         post.assert_called_once()
 
     @patch.dict('os.environ',{'MSG91_AUTH_KEY':'test'})
