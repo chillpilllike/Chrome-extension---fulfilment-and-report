@@ -35,3 +35,22 @@ Verification:
 - `npm run build --prefix frontend`
 - Fixture-based browser check of BSB → NPP → email → phone; no payout submitted.
 - Fixtures contain public schema definitions/example values, not customer data.
+
+## Settled receipts with pending Odoo payments
+
+A single pending Airwallex transaction can qualify without changing Odoo accounting
+when its webhook receipt ID is reverified live as settled, positive, same-currency
+and no larger than the transaction value. The receipt reference must identify only
+this order; the order name must be unique across configured Odoo databases; the
+transaction must match the order/customer; and no other payment may own the receipt.
+Multiple receipts/active payments, ambiguous references, cross-currency allocations,
+missing evidence and unsettled/reversed receipts remain blocked. Fully paid invoice
+and completed-transaction paths retain their existing checks.
+
+The refund uses the actual received amount, capped at the order total, less prior
+refunds/reservations and accounting deductions. A warning explains the shortfall
+and unreconciled Odoo status on the order and final review. Final submission repeats
+receipt verification under the existing refund locks. No Odoo payment/invoice status
+is changed by this eligibility check.
+
+Regression coverage: `python -m unittest tests.test_refund_short_payment`.

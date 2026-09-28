@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from app.services.airwallex_api import server_request
 from app.services.refund_destination import destination_label
 from app.services.airwallex_refund_errors import RefundProviderError, readable_error, transfer_failure, field_label
-from app.services.airwallex_hub import verify_webhook_signature
+from app.services.airwallex_hub import verify_webhook_signature, ORDER_REFERENCE_RE
 
 _reads = ThreadPoolExecutor(max_workers=8, thread_name_prefix='refund-read')
 _log = logging.getLogger(__name__)
@@ -340,6 +340,64 @@ class AirwallexRefunds:
                 lambda: client.search_read(model, [('id', '=', reference[0])], ['code'])[0]['code'])
         return partner, code('res.country', partner['country_id']), code('res.country.state', partner['state_id'])
 
+    def pending_receipt(self, store, client, order, txs):
+        """Verify a unique settled receipt without changing Odoo's accounting state."""
+        active = [t for t in txs if t.get('operation') != 'refund' and money(t['amount']) > 0
+                  and t['state'] in {'pending', 'authorized', 'done'}]
+        if len(active) != 1 or active[0]['state'] != 'pending' or active[0].get('provider_code') != 'airwallex_transfer':
+            return None
+        tx = active[0]
+        if tx.get('sale_order_ids') != [order['id']] or not self.customer_matches(client, order, tx.get('partner_id')):
+            raise ValueError('The payment customer or order could not be matched. Finance review is required.')
+        currency = order['currency_id'][1]
+        locked_currency = tx.get('airwallex_payment_currency_id') or tx['currency_id']
+        if tx['currency_id'][1] != currency or locked_currency[1] != currency:
+            raise ValueError('A pending payment in another currency needs finance allocation before refunding.')
+        # Webhooks locate the receipt only. Amount/status/reference are always read live.
+        with self.db() as c:
+            rows = c.execute('SELECT DISTINCT deposit_id FROM airwallex_webhook_events WHERE order_reference=?',
+                             (order['name'].upper(),)).fetchall()
+        ids = {r['deposit_id'] for r in rows if r['deposit_id']}
+        if tx.get('airwallex_deposit_id'):
+            ids.add(tx['airwallex_deposit_id'])
+        if not ids:
+            return None
+        if len(ids) != 1 or not all(UUID_RE.fullmatch(d) for d in ids):
+            raise ValueError('More than one receipt may belong to this order. Finance allocation is required.')
+        deposit_id = next(iter(ids))
+        deposit = self.call('GET', '/api/v1/deposits/' + deposit_id)
+        reference = str(deposit.get('reference') or '')
+        if (deposit.get('id') != deposit_id or deposit.get('status') != 'SETTLED'
+                or not whole_reference(reference, order['name'])
+                or set(ORDER_REFERENCE_RE.findall(reference.upper())) != {order['name'].upper()}):
+            raise ValueError('A unique settled Airwallex receipt could not be verified for this order.')
+        received = money(deposit.get('amount'))
+        if deposit.get('currency') != currency or received <= 0 or received > money(tx['amount']):
+            raise ValueError('The receipt amount or currency needs finance allocation before refunding.')
+        # A reference must identify one order across configured databases, including
+        # other websites. Also reject receipts already attached to another payment.
+        scopes = {(store.odoo_url.rstrip('/'), store.odoo_db): (store, client)}
+        for record in self.list_stores():
+            candidate = self.get_store(record['id'])
+            scope = (candidate.odoo_url.rstrip('/'), candidate.odoo_db)
+            if scope not in scopes:
+                scopes[scope] = (candidate, self.client_factory(candidate))
+        for candidate, lookup in scopes.values():
+            matches = lookup.search_read('sale.order', [('name', '=', order['name'])], ['id'])
+            current = self.order_key(candidate, order['id']) == self.order_key(store, order['id'])
+            if (current and [o['id'] for o in matches] != [order['id']]) or (not current and matches):
+                raise ValueError('This order reference is not unique. Finance allocation is required.')
+            fields = self.metadata.get(('transaction-fields', self.metadata_scope(candidate)),
+                lambda: lookup.execute('payment.transaction', 'fields_get', [], {'attributes': ['type']}))
+            if 'airwallex_deposit_id' not in fields:
+                raise ValueError('Receipt ownership could not be checked in Odoo. Finance review is required.')
+            reused = lookup.search_read('payment.transaction', [('airwallex_deposit_id', '=', deposit_id)], ['id'])
+            if any(not current or row['id'] != tx['id'] for row in reused):
+                raise ValueError('The Airwallex receipt is linked to another payment. Finance review is required.')
+        return {**tx, 'amount': str(received), 'airwallex_deposit_id': deposit_id,
+                'airwallex_payment_amount': str(received),
+                'airwallex_payment_currency_id': order['currency_id'], '_refund_receipt': deposit}
+
     def snapshot(self, store_id, order_id, transfers=None):
         # Independent Airwallex read overlaps Odoo verification; financial results are never cached.
         transfers = _reads.submit(self.transfers) if transfers is None else transfers
@@ -374,6 +432,17 @@ class AirwallexRefunds:
         if any(i['currency_id'][1] != order_currency for i in posted):
             raise ValueError('Mixed invoice currencies require finance reconciliation.')
         credits = sum((money(i['amount_total']) for i in posted if i['move_type'] == 'out_refund'), ZERO)
+        verified_pending = (None if any(i['move_type'] == 'out_invoice' and i['payment_state'] == 'paid'
+                            and money(i['amount_residual']) == 0 for i in posted)
+                            else self.pending_receipt(store, client, order, txs))
+        warnings = []
+        if verified_pending:
+            txs = [verified_pending if t['id'] == verified_pending['id'] else t for t in txs]
+            received = money(verified_pending['amount'])
+            shortfall = max(ZERO, total - received)
+            warnings.append(f'Airwallex received {received:.2f} {order_currency}; order value is {total:.2f} {order_currency}'
+                + (f' ({shortfall:.2f} {order_currency} short).' if shortfall else '.')
+                + ' Odoo still shows the payment as pending. You can refund the verified received amount, less previous refunds. Odoo accounting remains unreconciled.')
         payments, provider_refunds, currencies = [], ZERO, set()
         seen_deposits = set()
         payment_matches = []
@@ -383,7 +452,7 @@ class AirwallexRefunds:
                 if t['currency_id'][1] != order_currency:
                     raise ValueError('A provider refund uses another currency. Finance review is required.')
                 provider_refunds += abs(money(t['amount']))
-            elif t['state'] == 'done' and not is_refund:
+            elif (t['state'] == 'done' or t.get('_refund_receipt')) and not is_refund:
                 if t.get('sale_order_ids') != [order_id]:
                     raise ValueError('A payment covers multiple orders. Finance allocation is required.')
                 if not self.customer_matches(client, order, t.get('partner_id')):
@@ -405,7 +474,7 @@ class AirwallexRefunds:
                     if deposit_id in seen_deposits:
                         raise ValueError('A deposit is linked to more than one transaction. Finance review is required.')
                     seen_deposits.add(deposit_id)
-                    deposit = self.call('GET', '/api/v1/deposits/' + deposit_id)
+                    deposit = t.get('_refund_receipt') or self.call('GET', '/api/v1/deposits/' + deposit_id)
                     if deposit.get('status') != 'SETTLED':
                         raise ValueError('The original Airwallex deposit is not settled.')
                     if not whole_reference(deposit.get('reference'), order['name']):
@@ -421,7 +490,7 @@ class AirwallexRefunds:
                     collected = money(t.get('airwallex_payment_amount') if payment_currency else amount)
                     if deposit.get('currency') != currency or money(deposit['amount']) != collected:
                         raise ValueError('The settled deposit does not match the locked payment amount.')
-                match.update(amount=str(collected), currency=currency)
+                match.update(amount=str(collected), currency=currency, odoo_payment_status=t['state'])
                 payment_matches.append(match)
                 payments.append((amount, collected))
                 currencies.add(currency)
@@ -441,7 +510,7 @@ class AirwallexRefunds:
                 raise ValueError('Payments with different conversion rates need finance allocation.')
             rate = next(iter(rates))
             cap = min(total, original_paid) * rate
-            evidence = 'Completed Odoo payment' + (' + settled Airwallex deposit' if any(t.get('provider_code') == 'airwallex_transfer' for t in txs) else '')
+            evidence = 'Settled Airwallex receipt matched to order and customer; Odoo payment pending' if verified_pending else 'Completed Odoo payment' + (' + settled Airwallex deposit' if any(t.get('provider_code') == 'airwallex_transfer' for t in txs) else '')
         else:
             # A posted invoice is not itself evidence of payment; only fully paid invoices qualify.
             paid_invoices = [i for i in posted if i['move_type'] == 'out_invoice' and i['payment_state'] == 'paid' and money(i['amount_residual']) == 0]
@@ -483,7 +552,7 @@ class AirwallexRefunds:
         return {'store_id': store_id, 'order_id': order_id, 'order_key': key, 'order_name': order['name'],
                 'customer': partner['name'], 'order_value': str(total), 'order_currency': order_currency,
                 'order_equivalent': str(total * rate), 'conversion_rate': str(rate),
-                'payment_matches': payment_matches,
+                'payment_matches': payment_matches, 'warnings': warnings,
                 'currency': currency, 'paid': str(collected_paid), 'cap': str(cap), 'refunded_reserved': str(used),
                 'accounting_deduction': str(accounting_deduction), 'remaining': str(remaining),
                 'rounding': str(rounding), 'evidence': evidence, 'history': history,
@@ -619,7 +688,7 @@ class AirwallexRefunds:
                 'currency': snapshot['currency'], 'recipient': bank.get('account_name', ''),
                 'destination': destination_label(bank), 'method': schema_params.get('local_clearing_system') or transfer['transfer_method'],
                 **funding, 'fees': 'Airwallex fees are additional and paid by the business. Exact fees are recorded after submission.',
-                'expires_in_seconds': 600}
+                'warnings': snapshot.get('warnings', []), 'expires_in_seconds': 600}
 
     def submit(self, token, actor='staff'):
         cfg = self.config()
