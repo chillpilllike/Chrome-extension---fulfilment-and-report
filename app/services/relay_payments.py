@@ -749,8 +749,7 @@ class RelayPayments:
                 for sid in self.settings()['store_ids']:
                     store=self.get_store(sid);client=self.client(sid)
                     sites=[int(store.website_id)] if getattr(store,'website_id',None) else [x['id'] for x in client.execute('website','search_read',[[]],{'fields':['id']})]
-                    for website in sites:
-                        client.execute('payment.transaction','relay_bridge_creation_mode',[website,mode])
+                    client.execute('payment.transaction','relay_bridge_creation_mode',[sites,mode])
             except Exception:
                 raise HTTPException(409,'Could not update every Odoo website. Upgrade the Relay addon and retry saving this mode.')
             self.set_settings({'relay_payment_settings':json.dumps({**self.settings(),'creation_mode':mode})})
