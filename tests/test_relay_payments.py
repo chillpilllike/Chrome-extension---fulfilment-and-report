@@ -546,3 +546,36 @@ class ExtensionTokenSettingsTests(unittest.TestCase):
   self.assertEqual('',self.http.get('/api/relay/extension-token',headers=self.headers).json()['token'])
   r=self.http.post('/api/relay/extension-token',headers=self.headers)
   self.assertEqual(r.json()['token'],self.svc.reveal_extension_token())
+
+class DirectCreationTests(unittest.TestCase):
+ def tearDown(self):
+  self.http.close();self.c.close()
+ def setUp(self):
+  WorkflowTests.setUp(self)
+  import hashlib
+  from fastapi import FastAPI
+  from fastapi.testclient import TestClient
+  self.values={'relay_payment_settings':json.dumps({**DEFAULTS,'enabled':True,'store_ids':[1]}),
+               'relay_extension_token_hash':hashlib.sha256(b'test-direct').hexdigest()}
+  self.svc.get_settings=lambda:self.values
+  self.svc.set_settings=lambda v:self.values.update(v)
+  self.svc.current=lambda row:{**SNAP,'creation_mode':'direct','qbo_invoice_id':False,'line_text':'Payment against order #NC-22','currency':'USD'}
+  app=FastAPI();app.include_router(self.svc.router());self.http=TestClient(app)
+  self.headers={'X-Relay-Token':'test-direct'}
+ def plan(self,**kw):
+  return self.http.post('/api/relay/extension/direct-plan',headers=self.headers,json={'request_id':'req-1','owner':'worker-1234567890123456',**kw})
+ def test_durable_reservation_blocks_second_worker_and_second_final_action(self):
+  self.assertEqual(200,self.plan().status_code)
+  self.assertEqual(409,self.plan(owner='other-worker-123456789').status_code)
+  self.assertEqual(200,self.plan(arm=True).status_code)
+  self.assertEqual(409,self.plan(arm=True).status_code)
+  self.assertEqual('creating',self.c.execute('SELECT phase FROM relay_direct_jobs').fetchone()[0])
+ def test_existing_quickbooks_invoice_cannot_be_created_again(self):
+  self.svc.current=lambda row:{**SNAP,'creation_mode':'direct'}
+  self.assertEqual(409,self.plan().status_code)
+  self.assertEqual(0,self.c.execute('SELECT COUNT(*) FROM relay_direct_jobs').fetchone()[0])
+ def test_paid_or_bound_request_cannot_be_created(self):
+  self.svc.current=lambda row:{**SNAP,'creation_mode':'direct','qbo_invoice_id':False,'state':'done'}
+  self.assertEqual(409,self.plan().status_code)
+ def test_plan_requires_extension_authentication(self):
+  self.assertEqual(401,self.http.post('/api/relay/extension/direct-plan',json={}).status_code)

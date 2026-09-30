@@ -3,12 +3,14 @@
 Injected host functions keep this independent from the application's large main module.
 Only the server owns Odoo and Resend credentials. The extension credential can only
 resolve/upload matching payment links and retrieve an authenticated login link for
-a specific current journey; it cannot confirm orders or change settings.
+a specific current journey, reserve direct invoice creation, and select the creation
+method for new checkouts. It cannot confirm orders or change other settings.
 """
 import base64
 import hashlib
 import hmac
 import json
+import re
 import os
 import secrets
 import threading
@@ -26,7 +28,7 @@ from .relay_policy import match_capture, payment_key, parse_receipt
 from .relay_login import login_link, login_subject, recent_login_summaries
 
 DEFAULTS = {'enabled': False, 'store_ids': [], 'receiving_address': 'relay-payments@taloofalut.resend.app',
-            'forwarders': 'am-it@outlook.com', 'authserv_ids': '', 'public_base_url': '', 'test_mode': True}
+            'forwarders': 'am-it@outlook.com', 'authserv_ids': '', 'public_base_url': '', 'test_mode': True, 'creation_mode': 'quickbooks'}
 
 
 def now():
@@ -72,6 +74,9 @@ class RelayPayments:
 
     def ensure(self):
         with self.db() as c:
+            c.execute('''CREATE TABLE IF NOT EXISTS relay_direct_jobs (
+                request_id TEXT PRIMARY KEY, owner TEXT NOT NULL, phase TEXT NOT NULL,
+                created_at TEXT NOT NULL)''')
             c.execute('''CREATE TABLE IF NOT EXISTS relay_payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, store_id INTEGER NOT NULL,
                 request_id TEXT NOT NULL UNIQUE, case_id INTEGER,
@@ -177,6 +182,8 @@ class RelayPayments:
         for k in ('request_id', 'source_hash', 'customer_email', 'customer_name', 'amount_cents', 'order_number', 'website_id', 'database_uuid', 'qbo_invoice_id', 'invoice_number', 'qbo_realm', 'order_id', 'company_id', 'currency'):
             if fresh.get(k) != old.get(k):
                 raise ValueError('Current Odoo payment differs: ' + k)
+        if fresh.get('creation_mode', 'quickbooks') != old.get('creation_mode', 'quickbooks'):
+            raise ValueError('Current Odoo payment differs: creation_mode')
         if fresh['state'] not in ('pending', 'done'):
             raise ValueError('Payment is no longer active')
         return fresh
@@ -728,10 +735,49 @@ class RelayPayments:
             for row in rows:
                 if row['store_id'] not in stores:continue
                 snap=json.loads(row['snapshot_json'])
-                if snap.get('initiated_at') or snap.get('state') not in ('pending','draft') or not snap.get('qbo_invoice_id'):continue
-                items.append({'request_id':row['request_id'],'order_number':snap['order_number'],'invoice_number':snap['invoice_number']})
+                if snap.get('initiated_at') or snap.get('state') not in ('pending','draft') or (not snap.get('qbo_invoice_id') and snap.get('creation_mode') != 'direct'):continue
+                items.append({'request_id':row['request_id'],'order_number':snap['order_number'],'invoice_number':snap['invoice_number'],'creation_mode':snap.get('creation_mode','quickbooks')})
             from fastapi.responses import JSONResponse
             return JSONResponse({'ok':True,'items':items,'poll_seconds':2},headers={'Cache-Control':'no-store'})
+        @r.post('/extension/creation-mode')
+        def creation_mode(request:Request,payload:dict):
+            extension(request)
+            mode=payload.get('mode')
+            if mode not in ('quickbooks','direct'):raise HTTPException(400,'Invalid creation mode')
+            # Each website freezes this choice on new requests; existing invoices retain their route.
+            try:
+                for sid in self.settings()['store_ids']:
+                    store=self.get_store(sid);client=self.client(sid)
+                    sites=[int(store.website_id)] if getattr(store,'website_id',None) else [x['id'] for x in client.execute('website','search_read',[[]],{'fields':['id']})]
+                    for website in sites:
+                        client.execute('payment.transaction','relay_bridge_creation_mode',[website,mode])
+            except Exception:
+                raise HTTPException(409,'Could not update every Odoo website. Upgrade the Relay addon and retry saving this mode.')
+            self.set_settings({'relay_payment_settings':json.dumps({**self.settings(),'creation_mode':mode})})
+            return {'ok':True,'mode':mode}
+
+        @r.post('/extension/direct-plan')
+        def direct_plan(request:Request,payload:dict):
+            extension(request)
+            owner=str(payload.get('owner',''))
+            if not re.fullmatch(r'[A-Za-z0-9_-]{16,100}',owner):raise HTTPException(400,'Worker identity required')
+            with self.db() as c:
+                row=c.execute('SELECT * FROM relay_payments WHERE request_id=?',(payload.get('request_id'),)).fetchone()
+            if not row:raise HTTPException(404,'Request unavailable')
+            try:
+                snap=self.current(row)
+                if snap.get('creation_mode')!='direct' or snap.get('qbo_invoice_id') or snap.get('state')!='pending' or snap.get('initiated_at') or row['payment_link']:
+                    raise ValueError('Request is not eligible for direct creation')
+                if not snap.get('line_text') or not snap.get('due_date'):raise ValueError('Direct invoice data missing')
+                with self.db() as c:
+                    c.execute("INSERT INTO relay_direct_jobs(request_id,owner,phase,created_at) VALUES(?,?,'editing',?) ON CONFLICT(request_id) DO NOTHING",(row['request_id'],owner,now()))
+                    job=c.execute('SELECT * FROM relay_direct_jobs WHERE request_id=? FOR UPDATE',(row['request_id'],)).fetchone()
+                    if job['owner']!=owner or job['phase']!='editing':raise ValueError('Creation already reserved or attempted; reconcile existing Relay invoice before retrying')
+                    if payload.get('arm'):
+                        c.execute("UPDATE relay_direct_jobs SET phase='creating' WHERE request_id=?",(row['request_id'],))
+                return {'ok':True,'plan':{k:snap[k] for k in ('request_id','order_number','invoice_number','customer_name','customer_email','amount_cents','currency','due_date','line_text','source_hash')}}
+            except ValueError as exc:raise HTTPException(409,str(exc)) from None
+
         @r.post('/extension/resolve')
         def resolve(request:Request,payload:dict):
             extension(request)
