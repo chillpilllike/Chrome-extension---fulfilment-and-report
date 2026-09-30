@@ -579,3 +579,12 @@ class DirectCreationTests(unittest.TestCase):
   self.assertEqual(409,self.plan().status_code)
  def test_plan_requires_extension_authentication(self):
   self.assertEqual(401,self.http.post('/api/relay/extension/direct-plan',json={}).status_code)
+
+ def test_repeated_mode_save_does_not_repeat_odoo_calls(self):
+  from unittest.mock import Mock
+  saved=json.loads(self.values['relay_payment_settings']);saved['creation_mode']='direct'
+  self.values['relay_payment_settings']=json.dumps(saved)
+  self.svc.client=Mock(side_effect=AssertionError('Already applied'))
+  r=self.http.post('/api/relay/extension/creation-mode',headers=self.headers,json={'mode':'direct'})
+  self.assertEqual(200,r.status_code)
+  self.svc.client.assert_not_called()
