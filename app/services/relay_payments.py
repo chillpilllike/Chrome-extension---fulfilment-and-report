@@ -744,6 +744,10 @@ class RelayPayments:
             extension(request)
             mode=payload.get('mode')
             if mode not in ('quickbooks','direct'):raise HTTPException(400,'Invalid creation mode')
+            # A retry after a client timeout must acknowledge a completed save.
+            stored=json.loads(self.get_settings().get('relay_payment_settings') or '{}')
+            if stored.get('creation_mode') == mode:
+                return {'ok':True,'mode':mode}
             # Each website freezes this choice on new requests; existing invoices retain their route.
             try:
                 for sid in self.settings()['store_ids']:
