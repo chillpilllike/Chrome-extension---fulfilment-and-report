@@ -171,6 +171,27 @@ class ManualSMS:
             try:return fn(*args)
             except (ValueError,KeyError,TypeError) as exc:raise HTTPException(409,str(exc)) from exc
             except Exception as exc:raise HTTPException(502,'Could not verify customer/provider data. No automatic retry was made.') from exc
+        @router.get('/stores')
+        def stores():
+            enabled={int(key.split(':')[0]) for key,value in self.sms.config()['mappings'].items() if value.get('transactional_sms_enabled') and value.get('twilio')}
+            with self.r.db() as conn:
+                rows=conn.execute('SELECT id,name FROM stores WHERE active=1 ORDER BY name').fetchall()
+            return [dict(row) for row in rows if row['id'] in enabled]
+        @router.get('/lookup')
+        def lookup(store_id:int,order_number:str):
+            reference=order_number.strip()
+            if not reference or len(reference)>80:raise HTTPException(400,'Enter the complete order number.')
+            websites=[int(key.split(':')[1]) for key,value in self.sms.config()['mappings'].items()
+                      if int(key.split(':')[0])==store_id and value.get('transactional_sms_enabled') and value.get('twilio')]
+            if not websites:raise HTTPException(409,'SMS is not enabled for this store.')
+            def resolve():
+                client=self.r.OdooClient(self.r.get_store(store_id))
+                pattern=reference.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')
+                rows=client.search_read('sale.order',[('name','=ilike',pattern),('website_id','in',websites)],['id','name'],limit=2)
+                if not rows:raise ValueError('Order not found in the selected store. Check the complete order number.')
+                if len(rows)!=1:raise ValueError('More than one order has this reference. Use a unique order number.')
+                result=self.target({'store_id':store_id,'order_id':rows[0]['id']});result.pop('sender');return result
+            return safe(resolve)
         @router.get('/sites')
         def sites():
             rows=[]

@@ -26,6 +26,30 @@ class ManualSMSTests(unittest.TestCase):
         self.payload={'request_key':'11111111-1111-1111-1111-111111111111','store_id':1,'order_id':123,'body':'Your order update.','actor':'Test Operator','consent_confirmed':True}
     def tearDown(self):self.conn.close()
 
+    def test_lookup_fetches_exact_reference_from_selected_odoo_store(self):
+        self.service.sms.config=lambda:{'mappings':{'1:2':{'transactional_sms_enabled':True,'twilio':True},'9:8':{'transactional_sms_enabled':True,'twilio':True}}}
+        client=Mock();client.search_read.return_value=[{'id':456,'name':'NC_123%'}]
+        self.r.get_store=Mock(return_value={'id':1});self.r.OdooClient=Mock(return_value=client)
+        self.service.target.side_effect=lambda p:dict(self.info,odoo_order_id=p['order_id'])
+        lookup=next(x.endpoint for x in self.service.router().routes if x.path.endswith('/lookup'))
+        result=lookup(1,' NC_123% ')
+        self.r.get_store.assert_called_once_with(1)
+        client.search_read.assert_called_once_with('sale.order',[('name','=ilike','NC\\_123\\%'),('website_id','in',[2])],['id','name'],limit=2)
+        self.service.target.assert_called_once_with({'store_id':1,'order_id':456})
+        self.assertEqual(456,result['odoo_order_id']);self.assertNotIn('sender',result)
+
+    def test_lookup_rejects_missing_ambiguous_disabled_and_empty_orders(self):
+        from fastapi import HTTPException
+        self.service.sms.config=lambda:{'mappings':{'1:2':{'transactional_sms_enabled':True,'twilio':True}}}
+        client=Mock();self.r.OdooClient=lambda _:client;self.r.get_store=lambda _:{}
+        lookup=next(x.endpoint for x in self.service.router().routes if x.path.endswith('/lookup'))
+        for rows in [[],[{'id':1},{'id':2}]]:
+            client.search_read.return_value=rows
+            with self.assertRaises(HTTPException):lookup(1,'NC123')
+        for store,reference in [(9,'NC123'),(1,' '),(1,'x'*81)]:
+            with self.assertRaises(HTTPException):lookup(store,reference)
+        self.service.target.assert_not_called()
+
     @patch('app.services.manual_sms.deliver',return_value=('SM'+'1'*32,'accepted'))
     def test_preview_does_not_send_send_is_idempotent(self,send):
         row=self.service.preview(self.payload);send.assert_not_called()
