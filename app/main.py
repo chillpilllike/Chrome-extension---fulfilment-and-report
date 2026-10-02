@@ -2349,6 +2349,8 @@ def init_db() -> None:
         conn.executescript(reminder_schema)
         from app.services.care_sms import SCHEMA as sms_schema
         conn.executescript(sms_schema)
+        from app.services.manual_sms import SCHEMA as manual_sms_schema
+        conn.executescript(manual_sms_schema)
         from app.services.delivery_followup import SCHEMA as followup_schema
         conn.executescript(followup_schema)
         from app.services.manual_refunds import SCHEMA as manual_refund_schema
@@ -45774,6 +45776,9 @@ app.include_router(manual_refunds.router())
 app.include_router(manual_refunds.launch_router())
 from app.services.care_sms import SMS as CareSMS
 care_sms = CareSMS(globals())
+from app.services.manual_sms import ManualSMS
+manual_sms = ManualSMS(care_sms)
+app.include_router(manual_sms.router())
 app.include_router(care_sms.router())
 app.include_router(care_sms.webhook_router())
 

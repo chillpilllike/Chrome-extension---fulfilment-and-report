@@ -25,6 +25,7 @@ class Worker:
                 'reminders': lambda: r.care_reminders.run_due(request),
                 'sms_recovery': r.care_sms.recover_failed,
                 'sms_receipts': r.care_sms.reconcile_receipts,
+                'manual_sms_receipts': r.manual_sms.reconcile,
                 'sms_approval_release': r.care_sms.release_pending,
                 'refund_acknowledgements': lambda: r.refund_notices.run(request),
                 'financial_sms_preparation': self.financial_sms,

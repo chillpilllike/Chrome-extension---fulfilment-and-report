@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import './sms-log.css'
+import { ManualSmsComposer, ManualSmsDetails } from './ManualSms'
 type API = <T>(path: string, options?: RequestInit) => Promise<T>
 type Config = { relay_provider: string; relay_enabled: boolean; enabled: boolean; approval_required: boolean; provider: string; mappings: Record<string, unknown>; credentials: Record<string, boolean>; test_mode: boolean }
 export function SmsSettings({ api }: { api: API }) {
@@ -67,18 +68,21 @@ export function SmsPreview({ api, emailId, onChange }: { api: API; emailId: numb
 }
 
 export function SmsLog({api,storeId}:{api:API;storeId:string}) {
-  const [rows,setRows]=useState<(Row & {email_id:number;odoo_order_name:string;sender_domain:string;updated_at:string})[]>([])
+  const [rows,setRows]=useState<(Row & {email_id:number;manual_id?:number;odoo_order_name:string;sender_domain:string;updated_at:string})[]>([])
+  const [manualSelected,setManualSelected]=useState<number|null>(null)
   const [total,setTotal]=useState(0);const [page,setPage]=useState(1);const [status,setStatus]=useState('');const [query,setQuery]=useState('');const [selected,setSelected]=useState<number|null>(null);const [error,setError]=useState('');const [tick,setTick]=useState(0)
   const [loading,setLoading]=useState(true)
   useEffect(()=>{setPage(1);setSelected(null)},[storeId,status,query])
   useEffect(()=>{const c=new AbortController();setError('');setLoading(true);api<{rows:typeof rows;total:number}>(`/api/after-order/sms/log?${new URLSearchParams({store_id:storeId||'0',page:String(page),status,q:query})}`,{signal:c.signal}).then(d=>{if(!c.signal.aborted){setRows(d.rows);setTotal(d.total)}}).catch(e=>{if(!c.signal.aborted){setError(String(e));setRows([])}}).finally(()=>{if(!c.signal.aborted)setLoading(false)});return()=>c.abort()},[api,storeId,page,status,query,tick])
   return <section className="sms-log-panel" aria-label="SMS log" aria-busy={loading}>
+    <ManualSmsComposer api={api} storeId={storeId} onSent={()=>setTick(t=>t+1)}/>
     <div className="sms-log-toolbar"><label>Search<input className="form-control" placeholder="Order, phone or website" value={query} onChange={e=>setQuery(e.target.value)}/></label><label>Status<select className="form-select" value={status} onChange={e=>setStatus(e.target.value)}><option value="">All statuses</option>{Object.entries(smsLabels).filter(([s])=>s!=='canceled').map(([s,label])=><option key={s} value={s}>{label}</option>)}</select></label><Button variant="outline" disabled={loading} onClick={()=>setTick(t=>t+1)}>Refresh log</Button></div>
     <div className="sms-log-summary"><span>{loading?'Loading messages…':`${total} messages`}</span><span>Last 30 days · older history retained</span></div>
     {error && <p className="sms-error" role="alert">{error}</p>}
     {!loading && !error && !rows.length && <div className="sms-empty"><h3>No messages found</h3><p>{status==='awaiting_approval'?'There are no SMS messages waiting for approval.':'Try another status or search term.'}</p></div>}
-    <div className="sms-log-rows">{rows.map(row=><article key={row.id} className="sms-log-row"><div><strong>{row.odoo_order_name}</strong><small>{row.sender_domain}</small></div><div><strong className="sms-phone">{row.recipient}</strong><small>{row.test_mode?'Test message':'Customer message'} · {row.provider.toUpperCase()}</small></div><div><SmsStatus status={row.status}/><small>{new Date(row.updated_at).toLocaleString()}</small></div><Button variant={row.status==='awaiting_approval'?'default':'outline'} onClick={()=>setSelected(row.email_id)}>{row.status==='awaiting_approval'?'Review & approve':'View message'}</Button></article>)}</div>
+    <div className="sms-log-rows">{rows.map(row=><article key={row.id} className="sms-log-row"><div><strong>{row.odoo_order_name}</strong><small>{row.sender_domain}</small></div><div><strong className="sms-phone">{row.recipient}</strong><small>{row.manual_id?'Manual message':row.test_mode?'Test message':'Customer message'} · {row.provider.toUpperCase()}</small></div><div><SmsStatus status={row.status}/><small>{new Date(row.updated_at).toLocaleString()}</small></div><Button variant={row.status==='awaiting_approval'?'default':'outline'} onClick={()=>row.manual_id?setManualSelected(row.manual_id):setSelected(row.email_id)}>{row.status==='awaiting_approval'?'Review & approve':'View message'}</Button></article>)}</div>
     <div className="sms-log-pagination"><span>Page {page}</span><div className="sms-actions"><Button variant="outline" disabled={loading||page<=1} onClick={()=>setPage(p=>p-1)}>Previous</Button><Button variant="outline" disabled={loading||page*30>=total} onClick={()=>setPage(p=>p+1)}>Next</Button></div></div>
     <Dialog open={selected!==null} onOpenChange={open=>{if(!open)setSelected(null)}}><DialogContent className="sms-message-dialog"><DialogHeader><DialogTitle>{rows.find(r=>r.email_id===selected)?.odoo_order_name || 'SMS'} · Message details</DialogTitle><DialogDescription>Preview the message and review its delivery or approval status.</DialogDescription></DialogHeader>{selected!==null && <SmsPreview key={selected} api={api} emailId={selected} onChange={()=>setTick(t=>t+1)}/>}</DialogContent></Dialog>
+    <Dialog open={manualSelected!==null} onOpenChange={open=>{if(!open)setManualSelected(null)}}><DialogContent className="sms-message-dialog"><DialogHeader><DialogTitle>Manual SMS details</DialogTitle><DialogDescription>Message, sending team member and provider delivery status.</DialogDescription></DialogHeader>{manualSelected!==null&&<ManualSmsDetails api={api} id={manualSelected} onChange={()=>setTick(t=>t+1)}/>}</DialogContent></Dialog>
   </section>
 }

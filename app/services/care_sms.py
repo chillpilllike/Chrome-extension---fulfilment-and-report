@@ -947,21 +947,24 @@ class SMS:
 
         @router.get('/log')
         def log(store_id:int=0, status:str='', q:str='', page:int=1):
+            source='''(SELECT s.id,s.email_id,s.provider,s.recipient,s.test_mode,s.status,s.body,s.attempts,s.provider_id,s.snapshot_json,
+                s.last_error,s.created_at,s.updated_at,c.odoo_order_name,c.sender_domain,c.store_id,0 AS manual_id
+                FROM after_order_sms s JOIN after_order_cases c ON c.id=s.case_id
+                UNION ALL SELECT -m.id,NULL,'twilio',m.recipient,0,m.status,m.body,m.attempts,m.provider_id,m.snapshot_json,
+                m.last_error,m.created_at,m.updated_at,m.odoo_order_name,m.sender_domain,m.store_id,m.id AS manual_id FROM manual_sms m) s'''
             cutoff = (datetime.now(timezone.utc)-timedelta(days=30)).isoformat()
             where=['s.updated_at>=?']; args=[cutoff]
             if store_id:
-                where.append('c.store_id=?'); args.append(store_id)
+                where.append('s.store_id=?'); args.append(store_id)
             if status:
                 where.append('s.status=?'); args.append(status)
             if q:
-                where.append('(LOWER(c.odoo_order_name) LIKE ? OR s.recipient LIKE ? OR LOWER(c.sender_domain) LIKE ?)')
+                where.append('(LOWER(s.odoo_order_name) LIKE ? OR s.recipient LIKE ? OR LOWER(s.sender_domain) LIKE ?)')
                 args.extend(['%'+q.strip().lower()[:100]+'%']*3)
             clause=' AND '.join(where)
             with self.r.db() as conn:
-                total=conn.execute('SELECT COUNT(*) AS n FROM after_order_sms s JOIN after_order_cases c ON c.id=s.case_id WHERE '+clause,args).fetchone()['n']
-                rows=conn.execute('''SELECT s.id,s.email_id,s.provider,s.recipient,s.test_mode,s.status,s.body,s.attempts,s.provider_id,s.snapshot_json,
-                    s.last_error,s.created_at,s.updated_at,c.odoo_order_name,c.sender_domain
-                    FROM after_order_sms s JOIN after_order_cases c ON c.id=s.case_id WHERE '''+clause+
+                total=conn.execute('SELECT COUNT(*) AS n FROM '+source+' WHERE '+clause,args).fetchone()['n']
+                rows=conn.execute('SELECT s.* FROM '+source+' WHERE '+clause+
                     ' ORDER BY s.updated_at DESC,s.id DESC LIMIT 30 OFFSET ?',[*args,(max(1,page)-1)*30]).fetchall()
             results = []
             for raw in rows:

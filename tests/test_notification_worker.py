@@ -42,7 +42,7 @@ class NotificationWorkerTests(unittest.TestCase):
             'after_order_case_by_id':lambda i:self.cases[i],'after_order_case_is_in_scope':lambda c:c.get('in_scope',True),
             'record_after_order_event':self.events,'clean_error_message':str,'sync_after_order_cases':Mock(),
             'send_after_order_email':self.send,'after_order_unavailable_review':lambda *a,**k:{'blocked':False,'approved':False},
-            'care_delivery':Mock(),'care_requests':Mock(),'care_reminders':Mock(),'care_sms':Mock(),
+            'care_delivery':Mock(),'care_requests':Mock(),'care_reminders':Mock(),'care_sms':Mock(),'manual_sms':Mock(),
             'refund_notices':Mock(),'alternative_workflow':Mock()}
         self.worker=Worker(self.ns)
 

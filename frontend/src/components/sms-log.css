@@ -1,4 +1,10 @@
 .sms-log-panel{background:#fff;border:1px solid #dce3ec;border-radius:16px;overflow:hidden;color:#1e293b}
+.sms-log-panel>.btn{margin:20px 24px 0}
+.sms-message-dialog .grid{padding:24px;display:grid;gap:16px}
+.sms-message-dialog .grid label{display:grid;gap:8px;font-size:13px;font-weight:600}
+.sms-message-dialog .grid small{font-size:12px;color:#64748b;font-weight:400}
+.sms-message-dialog textarea{min-height:140px;resize:vertical}
+.sms-message-body{background:#eff4f9;border:1px solid #e2e8f0;border-radius:12px;padding:20px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:16px;line-height:1.6}
 .sms-log-toolbar{display:flex;align-items:end;gap:16px;padding:24px;background:#f8fafc}
 .sms-log-toolbar label{display:grid;gap:8px;font-size:13px;font-weight:600;flex:1}
 .sms-log-toolbar label:first-child{flex:2}.sms-log-toolbar input,.sms-log-toolbar select{min-height:42px}
