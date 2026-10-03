@@ -8,6 +8,7 @@ const base='/api/after-order/sms/manual'
 export function ManualSmsDetails({api,id,onChange}:{api:API;id:number;onChange:()=>void}) {
   const [row,setRow]=useState<Message|null>(null);const [error,setError]=useState('');const [busy,setBusy]=useState(false)
   useEffect(()=>{api<Message>(`${base}/${id}`).then(setRow).catch(e=>setError(String(e)))},[api,id])
+  useEffect(()=>{const timer=setInterval(()=>{if(!document.hidden)api<Message>(`${base}/${id}`).then(setRow).catch(()=>{})},15000);return()=>clearInterval(timer)},[api,id])
   async function refresh(){setBusy(true);try{setRow(await api<Message>(`${base}/${id}/refresh`,{method:'POST'}));onChange()}catch(e){setError(String(e))}finally{setBusy(false)}}
   return <div className="grid gap-3">{error&&<p role="alert">{error}</p>}{row&&<><p>{row.recipient} · {row.status} · Twilio</p><p>{row.customer_name} {row.order_total} {row.currency}</p><div className="sms-message-body whitespace-pre-wrap">{row.body}</div><p>Team member: {row.actor}</p><small>{row.actor_identity} · {new Date(row.created_at).toLocaleString()}</small>{row.last_error&&<p role="alert">{row.last_error}</p>}<Button disabled={busy} variant="outline" onClick={()=>void refresh()}>Refresh delivery status</Button><p className="text-sm">Provider acceptance does not confirm delivery. No automatic resend is performed for manual messages.</p></>}</div>
 }

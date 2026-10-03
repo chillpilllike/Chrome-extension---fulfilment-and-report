@@ -663,6 +663,43 @@ class SMSTests(unittest.TestCase):
         self.assertEqual('delivered',self.sms.refresh(1)['status'])
         self.assertEqual(0,self.row()['attempts'])
 
+    @patch('app.services.care_sms.deliver')
+    @patch.dict('os.environ',{'TWILIO_ACCOUNT_SID':'AC'+'a'*32,'TWILIO_AUTH_TOKEN':'test'})
+    @patch('app.services.care_sms.requests.get')
+    def test_background_twilio_poll_updates_delivery_and_never_sends(self,get,send):
+        self.sms.prepare(1)
+        self.conn.execute("UPDATE after_order_sms SET provider='twilio',provider_id=?,status='accepted'",('SM'+'b'*32,))
+        get.return_value.json.return_value={'status':'delivered'}
+        self.sms.reconcile_receipts();self.sms.reconcile_receipts()
+        self.assertEqual('delivered',self.row()['status'])
+        get.assert_called_once();send.assert_not_called()
+
+    @patch('app.services.care_sms.deliver')
+    def test_poll_failure_and_pending_status_are_throttled_and_retryable(self,send):
+        self.sms.prepare(1)
+        self.conn.execute("UPDATE after_order_sms SET provider='twilio',provider_id='SMref',status='sent'")
+        self.sms.refresh=Mock(side_effect=ValueError('Provider unavailable'))
+        self.sms.reconcile_receipts();self.sms.reconcile_receipts()
+        self.sms.refresh.assert_called_once()
+        self.assertEqual('sent',self.row()['status'])
+        check=self.conn.execute('SELECT * FROM after_order_sms_status_checks').fetchone()
+        self.assertIn('retry automatically',check['last_error'])
+        self.conn.execute("UPDATE after_order_sms_status_checks SET checked_at='2026-01-01'")
+        self.sms.refresh.side_effect=None
+        self.sms.reconcile_receipts()
+        self.assertEqual(2,self.sms.refresh.call_count)
+        self.assertIsNone(self.conn.execute('SELECT last_error FROM after_order_sms_status_checks').fetchone()[0])
+        send.assert_not_called()
+
+    @patch.dict('os.environ',{'TWILIO_ACCOUNT_SID':'AC'+'a'*32,'TWILIO_AUTH_TOKEN':'test'})
+    @patch('app.services.care_sms.requests.get')
+    def test_late_pending_receipt_cannot_overwrite_terminal_status(self,get):
+        self.sms.prepare(1)
+        self.conn.execute("UPDATE after_order_sms SET provider='twilio',provider_id=?,status='delivered'",('SM'+'b'*32,))
+        get.return_value.json.return_value={'status':'sent'}
+        self.sms.refresh(1)
+        self.assertEqual('delivered',self.row()['status'])
+
     @patch.dict('os.environ',{'MSG91_AUTH_KEY':'test'})
     @patch('app.services.care_sms.requests.post')
     def test_msg91_payload_and_acceptance(self, post):

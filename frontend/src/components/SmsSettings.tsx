@@ -48,6 +48,7 @@ export function SmsPreview({ api, emailId, onChange }: { api: API; emailId: numb
   const [confirm,setConfirm]=useState<'send'|'resend'|null>(null)
   async function load() { const d = await api<{ row: Row | null; reason?:string;can_prepare?:boolean;attempts?:typeof attempts }>(`/api/after-order/sms/email/${emailId}`); setRow(d.row);setReason(d.reason || '');setCanPrepare(!!d.can_prepare);setAttempts(d.attempts || []) }
   useEffect(() => { void load().catch(e => setNotice(String(e))) }, [emailId])
+  useEffect(()=>{const timer=setInterval(()=>{if(!document.hidden&&!busy)void load().catch(()=>{})},15000);return()=>clearInterval(timer)},[api,emailId,busy])
   async function act(path: string, body = {}) { setBusy(true); setNotice(''); try { const d = await api<{ error?: string }>(path, { method: 'POST', body: JSON.stringify(body) }); setNotice(d.error || 'SMS record updated.'); await load();onChange?.() } catch (e) { setNotice(String(e)) } finally { setBusy(false);setConfirm(null) } }
   return <section className="sms-preview" aria-busy={busy}>{row ? <>
       <div className="sms-preview-status"><SmsStatus status={row.status}/><span className="sms-mode">{row.test_mode?'TEST':'LIVE'}</span></div>
@@ -72,6 +73,7 @@ export function SmsLog({api,storeId}:{api:API;storeId:string}) {
   const [manualSelected,setManualSelected]=useState<number|null>(null)
   const [total,setTotal]=useState(0);const [page,setPage]=useState(1);const [status,setStatus]=useState('');const [query,setQuery]=useState('');const [selected,setSelected]=useState<number|null>(null);const [error,setError]=useState('');const [tick,setTick]=useState(0)
   const [loading,setLoading]=useState(true)
+  useEffect(()=>{const timer=setInterval(()=>{if(!document.hidden)setTick(t=>t+1)},15000);return()=>clearInterval(timer)},[])
   useEffect(()=>{setPage(1);setSelected(null)},[storeId,status,query])
   useEffect(()=>{const c=new AbortController();setError('');setLoading(true);api<{rows:typeof rows;total:number}>(`/api/after-order/sms/log?${new URLSearchParams({store_id:storeId||'0',page:String(page),status,q:query})}`,{signal:c.signal}).then(d=>{if(!c.signal.aborted){setRows(d.rows);setTotal(d.total)}}).catch(e=>{if(!c.signal.aborted){setError(String(e));setRows([])}}).finally(()=>{if(!c.signal.aborted)setLoading(false)});return()=>c.abort()},[api,storeId,page,status,query,tick])
   return <section className="sms-log-panel" aria-label="SMS log" aria-busy={loading}>

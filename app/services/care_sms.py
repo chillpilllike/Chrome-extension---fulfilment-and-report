@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -61,6 +62,9 @@ CREATE TABLE IF NOT EXISTS after_order_sms_attempts (
 CREATE TABLE IF NOT EXISTS after_order_sms_receipts (
  digest TEXT PRIMARY KEY, provider_id TEXT NOT NULL, recipient TEXT NOT NULL,
  status TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS after_order_sms_status_checks (
+ sms_id INTEGER PRIMARY KEY REFERENCES after_order_sms(id), checked_at TEXT NOT NULL, last_error TEXT
 );'''
 
 
@@ -720,6 +724,29 @@ class SMS:
                 ORDER BY updated_at LIMIT 200""").fetchall()
         for row in rows:
             self.refresh(row['id'])
+        # Twilio delivery reports need polling when no callback is configured.
+        # Separate check times rotate the backlog even when status is unchanged
+        # or a provider query fails. Receipt checks never call the send endpoint.
+        now=datetime.now(timezone.utc)
+        with self.r.db() as conn:
+            rows=conn.execute("""SELECT s.id FROM after_order_sms s
+                LEFT JOIN after_order_sms_status_checks k ON k.sms_id=s.id
+                WHERE s.provider='twilio' AND s.provider_id IS NOT NULL
+                  AND s.status IN ('accepted','queued','sending','sent','delivery_unknown')
+                  AND s.created_at>=? AND (k.checked_at IS NULL OR k.checked_at<=?)
+                ORDER BY COALESCE(k.checked_at,''),s.id LIMIT 100""",
+                ((now-timedelta(days=30)).isoformat(),(now-timedelta(minutes=2)).isoformat())).fetchall()
+        deadline=time.monotonic()+45
+        for row in rows:
+            if time.monotonic()>=deadline:break
+            error=None
+            try:self.refresh(row['id'])
+            except Exception as exc:
+                error=f'Delivery status lookup failed ({type(exc).__name__}); will retry automatically.'
+            with self.r.db() as conn:
+                conn.execute("""INSERT INTO after_order_sms_status_checks(sms_id,checked_at,last_error) VALUES(?,?,?)
+                    ON CONFLICT(sms_id) DO UPDATE SET checked_at=excluded.checked_at,last_error=excluded.last_error""",
+                    (row['id'],self.r.utc_now(),error))
 
     def recovery_allowed(self, conn, row):
         if row['provider']!='msg91' or row['test_mode'] or row['status']!='provider_failed' or not 1 <= row['attempts'] < 3:
@@ -935,7 +962,9 @@ class SMS:
             raise ValueError('Provider returned an unrecognized delivery status.')
         with r.db() as conn:
             # A slow status query must never overwrite a newer retry attempt.
-            conn.execute('UPDATE after_order_sms SET status=?,updated_at=? WHERE id=? AND attempts=? AND provider_id=? AND status<>?', (status,r.utc_now(),sms_id,row['attempts'],row['provider_id'],'sending'))
+            changed=conn.execute("""UPDATE after_order_sms SET status=?,updated_at=? WHERE id=? AND attempts=? AND provider_id=?
+                AND status NOT IN ('delivered','provider_failed','undelivered','cancelled','canceled')""", (status,r.utc_now(),sms_id,row['attempts'],row['provider_id']))
+            if not changed.rowcount:return {'ok':True,'status':row['status']}
             conn.execute('UPDATE after_order_sms_attempts SET status=?,updated_at=? WHERE sms_id=? AND attempt_number=? AND provider_id=?',
                          (status,r.utc_now(),sms_id,row['attempts'],row['provider_id']))
             if row['status'] != status:

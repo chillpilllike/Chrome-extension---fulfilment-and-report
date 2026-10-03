@@ -26382,6 +26382,7 @@ def startup() -> None:
                 threading.Thread(target=welcome_email_loop, name="new-order-welcome", daemon=True).start()
                 threading.Thread(target=email_approval_loop, name="email-approval-dispatch", daemon=True).start()
                 threading.Thread(target=notification_loop, name="care-notification-maintenance", daemon=True).start()
+                threading.Thread(target=sms_receipt_loop, name="sms-delivery-receipts", daemon=True).start()
                 threading.Thread(target=shopify_dispatch_loop, name="shopify-dispatch", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
                 threading.Thread(target=airwallex_refunds.loop, name="airwallex-refunds", daemon=True).start()
@@ -41646,6 +41647,24 @@ def notification_loop():
                 notification_worker.run(request)
         except Exception as exc:
             notification_worker.errors['worker']=clean_error_message(exc)
+        time.sleep(60)
+
+
+def sms_receipt_loop():
+    # Read provider delivery results independently of send/test-mode switches.
+    # A database lock prevents duplicate polling across app processes.
+    while True:
+        try:
+            with db() as guard:
+                if guard.execute('SELECT pg_try_advisory_xact_lock(781905445) AS locked').fetchone()['locked']:
+                    for name,action in [('sms_receipts',care_sms.reconcile_receipts),('manual_sms_receipts',manual_sms.reconcile)]:
+                        try:
+                            action()
+                            notification_worker.errors.pop(name,None)
+                        except Exception as exc:
+                            notification_worker.errors[name]=clean_error_message(exc)
+        except Exception as exc:
+            notification_worker.errors['sms_receipt_worker']=clean_error_message(exc)
         time.sleep(60)
 
 
