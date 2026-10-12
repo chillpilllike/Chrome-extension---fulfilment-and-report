@@ -164,6 +164,7 @@ class ReviewInput(BaseModel):
     fields: dict[str, str] = Field(default_factory=dict)
     edit_acknowledged: bool = False
     edit_reason: str = Field(default='', max_length=500)
+    manual_payment_confirmed: bool = False
     recipient_confirmed: bool = False
     other_refunds_checked: bool = False
 
@@ -347,6 +348,8 @@ class AirwallexRefunds:
         """Verify a unique settled receipt without changing Odoo's accounting state."""
         active = [t for t in txs if t.get('operation') != 'refund' and money(t['amount']) > 0
                   and t['state'] in {'pending', 'authorized', 'done'}]
+        if len(active) > 1 and any(t['state'] == 'pending' and t.get('provider_code') == 'airwallex_transfer' for t in active):
+            raise ValueError('Multiple active payments need finance allocation before refunding.')
         if len(active) != 1 or active[0]['state'] != 'pending' or active[0].get('provider_code') != 'airwallex_transfer':
             return None
         tx = active[0]
@@ -438,6 +441,7 @@ class AirwallexRefunds:
         verified_pending = (None if any(i['move_type'] == 'out_invoice' and i['payment_state'] == 'paid'
                             and money(i['amount_residual']) == 0 for i in posted)
                             else self.pending_receipt(store, client, order, txs))
+        manual_payment_required = False
         warnings = []
         if verified_pending:
             txs = [verified_pending if t['id'] == verified_pending['id'] else t for t in txs]
@@ -518,30 +522,43 @@ class AirwallexRefunds:
             # A posted invoice is not itself evidence of payment; only fully paid invoices qualify.
             paid_invoices = [i for i in posted if i['move_type'] == 'out_invoice' and i['payment_state'] == 'paid' and money(i['amount_residual']) == 0]
             if not paid_invoices:
-                raise ValueError('No completed payment or fully paid invoice could be verified in Odoo.')
-            if any(not self.customer_matches(client, order, i.get('partner_id')) for i in paid_invoices):
-                raise ValueError('The paid invoice customer does not match the order customer.')
-            # Avoid allocating a multi-order invoice to just this order.
-            invoice_ids = [i['id'] for i in paid_invoices]
-            related = client.search_read('sale.order', [('invoice_ids', 'in', invoice_ids)], ['id'])
-            if any(o['id'] != order_id for o in related):
-                raise ValueError('A paid invoice covers multiple orders. Finance allocation is required.')
-            invoice_fields = client.execute('account.move', 'fields_get', [], {'attributes': ['type']})
-            methods = set()
-            if 'invoice_payments_widget' in invoice_fields:
-                for inv in client.search_read('account.move', [('id', 'in', invoice_ids)], ['invoice_payments_widget']):
-                    widget = inv.get('invoice_payments_widget') or {}
-                    if isinstance(widget, str):
-                        widget = json.loads(widget) or {}
-                    for payment in widget.get('content', []):
-                        label = payment.get('payment_method_name') or payment.get('journal_name')
-                        if label:
-                            methods.add(label)
-            payment_matches.append({'provider': ' / '.join(sorted(methods)) or 'Original payment method unavailable in Odoo',
-                                    'method': 'Paid invoice', 'customer': order['partner_id'][1],
-                                    'customer_matched': True, 'order_matched': True, 'transaction': 'Invoice payment'})
-            collected_paid = sum((money(i['amount_total']) for i in paid_invoices), ZERO)
-            cap, rate, evidence = min(total, collected_paid), Decimal(1), 'Fully paid Odoo invoice'
+                for t in txs:
+                    if t.get('operation') != 'refund' and t['state'] in {'pending', 'authorized'}:
+                        if t.get('sale_order_ids') != [order_id] or not self.customer_matches(client, order, t.get('partner_id')):
+                            raise ValueError('The payment customer or order does not match. Finance review is required.')
+                manual_payment_required = True
+                warnings.append('Payment receipt could not be verified in Airwallex or Odoo. Check the original payment manually before processing. A confirmed order does not prove that payment was received.')
+                cap, rate, collected_paid = total, Decimal(1), ZERO
+                evidence = 'Payment unverified — manual confirmation required'
+                for t in txs:
+                    if t.get('operation') != 'refund':
+                        payment_matches.append({'provider': t['provider_id'][1] if t.get('provider_id') else t.get('provider_code') or 'Unknown',
+                            'method': 'Unverified payment', 'customer': order['partner_id'][1],
+                            'transaction': (t.get('reference') or str(t['id'])) + ' (' + t['state'] + ')'})
+            else:
+                if any(not self.customer_matches(client, order, i.get('partner_id')) for i in paid_invoices):
+                    raise ValueError('The paid invoice customer does not match the order customer.')
+                # Avoid allocating a multi-order invoice to just this order.
+                invoice_ids = [i['id'] for i in paid_invoices]
+                related = client.search_read('sale.order', [('invoice_ids', 'in', invoice_ids)], ['id'])
+                if any(o['id'] != order_id for o in related):
+                    raise ValueError('A paid invoice covers multiple orders. Finance allocation is required.')
+                invoice_fields = client.execute('account.move', 'fields_get', [], {'attributes': ['type']})
+                methods = set()
+                if 'invoice_payments_widget' in invoice_fields:
+                    for inv in client.search_read('account.move', [('id', 'in', invoice_ids)], ['invoice_payments_widget']):
+                        widget = inv.get('invoice_payments_widget') or {}
+                        if isinstance(widget, str):
+                            widget = json.loads(widget) or {}
+                        for payment in widget.get('content', []):
+                            label = payment.get('payment_method_name') or payment.get('journal_name')
+                            if label:
+                                methods.add(label)
+                payment_matches.append({'provider': ' / '.join(sorted(methods)) or 'Original payment method unavailable in Odoo',
+                                        'method': 'Paid invoice', 'customer': order['partner_id'][1],
+                                        'customer_matched': True, 'order_matched': True, 'transaction': 'Invoice payment'})
+                collected_paid = sum((money(i['amount_total']) for i in paid_invoices), ZERO)
+                cap, rate, evidence = min(total, collected_paid), Decimal(1), 'Fully paid Odoo invoice'
         key = self.order_key(store, order_id)
         with self.db() as c:
             local = c.execute('SELECT * FROM airwallex_refund_payouts WHERE order_key=?', (key,)).fetchall()
@@ -555,7 +572,7 @@ class AirwallexRefunds:
         return {'store_id': store_id, 'order_id': order_id, 'order_key': key, 'order_name': order['name'],
                 'customer': partner['name'], 'order_value': str(total), 'order_currency': order_currency,
                 'order_equivalent': str(total * rate), 'conversion_rate': str(rate),
-                'payment_matches': payment_matches, 'warnings': warnings,
+                'payment_matches': payment_matches, 'warnings': warnings, 'manual_payment_required': manual_payment_required,
                 'currency': currency, 'paid': str(collected_paid), 'cap': str(cap), 'refunded_reserved': str(used),
                 'accounting_deduction': str(accounting_deduction), 'remaining': str(remaining),
                 'rounding': str(rounding), 'evidence': evidence, 'history': history,
@@ -621,6 +638,8 @@ class AirwallexRefunds:
             raise ValueError('Confirm recipient details and check for refunds through other providers first.')
         transfers = _reads.submit(self.transfers)
         snapshot = self.snapshot(form.store_id, form.order_id, transfers)
+        if snapshot.get('manual_payment_required') and not form.manual_payment_confirmed:
+            raise ValueError('Payment is unverified. Check receipt manually and tick the manual-payment confirmation before continuing.')
         self.daily_guard(self.daily_usage(transfers.result()))
         amount = amount_guard(form.amount, snapshot['remaining'], snapshot['rounding'])
         if amount != money(snapshot['remaining']) and (not form.edit_acknowledged or not form.edit_reason.strip()):
@@ -683,7 +702,9 @@ class AirwallexRefunds:
         funding = self.check_funding(transfer)
         cfg = self.config()
         payload = {'store_id': form.store_id, 'order_id': form.order_id, 'order_key': snapshot['order_key'],
-                   'order_name': snapshot['order_name'], 'transfer': transfer, 'edit_reason': form.edit_reason,
+                   'order_name': snapshot['order_name'], 'transfer': transfer,
+                   'manual_payment_confirmed': bool(snapshot.get('manual_payment_required') and form.manual_payment_confirmed),
+                   'edit_reason': form.edit_reason + (' | Manual payment exception: staff confirmed receipt checked outside verified payment records.' if snapshot.get('manual_payment_required') else ''),
                    'account_key': self.account_key(cfg), 'amount': str(amount)}
         token = self.cipher(cfg).encrypt(json.dumps(payload, sort_keys=True).encode()).decode()
         bank = beneficiary.get('bank_details', {})
@@ -713,6 +734,8 @@ class AirwallexRefunds:
                 return self.public_row(existing)
             transfers = _reads.submit(self.transfers)
             fresh = self.snapshot(payload['store_id'], payload['order_id'], transfers)
+            if fresh.get('manual_payment_required') and not payload.get('manual_payment_confirmed'):
+                raise ValueError('Payment can no longer be verified. Review again and confirm receipt manually.')
             if fresh['order_key'] != key or fresh['currency'] != transfer['transfer_currency']:
                 raise ValueError('Order currency or identity changed. Review again.')
             amount_guard(payload['amount'], fresh['remaining'], fresh['rounding'])

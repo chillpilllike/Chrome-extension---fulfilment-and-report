@@ -76,3 +76,16 @@ No pending submission triggers a paid confirmation email.
 
 Validation: `python -m unittest tests.test_refund_submission_status` and
 `node --test tests/refund_outcome.test.cjs`, plus the refund regression suite/build.
+
+### Manual payment confirmation exception
+
+When no completed payment or fully paid invoice is available, the order snapshot
+shows unverified receipt and requires an explicit manual-payment checkbox before
+review. The signed review token carries that acknowledgment; submission checks it
+again against fresh evidence. The actor, timestamp and manual exception are saved
+on the payout (in its audit reason). No Odoo accounting state is changed.
+
+The exception uses the order currency and order-value cap, subtracting existing
+refunds, reservations, provider refunds and credit notes. Staff must verify actual
+receipt and reduce the refund if less was received. Verified payment caps, receipt
+mismatches, ambiguity checks, idempotency and daily limits remain enforced.

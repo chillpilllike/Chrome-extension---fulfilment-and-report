@@ -392,10 +392,13 @@ class SnapshotTests(unittest.TestCase):
     def test_overpayment_is_capped_at_order_value(self):
         self.tx['amount']=150
         self.assertEqual(self.svc.snapshot(1,1)['remaining'],'100')
-    def test_unpaid_pending_and_authorized_are_blocked(self):
+    def test_unpaid_states_require_manual_confirmation(self):
         for state in ['pending','authorized','draft','error']:
             self.tx['state']=state
-            with self.subTest(state=state),self.assertRaises(ValueError):self.svc.snapshot(1,1)
+            with self.subTest(state=state):
+                result=self.svc.snapshot(1,1)
+                self.assertTrue(result['manual_payment_required'])
+                self.assertEqual(result['paid'],'0')
     def test_partial_original_payment_caps_refund(self):
         self.tx['amount']=40
         self.assertEqual(self.svc.snapshot(1,1)['remaining'],'40')

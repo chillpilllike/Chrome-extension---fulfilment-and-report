@@ -41,7 +41,9 @@ class ShortPaymentTests(unittest.TestCase):
                 original=self.deposit.copy();self.deposit.update(changes)
                 with self.assertRaises(ValueError):self.s.snapshot(1,1)
                 self.deposit=original
-        for events in [[],[{'deposit_id':'one'},{'deposit_id':'two'}]]:
+        self.events=[]
+        self.assertTrue(self.s.snapshot(1,1)['manual_payment_required'])
+        for events in [[{'deposit_id':'one'},{'deposit_id':'two'}]]:
             self.events=events
             with self.assertRaises(ValueError):self.s.snapshot(1,1)
     def test_receipt_status_is_rechecked_not_cached(self):
@@ -64,7 +66,9 @@ class ShortPaymentTests(unittest.TestCase):
     def test_draft_and_authorized_payments_are_not_promoted(self):
         for state in ['draft','authorized','error','cancel']:
             self.f.tx['state']=state
-            with self.assertRaises(ValueError):self.s.snapshot(1,1)
+            result=self.s.snapshot(1,1)
+            self.assertTrue(result['manual_payment_required'])
+            self.assertEqual(result['paid'],'0')
     def test_final_submission_rechecks_receipt_and_rejects_reversal_or_reduced_cap(self):
         for changed in [{'status':'REVERSED'},{'amount':90}]:
             with self.subTest(changed=changed):
