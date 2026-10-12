@@ -3,7 +3,10 @@ import re
 
 
 class RefundProviderError(ValueError):
-    """An already translated provider error, safe to retain in refund history."""
+    """A translated error; only explicit create validation rejection releases funds."""
+    def __init__(self, message, *, creation_rejected=False):
+        super().__init__(message)
+        self.creation_rejected = creation_rejected
 
 
 FIELDS = {
@@ -80,7 +83,10 @@ VALIDATION = {
     '088': 'The transit number does not match the selected financial institution.',
     '090': 'Enter a value, not just spaces.',
     '091': 'Enter an IBAN or the required local bank account details.',
-    '092': 'Enter the phone number with its international country code.',
+    '092': 'Use +country-code followed by a hyphen and the phone number; for Australian PayID use +61-412345678.',
+    '099': 'The phone country code is not supported for this recipient country.',
+    '100': 'The phone number has the wrong number of digits after its country code.',
+    '102': 'This PayID or recipient identifier is invalid or is not registered to a bank account. Confirm the registered identifier with the customer.',
 }
 
 

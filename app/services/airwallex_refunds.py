@@ -32,7 +32,7 @@ _log = logging.getLogger(__name__)
 
 ZERO = Decimal('0')
 # Failed transfers can fail after being paid. Keep funds reserved until finance reconciles.
-RELEASED = {'CANCELLED', 'CANCELED'}
+RELEASED = {'CANCELLED', 'CANCELED', 'REJECTED'}
 UUID_RE = re.compile(r'^[a-zA-Z0-9-]{1,100}$')
 
 
@@ -133,7 +133,7 @@ def daily_refund_usage(local, transfers, now=None):
                 requests.add(row['request_id'])
     for row in candidates:
         status = str(row.get('status') or 'UNKNOWN').upper()
-        if status in {'FAILED', 'CANCELLED', 'CANCELED'}:
+        if status in {'FAILED', 'CANCELLED', 'CANCELED', 'REJECTED'}:
             continue
         if today(row.get('created_at')):
             if status == 'PAID':
@@ -252,7 +252,10 @@ class AirwallexRefunds:
                 payload = response.json()
             except ValueError:
                 payload = {}
-            raise RefundProviderError(readable_error(payload, response.status_code)) from None
+            raise RefundProviderError(readable_error(payload, response.status_code),
+                creation_rejected=(method == 'POST' and path == '/api/v1/transfers/create'
+                    and response.status_code == 400 and isinstance(payload, dict)
+                    and payload.get('code') == 'validation_failed')) from None
         except requests.Timeout:
             raise ValueError('Airwallex took too long to respond. Check refund history before trying again; do not send a second refund while the first is unconfirmed.') from None
         except requests.RequestException:
@@ -732,12 +735,22 @@ class AirwallexRefunds:
         try:
             result = self.call('POST', '/api/v1/transfers/create', data=transfer)
             self.record_result(rid, result)
+            if result.get('status') not in {'PAID', 'FAILED', 'CANCELLED', 'CANCELED'}:
+                # One read catches immediate downstream rejection; never resend.
+                try:
+                    self.refresh(rid)
+                except Exception:
+                    pass  # The accepted transfer remains pending, never completed.
         except Exception as exc:
-            # Do not automatically resend. Even HTTP errors can have an ambiguous result.
+            rejected = isinstance(exc, RefundProviderError) and exc.creation_rejected
+            # A timeout/duplicate/unrecognized error can still represent a payment.
+            # Only a documented create validation rejection proves no transfer began.
+            message = ((str(exc) + ' ') if isinstance(exc, RefundProviderError) else '')
+            message += ('Airwallex rejected this request before creating a transfer. No refund was sent. Correct the recipient details and review again.'
+                        if rejected else 'We could not confirm whether the refund was sent. Check its status before sending another refund.')
             with self.db() as c:
-                c.execute("UPDATE airwallex_refund_payouts SET status='UNKNOWN',last_error=?,updated_at=? WHERE request_id=?",
-                          ((str(exc) + ' ' if isinstance(exc, RefundProviderError) else '') + 'We could not confirm whether the refund was sent. Check its status before sending another refund.',
-                           datetime.now(timezone.utc).isoformat(), rid))
+                c.execute("UPDATE airwallex_refund_payouts SET status=?,last_error=?,updated_at=? WHERE request_id=?",
+                          ('REJECTED' if rejected else 'UNKNOWN', message, datetime.now(timezone.utc).isoformat(), rid))
         with self.db() as c:
             row = c.execute('SELECT * FROM airwallex_refund_payouts WHERE request_id=?', (rid,)).fetchone()
         return self.public_row(row)
@@ -777,6 +790,13 @@ class AirwallexRefunds:
         matches = [t for t in matches if t.get('request_id') == rid]
         if len(matches) == 1:
             self.record_result(rid, matches[0])
+        elif not matches and not row.get('transfer_id') and row['status'] in {'UNKNOWN', 'SUBMITTING'}:
+            # Missing results alone cannot safely release a historical reservation.
+            original = str(row.get('last_error') or '').split(' Latest status check:')[0]
+            message = original + ' Latest status check: no matching transfer was found in Airwallex. This refund is not confirmed; finance must reconcile this attempt before retrying.'
+            with self.db() as c:
+                c.execute("UPDATE airwallex_refund_payouts SET status=?,last_error=?,updated_at=? WHERE request_id=?",
+                          ('UNKNOWN', message.strip(), datetime.now(timezone.utc).isoformat(), rid))
         with self.db() as c:
             return self.public_row(c.execute('SELECT * FROM airwallex_refund_payouts WHERE request_id=?', (rid,)).fetchone())
 
@@ -902,7 +922,7 @@ class AirwallexRefunds:
 
     def poll(self):
         with self.db() as c:
-            rows = c.execute("SELECT request_id FROM airwallex_refund_payouts WHERE status NOT IN ('CANCELLED','CANCELED') ORDER BY updated_at LIMIT 30").fetchall()
+            rows = c.execute("SELECT request_id FROM airwallex_refund_payouts WHERE status NOT IN ('CANCELLED','CANCELED','REJECTED') ORDER BY CASE WHEN status IN ('PAID','FAILED') THEN 1 ELSE 0 END, updated_at LIMIT 30").fetchall()
         for row in rows:
             try:
                 self.refresh(row['request_id'])

@@ -1,0 +1,6 @@
+const {test}=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const Module=require('node:module');const ts=require('../frontend/node_modules/typescript')
+const mod=new Module('refundOutcome');mod._compile(ts.transpileModule(fs.readFileSync('frontend/src/components/refundOutcome.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS}}).outputText,'refundOutcome.js')
+const {refundOutcome,statusLabel}=mod.exports
+for(const status of ['REJECTED','FAILED','UNKNOWN','UNRECOGNIZED','CANCELLED'])test(status+' shows an error',()=>{assert.equal(refundOutcome({order_name:'NC32940',status,last_error:'Recipient details invalid'}).error,true)})
+for(const status of ['PROCESSING','SCHEDULED','PENDING','PENDING_APPROVAL','SUBMITTING'])test(status+' is explicitly not completed',()=>{const result=refundOutcome({order_name:'NC32940',status});assert.match(result.message,/not completed yet/);assert.doesNotMatch(statusLabel(status),/^Completed/)})
+test('only PAID confirms completion',()=>{assert.match(refundOutcome({order_name:'NC32940',status:'PAID'}).message,/confirmed this refund as paid/);assert.equal(refundOutcome({order_name:'NC32940',status:'PAID'}).error,false)})

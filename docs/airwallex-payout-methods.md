@@ -54,3 +54,25 @@ receipt verification under the existing refund locks. No Odoo payment/invoice st
 is changed by this eligibility check.
 
 Regression coverage: `python -m unittest tests.test_refund_short_payment`.
+
+## Submission outcomes
+
+Only Airwallex `PAID` is presented as completed. Accepted processing/approval states
+explicitly say they are awaiting completion. Rejections, failures and uncertain
+results use the error panel immediately; the latest submitted attempt also updates
+that panel when history polling observes a later provider failure.
+
+A documented HTTP 400 `validation_failed` response from transfer creation is saved
+as `REJECTED` (no transfer created). It releases the amount/day reservation but the
+same review token still returns the original attempt instead of resending. Timeouts,
+duplicate-request errors, unknown errors and missing history alone do not prove
+rejection and retain reservations. A failed transfer also retains the amount until
+finance reconciliation, because failure can occur after funds have moved.
+
+After an accepted nonterminal create response, one immediate provider read checks
+for fast downstream failure. Later bank errors remain asynchronous. Pending polls
+are prioritized, and unsuccessful lookups rotate instead of monopolizing the queue.
+No pending submission triggers a paid confirmation email.
+
+Validation: `python -m unittest tests.test_refund_submission_status` and
+`node --test tests/refund_outcome.test.cjs`, plus the refund regression suite/build.

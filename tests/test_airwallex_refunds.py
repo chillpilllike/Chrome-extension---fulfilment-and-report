@@ -35,6 +35,8 @@ class MemoryDB:
             self.rows[row['request_id']] = row
         elif "SET status='UNKNOWN'" in sql:
             self.rows[params[-1]].update(status='UNKNOWN',last_error=params[0])
+        elif 'SET status=?,last_error=?' in sql:
+            self.rows[params[-1]].update(status=params[0],last_error=params[1],updated_at=params[2])
         elif 'SET status=?' in sql:
             keys = ['status','transfer_id','updated_at','last_error','fee_amount','fee_currency']
             vals = list(params[:6])
