@@ -9679,7 +9679,7 @@ def should_skip_order_line(line: dict[str, Any], product: dict[str, Any], tmpl: 
     display_type = str(line.get("display_type") or "")
     detailed_type = str(product.get("detailed_type") or tmpl.get("detailed_type") or product.get("type") or tmpl.get("type") or "")
     price_unit = float(line.get("price_unit") or 0)
-    if display_type:
+    if display_type or is_delivery_line(line, default_code):
         return True
     if detailed_type in {"service"}:
         return True
@@ -9713,7 +9713,7 @@ def line_native_total(line: dict[str, Any]) -> float:
 def is_delivery_line(line: dict[str, Any], default_code: str) -> bool:
     name = clean_text(line.get("name"))
     code = clean_text(default_code)
-    return bool(DELIVERY_REFERENCE_RE.search(code) or DELIVERY_REFERENCE_RE.search(name))
+    return bool(line.get("is_delivery") or re.fullmatch(r"epg_[0-9]+_(packet|parcel)", code, re.IGNORECASE) or DELIVERY_REFERENCE_RE.search(code) or DELIVERY_REFERENCE_RE.search(name))
 
 
 def is_discount_line(line: dict[str, Any], default_code: str) -> bool:
@@ -10873,7 +10873,7 @@ def fetch_odoo_lines(
         domain.append(("date_order", ">=", cutoff.strftime("%Y-%m-%d %H:%M:%S")))
 
     order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "currency_id", "date_order", "partner_shipping_id", "partner_invoice_id", "partner_id"])
-    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
+    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "is_delivery", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
     product_fields = odoo.existing_fields("product.product", ["id", "product_tmpl_id", "default_code", "detailed_type", "type"])
     tmpl_fields = odoo.existing_fields("product.template", ["id", "description", "default_code", "detailed_type", "type"])
     invoice_fields = odoo.existing_fields("account.move", ["id", "move_type", "state", "payment_state", "amount_total_signed"])
@@ -10947,7 +10947,7 @@ def fetch_odoo_orders_by_names(store: Store, order_names: list[str], *, return_d
     if store.website_id:
         domain.append(("website_id", "=", store.website_id))
     order_fields = odoo.existing_fields("sale.order", ["id", "name", "note", "order_line", "state", "invoice_status", "invoice_ids", "transaction_ids", "currency_id", "date_order", "amount_total", "partner_shipping_id", "partner_invoice_id", "partner_id"])
-    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
+    line_fields = odoo.existing_fields("sale.order.line", ["id", "name", "display_type", "is_delivery", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"])
     product_fields = odoo.existing_fields("product.product", ["id", "product_tmpl_id", "default_code", "detailed_type", "type"])
     tmpl_fields = odoo.existing_fields("product.template", ["id", "description", "default_code", "detailed_type", "type"])
     invoice_fields = odoo.existing_fields("account.move", ["id", "move_type", "state", "payment_state", "amount_total_signed", "amount_residual"])
@@ -11479,7 +11479,7 @@ def backfill_missing_order_financials_for_profit_loss(
                 continue
             line_fields = odoo.existing_fields(
                 "sale.order.line",
-                ["id", "name", "display_type", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"],
+                ["id", "name", "display_type", "is_delivery", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total", "discount"],
             )
             line_rows = odoo.read("sale.order.line", all_line_ids, line_fields)
             lines_by_id = {int(line["id"]): line for line in line_rows}
@@ -23369,7 +23369,7 @@ def repair_shopify_synced_line_product(
         "status": "skipped",
         "error": "",
     }
-    if line.get("display_type"):
+    if line.get("display_type") or line.get("is_delivery"):
         return base_log
     qty_int = module.qty_to_int_or_none(float(line.get("product_uom_qty") or 0.0))
     if qty_int is None:

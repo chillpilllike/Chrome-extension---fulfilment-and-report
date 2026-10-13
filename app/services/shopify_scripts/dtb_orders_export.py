@@ -30,6 +30,8 @@ def _should_ignore_odoo_line_item(sku: str | None, title: str | None) -> bool:
     sku_norm = (sku or "").strip().lower()
     title_norm = (title or "").strip().lower()
 
+    if re.fullmatch(r"epg_[0-9]+_(packet|parcel)", sku_norm):
+        return True
     if sku_norm and sku_norm in IGNORE_LINEITEM_SKUS_EXACT:
         return True
     if title_norm and title_norm in IGNORE_LINEITEM_TITLES_EXACT:
@@ -1026,11 +1028,20 @@ class OdooClient:
         return out
 
     def get_order_lines(self, line_ids: list[int]) -> list[dict]:
-        return self.read(ODOO_ORDER_LINE_MODEL, line_ids, [
+        if not line_ids:
+            return []
+        fields = [
             "id", "name", "product_id", "product_uom_qty",
             "price_unit", "price_total", "price_subtotal", "discount",
             "display_type",
-        ])
+        ]
+        # Delivery is optional on source databases. Cache schema once per client.
+        if not hasattr(self, "_order_line_has_is_delivery"):
+            meta = self._exec(ODOO_ORDER_LINE_MODEL, "fields_get", [], {"attributes": ["type"]})
+            self._order_line_has_is_delivery = "is_delivery" in meta
+        if self._order_line_has_is_delivery:
+            fields.append("is_delivery")
+        return self.read(ODOO_ORDER_LINE_MODEL, line_ids, fields)
 
     def get_product_product(self, product_id: int) -> dict | None:
         rows = self.read(ODOO_PRODUCT_MODEL, [product_id], [
@@ -1845,10 +1856,18 @@ def ensure_product_variant_for_line(odoo: OdooClient, shop: ShopifyClient, state
     """Return (variant_id, custom_line_item, sku_audit).
     Shopify requires integer quantities. If qty_int is None (fractional), we fall back to a custom item with quantity=1.
     """
-    if line.get("display_type"):
+    if line.get("display_type") or line.get("is_delivery"):
         return None, None, None
 
     prod = line.get("product_id")
+    product_label = str(prod[1]) if isinstance(prod, (list, tuple)) and len(prod) > 1 else ""
+    reference = re.match(r"^\[([^]]+)\]", product_label.strip())
+    if _should_ignore_odoo_line_item(reference.group(1) if reference else None, line.get("name")):
+        return None, None, None
+    # Check the product SKU before custom-item fallbacks too.
+    pp = odoo.get_product_product(int(prod[0])) if isinstance(prod, (list, tuple)) and prod else None
+    if pp and _should_ignore_odoo_line_item(pp.get("default_code"), line.get("name")):
+        return None, None, None
     unit_price = float(line.get("price_unit") or 0.0)
 
     # Decide the price to apply on destination (non-AU/NZ only)
@@ -1882,7 +1901,6 @@ def ensure_product_variant_for_line(odoo: OdooClient, shop: ShopifyClient, state
             cli["price"] = target_price_str
         return None, cli, None
 
-    pp = odoo.get_product_product(int(prod[0]))
     if not pp:
         cli_title = rename_manager.resolve_title(
             order_name=order_name,

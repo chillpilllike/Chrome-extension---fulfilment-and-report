@@ -147,7 +147,7 @@ def prepare(module, odoo, order_name, settings, rename_manager, *, repair_refere
     items = []
     brands_cache = {}
     for line in lines:
-        if line.get('display_type') or float(line.get('price_unit') or 0) < 0 or float(line.get('price_total') or 0) < 0:
+        if line.get('display_type') or line.get('is_delivery') or float(line.get('price_unit') or 0) < 0 or float(line.get('price_total') or 0) < 0:
             continue
         ref = line.get('product_id') or [0]
         pp = odoo.get_product_product(int(ref[0])) if ref[0] else {}
