@@ -191,6 +191,29 @@ class SMSTests(unittest.TestCase):
         for value,region in [('4165551234',None),('123','CA'),('4165551234 ext 9','CA'),('', 'CA')]:
             with self.subTest(value=value),self.assertRaises(ValueError):customer_number(value,region)
 
+    def test_customer_phone_recovers_international_prefix_and_presentation(self):
+        for value,region,expected in [
+            ('00 44 7911 123456','CA','+447911123456'),
+            ('00447911123456',None,'+447911123456'),
+            ('011 44 7911 123456','CA','+447911123456'),
+            ('tel: (416) 555–1234','CA','+14165551234'),
+            ('＋１（４１６）５５５－１２３４','CA','+14165551234'),
+            ('٠٠٤٤٧٩١١١٢٣٤٥٦',None,'+447911123456'),
+            ('+44 (0)7911 123456','CA','+447911123456'),
+        ]:
+            with self.subTest(value=value):self.assertEqual(expected,customer_number(value,region))
+
+    def test_phone_recovery_does_not_guess_missing_digits_or_country(self):
+        for value,region in [('4165551234',None),('011447911123456',None),
+            ('++14165551234','CA'),('+0014165551234','CA'),('4165551234 / 6475551234','CA'),
+            ('4165551234 ext 1','CA'),('tel:hello','CA'),('12345','CA')]:
+            with self.subTest(value=value),self.assertRaises(ValueError):customer_number(value,region)
+
+    def test_phone_normalization_still_prefers_mobile_and_blocks_landlines(self):
+        from app.services.care_sms import sms_customer_number
+        self.assertEqual('+447911123456',sms_customer_number(['bad','00447911123456'],'CA'))
+        with self.assertRaisesRegex(ValueError,'landline'):sms_customer_number(['020 7946 0018'],'GB')
+
     def test_welcome_is_eligible(self):
         self.assertEqual('',preparation_reason({'template_kind':'new_order_welcome'}))
 

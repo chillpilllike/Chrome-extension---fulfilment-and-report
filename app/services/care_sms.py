@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import re
+import unicodedata
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -103,9 +104,20 @@ def recipient(value, test):
 
 def customer_number(value, country_code=None):
     """Normalize only with the phone owner's verified Odoo country, never the store domain."""
-    raw = str(value or '').strip()
-    region = str(country_code or '').upper()
-    if not raw or not re.fullmatch(r'[+\d\s().-]+', raw):
+    raw = unicodedata.normalize('NFKC', str(value or '')).strip()
+    # Recover presentation differences, not missing digits or a guessed country.
+    raw = re.sub(r'^tel:\s*', '', raw, flags=re.I)
+    raw = raw.translate(str.maketrans({'–':'-', '—':'-', '−':'-'}))
+    region = str(country_code or '').strip().upper()
+    if not raw or len(raw)>100 or not re.fullmatch(r'[+\d\s().-]+', raw):
+        raise ValueError('Customer phone is missing or ambiguous. Correct it in Odoo.')
+    raw = re.sub(r'[\s().-]', '', raw)
+    raw = ''.join(str(unicodedata.decimal(char)) if char.isdecimal() else char for char in raw)
+    # 00 is commonly stored as an international prefix even on North American
+    # contacts, whose local dial-out prefix is 011. Preserve the explicit country.
+    if raw.startswith('00'):
+        raw = '+' + raw[2:]
+    if not re.fullmatch(r'\+?[0-9]+', raw):
         raise ValueError('Customer phone is missing or ambiguous. Correct it in Odoo.')
     if not raw.startswith('+') and region not in pn.SUPPORTED_REGIONS:
         raise ValueError('National customer phone requires a verified Odoo contact country.')
