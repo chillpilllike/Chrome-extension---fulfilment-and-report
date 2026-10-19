@@ -1013,7 +1013,7 @@ def database_unavailable_response(request: Request, update_cooldown: bool = True
 
 @app.middleware("http")
 async def admin_access_middleware(request: Request, call_next: Any) -> Response:
-    token = effective_admin_access_token()
+    token = await __import__("starlette.concurrency", fromlist=["run_in_threadpool"]).run_in_threadpool(effective_admin_access_token)
     path = request.url.path
     # These routes implement their own narrow credential/token validation.
     if ((request.method == 'POST' and path in {'/api/relay/extension/check', '/api/relay/extension/creation-mode', '/api/relay/extension/direct-plan', '/api/relay/extension/login-link', '/api/relay/extension/pending', '/api/relay/odoo/notify', '/api/relay/extension/resolve', '/api/relay/extension/contact', '/api/relay/extension/capture'})
@@ -10001,6 +10001,9 @@ def preserved_order_line_refresh_state(preserved: Optional[dict[str, Any]]) -> t
     last_error = preserved.get("last_error")
     if amazon_order_id:
         return state, last_error
+    # A scheduled Odoo refresh must never make fulfilled stock purchasable again.
+    if state in {"inventory", "ignored", "ordered", "dispatched", "delivered"}:
+        return state, last_error
     if state == "missing" or amazon_status == "missing":
         return "missing", last_error
     if state == "error" or amazon_status == "chrome_error":
@@ -12972,6 +12975,67 @@ def chrome_order_is_on_or_after_start_date(group_rows: list[dict[str, Any]], sta
     )
 
 
+def automatic_chrome_order_block_reason(
+    selected: list[dict[str, Any]], siblings: list[dict[str, Any]], start_date: str,
+) -> str:
+    """Validate the complete order, including lines excluded by queue SQL."""
+    if not normalized_auto_chrome_start_date(start_date):
+        return "Choose a valid auto-ordering start date before enabling."
+    if not chrome_order_is_on_or_after_start_date(siblings, start_date):
+        return f"Order predates the automatic ordering start date {start_date}, or its date cannot be verified."
+    if any(clean_text(row.get("amazon_order_id")) or clean_text(row.get("state")) in {
+        "ordered", "dispatched", "delivered",
+    } for row in siblings):
+        return "Order already has purchased items; automatic ordering cannot purchase it again."
+    outstanding = [row for row in siblings if clean_text(row.get("state")) not in {
+        "inventory", "ignored",
+    } and inventory_purchase_quantity(row) > 0]
+    if not outstanding:
+        return "Order is already fulfilled from inventory."
+    if any(not normalize_asin(row.get("replacement_asin") or row.get("asin")) for row in outstanding):
+        return "An unresolved item has no valid ASIN; automatic ordering requires the complete order."
+    if {int(row["id"]) for row in selected} != {int(row["id"]) for row in outstanding}:
+        return "Queue contains only part of the remaining order; automatic ordering requires every unresolved item."
+    return ""
+
+
+def filter_automatic_chrome_orders(
+    conn: Any, lines: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    start_date = normalized_auto_chrome_start_date(get_service_settings().get("auto_chrome_fulfil_start_date"))
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for row in lines:
+        grouped.setdefault((int(row["store_id"]), int(row["odoo_order_id"])), []).append(dict(row))
+    allowed: list[dict[str, Any]] = []
+    messages: list[str] = []
+    for (store_id, order_id), selected in grouped.items():
+        siblings = rows_to_dicts(conn.execute(
+            "SELECT * FROM order_lines WHERE store_id=? AND odoo_order_id=? ORDER BY id FOR UPDATE",
+            (store_id, order_id),
+        ).fetchall())
+        reason = automatic_chrome_order_block_reason(selected, siblings, start_date)
+        if not reason:
+            allowed.extend(selected)
+            continue
+        message = f"{selected[0]['odoo_order_name']}: {reason}"
+        messages.append(message)
+        # Revoke only work that has not reached Amazon. Reporting remains protected.
+        conn.execute(
+            """
+            UPDATE order_lines
+            SET state=CASE WHEN state='submitted' THEN 'pulled' ELSE state END,
+                amazon_status=CASE WHEN state='submitted' THEN NULL ELSE amazon_status END,
+                amazon_group_key=NULL, chrome_claimed_by=NULL, chrome_claimed_at=NULL,
+                chrome_claim_expires_at=NULL, last_error=?, updated_at=?
+            WHERE store_id=? AND odoo_order_id=?
+              AND COALESCE(amazon_order_id, '')=''
+              AND COALESCE(amazon_status, '') NOT IN ('order_submitted', 'reporting_complete')
+            """,
+            (message, utc_now(), store_id, order_id),
+        )
+    return allowed, len(messages), messages
+
+
 def chrome_source_line_item_count(group_rows: list[dict[str, Any]]) -> int:
     """Return the number of distinct purchasable ASINs in a whole Chrome job.
 
@@ -13349,6 +13413,7 @@ def claim_next_chrome_job(
     account_experience: str = "",
     preferred_group_key: str = "",
     preferred_only: bool = False,
+    automatic: bool = False,
 ) -> Optional[dict[str, Any]]:
     worker_id = clean_text(worker_id)[:120] or f"worker-{uuid.uuid4().hex[:12]}"
     with db() as conn:
@@ -13435,11 +13500,14 @@ def claim_next_chrome_job(
                 """,
                 (worker_id, store_id, store_id),
             ).fetchall()
+            if existing and automatic:
+                existing, _blocked, _messages = filter_automatic_chrome_orders(conn, rows_to_dicts(existing))
             if existing:
                 existing_rows, _blocked, _messages = filter_lines_by_live_odoo_status(
                     conn,
                     int(existing[0]["store_id"]),
                     rows_to_dicts(existing),
+                    automatic=automatic,
                 )
                 existing = existing_rows
             if existing:
@@ -13544,11 +13612,14 @@ def claim_next_chrome_job(
                 """,
                 (group_key,),
             ).fetchall())
+            if candidate_rows and automatic:
+                candidate_rows, _blocked, _messages = filter_automatic_chrome_orders(conn, candidate_rows)
             if candidate_rows:
                 candidate_rows, _blocked, _messages = filter_lines_by_live_odoo_status(
                     conn,
                     int(candidate_rows[0]["store_id"]),
                     candidate_rows,
+                    automatic=automatic,
                 )
             if not candidate_rows or not chrome_account_experience_matches(candidate_rows, account_experience):
                 continue
@@ -14640,8 +14711,14 @@ def place_orders(
         if lines:
             lines, shopify_blocked, _shopify_messages = block_lines_with_fulfilled_shopify_orders(conn, store_id, [dict(line) for line in lines])
             failed += shopify_blocked
+        if lines and ordering_engine == "chrome" and minimum_odoo_order_date:
+            lines, auto_blocked, _auto_messages = filter_automatic_chrome_orders(conn, [dict(line) for line in lines])
+            failed += auto_blocked
         if lines:
-            lines, odoo_blocked, _odoo_messages = filter_lines_by_live_odoo_status(conn, store_id, [dict(line) for line in lines])
+            lines, odoo_blocked, _odoo_messages = filter_lines_by_live_odoo_status(
+                conn, store_id, [dict(line) for line in lines],
+                automatic=ordering_engine == "chrome" and bool(minimum_odoo_order_date),
+            )
             failed += odoo_blocked
         if lines and minimum_order_age_minutes > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(minimum_order_age_minutes)))
@@ -26951,7 +27028,7 @@ def autosync_loop() -> None:
                             pulled_count = fetch_odoo_lines_exclusive(get_store(store_id), days=days, limit=limit, wait=False)
                             if pulled_count:
                                 start_typesense_reindex_job()
-                            if pulled_count is not None:
+                            if pulled_count is not None and start_date:
                                 queued, skipped = place_orders(
                                     store_id,
                                     ordering_engine="chrome",
@@ -27850,7 +27927,9 @@ def missing_asin_check_candidates(limit: int = 40) -> list[dict[str, Any]]:
             return candidates
 
 
-def auto_queue_ready_missing_order(store_id: int, odoo_order_id: int) -> tuple[int, str]:
+def auto_queue_ready_missing_order(store_id: int, odoo_order_id: int, *, automatic: bool = True) -> tuple[int, str]:
+    if automatic and not auto_chrome_ordering_enabled():
+        return 0, "Automatic Chrome ordering is paused."
     with db() as conn:
         rows = rows_to_dicts(conn.execute(
             """
@@ -27871,6 +27950,10 @@ def auto_queue_ready_missing_order(store_id: int, odoo_order_id: int) -> tuple[i
             return 0, "No unresolved order lines remain eligible for Amazon ordering."
         if any(clean_text(row.get("state")) == "submitted" for row in rows):
             return 0, "This Odoo order is already queued for Chrome fulfilment."
+        if automatic:
+            rows, blocked, messages = filter_automatic_chrome_orders(conn, rows)
+            if blocked:
+                return 0, messages[0]
         waiting: list[str] = []
         for row in rows:
             if clean_text(row.get("state")) != "missing":
@@ -27999,7 +28082,7 @@ def check_odoo_order_not_cancelled(store_id: int, odoo_order_id: int) -> tuple[b
     return True, invoice_status or state or "open", ""
 
 
-def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any]) -> tuple[list[dict[str, Any]], int, list[str]]:
+def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any], *, automatic: bool = False) -> tuple[list[dict[str, Any]], int, list[str]]:
     rows = [row_to_dict(line) for line in (lines or [])]
     order_ids = sorted({
         int(row.get("odoo_order_id") or 0)
@@ -28012,11 +28095,12 @@ def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any])
     try:
         store = get_store(store_id)
         odoo = OdooClient(store)
-        fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status", "tag_ids"])
+        fields = odoo.existing_fields("sale.order", ["id", "name", "state", "invoice_status", "tag_ids", "date_order"])
         if "tag_ids" not in fields:
             raise RuntimeError("Odoo sale.order.tag_ids is unavailable; fulfilment was blocked because hold tags cannot be verified.")
         live_orders = odoo.read("sale.order", order_ids, fields)
         held_order_ids = odoo_order_ids_with_tag(odoo, live_orders, ODOO_HOLD_TAG_NAME)
+        ordered_order_ids = odoo_order_ids_with_tag(odoo, live_orders, ODOO_ORDERED_TAG_NAME) if automatic else set()
     except Exception as exc:
         raise HTTPException(502, f"Could not verify Odoo order status before placing order: {exc}") from exc
 
@@ -28036,6 +28120,13 @@ def filter_lines_by_live_odoo_status(conn: Any, store_id: int, lines: list[Any])
             blocked[order_id] = ("cancelled", f"Odoo order {order_name} is cancelled.")
         elif invoice_status == "refunded":
             blocked[order_id] = ("refunded", f"Odoo order {order_name} is refunded.")
+        elif automatic and order_id in ordered_order_ids:
+            blocked[order_id] = ("hold", f"Odoo order {order_name} already has the ordered tag; automatic purchase was blocked.")
+        elif automatic and not chrome_order_is_on_or_after_start_date(
+            [{"odoo_order_date": order.get("date_order")}],
+            normalized_auto_chrome_start_date(get_service_settings().get("auto_chrome_fulfil_start_date")),
+        ):
+            blocked[order_id] = ("hold", f"Odoo order {order_name} is before the automatic ordering start date, or its live date is unreadable.")
 
     if not blocked:
         return rows, 0, []
@@ -28213,6 +28304,7 @@ def api_back_in_stock_approve(availability_id: int) -> dict[str, Any]:
     queued, readiness_message = auto_queue_ready_missing_order(
         int(record["store_id"]),
         int(record["odoo_order_id"]),
+        automatic=False,
     )
     if not queued:
         next_status = "back_in_stock" if readiness_message.startswith("Waiting for the remaining missing ASIN") else "approval_failed"
@@ -32403,6 +32495,7 @@ def api_chrome_jobs(
             account_experience=account_experience,
             preferred_group_key=preferred_group_key,
             preferred_only=preferred_only,
+            automatic=not manual_claim,
         )
         # Before handing a fresh claim to Chrome, consume any one exact,
         # non-cancelled Amazon-history match. This prevents a previously
@@ -32423,6 +32516,9 @@ def api_chrome_jobs(
                 })
             except Exception as exc:
                 print(f"Chrome pre-claim history reconciliation held {job.get('group_key')}: {exc}", flush=True)
+                # An existing Amazon purchase was found. A failed report is
+                # never permission to return the same order for another checkout.
+                job = None
                 break
             job = claim_next_chrome_job(
                 store_id,
@@ -32432,7 +32528,19 @@ def api_chrome_jobs(
                 account_experience=account_experience,
                 preferred_group_key=preferred_group_key,
                 preferred_only=preferred_only,
+                automatic=not manual_claim,
             )
+        if job and not job.get("submitted_to_amazon"):
+            # Keep claim provenance on the durable attempt so final submission
+            # uses the same policy even after a browser or server restart.
+            with db() as conn:
+                conn.execute(
+                    """UPDATE amazon_attempts
+                       SET request_json=(COALESCE(NULLIF(request_json, ''), '{}')::jsonb
+                           || jsonb_build_object('automatic_claim', ?::boolean))::text
+                       WHERE external_id=? AND mode='chrome'""",
+                    (not manual_claim, job["group_key"]),
+                )
         return {
             "ok": True,
             "jobs": [job] if job else [],
@@ -32954,11 +33062,24 @@ def api_chrome_job_submitted(group_key: str, payload: ChromeJobHeartbeatPayload)
             ).fetchone()
             submitted_count = int(protected_row["count"] or 0) if protected_row else 0
         else:
-            _eligible, blocked_count, messages = filter_lines_by_live_odoo_status(
-                conn,
-                int(pending_rows[0]["store_id"]),
-                pending_rows,
-            )
+            attempt = conn.execute(
+                "SELECT request_json FROM amazon_attempts WHERE external_id=? AND mode='chrome' ORDER BY id DESC LIMIT 1",
+                (group_key,),
+            ).fetchone()
+            automatic = safe_json((attempt or {}).get("request_json")).get("automatic_claim") is True
+            eligible, blocked_count, messages = (pending_rows, 0, [])
+            if automatic:
+                if not auto_chrome_ordering_enabled():
+                    blocked_count, messages = 1, ["Automatic Chrome ordering is paused."]
+                else:
+                    eligible, blocked_count, messages = filter_automatic_chrome_orders(conn, pending_rows)
+            if not blocked_count:
+                _eligible, blocked_count, messages = filter_lines_by_live_odoo_status(
+                    conn,
+                    int(pending_rows[0]["store_id"]),
+                    eligible,
+                    automatic=automatic,
+                )
             if blocked_count:
                 blocked_message = messages[0] if messages else "Odoo order is not eligible for fulfilment."
             else:
@@ -33591,6 +33712,10 @@ def api_resume_chrome_auto_ordering(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(400, "Choose a valid auto-ordering start date before enabling.")
     with _AUTO_CHROME_QUEUE_CONTROL_LOCK:
         set_setting("auto_chrome_fulfil_start_date", start_date)
+        cleared, protected = reset_unsubmitted_chrome_queue(
+            attempt_status="auto_ordering_reset",
+            attempt_error="Automatic ordering restarted with a fresh eligibility check.",
+        )
         set_setting("auto_chrome_fulfil_enabled", "true")
         set_setting("auto_chrome_fulfil_last_run_at", "")
         set_setting(
@@ -33604,6 +33729,8 @@ def api_resume_chrome_auto_ordering(payload: dict[str, Any]) -> dict[str, Any]:
         "enabled": True,
         "start_date": start_date,
         "ready_missing_queued": ready_missing_queued,
+        "cleared": cleared,
+        "protected": protected,
         "message": (
             f"Automatic Chrome ordering enabled. Eligible orders dated {start_date} or later will be queued on the next scheduler pass. "
             f"Queued {ready_missing_queued} ready missing/replacement order(s)."
@@ -44767,7 +44894,7 @@ async def api_airwallex_operation(request: Request) -> dict[str, Any]:
                     timestamp=request.headers.get('x-timestamp', ''),
                     signature=request.headers.get('x-hub-signature', ''),
                     raw_body=b'airwallex-operation:' + raw, secrets=[c.get('hub_token') or c['secret']])]
-    configs = matching_configurations() or matching_configurations(force=True)
+    configs = await __import__("starlette.concurrency", fromlist=["run_in_threadpool"]).run_in_threadpool(matching_configurations) or await __import__("starlette.concurrency", fromlist=["run_in_threadpool"]).run_in_threadpool(matching_configurations, force=True)
     if not configs:
         raise HTTPException(403, 'Connected Airwallex provider authentication failed')
     config = configs[0]
