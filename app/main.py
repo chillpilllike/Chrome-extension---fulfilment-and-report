@@ -13039,16 +13039,52 @@ def filter_automatic_chrome_orders(
 def chrome_source_line_item_count(group_rows: list[dict[str, Any]]) -> int:
     """Return the number of distinct purchasable ASINs in a whole Chrome job.
 
-    Multiple Odoo source lines can legitimately consolidate into one Amazon
-    ASIN. Account routing must follow the checkout shape the extension will
-    actually process, not the historical Odoo source-line count.
+    Multiple source lines consolidated to one effective Amazon ASIN count
+    once. Whole-order context retains other purchase ASINs when completed,
+    missing, or review lines are absent from the current queue entry.
     """
     effective_asins = {
         normalize_asin(row.get("replacement_asin") or row.get("asin"))
         for row in group_rows
         if normalize_asin(row.get("replacement_asin") or row.get("asin"))
     }
-    return len(effective_asins) if effective_asins else len(group_rows)
+    current_count = len(effective_asins) if effective_asins else len(group_rows)
+    # A completed/missing sibling must not turn a multi-ASIN Odoo order into
+    # a Business job merely because only one line remains in the queue.
+    return max(current_count, max((int(row.get("_chrome_order_asin_count") or 0) for row in group_rows), default=0))
+
+
+def chrome_order_routing_context(conn: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    contexts: dict[tuple[int, int, str], int] = {}
+    result = []
+    for row in rows:
+        key = (int(row["store_id"]), int(row["odoo_order_id"]), clean_text(row.get("replacement_run_id")))
+        if key not in contexts:
+            siblings = rows_to_dicts(conn.execute(
+                """SELECT asin, replacement_asin, quantity, state, inventory_allocated_quantity
+                   FROM order_lines WHERE store_id=? AND odoo_order_id=?
+                     AND COALESCE(replacement_run_id, '')=?""",
+                key,
+            ).fetchall())
+            purchasable = [sibling for sibling in siblings
+                           if clean_text(sibling.get("state")) not in {"inventory", "ignored"}
+                           and inventory_purchase_quantity(sibling) > 0]
+            contexts[key] = chrome_source_line_item_count(purchasable)
+        result.append({**dict(row), "_chrome_order_asin_count": contexts[key]})
+    return result
+
+
+def chrome_order_routing_join_sql() -> str:
+    """Keep account filtering before LIMIT consistent with whole-order routing."""
+    return """CROSS JOIN LATERAL (
+        SELECT COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(source.replacement_asin, ''), source.asin)))) AS asin_count
+        FROM order_lines AS source
+        WHERE source.store_id=order_lines.store_id
+          AND source.odoo_order_id=order_lines.odoo_order_id
+          AND COALESCE(source.replacement_run_id, '')=COALESCE(order_lines.replacement_run_id, '')
+          AND source.state NOT IN ('inventory', 'ignored')
+          AND COALESCE(source.quantity, 0)>GREATEST(0, COALESCE(source.inventory_allocated_quantity, 0))
+    ) AS chrome_routing"""
 
 
 def required_chrome_account_experience(group_rows: list[dict[str, Any]]) -> str:
@@ -13243,7 +13279,7 @@ def chrome_queue_snapshot(
             (store_id, store_id),
         ).fetchall())
         candidate_rows = conn.execute(
-            """
+            f"""
             SELECT amazon_group_key,
                    COALESCE(MAX(CASE WHEN COALESCE(chrome_claimed_by, '') != '' THEN 1 ELSE 0 END), 0) AS locked,
                    COALESCE(MAX(CASE WHEN COALESCE(chrome_claimed_by, '') = ? THEN 1 ELSE 0 END), 0) AS claimed_by_current_worker,
@@ -13251,6 +13287,7 @@ def chrome_queue_snapshot(
                    MAX(odoo_order_id) AS newest_order_id,
                    MIN(id) AS first_line_id
             FROM order_lines
+            {chrome_order_routing_join_sql()}
             WHERE order_engine='chrome'
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
@@ -13262,11 +13299,11 @@ def chrome_queue_snapshot(
                 ? = 'any'
                 OR (
                     ? = 'consumer'
-                    AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) > 1
+                    AND GREATEST(COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))), MAX(chrome_routing.asin_count)) > 1
                 )
                 OR (
                     ? = 'business'
-                    AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) = 1
+                    AND GREATEST(COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))), MAX(chrome_routing.asin_count)) = 1
                 )
             )
             -- A worker's own pre-submit claim is the job that Start will resume.
@@ -13277,11 +13314,12 @@ def chrome_queue_snapshot(
             (worker_id, store_id, store_id, candidate_experience, candidate_experience, candidate_experience, limit),
         ).fetchall()
         job_count = int(conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count
             FROM (
                 SELECT amazon_group_key
                 FROM order_lines
+                {chrome_order_routing_join_sql()}
                 WHERE order_engine='chrome'
                   AND state='submitted'
                   AND COALESCE(amazon_order_id, '') = ''
@@ -13293,11 +13331,11 @@ def chrome_queue_snapshot(
                     ? = 'any'
                     OR (
                         ? = 'consumer'
-                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) > 1
+                        AND GREATEST(COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))), MAX(chrome_routing.asin_count)) > 1
                     )
                     OR (
                         ? = 'business'
-                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) = 1
+                        AND GREATEST(COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))), MAX(chrome_routing.asin_count)) = 1
                     )
                 )
             ) queued_groups
@@ -13324,6 +13362,7 @@ def chrome_queue_snapshot(
                 """,
                 group_keys,
             ).fetchall()
+        rows = chrome_order_routing_context(conn, rows_to_dicts(rows))
         account_rows = rows_to_dicts(conn.execute("SELECT * FROM amazon_accounts").fetchall())
     accounts_by_id = {int(row["id"]): row for row in account_rows if row.get("id") is not None}
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -13482,7 +13521,7 @@ def claim_next_chrome_job(
                     """,
                     (group_key,),
                 ).fetchall())
-                return chrome_job_from_rows(rows)
+                return chrome_job_from_rows(chrome_order_routing_context(conn, rows))
             existing = conn.execute(
                 """
                 SELECT *
@@ -13511,7 +13550,7 @@ def claim_next_chrome_job(
                 )
                 existing = existing_rows
             if existing:
-                existing_rows = rows_to_dicts(existing)
+                existing_rows = chrome_order_routing_context(conn, rows_to_dicts(existing))
                 if not chrome_account_experience_matches(existing_rows, account_experience):
                     group_key = str(existing_rows[0]["amazon_group_key"])
                     conn.execute(
@@ -13549,18 +13588,19 @@ def claim_next_chrome_job(
                     """,
                     (group_key,),
                 ).fetchall())
-                return chrome_job_from_rows(rows)
+                return chrome_job_from_rows(chrome_order_routing_context(conn, rows))
         candidate_experience = "any"
         if chrome_account_type_routing_enabled():
             detected_experience = clean_text(account_experience).lower()
             candidate_experience = detected_experience if detected_experience in {"consumer", "business"} else "none"
         candidates = conn.execute(
-            """
+            f"""
             SELECT amazon_group_key,
                    MAX(COALESCE(NULLIF(odoo_order_date, ''), NULLIF(pulled_at, ''), created_at)) AS newest_order_date,
                    MAX(odoo_order_id) AS newest_order_id,
                    MIN(id) AS first_line_id
             FROM order_lines
+            {chrome_order_routing_join_sql()}
             WHERE order_engine='chrome'
               AND state='submitted'
               AND COALESCE(amazon_order_id, '') = ''
@@ -13573,11 +13613,11 @@ def claim_next_chrome_job(
                     ? = 'any'
                     OR (
                         ? = 'consumer'
-                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) > 1
+                        AND GREATEST(COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))), MAX(chrome_routing.asin_count)) > 1
                     )
                     OR (
                         ? = 'business'
-                        AND COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))) = 1
+                        AND GREATEST(COUNT(DISTINCT UPPER(TRIM(COALESCE(NULLIF(replacement_asin, ''), asin)))), MAX(chrome_routing.asin_count)) = 1
                     )
                )
             ORDER BY newest_order_date DESC, newest_order_id DESC, first_line_id ASC
@@ -13621,6 +13661,7 @@ def claim_next_chrome_job(
                     candidate_rows,
                     automatic=automatic,
                 )
+            candidate_rows = chrome_order_routing_context(conn, candidate_rows)
             if not candidate_rows or not chrome_account_experience_matches(candidate_rows, account_experience):
                 continue
             # Whole-order invariant: the legacy split flag is intentionally
@@ -13655,7 +13696,7 @@ def claim_next_chrome_job(
                     """,
                     (group_key,),
                 ).fetchall())
-                return chrome_job_from_rows(rows)
+                return chrome_job_from_rows(chrome_order_routing_context(conn, rows))
     return None
 
 
@@ -32537,9 +32578,10 @@ def api_chrome_jobs(
                 conn.execute(
                     """UPDATE amazon_attempts
                        SET request_json=(COALESCE(NULLIF(request_json, ''), '{}')::jsonb
-                           || jsonb_build_object('automatic_claim', ?::boolean))::text
+                           || jsonb_build_object('automatic_claim', ?::boolean,
+                                                 'claim_account_experience', ?::text))::text
                        WHERE external_id=? AND mode='chrome'""",
-                    (not manual_claim, job["group_key"]),
+                    (not manual_claim, clean_text(account_experience).lower(), job["group_key"]),
                 )
         return {
             "ok": True,
@@ -33066,9 +33108,16 @@ def api_chrome_job_submitted(group_key: str, payload: ChromeJobHeartbeatPayload)
                 "SELECT request_json FROM amazon_attempts WHERE external_id=? AND mode='chrome' ORDER BY id DESC LIMIT 1",
                 (group_key,),
             ).fetchone()
-            automatic = safe_json((attempt or {}).get("request_json")).get("automatic_claim") is True
+            claim_metadata = safe_json((attempt or {}).get("request_json"))
+            automatic = claim_metadata.get("automatic_claim") is True
             eligible, blocked_count, messages = (pending_rows, 0, [])
-            if automatic:
+            if chrome_account_type_routing_enabled():
+                routing_rows = chrome_order_routing_context(conn, pending_rows)
+                claimed_experience = clean_text(claim_metadata.get("claim_account_experience")).lower()
+                if not chrome_account_experience_matches(routing_rows, claimed_experience):
+                    required = required_chrome_account_experience(routing_rows)
+                    blocked_count, messages = 1, [f"This whole Odoo order requires a {required} Amazon account; the claimed account is {claimed_experience or 'unverified'}. Reclaim it in the correct profile."]
+            if automatic and not blocked_count:
                 if not auto_chrome_ordering_enabled():
                     blocked_count, messages = 1, ["Automatic Chrome ordering is paused."]
                 else:

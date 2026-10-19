@@ -89,7 +89,7 @@ class AutoChromeEligibilityTests(unittest.TestCase):
             with self.subTest(manual=manual), patch.object(main, "db", db), patch.object(main, "auto_chrome_ordering_enabled", return_value=True), patch.object(main, "reconcile_exact_submitted_chrome_jobs_from_history", return_value=[]), patch.object(main, "repair_missing_chrome_order_chatter", return_value=[]), patch.object(main, "claim_next_chrome_job", return_value={"group_key": "test"}) as claim, patch.object(main, "exact_amazon_history_match_for_chrome_job", return_value=None):
                 main.api_chrome_jobs(manual_claim=manual)
                 self.assertEqual(claim.call_args.kwargs["automatic"], not manual)
-                self.assertEqual(conn.execute.call_args.args[1], (not manual, "test"))
+                self.assertEqual(conn.execute.call_args.args[1], (not manual, "", "test"))
 
     def test_final_submission_rechecks_automatic_policy_and_never_marks_blocked_job_submitted(self):
         conn = Mock()
@@ -98,7 +98,7 @@ class AutoChromeEligibilityTests(unittest.TestCase):
         @contextmanager
         def db():
             yield conn
-        with patch.object(main, "db", db), patch.object(main, "ensure_chrome_job_owner"), patch.object(main, "auto_chrome_ordering_enabled", return_value=True), patch.object(main, "filter_automatic_chrome_orders", return_value=([], 1, ["Order already fulfilled"])) as check, patch.object(main, "filter_lines_by_live_odoo_status") as live:
+        with patch.object(main, "db", db), patch.object(main, "ensure_chrome_job_owner"), patch.object(main, "chrome_account_type_routing_enabled", return_value=False), patch.object(main, "auto_chrome_ordering_enabled", return_value=True), patch.object(main, "filter_automatic_chrome_orders", return_value=([], 1, ["Order already fulfilled"])) as check, patch.object(main, "filter_lines_by_live_odoo_status") as live:
             with self.assertRaises(main.HTTPException) as caught:
                 main.api_chrome_job_submitted("test", main.ChromeJobHeartbeatPayload(worker_id="worker"))
             self.assertEqual(caught.exception.status_code, 409)
