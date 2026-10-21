@@ -114,3 +114,22 @@ class RouteOrderingTests(unittest.TestCase):
  def test_staff_notification_routes_precede_frontend_fallback(self):
   source=(Path(__file__).parents[1]/'app/main.py').read_text()
   self.assertLess(source.index('app.include_router(team_decision_notices.router())'),source.index('@app.get("/{frontend_path:path}")'))
+
+class BridgeRoundTripTests(unittest.TestCase):
+ def test_host_check_never_calls_back_into_odoo(self):
+  source=Path(__file__).parents[1]/'app/main.py'
+  fn=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='require_after_order_website_host')
+  class HTTPError(Exception):pass
+  ns=dict(Any=object,Request=object,clean_text=lambda v:str(v or ''),hmac=__import__('hmac'),HTTPException=HTTPError,hydrate_after_order_recipient_and_domain=Mock(side_effect=AssertionError('Recursive Odoo RPC')))
+  exec(compile(ast.Module(body=[fn],type_ignores=[]),'<host>','exec'),ns)
+  case={'sender_domain':'shop.example'}
+  request=SimpleNamespace(headers={'x-website-host':'shop.example'})
+  self.assertEqual(case,ns['require_after_order_website_host'](request,case))
+  with self.assertRaises(HTTPError):ns['require_after_order_website_host'](SimpleNamespace(headers={'x-website-host':'other.example'}),case)
+  ns['hydrate_after_order_recipient_and_domain'].assert_not_called()
+ def test_portal_generated_links_use_already_verified_context(self):
+  source=Path(__file__).parents[1]/'app/main.py'
+  fn=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='api_after_order_bridge_order')
+  calls=[n for n in ast.walk(fn) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='create_after_order_action_link']
+  self.assertTrue(calls)
+  self.assertTrue(all(any(k.arg=='refresh_context' and isinstance(k.value,ast.Constant) and k.value.value is False for k in n.keywords) for n in calls))

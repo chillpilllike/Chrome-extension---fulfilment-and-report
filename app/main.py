@@ -41141,12 +41141,14 @@ def create_after_order_action_link(
     allowed_override: Optional[list[str]] = None,
     test_mode: Optional[bool] = None,
     view_only: bool = False,
+    refresh_context: bool = True,
 ) -> dict[str, Any]:
     case = after_order_case_by_id(case_id)
     if not case:
         raise HTTPException(404, "After-order case not found.")
     require_after_order_case_in_scope(case)
-    case = hydrate_after_order_recipient_and_domain(case)
+    if refresh_context:
+        case = hydrate_after_order_recipient_and_domain(case)
     is_test = after_order_email_test_mode() if test_mode is None else bool(test_mode)
     if case.get("confirmed_at") and not is_test and not receipt_correction(case):
         raise HTTPException(409, "This decision is already confirmed and its links are expired.")
@@ -41261,7 +41263,7 @@ def api_after_order_bridge_order(order_id: int, request: Request) -> dict[str, A
                 continue
             if not after_order_allowed_actions(case):
                 continue
-            link = create_after_order_action_link(int(case["id"]), request)
+            link = create_after_order_action_link(int(case["id"]), request, refresh_context=False)
             actions.append({"token": link["fallback_url"].rsplit("/", 1)[-1]})
         except HTTPException as exc:
             if exc.status_code not in {403, 404, 409, 410}:
@@ -41270,7 +41272,10 @@ def api_after_order_bridge_order(order_id: int, request: Request) -> dict[str, A
 
 
 def require_after_order_website_host(request: Request, case: dict[str, Any]) -> dict[str, Any]:
-    hydrated = hydrate_after_order_recipient_and_domain(case)
+    # These values were verified when the notification/link was prepared.
+    # Odoo checks ownership and the order's current website locally before a
+    # decision. Calling back into Odoo here can deadlock all storefront workers.
+    hydrated = case
     expected_host = clean_text(hydrated.get("sender_domain")).lower()
     supplied_host = clean_text(request.headers.get("x-website-host")).split(":", 1)[0].lower().removeprefix("www.")
     if not expected_host or not supplied_host or not hmac.compare_digest(expected_host, supplied_host):
