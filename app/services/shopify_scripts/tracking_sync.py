@@ -8,7 +8,7 @@ SOURCE: Shopify stores  --->  DESTINATION: Odoo DBs
 What this script does
 ---------------------
 It reads fulfillments from Shopify SOURCE stores and writes tracking numbers/carrier
-into Odoo stock pickings for the mapped sale order.
+and safe tracking URLs into Odoo outbound pickings for the mapped sale order.
 
 STRICT MATCHING (TAG_DIRECT)
 ----------------------------
@@ -39,12 +39,13 @@ Dry-run mode
 
 Date filtering
 --------------
-Only Shopify fulfillments whose createdAt timestamp is within [from-date, to-date] are considered.
-Orders are fetched by updated_at range, but fulfillments are filtered by createdAt.
+Orders are fetched by updated_at range. All successful fulfillments on those orders
+are reconciled, including older parcels whose tracking URL was changed later.
 
 Idempotency (SQLite)
 --------------------
-In non-dry-run, each (src_shop, src_order_id, src_fulfillment_id) is synced once.
+Repeated runs compare current tracking data and only write changes. Fulfillment
+identity preserves separate parcels and URL-only corrections are reconciled.
 In dry-run, idempotency is not enforced (report-only).
 
 Usage
@@ -741,7 +742,7 @@ def iso_in_range(iso_str: str, start_dt: datetime, end_dt: datetime) -> bool:
 
 def fetch_source_orders(src_shop: str, token: str, api_version: str, from_query: str, to_query: str, max_pages=250):
     cursor = None
-    q = f"updated_at:>={from_query} updated_at:<={to_query} (fulfillment_status:fulfilled OR fulfillment_status:shipped)"
+    q = f"updated_at:>={from_query} updated_at:<={to_query} (fulfillment_status:fulfilled OR fulfillment_status:partial)"
     query = """
     query($first:Int!, $after:String, $q:String!) {
       orders(first:$first, after:$after, query:$q, reverse:true) {
@@ -753,7 +754,7 @@ def fetch_source_orders(src_shop: str, token: str, api_version: str, from_query:
             name
             updatedAt
             tags
-            fulfillments(first: 20) {
+            fulfillments(first: 250) {
               id
               status
               createdAt
@@ -782,6 +783,37 @@ def fetch_source_orders(src_shop: str, token: str, api_version: str, from_query:
             break
 
 
+def safe_tracking_url(value):
+    url = str(value or "").strip()
+    try:
+        parsed = urlparse(url)
+        if (parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or any(char.isspace() or ord(char) < 32 for char in url)
+                or "\\" in url):
+            return ""
+        _ = parsed.port
+    except ValueError:
+        return ""
+    return url
+
+
+def merge_tracking_data(existing, tracking_info, source_key):
+    """Replace one fulfillment's parcels, retaining the other fulfillments."""
+    result = [dict(row) for row in (existing or [])
+              if isinstance(row, dict) and row.get("source") != source_key]
+    seen = set()
+    for item in tracking_info:
+        number = str(item.get("number") or "").strip()
+        if not number or number in seen:
+            continue
+        seen.add(number)
+        result.append({"source": source_key, "number": number,
+                       "company": str(item.get("company") or "").strip(),
+                       "url": safe_tracking_url(item.get("url"))})
+    return sorted(result, key=lambda row: (row.get("source", ""), row.get("number", "")))
+
+
 # ----------------------------
 # Odoo XML-RPC
 # ----------------------------
@@ -796,6 +828,7 @@ class OdooClient:
         self.uid = None
         self.common = None
         self.models = None
+        self._picking_tracking_fields = None
 
     def connect(self):
         self.common = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common")
@@ -902,15 +935,19 @@ class OdooClient:
             return []
         return rows[0].get("picking_ids") or []
 
+    def picking_tracking_fields(self):
+        if self._picking_tracking_fields is None:
+            self._picking_tracking_fields = self.execute(
+                "stock.picking", "fields_get", [], {"attributes": ["type"]})
+        return self._picking_tracking_fields
+
     def read_pickings(self, picking_ids: list):
         if not picking_ids:
             return []
-        return self.execute(
-            "stock.picking",
-            "read",
-            [picking_ids],
-            {"fields": ["id", "name", "state", "carrier_tracking_ref", "carrier_id", "note"]},
-        )
+        fields = ["id", "name", "state", "carrier_tracking_ref", "carrier_id", "note", "picking_type_code"]
+        if "epg_tracking_data" in self.picking_tracking_fields():
+            fields.append("epg_tracking_data")
+        return self.execute("stock.picking", "read", [picking_ids], {"fields": fields})
 
     def find_carrier_id_by_name(self, carrier_name: str):
         if not carrier_name:
@@ -918,17 +955,31 @@ class OdooClient:
         ids = self.execute("delivery.carrier", "search", [[("name", "ilike", carrier_name)]], {"limit": 1})
         return ids[0] if ids else None
 
-    def write_picking_tracking(self, picking_id: int, tracking_text: str, carrier_id: int = None, append_note: str = ""):
+    def picking_tracking_values(self, picking, tracking_text, tracking_info, source_key, carrier_id=None):
+        if picking.get("state") == "cancel" or picking.get("picking_type_code") != "outgoing":
+            return {}
         vals = {}
-        if tracking_text:
+        if "epg_tracking_data" in self.picking_tracking_fields():
+            data = merge_tracking_data(picking.get("epg_tracking_data"), tracking_info, source_key)
+            if data != (picking.get("epg_tracking_data") or []):
+                vals["epg_tracking_data"] = data
+            tracking_text = ", ".join(dict.fromkeys(row["number"] for row in data if row.get("number")))
+        else:
+            # Keep compatibility while an instance waits for its addon upgrade.
+            urls = list(dict.fromkeys(filter(None, (safe_tracking_url(t.get("url")) for t in tracking_info))))
+            note = str(picking.get("note") or "")
+            if urls and any(url not in note for url in urls):
+                from html import escape
+                vals["note"] = note + "<p>Tracking URLs: " + ", ".join(escape(url) for url in urls) + "</p>"
+        if tracking_text and tracking_parts(picking.get("carrier_tracking_ref") or "") != tracking_parts(tracking_text):
             vals["carrier_tracking_ref"] = tracking_text
-        if carrier_id:
+        # Preserve the purchased EPG delivery method; source carrier is stored per parcel.
+        if carrier_id and not picking.get("carrier_id"):
             vals["carrier_id"] = carrier_id
-        if append_note:
-            vals["note"] = append_note
-        if not vals:
-            return False
-        return bool(self.execute("stock.picking", "write", [[picking_id], vals]))
+        return vals
+
+    def write_picking_tracking(self, picking_id: int, values: dict):
+        return bool(values and self.execute("stock.picking", "write", [[picking_id], values]))
 
 
 
@@ -1022,8 +1073,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="STRICT TAG_DIRECT tracking sync: Shopify SOURCE -> Odoo using SRC_ODOO_DB/SRC_ODOO_ORDER tags only."
     )
-    ap.add_argument("--from-date", required=True, help="Only process SOURCE fulfillments created on/after this date.")
-    ap.add_argument("--to-date", required=True, help="Only process SOURCE fulfillments created on/before this date.")
+    ap.add_argument("--from-date", required=True, help="Process SOURCE orders updated on/after this date.")
+    ap.add_argument("--to-date", required=True, help="Process SOURCE orders updated on/before this date.")
     ap.add_argument("--dry-run", action="store_true", help="Report-only: do not write to Odoo or SQLite.")
     ap.add_argument(
         "--skip-done-pickings",
@@ -1120,7 +1171,7 @@ def main():
     print("\n======================================================")
     print(" Odoo Tracking Sync (SMART v3.3) Shopify -> Odoo")
     print("======================================================")
-    print(f"Fulfillment createdAt filter: {start_dt.isoformat()}  ->  {end_dt.isoformat()}")
+    print("All successful fulfillments on updated orders are reconciled (including URL corrections).")
     print(f"Order updated_at fetch range: {from_query}  ->  {to_query}")
     print(f"Odoo DBs: {len(odoo_by_db)}/{len(ODOO_DESTS)} connected | Shopify SOURCE stores: {len(SHOPIFY_SOURCES)}")
     if odoo_connect_errors:
@@ -1342,17 +1393,7 @@ def main():
                     "odoo_order": odoo_order,
                 }
 
-                if not iso_in_range(f_created, start_dt, end_dt):
-                    add_counter("skipped_out_of_range")
-                    append_csv_row(
-                        report_csv,
-                        {
-                            **row_common,
-                            "action": "SKIP",
-                            "result": "OUT_OF_RANGE",
-                            "message": "Fulfillment createdAt outside date range",
-                        },
-                    )
+                if (f.get("status") or "").upper() != "SUCCESS":
                     continue
 
                 tracking_list = [
@@ -1380,7 +1421,8 @@ def main():
 
                 tracking_numbers = [(t.get("number") or "").strip() for t in tracking_list if (t.get("number") or "").strip()]
                 tracking_companies = [(t.get("company") or "").strip() for t in tracking_list]
-                tracking_urls = [(t.get("url") or "").strip() for t in tracking_list]
+                tracking_urls = [safe_tracking_url(t.get("url")) for t in tracking_list]
+                source_key = f"{src['shop']}:{f_id}"
 
                 tracking_text = ", ".join([x for x in tracking_numbers if x])
                 carrier_name = (tracking_companies[0] if tracking_companies else "").strip()
@@ -1460,6 +1502,7 @@ def main():
                     update_needed_ids = []
                     picking_existing_by_id = {}
                     replacement_needed_ids = []
+                    tracking_values_by_id = {}
                     for p in pickings:
                         pid = p.get("id")
                         stt = p.get("state")
@@ -1468,13 +1511,15 @@ def main():
                         picking_states.append(f"{pid}:{stt}")
                         picking_existing.append(f"{pid}:{existing}")
 
-                        if stt == "cancel":
+                        if stt == "cancel" or p.get("picking_type_code") != "outgoing":
                             continue
                         if stt == "done" and skip_done_pickings:
                             continue
-                        if tracking_matches(existing, tracking_text):
+                        values = oc.picking_tracking_values(p, tracking_text, tracking_list, source_key, carrier_id)
+                        if not values:
                             continue
-                        if has_tracking_text(existing):
+                        tracking_values_by_id[str(pid)] = values
+                        if "carrier_tracking_ref" in values and has_tracking_text(existing):
                             replacement_needed_ids.append(str(pid))
                         update_needed_ids.append(str(pid))
 
@@ -1489,7 +1534,7 @@ def main():
                                 pid2 = str(p.get("id"))
                                 stt2 = (p.get("state") or "")
                                 existing2 = (p.get("carrier_tracking_ref") or "").strip()
-                                if stt2 in ("done", "cancel"):
+                                if stt2 in ("done", "cancel") or p.get("picking_type_code") != "outgoing":
                                     continue
                                 if tracking_matches(existing2, tracking_text):
                                     validate_needed.add(pid2)
@@ -1535,9 +1580,6 @@ def main():
                         continue
 
                     updated_ids = []
-                    note_append = ""
-                    if tracking_urls:
-                        note_append = f"Tracking URLs: {', '.join([u for u in tracking_urls if u])}"
 
                     if dry_run:
                         updated_ids = update_needed_ids[:]  # what would update
@@ -1551,7 +1593,7 @@ def main():
                     else:
                         for pid in update_needed_ids:
                             check_cancelled()
-                            ok = oc.write_picking_tracking(int(pid), tracking_text, carrier_id=carrier_id, append_note=note_append)
+                            ok = oc.write_picking_tracking(int(pid), tracking_values_by_id[pid])
                             if ok:
                                 updated_ids.append(pid)
                         if updated_ids:
@@ -1572,7 +1614,7 @@ def main():
                             pid = str(p.get("id"))
                             stt = (p.get("state") or "")
                             existing = (p.get("carrier_tracking_ref") or "").strip()
-                            if stt in ("done", "cancel"):
+                            if stt in ("done", "cancel") or p.get("picking_type_code") != "outgoing":
                                 continue
                             if tracking_matches(existing, tracking_text):
                                 validate_needed.add(pid)
