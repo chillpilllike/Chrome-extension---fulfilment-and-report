@@ -1,3 +1,4 @@
+import { TeamDecisionSettings } from './components/TeamDecisionSettings'
 import { AmazonPurchaseAllocations } from './components/AmazonPurchaseAllocations'
 import { ShopifyTitleReview } from "./components/ShopifyTitleReview"
 import { SmsSettings } from './components/SmsSettings'
@@ -17430,6 +17431,7 @@ function SettingsPage({
         <h2 className="page-title">Settings</h2>
         <p className="text-sm text-muted-foreground">Configure stores, fulfilment addresses, Amazon accounts, service connections, backups, and punchout URLs.</p>
       </section>
+      <TeamDecisionSettings api={api} />
       <EmailApprovalSettings api={api} />
       <SmsSettings api={api} />
 

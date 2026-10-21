@@ -2355,6 +2355,8 @@ def init_db() -> None:
         conn.executescript(followup_schema)
         from app.services.manual_refunds import SCHEMA as manual_refund_schema
         conn.executescript(manual_refund_schema)
+        from app.services.team_decision_notices import SCHEMA as team_notice_schema
+        conn.executescript(team_notice_schema)
         store_columns = {r["name"] for r in conn.execute("PRAGMA table_info(stores)").fetchall()}
         if "airwallex_order_prefixes" not in store_columns:
             conn.execute("ALTER TABLE stores ADD COLUMN airwallex_order_prefixes TEXT NOT NULL DEFAULT ''")
@@ -26500,6 +26502,7 @@ def startup() -> None:
                 threading.Thread(target=welcome_email_loop, name="new-order-welcome", daemon=True).start()
                 threading.Thread(target=email_approval_loop, name="email-approval-dispatch", daemon=True).start()
                 threading.Thread(target=notification_loop, name="care-notification-maintenance", daemon=True).start()
+                threading.Thread(target=team_decision_notices.loop, name="team-decision-notices", daemon=True).start()
                 threading.Thread(target=sms_receipt_loop, name="sms-delivery-receipts", daemon=True).start()
                 threading.Thread(target=shopify_dispatch_loop, name="shopify-dispatch", daemon=True).start()
                 threading.Thread(target=relay_payments.loop, name="relay-payments", daemon=True).start()
@@ -26719,6 +26722,12 @@ def api_shopify_script_config() -> dict[str, Any]:
 @app.post("/api/settings/services")
 def api_save_service_settings(payload: ServiceSettingsPayload) -> dict[str, Any]:
     current = get_service_settings()
+    if 'after_order_team_emails' in payload.settings:
+        from app.services.team_decision_notices import recipients
+        try:
+            payload.settings['after_order_team_emails'] = '\n'.join(recipients(payload.settings['after_order_team_emails']))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     values = {}
     raw_tracking_config: Optional[dict[str, Any]] = None
     for key, value in payload.settings.items():
@@ -39569,14 +39578,17 @@ def record_after_order_event(
     decision: str = "",
     details: Optional[dict[str, Any]] = None,
 ) -> None:
-    conn.execute(
+    event = conn.execute(
         """
         INSERT INTO after_order_case_events
         (case_id, event_type, actor_type, actor_label, decision, details_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
         """,
         (case_id, event_type, actor_type, actor_label, decision, json.dumps(details or {}, default=str), utc_now()),
     )
+
+    event_id = event.fetchone()["id"]
+    team_decision_notices.enqueue(conn, event_id, case_id, event_type, actor_type, decision, details or {})
 
 
 def sync_after_order_cases(store_id: Optional[int] = None) -> None:
@@ -41176,7 +41188,7 @@ def api_after_order_action_link(case_id: int, request: Request) -> dict[str, Any
     return create_after_order_action_link(case_id, request)
 
 
-def after_order_action_link(token: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def after_order_action_link(token: str, *, allow_stale_navigation: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     token_hash = hashlib.sha256(clean_text(token).encode("utf-8")).hexdigest()
     with db() as conn:
         row = conn.execute(
@@ -41189,11 +41201,17 @@ def after_order_action_link(token: str) -> tuple[dict[str, Any], dict[str, Any]]
     case = after_order_case_by_id(int(link["case_id"]))
     if not case:
         raise HTTPException(404, "This decision link is invalid.")
+    if allow_stale_navigation and not after_order_case_is_in_scope(case):
+        return case, dict(link, navigation_only=True)
     require_after_order_case_in_scope(case)
     expires_at = parse_any_datetime(link.get("expires_at"))
     if expires_at and expires_at <= datetime.now(timezone.utc):
+        if allow_stale_navigation:
+            return case, dict(link, navigation_only=True)
         raise HTTPException(410, "This decision link has expired.")
     if not link.get("test_mode") and (link.get("invalidated_at") or not link.get("request_fingerprint") or link["request_fingerprint"] != request_fingerprint(case)):
+        if allow_stale_navigation:
+            return case, dict(link, navigation_only=True)
         raise HTTPException(410, "This order has changed. Please open its order details for the current options.")
     return case, link
 
@@ -41360,9 +41378,15 @@ def record_after_order_customer_decision(
 @app.get("/api/public/after-order-bridge/action/{token}")
 def api_after_order_bridge_action(token: str, request: Request) -> dict[str, Any]:
     require_after_order_bridge(request)
-    case, link = after_order_action_link(token)
+    case, link = after_order_action_link(token, allow_stale_navigation=True)
     require_after_order_test_admin(request, link)
     case = require_after_order_website_host(request, case)
+    if link.get('navigation_only'):
+        # Navigation to the order still uses Odoo's ownership checks. Never
+        # revive an old consent token or expose options from its old snapshot.
+        return {'ok':True,'stale_link':True,'locked':True,'allowed_actions':[],
+                'test_mode':bool(link.get('test_mode')) or after_order_email_test_mode(),
+                'order':{'id':case['odoo_order_id']}}
     expected_host = clean_text(case.get("sender_domain")).lower()
     try:
         allowed = json.loads(link.get("allowed_actions_json") or "[]")
@@ -46005,6 +46029,11 @@ airwallex_refunds = AirwallexRefunds(db=db, get_store=get_store, client_factory=
     configuration=airwallex_default_connection, notifications=refund_emails,
     staff_check=lambda request: bool(effective_admin_access_token()) and request_has_admin_access(request))
 app.include_router(airwallex_refunds.router())
+
+
+from app.services.team_decision_notices import Notices as TeamDecisionNotices
+team_decision_notices = TeamDecisionNotices(globals())
+app.include_router(team_decision_notices.router())
 
 
 @app.get("/{frontend_path:path}")
