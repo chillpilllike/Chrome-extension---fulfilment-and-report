@@ -204,6 +204,7 @@ class Notices:
                 conn.execute('UPDATE after_order_team_notices SET status=?,provider_message_id=?,last_error=?,updated_at=? WHERE id=?', (status,provider_id,error,r.utc_now(),row['id']))
                 if row['case_id'] is not None:
                     r.record_after_order_event(conn,row['case_id'],'team_decision_notice_'+status,details={'notice_id':row['id'],'recipient':row['recipient']})
+            time.sleep(0.6)  # Keep multi-recipient alerts within the provider's request rate.
 
     def reconcile(self):
         import requests
