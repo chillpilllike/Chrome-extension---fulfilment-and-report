@@ -24741,7 +24741,7 @@ def run_shopify_tracking_job(job_id: str) -> None:
         argv.append("--dry-run")
     if int(job["skip_done_pickings"] or 0):
         argv.append("--skip-done-pickings")
-    if not int(job["validate_deliveries"] or 1):
+    if int(job["validate_deliveries"] if job["validate_deliveries"] is not None else 1) == 0:
         argv.append("--no-validate-deliveries")
     def fail_tracking_job(exc: BaseException) -> None:
         error_text = str(exc)[:2000] or exc.__class__.__name__
