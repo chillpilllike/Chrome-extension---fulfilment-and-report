@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+from app.services.tracking_options import boolean_option as tracking_boolean_option
 import sys
 from app.services import amazon_purchase_allocations as purchase_allocations
 from app.services import pickup_evidence_repair, dispatch_purchase_identity
@@ -25075,7 +25077,10 @@ def create_shopify_tracking_job(payload: dict[str, Any], queued_by: str = "manua
         to_date = requested_to or today.isoformat()
     dry_run = bool(payload.get("dry_run", False))
     skip_done = bool(payload.get("skip_done_pickings", str(settings.get("shopify_tracking_skip_done_pickings", "false")).lower() in {"1", "true", "yes", "on"}))
-    validate = bool(payload.get("validate_deliveries", str(settings.get("shopify_tracking_validate_deliveries", "true")).lower() in {"1", "true", "yes", "on"}))
+    validate = tracking_boolean_option(
+        payload.get("validate_deliveries"),
+        default=tracking_boolean_option(settings.get("shopify_tracking_validate_deliveries"), default=True),
+    )
     job_id = uuid.uuid4().hex
     with db() as conn:
         conn.execute(
