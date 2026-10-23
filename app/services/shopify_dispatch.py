@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit
 from app.services.alternative_workflow import Runtime
 from app.services.welcome_email import moment
+from app.services.tracking_options import shopify_updated_window
 
 KIND = 'shopify_dispatch'
 SETTING = 'after_order_shopify_dispatch_started_at'
@@ -145,7 +146,7 @@ class Monitor:
                     saved_value=json.loads(saved_value)
                 since=max(moment(started),moment(saved_value)-timedelta(minutes=5)) if saved else moment(started)
                 through=datetime.now(timezone.utc)
-                query=f'updated_at:>={since.isoformat()} updated_at:<={through.isoformat()}'
+                query=shopify_updated_window(since, through)
                 cursor=None; complete=True
                 while True:
                     page=client.graphql(ORDERS_QUERY,{'query':query,'after':cursor})['orders']

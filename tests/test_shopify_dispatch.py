@@ -206,6 +206,19 @@ class MonitorTests(unittest.TestCase):
 
     def tearDown(self):self.conn.close()
 
+    def test_monitor_quotes_dates_and_saves_the_same_upper_boundary(self):
+        import re
+        self.m.run_checks(None)
+        query=self.client.graphql.call_args.args[1]['query']
+        terms=re.findall(r"updated_at:([<>]=)'([^']+)'",query)
+        self.assertEqual(len(terms),2)
+        lower=datetime.fromisoformat(terms[0][1].replace('Z','+00:00'))
+        upper=datetime.fromisoformat(terms[1][1].replace('Z','+00:00'))
+        self.assertEqual(lower,datetime.fromisoformat(self.fixture.started))
+        saved=self.conn.execute("SELECT value FROM app_settings WHERE key LIKE 'shopify_dispatch_cursor:%'").fetchone()
+        self.assertEqual(upper,datetime.fromisoformat(json.loads(saved['value'])))
+        self.assertEqual(self.send.call_count,1)
+
     def test_reservation_and_repeated_scans_send_once(self):
         self.m.run_checks(None);self.m.run_checks(None)
         self.assertEqual(1,self.send.call_count)
