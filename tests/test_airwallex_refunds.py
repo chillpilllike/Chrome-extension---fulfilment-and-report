@@ -405,6 +405,28 @@ class SnapshotTests(unittest.TestCase):
     def test_external_refund_is_deducted(self):
         self.external=[{'id':'t1','reference':'Partial Refund NC100','transfer_amount':30,'transfer_currency':'CAD','status':'PAID'}]
         self.assertEqual(self.svc.snapshot(1,1)['remaining'],'70')
+    def test_reconciled_rejection_releases_hold_without_claiming_refund_completed(self):
+        attempt={'id':'t1','reference':'Refund NC100','transfer_amount':100,'transfer_currency':'CAD','status':'UNKNOWN'}
+        self.external=[attempt]
+        held=self.svc.snapshot(1,1)
+        self.assertEqual(held['remaining'],'0')
+        self.assertEqual(held['refund_completed'],'0')
+        self.assertEqual(held['refund_reconciliation'],'100')
+        attempt['status']='REJECTED'
+        released=self.svc.snapshot(1,1)
+        self.assertEqual(released['remaining'],'100')
+        self.assertEqual(released['refund_completed'],'0')
+        self.assertEqual(released['refund_reconciliation'],'0')
+        self.assertEqual(released['history'][0]['status'],'REJECTED')
+    def test_completed_pending_and_failed_amounts_are_distinct_and_deduplicated(self):
+        base={'reference':'Partial Refund NC100','transfer_amount':10,'transfer_currency':'CAD'}
+        self.external=[dict(base,id='paid',status='PAID'),dict(base,id='pending',status='PROCESSING'),
+                       dict(base,id='failed',status='FAILED'),dict(base,id='paid',status='PAID')]
+        result=self.svc.snapshot(1,1)
+        self.assertEqual(result['refund_completed'],'10')
+        self.assertEqual(result['refund_pending'],'10')
+        self.assertEqual(result['refund_reconciliation'],'10')
+        self.assertEqual(result['remaining'],'70')
     def test_multiple_manual_partial_refunds_deduct_once_and_full_refund_blocks(self):
         first={'id':'t1','reference':'Partial Refund NC100','transfer_amount':30,'transfer_currency':'CAD','status':'PAID'}
         second={**first,'id':'t2','transfer_amount':20}

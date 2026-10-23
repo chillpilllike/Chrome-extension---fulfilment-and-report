@@ -564,6 +564,9 @@ class AirwallexRefunds:
             local = c.execute('SELECT * FROM airwallex_refund_payouts WHERE order_key=?', (key,)).fetchall()
         transfers = transfers.result() if isinstance(transfers, Future) else transfers
         used, history = refund_totals(order['name'], currency, transfers, local)
+        completed = sum((money(h['amount']) for h in history if h['status'] == 'PAID'), ZERO)
+        reconciliation = sum((money(h['amount']) for h in history if h['status'] in {'UNKNOWN', 'FAILED'}), ZERO)
+        pending = used - completed - reconciliation
         # Conservative: credit notes and external provider refunds may overlap; do not guess.
         accounting_deduction = (credits + provider_refunds) * rate
         remaining = max(ZERO, cap - used - accounting_deduction)
@@ -574,6 +577,8 @@ class AirwallexRefunds:
                 'order_equivalent': str(total * rate), 'conversion_rate': str(rate),
                 'payment_matches': payment_matches, 'warnings': warnings, 'manual_payment_required': manual_payment_required,
                 'currency': currency, 'paid': str(collected_paid), 'cap': str(cap), 'refunded_reserved': str(used),
+                'refund_completed': str(completed), 'refund_pending': str(pending),
+                'refund_reconciliation': str(reconciliation),
                 'accounting_deduction': str(accounting_deduction), 'remaining': str(remaining),
                 'rounding': str(rounding), 'evidence': evidence, 'history': history,
                 'defaults': {'beneficiary.entity_type': 'PERSONAL', 'beneficiary.type': 'BANK_ACCOUNT',

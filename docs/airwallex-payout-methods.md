@@ -89,3 +89,14 @@ The exception uses the order currency and order-value cap, subtracting existing
 refunds, reservations, provider refunds and credit notes. Staff must verify actual
 receipt and reduce the refund if less was received. Verified payment caps, receipt
 mismatches, ambiguity checks, idempotency and daily limits remain enforced.
+
+### Distinguishing refunds from holds
+
+The order snapshot reports completed refunds (PAID), pending transfers, and
+amounts held for reconciliation (UNKNOWN/FAILED) separately. Rejected and
+cancelled attempts remain visible in history without reducing the available
+refund amount. A zero available amount with an uncertain attempt explains the
+hold instead of implying that the customer was refunded. An absent transfer
+lookup alone still does not automatically release uncertain attempts; historical
+validation rejections require reconciliation against the correct account and
+complete transfer history before correcting the saved status.
