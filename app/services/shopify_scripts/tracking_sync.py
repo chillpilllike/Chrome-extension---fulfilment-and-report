@@ -742,7 +742,7 @@ def iso_in_range(iso_str: str, start_dt: datetime, end_dt: datetime) -> bool:
 
 def fetch_source_orders(src_shop: str, token: str, api_version: str, from_query: str, to_query: str, max_pages=250):
     cursor = None
-    q = f"updated_at:>={from_query} updated_at:<={to_query} (fulfillment_status:fulfilled OR fulfillment_status:partial)"
+    q = f"updated_at:>='{from_query}' updated_at:<='{to_query}' (fulfillment_status:fulfilled OR fulfillment_status:partial)"
     query = """
     query($first:Int!, $after:String, $q:String!) {
       orders(first:$first, after:$after, query:$q, reverse:true) {
