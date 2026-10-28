@@ -58,6 +58,7 @@ from fastapi.templating import Jinja2Templates
 from app.core.config import BASE_DIR, DEFAULT_SERVICE_SETTINGS, FRONTEND_DIST, env_bool
 from app.core.time import utc_now
 from app.db.session import db
+from app.services.refresh_guard import after_order_refresh_connection
 from app.db import session as db_session
 from app import redis_support
 from app.schemas.payloads import ThirdPartyTrackingPayload
@@ -695,6 +696,8 @@ FRONTEND_SHELL_PATHS = {
 
 def ensure_performance_indexes(conn: Any) -> None:
     index_statements = (
+        "CREATE INDEX IF NOT EXISTS idx_after_order_action_links_active_case ON after_order_action_links(case_id) WHERE test_mode=0 AND invalidated_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_after_order_cases_tracking_lookup ON after_order_cases(store_id, tracking_code, id DESC) WHERE tracking_provider='epg'",
         # Main dashboard and order table pagination.
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_order_page ON order_lines(store_id, odoo_order_id DESC, asin, id)",
         "CREATE INDEX IF NOT EXISTS idx_order_lines_store_updated_page ON order_lines(store_id, updated_at DESC, odoo_order_id DESC, id)",
@@ -22034,7 +22037,8 @@ def missing_shopify_push_candidates(limit: int = 1000) -> list[dict[str, Any]]:
             SELECT eligible.*,
                    latest_job.job_id,
                    latest_job.route,
-                   latest_job.job_status
+                   latest_job.job_status,
+                   latest_job.job_locked_at
             FROM eligible
             LEFT JOIN latest_job
               ON latest_job.store_id=eligible.store_id
@@ -22098,7 +22102,7 @@ def reconcile_missing_shopify_pushes(limit: int = 1000, start_worker: bool = Tru
                            OR (status='running' AND COALESCE(locked_at, updated_at, created_at) <= ?)
                       )
                     """,
-                    [utc_now(), utc_now(), stale_cutoff, *job_ids],
+                    [utc_now(), utc_now(), *job_ids, stale_cutoff],
                 )
                 recovered_jobs = int(cursor.rowcount or 0)
             for store_id, odoo_order_id, order_name in order_keys:
@@ -39600,7 +39604,9 @@ def sync_after_order_cases(store_id: Optional[int] = None) -> None:
     """Materialize provider facts into review cases without executing actions."""
     now = utc_now()
     cutoff_date = after_order_cutoff_date()
-    with db() as conn:
+    with after_order_refresh_connection(db) as conn:
+        if conn is None:
+            return
         conn.execute("UPDATE after_order_cases SET status='resolved', updated_at=? WHERE case_type='expected_dispatch' AND confirmed_at IS NULL AND (? IS NULL OR store_id=?)", (now, store_id, store_id))
         # ETA notices are materialized independently of anybody opening cards.
         eta_rows = rows_to_dicts(conn.execute(
@@ -41211,8 +41217,8 @@ def after_order_action_link(token: str, *, allow_stale_navigation: bool = False)
     if allow_stale_navigation and not after_order_case_is_in_scope(case):
         return case, dict(link, navigation_only=True)
     require_after_order_case_in_scope(case)
-    expires_at = parse_any_datetime(link.get("expires_at"))
-    if expires_at and expires_at <= datetime.now(timezone.utc):
+    from app.services.alternative_selection import action_link_expired
+    if action_link_expired(link):
         if allow_stale_navigation:
             return case, dict(link, navigation_only=True)
         raise HTTPException(410, "This decision link has expired.")
@@ -41356,10 +41362,14 @@ def record_after_order_customer_decision(
             latest_case["context"] = json.loads(latest_case.get("context_json") or "{}")
             if request_fingerprint(latest_case) != link.get("request_fingerprint"):
                 raise HTTPException(409, "The order changed while you were choosing. Reload the current options.")
-            fresh_link = conn.execute("SELECT invalidated_at FROM after_order_action_links WHERE id=?", (link["id"],)).fetchone()
-            if not fresh_link or fresh_link["invalidated_at"]:
+            fresh_link = conn.execute("SELECT * FROM after_order_action_links WHERE id=?", (link["id"],)).fetchone()
+            from app.services.alternative_selection import action_link_expired
+            if not fresh_link or fresh_link["invalidated_at"] or action_link_expired(fresh_link):
                 raise HTTPException(410, "This request has expired.")
             previous = clean_text(latest["current_decision"])
+            if (previous == normalized
+                    and (latest["selected_product_id"] or None) == (int(selected_product_id or 0) or None)):
+                return False, dict(case, **latest_case), "Your request is already recorded and awaiting team review. No further action is needed."
             cursor = conn.execute(
                 """UPDATE after_order_cases
                    SET previous_decision=current_decision, current_decision=?, selected_product_id=?, decision_version=decision_version+1,

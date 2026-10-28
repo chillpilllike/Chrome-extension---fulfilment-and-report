@@ -145,9 +145,9 @@ class StoredSelections(unittest.TestCase):
         self.conn.executescript('''CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY,confirmed_at TEXT,
             current_decision TEXT,decision_version INTEGER DEFAULT 0,decision_updated_at TEXT,status TEXT,decision_fingerprint TEXT,updated_at TEXT);
             CREATE TABLE order_lines(id INTEGER PRIMARY KEY);
-            CREATE TABLE after_order_action_links(id INTEGER PRIMARY KEY,invalidated_at TEXT);
+            CREATE TABLE after_order_action_links(id INTEGER PRIMARY KEY,invalidated_at TEXT,expires_at TEXT);
             INSERT INTO after_order_cases(id) VALUES(1);
-            INSERT INTO after_order_action_links(id) VALUES(1);''')
+            INSERT INTO after_order_action_links(id,expires_at) VALUES(1,'2999-01-01T00:00:00+00:00');''')
         self.conn.executescript(SCHEMA)
         self.case = {'id':1,'case_type':'item_unavailable','store_id':1,'website_id':3,'odoo_order_id':42,
                      'odoo_order_name':'TEST-42','affected_items':[{'line_id':10},{'line_id':11}]}
@@ -248,6 +248,21 @@ class StoredSelections(unittest.TestCase):
         with patch('app.services.alternative_workflow.datetime') as clock:
             clock.now.return_value=now
             return self.workflow.choose(self.case,{'id':1,'test_mode':test},line_id,product_id)
+
+    def test_duplicate_choice_does_not_change_version_deadline_or_events(self):
+        now=datetime.now(timezone.utc)
+        self.choose(10,100,now)
+        row=dict(self.conn.execute('SELECT * FROM after_order_line_selections').fetchone())
+        recorded,_,_=self.choose(10,100,now+timedelta(hours=1))
+        self.assertFalse(recorded)
+        self.assertEqual(row,dict(self.conn.execute('SELECT * FROM after_order_line_selections').fetchone()))
+        self.assertEqual(len(self.events),1)
+
+    def test_expired_or_corrupt_token_cannot_select_an_alternative(self):
+        for expiry in (None, 'invalid', '2020-01-01T00:00:00+00:00'):
+            self.conn.execute('UPDATE after_order_action_links SET expires_at=?',(expiry,))
+            with self.assertRaises(HTTPException):self.choose(10,100,datetime.now(timezone.utc))
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM after_order_line_selections').fetchone()[0],0)
 
     def test_two_lines_and_reselection_persist_independently(self):
         now=datetime(2026,9,6,10,tzinfo=timezone.utc)

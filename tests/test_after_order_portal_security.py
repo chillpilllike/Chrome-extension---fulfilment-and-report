@@ -1,4 +1,5 @@
 import ast
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,15 +8,16 @@ from unittest.mock import Mock
 from xml.etree import ElementTree
 
 ROOT = Path(__file__).parents[1]
+PORTAL_ROOT = Path(os.environ["AFTER_ORDER_PORTAL_TEST_ROOT"]) if os.environ.get("AFTER_ORDER_PORTAL_TEST_ROOT") else ROOT / "odoo-addons/after_order_portal"
 
 
 class PortalSecurityTests(unittest.TestCase):
     def setUp(self):
-        tree = ast.parse((ROOT / 'odoo-addons/after_order_portal/controllers/main.py').read_text())
+        tree = ast.parse((PORTAL_ROOT / 'controllers/main.py').read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
         for node in cls.body:
             if isinstance(node, ast.FunctionDef):
-                node.decorator_list = []
+                node.decorator_list = [d for d in node.decorator_list if isinstance(d, ast.Name) and d.id == 'staticmethod']
         self.admin = False
         self.website = SimpleNamespace(id=4)
         self.request = SimpleNamespace(
@@ -75,7 +77,7 @@ class PortalSecurityTests(unittest.TestCase):
         self.assertEqual('order-access', values['after_order_access_token'])
 
     def test_template_inherits_standard_preview_and_forms_have_csrf(self):
-        tree = ElementTree.parse(ROOT / 'odoo-addons/after_order_portal/views/order_preview.xml')
+        tree = ElementTree.parse(PORTAL_ROOT / 'views/order_preview.xml')
         self.assertEqual('sale.sale_order_portal_template', tree.find('template').get('inherit_id'))
         for form in tree.findall('.//form'):
             self.assertIsNotNone(form.find("input[@name='csrf_token']"))

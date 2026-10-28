@@ -13,7 +13,7 @@ from email.utils import parseaddr
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.services.alternative_selection import moment, price_fingerprint, resolved_asin, selection_change
+from app.services.alternative_selection import action_link_expired, moment, price_fingerprint, resolved_asin, selection_change
 
 
 SCHEMA = """
@@ -310,7 +310,7 @@ class Workflow:
             if current['confirmed_at']:
                 raise HTTPException(410, 'This request has already been confirmed.')
             fresh_link = conn.execute('SELECT * FROM after_order_action_links WHERE id=?', (link['id'],)).fetchone()
-            if not fresh_link or fresh_link['invalidated_at']:
+            if not fresh_link or fresh_link['invalidated_at'] or action_link_expired(fresh_link):
                 raise HTTPException(410, 'This link has expired.')
             fresh, _ = self.case_line(case['id'], line_id)
             if line_id in self.unavailable_without_alternatives(fresh):
@@ -320,6 +320,7 @@ class Workflow:
             prior = conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=?',
                 (case['id'],line_id,int(test_mode))).fetchone()
             prior = dict(prior) if prior else None
+            prior_was_choosing = bool(prior and prior["status"] == "choosing")
             if hasattr(r,'care_requests'):
                 removal = conn.execute('SELECT * FROM after_order_line_removals WHERE case_id=? AND line_id=? AND test_mode=?',
                     (case['id'],line_id,int(test_mode))).fetchone()
@@ -334,6 +335,9 @@ class Workflow:
                 change = selection_change(dict(prior) if prior else None, product, now)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
+            if (prior_was_choosing
+                    and json.loads(prior['product_json']) == product):
+                return False, case, 'Your alternative selection is already saved. The original selection deadline still applies.'
             conn.execute('''INSERT INTO after_order_line_selections
                 (case_id,line_id,test_mode,version,product_json,first_selected_at,deadline_at,status,issue_fingerprint,updated_at)
                 VALUES(?,?,?,?,?,?,?,'choosing',?,?) ON CONFLICT(case_id,line_id,test_mode) DO UPDATE SET

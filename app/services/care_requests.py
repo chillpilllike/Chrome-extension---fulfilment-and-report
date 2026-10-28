@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
-from app.services.alternative_selection import moment
+from app.services.alternative_selection import action_link_expired, moment
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS after_order_response_windows (
@@ -81,7 +81,7 @@ class Requests:
         with r.db() as conn:
             locked = conn.execute('SELECT * FROM after_order_cases WHERE id=? FOR UPDATE',(case['id'],)).fetchone()
             fresh = conn.execute('SELECT * FROM after_order_action_links WHERE id=?',(link['id'],)).fetchone()
-            if locked['confirmed_at'] or not fresh or fresh['invalidated_at'] or (not mode and fresh['request_fingerprint'] != r.request_fingerprint(case)):
+            if locked['confirmed_at'] or not fresh or fresh['invalidated_at'] or action_link_expired(fresh) or (not mode and fresh['request_fingerprint'] != r.request_fingerprint(case)):
                 raise HTTPException(409,'This request changed or was confirmed. Reload the current order.')
             prior = conn.execute('SELECT * FROM after_order_line_selections WHERE case_id=? AND line_id=? AND test_mode=?',(case['id'],line_id,int(mode))).fetchone()
             if prior and (prior['status']!='choosing' or moment(prior['deadline_at'])<=datetime.now(timezone.utc)):
@@ -91,6 +91,9 @@ class Requests:
             removal = conn.execute('SELECT * FROM after_order_line_removals WHERE case_id=? AND line_id=? AND test_mode=?',(case['id'],line_id,int(mode))).fetchone()
             if removal and removal['approved_at']:
                 raise HTTPException(409,'This removal was already approved.')
+            if (removal and removal['status'] == 'needs_approval'
+                    and removal['issue_fingerprint'] == r.request_fingerprint(case)):
+                return False, case, 'This item removal is already awaiting team approval. No refund has been issued.'
             conn.execute('''INSERT INTO after_order_line_removals(case_id,line_id,test_mode,issue_fingerprint,origin,status,updated_at)
                 VALUES(?,?,?,?,'customer','needs_approval',?) ON CONFLICT(case_id,line_id,test_mode)
                 DO UPDATE SET version=after_order_line_removals.version+1, status='needs_approval',updated_at=excluded.updated_at''',

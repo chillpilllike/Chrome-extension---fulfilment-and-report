@@ -193,6 +193,7 @@ class CaseMaterializationTests(unittest.TestCase):
         def db():
             yield self.conn
         self.sync = extract("sync_after_order_cases", {
+            "after_order_refresh_connection": lambda _factory: db(),
             "Optional": __import__('typing').Optional, "db": db, "utc_now": lambda: "2026-09-05",
             "after_order_cutoff_date": lambda: "2026-08-01", "rows_to_dicts": lambda rows: [dict(row) for row in rows],
             "unavailable_notice_block_reason": unavailable_notice_block_reason, "clean_text": lambda v: str(v or ""),

@@ -117,8 +117,8 @@ class DeliveryFollowupTests(unittest.TestCase):
                            'decision_version INTEGER DEFAULT 0', 'decision_updated_at TEXT', 'status TEXT',
                            'updated_at TEXT', 'decision_fingerprint TEXT', 'decision_locked_at TEXT', 'confirmed_by TEXT'):
             self.conn.execute('ALTER TABLE after_order_cases ADD COLUMN '+definition)
-        self.conn.executescript("""CREATE TABLE after_order_action_links(id INTEGER,invalidated_at TEXT);
-            INSERT INTO after_order_action_links VALUES(1,NULL);
+        self.conn.executescript("""CREATE TABLE after_order_action_links(id INTEGER,invalidated_at TEXT,expires_at TEXT);
+            INSERT INTO after_order_action_links VALUES(1,NULL,'2999-01-01T00:00:00+00:00');
             CREATE TABLE after_order_execution_jobs(case_id INTEGER,decision TEXT,status TEXT,updated_at TEXT);
             INSERT INTO after_order_execution_jobs VALUES(1,'not_received','pending','');
             UPDATE after_order_cases SET case_type='delivery_confirmation', current_decision='not_received',

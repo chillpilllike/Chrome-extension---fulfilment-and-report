@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import json
 import time
+import threading
+from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, HTTPException, Request
 
 SCHEMA = """
@@ -29,6 +31,11 @@ EVENT_STATUS = {'email.sent':'sent', 'email.delivered':'delivered', 'email.bounc
 PRIORITY = {'sent':10,'sent_test':10,'delivery_delayed':15,'failed':20,'delivered':30,'bounced':40,'complained':50}
 
 
+# Match provider IDs once, rather than testing every event/message pair. UNION
+# preserves one match when both the current send and an attempt share an ID.
+RECONCILE_QUERY = "WITH matching_messages AS (\n    SELECT provider_message_id, id AS message_id\n    FROM after_order_messages WHERE provider='resend'\n    UNION\n    SELECT a.provider_message_id, m.id AS message_id\n    FROM after_order_email_attempts a\n    JOIN after_order_messages m ON m.id=a.message_id\n    WHERE m.provider='resend'\n)\nSELECT e.*,m.id AS message_id,m.case_id,m.status,m.recipient,m.test_mode,\n       m.provider_message_id AS current_provider_id\nFROM after_order_delivery_events e\nJOIN matching_messages matched ON matched.provider_message_id=e.provider_message_id\nJOIN after_order_messages m ON m.id=matched.message_id\nWHERE e.processed_at IS NULL ORDER BY e.created_at LIMIT 100"
+
+
 def verify_receipt(body, headers, secret, now=None):
     if not secret or not secret.startswith('whsec_'):
         raise ValueError('Webhook signing secret is not configured.')
@@ -51,6 +58,7 @@ class Delivery:
     def __init__(self, namespace):
         from app.services.alternative_workflow import Runtime
         self.r = Runtime(namespace)
+        self._reconcile_lock = threading.Lock()
 
     def suppressed(self, recipient, test_mode):
         with self.r.db() as conn:
@@ -88,13 +96,20 @@ class Delivery:
                     r.record_after_order_event(conn,message['case_id'],'email_automatic_recovery_status',details={'message_id':message['id'],'reason':reason})
 
     def reconcile(self):
+        if not self._reconcile_lock.acquire(blocking=False):
+            return
+        try:
+            return self._reconcile()
+        finally:
+            self._reconcile_lock.release()
+
+    def _reconcile(self):
         r = self.r
         with r.db() as conn:
-            rows = conn.execute('''SELECT e.*,m.id AS message_id,m.case_id,m.status,m.recipient,m.test_mode,
-                m.provider_message_id AS current_provider_id FROM after_order_delivery_events e
-                JOIN after_order_messages m ON m.provider='resend' AND (m.provider_message_id=e.provider_message_id OR EXISTS
-                  (SELECT 1 FROM after_order_email_attempts a WHERE a.message_id=m.id AND a.provider_message_id=e.provider_message_id))
-                WHERE e.processed_at IS NULL ORDER BY e.created_at LIMIT 100''').fetchall()
+            row = conn.execute('SELECT pg_try_advisory_xact_lock(?) AS locked', (771905434,)).fetchone()
+            if not row or not row['locked']:
+                return
+            rows = conn.execute(RECONCILE_QUERY).fetchall()
             for row in rows:
                 # Recheck under lock so simultaneous webhook retries produce one timeline entry.
                 event = conn.execute('SELECT * FROM after_order_delivery_events WHERE event_id=? FOR UPDATE',(row['event_id'],)).fetchone()
@@ -112,6 +127,14 @@ class Delivery:
                 r.record_after_order_event(conn,message['case_id'],'email_'+status,details={
                     'message_id':message['id'],'provider_message_id':row['provider_message_id'],
                     'occurred_at':row['occurred_at'],'test_mode':bool(message['test_mode'])})
+
+    def accept_receipt(self, event_id, provider_id, kind, occurred_at):
+        with self.r.db() as conn:
+            conn.execute('''INSERT INTO after_order_delivery_events
+                (event_id,provider_message_id,event_type,occurred_at,created_at) VALUES(?,?,?,?,?)
+                ON CONFLICT(event_id) DO NOTHING''',
+                (event_id,provider_id,kind,occurred_at,self.r.utc_now()))
+        self.reconcile()
 
     def router(self):
         router = APIRouter()
@@ -133,13 +156,11 @@ class Delivery:
                     return {'ok':True,'ignored':True}
                 if not provider_id or len(provider_id)>200:
                     raise ValueError('Invalid email ID.')
-                with self.r.db() as conn:
-                    conn.execute('''INSERT INTO after_order_delivery_events
-                        (event_id,provider_message_id,event_type,occurred_at,created_at) VALUES(?,?,?,?,?)
-                        ON CONFLICT(event_id) DO NOTHING''',
-                        (event_id,provider_id,kind,str(payload.get('created_at') or self.r.utc_now()),self.r.utc_now()))
             except (ValueError, TypeError, KeyError) as exc:
                 raise HTTPException(400,'Invalid webhook.') from exc
-            self.reconcile()
+            # Database checkout, persistence and reconciliation can all block.
+            # Keep them off the ASGI event loop so unrelated pages keep serving.
+            await run_in_threadpool(self.accept_receipt, event_id, provider_id, kind,
+                                    str(payload.get('created_at') or self.r.utc_now()))
             return {'ok':True}
         return router

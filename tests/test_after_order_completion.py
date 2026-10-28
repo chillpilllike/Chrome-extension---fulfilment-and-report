@@ -39,15 +39,16 @@ class ReceiptSignatures(unittest.TestCase):
 class CompletionDB(unittest.TestCase):
     def setUp(self):
         self.conn=sqlite3.connect(':memory:');self.conn.row_factory=sqlite3.Row
+        self.conn.create_function('pg_try_advisory_xact_lock',1,lambda key:1)
         self.conn.executescript('''CREATE TABLE after_order_cases(id INTEGER PRIMARY KEY,confirmed_at TEXT,current_decision TEXT,status TEXT,decision_fingerprint TEXT,decision_version INTEGER DEFAULT 0,updated_at TEXT);
             CREATE TABLE order_lines(id INTEGER PRIMARY KEY,store_id INTEGER,odoo_order_id INTEGER,odoo_line_id INTEGER,product_name TEXT,quantity REAL,state TEXT);
             CREATE TABLE after_order_messages(id INTEGER PRIMARY KEY,case_id INTEGER,provider TEXT,provider_message_id TEXT,recipient TEXT,test_mode INTEGER,status TEXT,template_kind TEXT,payload_json TEXT,request_fingerprint TEXT,updated_at TEXT);
             CREATE TABLE after_order_email_attempts(message_id INTEGER,provider_message_id TEXT);
-            CREATE TABLE after_order_action_links(id INTEGER PRIMARY KEY,case_id INTEGER,invalidated_at TEXT,request_fingerprint TEXT);
+            CREATE TABLE after_order_action_links(id INTEGER PRIMARY KEY,case_id INTEGER,invalidated_at TEXT,request_fingerprint TEXT,expires_at TEXT);
             INSERT INTO after_order_cases(id,status) VALUES(1,'needs_attention');
             INSERT INTO order_lines VALUES(11,1,101,201,'Original A',1,'missing');
             INSERT INTO order_lines VALUES(12,1,101,202,'Original B',2,'missing');
-            INSERT INTO after_order_action_links VALUES(1,1,NULL,'fp');''')
+            INSERT INTO after_order_action_links VALUES(1,1,NULL,'fp','2999-01-01T00:00:00+00:00');''')
         self.conn.executescript(ALTERNATIVE_SCHEMA+DELIVERY_SCHEMA+REQUEST_SCHEMA)
         @contextmanager
         def db():
@@ -134,11 +135,17 @@ class CompletionDB(unittest.TestCase):
         self.conn.execute('INSERT INTO after_order_line_selections(case_id,line_id,test_mode,product_json,first_selected_at,deadline_at,issue_fingerprint,updated_at) VALUES(1,11,0,?,?,?,?,?)',('{}',now,now,'fp',now));self.conn.commit()
         self.requests.run_due();self.assertEqual([r['line_id'] for r in self.requests.rows(1)['removals']],[12])
 
-    def test_removal_decision_is_line_scoped_and_versioned(self):
+    def test_removal_decision_is_line_scoped_and_duplicates_are_noop(self):
         self.requests.remove(self.base,{'id':1},11)
         self.requests.remove(self.base,{'id':1},11)
-        rows=self.requests.rows(1)['removals'];self.assertEqual(len(rows),1);self.assertEqual(rows[0]['version'],2)
+        rows=self.requests.rows(1)['removals'];self.assertEqual(len(rows),1);self.assertEqual(rows[0]['version'],1)
         self.assertEqual(rows[0]['line_id'],11)
+
+    def test_expired_or_corrupt_token_cannot_remove_a_line(self):
+        for expiry in (None, 'invalid', '2020-01-01T00:00:00+00:00'):
+            self.conn.execute('UPDATE after_order_action_links SET expires_at=?',(expiry,));self.conn.commit()
+            with self.assertRaises(HTTPException):self.requests.remove(self.base,{'id':1},11)
+        self.assertEqual(self.requests.rows(1)['removals'],[])
 
     def test_approved_removal_cannot_be_changed(self):
         self.requests.remove(self.base,{'id':1},11)

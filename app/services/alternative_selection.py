@@ -11,6 +11,14 @@ def moment(value):
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 
+def action_link_expired(link, now=None):
+    """Missing or corrupt expiry must never grant customer write access."""
+    try:
+        return moment(dict(link).get('expires_at')) <= (now or datetime.now(timezone.utc))
+    except (TypeError, ValueError, OverflowError):
+        return True
+
+
 def selection_change(previous, product, now):
     """A re-selection never extends the first selection's 24-hour deadline."""
     if previous and (previous.get("status") != "choosing" or moment(previous["deadline_at"]) <= now):

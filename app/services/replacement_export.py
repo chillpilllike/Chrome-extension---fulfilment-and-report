@@ -10,7 +10,8 @@ from app.services.replacement_images import ReplacementImageSyncError
 class ReplacementExportOdoo:
     def __init__(self, client: Any, replacements: list[dict], image_loader: Callable[[str], str]):
         self.client = client
-        self.replacements = replacements
+        # Stable virtual line order keeps unchanged title approvals valid.
+        self.replacements = sorted(replacements, key=lambda item: int(item["id"]))
         self.image_loader = image_loader
         self.products: dict[int, dict] = {}
         self.images: dict[str, str] = {}
