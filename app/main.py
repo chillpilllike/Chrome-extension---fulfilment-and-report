@@ -132,7 +132,7 @@ from app.services.after_order import (
     EmailRejected,
 )
 from app.services.email_log import retry_block_reason, STATUS_LABELS as EMAIL_STATUS_LABELS
-from app.services.asin import decode_asin_reference, encode_asin, extract_asin_from_notes, normalize_asin, strip_html
+from app.services.asin import amazon_india_product_asins, decode_asin_reference, encode_asin, extract_asin_from_notes, normalize_asin, strip_html
 from app.services.airwallex_hub import (
     HANDLED_EVENTS as AIRWALLEX_HANDLED_EVENTS,
     DEPOSIT_ACTIVITY_CTE,
@@ -13148,6 +13148,24 @@ def clear_expired_chrome_claims(conn: Any) -> None:
     )
 
 
+def chrome_amazon_india_source_message(rows: list[dict[str, Any]]) -> str:
+    for row in rows:
+        raw = safe_json(row.get("raw_json"))
+        product_notes = [row.get("internal_note"), row.get("product_name")]
+        for source in raw.get("combined_source_lines") or []:
+            if isinstance(source, dict):
+                product_notes.extend((
+                    safe_json(source.get("template")).get("description"),
+                    safe_json(source.get("line")).get("name"),
+                ))
+        asins = {normalize_asin(row.get(field)) for field in ("asin", "original_asin", "replacement_asin")}
+        order_note = safe_json(raw.get("order")).get("note")
+        if any(amazon_india_product_asins(note) for note in product_notes) or asins.intersection(amazon_india_product_asins(order_note)):
+            name = clean_text(row.get("odoo_order_name")) or "This order"
+            return f"{name} has an Amazon India product source. Complete it through Amazon India."
+    return ""
+
+
 def chrome_job_from_rows(group_rows: list[dict[str, Any]], accounts_by_id: Optional[dict[int, dict[str, Any]]] = None) -> dict[str, Any]:
     group_rows = [
         row
@@ -13546,6 +13564,12 @@ def claim_next_chrome_job(
                 """,
                 (worker_id, store_id, store_id),
             ).fetchall()
+            if existing:
+                blocked_groups = {
+                    row["amazon_group_key"] for row in existing
+                    if chrome_amazon_india_source_message([row_to_dict(row)])
+                }
+                existing = [row for row in existing if row["amazon_group_key"] not in blocked_groups]
             if existing and automatic:
                 existing, _blocked, _messages = filter_automatic_chrome_orders(conn, rows_to_dicts(existing))
             if existing:
@@ -13659,6 +13683,8 @@ def claim_next_chrome_job(
                 """,
                 (group_key,),
             ).fetchall())
+            if chrome_amazon_india_source_message(candidate_rows):
+                continue
             if candidate_rows and automatic:
                 candidate_rows, _blocked, _messages = filter_automatic_chrome_orders(conn, candidate_rows)
             if candidate_rows:
@@ -13944,6 +13970,10 @@ def persist_chrome_order_groups(
     queued_line_ids: list[int] = []
     queued_snapshots: list[dict[str, Any]] = []
     for group_key_seed, group_lines in grouped.items():
+        marketplace_message = chrome_amazon_india_source_message(group_lines)
+        if marketplace_message:
+            details.append(marketplace_message)
+            continue
         require_complete_bundle_queue(conn, group_lines)
         group_key = f"chrome-{group_lines[0]['store_id']}-{group_key_seed}-{uuid.uuid4().hex[:10]}"
         order_names = list(dict.fromkeys(str(line["odoo_order_name"]) for line in group_lines))
@@ -14012,19 +14042,20 @@ def persist_chrome_order_groups(
             """,
             [*params, amazon_account["id"], amazon_account["name"], now],
         )
-    conn.execute_values(
-        """
-        INSERT INTO amazon_attempts
-        (order_line_id, external_id, mode, request_json, response_json, status, error, created_at)
-        VALUES ?
-        """,
-        attempts,
-        template="(?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)",
-        page_size=1000,
-    )
+    if attempts:
+        conn.execute_values(
+            """
+            INSERT INTO amazon_attempts
+            (order_line_id, external_id, mode, request_json, response_json, status, error, created_at)
+            VALUES ?
+            """,
+            attempts,
+            template="(?, ?, 'chrome', ?, NULL, 'queued', NULL, ?)",
+            page_size=1000,
+        )
     for snapshot in queued_snapshots:
         index_order_line(snapshot)
-    return len(grouped), details
+    return len(attempts), details
 
 
 def queue_chrome_order_groups(
@@ -33122,6 +33153,9 @@ def api_chrome_job_submitted(group_key: str, payload: ChromeJobHeartbeatPayload)
             ).fetchone()
             submitted_count = int(protected_row["count"] or 0) if protected_row else 0
         else:
+            marketplace_message = chrome_amazon_india_source_message(pending_rows)
+            if marketplace_message:
+                raise HTTPException(409, f"{marketplace_message} Amazon Place Order was stopped.")
             attempt = conn.execute(
                 "SELECT request_json FROM amazon_attempts WHERE external_id=? AND mode='chrome' ORDER BY id DESC LIMIT 1",
                 (group_key,),

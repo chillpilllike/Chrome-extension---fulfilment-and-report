@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import re
+from urllib.parse import urlsplit
 
 
 ASIN_SECRET = b"NUTRICITY-KEY"
@@ -59,3 +60,20 @@ def extract_asin_from_notes(*values: str) -> str:
 
 def strip_html(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(str(value or "")))).strip()
+
+
+def amazon_india_product_asins(value: str) -> set[str]:
+    """Extract product IDs from links whose actual host belongs to Amazon India."""
+    asins = set()
+    for link in re.findall(r"""(?:https?://|(?<![/@.\w])(?:www\.)?amazon\.in/)[^\s<>"']+""", html.unescape(str(value or "")), re.IGNORECASE):
+        try:
+            url = urlsplit(link if "://" in link else "https://" + link)
+            host = url.hostname or ""
+        except ValueError:
+            continue
+        if host != "amazon.in" and not host.endswith(".amazon.in"):
+            continue
+        product = re.search(r"/(?:dp|gp/product|gp/aw/d|exec/obidos/ASIN)/([A-Z0-9]{10})(?=/|$|[),.;])", url.path, re.IGNORECASE)
+        if product and (asin := normalize_asin(product.group(1))):
+            asins.add(asin)
+    return asins
